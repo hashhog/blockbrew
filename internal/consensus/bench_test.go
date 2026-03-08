@@ -1,12 +1,16 @@
 package consensus
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
+
+// Silence the unused import warning for bytes in normal tests
+var _ = bytes.Buffer{}
 
 func BenchmarkCalcMerkleRoot_10(b *testing.B) {
 	hashes := make([]wire.Hash256, 10)
@@ -349,4 +353,182 @@ func BenchmarkInMemoryUTXOView(b *testing.B) {
 			})
 		}
 	})
+}
+
+// BenchmarkUTXOSetCacheLookup benchmarks UTXO cache lookups.
+// Target: < 1 microsecond for cached lookups.
+func BenchmarkUTXOSetCacheLookup(b *testing.B) {
+	utxoSet := NewUTXOSet(nil) // nil DB for pure cache test
+
+	// Pre-populate with UTXOs
+	const numUTXOs = 100000
+	outpoints := make([]wire.OutPoint, numUTXOs)
+	for i := 0; i < numUTXOs; i++ {
+		op := wire.OutPoint{
+			Hash:  wire.Hash256{byte(i), byte(i >> 8), byte(i >> 16), byte(i >> 24)},
+			Index: uint32(i % 10),
+		}
+		outpoints[i] = op
+		utxoSet.AddUTXO(op, &UTXOEntry{
+			Amount:     int64(i * 1000),
+			PkScript:   make([]byte, 25),
+			Height:     int32(i / 1000),
+			IsCoinbase: false,
+		})
+	}
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			utxoSet.GetUTXO(outpoints[i%numUTXOs])
+			i++
+		}
+	})
+}
+
+// BenchmarkBufferPool benchmarks the buffer pool performance.
+func BenchmarkBufferPool(b *testing.B) {
+	b.Run("Get/Put", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			buf := GetBuffer()
+			buf.WriteString("test data for buffer pool benchmark")
+			PutBuffer(buf)
+		}
+	})
+
+	b.Run("NoPool", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			buf := new(bytes.Buffer)
+			buf.WriteString("test data for buffer pool benchmark")
+		}
+	})
+}
+
+// BenchmarkHash256Pool benchmarks the hash256 pool performance.
+func BenchmarkHash256Pool(b *testing.B) {
+	b.Run("Get/Put", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			h := GetHash256()
+			h[0] = byte(i)
+			PutHash256(h)
+		}
+	})
+
+	b.Run("NoPool", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			h := new([32]byte)
+			h[0] = byte(i)
+		}
+	})
+}
+
+// BenchmarkRuntimeMetrics benchmarks getting runtime metrics.
+func BenchmarkRuntimeMetrics(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		GetRuntimeMetrics()
+	}
+}
+
+// BenchmarkValidateBlockOptions tests block validation with different options.
+func BenchmarkValidateBlockOptions(b *testing.B) {
+	params := RegtestParams()
+
+	// Create a simple block with a coinbase transaction
+	coinbaseTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  wire.Hash256{},
+					Index: 0xFFFFFFFF,
+				},
+				SignatureScript: []byte{0x04, 0x01, 0x00, 0x00, 0x00}, // Height 1
+				Sequence:        0xFFFFFFFF,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    CalcBlockSubsidy(1),
+				PkScript: []byte{0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac},
+			},
+		},
+		LockTime: 0,
+	}
+
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    0x20000000,
+			PrevBlock:  params.GenesisHash,
+			MerkleRoot: CalcMerkleRoot([]wire.Hash256{coinbaseTx.TxHash()}),
+			Timestamp:  params.GenesisBlock.Header.Timestamp + 600,
+			Bits:       params.PowLimitBits,
+			Nonce:      0,
+		},
+		Transactions: []*wire.MsgTx{coinbaseTx},
+	}
+
+	// Mine the block
+	for nonce := uint32(0); ; nonce++ {
+		block.Header.Nonce = nonce
+		hash := block.Header.BlockHash()
+		if CheckProofOfWork(hash, block.Header.Bits, params.PowLimit) == nil {
+			break
+		}
+	}
+
+	prevHeader := &params.GenesisBlock.Header
+	utxoView := NewInMemoryUTXOView()
+
+	b.Run("Sequential", func(b *testing.B) {
+		opts := ValidateBlockOptions{
+			SkipScripts:     false,
+			ParallelScripts: false,
+		}
+		for i := 0; i < b.N; i++ {
+			view := NewInMemoryUTXOView()
+			_ = ValidateBlockWithOptions(block, prevHeader, 1, params, view, opts)
+		}
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		opts := ValidateBlockOptions{
+			SkipScripts:     false,
+			ParallelScripts: true,
+		}
+		for i := 0; i < b.N; i++ {
+			view := NewInMemoryUTXOView()
+			_ = ValidateBlockWithOptions(block, prevHeader, 1, params, view, opts)
+		}
+	})
+
+	b.Run("SkipScripts", func(b *testing.B) {
+		opts := ValidateBlockOptions{
+			SkipScripts:     true,
+			ParallelScripts: false,
+		}
+		for i := 0; i < b.N; i++ {
+			view := NewInMemoryUTXOView()
+			_ = ValidateBlockWithOptions(block, prevHeader, 1, params, view, opts)
+		}
+	})
+
+	_ = utxoView // prevent unused warning
+}
+
+// BenchmarkEstimateEntrySize benchmarks the entry size estimation.
+func BenchmarkEstimateEntrySize(b *testing.B) {
+	entries := []*UTXOEntry{
+		{Amount: 1000000, PkScript: make([]byte, 25), Height: 100, IsCoinbase: false},  // P2PKH
+		{Amount: 2000000, PkScript: make([]byte, 23), Height: 200, IsCoinbase: false},  // P2SH
+		{Amount: 3000000, PkScript: make([]byte, 22), Height: 300, IsCoinbase: false},  // P2WPKH
+		{Amount: 4000000, PkScript: make([]byte, 34), Height: 400, IsCoinbase: true},   // P2WSH
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		for _, e := range entries {
+			estimateEntrySize(e)
+		}
+	}
 }
