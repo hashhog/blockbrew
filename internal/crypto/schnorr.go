@@ -75,3 +75,63 @@ func SerializePubKeyXOnly(pubKey *secp256k1.PublicKey) []byte {
 	compressed := pubKey.SerializeCompressed()
 	return compressed[1:33]
 }
+
+// VerifyTaprootCommitment checks that outputKey == internalKey + tweak*G
+// where tweak is derived from the internal key and merkle root.
+// outputKeyXOnly is the 32-byte x-only output key from the scriptPubKey.
+// internalKeyXOnly is the 32-byte x-only internal key from the control block.
+// tweakHash is the 32-byte tap tweak hash.
+// outputParity is the parity bit from the control block (0 = even, 1 = odd).
+func VerifyTaprootCommitment(outputKeyXOnly, internalKeyXOnly []byte, tweakHash [32]byte, outputParity byte) bool {
+	if len(outputKeyXOnly) != 32 || len(internalKeyXOnly) != 32 {
+		return false
+	}
+
+	// Parse the internal key (assume even y for x-only key per BIP340)
+	compressedInternal := make([]byte, 33)
+	compressedInternal[0] = 0x02
+	copy(compressedInternal[1:], internalKeyXOnly)
+
+	internalKey, err := secp256k1.ParsePubKey(compressedInternal)
+	if err != nil {
+		return false
+	}
+
+	// Compute tweak*G
+	tweakScalar := new(secp256k1.ModNScalar)
+	if tweakScalar.SetByteSlice(tweakHash[:]) {
+		// tweakHash overflowed the curve order — invalid
+		return false
+	}
+
+	// tweakedKey = internalKey + tweak*G
+	var tweakPoint secp256k1.JacobianPoint
+	secp256k1.ScalarBaseMultNonConst(tweakScalar, &tweakPoint)
+
+	var internalPoint secp256k1.JacobianPoint
+	internalKey.AsJacobian(&internalPoint)
+
+	var resultPoint secp256k1.JacobianPoint
+	secp256k1.AddNonConst(&internalPoint, &tweakPoint, &resultPoint)
+	resultPoint.ToAffine()
+
+	// Convert result to public key and compare
+	resultPubKey := secp256k1.NewPublicKey(&resultPoint.X, &resultPoint.Y)
+	resultCompressed := resultPubKey.SerializeCompressed()
+
+	// Check parity matches
+	resultParity := resultCompressed[0] - 0x02 // 0=even, 1=odd
+	if resultParity != outputParity {
+		return false
+	}
+
+	// Compare x-coordinates
+	resultXOnly := resultCompressed[1:33]
+	for i := 0; i < 32; i++ {
+		if resultXOnly[i] != outputKeyXOnly[i] {
+			return false
+		}
+	}
+
+	return true
+}

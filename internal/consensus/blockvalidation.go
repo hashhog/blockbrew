@@ -28,6 +28,7 @@ var (
 	ErrBadWitnessCommitment    = errors.New("witness commitment mismatch")
 	ErrSigOpsCostTooHigh       = errors.New("block sigops cost exceeds maximum")
 	ErrBadCoinbaseValue        = errors.New("coinbase value exceeds allowed subsidy plus fees")
+	ErrDuplicateCoinbase       = errors.New("block contains duplicate coinbase outputs (BIP30)")
 )
 
 // WitnessCommitmentMagic is the magic prefix for witness commitment in coinbase.
@@ -95,7 +96,8 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int) error {
 }
 
 // CheckBlockContext performs context-dependent checks (requires chain state).
-func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, height int32, params *ChainParams) error {
+// medianTimePast is the MTP of the previous 11 blocks (0 to skip MTP check).
+func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, height int32, params *ChainParams, medianTimePast ...uint32) error {
 	// 1-3. Block version checks based on BIP34/66/65 activation
 	if height >= params.BIP34Height && block.Header.Version < 2 {
 		return fmt.Errorf("%w: version %d, need >= 2 for BIP34",
@@ -111,9 +113,11 @@ func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, heigh
 	}
 
 	// 4. Block timestamp must be greater than median time past (MTP)
-	// Note: We need the timestamps of the previous 11 blocks for MTP calculation.
-	// For now, we just check against the previous block's timestamp as a minimum check.
-	// Full MTP validation requires chain context that's passed in separately.
+	if len(medianTimePast) > 0 && medianTimePast[0] > 0 {
+		if err := CheckBlockTimestamp(block.Header.Timestamp, medianTimePast[0]); err != nil {
+			return err
+		}
+	}
 
 	// 5. If segwit is active, validate witness commitment
 	if height >= params.SegwitHeight {
@@ -126,6 +130,20 @@ func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, heigh
 	if height >= params.BIP34Height {
 		if err := checkBIP34Height(block.Transactions[0], height); err != nil {
 			return err
+		}
+	}
+
+	// Check all transactions are final (IsFinalTx)
+	// Use MTP as block time for BIP113 if CSV is active, otherwise use block timestamp
+	var blockTime uint32
+	if height >= params.CSVHeight && len(medianTimePast) > 0 {
+		blockTime = medianTimePast[0]
+	} else {
+		blockTime = block.Header.Timestamp
+	}
+	for i, tx := range block.Transactions {
+		if !IsFinalTx(tx, height, blockTime) {
+			return fmt.Errorf("tx %d: %w", i, ErrNonFinalTx)
 		}
 	}
 
@@ -309,6 +327,21 @@ func ValidateBlockWithOptions(block *wire.MsgBlock, prevHeader *wire.BlockHeader
 	// Perform context-dependent checks
 	if err := CheckBlockContext(block, prevHeader, height, params); err != nil {
 		return err
+	}
+
+	// BIP30: Check for duplicate coinbase transaction outputs.
+	// Two historical blocks (91722 and 91812) on mainnet have duplicate coinbase
+	// txids. After BIP34 activation (height 227931), duplicates are impossible
+	// because the height is encoded in the coinbase.
+	if height != 91722 && height != 91812 {
+		coinbaseTxHash := block.Transactions[0].TxHash()
+		for i := range block.Transactions[0].TxOut {
+			outpoint := wire.OutPoint{Hash: coinbaseTxHash, Index: uint32(i)}
+			if utxoView.GetUTXO(outpoint) != nil {
+				return fmt.Errorf("%w: output %s:%d already exists",
+					ErrDuplicateCoinbase, coinbaseTxHash.String()[:16], i)
+			}
+		}
 	}
 
 	// Get script flags for this block height

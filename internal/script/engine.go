@@ -78,6 +78,7 @@ type Engine struct {
 	sigVersion  SigVersion
 	opCount     int           // Number of operations executed
 	codesepPos  uint32        // Position of last OP_CODESEPARATOR (for tapscript)
+	sigopBudget int           // Tapscript signature validation weight budget
 }
 
 // NewEngine creates a script execution engine.
@@ -393,15 +394,15 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 		k = TapBranch(k, node)
 	}
 
-	// Compute tweaked output key
+	// Compute tweaked output key and verify it matches
 	tweak := TapTweak(internalPubKey, k[:])
 
-	// Verify the output key matches
-	// This requires EC math which we don't have direct access to here
-	// For now, we'll verify using Schnorr with a dummy signature check
-	// In production, we'd need proper EC point addition
-	_ = tweak
-	_ = outputKey
+	// Extract output parity from control block
+	outputParity := leafVersionAndParity & 0x01
+
+	if !crypto.VerifyTaprootCommitment(outputKey, internalPubKey, tweak, outputParity) {
+		return ErrWitnessProgram
+	}
 
 	// Set up stack and execute the script
 	e.stack = NewStack()
@@ -411,6 +412,17 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 
 	// Set leaf hash for sighash computation
 	e.codesepPos = 0xFFFFFFFF
+
+	// Initialize tapscript signature validation weight budget (BIP342).
+	// Budget = 50 + total witness size in bytes for this input.
+	witnessSize := 0
+	for _, w := range witness {
+		witnessSize += len(w)
+	}
+	if annex != nil {
+		witnessSize += len(annex)
+	}
+	e.sigopBudget = 50 + witnessSize
 
 	e.opCount = 0
 	return e.executeScript(script)
@@ -540,6 +552,15 @@ func (e *Engine) executeScript(script []byte) error {
 					return ErrStackUnderflow
 				}
 				val, _ := e.stack.Pop()
+
+				// BIP342: Tapscript requires minimal IF — condition must be
+				// exactly empty (false) or exactly {0x01} (true).
+				if e.sigVersion == SigVersionTapscript {
+					if len(val) > 1 || (len(val) == 1 && val[0] != 1) {
+						return fmt.Errorf("tapscript requires minimal IF/NOTIF argument")
+					}
+				}
+
 				cond = CastToBool(val)
 				if op == OP_NOTIF {
 					cond = !cond
@@ -649,6 +670,9 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int) error {
 
 	case OP_2SWAP:
 		return e.op2Swap()
+
+	case OP_2ROT:
+		return e.op2Rot()
 
 	case OP_TUCK:
 		return e.opTuck()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
+	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/crypto"
 	"golang.org/x/crypto/ripemd160"
@@ -128,6 +129,19 @@ func (e *Engine) opRot() error {
 
 func (e *Engine) opSwap() error {
 	return e.stack.SwapTop()
+}
+
+func (e *Engine) op2Rot() error {
+	if e.stack.Size() < 6 {
+		return ErrStackUnderflow
+	}
+	// Move the 5th and 6th items to the top
+	// [a, b, c, d, e, f] -> [c, d, e, f, a, b]
+	val1, _ := e.stack.RemoveAt(5) // 6th from top (deepest)
+	val2, _ := e.stack.RemoveAt(4) // 5th from top (shifted after first remove)
+	e.stack.Push(val1)
+	e.stack.Push(val2)
+	return nil
 }
 
 func (e *Engine) op2Swap() error {
@@ -599,6 +613,12 @@ func (e *Engine) opCheckSig(script []byte) error {
 		valid = crypto.VerifyECDSA(pubKey, sighash, sig)
 
 	case SigVersionTapscript:
+		// Decrement tapscript signature validation weight budget (BIP342)
+		e.sigopBudget -= TapscriptSigopBudgetCost
+		if e.sigopBudget < 0 {
+			return fmt.Errorf("tapscript validation weight exceeded")
+		}
+
 		// For tapscript, use Schnorr signature
 		if len(pubKeyBytes) != 32 {
 			e.stack.PushBool(false)
@@ -756,10 +776,16 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 		return err
 	}
 
-	// If signature is empty, just push n
+	// If signature is empty, just push n (no budget cost for empty sig)
 	if len(sigBytes) == 0 {
 		e.stack.PushInt(n)
 		return nil
+	}
+
+	// Decrement tapscript signature validation weight budget (BIP342)
+	e.sigopBudget -= TapscriptSigopBudgetCost
+	if e.sigopBudget < 0 {
+		return fmt.Errorf("tapscript validation weight exceeded")
 	}
 
 	// Verify the signature

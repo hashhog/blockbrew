@@ -25,6 +25,8 @@ var (
 	ErrInputTooLarge         = errors.New("transaction input value exceeds max money")
 	ErrTotalInputTooLarge    = errors.New("total transaction input exceeds max money")
 	ErrInsufficientFunds     = errors.New("transaction inputs less than outputs")
+	ErrNonFinalTx            = errors.New("transaction is not final")
+	ErrSequenceLockNotMet    = errors.New("sequence lock requirements not met")
 )
 
 // UTXOView provides access to unspent transaction outputs.
@@ -236,6 +238,107 @@ func (v *InMemoryUTXOView) AddTxOutputs(tx *wire.MsgTx, height int32) {
 			IsCoinbase: isCoinbase,
 		})
 	}
+}
+
+// IsFinalTx checks if a transaction is final at a given height and time.
+// A transaction is final if its locktime is satisfied or all inputs have
+// sequence 0xFFFFFFFF. This matches Bitcoin Core's IsFinalTx().
+func IsFinalTx(tx *wire.MsgTx, blockHeight int32, blockTime uint32) bool {
+	// A locktime of 0 means the transaction is always final.
+	if tx.LockTime == 0 {
+		return true
+	}
+
+	// Determine if locktime is a block height or timestamp.
+	var lockTimeLimit int64
+	if tx.LockTime < LockTimeThreshold {
+		lockTimeLimit = int64(blockHeight)
+	} else {
+		lockTimeLimit = int64(blockTime)
+	}
+
+	if int64(tx.LockTime) < lockTimeLimit {
+		return true
+	}
+
+	// If all inputs are finalized (sequence == 0xFFFFFFFF), tx is final
+	// regardless of locktime.
+	for _, in := range tx.TxIn {
+		if in.Sequence != 0xFFFFFFFF {
+			return false
+		}
+	}
+	return true
+}
+
+// SequenceLock represents the minimum block height and time at which a
+// transaction can be included in a block (BIP68).
+type SequenceLock struct {
+	MinHeight int32  // Minimum block height (-1 if no height lock)
+	MinTime   int64  // Minimum median time past (-1 if no time lock)
+}
+
+// CalculateSequenceLocks computes the sequence locks for a transaction.
+// For each input with a relative lock (BIP68), it calculates the minimum
+// block height or median time past required.
+// prevHeights contains the height of the block that includes each input's UTXO.
+// blockHeight is the height of the block being validated.
+func CalculateSequenceLocks(tx *wire.MsgTx, prevHeights []int32, medianTimePast int64, blockHeight int32) *SequenceLock {
+	lock := &SequenceLock{
+		MinHeight: -1,
+		MinTime:   -1,
+	}
+
+	// BIP68 only applies to version >= 2 transactions.
+	if tx.Version < 2 {
+		return lock
+	}
+
+	for i, in := range tx.TxIn {
+		// Skip coinbase inputs
+		if in.PreviousOutPoint.Hash.IsZero() && in.PreviousOutPoint.Index == 0xFFFFFFFF {
+			continue
+		}
+
+		seq := in.Sequence
+
+		// If the disable flag is set, skip this input.
+		if seq&SequenceLockTimeDisabledFlag != 0 {
+			continue
+		}
+
+		if seq&SequenceLockTimeTypeFlag != 0 {
+			// Time-based relative lock
+			// The locked time is in units of 512 seconds (granularity of 9 bits)
+			lockedTime := (int64(seq&SequenceLockTimeMask) << SequenceLockTimeGranularity) - 1
+			// Add to the MTP of the block that included the input UTXO
+			// We need the MTP at prevHeights[i]-1, but we approximate with
+			// medianTimePast which is the MTP of the current block's parent
+			minTime := lockedTime + medianTimePast
+			if minTime > lock.MinTime {
+				lock.MinTime = minTime
+			}
+		} else {
+			// Height-based relative lock
+			minHeight := prevHeights[i] + int32(seq&SequenceLockTimeMask) - 1
+			if minHeight > lock.MinHeight {
+				lock.MinHeight = minHeight
+			}
+		}
+	}
+
+	return lock
+}
+
+// EvaluateSequenceLocks checks if a transaction's sequence locks are satisfied.
+func EvaluateSequenceLocks(lock *SequenceLock, blockHeight int32, medianTimePast int64) bool {
+	if lock.MinHeight >= blockHeight {
+		return false
+	}
+	if lock.MinTime >= medianTimePast {
+		return false
+	}
+	return true
 }
 
 // SpendTxInputs removes all inputs of a transaction from the UTXO view.
