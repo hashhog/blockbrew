@@ -1,0 +1,256 @@
+package rpc
+
+import "encoding/json"
+
+// JSON-RPC error codes (from Bitcoin Core).
+const (
+	RPCErrParseError      = -32700 // Invalid JSON was received
+	RPCErrInvalidRequest  = -32600 // The JSON sent is not a valid Request object
+	RPCErrMethodNotFound  = -32601 // The method does not exist
+	RPCErrInvalidParams   = -32602 // Invalid method parameter(s)
+	RPCErrInternal        = -32603 // Internal JSON-RPC error
+	RPCErrBlockNotFound   = -5     // Block not found
+	RPCErrTxNotFound      = -5     // Transaction not found
+	RPCErrDeserialization = -22    // Error parsing or validating structure in raw format
+	RPCErrVerify          = -25    // Error during verification
+	RPCErrInWarmup        = -28    // Client still warming up
+)
+
+// RPCRequest is a JSON-RPC request.
+type RPCRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      interface{}     `json:"id"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params"`
+}
+
+// RPCResponse is a JSON-RPC response.
+type RPCResponse struct {
+	Result interface{} `json:"result"`
+	Error  *RPCError   `json:"error"`
+	ID     interface{} `json:"id"`
+}
+
+// RPCError is a JSON-RPC error.
+type RPCError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// Error implements the error interface.
+func (e *RPCError) Error() string {
+	return e.Message
+}
+
+// BlockchainInfo represents the result of getblockchaininfo.
+type BlockchainInfo struct {
+	Chain                string  `json:"chain"`
+	Blocks               int32   `json:"blocks"`
+	Headers              int32   `json:"headers"`
+	BestBlockHash        string  `json:"bestblockhash"`
+	Difficulty           float64 `json:"difficulty"`
+	MedianTime           int64   `json:"mediantime"`
+	VerificationProgress float64 `json:"verificationprogress"`
+	InitialBlockDownload bool    `json:"initialblockdownload"`
+	Pruned               bool    `json:"pruned"`
+}
+
+// BlockResult represents a block in RPC responses.
+type BlockResult struct {
+	Hash          string        `json:"hash"`
+	Confirmations int32         `json:"confirmations"`
+	Size          int           `json:"size"`
+	Weight        int           `json:"weight"`
+	Height        int32         `json:"height"`
+	Version       int32         `json:"version"`
+	VersionHex    string        `json:"versionHex"`
+	MerkleRoot    string        `json:"merkleroot"`
+	Tx            []interface{} `json:"tx"`
+	Time          uint32        `json:"time"`
+	MedianTime    int64         `json:"mediantime"`
+	Nonce         uint32        `json:"nonce"`
+	Bits          string        `json:"bits"`
+	Difficulty    float64       `json:"difficulty"`
+	ChainWork     string        `json:"chainwork,omitempty"`
+	NTx           int           `json:"nTx"`
+	PreviousHash  string        `json:"previousblockhash,omitempty"`
+	NextHash      string        `json:"nextblockhash,omitempty"`
+}
+
+// BlockHeaderResult represents a block header in RPC responses.
+type BlockHeaderResult struct {
+	Hash          string  `json:"hash"`
+	Confirmations int32   `json:"confirmations"`
+	Height        int32   `json:"height"`
+	Version       int32   `json:"version"`
+	VersionHex    string  `json:"versionHex"`
+	MerkleRoot    string  `json:"merkleroot"`
+	Time          uint32  `json:"time"`
+	MedianTime    int64   `json:"mediantime"`
+	Nonce         uint32  `json:"nonce"`
+	Bits          string  `json:"bits"`
+	Difficulty    float64 `json:"difficulty"`
+	ChainWork     string  `json:"chainwork,omitempty"`
+	NTx           int     `json:"nTx"`
+	PreviousHash  string  `json:"previousblockhash,omitempty"`
+	NextHash      string  `json:"nextblockhash,omitempty"`
+}
+
+// TxResult represents a transaction in RPC responses (verbose mode).
+type TxResult struct {
+	TxID          string       `json:"txid"`
+	Hash          string       `json:"hash"`
+	Version       int32        `json:"version"`
+	Size          int          `json:"size"`
+	VSize         int          `json:"vsize"`
+	Weight        int          `json:"weight"`
+	LockTime      uint32       `json:"locktime"`
+	Vin           []VinResult  `json:"vin"`
+	Vout          []VoutResult `json:"vout"`
+	Hex           string       `json:"hex,omitempty"`
+	BlockHash     string       `json:"blockhash,omitempty"`
+	Confirmations int32        `json:"confirmations,omitempty"`
+	BlockTime     uint32       `json:"blocktime,omitempty"`
+	Time          uint32       `json:"time,omitempty"`
+}
+
+// VinResult represents a transaction input in RPC responses.
+type VinResult struct {
+	TxID        string   `json:"txid,omitempty"`
+	Vout        uint32   `json:"vout,omitempty"`
+	ScriptSig   *Script  `json:"scriptSig,omitempty"`
+	TxInWitness []string `json:"txinwitness,omitempty"`
+	Sequence    uint32   `json:"sequence"`
+	Coinbase    string   `json:"coinbase,omitempty"`
+}
+
+// VoutResult represents a transaction output in RPC responses.
+type VoutResult struct {
+	Value        float64      `json:"value"`
+	N            int          `json:"n"`
+	ScriptPubKey ScriptPubKey `json:"scriptPubKey"`
+}
+
+// Script represents a script in RPC responses.
+type Script struct {
+	Asm string `json:"asm"`
+	Hex string `json:"hex"`
+}
+
+// ScriptPubKey represents an output script in RPC responses.
+type ScriptPubKey struct {
+	Asm     string `json:"asm"`
+	Hex     string `json:"hex"`
+	Type    string `json:"type"`
+	Address string `json:"address,omitempty"`
+}
+
+// MempoolInfo represents the result of getmempoolinfo.
+type MempoolInfo struct {
+	Loaded        bool    `json:"loaded"`
+	Size          int     `json:"size"`
+	Bytes         int64   `json:"bytes"`
+	Usage         int64   `json:"usage"`
+	MaxMempool    int64   `json:"maxmempool"`
+	MinRelayTxFee float64 `json:"mempoolminfee"`
+}
+
+// MempoolEntry represents a mempool entry (verbose getrawmempool).
+type MempoolEntry struct {
+	VSize            int64    `json:"vsize"`
+	Weight           int64    `json:"weight"`
+	Fee              float64  `json:"fee"`
+	ModifiedFee      float64  `json:"modifiedfee"`
+	Time             int64    `json:"time"`
+	Height           int32    `json:"height"`
+	DescendantCount  int      `json:"descendantcount"`
+	DescendantSize   int64    `json:"descendantsize"`
+	DescendantFees   float64  `json:"descendantfees"`
+	AncestorCount    int      `json:"ancestorcount"`
+	AncestorSize     int64    `json:"ancestorsize"`
+	AncestorFees     float64  `json:"ancestorfees"`
+	WTxID            string   `json:"wtxid"`
+	Depends          []string `json:"depends"`
+	SpentBy          []string `json:"spentby"`
+	Unbroadcast      bool     `json:"unbroadcast"`
+}
+
+// PeerInfo represents peer information in RPC responses.
+type PeerInfo struct {
+	ID          int     `json:"id"`
+	Addr        string  `json:"addr"`
+	Services    string  `json:"services"`
+	LastSend    int64   `json:"lastsend"`
+	LastRecv    int64   `json:"lastrecv"`
+	BytesSent   uint64  `json:"bytessent"`
+	BytesRecv   uint64  `json:"bytesrecv"`
+	ConnTime    int64   `json:"conntime"`
+	TimeOffset  int64   `json:"timeoffset"`
+	PingTime    float64 `json:"pingtime"`
+	Version     int32   `json:"version"`
+	SubVer      string  `json:"subver"`
+	Inbound     bool    `json:"inbound"`
+	StartHeight int32   `json:"startingheight"`
+	SyncedHeaders int32 `json:"synced_headers"`
+	SyncedBlocks  int32 `json:"synced_blocks"`
+}
+
+// NetworkInfo represents the result of getnetworkinfo.
+type NetworkInfo struct {
+	Version         int32  `json:"version"`
+	SubVersion      string `json:"subversion"`
+	ProtocolVersion int32  `json:"protocolversion"`
+	LocalServices   string `json:"localservices"`
+	LocalRelay      bool   `json:"localrelay"`
+	TimeOffset      int64  `json:"timeoffset"`
+	NetworkActive   bool   `json:"networkactive"`
+	Connections     int    `json:"connections"`
+	ConnectionsIn   int    `json:"connections_in"`
+	ConnectionsOut  int    `json:"connections_out"`
+}
+
+// SmartFeeResult represents the result of estimatesmartfee.
+type SmartFeeResult struct {
+	FeeRate float64  `json:"feerate,omitempty"`
+	Errors  []string `json:"errors,omitempty"`
+	Blocks  int      `json:"blocks"`
+}
+
+// ChainTip represents a chain tip (for getchaintips).
+type ChainTip struct {
+	Height    int32  `json:"height"`
+	Hash      string `json:"hash"`
+	BranchLen int32  `json:"branchlen"`
+	Status    string `json:"status"`
+}
+
+// BlockTemplateResult represents the result of getblocktemplate.
+type BlockTemplateResult struct {
+	Version                  int32                 `json:"version"`
+	PreviousBlockHash        string                `json:"previousblockhash"`
+	Transactions             []BlockTemplateTx     `json:"transactions"`
+	CoinbaseAux              map[string]string     `json:"coinbaseaux"`
+	CoinbaseValue            int64                 `json:"coinbasevalue"`
+	Target                   string                `json:"target"`
+	MinTime                  int64                 `json:"mintime"`
+	Mutable                  []string              `json:"mutable"`
+	NonceRange               string                `json:"noncerange"`
+	SigOpLimit               int64                 `json:"sigoplimit"`
+	SizeLimit                int64                 `json:"sizelimit"`
+	WeightLimit              int64                 `json:"weightlimit"`
+	CurTime                  int64                 `json:"curtime"`
+	Bits                     string                `json:"bits"`
+	Height                   int32                 `json:"height"`
+	DefaultWitnessCommitment string                `json:"default_witness_commitment,omitempty"`
+}
+
+// BlockTemplateTx represents a transaction in the block template.
+type BlockTemplateTx struct {
+	Data    string   `json:"data"`
+	TxID    string   `json:"txid"`
+	Hash    string   `json:"hash"`
+	Depends []int    `json:"depends"`
+	Fee     int64    `json:"fee"`
+	SigOps  int64    `json:"sigops"`
+	Weight  int64    `json:"weight"`
+}
