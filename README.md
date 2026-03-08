@@ -17,6 +17,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [x] Consensus parameters and difficulty calculations
 - [x] Genesis blocks (mainnet, testnet, regtest, signet)
+- [x] Database layer (Pebble backend, chain state, block storage)
 - [ ] P2P message framing and handshake
 - [ ] Block header validation and chain sync
 - [ ] UTXO set and block validation
@@ -49,7 +50,7 @@ internal/
   consensus/       consensus rules and validation
   script/          script interpreter
   p2p/             peer-to-peer networking
-  storage/         block and UTXO storage
+  storage/         database layer (pebble, chain state)
   mempool/         transaction memory pool
   rpc/             JSON-RPC server
   wallet/          key management
