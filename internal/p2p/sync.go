@@ -83,7 +83,8 @@ type SyncManager struct {
 	wg            sync.WaitGroup
 
 	// Callbacks for external integration
-	onSyncComplete func() // Called when header sync completes
+	onSyncComplete   func()                                    // Called when header sync completes
+	onBlockConnected func(block *wire.MsgBlock, height int32)  // Called after block connected
 
 	// Block download state
 	blockQueue     []*blockRequest              // Ordered list of blocks to download
@@ -116,13 +117,14 @@ type ChainConnector interface {
 
 // SyncManagerConfig configures the sync manager.
 type SyncManagerConfig struct {
-	ChainParams    *consensus.ChainParams
-	HeaderIndex    *consensus.HeaderIndex
-	ChainDB        *storage.ChainDB
-	PeerManager    *PeerManager
-	ChainManager   ChainConnector
-	OnSyncComplete func()
-	DownloadWindow int // Max concurrent block downloads (default: 1024)
+	ChainParams      *consensus.ChainParams
+	HeaderIndex      *consensus.HeaderIndex
+	ChainDB          *storage.ChainDB
+	PeerManager      *PeerManager
+	ChainManager     ChainConnector
+	OnSyncComplete   func()
+	OnBlockConnected func(block *wire.MsgBlock, height int32) // Called after a block is connected
+	DownloadWindow   int                                      // Max concurrent block downloads (default: 1024)
 }
 
 // NewSyncManager creates a new sync manager.
@@ -139,6 +141,7 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		peerMgr:          config.PeerManager,
 		quit:             make(chan struct{}),
 		onSyncComplete:   config.OnSyncComplete,
+		onBlockConnected: config.OnBlockConnected,
 		inflight:         make(map[wire.Hash256]*blockRequest),
 		downloadWindow:   downloadWindow,
 		validationChan:   make(chan *blockWithRequest, downloadWindow),
@@ -828,6 +831,11 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 
 		bwr.req.State = BlockDownloadConnected
 		delete(pending, nextHeight)
+
+		// Notify listeners of connected block
+		if sm.onBlockConnected != nil {
+			sm.onBlockConnected(bwr.block, nextHeight)
+		}
 
 		// Remove from queue
 		sm.mu.Lock()
