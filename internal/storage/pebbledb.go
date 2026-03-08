@@ -1,21 +1,87 @@
 package storage
 
 import (
+	"fmt"
+
 	"github.com/cockroachdb/pebble"
+	"github.com/cockroachdb/pebble/bloom"
 )
 
 // PebbleDB wraps a Pebble database to implement the DB interface.
 type PebbleDB struct {
-	db *pebble.DB
+	db    *pebble.DB
+	cache *pebble.Cache
+}
+
+// PebbleDBConfig contains Pebble database configuration options.
+type PebbleDBConfig struct {
+	// BlockCacheSize is the size of the block cache in bytes.
+	// Default is 256MB. Larger values improve read performance.
+	BlockCacheSize int64
+
+	// MemTableSize is the size of each memtable in bytes.
+	// Default is 64MB. Larger values reduce write amplification.
+	MemTableSize int
+
+	// MaxOpenFiles limits the number of open sstable file handles.
+	// Default is 1000.
+	MaxOpenFiles int
+
+	// Sync controls whether writes are synchronous.
+	// Default is true for durability.
+	Sync bool
+}
+
+// DefaultPebbleDBConfig returns the default configuration optimized for Bitcoin workloads.
+func DefaultPebbleDBConfig() PebbleDBConfig {
+	return PebbleDBConfig{
+		BlockCacheSize: 256 * 1024 * 1024, // 256MB block cache
+		MemTableSize:   64 * 1024 * 1024,  // 64MB memtable
+		MaxOpenFiles:   1000,
+		Sync:           true,
+	}
 }
 
 // NewPebbleDB opens or creates a Pebble database at the given path.
 func NewPebbleDB(path string) (*PebbleDB, error) {
-	db, err := pebble.Open(path, &pebble.Options{})
-	if err != nil {
-		return nil, err
+	return NewPebbleDBWithConfig(path, DefaultPebbleDBConfig())
+}
+
+// NewPebbleDBWithConfig opens or creates a Pebble database with custom configuration.
+func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
+	// Create block cache (shared across all SSTs)
+	cache := pebble.NewCache(cfg.BlockCacheSize)
+
+	// Configure level options with compression and bloom filters
+	levelOpts := make([]pebble.LevelOptions, 7)
+	for i := range levelOpts {
+		levelOpts[i] = pebble.LevelOptions{
+			Compression:    pebble.ZstdCompression,
+			TargetFileSize: 64 * 1024 * 1024, // 64MB target file size
+			FilterPolicy:   bloom.FilterPolicy(10), // Bloom filter with ~1% false positive rate
+		}
 	}
-	return &PebbleDB{db: db}, nil
+
+	opts := &pebble.Options{
+		Cache:                       cache,
+		MemTableSize:                uint64(cfg.MemTableSize),
+		MemTableStopWritesThreshold: 4, // Allow 4 memtables before stalling
+		Levels:                      levelOpts,
+		MaxOpenFiles:                cfg.MaxOpenFiles,
+		WALBytesPerSync:             1024 * 1024, // Sync WAL every 1MB
+
+		// L0 compaction settings
+		L0CompactionThreshold: 2, // Start compaction when L0 has 2 files
+		L0StopWritesThreshold: 8, // Stop writes when L0 has 8 files
+	}
+
+	db, err := pebble.Open(path, opts)
+	if err != nil {
+		cache.Unref()
+		return nil, fmt.Errorf("pebble open failed: %w", err)
+	}
+
+	return &PebbleDB{db: db, cache: cache}, nil
 }
 
 // Get retrieves a value by key. Returns nil, nil if key does not exist.
@@ -89,9 +155,13 @@ func (p *PebbleDB) NewIterator(prefix []byte) Iterator {
 	}
 }
 
-// Close closes the database.
+// Close closes the database and releases resources.
 func (p *PebbleDB) Close() error {
-	return p.db.Close()
+	err := p.db.Close()
+	if p.cache != nil {
+		p.cache.Unref()
+	}
+	return err
 }
 
 // prefixUpperBound computes the upper bound for prefix iteration.
