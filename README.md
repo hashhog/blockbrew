@@ -12,6 +12,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 
 - [x] Project scaffold and module layout
 - [x] Binary serialization (varint, compact size, tx, block)
+- [x] Cryptographic primitives (SHA256, RIPEMD160, secp256k1, ECDSA, Schnorr)
 - [ ] P2P message framing and handshake
 - [ ] Block header validation and chain sync
 - [ ] Script interpreter
@@ -39,6 +40,7 @@ make test
 ```
 cmd/blockbrew/     main entrypoint
 internal/
+  crypto/          hashing, keys, ecdsa, schnorr
   wire/            protocol message serialization
   consensus/       consensus rules and validation
   script/          script interpreter
