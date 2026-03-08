@@ -21,6 +21,7 @@ import (
 	"github.com/hashhog/blockbrew/internal/rpc"
 	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wallet"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 const (
@@ -279,10 +280,19 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		},
 	})
 
-	// 8. Initialize sync manager (we use a pointer indirection to handle the circular reference)
+	// 8. Initialize wallet early so sync callbacks can reference it
+	var w *wallet.Wallet
+
+	// 9. Initialize sync manager (we use a pointer indirection to handle the circular reference)
 	var syncMgr *p2p.SyncManager
 
 	// Create the sync manager with callbacks that reference it via the variable
+	onBlockConnected := func(block *wire.MsgBlock, height int32) {
+		if w != nil {
+			w.ScanBlock(block, height)
+		}
+		mp.BlockConnected(block)
+	}
 	syncMgr = p2p.NewSyncManager(p2p.SyncManagerConfig{
 		ChainParams:  chainParams,
 		HeaderIndex:  headerIndex,
@@ -293,6 +303,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("Header synchronization complete, starting block download")
 			syncMgr.StartBlockDownload()
 		},
+		OnBlockConnected: onBlockConnected,
 	})
 
 	// Wire up sync manager listeners to peer manager
@@ -328,22 +339,32 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("Header synchronization complete, starting block download")
 			syncMgr.StartBlockDownload()
 		},
+		OnBlockConnected: onBlockConnected,
 	})
 
 	// 9. Initialize mining template generator
 	templateGen := mining.NewTemplateGenerator(chainParams, chainMgr, mp, headerIndex)
 
 	// 10. Initialize wallet (optional)
-	var w *wallet.Wallet
 	walletPath := filepath.Join(cfg.DataDir, cfg.WalletFile)
+	walletCfg := wallet.WalletConfig{
+		DataDir:     cfg.DataDir,
+		Network:     networkToAddressNetwork(chainParams),
+		ChainParams: chainParams,
+	}
 	if _, err := os.Stat(walletPath); err == nil {
-		log.Printf("Wallet file found at %s (wallet loading not yet implemented)", walletPath)
-		// Initialize wallet structure even if file loading isn't implemented
-		w = wallet.NewWallet(wallet.WalletConfig{
-			DataDir:     cfg.DataDir,
-			Network:     networkToAddressNetwork(chainParams),
-			ChainParams: chainParams,
-		})
+		// Load existing wallet
+		loaded, loadErr := wallet.LoadFromFile(walletPath, "", walletCfg)
+		if loadErr != nil {
+			log.Printf("Warning: failed to load wallet from %s: %v (starting with empty wallet)", walletPath, loadErr)
+			w = wallet.NewWallet(walletCfg)
+		} else {
+			w = loaded
+			log.Printf("Wallet loaded from %s", walletPath)
+		}
+	} else {
+		w = wallet.NewWallet(walletCfg)
+		log.Printf("No wallet file found, starting with empty wallet")
 	}
 
 	// 11. Initialize RPC server
@@ -361,8 +382,8 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		rpc.WithPeerManager(peerMgr),
 		rpc.WithSyncManager(syncMgr),
 		rpc.WithTemplateGenerator(templateGen),
+		rpc.WithWallet(w),
 	)
-	_ = w // Wallet integration with RPC can be added later
 
 	// 12. Start all services
 	log.Printf("Starting services...")
@@ -406,6 +427,15 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	peerMgr.Stop()
 	log.Printf("Peer manager stopped")
+
+	// Save wallet state
+	if w != nil {
+		if err := w.SaveToFile(""); err != nil {
+			log.Printf("Warning: wallet save failed: %v", err)
+		} else {
+			log.Printf("Wallet saved")
+		}
+	}
 
 	if err := utxoSet.Flush(); err != nil {
 		log.Printf("Warning: UTXO flush failed: %v", err)
