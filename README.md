@@ -19,7 +19,8 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Genesis blocks (mainnet, testnet, regtest, signet)
 - [x] Database layer (Pebble backend, chain state, block storage)
 - [x] Block and transaction validation (merkle tree, sigops, BIP34, witness)
-- [ ] P2P message framing and handshake
+- [x] P2P message serialization (version, inv, headers, block, tx, etc)
+- [ ] P2P connection management and handshake
 - [ ] Block header validation and chain sync
 - [ ] Mempool
 - [ ] RPC interface
@@ -49,7 +50,7 @@ internal/
   wire/            protocol message serialization
   consensus/       consensus rules and validation
   script/          script interpreter
-  p2p/             peer-to-peer networking
+  p2p/             peer-to-peer networking and messages
   storage/         database layer (pebble, chain state)
   mempool/         transaction memory pool
   rpc/             JSON-RPC server
