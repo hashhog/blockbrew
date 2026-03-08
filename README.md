@@ -26,7 +26,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Block download and IBD pipeline (parallel download, validation, connection)
 - [x] Chain manager (block connection, reorg handling)
 - [x] UTXO set (caching, script compression, undo data for reorgs)
-- [ ] Mempool
+- [x] Mempool (tx validation, fee tracking, CPFP, orphan pool, eviction)
 - [ ] RPC interface
 - [ ] Wallet
 
