@@ -14,9 +14,9 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Binary serialization (varint, compact size, tx, block)
 - [x] Cryptographic primitives (SHA256, RIPEMD160, secp256k1, ECDSA, Schnorr)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
+- [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
 - [ ] P2P message framing and handshake
 - [ ] Block header validation and chain sync
-- [ ] Script interpreter
 - [ ] UTXO set and block validation
 - [ ] Mempool
 - [ ] RPC interface
