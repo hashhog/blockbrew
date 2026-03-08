@@ -46,6 +46,10 @@ type Config struct {
 	MaxMempool   int64
 	MinRelayFee  float64
 	PrintVersion bool
+
+	// Performance profiling
+	PprofAddr       string
+	ParallelScripts bool
 }
 
 func main() {
@@ -119,6 +123,8 @@ func parseFlags() *Config {
 	flag.Int64Var(&cfg.MaxMempool, "maxmempool", 300, "Maximum mempool size in MB")
 	flag.Float64Var(&cfg.MinRelayFee, "minrelayfee", 0.00001, "Minimum relay fee (BTC/kvB)")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "Print version and exit")
+	flag.StringVar(&cfg.PprofAddr, "pprof", "", "pprof HTTP server address (e.g., localhost:6060)")
+	flag.BoolVar(&cfg.ParallelScripts, "parallelscripts", true, "Enable parallel script validation")
 	flag.Parse()
 
 	if cfg.ListenP2P == "" {
@@ -194,6 +200,11 @@ func networkToAddressNetwork(params *consensus.ChainParams) address.Network {
 }
 
 func run(cfg *Config, chainParams *consensus.ChainParams) error {
+	// 0. Start pprof server if enabled
+	if cfg.PprofAddr != "" {
+		consensus.StartProfileServer(cfg.PprofAddr)
+	}
+
 	// 1. Open the database
 	dbPath := filepath.Join(cfg.DataDir, "chaindata")
 	db, err := storage.NewPebbleDB(dbPath)
@@ -231,12 +242,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	// 5. Initialize chain manager
 	chainMgr := consensus.NewChainManager(consensus.ChainManagerConfig{
-		Params:      chainParams,
-		HeaderIndex: headerIndex,
-		ChainDB:     chainDB,
-		UTXOSet:     utxoSet,
+		Params:          chainParams,
+		HeaderIndex:     headerIndex,
+		ChainDB:         chainDB,
+		UTXOSet:         utxoSet,
+		ParallelScripts: cfg.ParallelScripts,
 	})
-	log.Printf("Chain manager initialized")
+	log.Printf("Chain manager initialized (parallel scripts: %v)", cfg.ParallelScripts)
 
 	// 6. Initialize mempool
 	minRelayFeeRate := int64(cfg.MinRelayFee * 100_000_000 / 1000) // BTC/kvB to sat/kvB
@@ -505,6 +517,8 @@ func printHelp() {
 	fmt.Println("  --maxmempool    Maximum mempool size in MB (default: 300)")
 	fmt.Println("  --minrelayfee   Minimum relay fee in BTC/kvB (default: 0.00001)")
 	fmt.Println("  --version       Print version and exit")
+	fmt.Println("  --pprof         pprof HTTP server address (e.g., localhost:6060)")
+	fmt.Println("  --parallelscripts  Enable parallel script validation (default: true)")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  blockbrew                          Start node on mainnet")
