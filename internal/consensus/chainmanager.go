@@ -9,6 +9,18 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// UndoEntry stores the UTXO that was spent by a transaction input,
+// so it can be restored during DisconnectBlock.
+type UndoEntry struct {
+	Outpoint wire.OutPoint
+	Entry    UTXOEntry
+}
+
+// BlockUndo stores all undo data needed to disconnect a block.
+type BlockUndo struct {
+	SpentUTXOs []UndoEntry // UTXOs spent by this block (in tx order)
+}
+
 // ChainManager maintains the active chain and processes new blocks.
 type ChainManager struct {
 	mu          sync.RWMutex
@@ -18,6 +30,9 @@ type ChainManager struct {
 	utxoSet     UpdatableUTXOView
 	tipNode     *BlockNode
 	tipHeight   int32
+
+	// Undo data for recent blocks (needed for reorgs)
+	undoData map[wire.Hash256]*BlockUndo
 
 	// Flush tracking for IBD
 	blocksSinceFlush int
@@ -55,6 +70,7 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 		headerIndex:     config.HeaderIndex,
 		chainDB:         config.ChainDB,
 		utxoSet:         config.UTXOSet,
+		undoData:        make(map[wire.Hash256]*BlockUndo),
 		flushInterval:   flushInterval,
 		assumeValidHash: config.AssumeValidHash,
 		parallelScripts: config.ParallelScripts,
@@ -144,8 +160,15 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		return fmt.Errorf("block sanity check failed: %w", err)
 	}
 
+	// Collect MTP timestamps from previous 11 blocks
+	var mtp uint32
+	prevTimestamps := cm.collectPrevTimestamps(cm.tipNode, MedianTimeSpan)
+	if len(prevTimestamps) > 0 {
+		mtp = CalcMedianTimePast(prevTimestamps)
+	}
+
 	prevHeader := cm.tipNode.Header
-	err = CheckBlockContext(block, &prevHeader, node.Height, cm.params)
+	err = CheckBlockContext(block, &prevHeader, node.Height, cm.params, mtp)
 	if err != nil {
 		return fmt.Errorf("block context check failed: %w", err)
 	}
@@ -156,8 +179,9 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Calculate expected subsidy
 	subsidy := CalcBlockSubsidy(node.Height)
 
-	// Track total fees
+	// Track total fees and undo data
 	var totalFees int64
+	undo := &BlockUndo{}
 
 	// First pass: validate transaction structure and inputs (not scripts)
 	for i, tx := range block.Transactions {
@@ -178,6 +202,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			return fmt.Errorf("tx %d input validation failed: %w", i, err)
 		}
 		totalFees += fee
+
+		// Record spent UTXOs for undo data before spending
+		for _, in := range tx.TxIn {
+			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
+			if utxo != nil {
+				undo.SpentUTXOs = append(undo.SpentUTXOs, UndoEntry{
+					Outpoint: in.PreviousOutPoint,
+					Entry:    *utxo,
+				})
+			}
+		}
 
 		// Update UTXO view: spend inputs and add outputs
 		cm.utxoSet.SpendTxInputs(tx)
@@ -217,6 +252,9 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		return fmt.Errorf("coinbase value %d exceeds allowed %d (subsidy %d + fees %d)",
 			coinbaseValue, subsidy+totalFees, subsidy, totalFees)
 	}
+
+	// Store undo data for this block
+	cm.undoData[hash] = undo
 
 	// Update chain state
 	cm.tipNode = node
@@ -276,6 +314,17 @@ func (cm *ChainManager) flushUTXOs() {
 	log.Printf("chainmgr: UTXO flush at height %d", cm.tipHeight)
 }
 
+// collectPrevTimestamps collects timestamps from the previous N blocks.
+func (cm *ChainManager) collectPrevTimestamps(node *BlockNode, count int) []uint32 {
+	timestamps := make([]uint32, 0, count)
+	current := node
+	for i := 0; i < count && current != nil; i++ {
+		timestamps = append(timestamps, current.Header.Timestamp)
+		current = current.Parent
+	}
+	return timestamps
+}
+
 // DisconnectBlock undoes the effects of a block (for reorgs).
 func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	cm.mu.Lock()
@@ -292,6 +341,9 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 		return fmt.Errorf("block %s not found for disconnect: %w", hash.String()[:16], err)
 	}
 
+	// Get undo data for this block
+	undo, hasUndo := cm.undoData[hash]
+
 	// Undo UTXO changes in reverse order
 	// First, remove outputs that were created
 	for i := len(block.Transactions) - 1; i >= 0; i-- {
@@ -303,16 +355,16 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 		}
 	}
 
-	// Then, restore inputs that were spent (except coinbase)
-	for i := len(block.Transactions) - 1; i > 0; i-- {
-		tx := block.Transactions[i]
-		for _, in := range tx.TxIn {
-			// We need to get the original UTXO entry from the database
-			// For now, this is a simplified implementation
-			// A full implementation would store undo data when connecting blocks
-			_ = in // placeholder
+	// Then, restore inputs that were spent using undo data
+	if hasUndo {
+		for _, entry := range undo.SpentUTXOs {
+			restored := entry.Entry // copy
+			cm.utxoSet.AddUTXO(entry.Outpoint, &restored)
 		}
 	}
+
+	// Clean up undo data
+	delete(cm.undoData, hash)
 
 	// Update chain state
 	parent := cm.tipNode.Parent
