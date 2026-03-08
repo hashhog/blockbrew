@@ -10,51 +10,29 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 
 ## Current status
 
-- [x] Project scaffold and module layout
 - [x] Binary serialization (varint, compact size, tx, block)
 - [x] Cryptographic primitives (SHA256, RIPEMD160, secp256k1, ECDSA, Schnorr)
 - [x] Address encoding (Base58Check, Bech32, Bech32m)
 - [x] Script interpreter (P2PKH, P2SH, P2WPKH, P2WSH, P2TR)
-- [x] Consensus parameters and difficulty calculations
-- [x] Genesis blocks (mainnet, testnet, regtest, signet)
-- [x] Database layer (Pebble backend, chain state, block storage)
-- [x] Block and transaction validation (merkle tree, sigops, BIP34, witness)
-- [x] P2P message serialization (version, inv, headers, block, tx, etc)
-- [x] P2P connection management and handshake
-- [x] Peer manager (DNS discovery, connection limits, addr relay)
-- [x] Header synchronization (header index, getheaders/headers, checkpoints)
-- [x] Block download and IBD pipeline (parallel download, validation, connection)
+- [x] Consensus rules (difficulty, BIP34/65/66, segwit, taproot)
+- [x] Database layer (Pebble backend, tuned for Bitcoin workloads)
+- [x] Block and transaction validation (merkle tree, sigops, witness)
+- [x] P2P networking (message serialization, peer discovery, sync)
 - [x] Chain manager (block connection, reorg handling)
-- [x] UTXO set (caching, script compression, undo data for reorgs)
-- [x] Mempool (tx validation, fee tracking, CPFP, orphan pool, eviction)
-- [x] Fee estimation (bucketed histogram, decay, smart fee estimates)
-- [x] Block template construction (tx selection, coinbase, witness commitment)
+- [x] UTXO set (L1 cache, script compression, batched flushes)
+- [x] Mempool (fee tracking, CPFP, orphan pool, eviction)
+- [x] Block template construction (tx selection, witness commitment)
 - [x] JSON-RPC server (Bitcoin Core compatible API)
-- [x] HD Wallet (BIP32/BIP39/BIP84, P2WPKH addresses, encrypted storage)
-- [x] CLI and application entry point (flags, graceful shutdown, subcommands)
-- [x] Comprehensive test suite (unit tests, integration tests, benchmarks)
+- [x] HD Wallet (BIP32/BIP39/BIP84, P2WPKH addresses)
+- [x] Performance optimizations (parallel script validation, IBD tuning)
+- [ ] Full mainnet IBD completion
 
 ## Quick start
 
 ```bash
-go build -o blockbrew ./cmd/blockbrew
-./blockbrew --version
-./blockbrew --network regtest --datadir ~/.blockbrew
-```
-
-Or use the Makefile:
-
-```bash
 make build
-make test
-```
-
-Wallet commands:
-
-```bash
-./blockbrew wallet create    # Generate new wallet mnemonic
-./blockbrew wallet import    # Import wallet from mnemonic
-./blockbrew help             # Show all options
+./blockbrew --network regtest --datadir ~/.blockbrew
+./blockbrew wallet create
 ```
 
 ## Project structure
@@ -62,40 +40,31 @@ Wallet commands:
 ```
 cmd/blockbrew/     main entrypoint, CLI, configuration
 internal/
-  address/         address encoding (base58, bech32)
-  crypto/          hashing, keys, ecdsa, schnorr
-  wire/            protocol message serialization
-  consensus/       consensus rules, validation, chain manager
+  consensus/       validation, chain manager, UTXO set, profiling
   script/          script interpreter
-  p2p/             peer-to-peer networking, sync, block download
-  storage/         database layer (pebble, chain state)
-  mempool/         transaction memory pool, fee estimation
+  p2p/             peer-to-peer networking, sync
+  storage/         database layer (pebble)
+  mempool/         transaction pool, fee estimation
   rpc/             JSON-RPC server
-  wallet/          hd wallet (bip32/39/84, signing, storage)
+  wallet/          hd wallet (bip32/39/84)
   mining/          block template and PoW
-  testutil/        test helpers and utilities
-tests/             integration tests
-scripts/           build and test scripts
+  crypto/          hashing, keys, ecdsa, schnorr
+  wire/            protocol serialization
+  address/         address encoding
 ```
 
 ## Running tests
 
 ```bash
-# Run all unit tests
-go test ./...
+make test              # unit tests
+make test-race         # with race detector
+make bench             # benchmarks
+make profile-cpu       # CPU profiling
+```
 
-# Run with race detector
-go test -race ./...
+Enable pprof at runtime:
 
-# Run with coverage
-go test -cover ./...
-
-# Run integration tests
-go test -tags integration ./tests/
-
-# Run benchmarks
-go test -bench=. ./internal/wire/ ./internal/crypto/ ./internal/consensus/ ./internal/storage/
-
-# Or use the test script
-./scripts/test.sh
+```bash
+./blockbrew --pprof localhost:6060
+# then: go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
 ```
