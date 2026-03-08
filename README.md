@@ -18,9 +18,9 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Consensus parameters and difficulty calculations
 - [x] Genesis blocks (mainnet, testnet, regtest, signet)
 - [x] Database layer (Pebble backend, chain state, block storage)
+- [x] Block and transaction validation (merkle tree, sigops, BIP34, witness)
 - [ ] P2P message framing and handshake
 - [ ] Block header validation and chain sync
-- [ ] UTXO set and block validation
 - [ ] Mempool
 - [ ] RPC interface
 - [ ] Wallet
