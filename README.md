@@ -31,12 +31,14 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Block template construction (tx selection, coinbase, witness commitment)
 - [x] JSON-RPC server (Bitcoin Core compatible API)
 - [x] HD Wallet (BIP32/BIP39/BIP84, P2WPKH addresses, encrypted storage)
+- [x] CLI and application entry point (flags, graceful shutdown, subcommands)
 
 ## Quick start
 
 ```bash
 go build -o blockbrew ./cmd/blockbrew
-./blockbrew --datadir ~/.blockbrew
+./blockbrew --version
+./blockbrew --network regtest --datadir ~/.blockbrew
 ```
 
 Or use the Makefile:
@@ -46,10 +48,18 @@ make build
 make test
 ```
 
+Wallet commands:
+
+```bash
+./blockbrew wallet create    # Generate new wallet mnemonic
+./blockbrew wallet import    # Import wallet from mnemonic
+./blockbrew help             # Show all options
+```
+
 ## Project structure
 
 ```
-cmd/blockbrew/     main entrypoint
+cmd/blockbrew/     main entrypoint, CLI, configuration
 internal/
   address/         address encoding (base58, bech32)
   crypto/          hashing, keys, ecdsa, schnorr
