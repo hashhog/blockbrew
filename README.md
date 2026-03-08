@@ -22,7 +22,8 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] P2P message serialization (version, inv, headers, block, tx, etc)
 - [x] P2P connection management and handshake
 - [x] Peer manager (DNS discovery, connection limits, addr relay)
-- [ ] Block header validation and chain sync
+- [x] Header synchronization (header index, getheaders/headers, checkpoints)
+- [ ] Full block download and validation
 - [ ] Mempool
 - [ ] RPC interface
 - [ ] Wallet
