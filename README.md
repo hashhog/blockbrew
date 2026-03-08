@@ -27,6 +27,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Chain manager (block connection, reorg handling)
 - [x] UTXO set (caching, script compression, undo data for reorgs)
 - [x] Mempool (tx validation, fee tracking, CPFP, orphan pool, eviction)
+- [x] Fee estimation (bucketed histogram, decay, smart fee estimates)
 - [ ] RPC interface
 - [ ] Wallet
 
@@ -56,7 +57,7 @@ internal/
   script/          script interpreter
   p2p/             peer-to-peer networking, sync, block download
   storage/         database layer (pebble, chain state)
-  mempool/         transaction memory pool
+  mempool/         transaction memory pool, fee estimation
   rpc/             JSON-RPC server
   wallet/          key management
   mining/          block template and PoW
