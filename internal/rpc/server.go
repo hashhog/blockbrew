@@ -14,6 +14,7 @@ import (
 	"github.com/hashhog/blockbrew/internal/mining"
 	"github.com/hashhog/blockbrew/internal/p2p"
 	"github.com/hashhog/blockbrew/internal/storage"
+	"github.com/hashhog/blockbrew/internal/wallet"
 )
 
 // RPCConfig configures the RPC server.
@@ -34,6 +35,7 @@ type Server struct {
 	peerMgr     *p2p.PeerManager
 	syncMgr     *p2p.SyncManager
 	templateGen *mining.TemplateGenerator
+	wallet      *wallet.Wallet
 	httpServer  *http.Server
 
 	mu        sync.RWMutex
@@ -97,6 +99,13 @@ func WithSyncManager(sm *p2p.SyncManager) ServerOption {
 func WithTemplateGenerator(tg *mining.TemplateGenerator) ServerOption {
 	return func(s *Server) {
 		s.templateGen = tg
+	}
+}
+
+// WithWallet sets the wallet.
+func WithWallet(w *wallet.Wallet) ServerOption {
+	return func(s *Server) {
+		s.wallet = w
 	}
 }
 
@@ -267,6 +276,24 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 	// Fee estimation RPCs
 	case "estimatesmartfee":
 		return s.handleEstimateSmartFee(params)
+
+	// Wallet RPCs
+	case "getnewaddress":
+		return s.handleGetNewAddress()
+	case "getbalance":
+		return s.handleGetBalance()
+	case "listunspent":
+		return s.handleListUnspent()
+	case "sendtoaddress":
+		return s.handleSendToAddress(params)
+	case "walletpassphrase":
+		return s.handleWalletPassphrase(params)
+	case "walletlock":
+		return s.handleWalletLock()
+	case "listtransactions":
+		return s.handleListTransactions(params)
+	case "getwalletinfo":
+		return s.handleGetWalletInfo()
 
 	// Control RPCs
 	case "stop":

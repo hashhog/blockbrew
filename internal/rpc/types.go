@@ -11,6 +11,8 @@ const (
 	RPCErrInternal        = -32603 // Internal JSON-RPC error
 	RPCErrBlockNotFound   = -5     // Block not found
 	RPCErrTxNotFound      = -5     // Transaction not found
+	RPCErrWalletError     = -4     // Unspecified wallet error
+	RPCErrWalletNotFound  = -18    // Wallet not loaded
 	RPCErrDeserialization = -22    // Error parsing or validating structure in raw format
 	RPCErrVerify          = -25    // Error during verification
 	RPCErrInWarmup        = -28    // Client still warming up
@@ -222,6 +224,42 @@ type ChainTip struct {
 	Hash      string `json:"hash"`
 	BranchLen int32  `json:"branchlen"`
 	Status    string `json:"status"`
+}
+
+// WalletInfo represents the result of getwalletinfo.
+type WalletInfo struct {
+	WalletName        string  `json:"walletname"`
+	WalletVersion     int     `json:"walletversion"`
+	Balance           float64 `json:"balance"`
+	UnconfirmedBalance float64 `json:"unconfirmed_balance"`
+	TxCount           int     `json:"txcount"`
+	KeypoolSize       int     `json:"keypoolsize"`
+	PayTxFee          float64 `json:"paytxfee"`
+	Locked            bool    `json:"unlocked_until,omitempty"`
+}
+
+// ListUnspentResult represents an unspent output for listunspent.
+type ListUnspentResult struct {
+	TxID          string  `json:"txid"`
+	Vout          uint32  `json:"vout"`
+	Address       string  `json:"address"`
+	Amount        float64 `json:"amount"`
+	Confirmations int32   `json:"confirmations"`
+	Spendable     bool    `json:"spendable"`
+	Solvable      bool    `json:"solvable"`
+	Safe          bool    `json:"safe"`
+}
+
+// ListTransactionsResult represents a wallet transaction for listtransactions.
+type ListTransactionsResult struct {
+	Address       string  `json:"address"`
+	Category      string  `json:"category"` // "send", "receive"
+	Amount        float64 `json:"amount"`
+	Fee           float64 `json:"fee,omitempty"`
+	Confirmations int32   `json:"confirmations"`
+	TxID          string  `json:"txid"`
+	Time          int64   `json:"time"`
+	BlockHeight   int32   `json:"blockheight,omitempty"`
 }
 
 // BlockTemplateResult represents the result of getblocktemplate.
