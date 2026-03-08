@@ -1,4 +1,20 @@
-*.exe
-*.swp
-.env
+# Binary (root level only)
+/blockbrew
+
+# Test binaries
+*.test
+
+# Vendor directory
 vendor/
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*~
+
+# Environment
+.env
+
+# Windows
+*.exe
