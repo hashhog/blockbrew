@@ -30,7 +30,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Fee estimation (bucketed histogram, decay, smart fee estimates)
 - [x] Block template construction (tx selection, coinbase, witness commitment)
 - [x] JSON-RPC server (Bitcoin Core compatible API)
-- [ ] Wallet
+- [x] HD Wallet (BIP32/BIP39/BIP84, P2WPKH addresses, encrypted storage)
 
 ## Quick start
 
@@ -60,7 +60,7 @@ internal/
   storage/         database layer (pebble, chain state)
   mempool/         transaction memory pool, fee estimation
   rpc/             JSON-RPC server
-  wallet/          key management
+  wallet/          hd wallet (bip32/39/84, signing, storage)
   mining/          block template and PoW
 ```
 
