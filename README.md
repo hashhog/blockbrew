@@ -32,6 +32,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] JSON-RPC server (Bitcoin Core compatible API)
 - [x] HD Wallet (BIP32/BIP39/BIP84, P2WPKH addresses, encrypted storage)
 - [x] CLI and application entry point (flags, graceful shutdown, subcommands)
+- [x] Comprehensive test suite (unit tests, integration tests, benchmarks)
 
 ## Quick start
 
@@ -72,10 +73,29 @@ internal/
   rpc/             JSON-RPC server
   wallet/          hd wallet (bip32/39/84, signing, storage)
   mining/          block template and PoW
+  testutil/        test helpers and utilities
+tests/             integration tests
+scripts/           build and test scripts
 ```
 
 ## Running tests
 
 ```bash
+# Run all unit tests
 go test ./...
+
+# Run with race detector
+go test -race ./...
+
+# Run with coverage
+go test -cover ./...
+
+# Run integration tests
+go test -tags integration ./tests/
+
+# Run benchmarks
+go test -bench=. ./internal/wire/ ./internal/crypto/ ./internal/consensus/ ./internal/storage/
+
+# Or use the test script
+./scripts/test.sh
 ```
