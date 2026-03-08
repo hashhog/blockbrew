@@ -11,7 +11,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 ## Current status
 
 - [x] Project scaffold and module layout
-- [ ] Binary serialization (varint, compact size)
+- [x] Binary serialization (varint, compact size, tx, block)
 - [ ] P2P message framing and handshake
 - [ ] Block header validation and chain sync
 - [ ] Script interpreter
