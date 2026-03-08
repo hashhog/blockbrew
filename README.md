@@ -28,7 +28,8 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] UTXO set (caching, script compression, undo data for reorgs)
 - [x] Mempool (tx validation, fee tracking, CPFP, orphan pool, eviction)
 - [x] Fee estimation (bucketed histogram, decay, smart fee estimates)
-- [ ] RPC interface
+- [x] Block template construction (tx selection, coinbase, witness commitment)
+- [ ] RPC interface (getblocktemplate, mining RPCs)
 - [ ] Wallet
 
 ## Quick start
