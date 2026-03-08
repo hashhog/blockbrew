@@ -29,7 +29,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Mempool (tx validation, fee tracking, CPFP, orphan pool, eviction)
 - [x] Fee estimation (bucketed histogram, decay, smart fee estimates)
 - [x] Block template construction (tx selection, coinbase, witness commitment)
-- [ ] RPC interface (getblocktemplate, mining RPCs)
+- [x] JSON-RPC server (Bitcoin Core compatible API)
 - [ ] Wallet
 
 ## Quick start
