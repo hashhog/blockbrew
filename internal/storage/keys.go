@@ -22,6 +22,9 @@ var (
 	// UTXOPrefix is the prefix for UTXO entries. Key: "U" + outpoint (txid + index)
 	UTXOPrefix = []byte("U")
 
+	// UndoBlockPrefix is the prefix for undo block data. Key: "R" + block_hash
+	UndoBlockPrefix = []byte("R")
+
 	// ChainStateKey stores the current chain tip hash and height.
 	ChainStateKey = []byte("chainstate")
 
@@ -67,5 +70,13 @@ func MakeUTXOKey(outpoint wire.OutPoint) []byte {
 	key[0] = UTXOPrefix[0]
 	copy(key[1:33], outpoint.Hash[:])
 	binary.BigEndian.PutUint32(key[33:], outpoint.Index)
+	return key
+}
+
+// MakeUndoBlockKey creates a key for undo block data.
+func MakeUndoBlockKey(hash wire.Hash256) []byte {
+	key := make([]byte, 1+32)
+	key[0] = UndoBlockPrefix[0]
+	copy(key[1:], hash[:])
 	return key
 }
