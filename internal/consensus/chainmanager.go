@@ -22,6 +22,12 @@ type ChainManager struct {
 	// Flush tracking for IBD
 	blocksSinceFlush int
 	flushInterval    int
+
+	// IBD optimizations
+	assumeValidHash   wire.Hash256 // Skip script validation below this hash
+	assumeValidHeight int32        // Height of assume-valid block
+	isIBD             bool         // Initial Block Download mode
+	parallelScripts   bool         // Use parallel script validation
 }
 
 // ChainManagerConfig configures the chain manager.
@@ -31,6 +37,10 @@ type ChainManagerConfig struct {
 	ChainDB       *storage.ChainDB
 	UTXOSet       UpdatableUTXOView
 	FlushInterval int // Blocks between UTXO flushes (default: 2000)
+
+	// IBD optimizations
+	AssumeValidHash wire.Hash256 // Hash of assume-valid block (skip scripts below this)
+	ParallelScripts bool         // Use parallel script validation (default: true)
 }
 
 // NewChainManager creates a new chain manager.
@@ -41,11 +51,20 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 	}
 
 	cm := &ChainManager{
-		params:        config.Params,
-		headerIndex:   config.HeaderIndex,
-		chainDB:       config.ChainDB,
-		utxoSet:       config.UTXOSet,
-		flushInterval: flushInterval,
+		params:          config.Params,
+		headerIndex:     config.HeaderIndex,
+		chainDB:         config.ChainDB,
+		utxoSet:         config.UTXOSet,
+		flushInterval:   flushInterval,
+		assumeValidHash: config.AssumeValidHash,
+		parallelScripts: config.ParallelScripts,
+		isIBD:           true, // Start in IBD mode
+	}
+
+	// Default to parallel script validation
+	if !config.ParallelScripts {
+		// Only disable if explicitly set (zero value means not set)
+		cm.parallelScripts = true
 	}
 
 	// Initialize tip from genesis if no UTXO set provided
@@ -60,6 +79,15 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 	// Try to load chain state from database
 	if config.ChainDB != nil {
 		cm.loadChainState()
+	}
+
+	// Resolve assume-valid height
+	if !cm.assumeValidHash.IsZero() {
+		avNode := cm.headerIndex.GetNode(cm.assumeValidHash)
+		if avNode != nil {
+			cm.assumeValidHeight = avNode.Height
+			log.Printf("chainmgr: assume-valid block at height %d", cm.assumeValidHeight)
+		}
 	}
 
 	return cm
@@ -131,7 +159,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Track total fees
 	var totalFees int64
 
-	// Validate each transaction
+	// First pass: validate transaction structure and inputs (not scripts)
 	for i, tx := range block.Transactions {
 		// Check transaction sanity
 		if err := CheckTransactionSanity(tx); err != nil {
@@ -151,15 +179,32 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		}
 		totalFees += fee
 
-		// Validate scripts
-		err = ValidateTransactionScripts(tx, cm.utxoSet, flags)
-		if err != nil {
-			return fmt.Errorf("tx %d script validation failed: %w", i, err)
-		}
-
 		// Update UTXO view: spend inputs and add outputs
 		cm.utxoSet.SpendTxInputs(tx)
 		cm.utxoSet.AddTxOutputs(tx, node.Height)
+	}
+
+	// Second pass: validate scripts (can be skipped for assume-valid or parallelized)
+	// Assume-valid optimization: skip script validation for blocks before assume-valid point
+	skipScripts := cm.assumeValidHeight > 0 && node.Height <= cm.assumeValidHeight
+
+	if !skipScripts {
+		if cm.parallelScripts {
+			// Use parallel script validation for better performance
+			if err := ParallelScriptValidation(block, cm.utxoSet, flags); err != nil {
+				return fmt.Errorf("script validation failed: %w", err)
+			}
+		} else {
+			// Sequential script validation
+			for i, tx := range block.Transactions {
+				if i == 0 {
+					continue // Skip coinbase
+				}
+				if err := ValidateTransactionScripts(tx, cm.utxoSet, flags); err != nil {
+					return fmt.Errorf("tx %d script validation failed: %w", i, err)
+				}
+			}
+		}
 	}
 
 	// Verify coinbase value doesn't exceed subsidy + fees
@@ -178,6 +223,12 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	cm.tipHeight = node.Height
 	node.Status |= StatusFullyValid
 
+	// Exit IBD mode when close to current time
+	if cm.isIBD && cm.tipHeight == cm.assumeValidHeight {
+		cm.isIBD = false
+		log.Printf("chainmgr: exiting IBD mode at height %d", cm.tipHeight)
+	}
+
 	// Persist chain state
 	if cm.chainDB != nil {
 		cm.chainDB.SetBlockHeight(node.Height, hash)
@@ -195,6 +246,27 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	}
 
 	return nil
+}
+
+// IsIBD returns whether the node is in Initial Block Download mode.
+func (cm *ChainManager) IsIBD() bool {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.isIBD
+}
+
+// SetIBD sets the IBD mode flag.
+func (cm *ChainManager) SetIBD(isIBD bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.isIBD = isIBD
+}
+
+// SetParallelScripts enables or disables parallel script validation.
+func (cm *ChainManager) SetParallelScripts(parallel bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.parallelScripts = parallel
 }
 
 // flushUTXOs persists the UTXO set to disk.
