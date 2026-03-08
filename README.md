@@ -20,7 +20,7 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] Database layer (Pebble backend, chain state, block storage)
 - [x] Block and transaction validation (merkle tree, sigops, BIP34, witness)
 - [x] P2P message serialization (version, inv, headers, block, tx, etc)
-- [ ] P2P connection management and handshake
+- [x] P2P connection management and handshake
 - [ ] Block header validation and chain sync
 - [ ] Mempool
 - [ ] RPC interface
