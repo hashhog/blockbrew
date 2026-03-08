@@ -20,7 +20,55 @@ const (
 
 	// SyncRetryInterval is how long to wait before retrying sync with a new peer.
 	SyncRetryInterval = 5 * time.Second
+
+	// DefaultDownloadWindow is the max concurrent blocks in flight.
+	DefaultDownloadWindow = 1024
+
+	// MaxBlocksPerPeer is the max concurrent requests per peer.
+	MaxBlocksPerPeer = 16
+
+	// BlockRequestTimeout is the timeout for a single block request.
+	BlockRequestTimeout = 2 * time.Minute
+
+	// BaseStallTimeout is the initial stall detection timeout.
+	BaseStallTimeout = 5 * time.Second
+
+	// MaxStallTimeout is the maximum stall timeout after adaptive backoff.
+	MaxStallTimeout = 64 * time.Second
+
+	// ProgressLogInterval is how often to log IBD progress.
+	ProgressLogInterval = 10 * time.Second
+
+	// UTXOFlushInterval is how many blocks between UTXO flushes during IBD.
+	UTXOFlushInterval = 2000
 )
+
+// BlockDownloadState tracks the download state of a block.
+type BlockDownloadState int
+
+const (
+	BlockDownloadPending BlockDownloadState = iota
+	BlockDownloadInFlight
+	BlockDownloadReceived
+	BlockDownloadValidated
+	BlockDownloadConnected
+)
+
+// blockRequest tracks a pending block download.
+type blockRequest struct {
+	Hash       wire.Hash256
+	Height     int32
+	Peer       *Peer
+	State      BlockDownloadState
+	RequestAt  time.Time
+	RetryCount int
+}
+
+// blockWithRequest pairs a received block with its request metadata.
+type blockWithRequest struct {
+	block *wire.MsgBlock
+	req   *blockRequest
+}
 
 // SyncManager coordinates header and block synchronization with peers.
 type SyncManager struct {
@@ -36,6 +84,34 @@ type SyncManager struct {
 
 	// Callbacks for external integration
 	onSyncComplete func() // Called when header sync completes
+
+	// Block download state
+	blockQueue     []*blockRequest              // Ordered list of blocks to download
+	inflight       map[wire.Hash256]*blockRequest
+	downloadWindow int                           // Max concurrent downloads
+	nextHeight     int32                         // Next height to connect
+
+	// IBD pipeline channels
+	validationChan chan *blockWithRequest
+	connectionChan chan *blockWithRequest
+
+	// Peer stall tracking (adaptive timeout)
+	peerStallTimeout map[string]time.Duration
+
+	// Chain manager for block connection
+	chainMgr ChainConnector
+
+	// IBD state
+	ibdActive bool // True when downloading blocks
+}
+
+// ChainConnector is the interface for connecting blocks to the chain.
+// This allows the sync manager to work with any chain manager implementation.
+type ChainConnector interface {
+	// ConnectBlock validates and connects a block to the active chain.
+	ConnectBlock(block *wire.MsgBlock) error
+	// BestBlock returns the current chain tip hash and height.
+	BestBlock() (wire.Hash256, int32)
 }
 
 // SyncManagerConfig configures the sync manager.
@@ -44,18 +120,31 @@ type SyncManagerConfig struct {
 	HeaderIndex    *consensus.HeaderIndex
 	ChainDB        *storage.ChainDB
 	PeerManager    *PeerManager
+	ChainManager   ChainConnector
 	OnSyncComplete func()
+	DownloadWindow int // Max concurrent block downloads (default: 1024)
 }
 
 // NewSyncManager creates a new sync manager.
 func NewSyncManager(config SyncManagerConfig) *SyncManager {
+	downloadWindow := config.DownloadWindow
+	if downloadWindow <= 0 {
+		downloadWindow = DefaultDownloadWindow
+	}
+
 	return &SyncManager{
-		chainParams:    config.ChainParams,
-		headerIndex:    config.HeaderIndex,
-		chainDB:        config.ChainDB,
-		peerMgr:        config.PeerManager,
-		quit:           make(chan struct{}),
-		onSyncComplete: config.OnSyncComplete,
+		chainParams:      config.ChainParams,
+		headerIndex:      config.HeaderIndex,
+		chainDB:          config.ChainDB,
+		peerMgr:          config.PeerManager,
+		quit:             make(chan struct{}),
+		onSyncComplete:   config.OnSyncComplete,
+		inflight:         make(map[wire.Hash256]*blockRequest),
+		downloadWindow:   downloadWindow,
+		validationChan:   make(chan *blockWithRequest, downloadWindow),
+		connectionChan:   make(chan *blockWithRequest, downloadWindow),
+		peerStallTimeout: make(map[string]time.Duration),
+		chainMgr:         config.ChainManager,
 	}
 }
 
@@ -63,6 +152,12 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 func (sm *SyncManager) Start() {
 	sm.wg.Add(1)
 	go sm.syncHandler()
+
+	// Start IBD pipeline workers
+	sm.wg.Add(3)
+	go sm.validationWorker()
+	go sm.connectionWorker()
+	go sm.progressLogger()
 }
 
 // Stop halts synchronization.
@@ -370,5 +465,458 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 		OnGetHeaders: func(p *Peer, msg *MsgGetHeaders) {
 			sm.HandleGetHeaders(p, msg)
 		},
+		OnBlock: func(p *Peer, msg *MsgBlock) {
+			sm.HandleBlock(p, msg)
+		},
 	}
+}
+
+// ============================================================================
+// IBD (Initial Block Download) Pipeline
+// ============================================================================
+
+// StartBlockDownload begins downloading blocks after headers are synced.
+// This is called automatically when header sync completes.
+func (sm *SyncManager) StartBlockDownload() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.ibdActive {
+		return
+	}
+
+	// Determine where to start downloading from
+	startHeight := int32(0)
+	if sm.chainMgr != nil {
+		_, startHeight = sm.chainMgr.BestBlock()
+	}
+
+	// Build the block queue from headers
+	bestTip := sm.headerIndex.BestTip()
+	if bestTip == nil || bestTip.Height <= startHeight {
+		log.Printf("sync: no blocks to download, already at height %d", startHeight)
+		return
+	}
+
+	sm.blockQueue = make([]*blockRequest, 0, bestTip.Height-startHeight)
+	for height := startHeight + 1; height <= bestTip.Height; height++ {
+		node := bestTip.GetAncestor(height)
+		if node == nil {
+			continue
+		}
+		sm.blockQueue = append(sm.blockQueue, &blockRequest{
+			Hash:   node.Hash,
+			Height: height,
+			State:  BlockDownloadPending,
+		})
+	}
+
+	sm.nextHeight = startHeight + 1
+	sm.ibdActive = true
+
+	log.Printf("sync: starting block download from height %d to %d (%d blocks)",
+		startHeight+1, bestTip.Height, len(sm.blockQueue))
+
+	// Start requesting blocks
+	go sm.blockDownloadLoop()
+}
+
+// blockDownloadLoop is the main loop for requesting blocks during IBD.
+func (sm *SyncManager) blockDownloadLoop() {
+	requestTicker := time.NewTicker(100 * time.Millisecond)
+	defer requestTicker.Stop()
+
+	staleTicker := time.NewTicker(time.Second)
+	defer staleTicker.Stop()
+
+	for {
+		select {
+		case <-requestTicker.C:
+			sm.requestBlocks()
+
+		case <-staleTicker.C:
+			sm.checkStaleRequests()
+
+		case <-sm.quit:
+			return
+		}
+
+		// Check if IBD is complete
+		sm.mu.RLock()
+		done := len(sm.blockQueue) == 0 && len(sm.inflight) == 0
+		sm.mu.RUnlock()
+
+		if done {
+			log.Printf("sync: IBD complete")
+			return
+		}
+	}
+}
+
+// requestBlocks sends block requests to peers up to the download window.
+func (sm *SyncManager) requestBlocks() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	if sm.peerMgr == nil {
+		return
+	}
+
+	// Count in-flight requests per peer
+	peerInflight := make(map[string]int)
+	for _, req := range sm.inflight {
+		if req.Peer != nil {
+			peerInflight[req.Peer.Address()]++
+		}
+	}
+
+	// Get connected peers
+	peers := sm.peerMgr.ConnectedPeers()
+	if len(peers) == 0 {
+		return
+	}
+
+	// Batch getdata requests per peer
+	peerRequests := make(map[*Peer][]*InvVect)
+
+	for _, req := range sm.blockQueue {
+		if req.State != BlockDownloadPending {
+			continue
+		}
+		if len(sm.inflight) >= sm.downloadWindow {
+			break
+		}
+
+		// Find a peer that can serve this block
+		var selectedPeer *Peer
+		for _, peer := range peers {
+			if !peer.IsConnected() {
+				continue
+			}
+			addr := peer.Address()
+			if peerInflight[addr] >= MaxBlocksPerPeer {
+				continue
+			}
+			selectedPeer = peer
+			break
+		}
+
+		if selectedPeer == nil {
+			// All peers are at max capacity
+			break
+		}
+
+		// Mark request as in-flight
+		req.Peer = selectedPeer
+		req.State = BlockDownloadInFlight
+		req.RequestAt = time.Now()
+		sm.inflight[req.Hash] = req
+		peerInflight[selectedPeer.Address()]++
+
+		// Add to batch for this peer
+		peerRequests[selectedPeer] = append(peerRequests[selectedPeer], &InvVect{
+			Type: InvTypeWitnessBlock,
+			Hash: req.Hash,
+		})
+	}
+
+	// Send batched getdata requests
+	for peer, invList := range peerRequests {
+		if len(invList) > 0 {
+			peer.SendMessage(&MsgGetData{InvList: invList})
+		}
+	}
+}
+
+// checkStaleRequests detects and handles timed-out block requests.
+func (sm *SyncManager) checkStaleRequests() {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	now := time.Now()
+	for hash, req := range sm.inflight {
+		// Get the adaptive timeout for this peer
+		timeout := sm.getStallTimeout(req.Peer)
+
+		if now.Sub(req.RequestAt) > timeout {
+			// Request timed out
+			log.Printf("sync: block %s timed out from %s (retry %d)",
+				hash.String()[:16], req.Peer.Address(), req.RetryCount)
+
+			// Increase timeout for this peer (adaptive backoff)
+			sm.increaseStallTimeout(req.Peer)
+
+			// Reset request for retry
+			delete(sm.inflight, hash)
+			req.State = BlockDownloadPending
+			req.Peer = nil
+			req.RetryCount++
+		}
+	}
+}
+
+// getStallTimeout returns the current stall timeout for a peer.
+func (sm *SyncManager) getStallTimeout(peer *Peer) time.Duration {
+	if peer == nil {
+		return BlockRequestTimeout
+	}
+	timeout, ok := sm.peerStallTimeout[peer.Address()]
+	if !ok {
+		return BaseStallTimeout
+	}
+	return timeout
+}
+
+// increaseStallTimeout doubles the timeout for a peer (adaptive backoff).
+func (sm *SyncManager) increaseStallTimeout(peer *Peer) {
+	if peer == nil {
+		return
+	}
+	addr := peer.Address()
+	current := sm.getStallTimeout(peer)
+	newTimeout := current * 2
+	if newTimeout > MaxStallTimeout {
+		newTimeout = MaxStallTimeout
+	}
+	sm.peerStallTimeout[addr] = newTimeout
+}
+
+// decreaseStallTimeout reduces timeout on success (decay toward base).
+func (sm *SyncManager) decreaseStallTimeout(peer *Peer) {
+	if peer == nil {
+		return
+	}
+	addr := peer.Address()
+	current, ok := sm.peerStallTimeout[addr]
+	if !ok || current <= BaseStallTimeout {
+		return
+	}
+	// Decay by 25%
+	newTimeout := current * 3 / 4
+	if newTimeout < BaseStallTimeout {
+		newTimeout = BaseStallTimeout
+	}
+	sm.peerStallTimeout[addr] = newTimeout
+}
+
+// HandleBlock processes a received block message.
+func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
+	hash := msg.Block.Header.BlockHash()
+
+	sm.mu.Lock()
+	req, ok := sm.inflight[hash]
+	if !ok {
+		sm.mu.Unlock()
+		// Unsolicited block - ignore during IBD
+		return
+	}
+
+	delete(sm.inflight, hash)
+	req.State = BlockDownloadReceived
+
+	// Reduce stall timeout for successful peer
+	sm.decreaseStallTimeout(peer)
+	sm.mu.Unlock()
+
+	// Store block to database
+	if sm.chainDB != nil {
+		if err := sm.chainDB.StoreBlock(hash, msg.Block); err != nil {
+			log.Printf("sync: failed to store block %s: %v", hash.String()[:16], err)
+		}
+	}
+
+	// Send to validation pipeline
+	select {
+	case sm.validationChan <- &blockWithRequest{block: msg.Block, req: req}:
+	case <-sm.quit:
+	}
+}
+
+// validationWorker validates blocks from the validation channel.
+func (sm *SyncManager) validationWorker() {
+	defer sm.wg.Done()
+
+	for {
+		select {
+		case bwr := <-sm.validationChan:
+			if bwr == nil {
+				continue
+			}
+
+			// Basic sanity check
+			err := consensus.CheckBlockSanity(bwr.block, sm.chainParams.PowLimit)
+			if err != nil {
+				log.Printf("sync: block %s failed sanity check: %v",
+					bwr.req.Hash.String()[:16], err)
+				// Mark as invalid in header index
+				node := sm.headerIndex.GetNode(bwr.req.Hash)
+				if node != nil {
+					node.Status |= consensus.StatusInvalid
+				}
+				continue
+			}
+
+			bwr.req.State = BlockDownloadValidated
+
+			// Send to connection pipeline
+			select {
+			case sm.connectionChan <- bwr:
+			case <-sm.quit:
+				return
+			}
+
+		case <-sm.quit:
+			return
+		}
+	}
+}
+
+// connectionWorker connects validated blocks to the chain in order.
+func (sm *SyncManager) connectionWorker() {
+	defer sm.wg.Done()
+
+	// Buffer for out-of-order blocks
+	pending := make(map[int32]*blockWithRequest)
+
+	for {
+		select {
+		case bwr := <-sm.connectionChan:
+			if bwr == nil {
+				continue
+			}
+
+			// Add to pending
+			pending[bwr.req.Height] = bwr
+
+			// Try to connect blocks in order
+			sm.connectPendingBlocks(pending)
+
+		case <-sm.quit:
+			return
+		}
+	}
+}
+
+// connectPendingBlocks connects any blocks that are ready in order.
+func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest) {
+	sm.mu.Lock()
+	nextHeight := sm.nextHeight
+	sm.mu.Unlock()
+
+	connected := 0
+	for {
+		bwr, ok := pending[nextHeight]
+		if !ok {
+			break
+		}
+
+		// Connect the block
+		if sm.chainMgr != nil {
+			err := sm.chainMgr.ConnectBlock(bwr.block)
+			if err != nil {
+				log.Printf("sync: failed to connect block %d: %v", nextHeight, err)
+				// Mark as invalid
+				node := sm.headerIndex.GetNode(bwr.req.Hash)
+				if node != nil {
+					node.Status |= consensus.StatusInvalid
+				}
+				delete(pending, nextHeight)
+				nextHeight++
+				continue
+			}
+		}
+
+		bwr.req.State = BlockDownloadConnected
+		delete(pending, nextHeight)
+
+		// Remove from queue
+		sm.mu.Lock()
+		sm.removeFromQueue(bwr.req.Hash)
+		sm.nextHeight = nextHeight + 1
+		sm.mu.Unlock()
+
+		nextHeight++
+		connected++
+	}
+
+	if connected > 0 {
+		sm.mu.Lock()
+		sm.nextHeight = nextHeight
+		sm.mu.Unlock()
+	}
+}
+
+// removeFromQueue removes a block request from the queue.
+func (sm *SyncManager) removeFromQueue(hash wire.Hash256) {
+	for i, req := range sm.blockQueue {
+		if req.Hash == hash {
+			sm.blockQueue = append(sm.blockQueue[:i], sm.blockQueue[i+1:]...)
+			return
+		}
+	}
+}
+
+// progressLogger logs IBD progress periodically.
+func (sm *SyncManager) progressLogger() {
+	defer sm.wg.Done()
+
+	ticker := time.NewTicker(ProgressLogInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			sm.mu.RLock()
+			active := sm.ibdActive
+			queueLen := len(sm.blockQueue)
+			inflightLen := len(sm.inflight)
+			nextHeight := sm.nextHeight
+			sm.mu.RUnlock()
+
+			if !active {
+				continue
+			}
+
+			tipHeight := sm.headerIndex.BestHeight()
+			if tipHeight <= 0 {
+				continue
+			}
+
+			// Calculate progress
+			var height int32
+			if sm.chainMgr != nil {
+				_, height = sm.chainMgr.BestBlock()
+			} else {
+				height = nextHeight - 1
+			}
+
+			pct := float64(height) / float64(tipHeight) * 100
+			log.Printf("sync: IBD progress %d/%d (%.1f%%) [queue=%d, inflight=%d]",
+				height, tipHeight, pct, queueLen, inflightLen)
+
+		case <-sm.quit:
+			return
+		}
+	}
+}
+
+// IsIBDActive returns true if initial block download is in progress.
+func (sm *SyncManager) IsIBDActive() bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return sm.ibdActive
+}
+
+// BlocksInFlight returns the number of blocks currently being downloaded.
+func (sm *SyncManager) BlocksInFlight() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.inflight)
+}
+
+// BlockQueueLength returns the number of blocks waiting to be downloaded.
+func (sm *SyncManager) BlockQueueLength() int {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	return len(sm.blockQueue)
 }
