@@ -605,3 +605,300 @@ func TestHeaderSyncFlow(t *testing.T) {
 	close(peer.quit)
 	wg.Wait()
 }
+
+// ============================================================================
+// Block Download (IBD) Tests
+// ============================================================================
+
+func TestBlockDownloadStateConstants(t *testing.T) {
+	// Verify state constants are defined correctly
+	if BlockDownloadPending != 0 {
+		t.Errorf("BlockDownloadPending = %d, want 0", BlockDownloadPending)
+	}
+	if BlockDownloadInFlight != 1 {
+		t.Errorf("BlockDownloadInFlight = %d, want 1", BlockDownloadInFlight)
+	}
+	if BlockDownloadReceived != 2 {
+		t.Errorf("BlockDownloadReceived = %d, want 2", BlockDownloadReceived)
+	}
+}
+
+func TestSyncManagerBlockDownloadConfig(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	// Test default download window
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	if sm.downloadWindow != DefaultDownloadWindow {
+		t.Errorf("download window = %d, want %d", sm.downloadWindow, DefaultDownloadWindow)
+	}
+
+	// Test custom download window
+	sm2 := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		DownloadWindow: 512,
+	})
+
+	if sm2.downloadWindow != 512 {
+		t.Errorf("custom download window = %d, want 512", sm2.downloadWindow)
+	}
+}
+
+func TestSyncManagerHandleBlock(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	// Create a mock peer
+	peer := createMockPeer("1.2.3.4:8333", 100)
+
+	// Create a test block
+	genesis := idx.Genesis()
+	header := createTestBlockHeader(genesis.Hash, genesis.Header.Timestamp+600, 1)
+	blockHash := header.BlockHash()
+
+	// Add header to index
+	_, err := idx.AddHeader(header)
+	if err != nil {
+		t.Fatalf("failed to add header: %v", err)
+	}
+
+	// Create block request in inflight
+	sm.mu.Lock()
+	sm.inflight[blockHash] = &blockRequest{
+		Hash:      blockHash,
+		Height:    1,
+		Peer:      peer,
+		State:     BlockDownloadInFlight,
+		RequestAt: time.Now(),
+	}
+	sm.mu.Unlock()
+
+	// Create the block message
+	block := &wire.MsgBlock{
+		Header: header,
+		Transactions: []*wire.MsgTx{
+			{
+				Version: 1,
+				TxIn: []*wire.TxIn{
+					{
+						PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+						SignatureScript:  []byte{0x01, 0x01},
+						Sequence:         0xFFFFFFFF,
+					},
+				},
+				TxOut: []*wire.TxOut{
+					{Value: 5000000000, PkScript: []byte{0x51}},
+				},
+			},
+		},
+	}
+
+	// Handle the block
+	msgBlock := &MsgBlock{Block: block}
+	sm.HandleBlock(peer, msgBlock)
+
+	// Verify request was removed from inflight
+	sm.mu.RLock()
+	_, stillInflight := sm.inflight[blockHash]
+	sm.mu.RUnlock()
+
+	if stillInflight {
+		t.Error("block should be removed from inflight after handling")
+	}
+}
+
+func TestSyncManagerIgnoresUnsolicitedBlock(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	peer := createMockPeer("1.2.3.4:8333", 100)
+
+	// Create a block that wasn't requested
+	block := &wire.MsgBlock{
+		Header: createTestBlockHeader(params.GenesisHash, params.GenesisBlock.Header.Timestamp+600, 1),
+		Transactions: []*wire.MsgTx{
+			{
+				Version: 1,
+				TxIn: []*wire.TxIn{
+					{
+						PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+						SignatureScript:  []byte{0x01, 0x01},
+						Sequence:         0xFFFFFFFF,
+					},
+				},
+				TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x51}}},
+			},
+		},
+	}
+
+	msgBlock := &MsgBlock{Block: block}
+
+	// Should not panic when receiving unsolicited block
+	sm.HandleBlock(peer, msgBlock)
+
+	// No crash means success
+}
+
+func TestStallTimeoutAdaptive(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	peer := createMockPeer("1.2.3.4:8333", 100)
+
+	// Initial timeout should be base
+	timeout := sm.getStallTimeout(peer)
+	if timeout != BaseStallTimeout {
+		t.Errorf("initial timeout = %v, want %v", timeout, BaseStallTimeout)
+	}
+
+	// Increase timeout
+	sm.increaseStallTimeout(peer)
+	timeout = sm.getStallTimeout(peer)
+	expectedTimeout := BaseStallTimeout * 2
+	if timeout != expectedTimeout {
+		t.Errorf("after increase timeout = %v, want %v", timeout, expectedTimeout)
+	}
+
+	// Increase again
+	sm.increaseStallTimeout(peer)
+	timeout = sm.getStallTimeout(peer)
+	expectedTimeout = BaseStallTimeout * 4
+	if timeout != expectedTimeout {
+		t.Errorf("after second increase timeout = %v, want %v", timeout, expectedTimeout)
+	}
+
+	// Should cap at MaxStallTimeout
+	for i := 0; i < 10; i++ {
+		sm.increaseStallTimeout(peer)
+	}
+	timeout = sm.getStallTimeout(peer)
+	if timeout > MaxStallTimeout {
+		t.Errorf("timeout %v exceeds max %v", timeout, MaxStallTimeout)
+	}
+
+	// Decrease should work
+	sm.decreaseStallTimeout(peer)
+	newTimeout := sm.getStallTimeout(peer)
+	if newTimeout >= timeout {
+		t.Errorf("decrease should reduce timeout: %v >= %v", newTimeout, timeout)
+	}
+}
+
+func TestBlockQueueLength(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	// Initially queue should be empty
+	if sm.BlockQueueLength() != 0 {
+		t.Errorf("initial queue length = %d, want 0", sm.BlockQueueLength())
+	}
+
+	// Add some items to queue
+	sm.mu.Lock()
+	sm.blockQueue = []*blockRequest{
+		{Hash: wire.Hash256{1}, Height: 1, State: BlockDownloadPending},
+		{Hash: wire.Hash256{2}, Height: 2, State: BlockDownloadPending},
+		{Hash: wire.Hash256{3}, Height: 3, State: BlockDownloadPending},
+	}
+	sm.mu.Unlock()
+
+	if sm.BlockQueueLength() != 3 {
+		t.Errorf("queue length = %d, want 3", sm.BlockQueueLength())
+	}
+}
+
+func TestBlocksInFlight(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	// Initially should be empty
+	if sm.BlocksInFlight() != 0 {
+		t.Errorf("initial inflight = %d, want 0", sm.BlocksInFlight())
+	}
+
+	// Add some inflight requests
+	sm.mu.Lock()
+	sm.inflight[wire.Hash256{1}] = &blockRequest{Hash: wire.Hash256{1}}
+	sm.inflight[wire.Hash256{2}] = &blockRequest{Hash: wire.Hash256{2}}
+	sm.mu.Unlock()
+
+	if sm.BlocksInFlight() != 2 {
+		t.Errorf("inflight = %d, want 2", sm.BlocksInFlight())
+	}
+}
+
+func TestCreatePeerListenersIncludesOnBlock(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	listeners := sm.CreatePeerListeners()
+
+	if listeners.OnBlock == nil {
+		t.Error("OnBlock listener should be set")
+	}
+	if listeners.OnHeaders == nil {
+		t.Error("OnHeaders listener should be set")
+	}
+	if listeners.OnGetHeaders == nil {
+		t.Error("OnGetHeaders listener should be set")
+	}
+}
+
+func TestIsIBDActive(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	// Initially IBD should not be active
+	if sm.IsIBDActive() {
+		t.Error("IBD should not be active initially")
+	}
+
+	// Set IBD active
+	sm.mu.Lock()
+	sm.ibdActive = true
+	sm.mu.Unlock()
+
+	if !sm.IsIBDActive() {
+		t.Error("IBD should be active after setting")
+	}
+}
