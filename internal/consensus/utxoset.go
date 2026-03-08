@@ -19,6 +19,22 @@ var (
 // This corresponds roughly to 450 MB of memory usage.
 const DefaultCacheMaxEntries = 5_000_000
 
+// DefaultCacheMaxBytes is the maximum approximate cache size in bytes (450MB).
+const DefaultCacheMaxBytes = 450 * 1024 * 1024
+
+// IBDFlushInterval is the number of blocks between forced UTXO flushes during IBD.
+// Larger values improve IBD performance but use more memory.
+const IBDFlushInterval = 500
+
+// UTXOCacheStats tracks cache performance metrics.
+type UTXOCacheStats struct {
+	Hits       uint64 // Cache hits
+	Misses     uint64 // Cache misses (required DB lookup)
+	Flushes    uint64 // Number of flush operations
+	CacheSize  int    // Current cache entry count
+	CacheBytes int64  // Approximate memory usage
+}
+
 // UTXOSet manages the set of unspent transaction outputs with caching and persistence.
 type UTXOSet struct {
 	mu    sync.RWMutex
@@ -27,15 +43,29 @@ type UTXOSet struct {
 	dirty map[wire.OutPoint]bool        // Modified entries needing flush
 	// Track deletions separately since deleted entries should be flushed too
 	deleted map[wire.OutPoint]bool
+
+	// Performance tracking
+	cacheBytes   int64  // Approximate memory usage of cache
+	maxCacheBytes int64 // Maximum cache size in bytes
+	hits         uint64 // Cache hits
+	misses       uint64 // Cache misses
+	flushes      uint64 // Number of flush operations
+	blocksSinceFlush int // Blocks connected since last flush
 }
 
 // NewUTXOSet creates a new UTXO set backed by the given database.
 func NewUTXOSet(db *storage.ChainDB) *UTXOSet {
+	return NewUTXOSetWithMaxCache(db, DefaultCacheMaxBytes)
+}
+
+// NewUTXOSetWithMaxCache creates a UTXO set with a custom cache size limit.
+func NewUTXOSetWithMaxCache(db *storage.ChainDB, maxCacheBytes int64) *UTXOSet {
 	return &UTXOSet{
-		db:      db,
-		cache:   make(map[wire.OutPoint]*UTXOEntry),
-		dirty:   make(map[wire.OutPoint]bool),
-		deleted: make(map[wire.OutPoint]bool),
+		db:            db,
+		cache:         make(map[wire.OutPoint]*UTXOEntry),
+		dirty:         make(map[wire.OutPoint]bool),
+		deleted:       make(map[wire.OutPoint]bool),
+		maxCacheBytes: maxCacheBytes,
 	}
 }
 
@@ -51,6 +81,7 @@ func (u *UTXOSet) GetUTXO(outpoint wire.OutPoint) *UTXOEntry {
 
 	// Check cache first
 	if entry, ok := u.cache[outpoint]; ok {
+		u.hits++
 		u.mu.RUnlock()
 		return entry
 	}
@@ -75,15 +106,29 @@ func (u *UTXOSet) GetUTXO(outpoint wire.OutPoint) *UTXOEntry {
 	// Cache the entry for future lookups
 	u.mu.Lock()
 	u.cache[outpoint] = entry
+	u.cacheBytes += estimateEntrySize(entry)
+	u.misses++
 	u.mu.Unlock()
 
 	return entry
+}
+
+// estimateEntrySize estimates the memory usage of a UTXO entry in bytes.
+// Includes: OutPoint (36 bytes), Amount (8), PkScript (len + header), Height (4), IsCoinbase (1), map overhead (~100)
+func estimateEntrySize(entry *UTXOEntry) int64 {
+	return int64(36 + 8 + len(entry.PkScript) + 4 + 1 + 100)
 }
 
 // AddUTXO adds a new UTXO to the set.
 func (u *UTXOSet) AddUTXO(outpoint wire.OutPoint, entry *UTXOEntry) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+
+	// Track size change
+	if existing, ok := u.cache[outpoint]; ok {
+		u.cacheBytes -= estimateEntrySize(existing)
+	}
+	u.cacheBytes += estimateEntrySize(entry)
 
 	u.cache[outpoint] = entry
 	u.dirty[outpoint] = true
@@ -95,6 +140,11 @@ func (u *UTXOSet) AddUTXO(outpoint wire.OutPoint, entry *UTXOEntry) {
 func (u *UTXOSet) SpendUTXO(outpoint wire.OutPoint) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+
+	// Track size change
+	if existing, ok := u.cache[outpoint]; ok {
+		u.cacheBytes -= estimateEntrySize(existing)
+	}
 
 	delete(u.cache, outpoint)
 	delete(u.dirty, outpoint)
@@ -113,7 +163,8 @@ func (u *UTXOSet) SpendUTXOChecked(outpoint wire.OutPoint) error {
 	}
 
 	// Check if in cache
-	if _, ok := u.cache[outpoint]; ok {
+	if existing, ok := u.cache[outpoint]; ok {
+		u.cacheBytes -= estimateEntrySize(existing)
 		delete(u.cache, outpoint)
 		delete(u.dirty, outpoint)
 		u.deleted[outpoint] = true
@@ -170,6 +221,15 @@ func (u *UTXOSet) Flush() error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	return u.flushLocked()
+}
+
+// flushLocked performs flush while holding the lock.
+func (u *UTXOSet) flushLocked() error {
+	if u.db == nil {
+		return nil
+	}
+
 	batch := u.db.DB().NewBatch()
 
 	// Write all dirty entries
@@ -195,8 +255,86 @@ func (u *UTXOSet) Flush() error {
 	// Clear dirty and deleted tracking
 	u.dirty = make(map[wire.OutPoint]bool)
 	u.deleted = make(map[wire.OutPoint]bool)
+	u.flushes++
+	u.blocksSinceFlush = 0
 
 	return nil
+}
+
+// MaybeFlush flushes if cache exceeds size limit or after forceAfterBlocks blocks.
+// This is used during IBD to control memory usage while batching writes.
+func (u *UTXOSet) MaybeFlush(forceAfterBlocks int) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	u.blocksSinceFlush++
+
+	// Flush if cache exceeds size limit or we've connected enough blocks
+	if u.cacheBytes > u.maxCacheBytes || u.blocksSinceFlush >= forceAfterBlocks {
+		return u.flushLocked()
+	}
+	return nil
+}
+
+// MaybeFlushIBD is a convenience method for IBD flushing using default interval.
+func (u *UTXOSet) MaybeFlushIBD() error {
+	return u.MaybeFlush(IBDFlushInterval)
+}
+
+// PreloadUTXOs loads multiple UTXOs from the database into cache.
+// This is used to batch database reads before block validation.
+func (u *UTXOSet) PreloadUTXOs(outpoints []wire.OutPoint) {
+	if u.db == nil {
+		return
+	}
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	for _, op := range outpoints {
+		// Skip if already cached or deleted
+		if _, ok := u.cache[op]; ok {
+			continue
+		}
+		if u.deleted[op] {
+			continue
+		}
+
+		key := storage.MakeUTXOKey(op)
+		data, err := u.db.DB().Get(key)
+		if err != nil || data == nil {
+			continue
+		}
+
+		entry, err := DeserializeUTXOEntry(data)
+		if err != nil {
+			continue
+		}
+
+		u.cache[op] = entry
+		u.cacheBytes += estimateEntrySize(entry)
+	}
+}
+
+// Stats returns current cache statistics.
+func (u *UTXOSet) Stats() UTXOCacheStats {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+
+	return UTXOCacheStats{
+		Hits:       u.hits,
+		Misses:     u.misses,
+		Flushes:    u.flushes,
+		CacheSize:  len(u.cache),
+		CacheBytes: u.cacheBytes,
+	}
+}
+
+// CacheBytes returns the approximate memory usage of the cache.
+func (u *UTXOSet) CacheBytes() int64 {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.cacheBytes
 }
 
 // FlushBatch writes all dirty entries using a provided batch (for atomic block connection).
@@ -236,7 +374,11 @@ func (u *UTXOSet) Size() int {
 
 // maybeFlush flushes if cache exceeds the maximum size.
 func (u *UTXOSet) maybeFlush() error {
-	if len(u.cache) > DefaultCacheMaxEntries {
+	u.mu.RLock()
+	shouldFlush := len(u.cache) > DefaultCacheMaxEntries || u.cacheBytes > u.maxCacheBytes
+	u.mu.RUnlock()
+
+	if shouldFlush {
 		return u.Flush()
 	}
 	return nil
