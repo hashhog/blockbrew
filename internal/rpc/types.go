@@ -262,6 +262,31 @@ type ListTransactionsResult struct {
 	BlockHeight   int32   `json:"blockheight,omitempty"`
 }
 
+// TxOutResult represents the result of gettxout.
+type TxOutResult struct {
+	BestBlock     string       `json:"bestblock"`
+	Confirmations int32        `json:"confirmations"`
+	Value         float64      `json:"value"`
+	ScriptPubKey  ScriptPubKey `json:"scriptPubKey"`
+	Coinbase      bool         `json:"coinbase"`
+}
+
+// MiningInfo represents the result of getmininginfo.
+type MiningInfo struct {
+	Blocks       int32   `json:"blocks"`
+	Difficulty   float64 `json:"difficulty"`
+	NetworkHash  float64 `json:"networkhashps"`
+	PooledTx     int     `json:"pooledtx"`
+	Chain        string  `json:"chain"`
+}
+
+// DecodeScriptResult represents the result of decodescript.
+type DecodeScriptResult struct {
+	Asm  string `json:"asm"`
+	Type string `json:"type"`
+	P2SH string `json:"p2sh,omitempty"`
+}
+
 // BlockTemplateResult represents the result of getblocktemplate.
 type BlockTemplateResult struct {
 	Version                  int32                 `json:"version"`
