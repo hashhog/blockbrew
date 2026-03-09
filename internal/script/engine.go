@@ -31,10 +31,12 @@ var (
 	ErrWitnessProgram       = errors.New("invalid witness program")
 	ErrWitnessMismatch      = errors.New("witness data mismatch")
 	ErrWitnessMalleated     = errors.New("witness malleated")
-	ErrTaprootSigVerify     = errors.New("taproot signature verification failed")
-	ErrMinimalData          = errors.New("non-minimal data push")
-	ErrCLTVFailed           = errors.New("OP_CHECKLOCKTIMEVERIFY failed")
-	ErrCSVFailed            = errors.New("OP_CHECKSEQUENCEVERIFY failed")
+	ErrTaprootSigVerify         = errors.New("taproot signature verification failed")
+	ErrMinimalData              = errors.New("non-minimal data push")
+	ErrCLTVFailed               = errors.New("OP_CHECKLOCKTIMEVERIFY failed")
+	ErrCSVFailed                = errors.New("OP_CHECKSEQUENCEVERIFY failed")
+	ErrTapscriptCheckMultiSig   = errors.New("OP_CHECKMULTISIG(VERIFY) not allowed in tapscript")
+	ErrTaprootControlBlockSize  = errors.New("taproot control block wrong size")
 )
 
 // ScriptFlags control which script validation rules are enabled.
@@ -168,6 +170,10 @@ func (e *Engine) Execute() error {
 
 		if witnessVersion >= 0 && (e.flags&ScriptVerifyWitness != 0) {
 			// P2SH-wrapped segwit
+			// Fix #7: P2SH-wrapped witness v1+ is not executed (BIP341).
+			if witnessVersion >= 1 {
+				return nil
+			}
 			if err := e.executeWitnessProgram(witnessVersion, witnessProgram, txIn.Witness); err != nil {
 				return err
 			}
@@ -343,7 +349,10 @@ func (e *Engine) executeTaprootKeyPath(pubKey []byte, sig []byte, annex []byte) 
 		CodeSepPos: e.codesepPos,
 	}
 	if annex != nil {
-		annexHash := crypto.SHA256Hash(annex)
+		// Bitcoin Core serializes the annex with its compact-size length prefix before hashing
+		var annexBuf bytes.Buffer
+		wire.WriteVarBytes(&annexBuf, annex)
+		annexHash := crypto.SHA256Hash(annexBuf.Bytes())
 		opts.AnnexHash = &annexHash
 	}
 
@@ -374,8 +383,8 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	stackItems := witness[:len(witness)-2]
 
 	// Control block: [leaf version + parity] [internal pubkey (32)] [merkle path (32*n)]
-	if len(controlBlock) < 33 || (len(controlBlock)-33)%32 != 0 {
-		return ErrWitnessProgram
+	if len(controlBlock) < 33 || len(controlBlock) > 4129 || (len(controlBlock)-33)%32 != 0 {
+		return ErrTaprootControlBlockSize
 	}
 
 	leafVersionAndParity := controlBlock[0]
@@ -404,6 +413,12 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 		return ErrWitnessProgram
 	}
 
+	// Fix #6: Only execute as tapscript if leaf version is 0xc0.
+	// Unknown leaf versions succeed unconditionally.
+	if leafVersion != 0xc0 {
+		return nil
+	}
+
 	// Set up stack and execute the script
 	e.stack = NewStack()
 	for i := len(stackItems) - 1; i >= 0; i-- {
@@ -413,14 +428,20 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	// Set leaf hash for sighash computation
 	e.codesepPos = 0xFFFFFFFF
 
-	// Initialize tapscript signature validation weight budget (BIP342).
-	// Budget = 50 + total witness size in bytes for this input.
-	witnessSize := 0
+	// Fix #9: Initialize tapscript signature validation weight budget (BIP342).
+	// Budget = VALIDATION_WEIGHT_OFFSET (50) + serialized witness size.
+	// Serialized witness size uses the ORIGINAL witness (including annex if present).
+	// Format: compact_size(num_items) + sum(compact_size(len(item)) + len(item)).
+	totalItems := len(witness)
+	if annex != nil {
+		totalItems++
+	}
+	witnessSize := compactSizeLen(totalItems)
 	for _, w := range witness {
-		witnessSize += len(w)
+		witnessSize += compactSizeLen(len(w)) + len(w)
 	}
 	if annex != nil {
-		witnessSize += len(annex)
+		witnessSize += compactSizeLen(len(annex)) + len(annex)
 	}
 	e.sigopBudget = 50 + witnessSize
 
@@ -428,13 +449,66 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	return e.executeScript(script)
 }
 
+// IsOpSuccess returns true if the opcode is an OP_SUCCESSx opcode (BIP342).
+func IsOpSuccess(op byte) bool {
+	return op == 80 || op == 98 || (op >= 126 && op <= 129) ||
+		(op >= 131 && op <= 134) || (op >= 137 && op <= 138) ||
+		(op >= 141 && op <= 142) || (op >= 149 && op <= 153) ||
+		(op >= 187 && op <= 254)
+}
+
+// compactSizeLen returns the number of bytes needed to encode n as a Bitcoin compact size.
+func compactSizeLen(n int) int {
+	if n < 253 {
+		return 1
+	} else if n <= 0xFFFF {
+		return 3
+	} else if n <= 0xFFFFFFFF {
+		return 5
+	}
+	return 9
+}
+
 // executeScript executes a single script.
 func (e *Engine) executeScript(script []byte) error {
-	if len(script) > MaxScriptSize {
+	// Fix #2: Script size limit only applies to BASE and WITNESS_V0.
+	if (e.sigVersion == SigVersionBase || e.sigVersion == SigVersionWitnessV0) && len(script) > MaxScriptSize {
 		return ErrScriptTooLong
 	}
 
+	// Fix #3: OP_SUCCESSx handling for tapscript.
+	if e.sigVersion == SigVersionTapscript {
+		scanPC := 0
+		for scanPC < len(script) {
+			op := script[scanPC]
+			scanPC++
+			if op >= 0x01 && op <= 0x4b {
+				scanPC += int(op)
+			} else if op == OP_PUSHDATA1 {
+				if scanPC >= len(script) {
+					return errors.New("script too short for OP_PUSHDATA1")
+				}
+				scanPC += 1 + int(script[scanPC])
+			} else if op == OP_PUSHDATA2 {
+				if scanPC+2 > len(script) {
+					return errors.New("script too short for OP_PUSHDATA2")
+				}
+				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8
+				scanPC += 2 + dataLen
+			} else if op == OP_PUSHDATA4 {
+				if scanPC+4 > len(script) {
+					return errors.New("script too short for OP_PUSHDATA4")
+				}
+				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8 | int(script[scanPC+2])<<16 | int(script[scanPC+3])<<24
+				scanPC += 4 + dataLen
+			} else if IsOpSuccess(op) {
+				return nil
+			}
+		}
+	}
+
 	pc := 0 // Program counter
+	var opcodePos uint32 // Fix #5: opcode index counter for OP_CODESEPARATOR
 	for pc < len(script) {
 		// Check stack size limit
 		if e.stack.Size()+e.altStack.Size() > MaxStackSize {
@@ -457,6 +531,7 @@ func (e *Engine) executeScript(script []byte) error {
 			if executing {
 				e.stack.Push([]byte{})
 			}
+			opcodePos++
 			continue
 		}
 
@@ -470,6 +545,7 @@ func (e *Engine) executeScript(script []byte) error {
 				e.stack.Push(script[pc : pc+dataLen])
 			}
 			pc += dataLen
+			opcodePos++
 			continue
 		}
 
@@ -486,6 +562,7 @@ func (e *Engine) executeScript(script []byte) error {
 				e.stack.Push(script[pc : pc+dataLen])
 			}
 			pc += dataLen
+			opcodePos++
 			continue
 		}
 
@@ -502,6 +579,7 @@ func (e *Engine) executeScript(script []byte) error {
 				e.stack.Push(script[pc : pc+dataLen])
 			}
 			pc += dataLen
+			opcodePos++
 			continue
 		}
 
@@ -518,6 +596,7 @@ func (e *Engine) executeScript(script []byte) error {
 				e.stack.Push(script[pc : pc+dataLen])
 			}
 			pc += dataLen
+			opcodePos++
 			continue
 		}
 
@@ -525,6 +604,7 @@ func (e *Engine) executeScript(script []byte) error {
 			if executing {
 				e.stack.PushInt(-1)
 			}
+			opcodePos++
 			continue
 		}
 
@@ -532,14 +612,17 @@ func (e *Engine) executeScript(script []byte) error {
 			if executing {
 				e.stack.PushInt(int64(op - OP_1 + 1))
 			}
+			opcodePos++
 			continue
 		}
 
-		// Count non-push operations
+		// Fix #1: Count non-push operations only for BASE and WITNESS_V0.
 		if op > OP_16 {
-			e.opCount++
-			if e.opCount > MaxOpsPerScript {
-				return ErrOpCount
+			if e.sigVersion == SigVersionBase || e.sigVersion == SigVersionWitnessV0 {
+				e.opCount++
+				if e.opCount > MaxOpsPerScript {
+					return ErrOpCount
+				}
 			}
 		}
 
@@ -567,6 +650,7 @@ func (e *Engine) executeScript(script []byte) error {
 				}
 			}
 			e.condStack = append(e.condStack, executing && cond)
+			opcodePos++
 			continue
 
 		case OP_ELSE:
@@ -577,6 +661,7 @@ func (e *Engine) executeScript(script []byte) error {
 			if len(e.condStack) == 1 || e.condStack[len(e.condStack)-2] {
 				e.condStack[len(e.condStack)-1] = !e.condStack[len(e.condStack)-1]
 			}
+			opcodePos++
 			continue
 
 		case OP_ENDIF:
@@ -584,18 +669,21 @@ func (e *Engine) executeScript(script []byte) error {
 				return ErrUnbalancedConditional
 			}
 			e.condStack = e.condStack[:len(e.condStack)-1]
+			opcodePos++
 			continue
 		}
 
 		// Skip remaining operations if not executing
 		if !executing {
+			opcodePos++
 			continue
 		}
 
 		// Execute opcode
-		if err := e.executeOpcode(op, script, pc); err != nil {
+		if err := e.executeOpcode(op, script, pc, opcodePos); err != nil {
 			return err
 		}
+		opcodePos++
 	}
 
 	// Check for unbalanced conditionals
@@ -617,7 +705,7 @@ func (e *Engine) isExecuting() bool {
 }
 
 // executeOpcode executes a single opcode.
-func (e *Engine) executeOpcode(op byte, script []byte, pc int) error {
+func (e *Engine) executeOpcode(op byte, script []byte, pc int, opcodePos uint32) error {
 	switch op {
 	case OP_NOP:
 		return nil
@@ -768,7 +856,7 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int) error {
 		return e.opHash256()
 
 	case OP_CODESEPARATOR:
-		e.codesepPos = uint32(pc)
+		e.codesepPos = opcodePos
 		return nil
 
 	case OP_CHECKSIG:
@@ -781,9 +869,15 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int) error {
 		return e.opVerify()
 
 	case OP_CHECKMULTISIG:
+		if e.sigVersion == SigVersionTapscript {
+			return ErrTapscriptCheckMultiSig
+		}
 		return e.opCheckMultiSig(script)
 
 	case OP_CHECKMULTISIGVERIFY:
+		if e.sigVersion == SigVersionTapscript {
+			return ErrTapscriptCheckMultiSig
+		}
 		if err := e.opCheckMultiSig(script); err != nil {
 			return err
 		}

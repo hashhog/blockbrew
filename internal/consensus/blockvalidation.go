@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/script"
@@ -29,6 +30,7 @@ var (
 	ErrSigOpsCostTooHigh       = errors.New("block sigops cost exceeds maximum")
 	ErrBadCoinbaseValue        = errors.New("coinbase value exceeds allowed subsidy plus fees")
 	ErrDuplicateCoinbase       = errors.New("block contains duplicate coinbase outputs (BIP30)")
+	ErrBadDifficultyBits       = errors.New("block difficulty bits do not match expected value")
 )
 
 // WitnessCommitmentMagic is the magic prefix for witness commitment in coinbase.
@@ -130,6 +132,25 @@ func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, heigh
 	if height >= params.BIP34Height {
 		if err := checkBIP34Height(block.Transactions[0], height); err != nil {
 			return err
+		}
+	}
+
+	// Validate difficulty target: the block's nBits must match the expected value.
+	// For non-retarget blocks, bits must equal the parent's bits.
+	// For retarget blocks (height % DifficultyAdjInterval == 0), the caller must
+	// have already validated via the header index. We check the non-retarget case here.
+	if prevHeader != nil && height > 0 {
+		if height%int32(params.DifficultyAdjInterval) != 0 {
+			// Non-retarget block: difficulty must match parent
+			// Exception: testnet min-difficulty rule
+			expectedBits := prevHeader.Bits
+			if params.MinDiffReductionTime && IsMinDifficultyBlock(params, int64(block.Header.Timestamp), int64(prevHeader.Timestamp)) {
+				expectedBits = params.PowLimitBits
+			}
+			if block.Header.Bits != expectedBits {
+				return fmt.Errorf("%w: expected %x, got %x",
+					ErrBadDifficultyBits, expectedBits, block.Header.Bits)
+			}
 		}
 	}
 
@@ -560,8 +581,9 @@ func ParallelScriptValidation(block *wire.MsgBlock, utxoView UTXOView, flags scr
 		return nil
 	}
 
-	// Use a channel to report the first error (non-blocking sends)
-	errChan := make(chan error, 1)
+	// Use atomic.Pointer to store the first error without race conditions.
+	// Workers check this to exit early once any script fails.
+	var firstErr atomic.Pointer[error]
 
 	// WaitGroup to track completion
 	var wg sync.WaitGroup
@@ -579,10 +601,8 @@ func ParallelScriptValidation(block *wire.MsgBlock, utxoView UTXOView, flags scr
 			defer func() { <-sem }()
 
 			// Check if we already have an error (early exit)
-			select {
-			case <-errChan:
+			if firstErr.Load() != nil {
 				return
-			default:
 			}
 
 			// Validate the script
@@ -596,22 +616,19 @@ func ParallelScriptValidation(block *wire.MsgBlock, utxoView UTXOView, flags scr
 				j.prevOuts,
 			)
 			if err != nil {
-				// Try to send error (non-blocking, only first error wins)
-				select {
-				case errChan <- fmt.Errorf("tx %d input %d: script failed: %w", j.txIdx, j.inputIdx, err):
-				default:
-				}
+				// Store the first error atomically (only first wins)
+				wrapped := fmt.Errorf("tx %d input %d: script failed: %w", j.txIdx, j.inputIdx, err)
+				firstErr.CompareAndSwap(nil, &wrapped)
 			}
 		}(job)
 	}
 
 	// Wait for all workers to finish
 	wg.Wait()
-	close(errChan)
 
 	// Check if there was an error
-	if err, ok := <-errChan; ok {
-		return err
+	if errPtr := firstErr.Load(); errPtr != nil {
+		return *errPtr
 	}
 	return nil
 }
