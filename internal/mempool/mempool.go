@@ -27,8 +27,21 @@ var (
 	ErrInsufficientFee    = errors.New("fee rate below minimum relay fee")
 	ErrDustOutput         = errors.New("output is dust")
 	ErrScriptValidation   = errors.New("script validation failed")
-	ErrMempoolFull        = errors.New("mempool is full")
-	ErrOrphanPoolFull     = errors.New("orphan pool is full")
+	ErrMempoolFull         = errors.New("mempool is full")
+	ErrOrphanPoolFull      = errors.New("orphan pool is full")
+	ErrRBFNotSignaled      = errors.New("conflicting transaction does not signal RBF")
+	ErrRBFInsufficientFee  = errors.New("replacement fee too low")
+	ErrRBFTooManyConflicts = errors.New("replacement would evict too many transactions")
+)
+
+// RBF constants (BIP125).
+const (
+	// MaxRBFReplacedTxs is the maximum number of transactions that can be
+	// replaced by a single RBF replacement (including descendants).
+	MaxRBFReplacedTxs = 100
+
+	// SequenceFinal is the maximum sequence number (disables RBF signaling).
+	SequenceFinal = 0xFFFFFFFF
 )
 
 // Config configures the mempool.
@@ -173,15 +186,18 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	// 5. Calculate virtual size
 	vsize := (weight + 3) / 4 // Round up
 
-	// 6. Check for double spends and gather input values
+	// 6. Check for double spends (with RBF support) and gather input values
 	var totalInputValue int64
 	var missingInputs []wire.OutPoint
+	var conflictingTxs map[wire.Hash256]bool // Transactions to replace via RBF
 
 	for _, in := range tx.TxIn {
 		// Check mempool double-spend
-		if existingTx, ok := mp.outpoints[in.PreviousOutPoint]; ok {
-			return fmt.Errorf("%w: input %s:%d already spent by mempool tx %s",
-				ErrDoubleSpend, in.PreviousOutPoint.Hash, in.PreviousOutPoint.Index, existingTx)
+		if existingTxHash, ok := mp.outpoints[in.PreviousOutPoint]; ok {
+			if conflictingTxs == nil {
+				conflictingTxs = make(map[wire.Hash256]bool)
+			}
+			conflictingTxs[existingTxHash] = true
 		}
 
 		// Look up the UTXO (check mempool outputs first, then UTXO set)
@@ -190,6 +206,20 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 			missingInputs = append(missingInputs, in.PreviousOutPoint)
 		} else {
 			totalInputValue += utxo.Amount
+		}
+	}
+
+	// If there are conflicting transactions, check RBF rules
+	if len(conflictingTxs) > 0 && len(missingInputs) == 0 {
+		rbfErr := mp.checkRBFLocked(tx, conflictingTxs, totalInputValue)
+		if rbfErr != nil {
+			return rbfErr
+		}
+	} else if len(conflictingTxs) > 0 {
+		// Can't do RBF with missing inputs
+		for txHash := range conflictingTxs {
+			return fmt.Errorf("%w: input already spent by mempool tx %s",
+				ErrDoubleSpend, txHash)
 		}
 	}
 
@@ -255,6 +285,13 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	// Update ancestor/descendant tracking
 	mp.updateAncestorStateLocked(entry)
 	mp.updateDescendantStateLocked(entry)
+
+	// Execute RBF replacements if any
+	if len(conflictingTxs) > 0 {
+		for conflictHash := range conflictingTxs {
+			mp.removeWithDescendantsLocked(conflictHash)
+		}
+	}
 
 	// Add to pool
 	mp.pool[txHash] = entry
@@ -834,6 +871,94 @@ func (mp *Mempool) Clear() {
 	mp.outpoints = make(map[wire.OutPoint]wire.Hash256)
 	mp.orphans = make(map[wire.Hash256]*orphanEntry)
 	mp.totalSize = 0
+}
+
+// checkRBFLocked validates whether a replacement transaction satisfies BIP125 rules.
+// Must be called with mu held.
+func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash256]bool, totalInputValue int64) error {
+	// BIP125 Rule 1: All conflicting transactions must signal replaceability.
+	// A transaction signals RBF if any of its inputs have nSequence < 0xFFFFFFFF.
+	for txHash := range conflicting {
+		entry, ok := mp.pool[txHash]
+		if !ok {
+			continue
+		}
+		if !signalsRBF(entry.Tx) {
+			return fmt.Errorf("%w: tx %s does not signal RBF", ErrRBFNotSignaled, txHash)
+		}
+	}
+
+	// BIP125 Rule 2: The replacement must not contain any new unconfirmed inputs
+	// that weren't already in the original transactions. (Relaxed in practice.)
+
+	// BIP125 Rule 3: The replacement must pay an absolute fee higher than
+	// the total fees of all conflicting transactions.
+	var totalConflictingFee int64
+	var totalConflictingSize int64
+	var totalEvicted int
+
+	for txHash := range conflicting {
+		entry, ok := mp.pool[txHash]
+		if !ok {
+			continue
+		}
+		totalConflictingFee += entry.Fee
+		totalConflictingSize += entry.Size
+		totalEvicted++
+
+		// Include descendants
+		visited := make(map[wire.Hash256]bool)
+		descendants := mp.collectDescendantsLocked(txHash, visited)
+		for _, descHash := range descendants {
+			if descEntry, ok := mp.pool[descHash]; ok {
+				totalConflictingFee += descEntry.Fee
+				totalEvicted++
+			}
+		}
+	}
+
+	// BIP125 Rule 5: The number of replaced transactions (plus descendants) must
+	// not exceed MaxRBFReplacedTxs.
+	if totalEvicted > MaxRBFReplacedTxs {
+		return fmt.Errorf("%w: would evict %d transactions (max %d)",
+			ErrRBFTooManyConflicts, totalEvicted, MaxRBFReplacedTxs)
+	}
+
+	// Calculate new transaction fee
+	var totalOutputValue int64
+	for _, out := range newTx.TxOut {
+		totalOutputValue += out.Value
+	}
+	newFee := totalInputValue - totalOutputValue
+
+	// Rule 3: New fee must be higher than all conflicting fees combined
+	if newFee <= totalConflictingFee {
+		return fmt.Errorf("%w: new fee %d <= conflicting fees %d",
+			ErrRBFInsufficientFee, newFee, totalConflictingFee)
+	}
+
+	// BIP125 Rule 4: The replacement must pay for its own bandwidth at the
+	// minimum relay fee rate (the fee increase must cover at least the
+	// relay cost of the replacement).
+	weight := consensus.CalcTxWeight(newTx)
+	newVSize := (weight + 3) / 4
+	minFeeBump := (newVSize * mp.config.MinRelayFeeRate + 999) / 1000
+	if newFee-totalConflictingFee < minFeeBump {
+		return fmt.Errorf("%w: fee increase %d < minimum bump %d",
+			ErrRBFInsufficientFee, newFee-totalConflictingFee, minFeeBump)
+	}
+
+	return nil
+}
+
+// signalsRBF returns true if the transaction signals BIP125 replaceability.
+func signalsRBF(tx *wire.MsgTx) bool {
+	for _, in := range tx.TxIn {
+		if in.Sequence < SequenceFinal {
+			return true
+		}
+	}
+	return false
 }
 
 // Ensure Mempool implements consensus.UTXOView
