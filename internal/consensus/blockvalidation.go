@@ -29,6 +29,7 @@ var (
 	ErrBadWitnessCommitment    = errors.New("witness commitment mismatch")
 	ErrSigOpsCostTooHigh       = errors.New("block sigops cost exceeds maximum")
 	ErrBadCoinbaseValue        = errors.New("coinbase value exceeds allowed subsidy plus fees")
+	ErrDuplicateTx             = errors.New("block contains duplicate transaction outputs (BIP30)")
 	ErrDuplicateCoinbase       = errors.New("block contains duplicate coinbase outputs (BIP30)")
 	ErrBadDifficultyBits       = errors.New("block difficulty bits do not match expected value")
 )
@@ -350,17 +351,31 @@ func ValidateBlockWithOptions(block *wire.MsgBlock, prevHeader *wire.BlockHeader
 		return err
 	}
 
-	// BIP30: Check for duplicate coinbase transaction outputs.
+	// BIP30: Check for duplicate transaction outputs in the UTXO set.
 	// Two historical blocks (91722 and 91812) on mainnet have duplicate coinbase
-	// txids. After BIP34 activation (height 227931), duplicates are impossible
-	// because the height is encoded in the coinbase.
-	if height != 91722 && height != 91812 {
-		coinbaseTxHash := block.Transactions[0].TxHash()
-		for i := range block.Transactions[0].TxOut {
-			outpoint := wire.OutPoint{Hash: coinbaseTxHash, Index: uint32(i)}
-			if utxoView.GetUTXO(outpoint) != nil {
-				return fmt.Errorf("%w: output %s:%d already exists",
-					ErrDuplicateCoinbase, coinbaseTxHash.String()[:16], i)
+	// txids and are exempted. After BIP34 activation, the height encoded in the
+	// coinbase makes duplicate txids impossible, so the check can be skipped.
+	// However, after height 1,983,702 the check must resume because BIP34 does
+	// not fully guarantee uniqueness beyond that point.
+	const bip34ImpliesBIP30Limit int32 = 1_983_702
+	enforceBIP30 := height != 91722 && height != 91812
+	// Skip BIP30 after BIP34 activation (unique coinbase guarantees unique txids)
+	if enforceBIP30 && height >= params.BIP34Height {
+		enforceBIP30 = false
+	}
+	// Re-enable BIP30 at or above the BIP34-implies-BIP30 limit
+	if !enforceBIP30 && height >= bip34ImpliesBIP30Limit {
+		enforceBIP30 = true
+	}
+	if enforceBIP30 {
+		for _, tx := range block.Transactions {
+			txHash := tx.TxHash()
+			for i := range tx.TxOut {
+				outpoint := wire.OutPoint{Hash: txHash, Index: uint32(i)}
+				if utxoView.GetUTXO(outpoint) != nil {
+					return fmt.Errorf("%w: output %s:%d already exists",
+						ErrDuplicateTx, txHash.String()[:16], i)
+				}
 			}
 		}
 	}
@@ -394,6 +409,9 @@ func ValidateBlockWithOptions(block *wire.MsgBlock, prevHeader *wire.BlockHeader
 			return fmt.Errorf("tx %d: %w", i, err)
 		}
 		totalFees += fee
+		if totalFees > MaxMoney {
+			return fmt.Errorf("accumulated fee in the block out of range: %d > %d", totalFees, MaxMoney)
+		}
 
 		// Update UTXO view: spend inputs and add outputs
 		// IMPORTANT: This handles intra-block spending - txs can spend outputs

@@ -220,6 +220,9 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			return fmt.Errorf("tx %d input validation failed: %w", i, err)
 		}
 		totalFees += fee
+		if totalFees > MaxMoney {
+			return fmt.Errorf("accumulated fee in the block out of range: %d > %d", totalFees, MaxMoney)
+		}
 
 		// BIP68: Enforce sequence locks after CSV activation
 		if node.Height >= cm.params.CSVHeight {
@@ -378,11 +381,15 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	undo, hasUndo := cm.undoData[hash]
 
 	// Undo UTXO changes in reverse order
-	// First, remove outputs that were created
+	// First, remove outputs that were created (skip unspendable outputs
+	// since they were never added to the UTXO set)
 	for i := len(block.Transactions) - 1; i >= 0; i-- {
 		tx := block.Transactions[i]
 		txHash := tx.TxHash()
-		for idx := range tx.TxOut {
+		for idx, out := range tx.TxOut {
+			if IsUnspendable(out.PkScript) {
+				continue
+			}
 			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
 			cm.utxoSet.SpendUTXO(outpoint)
 		}
@@ -390,6 +397,25 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 
 	// Then, restore inputs that were spent using undo data
 	if hasUndo {
+		// Verify undo data consistency: count non-coinbase transactions
+		nonCoinbaseTxCount := len(block.Transactions) - 1
+		if nonCoinbaseTxCount < 0 {
+			nonCoinbaseTxCount = 0
+		}
+
+		// Count total expected inputs across all non-coinbase transactions
+		expectedInputs := 0
+		for i := 1; i < len(block.Transactions); i++ {
+			expectedInputs += len(block.Transactions[i].TxIn)
+		}
+
+		// The number of undo entries must match the total number of
+		// non-coinbase inputs
+		if len(undo.SpentUTXOs) != expectedInputs {
+			return fmt.Errorf("undo data mismatch: %d spent UTXOs but %d non-coinbase inputs across %d transactions",
+				len(undo.SpentUTXOs), expectedInputs, nonCoinbaseTxCount)
+		}
+
 		for _, entry := range undo.SpentUTXOs {
 			restored := entry.Entry // copy
 			cm.utxoSet.AddUTXO(entry.Outpoint, &restored)
