@@ -566,41 +566,30 @@ func (e *Engine) opCheckSig(script []byte) error {
 		return err
 	}
 
-	// Empty signature is always false (but not an error)
-	if len(sigBytes) == 0 {
-		e.stack.PushBool(false)
-		return nil
-	}
-
-	// Extract sighash type (last byte of signature)
-	hashType := SigHashType(sigBytes[len(sigBytes)-1])
-	sig := sigBytes[:len(sigBytes)-1]
-
 	// Compute sighash based on sig version
 	var sighash [32]byte
 	var valid bool
 
 	switch e.sigVersion {
-	case SigVersionBase:
-		// For legacy, apply FindAndDelete to remove signature from script
-		scriptCode := FindAndDelete(script, sigBytes)
-		sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
-		if err != nil {
+	case SigVersionBase, SigVersionWitnessV0:
+		// Empty signature is always false (but not an error) for legacy/segwit
+		if len(sigBytes) == 0 {
 			e.stack.PushBool(false)
 			return nil
 		}
-		// Verify ECDSA signature
-		pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
-		if err != nil {
-			e.stack.PushBool(false)
-			return nil
-		}
-		valid = crypto.VerifyECDSA(pubKey, sighash, sig)
 
-	case SigVersionWitnessV0:
-		// For witness v0, use BIP143 sighash
-		// Script is already the scriptCode (no FindAndDelete needed)
-		sighash, err = CalcWitnessSignatureHash(script, hashType, e.tx, e.txIdx, e.amount)
+		// Extract sighash type (last byte of signature)
+		hashType := SigHashType(sigBytes[len(sigBytes)-1])
+		sig := sigBytes[:len(sigBytes)-1]
+
+		if e.sigVersion == SigVersionBase {
+			// For legacy, apply FindAndDelete to remove signature from script
+			scriptCode := FindAndDelete(script, sigBytes)
+			sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
+		} else {
+			// For witness v0, use BIP143 sighash
+			sighash, err = CalcWitnessSignatureHash(script, hashType, e.tx, e.txIdx, e.amount)
+		}
 		if err != nil {
 			e.stack.PushBool(false)
 			return nil
@@ -613,16 +602,46 @@ func (e *Engine) opCheckSig(script []byte) error {
 		valid = crypto.VerifyECDSA(pubKey, sighash, sig)
 
 	case SigVersionTapscript:
+		// Empty pubkey is a hard error in tapscript
+		if len(pubKeyBytes) == 0 {
+			return fmt.Errorf("tapscript empty pubkey")
+		}
+
+		// Empty signature pushes false (soft failure, no budget cost)
+		if len(sigBytes) == 0 {
+			e.stack.PushBool(false)
+			return nil
+		}
+
 		// Decrement tapscript signature validation weight budget (BIP342)
 		e.sigopBudget -= TapscriptSigopBudgetCost
 		if e.sigopBudget < 0 {
 			return fmt.Errorf("tapscript validation weight exceeded")
 		}
 
-		// For tapscript, use Schnorr signature
+		// For non-32-byte pubkeys (unknown key version), push true for upgradability
 		if len(pubKeyBytes) != 32 {
-			e.stack.PushBool(false)
+			e.stack.PushBool(true)
 			return nil
+		}
+
+		// Schnorr signature length handling:
+		// 64 bytes: SIGHASH_DEFAULT (0x00), signature is entire blob
+		// 65 bytes: last byte is hashType, signature is first 64 bytes
+		// Other: hard error
+		var hashType SigHashType
+		var sig []byte
+		if len(sigBytes) == 64 {
+			hashType = SigHashDefault
+			sig = sigBytes
+		} else if len(sigBytes) == 65 {
+			hashType = SigHashType(sigBytes[64])
+			if hashType == SigHashDefault {
+				return fmt.Errorf("schnorr signature hash type 0x00 not allowed with 65-byte signature")
+			}
+			sig = sigBytes[:64]
+		} else {
+			return fmt.Errorf("invalid schnorr signature size: %d", len(sigBytes))
 		}
 
 		// Get tapscript-specific sighash
@@ -634,10 +653,14 @@ func (e *Engine) opCheckSig(script []byte) error {
 		}
 		sighash, err = CalcTaprootSignatureHash(hashType, e.tx, e.txIdx, e.prevOuts, opts)
 		if err != nil {
-			e.stack.PushBool(false)
-			return nil
+			return err
 		}
 		valid = crypto.VerifySchnorr(pubKeyBytes, sighash, sig)
+
+		// In tapscript, non-empty signature that fails verification is a HARD error
+		if !valid {
+			return fmt.Errorf("schnorr signature verification failed")
+		}
 
 	default:
 		e.stack.PushBool(false)
@@ -776,6 +799,11 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 		return err
 	}
 
+	// Empty pubkey is a hard error in tapscript
+	if len(pubKeyBytes) == 0 {
+		return fmt.Errorf("tapscript empty pubkey")
+	}
+
 	// If signature is empty, just push n (no budget cost for empty sig)
 	if len(sigBytes) == 0 {
 		e.stack.PushInt(n)
@@ -788,13 +816,16 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 		return fmt.Errorf("tapscript validation weight exceeded")
 	}
 
-	// Verify the signature
+	// For non-32-byte pubkeys (unknown key version), push n+1 for upgradability
 	if len(pubKeyBytes) != 32 {
-		e.stack.PushInt(n)
+		e.stack.PushInt(n + 1)
 		return nil
 	}
 
-	// Extract hash type
+	// Schnorr signature length handling:
+	// 64 bytes: SIGHASH_DEFAULT (0x00), signature is entire blob
+	// 65 bytes: last byte is hashType, signature is first 64 bytes
+	// Other: hard error
 	var hashType SigHashType
 	var sig []byte
 	if len(sigBytes) == 64 {
@@ -802,10 +833,12 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 		sig = sigBytes
 	} else if len(sigBytes) == 65 {
 		hashType = SigHashType(sigBytes[64])
+		if hashType == SigHashDefault {
+			return fmt.Errorf("schnorr signature hash type 0x00 not allowed with 65-byte signature")
+		}
 		sig = sigBytes[:64]
 	} else {
-		e.stack.PushInt(n)
-		return nil
+		return fmt.Errorf("invalid schnorr signature size: %d", len(sigBytes))
 	}
 
 	// Compute sighash
@@ -817,14 +850,14 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 	}
 	sighash, err := CalcTaprootSignatureHash(hashType, e.tx, e.txIdx, e.prevOuts, opts)
 	if err != nil {
-		e.stack.PushInt(n)
-		return nil
+		return err
 	}
 
 	if crypto.VerifySchnorr(pubKeyBytes, sighash, sig) {
 		e.stack.PushInt(n + 1)
 	} else {
-		e.stack.PushInt(n)
+		// In tapscript, non-empty signature that fails verification is a HARD error
+		return fmt.Errorf("schnorr signature verification failed")
 	}
 	return nil
 }

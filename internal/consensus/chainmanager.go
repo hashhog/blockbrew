@@ -183,6 +183,24 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	var totalFees int64
 	undo := &BlockUndo{}
 
+	// Genesis block special case: the genesis coinbase is unspendable.
+	// Bitcoin Core skips transaction connection for the genesis block.
+	if node.Height == 0 {
+		// Store undo data (empty) and update chain state
+		cm.undoData[hash] = undo
+		cm.tipNode = node
+		cm.tipHeight = node.Height
+		node.Status |= StatusFullyValid
+		if cm.chainDB != nil {
+			cm.chainDB.SetBlockHeight(node.Height, hash)
+			cm.chainDB.SetChainState(&storage.ChainState{
+				BestHash:   hash,
+				BestHeight: node.Height,
+			})
+		}
+		return nil
+	}
+
 	// First pass: validate transaction structure and inputs (not scripts)
 	for i, tx := range block.Transactions {
 		// Check transaction sanity
@@ -202,6 +220,21 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			return fmt.Errorf("tx %d input validation failed: %w", i, err)
 		}
 		totalFees += fee
+
+		// BIP68: Enforce sequence locks after CSV activation
+		if node.Height >= cm.params.CSVHeight {
+			prevHeights := make([]int32, len(tx.TxIn))
+			for j, in := range tx.TxIn {
+				utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
+				if utxo != nil {
+					prevHeights[j] = utxo.Height
+				}
+			}
+			seqLock := CalculateSequenceLocks(tx, prevHeights, int64(mtp), node.Height)
+			if !EvaluateSequenceLocks(seqLock, node.Height, int64(mtp)) {
+				return fmt.Errorf("tx %d: %w", i, ErrSequenceLockNotMet)
+			}
+		}
 
 		// Record spent UTXOs for undo data before spending
 		for _, in := range tx.TxIn {

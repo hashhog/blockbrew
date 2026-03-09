@@ -221,12 +221,27 @@ func (v *InMemoryUTXOView) SpendUTXO(outpoint wire.OutPoint) {
 	delete(v.utxos, outpoint)
 }
 
+// IsUnspendable returns true if a script is provably unspendable.
+// A script is unspendable if it starts with OP_RETURN (0x6a) or is empty.
+func IsUnspendable(pkScript []byte) bool {
+	if len(pkScript) == 0 {
+		return true
+	}
+	return pkScript[0] == 0x6a // OP_RETURN
+}
+
 // AddTxOutputs adds all outputs from a transaction to the UTXO view.
+// Outputs that are provably unspendable (OP_RETURN or empty script) are
+// skipped to avoid polluting the UTXO set.
 func (v *InMemoryUTXOView) AddTxOutputs(tx *wire.MsgTx, height int32) {
 	txHash := tx.TxHash()
 	isCoinbase := IsCoinbaseTx(tx)
 
 	for i, out := range tx.TxOut {
+		// Skip provably unspendable outputs (OP_RETURN or empty script)
+		if IsUnspendable(out.PkScript) {
+			continue
+		}
 		outpoint := wire.OutPoint{
 			Hash:  txHash,
 			Index: uint32(i),

@@ -355,7 +355,12 @@ func CountBlockSigOpsCost(block *wire.MsgBlock, utxoView UTXOView) int {
 	totalCost := 0
 
 	for _, tx := range block.Transactions {
-		// Base sigops from outputs (scaled)
+		// Legacy sigops from both inputs (scriptSig) and outputs (scriptPubKey),
+		// scaled by WitnessScaleFactor. This matches Bitcoin Core's
+		// GetLegacySigOpCount which counts sigops in both vin and vout.
+		for _, in := range tx.TxIn {
+			totalCost += CountSigOps(in.SignatureScript) * WitnessScaleFactor
+		}
 		for _, out := range tx.TxOut {
 			totalCost += CountSigOps(out.PkScript) * WitnessScaleFactor
 		}

@@ -3,6 +3,7 @@ package script
 import (
 	"bytes"
 	"crypto/sha256"
+	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -196,25 +197,24 @@ func CalcTaprootSignatureHash(hashType SigHashType, tx *wire.MsgTx, idx int, pre
 		return [32]byte{}, ErrInvalidIndex
 	}
 
-	// Default hashType to SIGHASH_DEFAULT (which behaves like ALL)
-	if hashType == SigHashDefault {
-		hashType = SigHashAll
+	// Validate hash_type: must be one of 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83
+	if !(hashType <= 0x03 || (hashType >= 0x81 && hashType <= 0x83)) {
+		return [32]byte{}, fmt.Errorf("invalid taproot sighash type: 0x%02x", hashType)
 	}
 
-	baseType := hashType.BaseType()
+	// Determine output type for behavior: DEFAULT behaves like ALL
+	outputType := hashType & 0x03
+	if outputType == SigHashDefault {
+		outputType = SigHashAll
+	}
 	anyoneCanPay := hashType.HasAnyOneCanPay()
 
 	// Epoch (1 byte) - always 0 for taproot
 	var preimage bytes.Buffer
 	preimage.WriteByte(0x00)
 
-	// hash_type (1 byte)
-	if hashType == SigHashAll {
-		// Write 0x00 for SIGHASH_DEFAULT (which we mapped to ALL)
-		preimage.WriteByte(0x00)
-	} else {
-		preimage.WriteByte(byte(hashType))
-	}
+	// hash_type (1 byte) - write the original value, not the mapped one
+	preimage.WriteByte(byte(hashType))
 
 	// nVersion (4 bytes LE)
 	wire.WriteInt32LE(&preimage, tx.Version)
@@ -258,7 +258,7 @@ func CalcTaprootSignatureHash(hashType SigHashType, tx *wire.MsgTx, idx int, pre
 	}
 
 	// If not NONE or SINGLE
-	if baseType != SigHashNone && baseType != SigHashSingle {
+	if outputType != SigHashNone && outputType != SigHashSingle {
 		var buf bytes.Buffer
 		for _, out := range tx.TxOut {
 			out.Serialize(&buf)
@@ -298,7 +298,7 @@ func CalcTaprootSignatureHash(hashType SigHashType, tx *wire.MsgTx, idx int, pre
 	}
 
 	// Output specific data for SIGHASH_SINGLE
-	if baseType == SigHashSingle {
+	if outputType == SigHashSingle {
 		if idx >= len(tx.TxOut) {
 			return [32]byte{}, ErrInvalidIndex
 		}
