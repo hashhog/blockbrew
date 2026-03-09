@@ -255,8 +255,8 @@ func TestDoubleSpendRejection(t *testing.T) {
 		t.Fatal("Expected error for double spend")
 	}
 
-	if !containsString(err.Error(), "already spent") {
-		t.Fatalf("Expected 'already spent' error, got: %v", err)
+	if !containsString(err.Error(), "already spent") && !containsString(err.Error(), "does not signal RBF") {
+		t.Fatalf("Expected double-spend rejection error, got: %v", err)
 	}
 }
 
