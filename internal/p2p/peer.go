@@ -117,6 +117,7 @@ type Peer struct {
 
 	// Protocol negotiation results
 	sendHeadersPreferred bool // Peer prefers headers announcements (BIP130)
+	wtxidRelaySupported  bool // Peer supports wtxid-based relay (BIP339)
 
 	// Handshake completion signal
 	handshakeDone chan struct{}
@@ -404,6 +405,12 @@ func (p *Peer) handleMessage(msg Message) {
 		if p.config.Listeners != nil && p.config.Listeners.OnFeeFilter != nil {
 			p.config.Listeners.OnFeeFilter(p, m)
 		}
+	case *MsgWTxidRelay:
+		p.mu.Lock()
+		p.wtxidRelaySupported = true
+		p.mu.Unlock()
+	case *MsgSendCmpct:
+		// Record compact block preferences (handled in BIP152 negotiation)
 	}
 }
 
@@ -433,6 +440,11 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 	// For inbound connections, send our version after receiving theirs
 	if inbound && !versionSent {
 		p.sendVersionMessage()
+	}
+
+	// Send wtxidrelay (BIP339) before verack if peer supports protocol >= 70016
+	if msg.ProtocolVersion >= 70016 {
+		p.SendMessage(&MsgWTxidRelay{})
 	}
 
 	// Send verack
@@ -666,6 +678,13 @@ func (p *Peer) SendsHeaders() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.sendHeadersPreferred
+}
+
+// WTxidRelay returns true if the peer supports wtxid-based relay (BIP339).
+func (p *Peer) WTxidRelay() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.wtxidRelaySupported
 }
 
 // randomUint64 generates a cryptographically random uint64.
