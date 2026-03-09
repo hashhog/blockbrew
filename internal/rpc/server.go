@@ -242,8 +242,12 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 		return s.handleGetDifficulty()
 	case "getchaintips":
 		return s.handleGetChainTips()
+	case "gettxout":
+		return s.handleGetTxOut(params)
 
 	// Transaction RPCs
+	case "decodescript":
+		return s.handleDecodeScript(params)
 	case "getrawtransaction":
 		return s.handleGetRawTransaction(params)
 	case "sendrawtransaction":
@@ -272,6 +276,8 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 		return s.handleGetBlockTemplate(params)
 	case "submitblock":
 		return s.handleSubmitBlock(params)
+	case "getmininginfo":
+		return s.handleGetMiningInfo()
 
 	// Fee estimation RPCs
 	case "estimatesmartfee":
@@ -302,6 +308,10 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 		return s.handleUptime()
 	case "getinfo":
 		return s.handleGetInfo()
+	case "help":
+		return s.handleHelp(params)
+	case "verifymessage":
+		return s.handleVerifyMessage(params)
 
 	default:
 		return nil, &RPCError{Code: RPCErrMethodNotFound, Message: fmt.Sprintf("Method not found: %s", method)}
