@@ -246,6 +246,12 @@ func makeMessage(command string) (Message, error) {
 		return &MsgMempool{}, nil
 	case "wtxidrelay":
 		return &MsgWTxidRelay{}, nil
+	case "cmpctblock":
+		return &MsgCmpctBlock{}, nil
+	case "getblocktxn":
+		return &MsgGetBlockTxn{}, nil
+	case "blocktxn":
+		return &MsgBlockTxn{}, nil
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnknownCommand, command)
 	}
