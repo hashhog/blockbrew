@@ -234,6 +234,19 @@ func (m *MsgMempool) Serialize(w io.Writer) error { return nil }
 // Deserialize reads the mempool message from r (no payload).
 func (m *MsgMempool) Deserialize(r io.Reader) error { return nil }
 
+// MsgWTxidRelay is the "wtxidrelay" message (BIP339) indicating support for
+// wtxid-based transaction relay. Sent during handshake before verack.
+type MsgWTxidRelay struct{}
+
+// Command returns the protocol command string for the message.
+func (m *MsgWTxidRelay) Command() string { return "wtxidrelay" }
+
+// Serialize writes the wtxidrelay message to w (no payload).
+func (m *MsgWTxidRelay) Serialize(w io.Writer) error { return nil }
+
+// Deserialize reads the wtxidrelay message from r (no payload).
+func (m *MsgWTxidRelay) Deserialize(r io.Reader) error { return nil }
+
 // MsgGetBlocks is the "getblocks" message similar to getheaders but for blocks.
 type MsgGetBlocks struct {
 	ProtocolVersion uint32

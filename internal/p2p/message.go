@@ -244,6 +244,8 @@ func makeMessage(command string) (Message, error) {
 		return &MsgFeeFilter{}, nil
 	case "mempool":
 		return &MsgMempool{}, nil
+	case "wtxidrelay":
+		return &MsgWTxidRelay{}, nil
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnknownCommand, command)
 	}
