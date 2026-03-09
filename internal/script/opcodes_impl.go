@@ -578,6 +578,27 @@ func (e *Engine) opCheckSig(script []byte) error {
 			return nil
 		}
 
+		// DER signature encoding check (BIP66)
+		if (e.flags&ScriptVerifyDERSig != 0) || (e.flags&ScriptVerifyLowS != 0) || (e.flags&ScriptVerifyStrictEncoding != 0) {
+			if !IsValidDERSignatureEncoding(sigBytes) {
+				return ErrSigDER
+			}
+		}
+
+		// Low-S check (BIP62 rule 5)
+		if e.flags&ScriptVerifyLowS != 0 {
+			if !IsLowSSignature(sigBytes) {
+				return ErrSigHighS
+			}
+		}
+
+		// WITNESS_PUBKEYTYPE: witness v0 requires compressed pubkeys
+		if e.sigVersion == SigVersionWitnessV0 && (e.flags&ScriptVerifyWitnessPubKeyType != 0) {
+			if !IsCompressedPubKey(pubKeyBytes) {
+				return ErrWitnessPubKeyType
+			}
+		}
+
 		// Extract sighash type (last byte of signature)
 		hashType := SigHashType(sigBytes[len(sigBytes)-1])
 		sig := sigBytes[:len(sigBytes)-1]
@@ -600,6 +621,11 @@ func (e *Engine) opCheckSig(script []byte) error {
 			return nil
 		}
 		valid = crypto.VerifyECDSA(pubKey, sighash, sig)
+
+		// NULLFAIL: non-empty signature that fails verification must cause error
+		if !valid && len(sigBytes) > 0 && (e.flags&ScriptVerifyNullFail != 0) {
+			return ErrNullFail
+		}
 
 	case SigVersionTapscript:
 		// Empty pubkey is a hard error in tapscript
@@ -734,6 +760,20 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 			break
 		}
 
+		// DER signature encoding check (BIP66)
+		if (e.flags&ScriptVerifyDERSig != 0) || (e.flags&ScriptVerifyLowS != 0) || (e.flags&ScriptVerifyStrictEncoding != 0) {
+			if !IsValidDERSignatureEncoding(sigBytes) {
+				return ErrSigDER
+			}
+		}
+
+		// Low-S check (BIP62 rule 5)
+		if e.flags&ScriptVerifyLowS != 0 {
+			if !IsLowSSignature(sigBytes) {
+				return ErrSigHighS
+			}
+		}
+
 		hashType := SigHashType(sigBytes[len(sigBytes)-1])
 		sig := sigBytes[:len(sigBytes)-1]
 
@@ -742,6 +782,13 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 		for pubKeyIdx < len(pubKeys) {
 			pubKeyBytes := pubKeys[pubKeyIdx]
 			pubKeyIdx++
+
+			// WITNESS_PUBKEYTYPE: witness v0 requires compressed pubkeys
+			if e.sigVersion == SigVersionWitnessV0 && (e.flags&ScriptVerifyWitnessPubKeyType != 0) {
+				if !IsCompressedPubKey(pubKeyBytes) {
+					return ErrWitnessPubKeyType
+				}
+			}
 
 			var sighash [32]byte
 			switch e.sigVersion {
@@ -771,6 +818,15 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 		if !matched {
 			success = false
 			break
+		}
+	}
+
+	// NULLFAIL: if multisig failed, all signatures must be empty
+	if !success && (e.flags&ScriptVerifyNullFail != 0) {
+		for _, sigBytes := range sigs {
+			if len(sigBytes) > 0 {
+				return ErrNullFail
+			}
 		}
 	}
 
@@ -953,4 +1009,137 @@ func (e *Engine) opCheckSequenceVerify() error {
 	}
 
 	return nil
+}
+
+// IsValidDERSignatureEncoding checks if a signature has valid DER encoding.
+// The signature includes the sighash type byte as the last byte.
+// This is consensus-critical since BIP66.
+func IsValidDERSignatureEncoding(sig []byte) bool {
+	// Format: 0x30 [total-length] 0x02 [R-length] [R] 0x02 [S-length] [S] [sighash]
+	// Minimum and maximum size constraints.
+	if len(sig) < 9 {
+		return false
+	}
+	if len(sig) > 73 {
+		return false
+	}
+
+	// A signature is of type 0x30 (compound).
+	if sig[0] != 0x30 {
+		return false
+	}
+
+	// Make sure the length covers the entire signature.
+	if int(sig[1]) != len(sig)-3 {
+		return false
+	}
+
+	// Extract the length of the R element.
+	lenR := int(sig[3])
+
+	// Make sure the length of the S element is still inside the signature.
+	if 5+lenR >= len(sig) {
+		return false
+	}
+
+	// Extract the length of the S element.
+	lenS := int(sig[5+lenR])
+
+	// Verify that the length of the signature matches the sum of the length
+	// of the elements.
+	if lenR+lenS+7 != len(sig) {
+		return false
+	}
+
+	// Check whether the R element is an integer.
+	if sig[2] != 0x02 {
+		return false
+	}
+
+	// Zero-length integers are not allowed for R.
+	if lenR == 0 {
+		return false
+	}
+
+	// Negative numbers are not allowed for R.
+	if sig[4]&0x80 != 0 {
+		return false
+	}
+
+	// Null bytes at the start of R are not allowed, unless R would
+	// otherwise be interpreted as a negative number.
+	if lenR > 1 && sig[4] == 0x00 && sig[5]&0x80 == 0 {
+		return false
+	}
+
+	// Check whether the S element is an integer.
+	if sig[lenR+4] != 0x02 {
+		return false
+	}
+
+	// Zero-length integers are not allowed for S.
+	if lenS == 0 {
+		return false
+	}
+
+	// Negative numbers are not allowed for S.
+	if sig[lenR+6]&0x80 != 0 {
+		return false
+	}
+
+	// Null bytes at the start of S are not allowed, unless S would otherwise be
+	// interpreted as a negative number.
+	if lenS > 1 && sig[lenR+6] == 0x00 && sig[lenR+7]&0x80 == 0 {
+		return false
+	}
+
+	return true
+}
+
+// IsLowSSignature checks that the S value in a DER-encoded signature is in the
+// lower half of the curve order (BIP62 rule 5). The signature must already be
+// valid DER encoding. The signature includes the sighash type byte.
+func IsLowSSignature(sig []byte) bool {
+	if !IsValidDERSignatureEncoding(sig) {
+		return false
+	}
+
+	// Extract S value from DER signature (without sighash byte)
+	lenR := int(sig[3])
+	sStart := 6 + lenR
+	lenS := int(sig[5+lenR])
+	sBytes := sig[sStart : sStart+lenS]
+
+	// The secp256k1 curve order / 2:
+	// 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0
+	halfOrder := [32]byte{
+		0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0x5D, 0x57, 0x6E, 0x73, 0x57, 0xA4, 0x50, 0x1D,
+		0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
+	}
+
+	// Pad S to 32 bytes for comparison
+	var sPadded [32]byte
+	if lenS > 32 {
+		return false
+	}
+	copy(sPadded[32-lenS:], sBytes)
+
+	// Compare: S must be <= halfOrder
+	for i := 0; i < 32; i++ {
+		if sPadded[i] < halfOrder[i] {
+			return true
+		}
+		if sPadded[i] > halfOrder[i] {
+			return false
+		}
+	}
+	return true // equal is ok
+}
+
+// IsCompressedPubKey returns true if the public key is a compressed public key
+// (33 bytes starting with 0x02 or 0x03).
+func IsCompressedPubKey(pubKey []byte) bool {
+	return len(pubKey) == 33 && (pubKey[0] == 0x02 || pubKey[0] == 0x03)
 }

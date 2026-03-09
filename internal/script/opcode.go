@@ -352,7 +352,8 @@ const (
 	MaxStackSize       = 1000  // Maximum stack items
 	MaxOpsPerScript    = 201   // Maximum non-push operations per script
 	MaxScriptNumLen    = 4     // Maximum script number size in bytes
-	MaxPubKeysPerMultisig = 20 // Maximum public keys in multisig
+	MaxPubKeysPerMultisig  = 20  // Maximum public keys in multisig
+	MaxScriptElementSize   = 520 // Maximum size of a push data element
 
 	// TapscriptSigopBudgetCost is the cost per signature operation in tapscript (BIP342).
 	// The total budget is 50 + witness_size.

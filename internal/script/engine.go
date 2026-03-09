@@ -37,6 +37,12 @@ var (
 	ErrCSVFailed                = errors.New("OP_CHECKSEQUENCEVERIFY failed")
 	ErrTapscriptCheckMultiSig   = errors.New("OP_CHECKMULTISIG(VERIFY) not allowed in tapscript")
 	ErrTaprootControlBlockSize  = errors.New("taproot control block wrong size")
+	ErrNullFail                 = errors.New("non-empty signature on failed CHECKSIG when NULLFAIL is active")
+	ErrSigPushOnly              = errors.New("scriptSig contains non-push opcode")
+	ErrWitnessUnexpected        = errors.New("unexpected witness data for non-witness script")
+	ErrSigDER                   = errors.New("signature is not valid DER encoding")
+	ErrSigHighS                 = errors.New("signature S value is not low")
+	ErrWitnessPubKeyType        = errors.New("witness v0 requires compressed public key")
 )
 
 // ScriptFlags control which script validation rules are enabled.
@@ -53,8 +59,11 @@ const (
 	ScriptVerifyNullDummy      ScriptFlags = 1 << 6  // BIP147 - null dummy for CHECKMULTISIG
 	ScriptVerifyStrictEncoding ScriptFlags = 1 << 7  // Strict signature/pubkey encoding
 	ScriptVerifyTaproot        ScriptFlags = 1 << 8  // BIP341/342
-	ScriptVerifyCLTV           ScriptFlags = 1 << 9  // BIP65 - CHECKLOCKTIMEVERIFY
-	ScriptVerifyCSV            ScriptFlags = 1 << 10 // BIP112 - CHECKSEQUENCEVERIFY
+	ScriptVerifyCLTV              ScriptFlags = 1 << 9  // BIP65 - CHECKLOCKTIMEVERIFY
+	ScriptVerifyCSV               ScriptFlags = 1 << 10 // BIP112 - CHECKSEQUENCEVERIFY
+	ScriptVerifyNullFail          ScriptFlags = 1 << 11 // BIP146 - NULLFAIL
+	ScriptVerifySigPushOnly       ScriptFlags = 1 << 12 // Require scriptSig is push-only
+	ScriptVerifyWitnessPubKeyType ScriptFlags = 1 << 13 // BIP141 - compressed keys in witness v0
 )
 
 // SigVersion indicates the signature validation rules to use.
@@ -124,10 +133,16 @@ func (e *Engine) Execute() error {
 	// Detect witness program
 	witnessVersion, witnessProgram := ExtractWitnessProgram(scriptPubKey)
 	hasWitness := witnessVersion >= 0
+	hadWitness := false // tracks whether any witness program was executed
 
 	// For native segwit, scriptSig must be empty
 	if hasWitness && (e.flags&ScriptVerifyWitness != 0) && len(scriptSig) > 0 {
 		return ErrWitnessMalleated
+	}
+
+	// SIGPUSHONLY: scriptSig must contain only push operations
+	if (e.flags&ScriptVerifySigPushOnly != 0) && !IsPushOnly(scriptSig) {
+		return ErrSigPushOnly
 	}
 
 	// Execute scriptSig (for non-segwit or P2SH-wrapped segwit)
@@ -170,6 +185,7 @@ func (e *Engine) Execute() error {
 
 		if witnessVersion >= 0 && (e.flags&ScriptVerifyWitness != 0) {
 			// P2SH-wrapped segwit
+			hadWitness = true
 			// Fix #7: P2SH-wrapped witness v1+ is not executed (BIP341).
 			if witnessVersion >= 1 {
 				return nil
@@ -198,6 +214,7 @@ func (e *Engine) Execute() error {
 
 	// Handle native witness program
 	if hasWitness && (e.flags&ScriptVerifyWitness != 0) {
+		hadWitness = true
 		if err := e.executeWitnessProgram(witnessVersion, witnessProgram, txIn.Witness); err != nil {
 			return err
 		}
@@ -208,6 +225,12 @@ func (e *Engine) Execute() error {
 		if e.stack.Size() != 0 {
 			return ErrScriptNotClean
 		}
+	}
+
+	// WITNESS_UNEXPECTED: if no witness program was found but the input has
+	// non-empty witness data, the script must fail.
+	if (e.flags&ScriptVerifyWitness != 0) && !hadWitness && len(txIn.Witness) > 0 {
+		return ErrWitnessUnexpected
 	}
 
 	return nil
@@ -510,11 +533,6 @@ func (e *Engine) executeScript(script []byte) error {
 	pc := 0 // Program counter
 	var opcodePos uint32 // Fix #5: opcode index counter for OP_CODESEPARATOR
 	for pc < len(script) {
-		// Check stack size limit
-		if e.stack.Size()+e.altStack.Size() > MaxStackSize {
-			return ErrStackOverflow
-		}
-
 		op := script[pc]
 		pc++
 
@@ -541,6 +559,9 @@ func (e *Engine) executeScript(script []byte) error {
 			if pc+dataLen > len(script) {
 				return fmt.Errorf("script too short for push of %d bytes", dataLen)
 			}
+			if dataLen > MaxScriptElementSize {
+				return ErrPushSize
+			}
 			if executing {
 				e.stack.Push(script[pc : pc+dataLen])
 			}
@@ -557,6 +578,9 @@ func (e *Engine) executeScript(script []byte) error {
 			pc++
 			if pc+dataLen > len(script) {
 				return errors.New("script too short for OP_PUSHDATA1 data")
+			}
+			if dataLen > MaxScriptElementSize {
+				return ErrPushSize
 			}
 			if executing {
 				e.stack.Push(script[pc : pc+dataLen])
@@ -575,6 +599,9 @@ func (e *Engine) executeScript(script []byte) error {
 			if pc+dataLen > len(script) {
 				return errors.New("script too short for OP_PUSHDATA2 data")
 			}
+			if dataLen > MaxScriptElementSize {
+				return ErrPushSize
+			}
 			if executing {
 				e.stack.Push(script[pc : pc+dataLen])
 			}
@@ -591,6 +618,9 @@ func (e *Engine) executeScript(script []byte) error {
 			pc += 4
 			if pc+dataLen > len(script) {
 				return errors.New("script too short for OP_PUSHDATA4 data")
+			}
+			if dataLen > MaxScriptElementSize {
+				return ErrPushSize
 			}
 			if executing {
 				e.stack.Push(script[pc : pc+dataLen])
@@ -651,6 +681,10 @@ func (e *Engine) executeScript(script []byte) error {
 			}
 			e.condStack = append(e.condStack, executing && cond)
 			opcodePos++
+			// Stack size check after control flow opcode
+			if e.stack.Size()+e.altStack.Size() > MaxStackSize {
+				return ErrStackOverflow
+			}
 			continue
 
 		case OP_ELSE:
@@ -662,6 +696,10 @@ func (e *Engine) executeScript(script []byte) error {
 				e.condStack[len(e.condStack)-1] = !e.condStack[len(e.condStack)-1]
 			}
 			opcodePos++
+			// Stack size check after control flow opcode
+			if e.stack.Size()+e.altStack.Size() > MaxStackSize {
+				return ErrStackOverflow
+			}
 			continue
 
 		case OP_ENDIF:
@@ -670,6 +708,10 @@ func (e *Engine) executeScript(script []byte) error {
 			}
 			e.condStack = e.condStack[:len(e.condStack)-1]
 			opcodePos++
+			// Stack size check after control flow opcode
+			if e.stack.Size()+e.altStack.Size() > MaxStackSize {
+				return ErrStackOverflow
+			}
 			continue
 		}
 
@@ -684,6 +726,11 @@ func (e *Engine) executeScript(script []byte) error {
 			return err
 		}
 		opcodePos++
+
+		// Check stack size limit after every opcode execution
+		if e.stack.Size()+e.altStack.Size() > MaxStackSize {
+			return ErrStackOverflow
+		}
 	}
 
 	// Check for unbalanced conditionals
@@ -985,6 +1032,43 @@ func ExtractWitnessProgram(script []byte) (version int, program []byte) {
 	}
 
 	return version, script[2:]
+}
+
+// IsPushOnly returns true if the script contains only push operations.
+// This is used for the SIGPUSHONLY check on scriptSig.
+func IsPushOnly(script []byte) bool {
+	pc := 0
+	for pc < len(script) {
+		op := script[pc]
+		pc++
+
+		if op > OP_16 {
+			return false
+		}
+
+		// Skip push data
+		if op >= 0x01 && op <= 0x4b {
+			pc += int(op)
+		} else if op == OP_PUSHDATA1 {
+			if pc >= len(script) {
+				return false
+			}
+			pc += 1 + int(script[pc])
+		} else if op == OP_PUSHDATA2 {
+			if pc+2 > len(script) {
+				return false
+			}
+			dataLen := int(script[pc]) | int(script[pc+1])<<8
+			pc += 2 + dataLen
+		} else if op == OP_PUSHDATA4 {
+			if pc+4 > len(script) {
+				return false
+			}
+			dataLen := int(script[pc]) | int(script[pc+1])<<8 | int(script[pc+2])<<16 | int(script[pc+3])<<24
+			pc += 4 + dataLen
+		}
+	}
+	return true
 }
 
 // VerifyScript is a convenience function to verify a transaction input.
