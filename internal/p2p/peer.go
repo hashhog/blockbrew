@@ -411,6 +411,12 @@ func (p *Peer) handleMessage(msg Message) {
 		p.mu.Unlock()
 	case *MsgSendCmpct:
 		// Record compact block preferences (handled in BIP152 negotiation)
+	case *MsgCmpctBlock:
+		// Compact block received - would need reconstruction logic
+	case *MsgGetBlockTxn:
+		// Peer requesting missing transactions for compact block
+	case *MsgBlockTxn:
+		// Missing transactions received for compact block reconstruction
 	}
 }
 
