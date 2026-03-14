@@ -33,9 +33,11 @@ func GetBlockScriptFlags(height int32, params *ChainParams) script.ScriptFlags {
 	}
 
 	// BIP141/BIP143/BIP147: Segregated Witness (activated at SegwitHeight)
+	// BIP146: NULLFAIL is also activated with segwit
 	if height >= params.SegwitHeight {
 		flags |= script.ScriptVerifyWitness
 		flags |= script.ScriptVerifyNullDummy
+		flags |= script.ScriptVerifyNullFail
 	}
 
 	// BIP341/BIP342: Taproot (activated at TaprootHeight)
