@@ -30,7 +30,9 @@ type ChainParams struct {
 	ScriptHashAddrID       byte
 	PrivateKeyID           byte // WIF prefix
 	HDCoinType             uint32
-	MinDiffReductionTime   bool // Testnet allows min-difficulty blocks
+	MinDiffReductionTime   bool // Testnet allows min-difficulty blocks after 20min gap
+	PowNoRetargeting       bool // Regtest: never adjust difficulty
+	EnforceBIP94           bool // Testnet4: use first block of period for retarget base
 }
 
 // mainnetPowLimit is the highest proof of work value a Bitcoin block can have
@@ -60,6 +62,9 @@ var regtestParams *ChainParams
 
 // signetParams holds the chain parameters for signet.
 var signetParams *ChainParams
+
+// testnet4Params holds the chain parameters for testnet4.
+var testnet4Params *ChainParams
 
 // MainnetParams returns the chain parameters for mainnet.
 func MainnetParams() *ChainParams {
@@ -104,6 +109,8 @@ func MainnetParams() *ChainParams {
 		PrivateKeyID:           0x80,
 		HDCoinType:             0,
 		MinDiffReductionTime:   false,
+		PowNoRetargeting:       false,
+		EnforceBIP94:           false,
 	}
 	return mainnetParams
 }
@@ -146,6 +153,8 @@ func TestnetParams() *ChainParams {
 		PrivateKeyID:           0xef,
 		HDCoinType:             1,
 		MinDiffReductionTime:   true,
+		PowNoRetargeting:       false,
+		EnforceBIP94:           false,
 	}
 	return testnetParams
 }
@@ -183,6 +192,7 @@ func RegtestParams() *ChainParams {
 		PrivateKeyID:           0xef,
 		HDCoinType:             1,
 		MinDiffReductionTime:   true,
+		PowNoRetargeting:       true,
 	}
 	return regtestParams
 }
@@ -222,6 +232,50 @@ func SignetParams() *ChainParams {
 		PrivateKeyID:           0xef,
 		HDCoinType:             1,
 		MinDiffReductionTime:   false,
+		PowNoRetargeting:       false,
+		EnforceBIP94:           false,
 	}
 	return signetParams
+}
+
+// Testnet4Params returns the chain parameters for testnet4 (BIP 94).
+func Testnet4Params() *ChainParams {
+	if testnet4Params != nil {
+		return testnet4Params
+	}
+
+	genesisBlock := Testnet4GenesisBlock()
+	genesisHash := genesisBlock.Header.BlockHash()
+
+	testnet4Params = &ChainParams{
+		Name:        "testnet4",
+		DefaultPort: 48333,
+		DNSSeeds: []string{
+			"seed.testnet4.bitcoin.sprovoost.nl",
+			"seed.testnet4.wiz.biz",
+		},
+		GenesisBlock:           genesisBlock,
+		GenesisHash:            genesisHash,
+		PowLimitBits:           0x1d00ffff,
+		PowLimit:               mainnetPowLimit,
+		TargetTimespan:         TargetTimespan,
+		TargetSpacing:          TargetSpacing,
+		DifficultyAdjInterval:  DifficultyAdjustmentInterval,
+		SubsidyHalvingInterval: SubsidyHalvingInterval,
+		BIP34Height:            1,  // All BIPs active from genesis
+		BIP65Height:            1,
+		BIP66Height:            1,
+		CSVHeight:              1,
+		SegwitHeight:           1,
+		TaprootHeight:          1,
+		Bech32HRP:              "tb",
+		PubKeyHashAddrID:       0x6f,
+		ScriptHashAddrID:       0xc4,
+		PrivateKeyID:           0xef,
+		HDCoinType:             1,
+		MinDiffReductionTime:   true,
+		PowNoRetargeting:       false,
+		EnforceBIP94:           true,
+	}
+	return testnet4Params
 }
