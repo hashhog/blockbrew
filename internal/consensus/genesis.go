@@ -138,3 +138,63 @@ func SignetGenesisBlock() *wire.MsgBlock {
 		Transactions: []*wire.MsgTx{coinbaseTx},
 	}
 }
+
+// testnet4GenesisCoinbaseTx creates the coinbase transaction for testnet4 genesis.
+// Testnet4 uses a different message and output script than mainnet.
+// Message: "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+// Output script: <32 zero bytes> OP_CHECKSIG
+func testnet4GenesisCoinbaseTx() *wire.MsgTx {
+	// The coinbase scriptSig: 0x04ffff001d0104 + len + "03/May/2024 000000000000000000001ebd58c244970b3aa9d783bb001011fbe8ea8e98e00e"
+	// Built using the same formula as mainnet: << 486604799 << CScriptNum(4) << message
+	// 486604799 in little-endian with push opcode = 04 ffff001d
+	// CScriptNum(4) = 01 04
+	// Message length = 79 bytes = 0x4f
+	scriptSig, _ := hex.DecodeString("04ffff001d01044f30332f4d61792f32303234203030303030303030303030303030303030303030303165626435386332343439373062336161396437383362623030313031316662653865613865393865303065")
+
+	// Output script: <push 32 bytes of zeros> OP_CHECKSIG
+	// 0x20 (push 32 bytes) + 32 zeros + 0xac (OP_CHECKSIG)
+	pkScript, _ := hex.DecodeString("200000000000000000000000000000000000000000000000000000000000000000ac")
+
+	return &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  wire.Hash256{}, // All zeros
+					Index: 0xFFFFFFFF,      // Coinbase marker
+				},
+				SignatureScript: scriptSig,
+				Sequence:        0xFFFFFFFF,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    50 * SatoshiPerBitcoin, // 50 BTC
+				PkScript: pkScript,
+			},
+		},
+		LockTime: 0,
+	}
+}
+
+// Testnet4GenesisBlock returns the genesis block for testnet4 (BIP 94).
+// Block hash: 00000000da84f2bafbbc53dee25a72ae507ff4914b867c565be350b0da8bf043
+// Merkle root: 7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e
+func Testnet4GenesisBlock() *wire.MsgBlock {
+	coinbaseTx := testnet4GenesisCoinbaseTx()
+
+	// Merkle root for testnet4
+	merkleRoot, _ := wire.NewHash256FromHex("7aa0a7ae1e223414cb807e40cd57e667b718e42aaf9306db9102fe28912b7b4e")
+
+	return &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    1,
+			PrevBlock:  wire.Hash256{}, // All zeros
+			MerkleRoot: merkleRoot,
+			Timestamp:  1714777860, // 2024-05-03 23:11:00 UTC
+			Bits:       0x1d00ffff,
+			Nonce:      393743547,
+		},
+		Transactions: []*wire.MsgTx{coinbaseTx},
+	}
+}
