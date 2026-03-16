@@ -955,3 +955,380 @@ func TestWitnessCommitmentMagic(t *testing.T) {
 		t.Errorf("WitnessCommitmentMagic = %x, want %x", WitnessCommitmentMagic, expected)
 	}
 }
+
+// TestBIP68SequenceLockConstants verifies the BIP68 sequence lock constants.
+func TestBIP68SequenceLockConstants(t *testing.T) {
+	// BIP68 constants from consensus/params.go
+	if SequenceLockTimeDisabledFlag != 0x80000000 {
+		t.Errorf("SequenceLockTimeDisabledFlag = %x, want 0x80000000", SequenceLockTimeDisabledFlag)
+	}
+	if SequenceLockTimeTypeFlag != 0x00400000 {
+		t.Errorf("SequenceLockTimeTypeFlag = %x, want 0x00400000", SequenceLockTimeTypeFlag)
+	}
+	if SequenceLockTimeMask != 0x0000ffff {
+		t.Errorf("SequenceLockTimeMask = %x, want 0x0000ffff", SequenceLockTimeMask)
+	}
+	if SequenceLockTimeGranularity != 9 {
+		t.Errorf("SequenceLockTimeGranularity = %d, want 9", SequenceLockTimeGranularity)
+	}
+	// 2^9 = 512 seconds
+	if (1 << SequenceLockTimeGranularity) != 512 {
+		t.Errorf("Time granularity should be 512 seconds")
+	}
+}
+
+// TestCalculateSequenceLocks tests BIP68 sequence lock calculation.
+func TestCalculateSequenceLocks(t *testing.T) {
+	// Create a mock MTP lookup function
+	// Simulates MTP increasing by 600 seconds (10 min) per block
+	mockMTP := func(height int32) int64 {
+		if height < 0 {
+			return 0
+		}
+		return int64(1600000000) + int64(height)*600
+	}
+
+	tests := []struct {
+		name        string
+		txVersion   int32
+		sequences   []uint32
+		prevHeights []int32
+		wantHeight  int32
+		wantTime    int64
+	}{
+		{
+			name:        "version 1 tx ignores sequence locks",
+			txVersion:   1,
+			sequences:   []uint32{10}, // Would be height lock of 10
+			prevHeights: []int32{100},
+			wantHeight:  -1, // No lock
+			wantTime:    -1,
+		},
+		{
+			name:        "version 2 tx with disabled flag",
+			txVersion:   2,
+			sequences:   []uint32{SequenceLockTimeDisabledFlag | 10},
+			prevHeights: []int32{100},
+			wantHeight:  -1, // No lock
+			wantTime:    -1,
+		},
+		{
+			name:        "height-based lock of 10 blocks",
+			txVersion:   2,
+			sequences:   []uint32{10},
+			prevHeights: []int32{100},
+			wantHeight:  100 + 10 - 1, // 109
+			wantTime:    -1,
+		},
+		{
+			name:        "height-based lock of 1 block (minimum)",
+			txVersion:   2,
+			sequences:   []uint32{1},
+			prevHeights: []int32{100},
+			wantHeight:  100, // 100 + 1 - 1
+			wantTime:    -1,
+		},
+		{
+			name:        "time-based lock of 512 seconds (1 unit)",
+			txVersion:   2,
+			sequences:   []uint32{SequenceLockTimeTypeFlag | 1},
+			prevHeights: []int32{100},
+			// MTP at height 99 (prevHeight - 1) = 1600000000 + 99*600 = 1600059400
+			// lockedTime = (1 << 9) - 1 = 511
+			// minTime = 1600059400 + 511 = 1600059911
+			wantHeight: -1,
+			wantTime:   mockMTP(99) + 511,
+		},
+		{
+			name:        "time-based lock of 65535 units (max)",
+			txVersion:   2,
+			sequences:   []uint32{SequenceLockTimeTypeFlag | 0xFFFF},
+			prevHeights: []int32{100},
+			// lockedTime = (65535 << 9) - 1 = 33553919
+			wantHeight: -1,
+			wantTime:   mockMTP(99) + 33553919,
+		},
+		{
+			name:        "multiple inputs - take maximum height",
+			txVersion:   2,
+			sequences:   []uint32{5, 10, 3},
+			prevHeights: []int32{100, 50, 200},
+			// Input 0: 100 + 5 - 1 = 104
+			// Input 1: 50 + 10 - 1 = 59
+			// Input 2: 200 + 3 - 1 = 202 (maximum)
+			wantHeight: 202,
+			wantTime:   -1,
+		},
+		{
+			name:      "mixed height and time locks",
+			txVersion: 2,
+			sequences: []uint32{
+				10,                                // Height lock: 10 blocks
+				SequenceLockTimeTypeFlag | 100,    // Time lock: 100 * 512 seconds
+				SequenceLockTimeDisabledFlag | 99, // Disabled
+			},
+			prevHeights: []int32{100, 50, 200},
+			// Height: 100 + 10 - 1 = 109
+			// Time: MTP(49) + (100 << 9) - 1 = MTP(49) + 51199
+			wantHeight: 109,
+			wantTime:   mockMTP(49) + 51199,
+		},
+		{
+			name:        "zero height lock (immediate)",
+			txVersion:   2,
+			sequences:   []uint32{0},
+			prevHeights: []int32{100},
+			// 100 + 0 - 1 = 99
+			wantHeight: 99,
+			wantTime:   -1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create transaction with specified version and inputs
+			tx := &wire.MsgTx{
+				Version: tt.txVersion,
+				TxIn:    make([]*wire.TxIn, len(tt.sequences)),
+				TxOut:   []*wire.TxOut{{Value: 1000}},
+			}
+
+			for i, seq := range tt.sequences {
+				tx.TxIn[i] = &wire.TxIn{
+					PreviousOutPoint: wire.OutPoint{
+						Hash:  wire.Hash256{byte(i + 1)}, // Non-zero hash
+						Index: 0,
+					},
+					Sequence: seq,
+				}
+			}
+
+			lock := CalculateSequenceLocks(tx, tt.prevHeights, mockMTP)
+
+			if lock.MinHeight != tt.wantHeight {
+				t.Errorf("MinHeight = %d, want %d", lock.MinHeight, tt.wantHeight)
+			}
+			if lock.MinTime != tt.wantTime {
+				t.Errorf("MinTime = %d, want %d", lock.MinTime, tt.wantTime)
+			}
+		})
+	}
+}
+
+// TestEvaluateSequenceLocks tests sequence lock evaluation.
+func TestEvaluateSequenceLocks(t *testing.T) {
+	tests := []struct {
+		name        string
+		lock        *SequenceLock
+		blockHeight int32
+		blockMTP    int64
+		want        bool
+	}{
+		{
+			name:        "no locks (both -1)",
+			lock:        &SequenceLock{MinHeight: -1, MinTime: -1},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        true,
+		},
+		{
+			name:        "height lock satisfied",
+			lock:        &SequenceLock{MinHeight: 99, MinTime: -1},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        true,
+		},
+		{
+			name:        "height lock exactly at boundary (not satisfied)",
+			lock:        &SequenceLock{MinHeight: 100, MinTime: -1},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        false, // MinHeight >= blockHeight
+		},
+		{
+			name:        "height lock not satisfied",
+			lock:        &SequenceLock{MinHeight: 150, MinTime: -1},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        false,
+		},
+		{
+			name:        "time lock satisfied",
+			lock:        &SequenceLock{MinHeight: -1, MinTime: 1599999999},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        true,
+		},
+		{
+			name:        "time lock exactly at boundary (not satisfied)",
+			lock:        &SequenceLock{MinHeight: -1, MinTime: 1600000000},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        false, // MinTime >= blockMTP
+		},
+		{
+			name:        "time lock not satisfied",
+			lock:        &SequenceLock{MinHeight: -1, MinTime: 1600001000},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        false,
+		},
+		{
+			name:        "both locks satisfied",
+			lock:        &SequenceLock{MinHeight: 50, MinTime: 1599999000},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        true,
+		},
+		{
+			name:        "height satisfied, time not",
+			lock:        &SequenceLock{MinHeight: 50, MinTime: 1600001000},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        false,
+		},
+		{
+			name:        "time satisfied, height not",
+			lock:        &SequenceLock{MinHeight: 150, MinTime: 1599999000},
+			blockHeight: 100,
+			blockMTP:    1600000000,
+			want:        false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := EvaluateSequenceLocks(tt.lock, tt.blockHeight, tt.blockMTP)
+			if got != tt.want {
+				t.Errorf("EvaluateSequenceLocks() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBIP68TimeLockGranularity verifies that time locks use 512-second granularity.
+func TestBIP68TimeLockGranularity(t *testing.T) {
+	baseMTP := int64(1600000000)
+	mockMTP := func(height int32) int64 {
+		return baseMTP
+	}
+
+	tests := []struct {
+		sequenceValue uint16
+		expectedDelta int64 // Expected delta from base MTP
+	}{
+		{1, (1 << 9) - 1},      // 511 seconds
+		{2, (2 << 9) - 1},      // 1023 seconds
+		{10, (10 << 9) - 1},    // 5119 seconds
+		{100, (100 << 9) - 1},  // 51199 seconds
+		{1000, (1000 << 9) - 1}, // ~8.5 hours
+	}
+
+	for _, tt := range tests {
+		t.Run("", func(t *testing.T) {
+			tx := &wire.MsgTx{
+				Version: 2,
+				TxIn: []*wire.TxIn{{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{1}, Index: 0},
+					Sequence:         SequenceLockTimeTypeFlag | uint32(tt.sequenceValue),
+				}},
+				TxOut: []*wire.TxOut{{Value: 1000}},
+			}
+
+			// prevHeight = 1, so we get MTP at height 0
+			lock := CalculateSequenceLocks(tx, []int32{1}, mockMTP)
+
+			expectedMinTime := baseMTP + tt.expectedDelta
+			if lock.MinTime != expectedMinTime {
+				t.Errorf("sequence %d: MinTime = %d, want %d (delta %d)",
+					tt.sequenceValue, lock.MinTime, expectedMinTime, tt.expectedDelta)
+			}
+		})
+	}
+}
+
+// TestBIP68CoinbaseInput verifies that coinbase inputs are skipped.
+func TestBIP68CoinbaseInput(t *testing.T) {
+	mockMTP := func(height int32) int64 { return 1600000000 }
+
+	// Create a transaction with a coinbase-like input (null hash, max index)
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  wire.Hash256{}, // All zeros
+					Index: 0xFFFFFFFF,
+				},
+				Sequence: 10, // Would be a 10-block lock if not skipped
+			},
+		},
+		TxOut: []*wire.TxOut{{Value: 1000}},
+	}
+
+	lock := CalculateSequenceLocks(tx, []int32{100}, mockMTP)
+
+	// Coinbase input should be skipped, so no locks
+	if lock.MinHeight != -1 {
+		t.Errorf("MinHeight = %d, want -1 (coinbase input should be skipped)", lock.MinHeight)
+	}
+	if lock.MinTime != -1 {
+		t.Errorf("MinTime = %d, want -1 (coinbase input should be skipped)", lock.MinTime)
+	}
+}
+
+// TestBIP68CorrectMTPHeight verifies that time-based locks use MTP at (prevHeight - 1).
+func TestBIP68CorrectMTPHeight(t *testing.T) {
+	// Track which heights the MTP lookup was called with
+	calledHeights := make(map[int32]bool)
+	mockMTP := func(height int32) int64 {
+		calledHeights[height] = true
+		return int64(1600000000) + int64(height)*600
+	}
+
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{1}, Index: 0},
+			Sequence:         SequenceLockTimeTypeFlag | 1, // Time-based lock
+		}},
+		TxOut: []*wire.TxOut{{Value: 1000}},
+	}
+
+	// Input UTXO was confirmed at height 100
+	// BIP68 should use MTP at height 99 (prevHeight - 1)
+	_ = CalculateSequenceLocks(tx, []int32{100}, mockMTP)
+
+	if !calledHeights[99] {
+		t.Errorf("MTP lookup should have been called with height 99 (prevHeight - 1)")
+	}
+	if calledHeights[100] {
+		t.Errorf("MTP lookup should NOT use the UTXO's confirmation height directly")
+	}
+}
+
+// TestBIP68EdgeCasePrevHeightZero tests edge case when UTXO was confirmed at height 0.
+func TestBIP68EdgeCasePrevHeightZero(t *testing.T) {
+	calledHeights := make(map[int32]bool)
+	mockMTP := func(height int32) int64 {
+		calledHeights[height] = true
+		return int64(1231006505) // Genesis timestamp
+	}
+
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{1}, Index: 0},
+			Sequence:         SequenceLockTimeTypeFlag | 1,
+		}},
+		TxOut: []*wire.TxOut{{Value: 1000}},
+	}
+
+	// UTXO confirmed at height 0 (genesis)
+	// max(0 - 1, 0) = 0, so should use MTP at height 0
+	_ = CalculateSequenceLocks(tx, []int32{0}, mockMTP)
+
+	if !calledHeights[0] {
+		t.Errorf("For prevHeight=0, MTP should be fetched at height 0")
+	}
+}
