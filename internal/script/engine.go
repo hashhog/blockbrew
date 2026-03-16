@@ -92,6 +92,10 @@ type Engine struct {
 	opCount     int           // Number of operations executed
 	codesepPos  uint32        // Position of last OP_CODESEPARATOR (for tapscript)
 	sigopBudget int           // Tapscript signature validation weight budget
+
+	// For legacy sighash: track the script and the byte offset after last OP_CODESEPARATOR
+	currentScript    []byte // The script currently being executed
+	lastCodeSepIdx   int    // Byte index after last OP_CODESEPARATOR (-1 = use entire script)
 }
 
 // NewEngine creates a script execution engine.
@@ -101,16 +105,17 @@ func NewEngine(scriptPubKey []byte, tx *wire.MsgTx, txIdx int, flags ScriptFlags
 	}
 
 	return &Engine{
-		tx:         tx,
-		txIdx:      txIdx,
-		flags:      flags,
-		stack:      NewStack(),
-		altStack:   NewStack(),
-		condStack:  make([]bool, 0),
-		amount:     amount,
-		prevOuts:   prevOuts,
-		sigVersion: SigVersionBase,
-		codesepPos: 0xFFFFFFFF, // Initialize to 0xFFFFFFFF per Bitcoin Core
+		tx:             tx,
+		txIdx:          txIdx,
+		flags:          flags,
+		stack:          NewStack(),
+		altStack:       NewStack(),
+		condStack:      make([]bool, 0),
+		amount:         amount,
+		prevOuts:       prevOuts,
+		sigVersion:     SigVersionBase,
+		codesepPos:     0xFFFFFFFF, // Initialize to 0xFFFFFFFF per Bitcoin Core
+		lastCodeSepIdx: 0,          // Start at beginning of script
 	}, nil
 }
 
@@ -532,6 +537,10 @@ func (e *Engine) executeScript(script []byte) error {
 		return ErrScriptTooLong
 	}
 
+	// Track the script for legacy sighash computation with OP_CODESEPARATOR
+	e.currentScript = script
+	e.lastCodeSepIdx = 0 // Reset: scriptCode starts from beginning
+
 	// Fix #3: OP_SUCCESSx handling for tapscript.
 	if e.sigVersion == SigVersionTapscript {
 		scanPC := 0
@@ -936,7 +945,11 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int, opcodePos uint32)
 		return e.opHash256()
 
 	case OP_CODESEPARATOR:
+		// For tapscript, update codesep_pos (opcode index)
 		e.codesepPos = opcodePos
+		// For legacy scripts, track byte position after this opcode
+		// pc is already positioned after the OP_CODESEPARATOR opcode
+		e.lastCodeSepIdx = pc
 		return nil
 
 	case OP_CHECKSIG:
