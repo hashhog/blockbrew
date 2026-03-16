@@ -1547,3 +1547,306 @@ func TestSigHashKnownValue(t *testing.T) {
 		t.Error("Expected non-zero hash")
 	}
 }
+
+// TestWitnessPubKeyType tests that SCRIPT_VERIFY_WITNESS_PUBKEYTYPE correctly
+// rejects uncompressed public keys in witness v0 scripts.
+// TestWitnessCleanStack tests that witness v0 and v1 (tapscript) unconditionally
+// enforce cleanstack (BIP141/BIP342).
+func TestWitnessCleanStack(t *testing.T) {
+	// Test P2WSH with cleanstack violation (multiple items left on stack)
+	t.Run("P2WSH_extra_item_on_stack", func(t *testing.T) {
+		// Create a witness script that leaves 2 items on the stack: OP_1 OP_1
+		// (both true values, but should fail cleanstack)
+		witnessScript := []byte{OP_1, OP_1}
+		scriptHash := crypto.SHA256Hash(witnessScript)
+
+		// P2WSH scriptPubKey
+		p2wshScript := make([]byte, 34)
+		p2wshScript[0] = OP_0
+		p2wshScript[1] = 32
+		copy(p2wshScript[2:], scriptHash[:])
+
+		prevOut := &wire.TxOut{Value: 100000, PkScript: p2wshScript}
+		prevOuts := []*wire.TxOut{prevOut}
+
+		tx := &wire.MsgTx{
+			Version: 2,
+			TxIn: []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+					Sequence:         0xffffffff,
+					Witness:          [][]byte{witnessScript},
+				},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 90000, PkScript: p2wshScript},
+			},
+		}
+
+		err := VerifyScript(nil, p2wshScript, tx, 0, ScriptVerifyWitness, prevOut.Value, prevOuts)
+		if err != ErrCleanStack {
+			t.Errorf("expected ErrCleanStack, got: %v", err)
+		}
+	})
+
+	t.Run("P2WSH_empty_stack", func(t *testing.T) {
+		// Create a witness script that leaves empty stack: OP_1 OP_DROP
+		witnessScript := []byte{OP_1, OP_DROP}
+		scriptHash := crypto.SHA256Hash(witnessScript)
+
+		// P2WSH scriptPubKey
+		p2wshScript := make([]byte, 34)
+		p2wshScript[0] = OP_0
+		p2wshScript[1] = 32
+		copy(p2wshScript[2:], scriptHash[:])
+
+		prevOut := &wire.TxOut{Value: 100000, PkScript: p2wshScript}
+		prevOuts := []*wire.TxOut{prevOut}
+
+		tx := &wire.MsgTx{
+			Version: 2,
+			TxIn: []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+					Sequence:         0xffffffff,
+					Witness:          [][]byte{witnessScript},
+				},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 90000, PkScript: p2wshScript},
+			},
+		}
+
+		err := VerifyScript(nil, p2wshScript, tx, 0, ScriptVerifyWitness, prevOut.Value, prevOuts)
+		if err != ErrEvalFalse {
+			t.Errorf("expected ErrEvalFalse, got: %v", err)
+		}
+	})
+
+	t.Run("P2WSH_false_on_stack", func(t *testing.T) {
+		// Create a witness script that leaves false on stack: OP_0
+		witnessScript := []byte{OP_0}
+		scriptHash := crypto.SHA256Hash(witnessScript)
+
+		// P2WSH scriptPubKey
+		p2wshScript := make([]byte, 34)
+		p2wshScript[0] = OP_0
+		p2wshScript[1] = 32
+		copy(p2wshScript[2:], scriptHash[:])
+
+		prevOut := &wire.TxOut{Value: 100000, PkScript: p2wshScript}
+		prevOuts := []*wire.TxOut{prevOut}
+
+		tx := &wire.MsgTx{
+			Version: 2,
+			TxIn: []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+					Sequence:         0xffffffff,
+					Witness:          [][]byte{witnessScript},
+				},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 90000, PkScript: p2wshScript},
+			},
+		}
+
+		err := VerifyScript(nil, p2wshScript, tx, 0, ScriptVerifyWitness, prevOut.Value, prevOuts)
+		if err != ErrEvalFalse {
+			t.Errorf("expected ErrEvalFalse, got: %v", err)
+		}
+	})
+
+	t.Run("P2WSH_valid_single_true", func(t *testing.T) {
+		// Create a witness script that leaves exactly one true on stack: OP_1
+		witnessScript := []byte{OP_1}
+		scriptHash := crypto.SHA256Hash(witnessScript)
+
+		// P2WSH scriptPubKey
+		p2wshScript := make([]byte, 34)
+		p2wshScript[0] = OP_0
+		p2wshScript[1] = 32
+		copy(p2wshScript[2:], scriptHash[:])
+
+		prevOut := &wire.TxOut{Value: 100000, PkScript: p2wshScript}
+		prevOuts := []*wire.TxOut{prevOut}
+
+		tx := &wire.MsgTx{
+			Version: 2,
+			TxIn: []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+					Sequence:         0xffffffff,
+					Witness:          [][]byte{witnessScript},
+				},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 90000, PkScript: p2wshScript},
+			},
+		}
+
+		err := VerifyScript(nil, p2wshScript, tx, 0, ScriptVerifyWitness, prevOut.Value, prevOuts)
+		if err != nil {
+			t.Errorf("expected success, got: %v", err)
+		}
+	})
+
+	t.Run("P2WSH_cleanstack_not_gated_by_flag", func(t *testing.T) {
+		// Verify that cleanstack is enforced even WITHOUT ScriptVerifyCleanStack flag
+		// (it's part of BIP141 consensus, not the separate cleanstack policy flag)
+		witnessScript := []byte{OP_1, OP_1} // 2 items on stack
+		scriptHash := crypto.SHA256Hash(witnessScript)
+
+		p2wshScript := make([]byte, 34)
+		p2wshScript[0] = OP_0
+		p2wshScript[1] = 32
+		copy(p2wshScript[2:], scriptHash[:])
+
+		prevOut := &wire.TxOut{Value: 100000, PkScript: p2wshScript}
+		prevOuts := []*wire.TxOut{prevOut}
+
+		tx := &wire.MsgTx{
+			Version: 2,
+			TxIn: []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+					Sequence:         0xffffffff,
+					Witness:          [][]byte{witnessScript},
+				},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 90000, PkScript: p2wshScript},
+			},
+		}
+
+		// Only ScriptVerifyWitness, NOT ScriptVerifyCleanStack
+		err := VerifyScript(nil, p2wshScript, tx, 0, ScriptVerifyWitness, prevOut.Value, prevOuts)
+		if err != ErrCleanStack {
+			t.Errorf("witness cleanstack should be enforced even without ScriptVerifyCleanStack flag, got: %v", err)
+		}
+	})
+}
+
+func TestWitnessPubKeyType(t *testing.T) {
+	// Generate a test key pair
+	privKey, err := crypto.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("GeneratePrivateKey error: %v", err)
+	}
+	pubKey := privKey.PubKey()
+	compressedPubKey := pubKey.SerializeCompressed()
+	uncompressedPubKey := pubKey.SerializeUncompressed()
+
+	// Verify compressed key is 33 bytes starting with 0x02 or 0x03
+	if len(compressedPubKey) != 33 {
+		t.Fatalf("compressed pubkey should be 33 bytes, got %d", len(compressedPubKey))
+	}
+	if compressedPubKey[0] != 0x02 && compressedPubKey[0] != 0x03 {
+		t.Fatalf("compressed pubkey should start with 0x02 or 0x03, got 0x%02x", compressedPubKey[0])
+	}
+
+	// Verify uncompressed key is 65 bytes starting with 0x04
+	if len(uncompressedPubKey) != 65 {
+		t.Fatalf("uncompressed pubkey should be 65 bytes, got %d", len(uncompressedPubKey))
+	}
+	if uncompressedPubKey[0] != 0x04 {
+		t.Fatalf("uncompressed pubkey should start with 0x04, got 0x%02x", uncompressedPubKey[0])
+	}
+
+	// Test helper function directly
+	t.Run("IsCompressedPubKey helper", func(t *testing.T) {
+		if !IsCompressedPubKey(compressedPubKey) {
+			t.Error("IsCompressedPubKey should return true for compressed pubkey")
+		}
+		if IsCompressedPubKey(uncompressedPubKey) {
+			t.Error("IsCompressedPubKey should return false for uncompressed pubkey")
+		}
+		if IsCompressedPubKey([]byte{0x02}) {
+			t.Error("IsCompressedPubKey should return false for too-short key")
+		}
+		if IsCompressedPubKey(nil) {
+			t.Error("IsCompressedPubKey should return false for nil")
+		}
+	})
+
+	// For testing WITNESS_PUBKEYTYPE, we use P2WSH with a simple CHECKSIG script.
+	// This allows us to directly control the pubkey used without hash mismatches.
+	// The witness script is: <pubkey> OP_CHECKSIG
+	// The witness is: <signature> <witnessScript>
+
+	// Helper to build P2WSH witness script: <pubkey> OP_CHECKSIG
+	buildWitnessScript := func(pk []byte) []byte {
+		script := make([]byte, 0, len(pk)+2)
+		script = append(script, byte(len(pk))) // push opcode
+		script = append(script, pk...)
+		script = append(script, OP_CHECKSIG)
+		return script
+	}
+
+	// Helper to create a P2WSH test transaction and run it
+	runP2WSHTest := func(t *testing.T, pk []byte, flags ScriptFlags) error {
+		witnessScript := buildWitnessScript(pk)
+		scriptHash := crypto.SHA256Hash(witnessScript)
+
+		// P2WSH scriptPubKey: OP_0 <32-byte hash>
+		p2wshScript := make([]byte, 34)
+		p2wshScript[0] = OP_0
+		p2wshScript[1] = 32
+		copy(p2wshScript[2:], scriptHash[:])
+
+		prevOut := &wire.TxOut{Value: 100000, PkScript: p2wshScript}
+		prevOuts := []*wire.TxOut{prevOut}
+
+		tx := &wire.MsgTx{
+			Version: 2,
+			TxIn: []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+					Sequence:         0xffffffff,
+				},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 90000, PkScript: p2wshScript},
+			},
+		}
+
+		// Sign with the witness script
+		sighash, err := CalcWitnessSignatureHash(witnessScript, SigHashAll, tx, 0, prevOut.Value)
+		if err != nil {
+			t.Fatalf("CalcWitnessSignatureHash error: %v", err)
+		}
+		sig, err := crypto.SignECDSA(privKey, sighash)
+		if err != nil {
+			t.Fatalf("SignECDSA error: %v", err)
+		}
+		sig = append(sig, byte(SigHashAll))
+
+		// P2WSH witness: [sig, witnessScript]
+		// The witnessScript contains the pubkey, so sig is pushed as a stack item
+		tx.TxIn[0].Witness = [][]byte{sig, witnessScript}
+
+		return VerifyScript(nil, p2wshScript, tx, 0, flags, prevOut.Value, prevOuts)
+	}
+
+	t.Run("P2WSH with compressed pubkey and flag enabled", func(t *testing.T) {
+		err := runP2WSHTest(t, compressedPubKey, ScriptVerifyWitness|ScriptVerifyWitnessPubKeyType)
+		if err != nil {
+			t.Errorf("expected success, got error: %v", err)
+		}
+	})
+
+	t.Run("P2WSH with uncompressed pubkey and flag enabled", func(t *testing.T) {
+		err := runP2WSHTest(t, uncompressedPubKey, ScriptVerifyWitness|ScriptVerifyWitnessPubKeyType)
+		if err != ErrWitnessPubKeyType {
+			t.Errorf("expected ErrWitnessPubKeyType, got: %v", err)
+		}
+	})
+
+	t.Run("P2WSH with uncompressed pubkey without flag", func(t *testing.T) {
+		// Without WITNESS_PUBKEYTYPE flag, uncompressed keys should be allowed
+		err := runP2WSHTest(t, uncompressedPubKey, ScriptVerifyWitness)
+		if err != nil {
+			t.Errorf("expected success without WITNESS_PUBKEYTYPE flag, got: %v", err)
+		}
+	})
+}
