@@ -782,6 +782,141 @@ func TestCheckMultiSigNullDummy(t *testing.T) {
 	}
 }
 
+func TestNullFail(t *testing.T) {
+	// BIP146 NULLFAIL: when signature verification fails and NULLFAIL is active,
+	// the signature must be the empty byte vector, otherwise the script fails.
+	privKey, _ := crypto.GeneratePrivateKey()
+	pubKey := privKey.PubKey()
+
+	pkBytes := pubKey.SerializeCompressed()
+
+	// P2PKH-style scriptPubKey
+	pubKeyHash := crypto.Hash160(pkBytes)
+	scriptPubKey := []byte{OP_DUP, OP_HASH160, 20}
+	scriptPubKey = append(scriptPubKey, pubKeyHash[:]...)
+	scriptPubKey = append(scriptPubKey, OP_EQUALVERIFY, OP_CHECKSIG)
+
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 90000, PkScript: []byte{}},
+		},
+	}
+
+	prevOut := &wire.TxOut{Value: 100000, PkScript: scriptPubKey}
+
+	// Create an invalid signature (wrong key signs)
+	otherPrivKey, _ := crypto.GeneratePrivateKey()
+	sighash, _ := CalcSignatureHash(scriptPubKey, SigHashAll, tx, 0)
+	wrongSig, _ := crypto.SignECDSA(otherPrivKey, sighash)
+	wrongSig = append(wrongSig, byte(SigHashAll))
+
+	// ScriptSig with non-empty invalid signature
+	scriptSig := []byte{byte(len(wrongSig))}
+	scriptSig = append(scriptSig, wrongSig...)
+	scriptSig = append(scriptSig, byte(len(pkBytes)))
+	scriptSig = append(scriptSig, pkBytes...)
+	tx.TxIn[0].SignatureScript = scriptSig
+
+	// With NULLFAIL, non-empty failing signature must error
+	err := VerifyScript(scriptSig, scriptPubKey, tx, 0, ScriptVerifyNullFail, prevOut.Value, []*wire.TxOut{prevOut})
+	if err != ErrNullFail {
+		t.Errorf("Expected ErrNullFail with non-empty invalid signature, got %v", err)
+	}
+
+	// Without NULLFAIL, the invalid sig just returns false (script fails)
+	err = VerifyScript(scriptSig, scriptPubKey, tx, 0, ScriptVerifyNone, prevOut.Value, []*wire.TxOut{prevOut})
+	if err != ErrScriptFailed {
+		t.Errorf("Expected ErrScriptFailed without NULLFAIL, got %v", err)
+	}
+
+	// With empty signature (valid NULLFAIL behavior), script still fails but not with ErrNullFail
+	emptyScriptSig := []byte{0} // Push empty byte array
+	emptyScriptSig = append(emptyScriptSig, byte(len(pkBytes)))
+	emptyScriptSig = append(emptyScriptSig, pkBytes...)
+	tx.TxIn[0].SignatureScript = emptyScriptSig
+
+	err = VerifyScript(emptyScriptSig, scriptPubKey, tx, 0, ScriptVerifyNullFail, prevOut.Value, []*wire.TxOut{prevOut})
+	// Should fail but NOT with ErrNullFail (empty sig is allowed to fail)
+	if err == ErrNullFail {
+		t.Errorf("Empty signature should not trigger ErrNullFail")
+	}
+	if err == nil {
+		t.Errorf("Empty signature should not pass verification")
+	}
+}
+
+func TestNullFailMultiSig(t *testing.T) {
+	// BIP146 NULLFAIL for CHECKMULTISIG: if multisig fails, all signatures
+	// must be empty when NULLFAIL is active
+	privKey1, _ := crypto.GeneratePrivateKey()
+	pubKey1 := privKey1.PubKey()
+	pkBytes1 := pubKey1.SerializeCompressed()
+
+	privKey2, _ := crypto.GeneratePrivateKey()
+	pubKey2 := privKey2.PubKey()
+	pkBytes2 := pubKey2.SerializeCompressed()
+
+	// 2-of-2 multisig
+	redeemScript := []byte{OP_2}
+	redeemScript = append(redeemScript, byte(len(pkBytes1)))
+	redeemScript = append(redeemScript, pkBytes1...)
+	redeemScript = append(redeemScript, byte(len(pkBytes2)))
+	redeemScript = append(redeemScript, pkBytes2...)
+	redeemScript = append(redeemScript, OP_2, OP_CHECKMULTISIG)
+
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 90000, PkScript: []byte{}},
+		},
+	}
+
+	prevOut := &wire.TxOut{Value: 100000, PkScript: redeemScript}
+
+	// Create valid signatures
+	sighash, _ := CalcSignatureHash(redeemScript, SigHashAll, tx, 0)
+	sig1, _ := crypto.SignECDSA(privKey1, sighash)
+	sig1 = append(sig1, byte(SigHashAll))
+
+	// Create an invalid signature for slot 2 (from wrong key)
+	otherPrivKey, _ := crypto.GeneratePrivateKey()
+	wrongSig, _ := crypto.SignECDSA(otherPrivKey, sighash)
+	wrongSig = append(wrongSig, byte(SigHashAll))
+
+	// ScriptSig: OP_0 (dummy) sig1 wrongSig
+	scriptSig := []byte{0} // empty dummy
+	scriptSig = append(scriptSig, byte(len(sig1)))
+	scriptSig = append(scriptSig, sig1...)
+	scriptSig = append(scriptSig, byte(len(wrongSig)))
+	scriptSig = append(scriptSig, wrongSig...)
+	tx.TxIn[0].SignatureScript = scriptSig
+
+	// With NULLFAIL, the non-empty failing sig triggers ErrNullFail
+	err := VerifyScript(scriptSig, redeemScript, tx, 0, ScriptVerifyNullFail, prevOut.Value, []*wire.TxOut{prevOut})
+	if err != ErrNullFail {
+		t.Errorf("Expected ErrNullFail for failed multisig with non-empty sig, got %v", err)
+	}
+
+	// Without NULLFAIL, it just fails
+	err = VerifyScript(scriptSig, redeemScript, tx, 0, ScriptVerifyNone, prevOut.Value, []*wire.TxOut{prevOut})
+	if err != ErrScriptFailed {
+		t.Errorf("Expected ErrScriptFailed without NULLFAIL, got %v", err)
+	}
+}
+
 func TestStackUnderflow(t *testing.T) {
 	// OP_DUP with empty stack should fail
 	script := []byte{OP_DUP}
