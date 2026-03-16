@@ -604,11 +604,13 @@ func (e *Engine) opCheckSig(script []byte) error {
 		sig := sigBytes[:len(sigBytes)-1]
 
 		if e.sigVersion == SigVersionBase {
-			// For legacy, apply FindAndDelete to remove signature from script
-			scriptCode := FindAndDelete(script, sigBytes)
+			// For legacy, get scriptCode from after last OP_CODESEPARATOR
+			scriptCode := e.currentScript[e.lastCodeSepIdx:]
+			// Apply FindAndDelete to remove the push-encoded signature from scriptCode
+			scriptCode = FindAndDelete(scriptCode, sigBytes)
 			sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
 		} else {
-			// For witness v0, use BIP143 sighash
+			// For witness v0, use BIP143 sighash (no FindAndDelete, no OP_CODESEPARATOR handling needed)
 			sighash, err = CalcWitnessSignatureHash(script, hashType, e.tx, e.txIdx, e.amount)
 		}
 		if err != nil {
@@ -751,6 +753,19 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 		return ErrNullDummy
 	}
 
+	// For legacy scripts, prepare scriptCode by:
+	// 1. Taking script from after last OP_CODESEPARATOR
+	// 2. Applying FindAndDelete for ALL signatures before verification
+	// This matches Bitcoin Core's behavior in interpreter.cpp lines 1138-1150
+	var scriptCode []byte
+	if e.sigVersion == SigVersionBase {
+		scriptCode = e.currentScript[e.lastCodeSepIdx:]
+		// Remove all signatures from scriptCode before verification
+		for _, sigBytes := range sigs {
+			scriptCode = FindAndDelete(scriptCode, sigBytes)
+		}
+	}
+
 	// Verify signatures
 	success := true
 	pubKeyIdx := 0
@@ -793,9 +808,10 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 			var sighash [32]byte
 			switch e.sigVersion {
 			case SigVersionBase:
-				scriptCode := FindAndDelete(script, sigBytes)
+				// Use the pre-computed scriptCode with all sigs removed
 				sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
 			case SigVersionWitnessV0:
+				// For witness v0, use BIP143 sighash (no FindAndDelete needed)
 				sighash, err = CalcWitnessSignatureHash(script, hashType, e.tx, e.txIdx, e.amount)
 			default:
 				continue
