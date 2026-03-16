@@ -11,12 +11,13 @@ import (
 
 // Header validation errors.
 var (
-	ErrOrphanHeader       = errors.New("header has unknown parent")
-	ErrDuplicateHeader    = errors.New("header already exists")
-	ErrInvalidPoW         = errors.New("header has invalid proof of work")
-	ErrTimestampTooEarly  = errors.New("header timestamp is before median time past")
-	ErrBadDifficulty      = errors.New("header has incorrect difficulty bits")
-	ErrCheckpointMismatch = errors.New("header does not match checkpoint")
+	ErrOrphanHeader         = errors.New("header has unknown parent")
+	ErrDuplicateHeader      = errors.New("header already exists")
+	ErrInvalidPoW           = errors.New("header has invalid proof of work")
+	ErrTimestampTooEarly    = errors.New("header timestamp is before median time past")
+	ErrBadDifficulty        = errors.New("header has incorrect difficulty bits")
+	ErrCheckpointMismatch   = errors.New("header does not match checkpoint")
+	ErrForkBeforeCheckpoint = errors.New("fork before last checkpoint is not allowed")
 )
 
 // BlockStatus tracks the validation state of a block.
@@ -161,20 +162,15 @@ func FindFork(a, b *BlockNode) *BlockNode {
 	return a
 }
 
-// Checkpoint represents a known-good block hash at a specific height.
-type Checkpoint struct {
-	Height int32
-	Hash   wire.Hash256
-}
 
 // HeaderIndex maintains the tree of block headers.
 type HeaderIndex struct {
-	mu           sync.RWMutex
-	nodes        map[wire.Hash256]*BlockNode // All known block nodes
-	bestTip      *BlockNode                  // Tip of the best (most work) chain
-	genesis      *BlockNode                  // The genesis block node
-	params       *ChainParams                // Chain parameters
-	checkpoints  map[int32]wire.Hash256      // Height -> expected hash
+	mu              sync.RWMutex
+	nodes           map[wire.Hash256]*BlockNode // All known block nodes
+	bestTip         *BlockNode                  // Tip of the best (most work) chain
+	genesis         *BlockNode                  // The genesis block node
+	params          *ChainParams                // Chain parameters
+	checkpointData  *CheckpointData             // Checkpoint verification data
 }
 
 // Ensure HeaderIndex implements BlockProvider
@@ -200,9 +196,9 @@ func (idx *HeaderIndex) GetPrevHeader(node *BlockNode) *BlockNode {
 // NewHeaderIndex creates a new header index with the genesis block.
 func NewHeaderIndex(params *ChainParams) *HeaderIndex {
 	idx := &HeaderIndex{
-		nodes:       make(map[wire.Hash256]*BlockNode),
-		params:      params,
-		checkpoints: make(map[int32]wire.Hash256),
+		nodes:          make(map[wire.Hash256]*BlockNode),
+		params:         params,
+		checkpointData: GetCheckpointsForNetwork(params.Name),
 	}
 
 	// Add genesis block
@@ -220,34 +216,62 @@ func NewHeaderIndex(params *ChainParams) *HeaderIndex {
 	idx.genesis = genesisNode
 	idx.bestTip = genesisNode
 
-	// Add mainnet checkpoints
-	idx.loadCheckpoints()
-
 	return idx
 }
 
-// loadCheckpoints adds known-good block hashes for checkpoint verification.
-func (idx *HeaderIndex) loadCheckpoints() {
-	if idx.params.Name != "mainnet" {
-		return
+// GetCheckpointData returns the checkpoint data for this header index.
+func (idx *HeaderIndex) GetCheckpointData() *CheckpointData {
+	return idx.checkpointData
+}
+
+// GetLastCheckpoint returns the highest checkpoint for this network.
+func (idx *HeaderIndex) GetLastCheckpoint() *Checkpoint {
+	if idx.checkpointData == nil {
+		return nil
+	}
+	return idx.checkpointData.GetLastCheckpoint()
+}
+
+// isOnBestChain checks if a block node is on the current best chain.
+func (idx *HeaderIndex) isOnBestChain(node *BlockNode) bool {
+	if node == nil || idx.bestTip == nil {
+		return false
+	}
+	// A node is on the best chain if its ancestor at that height equals the node
+	ancestor := idx.bestTip.GetAncestor(node.Height)
+	return ancestor != nil && ancestor.Hash == node.Hash
+}
+
+// wouldCreateFork returns true if adding a header at the given height with the given parent
+// would create a fork from the best chain. A fork is created if the best chain already
+// has a block at this height that isn't the new header's parent's child.
+func (idx *HeaderIndex) wouldCreateFork(parent *BlockNode, newHeight int32) bool {
+	if idx.bestTip == nil {
+		return false
 	}
 
-	checkpoints := []Checkpoint{
-		{11111, mustParseHash("0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d")},
-		{33333, mustParseHash("000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6")},
-		{74000, mustParseHash("0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20")},
-		{105000, mustParseHash("00000000000291ce28027faea320c8d2b054b2e0fe44a773f3eefb151d6bdc97")},
-		{134444, mustParseHash("00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe")},
-		{168000, mustParseHash("000000000000099e61ea72015e79632f216fe6cb33d7899acb35b75c8303b763")},
-		{193000, mustParseHash("000000000000059f452a5f7340de6682a977387c17010ff6e6c3bd83ca8b1317")},
-		{210000, mustParseHash("000000000000048b95347e83192f69cf0366076336c639f9b7228e9ba171342e")},
-		{250000, mustParseHash("000000000000003887df1f29024b06fc2200b55f8af8f35453d7be294df2d214")},
-		{295000, mustParseHash("00000000000000004d9b4ef50f0f9d686fd69db2e03af35a100370c64632a983")},
+	// If new height is beyond the best tip, it's extending the chain, not forking
+	if newHeight > idx.bestTip.Height {
+		return false
 	}
 
-	for _, cp := range checkpoints {
-		idx.checkpoints[cp.Height] = cp.Hash
+	// Check if the parent is on the best chain
+	parentOnBestChain := idx.isOnBestChain(parent)
+	if !parentOnBestChain {
+		// Parent is not on best chain, so this is definitely a fork
+		return true
 	}
+
+	// Parent is on best chain. Check if there's already a block at newHeight on best chain.
+	// If the best chain has a block at this height, we're creating a sibling (fork).
+	existingAtHeight := idx.bestTip.GetAncestor(newHeight)
+	if existingAtHeight != nil {
+		// There's already a block at this height on the best chain
+		// Adding another one is a fork
+		return true
+	}
+
+	return false
 }
 
 // mustParseHash parses a hex hash string, panicking on error.
@@ -297,11 +321,16 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 		return nil, err
 	}
 
-	// Check against checkpoints
-	if expectedHash, ok := idx.checkpoints[height]; ok {
-		if hash != expectedHash {
-			return nil, ErrCheckpointMismatch
-		}
+	// Checkpoint verification: verify hash matches if at a checkpoint height
+	if err := VerifyCheckpoint(idx.checkpointData, height, hash); err != nil {
+		return nil, err
+	}
+
+	// Checkpoint fork rejection: reject headers that would fork before the last checkpoint.
+	// A header creates a fork if there's already a different block at this height on the best chain.
+	isFork := idx.wouldCreateFork(parent, height)
+	if err := CheckForkBeforeLastCheckpoint(idx.checkpointData, height, isFork); err != nil {
+		return nil, err
 	}
 
 	// Calculate total work
