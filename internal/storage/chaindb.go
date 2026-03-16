@@ -134,3 +134,32 @@ func (c *ChainDB) SetChainState(state *ChainState) error {
 func (c *ChainDB) Close() error {
 	return c.db.Close()
 }
+
+// WriteBlockUndo persists undo data for a block.
+// The undo data is keyed by block hash since heights can change during reorgs.
+func (c *ChainDB) WriteBlockUndo(hash wire.Hash256, undo *BlockUndo) error {
+	key := MakeUndoBlockKey(hash)
+	return c.db.Put(key, undo.Serialize())
+}
+
+// ReadBlockUndo retrieves undo data for a block.
+// Returns ErrNotFound if no undo data exists for the block.
+func (c *ChainDB) ReadBlockUndo(hash wire.Hash256) (*BlockUndo, error) {
+	key := MakeUndoBlockKey(hash)
+
+	data, err := c.db.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, ErrNotFound
+	}
+
+	return DeserializeBlockUndo(data)
+}
+
+// DeleteBlockUndo removes undo data for a block.
+func (c *ChainDB) DeleteBlockUndo(hash wire.Hash256) error {
+	key := MakeUndoBlockKey(hash)
+	return c.db.Delete(key)
+}
