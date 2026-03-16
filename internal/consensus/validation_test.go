@@ -764,67 +764,74 @@ func TestGetBlockScriptFlags(t *testing.T) {
 	params := MainnetParams()
 
 	tests := []struct {
-		height        int32
-		expectP2SH    bool
-		expectBIP66   bool
-		expectBIP65   bool
-		expectCSV     bool
-		expectSegwit  bool
-		expectNullFail bool
+		height              int32
+		expectP2SH          bool
+		expectBIP66         bool
+		expectBIP65         bool
+		expectCSV           bool
+		expectSegwit        bool
+		expectNullFail      bool
+		expectWitnessPubKey bool
 	}{
 		{
-			height:        0,
-			expectP2SH:    true,
-			expectBIP66:   false,
-			expectBIP65:   false,
-			expectCSV:     false,
-			expectSegwit:  false,
-			expectNullFail: false,
+			height:              0,
+			expectP2SH:          true,
+			expectBIP66:         false,
+			expectBIP65:         false,
+			expectCSV:           false,
+			expectSegwit:        false,
+			expectNullFail:      false,
+			expectWitnessPubKey: false,
 		},
 		{
-			height:        params.BIP66Height,
-			expectP2SH:    true,
-			expectBIP66:   true,
-			expectBIP65:   false,
-			expectCSV:     false,
-			expectSegwit:  false,
-			expectNullFail: false,
+			height:              params.BIP66Height,
+			expectP2SH:          true,
+			expectBIP66:         true,
+			expectBIP65:         false,
+			expectCSV:           false,
+			expectSegwit:        false,
+			expectNullFail:      false,
+			expectWitnessPubKey: false,
 		},
 		{
-			height:        params.BIP65Height,
-			expectP2SH:    true,
-			expectBIP66:   true,
-			expectBIP65:   true,
-			expectCSV:     false,
-			expectSegwit:  false,
-			expectNullFail: false,
+			height:              params.BIP65Height,
+			expectP2SH:          true,
+			expectBIP66:         true,
+			expectBIP65:         true,
+			expectCSV:           false,
+			expectSegwit:        false,
+			expectNullFail:      false,
+			expectWitnessPubKey: false,
 		},
 		{
-			height:        params.CSVHeight,
-			expectP2SH:    true,
-			expectBIP66:   true,
-			expectBIP65:   true,
-			expectCSV:     true,
-			expectSegwit:  false,
-			expectNullFail: false,
+			height:              params.CSVHeight,
+			expectP2SH:          true,
+			expectBIP66:         true,
+			expectBIP65:         true,
+			expectCSV:           true,
+			expectSegwit:        false,
+			expectNullFail:      false,
+			expectWitnessPubKey: false,
 		},
 		{
-			height:        params.SegwitHeight,
-			expectP2SH:    true,
-			expectBIP66:   true,
-			expectBIP65:   true,
-			expectCSV:     true,
-			expectSegwit:  true,
-			expectNullFail: true, // BIP146 NULLFAIL activates with segwit
+			height:              params.SegwitHeight,
+			expectP2SH:          true,
+			expectBIP66:         true,
+			expectBIP65:         true,
+			expectCSV:           true,
+			expectSegwit:        true,
+			expectNullFail:      true, // BIP146 NULLFAIL activates with segwit
+			expectWitnessPubKey: true, // BIP141 WITNESS_PUBKEYTYPE activates with segwit
 		},
 		{
-			height:        params.SegwitHeight - 1,
-			expectP2SH:    true,
-			expectBIP66:   true,
-			expectBIP65:   true,
-			expectCSV:     true,
-			expectSegwit:  false,
-			expectNullFail: false, // NULLFAIL not active before segwit
+			height:              params.SegwitHeight - 1,
+			expectP2SH:          true,
+			expectBIP66:         true,
+			expectBIP65:         true,
+			expectCSV:           true,
+			expectSegwit:        false,
+			expectNullFail:      false, // NULLFAIL not active before segwit
+			expectWitnessPubKey: false, // WITNESS_PUBKEYTYPE not active before segwit
 		},
 	}
 
@@ -838,7 +845,8 @@ func TestGetBlockScriptFlags(t *testing.T) {
 			hasDERSig := flags&0x08 != 0
 			hasCLTV := flags&0x200 != 0
 			hasCSV := flags&0x400 != 0
-			hasNullFail := flags&0x800 != 0 // ScriptVerifyNullFail = 1 << 11
+			hasNullFail := flags&0x800 != 0    // ScriptVerifyNullFail = 1 << 11
+			hasWitnessPubKey := flags&0x2000 != 0 // ScriptVerifyWitnessPubKeyType = 1 << 13
 
 			if hasP2SH != tt.expectP2SH {
 				t.Errorf("P2SH at height %d: got %v, want %v", tt.height, hasP2SH, tt.expectP2SH)
@@ -857,6 +865,9 @@ func TestGetBlockScriptFlags(t *testing.T) {
 			}
 			if hasNullFail != tt.expectNullFail {
 				t.Errorf("NullFail at height %d: got %v, want %v", tt.height, hasNullFail, tt.expectNullFail)
+			}
+			if hasWitnessPubKey != tt.expectWitnessPubKey {
+				t.Errorf("WitnessPubKeyType at height %d: got %v, want %v", tt.height, hasWitnessPubKey, tt.expectWitnessPubKey)
 			}
 		})
 	}
