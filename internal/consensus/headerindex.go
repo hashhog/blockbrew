@@ -27,18 +27,25 @@ const (
 	StatusHeaderValid BlockStatus = 1 << 0 // Header passed PoW and basic checks
 	StatusDataStored  BlockStatus = 1 << 1 // Full block data is stored
 	StatusFullyValid  BlockStatus = 1 << 2 // Block passed full validation
-	StatusInvalid     BlockStatus = 1 << 3 // Block is known invalid
+	StatusInvalid     BlockStatus = 1 << 3 // Block is known invalid (explicitly marked via invalidateblock)
+	StatusInvalidChild BlockStatus = 1 << 4 // Block is invalid because ancestor is invalid
 )
+
+// IsInvalid returns true if this block is marked as invalid (either directly or via ancestor).
+func (s BlockStatus) IsInvalid() bool {
+	return s&(StatusInvalid|StatusInvalidChild) != 0
+}
 
 // BlockNode represents a block header in the header chain.
 type BlockNode struct {
-	Hash      wire.Hash256
-	Header    wire.BlockHeader
-	Height    int32
-	Parent    *BlockNode
-	TotalWork *big.Int      // Cumulative chain work up to this block
-	Status    BlockStatus   // Validation state
-	Children  []*BlockNode  // Potential forks
+	Hash       wire.Hash256
+	Header     wire.BlockHeader
+	Height     int32
+	Parent     *BlockNode
+	TotalWork  *big.Int      // Cumulative chain work up to this block
+	Status     BlockStatus   // Validation state
+	Children   []*BlockNode  // Potential forks
+	SequenceID int32         // Sequence ID for precious block ordering (lower = more precious)
 }
 
 // GetAncestor returns the ancestor of a node at a given height.
@@ -171,6 +178,11 @@ type HeaderIndex struct {
 	genesis         *BlockNode                  // The genesis block node
 	params          *ChainParams                // Chain parameters
 	checkpointData  *CheckpointData             // Checkpoint verification data
+
+	// Precious block tracking
+	preciousBlock       *BlockNode // The block designated as precious (ephemeral)
+	lastPreciousWork    *big.Int   // Chainwork when last precious call was made
+	blockSequenceID     int32      // Sequence counter for precious block tie-breaking
 }
 
 // Ensure HeaderIndex implements BlockProvider
@@ -542,4 +554,100 @@ func (idx *HeaderIndex) GetHeadersAfter(startHash wire.Hash256, maxHeaders int) 
 	}
 
 	return headers
+}
+
+// SetPreciousBlock marks a block as "precious" for chain selection.
+// When two chains have equal work, the precious block's chain is preferred.
+// This is ephemeral - lost on restart. New calls override previous.
+func (idx *HeaderIndex) SetPreciousBlock(node *BlockNode) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	// If chain has been extended since last precious call, reset the sequence counter
+	if idx.lastPreciousWork == nil || idx.bestTip.TotalWork.Cmp(idx.lastPreciousWork) > 0 {
+		idx.blockSequenceID = -1
+	}
+	idx.lastPreciousWork = new(big.Int).Set(idx.bestTip.TotalWork)
+
+	// Give this block a negative sequence ID (lower = more precious)
+	node.SequenceID = idx.blockSequenceID
+	if idx.blockSequenceID > -2147483647 { // Avoid overflow
+		idx.blockSequenceID--
+	}
+
+	idx.preciousBlock = node
+}
+
+// RecalculateBestTip recalculates the best chain tip, excluding invalid blocks.
+// This is called after marking blocks as invalid or reconsidering them.
+func (idx *HeaderIndex) RecalculateBestTip() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	idx.recalculateBestTipLocked()
+}
+
+// recalculateBestTipLocked performs the actual best tip calculation (caller must hold lock).
+func (idx *HeaderIndex) recalculateBestTipLocked() {
+	var bestCandidate *BlockNode
+
+	// Find all chain tips (nodes with no children or only invalid children)
+	for _, node := range idx.nodes {
+		// Skip invalid blocks
+		if node.Status.IsInvalid() {
+			continue
+		}
+
+		// Check if this could be a tip (better than current best candidate)
+		if bestCandidate == nil {
+			bestCandidate = node
+			continue
+		}
+
+		// Compare using work and sequence ID
+		switch node.TotalWork.Cmp(bestCandidate.TotalWork) {
+		case 1: // node has more work
+			bestCandidate = node
+		case 0: // equal work - use sequence ID (precious block preference)
+			if node.SequenceID < bestCandidate.SequenceID {
+				bestCandidate = node
+			}
+		}
+	}
+
+	if bestCandidate != nil {
+		idx.bestTip = bestCandidate
+	}
+}
+
+// ClearPreciousBlock removes the precious block designation.
+func (idx *HeaderIndex) ClearPreciousBlock() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	idx.preciousBlock = nil
+}
+
+// GetAllTips returns all chain tips (leaf nodes) in the header index.
+// This is useful for implementing getchaintips RPC.
+func (idx *HeaderIndex) GetAllTips() []*BlockNode {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+
+	tips := make([]*BlockNode, 0)
+
+	// Find all nodes that have no valid children on any chain
+	for _, node := range idx.nodes {
+		hasValidChild := false
+		for _, child := range node.Children {
+			if !child.Status.IsInvalid() {
+				hasValidChild = true
+				break
+			}
+		}
+		if !hasValidChild {
+			tips = append(tips, node)
+		}
+	}
+
+	return tips
 }
