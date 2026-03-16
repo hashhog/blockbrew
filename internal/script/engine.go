@@ -43,6 +43,8 @@ var (
 	ErrSigDER                   = errors.New("signature is not valid DER encoding")
 	ErrSigHighS                 = errors.New("signature S value is not low")
 	ErrWitnessPubKeyType        = errors.New("witness v0 requires compressed public key")
+	ErrEvalFalse                = errors.New("script evaluated to false")
+	ErrCleanStack               = errors.New("stack not clean after witness script execution")
 )
 
 // ScriptFlags control which script validation rules are enabled.
@@ -264,6 +266,23 @@ func (e *Engine) executeWitnessProgram(version int, program []byte, witness [][]
 	}
 }
 
+// verifyWitnessCleanStack checks the cleanstack condition for witness scripts.
+// After witness script execution, the stack must have exactly one element,
+// and that element must be true. This is BIP141 consensus, not gated by flags.
+func (e *Engine) verifyWitnessCleanStack() error {
+	if e.stack.Size() == 0 {
+		return ErrEvalFalse
+	}
+	if e.stack.Size() != 1 {
+		return ErrCleanStack
+	}
+	result, _ := e.stack.Peek()
+	if !CastToBool(result) {
+		return ErrEvalFalse
+	}
+	return nil
+}
+
 // executeWitnessV0 executes a segwit v0 program.
 func (e *Engine) executeWitnessV0(program []byte, witness [][]byte) error {
 	e.sigVersion = SigVersionWitnessV0
@@ -289,7 +308,11 @@ func (e *Engine) executeWitnessV0(program []byte, witness [][]byte) error {
 		}
 
 		e.opCount = 0
-		return e.executeScript(script)
+		if err := e.executeScript(script); err != nil {
+			return err
+		}
+		// BIP141: witness scripts implicitly require cleanstack
+		return e.verifyWitnessCleanStack()
 	}
 
 	if len(program) == 32 {
@@ -297,8 +320,9 @@ func (e *Engine) executeWitnessV0(program []byte, witness [][]byte) error {
 		if len(witness) == 0 {
 			return ErrWitnessMismatch
 		}
-		// The witness script is the last item
-		witnessScript := witness[len(witness)-1]
+		// After reversal in executeWitnessProgram, the witness script is at index 0
+		// (it was originally the last/top item in wire format)
+		witnessScript := witness[0]
 
 		// Verify SHA256 of witness script matches program
 		hash := crypto.SHA256Hash(witnessScript)
@@ -306,14 +330,19 @@ func (e *Engine) executeWitnessV0(program []byte, witness [][]byte) error {
 			return ErrWitnessMismatch
 		}
 
-		// Set up stack with remaining witness items
+		// Set up stack with remaining witness items (indices 1 through len-1)
+		// Push from the end going backwards to maintain correct stack order
 		e.stack = NewStack()
-		for i := len(witness) - 2; i >= 0; i-- {
+		for i := len(witness) - 1; i >= 1; i-- {
 			e.stack.Push(witness[i])
 		}
 
 		e.opCount = 0
-		return e.executeScript(witnessScript)
+		if err := e.executeScript(witnessScript); err != nil {
+			return err
+		}
+		// BIP141: witness scripts implicitly require cleanstack
+		return e.verifyWitnessCleanStack()
 	}
 
 	return ErrWitnessProgram
@@ -469,7 +498,11 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	e.sigopBudget = 50 + witnessSize
 
 	e.opCount = 0
-	return e.executeScript(script)
+	if err := e.executeScript(script); err != nil {
+		return err
+	}
+	// BIP342: tapscript also implicitly requires cleanstack
+	return e.verifyWitnessCleanStack()
 }
 
 // IsOpSuccess returns true if the opcode is an OP_SUCCESSx opcode (BIP342).
