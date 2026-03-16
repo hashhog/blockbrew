@@ -1057,19 +1057,66 @@ func TestExtractWitnessProgram(t *testing.T) {
 }
 
 func TestFindAndDelete(t *testing.T) {
-	sig := []byte{0x30, 0x44, 0x02, 0x20} // Partial DER sig
-	script := []byte{byte(len(sig))}
-	script = append(script, sig...)
-	script = append(script, OP_DUP, byte(len(sig)))
-	script = append(script, sig...)
-	script = append(script, OP_HASH160)
+	// FindAndDelete takes raw signature bytes and builds the push-encoded pattern.
+	// It removes all occurrences of the push-encoded signature from the script.
+	tests := []struct {
+		name     string
+		script   []byte
+		toDelete []byte
+		expected []byte
+	}{
+		{
+			name:     "empty signature does nothing",
+			script:   []byte{OP_1, OP_2},
+			toDelete: []byte{},
+			expected: []byte{OP_1, OP_2},
+		},
+		{
+			name: "delete push data sequence",
+			// Script: <push 3 bytes: 0x02 0xff 0x03>
+			script:   []byte{0x03, 0x02, 0xff, 0x03},
+			toDelete: []byte{0x02, 0xff, 0x03}, // raw bytes
+			expected: []byte{},
+		},
+		{
+			name: "delete two push data sequences",
+			// Script: <push 3 bytes> <push 3 bytes>
+			script:   []byte{0x03, 0x02, 0xff, 0x03, 0x03, 0x02, 0xff, 0x03},
+			toDelete: []byte{0x02, 0xff, 0x03},
+			expected: []byte{},
+		},
+		{
+			name: "no match when data doesn't match",
+			// Script has push of [0x02, 0xff, 0x03], but we try to delete [0xff]
+			// The push-encoded [0xff] is [0x01, 0xff] which doesn't appear
+			script:   []byte{0x03, 0x02, 0xff, 0x03},
+			toDelete: []byte{0xff},
+			expected: []byte{0x03, 0x02, 0xff, 0x03},
+		},
+		{
+			name: "basic two signatures removal",
+			// Script: <push 4 bytes: sig> OP_DUP <push 4 bytes: sig> OP_HASH160
+			script:   append(append([]byte{0x04, 0x30, 0x44, 0x02, 0x20}, OP_DUP, 0x04, 0x30, 0x44, 0x02, 0x20), OP_HASH160),
+			toDelete: []byte{0x30, 0x44, 0x02, 0x20},
+			expected: []byte{OP_DUP, OP_HASH160},
+		},
+		{
+			name: "partial match doesn't delete",
+			// Script: <push 5 bytes: 0x30 0x44 0x02 0x20 0x00>
+			// Trying to delete 4-byte signature should not match
+			script:   []byte{0x05, 0x30, 0x44, 0x02, 0x20, 0x00},
+			toDelete: []byte{0x30, 0x44, 0x02, 0x20},
+			expected: []byte{0x05, 0x30, 0x44, 0x02, 0x20, 0x00},
+		},
+	}
 
-	result := FindAndDelete(script, sig)
-
-	// Should have removed both occurrences of the push-encoded signature
-	expected := []byte{OP_DUP, OP_HASH160}
-	if !bytes.Equal(result, expected) {
-		t.Errorf("FindAndDelete result = %x, want %x", result, expected)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FindAndDelete(tt.script, tt.toDelete)
+			if !bytes.Equal(result, tt.expected) {
+				t.Errorf("FindAndDelete result = %x, want %x", result, tt.expected)
+			}
+		})
 	}
 }
 
@@ -1849,4 +1896,162 @@ func TestWitnessPubKeyType(t *testing.T) {
 			t.Errorf("expected success without WITNESS_PUBKEYTYPE flag, got: %v", err)
 		}
 	})
+}
+
+// TestCodeSeparatorLegacy tests that OP_CODESEPARATOR correctly affects
+// legacy script sighash computation by only including script bytes after
+// the last OP_CODESEPARATOR in the scriptCode.
+func TestCodeSeparatorLegacy(t *testing.T) {
+	// Generate a key pair for signing
+	privKey, err := crypto.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("GeneratePrivateKey error: %v", err)
+	}
+	pubKey := privKey.PubKey()
+	pubKeyBytes := pubKey.SerializeCompressed()
+	pubKeyHash := crypto.Hash160(pubKeyBytes)
+
+	// Create a scriptPubKey that uses OP_CODESEPARATOR:
+	// OP_DUP OP_HASH160 <pubkeyhash> OP_EQUALVERIFY OP_CODESEPARATOR OP_CHECKSIG
+	//
+	// The scriptCode for sighash will only include OP_CHECKSIG (after CODESEPARATOR)
+	scriptPubKey := []byte{
+		OP_DUP,
+		OP_HASH160,
+		20, // Push 20 bytes
+	}
+	scriptPubKey = append(scriptPubKey, pubKeyHash[:]...)
+	scriptPubKey = append(scriptPubKey, OP_EQUALVERIFY, OP_CODESEPARATOR, OP_CHECKSIG)
+
+	// Create the scriptCode as it will be computed during signature verification
+	// (after OP_CODESEPARATOR, so just OP_CHECKSIG)
+	scriptCodeAfterCodeSep := []byte{OP_CHECKSIG}
+
+	prevOut := &wire.TxOut{Value: 100000, PkScript: scriptPubKey}
+
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{},
+				SignatureScript:  nil,
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 90000, PkScript: []byte{OP_TRUE}},
+		},
+		LockTime: 0,
+	}
+
+	// Sign using the scriptCode AFTER OP_CODESEPARATOR
+	sighash, err := CalcSignatureHash(scriptCodeAfterCodeSep, SigHashAll, tx, 0)
+	if err != nil {
+		t.Fatalf("CalcSignatureHash error: %v", err)
+	}
+
+	sig, err := crypto.SignECDSA(privKey, sighash)
+	if err != nil {
+		t.Fatalf("SignECDSA error: %v", err)
+	}
+	sig = append(sig, byte(SigHashAll))
+
+	// Create scriptSig: <sig> <pubkey>
+	scriptSig := []byte{byte(len(sig))}
+	scriptSig = append(scriptSig, sig...)
+	scriptSig = append(scriptSig, byte(len(pubKeyBytes)))
+	scriptSig = append(scriptSig, pubKeyBytes...)
+
+	tx.TxIn[0].SignatureScript = scriptSig
+
+	// Verify - should succeed because the signature was computed using
+	// the correct scriptCode (after OP_CODESEPARATOR)
+	err = VerifyScript(scriptSig, scriptPubKey, tx, 0, ScriptVerifyNone, prevOut.Value, []*wire.TxOut{prevOut})
+	if err != nil {
+		t.Errorf("OP_CODESEPARATOR verification failed: %v", err)
+	}
+}
+
+// TestCodeSeparatorMultiple tests that multiple OP_CODESEPARATORs work correctly.
+// Only the script after the LAST OP_CODESEPARATOR should be used for sighash.
+func TestCodeSeparatorMultiple(t *testing.T) {
+	privKey, _ := crypto.GeneratePrivateKey()
+	pubKey := privKey.PubKey()
+	pubKeyBytes := pubKey.SerializeCompressed()
+	pubKeyHash := crypto.Hash160(pubKeyBytes)
+
+	// Script: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CODESEPARATOR OP_1 OP_CODESEPARATOR OP_CHECKSIG
+	// ScriptCode after last CODESEPARATOR: OP_CHECKSIG only
+	scriptPubKey := []byte{
+		OP_DUP, OP_HASH160, 20,
+	}
+	scriptPubKey = append(scriptPubKey, pubKeyHash[:]...)
+	scriptPubKey = append(scriptPubKey, OP_EQUALVERIFY, OP_CODESEPARATOR, OP_1, OP_DROP, OP_CODESEPARATOR, OP_CHECKSIG)
+
+	// ScriptCode for sighash: just OP_CHECKSIG
+	scriptCodeAfterLastCodeSep := []byte{OP_CHECKSIG}
+
+	prevOut := &wire.TxOut{Value: 100000, PkScript: scriptPubKey}
+
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{{Value: 90000, PkScript: []byte{OP_TRUE}}},
+	}
+
+	// Sign using scriptCode after the LAST OP_CODESEPARATOR
+	sighash, _ := CalcSignatureHash(scriptCodeAfterLastCodeSep, SigHashAll, tx, 0)
+	sig, _ := crypto.SignECDSA(privKey, sighash)
+	sig = append(sig, byte(SigHashAll))
+
+	scriptSig := []byte{byte(len(sig))}
+	scriptSig = append(scriptSig, sig...)
+	scriptSig = append(scriptSig, byte(len(pubKeyBytes)))
+	scriptSig = append(scriptSig, pubKeyBytes...)
+
+	tx.TxIn[0].SignatureScript = scriptSig
+
+	err := VerifyScript(scriptSig, scriptPubKey, tx, 0, ScriptVerifyNone, prevOut.Value, []*wire.TxOut{prevOut})
+	if err != nil {
+		t.Errorf("Multiple OP_CODESEPARATOR verification failed: %v", err)
+	}
+}
+
+// TestSighashRemovesCodeSeparator tests that CalcSignatureHash removes
+// OP_CODESEPARATOR bytes from the scriptCode before hashing.
+func TestSighashRemovesCodeSeparator(t *testing.T) {
+	// Two scripts that should produce the same sighash:
+	// 1. OP_CHECKSIG
+	// 2. OP_CODESEPARATOR OP_CHECKSIG
+	// Because OP_CODESEPARATOR is removed from scriptCode during sighash
+
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{{Value: 50000, PkScript: []byte{OP_TRUE}}},
+	}
+
+	script1 := []byte{OP_CHECKSIG}
+	script2 := []byte{OP_CODESEPARATOR, OP_CHECKSIG}
+
+	hash1, err1 := CalcSignatureHash(script1, SigHashAll, tx, 0)
+	hash2, err2 := CalcSignatureHash(script2, SigHashAll, tx, 0)
+
+	if err1 != nil || err2 != nil {
+		t.Fatalf("CalcSignatureHash errors: %v, %v", err1, err2)
+	}
+
+	if !bytes.Equal(hash1[:], hash2[:]) {
+		t.Errorf("Sighash should be equal after removing OP_CODESEPARATOR\nhash1: %x\nhash2: %x", hash1, hash2)
+	}
 }
