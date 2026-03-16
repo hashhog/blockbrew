@@ -9,18 +9,6 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
-// UndoEntry stores the UTXO that was spent by a transaction input,
-// so it can be restored during DisconnectBlock.
-type UndoEntry struct {
-	Outpoint wire.OutPoint
-	Entry    UTXOEntry
-}
-
-// BlockUndo stores all undo data needed to disconnect a block.
-type BlockUndo struct {
-	SpentUTXOs []UndoEntry // UTXOs spent by this block (in tx order)
-}
-
 // ChainManager maintains the active chain and processes new blocks.
 type ChainManager struct {
 	mu          sync.RWMutex
@@ -30,9 +18,6 @@ type ChainManager struct {
 	utxoSet     UpdatableUTXOView
 	tipNode     *BlockNode
 	tipHeight   int32
-
-	// Undo data for recent blocks (needed for reorgs)
-	undoData map[wire.Hash256]*BlockUndo
 
 	// Flush tracking for IBD
 	blocksSinceFlush int
@@ -70,7 +55,6 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 		headerIndex:     config.HeaderIndex,
 		chainDB:         config.ChainDB,
 		utxoSet:         config.UTXOSet,
-		undoData:        make(map[wire.Hash256]*BlockUndo),
 		flushInterval:   flushInterval,
 		assumeValidHash: config.AssumeValidHash,
 		parallelScripts: config.ParallelScripts,
@@ -181,17 +165,20 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 
 	// Track total fees and undo data
 	var totalFees int64
-	undo := &BlockUndo{}
+	// Undo data: one TxUndo per non-coinbase transaction
+	blockUndo := &storage.BlockUndo{
+		TxUndos: make([]storage.TxUndo, 0, len(block.Transactions)-1),
+	}
 
 	// Genesis block special case: the genesis coinbase is unspendable.
 	// Bitcoin Core skips transaction connection for the genesis block.
 	if node.Height == 0 {
-		// Store undo data (empty) and update chain state
-		cm.undoData[hash] = undo
+		// Store empty undo data and update chain state
 		cm.tipNode = node
 		cm.tipHeight = node.Height
 		node.Status |= StatusFullyValid
 		if cm.chainDB != nil {
+			cm.chainDB.WriteBlockUndo(hash, blockUndo)
 			cm.chainDB.SetBlockHeight(node.Height, hash)
 			cm.chainDB.SetChainState(&storage.ChainState{
 				BestHash:   hash,
@@ -233,22 +220,40 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 					prevHeights[j] = utxo.Height
 				}
 			}
-			seqLock := CalculateSequenceLocks(tx, prevHeights, int64(mtp), node.Height)
+			// Create MTP lookup function using header index
+			// BIP68 time-based locks need MTP at the height of the block prior to
+			// where the UTXO was confirmed
+			getMTP := func(height int32) int64 {
+				ancestor := node.GetAncestor(height)
+				if ancestor == nil {
+					return 0
+				}
+				return ancestor.GetMedianTimePast()
+			}
+			seqLock := CalculateSequenceLocks(tx, prevHeights, getMTP)
 			if !EvaluateSequenceLocks(seqLock, node.Height, int64(mtp)) {
 				return fmt.Errorf("tx %d: %w", i, ErrSequenceLockNotMet)
 			}
 		}
 
-		// Record spent UTXOs for undo data before spending
+		// Record spent UTXOs for undo data before spending (one TxUndo per transaction)
+		txUndo := storage.TxUndo{
+			SpentCoins: make([]storage.SpentCoin, 0, len(tx.TxIn)),
+		}
 		for _, in := range tx.TxIn {
 			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
 			if utxo != nil {
-				undo.SpentUTXOs = append(undo.SpentUTXOs, UndoEntry{
-					Outpoint: in.PreviousOutPoint,
-					Entry:    *utxo,
+				txUndo.SpentCoins = append(txUndo.SpentCoins, storage.SpentCoin{
+					TxOut: wire.TxOut{
+						Value:    utxo.Amount,
+						PkScript: utxo.PkScript,
+					},
+					Height:   utxo.Height,
+					Coinbase: utxo.IsCoinbase,
 				})
 			}
 		}
+		blockUndo.TxUndos = append(blockUndo.TxUndos, txUndo)
 
 		// Update UTXO view: spend inputs and add outputs
 		cm.utxoSet.SpendTxInputs(tx)
@@ -289,9 +294,6 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			coinbaseValue, subsidy+totalFees, subsidy, totalFees)
 	}
 
-	// Store undo data for this block
-	cm.undoData[hash] = undo
-
 	// Update chain state
 	cm.tipNode = node
 	cm.tipHeight = node.Height
@@ -303,8 +305,12 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		log.Printf("chainmgr: exiting IBD mode at height %d", cm.tipHeight)
 	}
 
-	// Persist chain state
+	// Persist undo data and chain state
 	if cm.chainDB != nil {
+		// Write undo data keyed by block hash (not height, since heights can change during reorgs)
+		if err := cm.chainDB.WriteBlockUndo(hash, blockUndo); err != nil {
+			return fmt.Errorf("failed to write undo data: %w", err)
+		}
 		cm.chainDB.SetBlockHeight(node.Height, hash)
 		cm.chainDB.SetChainState(&storage.ChainState{
 			BestHash:   hash,
@@ -362,6 +368,8 @@ func (cm *ChainManager) collectPrevTimestamps(node *BlockNode, count int) []uint
 }
 
 // DisconnectBlock undoes the effects of a block (for reorgs).
+// It removes outputs created by the block and restores spent UTXOs from undo data.
+// Transactions must be disconnected in reverse order to correctly restore the UTXO set.
 func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -377,15 +385,29 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 		return fmt.Errorf("block %s not found for disconnect: %w", hash.String()[:16], err)
 	}
 
-	// Get undo data for this block
-	undo, hasUndo := cm.undoData[hash]
+	// Load undo data from database
+	blockUndo, err := cm.chainDB.ReadBlockUndo(hash)
+	if err != nil {
+		return fmt.Errorf("failed to read undo data for block %s: %w", hash.String()[:16], err)
+	}
 
-	// Undo UTXO changes in reverse order
-	// First, remove outputs that were created (skip unspendable outputs
-	// since they were never added to the UTXO set)
+	// Verify undo data consistency
+	nonCoinbaseTxCount := len(block.Transactions) - 1
+	if nonCoinbaseTxCount < 0 {
+		nonCoinbaseTxCount = 0
+	}
+	if len(blockUndo.TxUndos) != nonCoinbaseTxCount {
+		return fmt.Errorf("undo data mismatch: %d TxUndos but %d non-coinbase transactions",
+			len(blockUndo.TxUndos), nonCoinbaseTxCount)
+	}
+
+	// Process transactions in REVERSE order (critical for correct UTXO restoration)
 	for i := len(block.Transactions) - 1; i >= 0; i-- {
 		tx := block.Transactions[i]
 		txHash := tx.TxHash()
+
+		// Remove outputs created by this transaction (skip unspendable outputs
+		// since they were never added to the UTXO set)
 		for idx, out := range tx.TxOut {
 			if IsUnspendable(out.PkScript) {
 				continue
@@ -393,37 +415,36 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
 			cm.utxoSet.SpendUTXO(outpoint)
 		}
+
+		// For non-coinbase transactions, restore the inputs that were spent
+		if i > 0 {
+			// Get the TxUndo for this transaction (i-1 because index 0 is coinbase)
+			txUndo := &blockUndo.TxUndos[i-1]
+
+			// Verify input count matches
+			if len(txUndo.SpentCoins) != len(tx.TxIn) {
+				return fmt.Errorf("tx %d undo mismatch: %d spent coins but %d inputs",
+					i, len(txUndo.SpentCoins), len(tx.TxIn))
+			}
+
+			// Restore each spent UTXO
+			for j, in := range tx.TxIn {
+				spentCoin := &txUndo.SpentCoins[j]
+				cm.utxoSet.AddUTXO(in.PreviousOutPoint, &UTXOEntry{
+					Amount:     spentCoin.TxOut.Value,
+					PkScript:   spentCoin.TxOut.PkScript,
+					Height:     spentCoin.Height,
+					IsCoinbase: spentCoin.Coinbase,
+				})
+			}
+		}
+		// Coinbase (i == 0) has no inputs to restore - we just removed its outputs above
 	}
 
-	// Then, restore inputs that were spent using undo data
-	if hasUndo {
-		// Verify undo data consistency: count non-coinbase transactions
-		nonCoinbaseTxCount := len(block.Transactions) - 1
-		if nonCoinbaseTxCount < 0 {
-			nonCoinbaseTxCount = 0
-		}
-
-		// Count total expected inputs across all non-coinbase transactions
-		expectedInputs := 0
-		for i := 1; i < len(block.Transactions); i++ {
-			expectedInputs += len(block.Transactions[i].TxIn)
-		}
-
-		// The number of undo entries must match the total number of
-		// non-coinbase inputs
-		if len(undo.SpentUTXOs) != expectedInputs {
-			return fmt.Errorf("undo data mismatch: %d spent UTXOs but %d non-coinbase inputs across %d transactions",
-				len(undo.SpentUTXOs), expectedInputs, nonCoinbaseTxCount)
-		}
-
-		for _, entry := range undo.SpentUTXOs {
-			restored := entry.Entry // copy
-			cm.utxoSet.AddUTXO(entry.Outpoint, &restored)
-		}
+	// Delete undo data from database
+	if err := cm.chainDB.DeleteBlockUndo(hash); err != nil {
+		log.Printf("chainmgr: warning: failed to delete undo data for %s: %v", hash.String()[:16], err)
 	}
-
-	// Clean up undo data
-	delete(cm.undoData, hash)
 
 	// Update chain state
 	parent := cm.tipNode.Parent
@@ -434,7 +455,7 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	cm.tipNode = parent
 	cm.tipHeight = parent.Height
 
-	// Persist
+	// Persist updated chain state
 	if cm.chainDB != nil {
 		cm.chainDB.SetChainState(&storage.ChainState{
 			BestHash:   parent.Hash,
