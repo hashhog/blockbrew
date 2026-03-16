@@ -473,3 +473,148 @@ func TestChainManagerWithNilUTXOSet(t *testing.T) {
 		t.Error("chain manager should create UTXO set if none provided")
 	}
 }
+
+// TestConnectDisconnectRestoresUTXO verifies that after ConnectBlock + DisconnectBlock,
+// the UTXO set is restored to its previous state.
+func TestConnectDisconnectRestoresUTXO(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// Connect block 1 (just a coinbase)
+	block1 := createTestBlock(t, params, genesis, nil)
+	block1Hash := block1.Header.BlockHash()
+	node1, err := idx.AddHeader(block1.Header)
+	if err != nil {
+		t.Fatalf("failed to add block1 header: %v", err)
+	}
+	if err := db.StoreBlock(block1Hash, block1); err != nil {
+		t.Fatalf("failed to store block1: %v", err)
+	}
+	if err := cm.ConnectBlock(block1); err != nil {
+		t.Fatalf("failed to connect block1: %v", err)
+	}
+
+	// Verify block1 coinbase output is in UTXO set
+	coinbase1Hash := block1.Transactions[0].TxHash()
+	coinbase1Outpoint := wire.OutPoint{Hash: coinbase1Hash, Index: 0}
+	utxo1 := cm.UTXOSet().GetUTXO(coinbase1Outpoint)
+	if utxo1 == nil {
+		t.Fatal("block1 coinbase should be in UTXO set")
+	}
+
+	// Connect block 2 (another coinbase only)
+	block2 := createTestBlock(t, params, node1, nil)
+	block2Hash := block2.Header.BlockHash()
+	_, err = idx.AddHeader(block2.Header)
+	if err != nil {
+		t.Fatalf("failed to add block2 header: %v", err)
+	}
+	if err := db.StoreBlock(block2Hash, block2); err != nil {
+		t.Fatalf("failed to store block2: %v", err)
+	}
+	if err := cm.ConnectBlock(block2); err != nil {
+		t.Fatalf("failed to connect block2: %v", err)
+	}
+
+	// Verify tip is at block 2
+	tipHash, tipHeight := cm.BestBlock()
+	if tipHeight != 2 {
+		t.Errorf("tip height = %d, want 2", tipHeight)
+	}
+	if tipHash != block2Hash {
+		t.Errorf("tip hash mismatch")
+	}
+
+	// Verify block2 coinbase is in UTXO set
+	coinbase2Hash := block2.Transactions[0].TxHash()
+	coinbase2Outpoint := wire.OutPoint{Hash: coinbase2Hash, Index: 0}
+	utxo2 := cm.UTXOSet().GetUTXO(coinbase2Outpoint)
+	if utxo2 == nil {
+		t.Fatal("block2 coinbase should be in UTXO set")
+	}
+
+	// Disconnect block 2
+	if err := cm.DisconnectBlock(block2Hash); err != nil {
+		t.Fatalf("failed to disconnect block2: %v", err)
+	}
+
+	// Verify tip is back at block 1
+	tipHash, tipHeight = cm.BestBlock()
+	if tipHeight != 1 {
+		t.Errorf("tip height after disconnect = %d, want 1", tipHeight)
+	}
+	if tipHash != block1Hash {
+		t.Errorf("tip hash after disconnect should be block1")
+	}
+
+	// Verify block2 coinbase is no longer in UTXO set
+	utxo2After := cm.UTXOSet().GetUTXO(coinbase2Outpoint)
+	if utxo2After != nil {
+		t.Error("block2 coinbase should NOT be in UTXO set after disconnect")
+	}
+
+	// Verify block1 coinbase is still in UTXO set
+	utxo1After := cm.UTXOSet().GetUTXO(coinbase1Outpoint)
+	if utxo1After == nil {
+		t.Error("block1 coinbase should still be in UTXO set after disconnect")
+	}
+}
+
+// TestBlockUndoPersistence verifies that undo data is persisted to the database.
+func TestBlockUndoPersistence(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// Connect a block
+	block1 := createTestBlock(t, params, genesis, nil)
+	block1Hash := block1.Header.BlockHash()
+	_, err := idx.AddHeader(block1.Header)
+	if err != nil {
+		t.Fatalf("failed to add header: %v", err)
+	}
+	if err := db.StoreBlock(block1Hash, block1); err != nil {
+		t.Fatalf("failed to store block: %v", err)
+	}
+	if err := cm.ConnectBlock(block1); err != nil {
+		t.Fatalf("failed to connect block: %v", err)
+	}
+
+	// Verify undo data was persisted
+	undo, err := db.ReadBlockUndo(block1Hash)
+	if err != nil {
+		t.Fatalf("failed to read undo data: %v", err)
+	}
+
+	// Block 1 has only coinbase, so TxUndos should be empty
+	if len(undo.TxUndos) != 0 {
+		t.Errorf("TxUndos count = %d, want 0 (coinbase-only block)", len(undo.TxUndos))
+	}
+
+	// After disconnect, undo data should be deleted
+	if err := cm.DisconnectBlock(block1Hash); err != nil {
+		t.Fatalf("failed to disconnect block: %v", err)
+	}
+
+	_, err = db.ReadBlockUndo(block1Hash)
+	if err != storage.ErrNotFound {
+		t.Errorf("undo data should be deleted after disconnect, got err=%v", err)
+	}
+}
