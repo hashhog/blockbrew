@@ -193,3 +193,119 @@ func IsMinDifficultyBlock(params *ChainParams, blockTimestamp, prevBlockTimestam
 	}
 	return blockTimestamp > prevBlockTimestamp+2*params.TargetSpacing
 }
+
+// BlockProvider is an interface for looking up block header data needed for
+// difficulty calculations. This allows the difficulty code to work with both
+// the full HeaderIndex and simpler test implementations.
+type BlockProvider interface {
+	// GetHeaderByHeight returns the header at a given height, or nil if not found.
+	GetHeaderByHeight(height int32) *BlockNode
+	// GetPrevHeader returns the parent of a block, or nil for genesis.
+	GetPrevHeader(node *BlockNode) *BlockNode
+}
+
+// GetNextWorkRequired calculates the required difficulty for a new block.
+// This is the main entry point that handles all network-specific rules:
+//   - Normal mainnet retarget (every 2016 blocks)
+//   - Testnet min-difficulty exception (> 20 min gap)
+//   - Testnet walk-back (find last non-min-difficulty block)
+//   - BIP94 testnet4 (use first block of period for retarget base)
+//   - Regtest no-retarget (always return genesis difficulty)
+//
+// Parameters:
+//   - params: chain parameters
+//   - height: height of the new block being validated
+//   - newBlockTimestamp: timestamp of the new block
+//   - lastNode: the parent block node
+//   - provider: interface to look up ancestor blocks
+func GetNextWorkRequired(params *ChainParams, height int32, newBlockTimestamp int64, lastNode *BlockNode, provider BlockProvider) uint32 {
+	// Genesis block uses PowLimitBits
+	if lastNode == nil {
+		return params.PowLimitBits
+	}
+
+	// Regtest: never adjust difficulty
+	if params.PowNoRetargeting {
+		return lastNode.Header.Bits
+	}
+
+	// Check if this is a difficulty adjustment boundary
+	if height%int32(params.DifficultyAdjInterval) != 0 {
+		// Not at a retarget boundary
+		if params.MinDiffReductionTime {
+			// Testnet special rule: if block is > 20 min after previous,
+			// allow minimum difficulty
+			if newBlockTimestamp > int64(lastNode.Header.Timestamp)+2*params.TargetSpacing {
+				return params.PowLimitBits
+			}
+			// Otherwise, walk back to find the last non-min-difficulty block
+			return getTestnetNonMinDiffBits(params, lastNode, provider)
+		}
+		// Mainnet: use same difficulty as last block
+		return lastNode.Header.Bits
+	}
+
+	// At a difficulty adjustment boundary (every 2016 blocks)
+	return CalculateNextWorkRequired(params, height, lastNode, provider)
+}
+
+// getTestnetNonMinDiffBits walks back through the chain to find the last block
+// that wasn't at minimum difficulty. This implements the testnet walk-back rule.
+func getTestnetNonMinDiffBits(params *ChainParams, lastNode *BlockNode, provider BlockProvider) uint32 {
+	node := lastNode
+	for node != nil &&
+		node.Height%int32(params.DifficultyAdjInterval) != 0 &&
+		node.Header.Bits == params.PowLimitBits {
+		node = provider.GetPrevHeader(node)
+	}
+	if node == nil {
+		return params.PowLimitBits
+	}
+	return node.Header.Bits
+}
+
+// CalculateNextWorkRequired calculates the new difficulty at a retarget boundary.
+// Implements both standard and BIP94 (testnet4) retarget logic.
+func CalculateNextWorkRequired(params *ChainParams, height int32, lastNode *BlockNode, provider BlockProvider) uint32 {
+	// Find the first block of the difficulty period
+	firstHeight := height - int32(params.DifficultyAdjInterval)
+	firstNode := provider.GetHeaderByHeight(firstHeight)
+	if firstNode == nil {
+		return lastNode.Header.Bits
+	}
+
+	// Calculate actual timespan for the period
+	actualTimespan := int64(lastNode.Header.Timestamp) - int64(firstNode.Header.Timestamp)
+
+	// Clamp to [TargetTimespan/4, TargetTimespan*4]
+	minTimespan := params.TargetTimespan / 4
+	maxTimespan := params.TargetTimespan * 4
+	if actualTimespan < minTimespan {
+		actualTimespan = minTimespan
+	}
+	if actualTimespan > maxTimespan {
+		actualTimespan = maxTimespan
+	}
+
+	// BIP94 (testnet4): use the first block's difficulty as the base.
+	// This prevents miners from manipulating difficulty by using the
+	// min-difficulty exception repeatedly.
+	var baseBits uint32
+	if params.EnforceBIP94 {
+		baseBits = firstNode.Header.Bits
+	} else {
+		baseBits = lastNode.Header.Bits
+	}
+
+	// Calculate new target: newTarget = oldTarget * actualTimespan / TargetTimespan
+	oldTarget := CompactToBig(baseBits)
+	newTarget := new(big.Int).Mul(oldTarget, big.NewInt(actualTimespan))
+	newTarget.Div(newTarget, big.NewInt(params.TargetTimespan))
+
+	// Ensure new target doesn't exceed pow limit
+	if newTarget.Cmp(params.PowLimit) > 0 {
+		newTarget.Set(params.PowLimit)
+	}
+
+	return BigToCompact(newTarget)
+}
