@@ -289,16 +289,29 @@ func IsFinalTx(tx *wire.MsgTx, blockHeight int32, blockTime uint32) bool {
 // SequenceLock represents the minimum block height and time at which a
 // transaction can be included in a block (BIP68).
 type SequenceLock struct {
-	MinHeight int32  // Minimum block height (-1 if no height lock)
-	MinTime   int64  // Minimum median time past (-1 if no time lock)
+	MinHeight int32 // Minimum block height (-1 if no height lock)
+	MinTime   int64 // Minimum median time past (-1 if no time lock)
 }
+
+// MTPLookup is a function that returns the MTP at a given block height.
+// This is used by CalculateSequenceLocks to get the MTP of the block prior to
+// where each input UTXO was confirmed. Returns 0 if height is invalid.
+type MTPLookup func(height int32) int64
 
 // CalculateSequenceLocks computes the sequence locks for a transaction.
 // For each input with a relative lock (BIP68), it calculates the minimum
 // block height or median time past required.
+//
 // prevHeights contains the height of the block that includes each input's UTXO.
-// blockHeight is the height of the block being validated.
-func CalculateSequenceLocks(tx *wire.MsgTx, prevHeights []int32, medianTimePast int64, blockHeight int32) *SequenceLock {
+// getMTP is a function that returns the MTP at a given height.
+//
+// Bitcoin Core behavior (BIP68):
+// - Height-based locks: minHeight = prevHeights[i] + (sequence & MASK) - 1
+// - Time-based locks: The lock is relative to the MTP of the block PRIOR to the
+//   block that confirmed the UTXO (i.e., MTP at prevHeights[i]-1). This is because
+//   the "smallest allowed timestamp" of a block is its MTP, which is determined
+//   by its 11 ancestors.
+func CalculateSequenceLocks(tx *wire.MsgTx, prevHeights []int32, getMTP MTPLookup) *SequenceLock {
 	lock := &SequenceLock{
 		MinHeight: -1,
 		MinTime:   -1,
@@ -324,17 +337,25 @@ func CalculateSequenceLocks(tx *wire.MsgTx, prevHeights []int32, medianTimePast 
 
 		if seq&SequenceLockTimeTypeFlag != 0 {
 			// Time-based relative lock
-			// The locked time is in units of 512 seconds (granularity of 9 bits)
+			// BIP68: Time-based relative lock-times are measured from the smallest
+			// allowed timestamp of the block containing the txout being spent,
+			// which is the median time past of the block prior.
+			coinMTPHeight := prevHeights[i] - 1
+			if coinMTPHeight < 0 {
+				coinMTPHeight = 0
+			}
+			coinMTP := getMTP(coinMTPHeight)
+
+			// The locked time is in units of 512 seconds (granularity = 9 bits)
+			// Subtract 1 to maintain nLockTime semantics (last invalid, not first valid)
 			lockedTime := (int64(seq&SequenceLockTimeMask) << SequenceLockTimeGranularity) - 1
-			// Add to the MTP of the block that included the input UTXO
-			// We need the MTP at prevHeights[i]-1, but we approximate with
-			// medianTimePast which is the MTP of the current block's parent
-			minTime := lockedTime + medianTimePast
+			minTime := coinMTP + lockedTime
 			if minTime > lock.MinTime {
 				lock.MinTime = minTime
 			}
 		} else {
 			// Height-based relative lock
+			// Subtract 1 to maintain nLockTime semantics (last invalid, not first valid)
 			minHeight := prevHeights[i] + int32(seq&SequenceLockTimeMask) - 1
 			if minHeight > lock.MinHeight {
 				lock.MinHeight = minHeight
@@ -346,11 +367,17 @@ func CalculateSequenceLocks(tx *wire.MsgTx, prevHeights []int32, medianTimePast 
 }
 
 // EvaluateSequenceLocks checks if a transaction's sequence locks are satisfied.
-func EvaluateSequenceLocks(lock *SequenceLock, blockHeight int32, medianTimePast int64) bool {
+// blockHeight is the height of the block being validated.
+// blockMTP is the MTP of the block being validated (i.e., MTP of its parent chain).
+//
+// Bitcoin Core semantics: locks are "last invalid" values, so a tx is valid when:
+// - lock.MinHeight < blockHeight (not <=)
+// - lock.MinTime < blockMTP (not <=)
+func EvaluateSequenceLocks(lock *SequenceLock, blockHeight int32, blockMTP int64) bool {
 	if lock.MinHeight >= blockHeight {
 		return false
 	}
-	if lock.MinTime >= medianTimePast {
+	if lock.MinTime >= blockMTP {
 		return false
 	}
 	return true
