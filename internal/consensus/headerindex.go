@@ -177,6 +177,26 @@ type HeaderIndex struct {
 	checkpoints  map[int32]wire.Hash256      // Height -> expected hash
 }
 
+// Ensure HeaderIndex implements BlockProvider
+var _ BlockProvider = (*HeaderIndex)(nil)
+
+// GetHeaderByHeight returns the block node at a given height on the best chain.
+// Returns nil if the height is invalid or beyond the current tip.
+func (idx *HeaderIndex) GetHeaderByHeight(height int32) *BlockNode {
+	if height < 0 || idx.bestTip == nil || height > idx.bestTip.Height {
+		return nil
+	}
+	return idx.bestTip.GetAncestor(height)
+}
+
+// GetPrevHeader returns the parent of a block node.
+func (idx *HeaderIndex) GetPrevHeader(node *BlockNode) *BlockNode {
+	if node == nil {
+		return nil
+	}
+	return node.Parent
+}
+
 // NewHeaderIndex creates a new header index with the genesis block.
 func NewHeaderIndex(params *ChainParams) *HeaderIndex {
 	idx := &HeaderIndex{
@@ -315,64 +335,47 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 
 // validateDifficulty checks that the header has the correct difficulty target.
 func (idx *HeaderIndex) validateDifficulty(header wire.BlockHeader, parent *BlockNode, height int32) error {
-	// Check for testnet min difficulty rule
+	// Use GetNextWorkRequired to calculate the expected difficulty
+	expectedBits := GetNextWorkRequired(idx.params, height, int64(header.Timestamp), parent, idx)
+
+	// For regtest with no-retargeting, just check against expected
+	if idx.params.PowNoRetargeting {
+		if header.Bits != expectedBits {
+			return ErrBadDifficulty
+		}
+		return nil
+	}
+
+	// For testnet, min-difficulty blocks are allowed when > 20 min gap
 	if idx.params.MinDiffReductionTime {
 		if IsMinDifficultyBlock(idx.params, int64(header.Timestamp), int64(parent.Header.Timestamp)) {
-			// On testnet, if block is > 20 minutes after prev, difficulty can be PowLimitBits
+			// Block can use either min difficulty or the expected difficulty
 			if header.Bits == idx.params.PowLimitBits {
 				return nil
 			}
 		}
 	}
 
-	// At difficulty adjustment boundaries (every 2016 blocks)
-	if height%int32(idx.params.DifficultyAdjInterval) == 0 {
-		return idx.validateDifficultyAdjustment(header, parent, height)
+	// Compare expected vs actual bits
+	if header.Bits == expectedBits {
+		return nil
 	}
-
-	// Non-adjustment block should have same difficulty as parent
-	// (except for testnet min difficulty which was checked above)
-	if !idx.params.MinDiffReductionTime && header.Bits != parent.Header.Bits {
-		return ErrBadDifficulty
-	}
-
-	return nil
-}
-
-// validateDifficultyAdjustment validates the difficulty at a 2016 block boundary.
-func (idx *HeaderIndex) validateDifficultyAdjustment(header wire.BlockHeader, parent *BlockNode, height int32) error {
-	// Find the first block in this difficulty period
-	blocksBack := int32(idx.params.DifficultyAdjInterval) - 1
-	firstNode := parent
-	for i := int32(0); i < blocksBack && firstNode.Parent != nil; i++ {
-		firstNode = firstNode.Parent
-	}
-
-	// Calculate expected difficulty
-	expectedBits := CalcNextRequiredDifficulty(
-		idx.params,
-		parent.Header.Bits,
-		int64(firstNode.Header.Timestamp),
-		int64(parent.Header.Timestamp),
-	)
 
 	// Allow small rounding differences by comparing the actual targets
 	expectedTarget := CompactToBig(expectedBits)
 	actualTarget := CompactToBig(header.Bits)
 
 	// Targets must match (or be very close due to compact encoding rounding)
-	if actualTarget.Cmp(expectedTarget) != 0 {
-		// Check if they're within 0.1% of each other (compact encoding can round)
-		diff := new(big.Int).Sub(actualTarget, expectedTarget)
-		diff.Abs(diff)
-		tolerance := new(big.Int).Div(expectedTarget, big.NewInt(1000))
-		if diff.Cmp(tolerance) > 0 {
-			return ErrBadDifficulty
-		}
+	diff := new(big.Int).Sub(actualTarget, expectedTarget)
+	diff.Abs(diff)
+	tolerance := new(big.Int).Div(expectedTarget, big.NewInt(1000))
+	if diff.Cmp(tolerance) > 0 {
+		return ErrBadDifficulty
 	}
 
 	return nil
 }
+
 
 // GetNode returns the BlockNode for a hash, or nil if unknown.
 func (idx *HeaderIndex) GetNode(hash wire.Hash256) *BlockNode {
