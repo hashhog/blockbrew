@@ -26,6 +26,8 @@ syncs the blockchain, validates blocks, and participates in the peer-to-peer net
 - [x] HD Wallet (BIP32/BIP39/BIP84, P2WPKH addresses)
 - [x] Performance optimizations (parallel script validation, IBD tuning)
 - [x] Checkpoint verification (fork rejection during header sync)
+- [x] Regtest mode with generate RPCs (instant block mining)
+- [x] Signature verification cache (avoids redundant script checks)
 - [ ] Full mainnet IBD completion
 
 ## Quick start
