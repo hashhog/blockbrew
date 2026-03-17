@@ -28,6 +28,9 @@ type ChainManager struct {
 	assumeValidHeight int32        // Height of assume-valid block
 	isIBD             bool         // Initial Block Download mode
 	parallelScripts   bool         // Use parallel script validation
+
+	// Signature cache for faster block connection
+	sigCache *SigCache
 }
 
 // ChainManagerConfig configures the chain manager.
@@ -41,6 +44,10 @@ type ChainManagerConfig struct {
 	// IBD optimizations
 	AssumeValidHash wire.Hash256 // Hash of assume-valid block (skip scripts below this)
 	ParallelScripts bool         // Use parallel script validation (default: true)
+
+	// SigCacheSize is the maximum number of entries in the signature cache.
+	// Default: 50,000 entries. Set to 0 to disable caching.
+	SigCacheSize int
 }
 
 // NewChainManager creates a new chain manager.
@@ -48,6 +55,13 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 	flushInterval := config.FlushInterval
 	if flushInterval <= 0 {
 		flushInterval = 2000 // Default: flush every 2000 blocks
+	}
+
+	// Initialize signature cache
+	var sigCache *SigCache
+	if config.SigCacheSize >= 0 {
+		// Use provided size (0 means use default, negative means disabled)
+		sigCache = NewSigCache(config.SigCacheSize)
 	}
 
 	cm := &ChainManager{
@@ -59,6 +73,7 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 		assumeValidHash: config.AssumeValidHash,
 		parallelScripts: config.ParallelScripts,
 		isIBD:           true, // Start in IBD mode
+		sigCache:        sigCache,
 	}
 
 	// Default to parallel script validation
@@ -266,8 +281,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 
 	if !skipScripts {
 		if cm.parallelScripts {
-			// Use parallel script validation for better performance
-			if err := ParallelScriptValidation(block, cm.utxoSet, flags); err != nil {
+			// Use parallel script validation with signature cache for better performance
+			if err := ParallelScriptValidationCached(block, cm.utxoSet, flags, cm.sigCache); err != nil {
 				return fmt.Errorf("script validation failed: %w", err)
 			}
 		} else {
@@ -446,6 +461,13 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 		log.Printf("chainmgr: warning: failed to delete undo data for %s: %v", hash.String()[:16], err)
 	}
 
+	// Clear signature cache since cached entries may no longer be valid after reorg.
+	// A transaction that was valid in the old chain might reference UTXOs that
+	// no longer exist or have different values in the new chain.
+	if cm.sigCache != nil {
+		cm.sigCache.Clear()
+	}
+
 	// Update chain state
 	parent := cm.tipNode.Parent
 	if parent == nil {
@@ -549,4 +571,230 @@ func (cm *ChainManager) TipNode() *BlockNode {
 // UTXOSet returns the current UTXO set.
 func (cm *ChainManager) UTXOSet() UpdatableUTXOView {
 	return cm.utxoSet
+}
+
+// InvalidateBlock marks a block as invalid and triggers a reorg if needed.
+// This implements the invalidateblock RPC behavior.
+// If the block is in the active chain, it will be disconnected along with all
+// blocks built on top of it, and the best valid chain will be activated.
+// Descendants of the invalid block are marked with StatusInvalidChild.
+func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
+	node := cm.headerIndex.GetNode(hash)
+	if node == nil {
+		return fmt.Errorf("block not found")
+	}
+
+	// Genesis block can't be invalidated
+	if node.Height == 0 {
+		return fmt.Errorf("genesis block cannot be invalidated")
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// First, mark all descendants as invalid child (before disconnecting)
+	// This way the descendants get the right flag even if they're in the active chain
+	cm.markDescendantsInvalid(node)
+
+	// Mark the target block itself as explicitly invalid
+	node.Status |= StatusInvalid
+
+	// Check if block is in the active chain
+	isInActiveChain := cm.isAncestorOfTip(node)
+
+	if isInActiveChain {
+		// Disconnect blocks from tip back to the invalid block (inclusive)
+		// We stop when the parent of the invalid block becomes the tip
+		disconnected := 0
+		for cm.tipNode != node.Parent {
+			if cm.tipNode == nil || cm.tipNode.Height < node.Parent.Height {
+				return fmt.Errorf("failed to disconnect to target: tip is below target parent")
+			}
+
+			tipHash := cm.tipNode.Hash
+
+			// Unlock for the potentially long disconnect operation
+			cm.mu.Unlock()
+			err := cm.DisconnectBlock(tipHash)
+			cm.mu.Lock()
+
+			if err != nil {
+				return fmt.Errorf("failed to disconnect block at height %d: %w",
+					cm.tipNode.Height, err)
+			}
+			disconnected++
+
+			// Limit transactions being readded to mempool during deep reorgs
+			if disconnected > 10 {
+				// For deep reorgs, mempool updates become expensive
+				// In a full implementation, we'd stop adding txs back to mempool
+			}
+		}
+	}
+
+	// Update header index to recalculate best tip excluding invalid blocks
+	cm.headerIndex.RecalculateBestTip()
+
+	// If the new best tip has more work than current tip, reorg to it
+	bestTip := cm.headerIndex.BestTip()
+	if bestTip != nil && !bestTip.Status.IsInvalid() && bestTip.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
+		// Need to activate the best valid chain
+		cm.mu.Unlock()
+		err := cm.ReorgTo(bestTip)
+		cm.mu.Lock()
+		if err != nil {
+			log.Printf("chainmgr: failed to reorg to best chain after invalidation: %v", err)
+		}
+	}
+
+	log.Printf("chainmgr: invalidated block %s at height %d", hash.String()[:16], node.Height)
+	return nil
+}
+
+// markDescendantsInvalid marks all descendants of a block as invalid.
+func (cm *ChainManager) markDescendantsInvalid(node *BlockNode) {
+	// Use BFS to mark all descendants
+	queue := make([]*BlockNode, 0)
+	for _, child := range node.Children {
+		queue = append(queue, child)
+	}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		// Mark as invalid child (unless already explicitly invalid)
+		if current.Status&StatusInvalid == 0 {
+			current.Status |= StatusInvalidChild
+		}
+
+		// Add children to queue
+		queue = append(queue, current.Children...)
+	}
+}
+
+// isAncestorOfTip checks if a node is an ancestor of (or equal to) the current tip.
+func (cm *ChainManager) isAncestorOfTip(node *BlockNode) bool {
+	if cm.tipNode == nil || node == nil {
+		return false
+	}
+	// Walk up from tip to see if we reach node
+	current := cm.tipNode
+	for current != nil && current.Height >= node.Height {
+		if current.Hash == node.Hash {
+			return true
+		}
+		current = current.Parent
+	}
+	return false
+}
+
+// ReconsiderBlock clears the invalid flag from a block and its ancestors/descendants,
+// allowing them to be reconsidered for chain selection.
+// This implements the reconsiderblock RPC behavior.
+func (cm *ChainManager) ReconsiderBlock(hash wire.Hash256) error {
+	node := cm.headerIndex.GetNode(hash)
+	if node == nil {
+		return fmt.Errorf("block not found")
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Clear invalid flags from this block and all ancestors up to genesis
+	current := node
+	for current != nil {
+		current.Status &^= (StatusInvalid | StatusInvalidChild)
+		current = current.Parent
+	}
+
+	// Clear invalid flags from all descendants
+	cm.clearDescendantInvalidFlags(node)
+
+	// Recalculate best tip
+	cm.headerIndex.RecalculateBestTip()
+
+	// If the reconsidered chain now has more work, reorg to it
+	bestTip := cm.headerIndex.BestTip()
+	if bestTip != nil && !bestTip.Status.IsInvalid() {
+		// Only reorg if the new best has more work
+		if bestTip.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
+			cm.mu.Unlock()
+			err := cm.ReorgTo(bestTip)
+			cm.mu.Lock()
+			if err != nil {
+				return fmt.Errorf("failed to reorg to reconsidered chain: %w", err)
+			}
+		}
+	}
+
+	log.Printf("chainmgr: reconsidered block %s at height %d", hash.String()[:16], node.Height)
+	return nil
+}
+
+// clearDescendantInvalidFlags clears invalid flags from all descendants of a block.
+func (cm *ChainManager) clearDescendantInvalidFlags(node *BlockNode) {
+	// Use BFS to clear flags from all descendants
+	queue := make([]*BlockNode, 0)
+	for _, child := range node.Children {
+		queue = append(queue, child)
+	}
+
+	for len(queue) > 0 {
+		current := queue[0]
+		queue = queue[1:]
+
+		// Clear invalid child flag (keep explicit invalid if set)
+		current.Status &^= StatusInvalidChild
+
+		// Add children to queue
+		queue = append(queue, current.Children...)
+	}
+}
+
+// PreciousBlock gives a block temporary priority in chain selection.
+// If there are two chains with equal work, prefer the one containing this block.
+// This is ephemeral - the preference is lost on restart.
+// Only the last PreciousBlock call matters (new calls override previous).
+func (cm *ChainManager) PreciousBlock(hash wire.Hash256) error {
+	node := cm.headerIndex.GetNode(hash)
+	if node == nil {
+		return fmt.Errorf("block not found")
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// If the block has less work than current tip, nothing to do
+	if node.TotalWork.Cmp(cm.tipNode.TotalWork) < 0 {
+		return nil
+	}
+
+	// Mark this block as precious in the header index
+	cm.headerIndex.SetPreciousBlock(node)
+
+	// If the precious block is not on our current chain and has equal or more work,
+	// try to reorg to it
+	if !cm.isAncestorOfTip(node) && node.TotalWork.Cmp(cm.tipNode.TotalWork) >= 0 {
+		// Recalculate best tip with precious preference
+		cm.headerIndex.RecalculateBestTip()
+
+		bestTip := cm.headerIndex.BestTip()
+		if bestTip != nil && bestTip.Hash != cm.tipNode.Hash {
+			cm.mu.Unlock()
+			err := cm.ReorgTo(bestTip)
+			cm.mu.Lock()
+			if err != nil {
+				return fmt.Errorf("failed to reorg to precious chain: %w", err)
+			}
+		}
+	}
+
+	log.Printf("chainmgr: set precious block %s at height %d", hash.String()[:16], node.Height)
+	return nil
+}
+
+// GetHeaderIndex returns the header index.
+func (cm *ChainManager) GetHeaderIndex() *HeaderIndex {
+	return cm.headerIndex
 }
