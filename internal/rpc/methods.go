@@ -6,12 +6,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
 	"time"
 
+	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/mempool"
 	"github.com/hashhog/blockbrew/internal/mining"
+	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
+
+// createSnapshotFile creates a file for writing a UTXO snapshot.
+func createSnapshotFile(path string) (*os.File, error) {
+	return os.Create(path)
+}
+
+// openSnapshotFile opens a UTXO snapshot file for reading.
+func openSnapshotFile(path string) (*os.File, error) {
+	return os.Open(path)
+}
 
 // Satoshis per Bitcoin for conversion.
 const satoshiPerBitcoin = 100_000_000
@@ -430,25 +444,109 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 		}
 	}
 
+	// Parse optional blockhash parameter
+	var blockHashParam *wire.Hash256
+	if len(args) >= 3 {
+		if bhStr, ok := args[2].(string); ok && bhStr != "" {
+			bh, err := wire.NewHash256FromHex(bhStr)
+			if err != nil {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+			}
+			blockHashParam = &bh
+		}
+	}
+
 	txid, err := wire.NewHash256FromHex(txidStr)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid format"}
 	}
 
-	// First check mempool
 	var tx *wire.MsgTx
 	var blockHash wire.Hash256
 	var blockTime uint32
 	var confirmations int32
+	var isCoinbase bool
 
-	if s.mempool != nil {
-		tx = s.mempool.GetTransaction(txid)
-	}
+	// If blockhash is provided, look up the transaction in that specific block
+	if blockHashParam != nil {
+		if s.chainDB == nil {
+			return nil, &RPCError{Code: RPCErrInternal, Message: "Block storage not available"}
+		}
 
-	if tx == nil {
-		// TODO: Search in blockchain
-		// This requires a transaction index which we don't have yet
-		return nil, &RPCError{Code: RPCErrTxNotFound, Message: "Transaction not found"}
+		block, err := s.chainDB.GetBlock(*blockHashParam)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+		}
+
+		// Search for transaction in block
+		for i, btx := range block.Transactions {
+			if btx.TxHash() == txid {
+				tx = btx
+				isCoinbase = (i == 0)
+				break
+			}
+		}
+
+		if tx == nil {
+			return nil, &RPCError{Code: RPCErrTxNotFound, Message: "No such transaction found in the provided block"}
+		}
+
+		blockHash = *blockHashParam
+		blockTime = block.Header.Timestamp
+
+		// Calculate confirmations
+		if s.chainMgr != nil {
+			_, tipHeight := s.chainMgr.BestBlock()
+			blockNode := s.headerIndex.GetNode(blockHash)
+			if blockNode != nil {
+				confirmations = tipHeight - blockNode.Height + 1
+			}
+		}
+	} else {
+		// First check mempool
+		if s.mempool != nil {
+			tx = s.mempool.GetTransaction(txid)
+		}
+
+		// If not in mempool, check txindex
+		if tx == nil && s.chainDB != nil && s.config.TxIndex {
+			entry, err := s.chainDB.GetTxIndex(txid)
+			if err == nil && entry != nil {
+				// Found in txindex, get the block
+				block, err := s.chainDB.GetBlock(entry.BlockHash)
+				if err == nil {
+					for i, btx := range block.Transactions {
+						if btx.TxHash() == txid {
+							tx = btx
+							isCoinbase = (i == 0)
+							blockHash = entry.BlockHash
+							blockTime = block.Header.Timestamp
+							break
+						}
+					}
+				}
+
+				// Calculate confirmations
+				if tx != nil && s.chainMgr != nil {
+					_, tipHeight := s.chainMgr.BestBlock()
+					blockNode := s.headerIndex.GetNode(blockHash)
+					if blockNode != nil {
+						confirmations = tipHeight - blockNode.Height + 1
+					}
+				}
+			}
+		}
+
+		// Transaction not found
+		if tx == nil {
+			if !s.config.TxIndex {
+				return nil, &RPCError{
+					Code:    RPCErrTxNotFound,
+					Message: "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries",
+				}
+			}
+			return nil, &RPCError{Code: RPCErrTxNotFound, Message: "No such mempool or blockchain transaction"}
+		}
 	}
 
 	// Non-verbose: return hex
@@ -461,7 +559,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 	}
 
 	// Verbose: return full transaction object
-	result := buildTxResult(tx, false)
+	result := buildTxResult(tx, isCoinbase)
 	if !blockHash.IsZero() {
 		result.BlockHash = blockHash.String()
 		result.Confirmations = confirmations
@@ -487,6 +585,22 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hex string"}
 	}
 
+	// Parse maxfeerate parameter (optional, default 0.10 BTC/kvB)
+	// 0 means no limit
+	maxFeeRate := 0.10 * satoshiPerBitcoin // Default: 0.10 BTC/kvB = 10,000,000 sat/kvB
+	if len(args) >= 2 {
+		switch v := args[1].(type) {
+		case float64:
+			maxFeeRate = v * satoshiPerBitcoin // Convert from BTC/kvB to sat/kvB
+		case string:
+			// Some clients may pass as string
+			var f float64
+			if _, err := fmt.Sscanf(v, "%f", &f); err == nil {
+				maxFeeRate = f * satoshiPerBitcoin
+			}
+		}
+	}
+
 	// Decode hex
 	txBytes, err := hex.DecodeString(hexStr)
 	if err != nil {
@@ -499,21 +613,55 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %v", err)}
 	}
 
-	// Add to mempool
+	txid := tx.TxHash()
+
+	// Check mempool availability
 	if s.mempool == nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
 	}
 
+	// Check if transaction is already in mempool (idempotent behavior)
+	if s.mempool.HasTransaction(txid) {
+		// Transaction already in mempool, return txid without error
+		// Optionally relay again
+		if s.peerMgr != nil {
+			entry := s.mempool.GetEntry(txid)
+			if entry != nil {
+				s.peerMgr.RelayTransaction(txid, entry.Fee, entry.Size, "")
+			}
+		}
+		return txid.String(), nil
+	}
+
+	// Add to mempool
 	if err := s.mempool.AddTransaction(tx); err != nil {
 		return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Transaction rejected: %v", err)}
 	}
 
-	txid := tx.TxHash()
+	// Check fee rate against maxfeerate limit
+	if maxFeeRate > 0 {
+		entry := s.mempool.GetEntry(txid)
+		if entry != nil {
+			// Convert entry.FeeRate from sat/vB to sat/kvB for comparison
+			feeRateKvB := entry.FeeRate * 1000
+			if feeRateKvB > maxFeeRate {
+				// Fee rate too high, remove from mempool and return error
+				s.mempool.RemoveTransaction(txid)
+				return nil, &RPCError{
+					Code:    RPCErrVerify,
+					Message: fmt.Sprintf("Fee rate (%.8f BTC/kvB) exceeds maxfeerate (%.8f BTC/kvB)", feeRateKvB/satoshiPerBitcoin, maxFeeRate/satoshiPerBitcoin),
+				}
+			}
+		}
+	}
 
 	// Broadcast to peers via inv message
+	// Pass empty string for fromPeer since this originated locally via RPC
 	if s.peerMgr != nil {
-		// TODO: Broadcast inv to peers
-		// This would require access to the p2p layer's inv broadcasting
+		entry := s.mempool.GetEntry(txid)
+		if entry != nil {
+			s.peerMgr.RelayTransaction(txid, entry.Fee, entry.Size, "")
+		}
 	}
 
 	return txid.String(), nil
@@ -550,6 +698,191 @@ func (s *Server) handleDecodeRawTransaction(params json.RawMessage) (interface{}
 // ============================================================================
 // Mempool RPCs
 // ============================================================================
+
+func (s *Server) handleSubmitPackage(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: array of raw transaction hex strings
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing package parameter"}
+	}
+
+	// First argument is the array of raw transactions
+	rawTxs, ok := args[0].([]interface{})
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Package must be an array of hex strings"}
+	}
+
+	if len(rawTxs) == 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Package must contain at least one transaction"}
+	}
+
+	// Parse maxfeerate (optional, default 0.10 BTC/kvB)
+	maxFeeRate := 0.10 * satoshiPerBitcoin // sat/kvB
+	if len(args) >= 2 {
+		switch v := args[1].(type) {
+		case float64:
+			maxFeeRate = v * satoshiPerBitcoin
+		case string:
+			var f float64
+			if _, err := fmt.Sscanf(v, "%f", &f); err == nil {
+				maxFeeRate = f * satoshiPerBitcoin
+			}
+		}
+	}
+
+	// Parse maxburnamount (optional, default 0)
+	maxBurnAmount := int64(0)
+	if len(args) >= 3 {
+		if v, ok := args[2].(float64); ok {
+			maxBurnAmount = int64(v * satoshiPerBitcoin)
+		}
+	}
+
+	// Decode all transactions
+	txns := make([]*wire.MsgTx, 0, len(rawTxs))
+	for i, rawTx := range rawTxs {
+		hexStr, ok := rawTx.(string)
+		if !ok {
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParams,
+				Message: fmt.Sprintf("Transaction %d must be a hex string", i),
+			}
+		}
+
+		txBytes, err := hex.DecodeString(hexStr)
+		if err != nil {
+			return nil, &RPCError{
+				Code:    RPCErrDeserialization,
+				Message: fmt.Sprintf("Transaction %d: invalid hex encoding", i),
+			}
+		}
+
+		tx := &wire.MsgTx{}
+		if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+			return nil, &RPCError{
+				Code:    RPCErrDeserialization,
+				Message: fmt.Sprintf("Transaction %d: decode failed: %v", i, err),
+			}
+		}
+
+		// Check burn amount if limit is set
+		if maxBurnAmount > 0 {
+			for j, out := range tx.TxOut {
+				if isUnspendable(out.PkScript) && out.Value > maxBurnAmount {
+					return nil, &RPCError{
+						Code:    RPCErrVerify,
+						Message: fmt.Sprintf("Transaction %d output %d exceeds maxburnamount", i, j),
+					}
+				}
+			}
+		}
+
+		txns = append(txns, tx)
+	}
+
+	// Check package topology for multi-tx packages
+	if len(txns) > 1 {
+		if !mempool.IsChildWithParentsTree(txns) {
+			return nil, &RPCError{
+				Code:    RPCErrVerify,
+				Message: "package topology disallowed. not child-with-parents or parents depend on each other.",
+			}
+		}
+	}
+
+	// Check mempool availability
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
+	}
+
+	// Accept the package
+	pkgResult, err := s.mempool.AcceptPackage(txns)
+
+	// Build result
+	result := &SubmitPackageResult{
+		TxResults: make(map[string]*SubmitPackageTxResult),
+	}
+
+	// Set package message
+	if err != nil {
+		result.PackageMsg = err.Error()
+	} else {
+		result.PackageMsg = "success"
+	}
+
+	// Add replaced transactions
+	if pkgResult != nil && len(pkgResult.ReplacedTxs) > 0 {
+		result.ReplacedTransactions = make([]string, len(pkgResult.ReplacedTxs))
+		for i, txid := range pkgResult.ReplacedTxs {
+			result.ReplacedTransactions[i] = txid.String()
+		}
+	}
+
+	// Add per-transaction results
+	if pkgResult != nil {
+		for wtxid, txResult := range pkgResult.TxResults {
+			txResultRPC := &SubmitPackageTxResult{
+				TxID:  txResult.TxID.String(),
+				WTxID: wtxid.String(),
+			}
+
+			if txResult.Accepted || txResult.AlreadyInMempool {
+				txResultRPC.VSize = txResult.VSize
+				txResultRPC.Fees = &TxFees{
+					Base: float64(txResult.Fee) / satoshiPerBitcoin,
+				}
+				// Effective feerate in BTC/kvB
+				txResultRPC.EffectiveFeerate = txResult.EffectiveFeerate / satoshiPerBitcoin * 1000
+
+				// List of wtxids included in feerate calculation
+				txResultRPC.EffectiveIncludes = make([]string, len(txResult.EffectiveIncludes))
+				for i, w := range txResult.EffectiveIncludes {
+					txResultRPC.EffectiveIncludes[i] = w.String()
+				}
+			}
+
+			if txResult.Error != nil {
+				txResultRPC.Error = txResult.Error.Error()
+			}
+
+			result.TxResults[wtxid.String()] = txResultRPC
+		}
+	}
+
+	// Check if any transaction exceeds maxfeerate
+	if maxFeeRate > 0 && pkgResult != nil {
+		for _, txResult := range pkgResult.TxResults {
+			if txResult.Accepted && txResult.EffectiveFeerate*1000 > maxFeeRate {
+				// Remove transactions that exceed the fee rate
+				// Note: In a production implementation, we would prevent acceptance entirely
+				// rather than accepting then removing. For now, we just warn.
+				rpcResult := result.TxResults[txResult.WTxID.String()]
+				if rpcResult != nil {
+					rpcResult.Error = fmt.Sprintf("max-fee-exceeded: %.8f BTC/kvB",
+						txResult.EffectiveFeerate/satoshiPerBitcoin*1000)
+				}
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// isUnspendable checks if a script is unspendable (OP_RETURN or invalid).
+func isUnspendable(pkScript []byte) bool {
+	if len(pkScript) == 0 {
+		return false
+	}
+	// OP_RETURN
+	if pkScript[0] == 0x6a {
+		return true
+	}
+	return false
+}
 
 func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 	if s.mempool == nil {
@@ -694,6 +1027,105 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 		ConnectionsIn:   inbound,
 		ConnectionsOut:  outbound,
 	}, nil
+}
+
+func (s *Server) handleListBanned() (interface{}, *RPCError) {
+	if s.peerMgr == nil {
+		return []BannedInfo{}, nil
+	}
+
+	banList := s.peerMgr.ListBanned()
+	result := make([]BannedInfo, 0, len(banList))
+
+	for ip, info := range banList {
+		result = append(result, BannedInfo{
+			Address:     ip,
+			BanCreated:  info.CreatedAt.Unix(),
+			BannedUntil: info.Expiry.Unix(),
+			BanReason:   info.Reason,
+		})
+	}
+
+	return result, nil
+}
+
+func (s *Server) handleSetBan(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: [ip, command, bantime, absolute]
+	// command: "add" or "remove"
+	// bantime: duration in seconds (default 86400 = 24h)
+	// absolute: if true, bantime is an absolute Unix timestamp
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing parameters (ip, command)"}
+	}
+
+	ip, ok := args[0].(string)
+	if !ok || ip == "" {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid IP address"}
+	}
+
+	command, ok := args[1].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid command"}
+	}
+
+	if s.peerMgr == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Peer manager not available"}
+	}
+
+	switch command {
+	case "add":
+		banTime := int64(86400) // Default 24 hours
+		absolute := false
+
+		if len(args) >= 3 {
+			if bt, ok := args[2].(float64); ok {
+				banTime = int64(bt)
+			}
+		}
+		if len(args) >= 4 {
+			if abs, ok := args[3].(bool); ok {
+				absolute = abs
+			}
+		}
+
+		var duration time.Duration
+		if absolute {
+			// banTime is an absolute Unix timestamp
+			untilTime := time.Unix(banTime, 0)
+			duration = time.Until(untilTime)
+			if duration <= 0 {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Ban time already expired"}
+			}
+		} else {
+			duration = time.Duration(banTime) * time.Second
+		}
+
+		s.peerMgr.SetBan(ip, duration, "manually banned via RPC")
+		return nil, nil
+
+	case "remove":
+		if s.peerMgr.Unban(ip) {
+			return nil, nil
+		}
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "IP not found in ban list"}
+
+	default:
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid command (use 'add' or 'remove')"}
+	}
+}
+
+func (s *Server) handleClearBanned() (interface{}, *RPCError) {
+	if s.peerMgr == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Peer manager not available"}
+	}
+
+	s.peerMgr.ClearBanned()
+	return nil, nil
 }
 
 func (s *Server) handleAddNode(params json.RawMessage) (interface{}, *RPCError) {
@@ -843,8 +1275,11 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (interface{}, *RPCErr
 		}
 	}
 
-	// Connect block to chain
+	// Add header to index before connecting
 	if s.chainMgr != nil {
+		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil {
+			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to add header to index: %v", err)}
+		}
 		if err := s.chainMgr.ConnectBlock(block); err != nil {
 			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Block connection failed: %v", err)}
 		}
@@ -1041,4 +1476,825 @@ func buildTxResult(tx *wire.MsgTx, isCoinbase bool) *TxResult {
 		Vout:     vout,
 		Hex:      hex.EncodeToString(buf.Bytes()),
 	}
+}
+
+// ============================================================================
+// Descriptor RPCs
+// ============================================================================
+
+func (s *Server) handleGetDescriptorInfo(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: [descriptor]
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing descriptor parameter"}
+	}
+
+	desc, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid descriptor"}
+	}
+
+	// Determine network from chain params
+	net := s.getNetwork()
+
+	// Get descriptor info
+	info, err := wallet.GetDescriptorInfo(desc, net)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: err.Error()}
+	}
+
+	return &DescriptorInfoResult{
+		Descriptor:     info.Descriptor,
+		Checksum:       info.Checksum,
+		IsRange:        info.IsRange,
+		IsSolvable:     info.IsSolvable,
+		HasPrivateKeys: info.HasPrivateKeys,
+	}, nil
+}
+
+func (s *Server) handleDeriveAddresses(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: [descriptor, [start, end]]
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing descriptor parameter"}
+	}
+
+	desc, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid descriptor"}
+	}
+
+	// Parse optional range parameter
+	var start, end uint32 = 0, 0
+	if len(args) >= 2 {
+		// Range can be a number or [start, end] array
+		switch r := args[1].(type) {
+		case float64:
+			// Single number means [0, n]
+			end = uint32(r)
+		case []interface{}:
+			if len(r) == 2 {
+				if s, ok := r[0].(float64); ok {
+					start = uint32(s)
+				}
+				if e, ok := r[1].(float64); ok {
+					end = uint32(e)
+				}
+			}
+		}
+	}
+
+	// Determine network from chain params
+	net := s.getNetwork()
+
+	// Parse descriptor to check if it's ranged
+	parsed, err := wallet.ParseDescriptor(desc, net)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: err.Error()}
+	}
+
+	// For non-ranged descriptors, derive a single address
+	if !parsed.IsRange() {
+		addresses, err := wallet.DeriveAddresses(desc, net, 0, 0)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: err.Error()}
+		}
+		return addresses, nil
+	}
+
+	// For ranged descriptors, a range must be specified
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Range must be specified for ranged descriptor"}
+	}
+
+	addresses, err := wallet.DeriveAddresses(desc, net, start, end)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: err.Error()}
+	}
+
+	return addresses, nil
+}
+
+// getNetwork returns the address.Network based on chain params.
+func (s *Server) getNetwork() address.Network {
+	if s.chainParams == nil {
+		return address.Mainnet
+	}
+	switch s.chainParams.Name {
+	case "testnet4", "testnet":
+		return address.Testnet
+	case "regtest":
+		return address.Regtest
+	case "signet":
+		return address.Signet
+	default:
+		return address.Mainnet
+	}
+}
+
+// ============================================================================
+// AssumeUTXO RPCs
+// ============================================================================
+
+func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: [path]
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing path parameter"}
+	}
+
+	path, ok := args[0].(string)
+	if !ok || path == "" {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid path"}
+	}
+
+	if s.chainMgr == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Chain manager not available"}
+	}
+
+	// Get current tip
+	tipHash, tipHeight := s.chainMgr.BestBlock()
+
+	// Get UTXO set - need to access it through chain manager
+	utxoSet := s.chainMgr.UTXOSet()
+	if utxoSet == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set not available"}
+	}
+
+	// Cast to *UTXOSet for snapshot operations
+	us, ok := utxoSet.(*consensus.UTXOSet)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set type not supported for snapshots"}
+	}
+
+	// Open file for writing
+	f, err := createSnapshotFile(path)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to create file: %v", err)}
+	}
+	defer f.Close()
+
+	// Write snapshot
+	networkMagic := s.chainParams.NetworkMagic
+	stats, err := consensus.WriteSnapshot(f, us, tipHash, networkMagic)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to write snapshot: %v", err)}
+	}
+	stats.Height = tipHeight
+
+	// Compute hash of the UTXO set for verification
+	utxoHash, coinsCount, err := consensus.ComputeUTXOHash(us)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to compute UTXO hash: %v", err)}
+	}
+
+	return &DumpTxOutSetResult{
+		CoinsWritten: stats.CoinsWritten,
+		BaseHash:     tipHash.String(),
+		BaseHeight:   tipHeight,
+		Path:         path,
+		TxOutSetHash: utxoHash.String(),
+		NChainTx:     coinsCount, // Note: this is coins count, not chain tx count
+	}, nil
+}
+
+func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: [path]
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing path parameter"}
+	}
+
+	path, ok := args[0].(string)
+	if !ok || path == "" {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid path"}
+	}
+
+	if s.chainParams == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Chain params not available"}
+	}
+
+	// Open file for reading
+	f, err := openSnapshotFile(path)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to open file: %v", err)}
+	}
+	defer f.Close()
+
+	// Load snapshot
+	networkMagic := s.chainParams.NetworkMagic
+	utxoSet, stats, err := consensus.LoadSnapshot(f, s.chainDB, networkMagic)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to load snapshot: %v", err)}
+	}
+
+	// Verify the snapshot hash matches assumeutxo params if available
+	if s.chainParams.AssumeUTXO != nil {
+		auData := s.chainParams.AssumeUTXO.ForBlockHash(stats.BlockHash)
+		if auData == nil {
+			return nil, &RPCError{
+				Code:    RPCErrVerify,
+				Message: fmt.Sprintf("Snapshot block hash %s not recognized in assumeutxo params", stats.BlockHash.String()),
+			}
+		}
+
+		// Compute hash of loaded UTXO set
+		computedHash, _, err := consensus.ComputeUTXOHash(utxoSet)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to compute UTXO hash: %v", err)}
+		}
+
+		if computedHash != auData.HashSerialized {
+			return nil, &RPCError{
+				Code:    RPCErrVerify,
+				Message: fmt.Sprintf("Snapshot UTXO hash mismatch: expected %s, got %s",
+					auData.HashSerialized.String(), computedHash.String()),
+			}
+		}
+
+		stats.Height = auData.Height
+	}
+
+	// Look up the snapshot block in header index to get height
+	if s.headerIndex != nil {
+		node := s.headerIndex.GetNode(stats.BlockHash)
+		if node != nil {
+			stats.Height = node.Height
+		}
+	}
+
+	// Store reference to the loaded UTXO set
+	// In a full implementation, this would activate a snapshot chainstate
+	// For now, we just return success with the stats
+	_ = utxoSet // Would be used to create a snapshot chainstate
+
+	return &LoadTxOutSetResult{
+		CoinsLoaded: stats.CoinsLoaded,
+		TipHash:     stats.BlockHash.String(),
+		BaseHeight:  stats.Height,
+		Path:        path,
+	}, nil
+}
+
+func (s *Server) handleGetChainStates() (interface{}, *RPCError) {
+	headersHeight := int32(-1)
+	if s.headerIndex != nil {
+		headersHeight = s.headerIndex.BestHeight()
+	}
+
+	result := &ChainStatesResult{
+		Headers:     headersHeight,
+		Chainstates: make([]ChainstateInfo, 0),
+	}
+
+	// Add the main chainstate
+	if s.chainMgr != nil {
+		tipHash, tipHeight := s.chainMgr.BestBlock()
+
+		var difficulty float64
+		tipNode := s.headerIndex.GetNode(tipHash)
+		if tipNode != nil {
+			genesisTarget := consensus.CompactToBig(0x1d00ffff)
+			currentTarget := consensus.CompactToBig(tipNode.Header.Bits)
+			if currentTarget.Sign() > 0 {
+				diff := new(big.Float).SetInt(genesisTarget)
+				diff.Quo(diff, new(big.Float).SetInt(currentTarget))
+				difficulty, _ = diff.Float64()
+			}
+		}
+
+		var verificationProgress float64
+		if headersHeight > 0 {
+			verificationProgress = float64(tipHeight) / float64(headersHeight)
+			if verificationProgress > 1.0 {
+				verificationProgress = 1.0
+			}
+		}
+
+		info := ChainstateInfo{
+			Blocks:               tipHeight,
+			BestBlockHash:        tipHash.String(),
+			Difficulty:           difficulty,
+			VerificationProgress: verificationProgress,
+			Validated:            true, // Main chainstate is always validated
+		}
+
+		if tipNode != nil {
+			info.Bits = fmt.Sprintf("%08x", tipNode.Header.Bits)
+			info.Target = consensus.CompactToBig(tipNode.Header.Bits).Text(16)
+		}
+
+		result.Chainstates = append(result.Chainstates, info)
+	}
+
+	return result, nil
+}
+
+// DumpTxOutSetResult is the result of the dumptxoutset RPC.
+type DumpTxOutSetResult struct {
+	CoinsWritten uint64 `json:"coins_written"`
+	BaseHash     string `json:"base_hash"`
+	BaseHeight   int32  `json:"base_height"`
+	Path         string `json:"path"`
+	TxOutSetHash string `json:"txoutset_hash"`
+	NChainTx     uint64 `json:"nchaintx"`
+}
+
+// LoadTxOutSetResult is the result of the loadtxoutset RPC.
+type LoadTxOutSetResult struct {
+	CoinsLoaded uint64 `json:"coins_loaded"`
+	TipHash     string `json:"tip_hash"`
+	BaseHeight  int32  `json:"base_height"`
+	Path        string `json:"path"`
+}
+
+// ChainStatesResult is the result of the getchainstates RPC.
+type ChainStatesResult struct {
+	Headers     int32            `json:"headers"`
+	Chainstates []ChainstateInfo `json:"chainstates"`
+}
+
+// ChainstateInfo contains information about a single chainstate.
+type ChainstateInfo struct {
+	Blocks               int32   `json:"blocks"`
+	BestBlockHash        string  `json:"bestblockhash"`
+	Bits                 string  `json:"bits,omitempty"`
+	Target               string  `json:"target,omitempty"`
+	Difficulty           float64 `json:"difficulty"`
+	VerificationProgress float64 `json:"verificationprogress"`
+	SnapshotBlockHash    string  `json:"snapshot_blockhash,omitempty"`
+	CoinsDBCacheBytes    int64   `json:"coins_db_cache_bytes,omitempty"`
+	CoinsTipCacheBytes   int64   `json:"coins_tip_cache_bytes,omitempty"`
+	Validated            bool    `json:"validated"`
+}
+
+// ============================================================================
+// Generate RPCs (for regtest)
+// ============================================================================
+
+func (s *Server) handleGenerateToAddress(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: [nblocks, address, maxtries]
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing required parameters (nblocks, address)"}
+	}
+
+	// Parse nblocks
+	nblocks, ok := args[0].(float64)
+	if !ok || nblocks < 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid nblocks parameter"}
+	}
+
+	// Parse address
+	addrStr, ok := args[1].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address parameter"}
+	}
+
+	// Parse optional maxtries
+	maxTries := mining.DefaultMaxTries
+	if len(args) >= 3 {
+		if mt, ok := args[2].(float64); ok {
+			maxTries = int(mt)
+		}
+	}
+
+	// Validate address and get scriptPubKey
+	net := s.getNetwork()
+	addr, err := address.DecodeAddress(addrStr, net)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid address: %v", err)}
+	}
+	coinbaseScript := addr.ScriptPubKey()
+
+	// Create the block miner
+	miner := s.createBlockMiner()
+	if miner == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mining not available"}
+	}
+
+	// Generate blocks
+	hashes, err := miner.GenerateBlocks(int(nblocks), coinbaseScript, maxTries)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Block generation failed: %v", err)}
+	}
+
+	// Convert hashes to strings
+	result := make([]string, len(hashes))
+	for i, h := range hashes {
+		result[i] = h.String()
+	}
+
+	return result, nil
+}
+
+func (s *Server) handleGenerateToDescriptor(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: [num_blocks, descriptor, maxtries]
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing required parameters (num_blocks, descriptor)"}
+	}
+
+	// Parse num_blocks
+	numBlocks, ok := args[0].(float64)
+	if !ok || numBlocks < 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid num_blocks parameter"}
+	}
+
+	// Parse descriptor
+	descriptor, ok := args[1].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid descriptor parameter"}
+	}
+
+	// Parse optional maxtries
+	maxTries := mining.DefaultMaxTries
+	if len(args) >= 3 {
+		if mt, ok := args[2].(float64); ok {
+			maxTries = int(mt)
+		}
+	}
+
+	// Derive address from descriptor
+	net := s.getNetwork()
+	addresses, err := wallet.DeriveAddresses(descriptor, net, 0, 0)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid descriptor: %v", err)}
+	}
+	if len(addresses) == 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Descriptor did not produce any addresses"}
+	}
+
+	// Get scriptPubKey from the first derived address
+	addr, err := address.DecodeAddress(addresses[0], net)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to decode derived address: %v", err)}
+	}
+	coinbaseScript := addr.ScriptPubKey()
+
+	// Create the block miner
+	miner := s.createBlockMiner()
+	if miner == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mining not available"}
+	}
+
+	// Generate blocks
+	hashes, err := miner.GenerateBlocks(int(numBlocks), coinbaseScript, maxTries)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Block generation failed: %v", err)}
+	}
+
+	// Convert hashes to strings
+	result := make([]string, len(hashes))
+	for i, h := range hashes {
+		result[i] = h.String()
+	}
+
+	return result, nil
+}
+
+func (s *Server) handleGenerateBlock(params json.RawMessage) (interface{}, *RPCError) {
+	// Parse parameters: [output, transactions, submit]
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing required parameters (output, transactions)"}
+	}
+
+	// Parse output (address or descriptor)
+	output, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid output parameter"}
+	}
+
+	// Parse transactions array
+	txsRaw, ok := args[1].([]interface{})
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid transactions parameter"}
+	}
+
+	// Parse optional submit parameter (default true)
+	submit := true
+	if len(args) >= 3 {
+		if sub, ok := args[2].(bool); ok {
+			submit = sub
+		}
+	}
+
+	// Get coinbase script from output (try as address first, then descriptor)
+	net := s.getNetwork()
+	var coinbaseScript []byte
+
+	// Try as address first
+	addr, err := address.DecodeAddress(output, net)
+	if err == nil {
+		coinbaseScript = addr.ScriptPubKey()
+	} else {
+		// Try as descriptor
+		addresses, err := wallet.DeriveAddresses(output, net, 0, 0)
+		if err != nil || len(addresses) == 0 {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid output: not a valid address or descriptor"}
+		}
+		addr, err := address.DecodeAddress(addresses[0], net)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to decode derived address: %v", err)}
+		}
+		coinbaseScript = addr.ScriptPubKey()
+	}
+
+	// Parse transactions (can be txids from mempool or raw tx hex)
+	var txs []*wire.MsgTx
+	for i, txRaw := range txsRaw {
+		txStr, ok := txRaw.(string)
+		if !ok {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Transaction %d must be a string", i)}
+		}
+
+		// Try as txid first (lookup in mempool)
+		if len(txStr) == 64 {
+			txid, err := wire.NewHash256FromHex(txStr)
+			if err == nil && s.mempool != nil {
+				if tx := s.mempool.GetTransaction(txid); tx != nil {
+					txs = append(txs, tx)
+					continue
+				}
+			}
+		}
+
+		// Try as raw transaction hex
+		txBytes, err := hex.DecodeString(txStr)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Transaction %d: invalid hex", i)}
+		}
+
+		tx := &wire.MsgTx{}
+		if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Transaction %d: decode failed: %v", i, err)}
+		}
+		txs = append(txs, tx)
+	}
+
+	// Generate the block template
+	config := mining.TemplateConfig{
+		MinerAddress: coinbaseScript,
+	}
+
+	if s.templateGen == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mining not available"}
+	}
+
+	template, err := s.templateGen.GenerateTemplate(config)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Template generation failed: %v", err)}
+	}
+
+	block := template.Block
+
+	// Replace transactions with the provided ones
+	coinbase := block.Transactions[0]
+	block.Transactions = make([]*wire.MsgTx, 0, len(txs)+1)
+	block.Transactions = append(block.Transactions, coinbase)
+	block.Transactions = append(block.Transactions, txs...)
+
+	// Recalculate merkle root
+	txHashes := make([]wire.Hash256, len(block.Transactions))
+	for i, tx := range block.Transactions {
+		txHashes[i] = tx.TxHash()
+	}
+	block.Header.MerkleRoot = consensus.CalcMerkleRoot(txHashes)
+
+	// Recalculate witness commitment if segwit is active
+	if s.chainParams.SegwitHeight <= template.Height {
+		wtxids := make([]wire.Hash256, len(block.Transactions))
+		wtxids[0] = wire.Hash256{} // Coinbase wtxid is all zeros
+		for i := 1; i < len(block.Transactions); i++ {
+			wtxids[i] = block.Transactions[i].WTxHash()
+		}
+		witnessReserved := make([]byte, 32)
+		commitment := consensus.CalcWitnessCommitment(wtxids, witnessReserved)
+		mining.UpdateCoinbaseWitnessCommitment(coinbase, commitment[:])
+	}
+
+	// Mine the block
+	target := consensus.CompactToBig(block.Header.Bits)
+	var blockHash wire.Hash256
+	found := false
+
+	for nonce := uint32(0); nonce < uint32(mining.DefaultMaxTries); nonce++ {
+		block.Header.Nonce = nonce
+		hash := block.Header.BlockHash()
+
+		hashNum := consensus.HashToBig(hash)
+		if hashNum.Cmp(target) <= 0 {
+			blockHash = hash
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to mine block (max tries exceeded)"}
+	}
+
+	result := &GenerateBlockResult{
+		Hash: blockHash.String(),
+	}
+
+	// If not submitting, return the hex
+	if !submit {
+		var buf bytes.Buffer
+		if err := block.Serialize(&buf); err != nil {
+			return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to serialize block"}
+		}
+		result.Hex = hex.EncodeToString(buf.Bytes())
+		return result, nil
+	}
+
+	// Submit the block
+	if s.chainDB != nil {
+		if err := s.chainDB.StoreBlock(blockHash, block); err != nil {
+			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to store block: %v", err)}
+		}
+	}
+
+	if s.chainMgr != nil {
+		if err := s.chainMgr.ConnectBlock(block); err != nil {
+			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Block connection failed: %v", err)}
+		}
+	}
+
+	return result, nil
+}
+
+func (s *Server) handleGenerate(params json.RawMessage) (interface{}, *RPCError) {
+	// The 'generate' RPC is deprecated in Bitcoin Core
+	// It has been replaced by 'generatetoaddress'
+	return nil, &RPCError{
+		Code:    RPCErrMethodNotFound,
+		Message: "The 'generate' RPC has been replaced by 'generatetoaddress'. Please use 'generatetoaddress' instead.",
+	}
+}
+
+// createBlockMiner creates a BlockMiner for instant block generation.
+func (s *Server) createBlockMiner() *mining.BlockMiner {
+	if s.templateGen == nil {
+		return nil
+	}
+
+	return mining.NewBlockMiner(
+		s.templateGen,
+		s.chainMgr,
+		s.chainDB,
+		s.headerIndex,
+		s.chainParams,
+	)
+}
+
+// ============================================================================
+// Chain Management RPCs
+// ============================================================================
+
+// handleInvalidateBlock marks a block as permanently invalid.
+// If the block is in the active chain, it triggers a reorg to the best valid chain.
+func (s *Server) handleInvalidateBlock(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing blockhash parameter"}
+	}
+
+	hashStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash"}
+	}
+
+	hash, err := wire.NewHash256FromHex(hashStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+	}
+
+	if s.chainMgr == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+
+	// Check if block exists
+	if s.headerIndex.GetNode(hash) == nil {
+		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+	}
+
+	// Invalidate the block
+	if err := s.chainMgr.InvalidateBlock(hash); err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
+	}
+
+	return nil, nil
+}
+
+// handleReconsiderBlock removes the invalid status from a block and its descendants.
+// This undoes the effect of invalidateblock.
+func (s *Server) handleReconsiderBlock(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing blockhash parameter"}
+	}
+
+	hashStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash"}
+	}
+
+	hash, err := wire.NewHash256FromHex(hashStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+	}
+
+	if s.chainMgr == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+
+	// Check if block exists
+	if s.headerIndex.GetNode(hash) == nil {
+		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+	}
+
+	// Reconsider the block
+	if err := s.chainMgr.ReconsiderBlock(hash); err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
+	}
+
+	return nil, nil
+}
+
+// handlePreciousBlock treats a block as if it were received before others with the same work.
+// This gives the block's chain priority in chain selection when there are ties.
+// The effect is ephemeral - lost on restart - and new calls override previous ones.
+func (s *Server) handlePreciousBlock(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing blockhash parameter"}
+	}
+
+	hashStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash"}
+	}
+
+	hash, err := wire.NewHash256FromHex(hashStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+	}
+
+	if s.chainMgr == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+
+	// Check if block exists
+	if s.headerIndex.GetNode(hash) == nil {
+		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+	}
+
+	// Mark the block as precious
+	if err := s.chainMgr.PreciousBlock(hash); err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
+	}
+
+	return nil, nil
 }

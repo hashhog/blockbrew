@@ -654,3 +654,663 @@ func BenchmarkCreateTransaction(b *testing.B) {
 		w.CreateTransaction(destAddr, 100000, 1.0)
 	}
 }
+
+// Tests for multi-address type support
+
+func TestAddressGeneration(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	err := w.CreateFromMnemonic(testMnemonic, "")
+	if err != nil {
+		t.Fatalf("CreateFromMnemonic failed: %v", err)
+	}
+
+	tests := []struct {
+		name       string
+		genFunc    func() (string, error)
+		wantPrefix string
+	}{
+		{
+			name:       "P2WPKH",
+			genFunc:    w.NewP2WPKHAddress,
+			wantPrefix: "bc1q",
+		},
+		{
+			name:       "P2PKH",
+			genFunc:    w.NewP2PKHAddress,
+			wantPrefix: "1",
+		},
+		{
+			name:       "P2SH-P2WPKH",
+			genFunc:    w.NewP2SH_P2WPKHAddress,
+			wantPrefix: "3",
+		},
+		{
+			name:       "P2TR",
+			genFunc:    w.NewP2TRAddress,
+			wantPrefix: "bc1p",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			addr, err := tt.genFunc()
+			if err != nil {
+				t.Fatalf("Failed to generate %s address: %v", tt.name, err)
+			}
+
+			if !strings.HasPrefix(addr, tt.wantPrefix) {
+				t.Errorf("%s address = %s, want prefix %s", tt.name, addr, tt.wantPrefix)
+			}
+
+			// Address should be recognized by wallet
+			if !w.IsOwnAddress(addr) {
+				t.Errorf("Wallet should recognize %s address %s", tt.name, addr)
+			}
+		})
+	}
+}
+
+func TestP2PKHAddressDeterministic(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	// Create first wallet
+	w1 := NewWallet(config)
+	w1.CreateFromMnemonic(testMnemonic, "")
+	addr1, _ := w1.NewP2PKHAddress()
+
+	// Create second wallet with same mnemonic
+	w2 := NewWallet(config)
+	w2.CreateFromMnemonic(testMnemonic, "")
+	addr2, _ := w2.NewP2PKHAddress()
+
+	// Addresses should match
+	if addr1 != addr2 {
+		t.Errorf("P2PKH addresses don't match: %s vs %s", addr1, addr2)
+	}
+}
+
+func TestP2SH_P2WPKHAddressDeterministic(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	// Create first wallet
+	w1 := NewWallet(config)
+	w1.CreateFromMnemonic(testMnemonic, "")
+	addr1, _ := w1.NewP2SH_P2WPKHAddress()
+
+	// Create second wallet with same mnemonic
+	w2 := NewWallet(config)
+	w2.CreateFromMnemonic(testMnemonic, "")
+	addr2, _ := w2.NewP2SH_P2WPKHAddress()
+
+	// Addresses should match
+	if addr1 != addr2 {
+		t.Errorf("P2SH-P2WPKH addresses don't match: %s vs %s", addr1, addr2)
+	}
+}
+
+func TestP2TRAddressDeterministic(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	// Create first wallet
+	w1 := NewWallet(config)
+	w1.CreateFromMnemonic(testMnemonic, "")
+	addr1, _ := w1.NewP2TRAddress()
+
+	// Create second wallet with same mnemonic
+	w2 := NewWallet(config)
+	w2.CreateFromMnemonic(testMnemonic, "")
+	addr2, _ := w2.NewP2TRAddress()
+
+	// Addresses should match
+	if addr1 != addr2 {
+		t.Errorf("P2TR addresses don't match: %s vs %s", addr1, addr2)
+	}
+}
+
+func TestAddressTypeChangeAddress(t *testing.T) {
+	tests := []struct {
+		name       string
+		addrType   WalletAddressType
+		wantPrefix string
+	}{
+		{"P2WPKH", AddressTypeP2WPKH, "bc1q"},
+		{"P2PKH", AddressTypeP2PKH, "1"},
+		{"P2SH-P2WPKH", AddressTypeP2SH_P2WPKH, "3"},
+		{"P2TR", AddressTypeP2TR, "bc1p"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := WalletConfig{
+				DataDir:     t.TempDir(),
+				Network:     address.Mainnet,
+				ChainParams: consensus.MainnetParams(),
+				AddressType: tt.addrType,
+			}
+
+			w := NewWallet(config)
+			w.CreateFromMnemonic(testMnemonic, "")
+
+			changeAddr, err := w.NewChangeAddress()
+			if err != nil {
+				t.Fatalf("NewChangeAddress failed: %v", err)
+			}
+
+			if !strings.HasPrefix(changeAddr, tt.wantPrefix) {
+				t.Errorf("Change address = %s, want prefix %s", changeAddr, tt.wantPrefix)
+			}
+		})
+	}
+}
+
+func TestCoinSelection(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	// Add multiple UTXOs with different values
+	addrs := make([]string, 5)
+	for i := 0; i < 5; i++ {
+		addr, _ := w.NewAddress()
+		addrs[i] = addr
+		utxo := &WalletUTXO{
+			OutPoint: wire.OutPoint{
+				Hash:  wire.Hash256{byte(i)},
+				Index: 0,
+			},
+			Amount:    int64((i + 1) * 100000), // 100k, 200k, 300k, 400k, 500k sats
+			Address:   addr,
+			KeyPath:   BIP84Path(0, 0, 0, uint32(i)),
+			PkScript:  []byte{0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			Confirmed: true,
+		}
+		w.AddUTXO(utxo)
+	}
+
+	// Test coin selection
+	utxos := w.ListUnspent()
+	result, err := SelectCoins(utxos, 350000, 1.0, 31)
+	if err != nil {
+		t.Fatalf("SelectCoins failed: %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("Expected selection result")
+	}
+
+	// Total should cover target
+	if result.Total < 350000 {
+		t.Errorf("Selected total %d is less than target 350000", result.Total)
+	}
+}
+
+func TestBnB(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	// Create UTXOs that can form an exact match
+	// 50000 + 30000 = 80000 effective value (minus fees)
+	amounts := []int64{50068, 30068, 20068} // Include input fee in amounts
+	for i, amt := range amounts {
+		addr, _ := w.NewAddress()
+		utxo := &WalletUTXO{
+			OutPoint: wire.OutPoint{
+				Hash:  wire.Hash256{byte(i)},
+				Index: 0,
+			},
+			Amount:    amt,
+			Address:   addr,
+			KeyPath:   BIP84Path(0, 0, 0, uint32(i)),
+			PkScript:  []byte{0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			Confirmed: true,
+		}
+		w.AddUTXO(utxo)
+	}
+
+	utxos := w.ListUnspent()
+	result, err := SelectCoins(utxos, 80000, 1.0, 100)
+	if err != nil {
+		t.Fatalf("SelectCoins failed: %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("Expected BnB to find a solution")
+	}
+
+	// BnB should be preferred when exact match is possible
+	if result.Total < 80000 {
+		t.Errorf("Total %d less than target", result.Total)
+	}
+}
+
+func TestKnapsack(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	// Create UTXOs where no exact match exists
+	amounts := []int64{100000, 60000, 35000}
+	for i, amt := range amounts {
+		addr, _ := w.NewAddress()
+		utxo := &WalletUTXO{
+			OutPoint: wire.OutPoint{
+				Hash:  wire.Hash256{byte(i)},
+				Index: 0,
+			},
+			Amount:    amt,
+			Address:   addr,
+			KeyPath:   BIP84Path(0, 0, 0, uint32(i)),
+			PkScript:  []byte{0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+			Confirmed: true,
+		}
+		w.AddUTXO(utxo)
+	}
+
+	utxos := w.ListUnspent()
+	// Target that doesn't have an exact match
+	result, err := SelectCoins(utxos, 150000, 1.0, 31)
+	if err != nil {
+		t.Fatalf("SelectCoins failed: %v", err)
+	}
+
+	if result == nil {
+		t.Fatal("Expected Knapsack to find a solution")
+	}
+
+	if result.Total < 150000 {
+		t.Errorf("Total %d less than target", result.Total)
+	}
+}
+
+// ============================================================================
+// Address Label Tests
+// ============================================================================
+
+func TestSetLabel(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	addr, _ := w.NewAddress()
+
+	// Set a label
+	err := w.SetLabel(addr, "savings")
+	if err != nil {
+		t.Fatalf("SetLabel failed: %v", err)
+	}
+
+	// Get the label
+	label := w.GetLabel(addr)
+	if label != "savings" {
+		t.Errorf("GetLabel = %q, want %q", label, "savings")
+	}
+
+	// Setting to different address not in wallet should fail
+	err = w.SetLabel("bc1qsomeotheraddress", "test")
+	if err != ErrInvalidAddress {
+		t.Errorf("Expected ErrInvalidAddress for unknown address, got %v", err)
+	}
+
+	// Setting empty label removes it
+	err = w.SetLabel(addr, "")
+	if err != nil {
+		t.Fatalf("SetLabel to empty failed: %v", err)
+	}
+	label = w.GetLabel(addr)
+	if label != "" {
+		t.Errorf("GetLabel after removal = %q, want empty", label)
+	}
+}
+
+func TestListLabels(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	// Initially no labels
+	labels := w.ListLabels()
+	if len(labels) != 0 {
+		t.Errorf("Expected 0 labels initially, got %d", len(labels))
+	}
+
+	// Create addresses and set labels
+	addr1, _ := w.NewAddress()
+	addr2, _ := w.NewAddress()
+	addr3, _ := w.NewAddress()
+
+	w.SetLabel(addr1, "savings")
+	w.SetLabel(addr2, "business")
+	w.SetLabel(addr3, "savings") // Duplicate label
+
+	labels = w.ListLabels()
+	if len(labels) != 2 {
+		t.Errorf("Expected 2 unique labels, got %d", len(labels))
+	}
+
+	// Check that both labels exist
+	found := make(map[string]bool)
+	for _, l := range labels {
+		found[l] = true
+	}
+	if !found["savings"] || !found["business"] {
+		t.Errorf("Expected 'savings' and 'business' labels, got %v", labels)
+	}
+}
+
+func TestGetAddressesByLabel(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	addr1, _ := w.NewAddress()
+	addr2, _ := w.NewAddress()
+	addr3, _ := w.NewAddress()
+
+	w.SetLabel(addr1, "savings")
+	w.SetLabel(addr2, "savings")
+	w.SetLabel(addr3, "business")
+
+	// Get addresses by label
+	savingsAddrs := w.GetAddressesByLabel("savings")
+	if len(savingsAddrs) != 2 {
+		t.Errorf("Expected 2 savings addresses, got %d", len(savingsAddrs))
+	}
+
+	businessAddrs := w.GetAddressesByLabel("business")
+	if len(businessAddrs) != 1 {
+		t.Errorf("Expected 1 business address, got %d", len(businessAddrs))
+	}
+
+	// Non-existent label returns empty
+	noAddrs := w.GetAddressesByLabel("nonexistent")
+	if len(noAddrs) != 0 {
+		t.Errorf("Expected 0 addresses for nonexistent label, got %d", len(noAddrs))
+	}
+}
+
+func TestLabelsPersistence(t *testing.T) {
+	tmpDir := t.TempDir()
+	config := WalletConfig{
+		DataDir:     tmpDir,
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	// Create wallet and set labels
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	addr1, _ := w.NewAddress()
+	addr2, _ := w.NewAddress()
+
+	w.SetLabel(addr1, "savings")
+	w.SetLabel(addr2, "business")
+
+	// Save wallet
+	password := "testpassword123"
+	err := w.SaveToFile(password)
+	if err != nil {
+		t.Fatalf("SaveToFile failed: %v", err)
+	}
+
+	// Load wallet
+	loaded, err := LoadFromFile(tmpDir, password, config)
+	if err != nil {
+		t.Fatalf("LoadFromFile failed: %v", err)
+	}
+
+	// Check labels persisted
+	if loaded.GetLabel(addr1) != "savings" {
+		t.Errorf("Label for addr1 not persisted, got %q", loaded.GetLabel(addr1))
+	}
+	if loaded.GetLabel(addr2) != "business" {
+		t.Errorf("Label for addr2 not persisted, got %q", loaded.GetLabel(addr2))
+	}
+}
+
+// ============================================================================
+// Coinbase Maturity Tests
+// ============================================================================
+
+func TestCoinbaseMaturity(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	addr, _ := w.NewAddress()
+
+	// Add a coinbase UTXO at height 100
+	coinbaseUTXO := &WalletUTXO{
+		OutPoint: wire.OutPoint{
+			Hash:  wire.Hash256{1, 2, 3},
+			Index: 0,
+		},
+		Amount:     50_00000000, // 50 BTC
+		Address:    addr,
+		Height:     100,
+		IsCoinbase: true,
+		KeyPath:    "m/84'/0'/0'/0/0",
+		Confirmed:  true,
+	}
+	w.AddUTXO(coinbaseUTXO)
+
+	// Add a regular UTXO at same height
+	regularUTXO := &WalletUTXO{
+		OutPoint: wire.OutPoint{
+			Hash:  wire.Hash256{4, 5, 6},
+			Index: 0,
+		},
+		Amount:     10_00000000, // 10 BTC
+		Address:    addr,
+		Height:     100,
+		IsCoinbase: false,
+		KeyPath:    "m/84'/0'/0'/0/0",
+		Confirmed:  true,
+	}
+	w.AddUTXO(regularUTXO)
+
+	// At tip=148 (49 confirmations: 148-100+1=49), coinbase is immature
+	tipHeight := int32(148)
+	if w.IsUTXOSpendable(coinbaseUTXO, tipHeight) {
+		t.Error("Coinbase should be immature at 49 confirmations")
+	}
+	if !w.IsUTXOSpendable(regularUTXO, tipHeight) {
+		t.Error("Regular UTXO should be spendable")
+	}
+
+	// Check spendable balance
+	spendable, immature := w.GetSpendableBalance(tipHeight)
+	if spendable != 10_00000000 {
+		t.Errorf("Spendable = %d, want 1000000000", spendable)
+	}
+	if immature != 50_00000000 {
+		t.Errorf("Immature = %d, want 5000000000", immature)
+	}
+
+	// At tip=198 (99 confirmations: 198-100+1=99), coinbase is still immature
+	tipHeight = 198
+	if w.IsUTXOSpendable(coinbaseUTXO, tipHeight) {
+		t.Error("Coinbase should be immature at 99 confirmations")
+	}
+
+	// At tip=199 (100 confirmations: 199-100+1=100), coinbase becomes mature
+	tipHeight = 199
+	if !w.IsUTXOSpendable(coinbaseUTXO, tipHeight) {
+		t.Error("Coinbase should be mature at 100 confirmations")
+	}
+
+	spendable, immature = w.GetSpendableBalance(tipHeight)
+	if spendable != 60_00000000 {
+		t.Errorf("Spendable at maturity = %d, want 6000000000", spendable)
+	}
+	if immature != 0 {
+		t.Errorf("Immature at maturity = %d, want 0", immature)
+	}
+}
+
+func TestListSpendable(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	addr, _ := w.NewAddress()
+
+	// Add immature coinbase
+	w.AddUTXO(&WalletUTXO{
+		OutPoint:   wire.OutPoint{Hash: wire.Hash256{1}, Index: 0},
+		Amount:     100000,
+		Address:    addr,
+		Height:     100,
+		IsCoinbase: true,
+		KeyPath:    "m/84'/0'/0'/0/0",
+		Confirmed:  true,
+	})
+
+	// Add mature coinbase
+	w.AddUTXO(&WalletUTXO{
+		OutPoint:   wire.OutPoint{Hash: wire.Hash256{2}, Index: 0},
+		Amount:     200000,
+		Address:    addr,
+		Height:     50,
+		IsCoinbase: true,
+		KeyPath:    "m/84'/0'/0'/0/0",
+		Confirmed:  true,
+	})
+
+	// Add regular UTXO
+	w.AddUTXO(&WalletUTXO{
+		OutPoint:   wire.OutPoint{Hash: wire.Hash256{3}, Index: 0},
+		Amount:     300000,
+		Address:    addr,
+		Height:     100,
+		IsCoinbase: false,
+		KeyPath:    "m/84'/0'/0'/0/0",
+		Confirmed:  true,
+	})
+
+	// ListUnspent should return all
+	all := w.ListUnspent()
+	if len(all) != 3 {
+		t.Errorf("ListUnspent = %d, want 3", len(all))
+	}
+
+	// ListSpendable at tip=148 should exclude immature coinbase at height 100
+	// Coinbase at height 100: 49 confirmations (148-100+1=49, immature)
+	// Coinbase at height 50: 99 confirmations (148-50+1=99, immature)
+	spendable := w.ListSpendable(148)
+	if len(spendable) != 1 {
+		t.Errorf("ListSpendable(148) = %d, want 1 (only regular UTXO)", len(spendable))
+	}
+
+	// At tip=149, coinbase at height 50 becomes mature (100 confirmations)
+	spendable = w.ListSpendable(149)
+	if len(spendable) != 2 {
+		t.Errorf("ListSpendable(149) = %d, want 2", len(spendable))
+	}
+
+	// At tip=199, all should be spendable
+	spendable = w.ListSpendable(199)
+	if len(spendable) != 3 {
+		t.Errorf("ListSpendable(199) = %d, want 3", len(spendable))
+	}
+}
+
+func TestCreateTransactionWithImmatureCoinbase(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+	}
+
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+
+	addr, _ := w.NewAddress()
+
+	// Only add an immature coinbase UTXO
+	w.AddUTXO(&WalletUTXO{
+		OutPoint:   wire.OutPoint{Hash: wire.Hash256{1, 2, 3}, Index: 0},
+		Amount:     50_00000000,
+		Address:    addr,
+		Height:     100,
+		IsCoinbase: true,
+		KeyPath:    "m/84'/0'/0'/0/0",
+		PkScript:   []byte{0x00, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},
+		Confirmed:  true,
+	})
+
+	// Try to create transaction at tip=148 (only 49 confirmations: 148-100+1=49)
+	// Should fail because coinbase is immature
+	_, err := w.CreateTransactionWithTip("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", 1000000, 1.0, 148)
+	if err != ErrInsufficientFunds {
+		t.Errorf("Expected ErrInsufficientFunds for immature coinbase, got %v", err)
+	}
+
+	// At tip=199 (100 confirmations: 199-100+1=100), should succeed
+	tx, err := w.CreateTransactionWithTip("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", 1000000, 1.0, 199)
+	if err != nil {
+		t.Fatalf("CreateTransactionWithTip should succeed at maturity: %v", err)
+	}
+	if tx == nil {
+		t.Error("Expected transaction to be created")
+	}
+}

@@ -4,18 +4,22 @@ import "encoding/json"
 
 // JSON-RPC error codes (from Bitcoin Core).
 const (
-	RPCErrParseError      = -32700 // Invalid JSON was received
-	RPCErrInvalidRequest  = -32600 // The JSON sent is not a valid Request object
-	RPCErrMethodNotFound  = -32601 // The method does not exist
-	RPCErrInvalidParams   = -32602 // Invalid method parameter(s)
-	RPCErrInternal        = -32603 // Internal JSON-RPC error
-	RPCErrBlockNotFound   = -5     // Block not found
-	RPCErrTxNotFound      = -5     // Transaction not found
-	RPCErrWalletError     = -4     // Unspecified wallet error
-	RPCErrWalletNotFound  = -18    // Wallet not loaded
-	RPCErrDeserialization = -22    // Error parsing or validating structure in raw format
-	RPCErrVerify          = -25    // Error during verification
-	RPCErrInWarmup        = -28    // Client still warming up
+	RPCErrParseError         = -32700 // Invalid JSON was received
+	RPCErrInvalidRequest     = -32600 // The JSON sent is not a valid Request object
+	RPCErrMethodNotFound     = -32601 // The method does not exist
+	RPCErrInvalidParams      = -32602 // Invalid method parameter(s)
+	RPCErrInternal           = -32603 // Internal JSON-RPC error
+	RPCErrBlockNotFound      = -5     // Block not found
+	RPCErrTxNotFound         = -5     // Transaction not found
+	RPCErrWalletError        = -4     // Unspecified wallet error
+	RPCErrWalletNotFound     = -18    // Wallet not loaded
+	RPCErrWalletNotSpecified = -19    // Multiple wallets loaded, must specify which
+	RPCErrWalletAlreadyLoaded = -35   // Wallet is already loaded
+	RPCErrDeserialization      = -22    // Error parsing or validating structure in raw format
+	RPCErrVerify               = -25    // Error during verification
+	RPCErrInWarmup             = -28    // Client still warming up
+	RPCErrClientNodeNotConnected = -29  // Node not found/connected
+	RPCErrWallet               = -4     // Wallet error (general)
 )
 
 // RPCRequest is a JSON-RPC request.
@@ -228,14 +232,23 @@ type ChainTip struct {
 
 // WalletInfo represents the result of getwalletinfo.
 type WalletInfo struct {
-	WalletName        string  `json:"walletname"`
-	WalletVersion     int     `json:"walletversion"`
-	Balance           float64 `json:"balance"`
-	UnconfirmedBalance float64 `json:"unconfirmed_balance"`
-	TxCount           int     `json:"txcount"`
-	KeypoolSize       int     `json:"keypoolsize"`
-	PayTxFee          float64 `json:"paytxfee"`
-	Locked            bool    `json:"unlocked_until,omitempty"`
+	WalletName            string  `json:"walletname"`
+	WalletVersion         int     `json:"walletversion"`
+	Format                string  `json:"format,omitempty"`
+	Balance               float64 `json:"balance"`
+	UnconfirmedBalance    float64 `json:"unconfirmed_balance"`
+	TxCount               int     `json:"txcount"`
+	KeypoolSize           int     `json:"keypoolsize"`
+	KeypoolSizeHDInternal int     `json:"keypoolsize_hd_internal,omitempty"`
+	UnlockedUntil         *int64  `json:"unlocked_until,omitempty"`
+	PayTxFee              float64 `json:"paytxfee"`
+	PrivateKeysEnabled    bool    `json:"private_keys_enabled"`
+	AvoidReuse            bool    `json:"avoid_reuse"`
+	Scanning              bool    `json:"scanning"`
+	Descriptors           bool    `json:"descriptors"`
+	ExternalSigner        bool    `json:"external_signer"`
+	Blank                 bool    `json:"blank"`
+	Locked                bool    `json:"-"` // Internal use, not serialized
 }
 
 // ListUnspentResult represents an unspent output for listunspent.
@@ -243,6 +256,7 @@ type ListUnspentResult struct {
 	TxID          string  `json:"txid"`
 	Vout          uint32  `json:"vout"`
 	Address       string  `json:"address"`
+	Label         string  `json:"label,omitempty"`
 	Amount        float64 `json:"amount"`
 	Confirmations int32   `json:"confirmations"`
 	Spendable     bool    `json:"spendable"`
@@ -317,3 +331,101 @@ type BlockTemplateTx struct {
 	SigOps  int64    `json:"sigops"`
 	Weight  int64    `json:"weight"`
 }
+
+// BannedInfo represents a banned peer in RPC responses.
+type BannedInfo struct {
+	Address     string `json:"address"`
+	BanCreated  int64  `json:"ban_created"`
+	BannedUntil int64  `json:"banned_until"`
+	BanReason   string `json:"ban_reason,omitempty"`
+}
+
+// AddressInfoResult represents the result of getaddressinfo.
+type AddressInfoResult struct {
+	Address      string `json:"address"`
+	ScriptPubKey string `json:"scriptPubKey,omitempty"`
+	IsMine       bool   `json:"ismine"`
+	IsWatchOnly  bool   `json:"iswatchonly"`
+	Solvable     bool   `json:"solvable"`
+	Label        string `json:"label,omitempty"`
+	Labels       []struct {
+		Name    string `json:"name"`
+		Purpose string `json:"purpose"`
+	} `json:"labels,omitempty"`
+}
+
+// AddressByLabelResult represents an address in getaddressesbylabel response.
+type AddressByLabelResult struct {
+	Purpose string `json:"purpose"`
+}
+
+// SubmitPackageResult is the result of the submitpackage RPC.
+type SubmitPackageResult struct {
+	PackageMsg           string                           `json:"package_msg"`
+	TxResults            map[string]*SubmitPackageTxResult `json:"tx-results"`
+	ReplacedTransactions []string                         `json:"replaced-transactions,omitempty"`
+}
+
+// SubmitPackageTxResult is the per-transaction result in submitpackage.
+type SubmitPackageTxResult struct {
+	TxID              string   `json:"txid"`
+	WTxID             string   `json:"wtxid,omitempty"`
+	VSize             int64    `json:"vsize,omitempty"`
+	Fees              *TxFees  `json:"fees,omitempty"`
+	Error             string   `json:"error,omitempty"`
+	EffectiveFeerate  float64  `json:"effective-feerate,omitempty"`
+	EffectiveIncludes []string `json:"effective-includes,omitempty"`
+}
+
+// TxFees represents fees for a transaction in submitpackage results.
+type TxFees struct {
+	Base float64 `json:"base"`
+}
+
+// DescriptorInfoResult represents the result of getdescriptorinfo.
+type DescriptorInfoResult struct {
+	Descriptor     string `json:"descriptor"`
+	Checksum       string `json:"checksum"`
+	IsRange        bool   `json:"isrange"`
+	IsSolvable     bool   `json:"issolvable"`
+	HasPrivateKeys bool   `json:"hasprivatekeys"`
+}
+
+// DeriveAddressesResult represents the result of deriveaddresses.
+// It's just a list of strings, but we define this for documentation.
+type DeriveAddressesResult []string
+
+// GenerateBlockResult represents the result of generateblock.
+type GenerateBlockResult struct {
+	Hash string `json:"hash"`
+	Hex  string `json:"hex,omitempty"`
+}
+
+// CreateWalletResult represents the result of createwallet.
+type CreateWalletResult struct {
+	Name     string   `json:"name"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// LoadWalletResult represents the result of loadwallet.
+type LoadWalletResult struct {
+	Name     string   `json:"name"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// UnloadWalletResult represents the result of unloadwallet.
+type UnloadWalletResult struct {
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// WalletDirEntry represents a wallet in listwalletdir.
+type WalletDirEntry struct {
+	Name     string   `json:"name"`
+	Warnings []string `json:"warnings,omitempty"`
+}
+
+// ListWalletDirResult represents the result of listwalletdir.
+type ListWalletDirResult struct {
+	Wallets []WalletDirEntry `json:"wallets"`
+}
+

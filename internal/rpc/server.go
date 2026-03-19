@@ -19,24 +19,28 @@ import (
 
 // RPCConfig configures the RPC server.
 type RPCConfig struct {
-	ListenAddr string // e.g., "127.0.0.1:8332"
-	Username   string // Basic auth username
-	Password   string // Basic auth password
+	ListenAddr  string // e.g., "127.0.0.1:8332"
+	Username    string // Basic auth username
+	Password    string // Basic auth password
+	TxIndex     bool   // Whether txindex is enabled
+	RESTEnabled bool   // Whether REST API is enabled
 }
 
 // Server is the JSON-RPC server.
 type Server struct {
-	config      RPCConfig
-	chainParams *consensus.ChainParams
-	chainMgr    *consensus.ChainManager
-	headerIndex *consensus.HeaderIndex
-	chainDB     *storage.ChainDB
-	mempool     *mempool.Mempool
-	peerMgr     *p2p.PeerManager
-	syncMgr     *p2p.SyncManager
-	templateGen *mining.TemplateGenerator
-	wallet      *wallet.Wallet
-	httpServer  *http.Server
+	config       RPCConfig
+	chainParams  *consensus.ChainParams
+	chainMgr     *consensus.ChainManager
+	headerIndex  *consensus.HeaderIndex
+	chainDB      *storage.ChainDB
+	mempool      *mempool.Mempool
+	peerMgr      *p2p.PeerManager
+	syncMgr      *p2p.SyncManager
+	templateGen  *mining.TemplateGenerator
+	wallet       *wallet.Wallet         // single wallet (legacy support)
+	walletMgr    *wallet.Manager        // multi-wallet manager
+	indexManager *storage.IndexManager
+	httpServer   *http.Server
 
 	mu        sync.RWMutex
 	startTime time.Time
@@ -102,10 +106,24 @@ func WithTemplateGenerator(tg *mining.TemplateGenerator) ServerOption {
 	}
 }
 
-// WithWallet sets the wallet.
+// WithWallet sets the wallet (legacy, single wallet mode).
 func WithWallet(w *wallet.Wallet) ServerOption {
 	return func(s *Server) {
 		s.wallet = w
+	}
+}
+
+// WithWalletManager sets the multi-wallet manager.
+func WithWalletManager(wm *wallet.Manager) ServerOption {
+	return func(s *Server) {
+		s.walletMgr = wm
+	}
+}
+
+// WithIndexManager sets the index manager.
+func WithIndexManager(im *storage.IndexManager) ServerOption {
+	return func(s *Server) {
+		s.indexManager = im
 	}
 }
 
@@ -127,6 +145,14 @@ func NewServer(config RPCConfig, opts ...ServerOption) *Server {
 // Start begins listening for RPC requests.
 func (s *Server) Start() error {
 	mux := http.NewServeMux()
+
+	// Register REST API handlers if enabled
+	if s.config.RESTEnabled {
+		s.RegisterRESTHandlers(mux)
+		log.Printf("REST API enabled")
+	}
+
+	// Register JSON-RPC handler (must be after REST to not override /rest/ paths)
 	mux.HandleFunc("/", s.handleRPC)
 
 	s.httpServer = &http.Server{
@@ -174,6 +200,10 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Extract wallet name from URL path if present
+	// URL pattern: /wallet/<walletname>
+	walletName := s.extractWalletName(r.URL.Path)
+
 	// Parse the request body
 	var req RPCRequest
 	decoder := json.NewDecoder(r.Body)
@@ -182,13 +212,56 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dispatch to the appropriate handler
-	result, rpcErr := s.dispatch(req.Method, req.Params)
+	// Dispatch to the appropriate handler with wallet context
+	result, rpcErr := s.dispatch(req.Method, req.Params, walletName)
 	if rpcErr != nil {
 		s.sendResponse(w, RPCResponse{Error: rpcErr, ID: req.ID})
 		return
 	}
 	s.sendResponse(w, RPCResponse{Result: result, ID: req.ID})
+}
+
+// extractWalletName extracts wallet name from URL path.
+// Returns empty string if no wallet specified or path is "/".
+func (s *Server) extractWalletName(path string) string {
+	// Path format: /wallet/<walletname>
+	const walletPrefix = "/wallet/"
+	if len(path) > len(walletPrefix) && path[:len(walletPrefix)] == walletPrefix {
+		return path[len(walletPrefix):]
+	}
+	return ""
+}
+
+// getWalletForRPC returns the wallet to use for wallet-related RPC calls.
+// If walletName is specified, returns that specific wallet.
+// If walletName is empty and only one wallet is loaded, returns that wallet.
+// If walletName is empty and multiple wallets are loaded, returns an error.
+func (s *Server) getWalletForRPC(walletName string) (*wallet.Wallet, *RPCError) {
+	// Multi-wallet mode
+	if s.walletMgr != nil {
+		if walletName != "" {
+			w, err := s.walletMgr.GetWallet(walletName)
+			if err != nil {
+				return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Requested wallet does not exist or is not loaded"}
+			}
+			return w, nil
+		}
+		// No wallet specified, try to get default
+		w, err := s.walletMgr.GetDefaultWallet()
+		if err != nil {
+			if err == wallet.ErrMultipleWalletsNamed {
+				return nil, &RPCError{Code: RPCErrWalletNotSpecified, Message: "Wallet file not specified (multiple wallets loaded)"}
+			}
+			return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "No wallet loaded"}
+		}
+		return w, nil
+	}
+
+	// Legacy single-wallet mode
+	if s.wallet == nil {
+		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
+	}
+	return s.wallet, nil
 }
 
 // checkAuth verifies basic authentication.
@@ -223,7 +296,8 @@ func (s *Server) sendError(w http.ResponseWriter, id interface{}, code int, mess
 }
 
 // dispatch routes method names to handlers.
-func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *RPCError) {
+// walletName is the wallet name from URL path (empty if not specified).
+func (s *Server) dispatch(method string, params json.RawMessage, walletName string) (interface{}, *RPCError) {
 	switch method {
 	// Blockchain RPCs
 	case "getblockchaininfo":
@@ -244,6 +318,18 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 		return s.handleGetChainTips()
 	case "gettxout":
 		return s.handleGetTxOut(params)
+	case "getindexinfo":
+		return s.handleGetIndexInfo()
+	case "getblockfilter":
+		return s.handleGetBlockFilter(params)
+
+	// Chain management RPCs
+	case "invalidateblock":
+		return s.handleInvalidateBlock(params)
+	case "reconsiderblock":
+		return s.handleReconsiderBlock(params)
+	case "preciousblock":
+		return s.handlePreciousBlock(params)
 
 	// Transaction RPCs
 	case "decodescript":
@@ -254,12 +340,26 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 		return s.handleSendRawTransaction(params)
 	case "decoderawtransaction":
 		return s.handleDecodeRawTransaction(params)
+	case "createrawtransaction":
+		return s.handleCreateRawTransaction(params)
+	case "signrawtransactionwithwallet":
+		return s.handleSignRawTransactionWithWallet(params, walletName)
 
 	// Mempool RPCs
 	case "getmempoolinfo":
 		return s.handleGetMempoolInfo()
 	case "getrawmempool":
 		return s.handleGetRawMempool(params)
+	case "submitpackage":
+		return s.handleSubmitPackage(params)
+	case "testmempoolaccept":
+		return s.handleTestMempoolAccept(params)
+	case "getmempoolentry":
+		return s.handleGetMempoolEntry(params)
+	case "getmempoolancestors":
+		return s.handleGetMempoolAncestors(params)
+	case "getmempooldescendants":
+		return s.handleGetMempoolDescendants(params)
 
 	// Network RPCs
 	case "getpeerinfo":
@@ -270,6 +370,14 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 		return s.handleGetNetworkInfo()
 	case "addnode":
 		return s.handleAddNode(params)
+	case "disconnectnode":
+		return s.handleDisconnectNode(params)
+	case "listbanned":
+		return s.handleListBanned()
+	case "setban":
+		return s.handleSetBan(params)
+	case "clearbanned":
+		return s.handleClearBanned()
 
 	// Mining RPCs
 	case "getblocktemplate":
@@ -278,28 +386,78 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 		return s.handleSubmitBlock(params)
 	case "getmininginfo":
 		return s.handleGetMiningInfo()
+	case "generatetoaddress":
+		return s.handleGenerateToAddress(params)
+	case "generatetodescriptor":
+		return s.handleGenerateToDescriptor(params)
+	case "generateblock":
+		return s.handleGenerateBlock(params)
+	case "generate":
+		return s.handleGenerate(params)
 
 	// Fee estimation RPCs
 	case "estimatesmartfee":
 		return s.handleEstimateSmartFee(params)
 
-	// Wallet RPCs
+	// Wallet management RPCs (don't require a specific wallet)
+	case "createwallet":
+		return s.handleCreateWallet(params)
+	case "loadwallet":
+		return s.handleLoadWallet(params)
+	case "unloadwallet":
+		return s.handleUnloadWallet(params, walletName)
+	case "listwallets":
+		return s.handleListWallets()
+	case "listwalletdir":
+		return s.handleListWalletDir()
+	case "backupwallet":
+		return s.handleBackupWallet(params, walletName)
+
+	// Wallet RPCs (require wallet context)
 	case "getnewaddress":
-		return s.handleGetNewAddress()
+		return s.handleGetNewAddressWithWallet(walletName)
 	case "getbalance":
-		return s.handleGetBalance()
+		return s.handleGetBalanceWithWallet(walletName)
 	case "listunspent":
-		return s.handleListUnspent()
+		return s.handleListUnspentWithWallet(walletName)
 	case "sendtoaddress":
-		return s.handleSendToAddress(params)
+		return s.handleSendToAddressWithWallet(params, walletName)
 	case "walletpassphrase":
-		return s.handleWalletPassphrase(params)
+		return s.handleWalletPassphraseWithWallet(params, walletName)
 	case "walletlock":
-		return s.handleWalletLock()
+		return s.handleWalletLockWithWallet(walletName)
 	case "listtransactions":
-		return s.handleListTransactions(params)
+		return s.handleListTransactionsWithWallet(params, walletName)
 	case "getwalletinfo":
-		return s.handleGetWalletInfo()
+		return s.handleGetWalletInfoWithWallet(walletName)
+	case "setlabel":
+		return s.handleSetLabelWithWallet(params, walletName)
+	case "listlabels":
+		return s.handleListLabelsWithWallet(params, walletName)
+	case "getaddressesbylabel":
+		return s.handleGetAddressesByLabelWithWallet(params, walletName)
+	case "getaddressinfo":
+		return s.handleGetAddressInfoWithWallet(params, walletName)
+
+	// PSBT RPCs
+	case "createpsbt":
+		return s.handleCreatePSBT(params)
+	case "decodepsbt":
+		return s.handleDecodePSBT(params)
+	case "combinepsbt":
+		return s.handleCombinePSBT(params)
+	case "finalizepsbt":
+		return s.handleFinalizePSBT(params)
+	case "converttopsbt":
+		return s.handleConvertToPSBT(params)
+	case "walletprocesspsbt":
+		return s.handleWalletProcessPSBTWithWallet(params, walletName)
+	case "analyzepsbt":
+		return s.handleAnalyzePSBT(params)
+	case "joinpsbts":
+		return s.handleJoinPSBTs(params)
+	case "utxoupdatepsbt":
+		return s.handleUTXOUpdatePSBT(params)
 
 	// Control RPCs
 	case "stop":
@@ -312,6 +470,20 @@ func (s *Server) dispatch(method string, params json.RawMessage) (interface{}, *
 		return s.handleHelp(params)
 	case "verifymessage":
 		return s.handleVerifyMessage(params)
+
+	// Descriptor RPCs
+	case "getdescriptorinfo":
+		return s.handleGetDescriptorInfo(params)
+	case "deriveaddresses":
+		return s.handleDeriveAddresses(params)
+
+	// AssumeUTXO RPCs
+	case "dumptxoutset":
+		return s.handleDumpTxOutSet(params)
+	case "loadtxoutset":
+		return s.handleLoadTxOutSet(params)
+	case "getchainstates":
+		return s.handleGetChainStates()
 
 	default:
 		return nil, &RPCError{Code: RPCErrMethodNotFound, Message: fmt.Sprintf("Method not found: %s", method)}

@@ -280,6 +280,12 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	// Check for too many headers (protocol violation)
+	if len(msg.Headers) > MaxHeadersPerRequest {
+		peer.Misbehaving(20, "too many headers in message")
+		return
+	}
+
 	// Ignore headers from non-sync peers during initial sync
 	if sm.syncPeer != nil && peer != sm.syncPeer {
 		return
@@ -296,10 +302,10 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 				continue
 			}
 
-			// Invalid header — ban the peer
+			// Invalid header — misbehavior score 100 causes immediate ban
 			log.Printf("sync: bad header from %s at height %d: %v",
 				peer.Address(), sm.headerIndex.BestHeight()+1, err)
-			sm.peerMgr.BanPeer(peer.Address(), 24*time.Hour, fmt.Sprintf("bad header: %v", err))
+			peer.Misbehaving(100, fmt.Sprintf("invalid header: %v", err))
 			peer.Disconnect()
 			sm.syncPeer = nil
 			go sm.startHeaderSync() // Try another peer
@@ -471,6 +477,29 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 		OnBlock: func(p *Peer, msg *MsgBlock) {
 			sm.HandleBlock(p, msg)
 		},
+		OnGetData: func(p *Peer, msg *MsgGetData) {
+			sm.HandleGetData(p, msg)
+		},
+	}
+}
+
+// HandleGetData responds to getdata requests by sending requested blocks and transactions.
+func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
+	for _, inv := range msg.InvList {
+		// Strip witness flag to get base type
+		baseType := inv.Type &^ InvWitnessFlag
+		switch baseType {
+		case InvTypeBlock:
+			block, err := sm.chainDB.GetBlock(inv.Hash)
+			if err != nil {
+				log.Printf("sync: getdata block %x not found: %v", inv.Hash[:4], err)
+				continue
+			}
+			log.Printf("sync: serving block at %x to peer %s", inv.Hash[:4], peer.Address())
+			peer.SendMessage(&MsgBlock{Block: block})
+		case InvTypeTx:
+			// TODO: look up transaction from mempool
+		}
 	}
 }
 
@@ -710,7 +739,10 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 	req, ok := sm.inflight[hash]
 	if !ok {
 		sm.mu.Unlock()
-		// Unsolicited block - ignore during IBD
+		// Unsolicited block - penalize with moderate score (20)
+		if peer != nil && sm.ibdActive {
+			peer.Misbehaving(20, "unsolicited block during IBD")
+		}
 		return
 	}
 
@@ -755,6 +787,10 @@ func (sm *SyncManager) validationWorker() {
 				node := sm.headerIndex.GetNode(bwr.req.Hash)
 				if node != nil {
 					node.Status |= consensus.StatusInvalid
+				}
+				// Penalize the peer that sent the invalid block
+				if bwr.req.Peer != nil {
+					bwr.req.Peer.Misbehaving(100, fmt.Sprintf("invalid block: %v", err))
 				}
 				continue
 			}

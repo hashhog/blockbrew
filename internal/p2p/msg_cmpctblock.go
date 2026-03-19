@@ -37,10 +37,10 @@ func (m *MsgCmpctBlock) Serialize(w io.Writer) error {
 	if err := wire.WriteCompactSize(w, uint64(len(m.ShortIDs))); err != nil {
 		return err
 	}
-	// Each short ID is 6 bytes
+	// Each short ID is 6 bytes (48 bits)
 	for _, sid := range m.ShortIDs {
-		var buf [6]byte
-		binary.LittleEndian.PutUint64(buf[:], sid) // Only first 6 bytes used
+		var buf [8]byte
+		binary.LittleEndian.PutUint64(buf[:], sid)
 		if _, err := w.Write(buf[:6]); err != nil {
 			return err
 		}

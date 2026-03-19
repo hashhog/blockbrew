@@ -486,3 +486,15 @@ func BIP84Path(coinType, account, change, index uint32) string {
 func BIP44Path(coinType, account, change, index uint32) string {
 	return fmt.Sprintf("m/44'/%d'/%d'/%d/%d", coinType, account, change, index)
 }
+
+// BIP49Path returns the BIP49 derivation path for nested segwit addresses (P2SH-P2WPKH).
+// Format: m/49'/coin'/account'/change/index
+func BIP49Path(coinType, account, change, index uint32) string {
+	return fmt.Sprintf("m/49'/%d'/%d'/%d/%d", coinType, account, change, index)
+}
+
+// BIP86Path returns the BIP86 derivation path for taproot addresses (P2TR).
+// Format: m/86'/coin'/account'/change/index
+func BIP86Path(coinType, account, change, index uint32) string {
+	return fmt.Sprintf("m/86'/%d'/%d'/%d/%d", coinType, account, change, index)
+}

@@ -37,6 +37,7 @@ type walletData struct {
 	NextExtIdx uint32            `json:"next_ext_idx"`
 	NextIntIdx uint32            `json:"next_int_idx"`
 	AddrPaths  map[string]string `json:"addr_paths"`
+	AddrLabels map[string]string `json:"addr_labels,omitempty"`
 	UTXOs      []*utxoData       `json:"utxos"`
 	TxHistory  []*txData         `json:"tx_history"`
 }
@@ -75,6 +76,7 @@ func (w *Wallet) SaveToFile(password string) error {
 		NextExtIdx: w.nextExtIdx,
 		NextIntIdx: w.nextIntIdx,
 		AddrPaths:  w.addrToPath,
+		AddrLabels: w.addrLabels,
 		UTXOs:      make([]*utxoData, 0, len(w.utxos)),
 		TxHistory:  make([]*txData, 0, len(w.txHistory)),
 	}
@@ -183,6 +185,10 @@ func LoadFromFile(path string, password string, config WalletConfig) (*Wallet, e
 	w.addrToPath = data.AddrPaths
 	if w.addrToPath == nil {
 		w.addrToPath = make(map[string]string)
+	}
+	w.addrLabels = data.AddrLabels
+	if w.addrLabels == nil {
+		w.addrLabels = make(map[string]string)
 	}
 
 	// Restore UTXOs

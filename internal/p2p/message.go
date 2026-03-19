@@ -252,6 +252,41 @@ func makeMessage(command string) (Message, error) {
 		return &MsgGetBlockTxn{}, nil
 	case "blocktxn":
 		return &MsgBlockTxn{}, nil
+	case "sendaddrv2":
+		return &MsgSendAddrv2{}, nil
+	case "addrv2":
+		return &MsgAddrv2{}, nil
+	// BIP330 Erlay messages
+	case "sendtxrcncl":
+		return &MsgSendTxRcncl{}, nil
+	case "reqreconcil":
+		return &MsgReqReconcil{}, nil
+	case "sketch":
+		return &MsgSketch{}, nil
+	case "reconcildiff":
+		return &MsgReconcilDiff{}, nil
+	// BIP37 bloom filter messages
+	case "filterload":
+		return &MsgFilterLoad{}, nil
+	case "filteradd":
+		return &MsgFilterAdd{}, nil
+	case "filterclear":
+		return &MsgFilterClear{}, nil
+	case "merkleblock":
+		return &MsgMerkleBlock{}, nil
+	// BIP157/158 compact block filter messages
+	case "getcfilters":
+		return &MsgGetCFilters{}, nil
+	case "cfilter":
+		return &MsgCFilter{}, nil
+	case "getcfheaders":
+		return &MsgGetCFHeaders{}, nil
+	case "cfheaders":
+		return &MsgCFHeaders{}, nil
+	case "getcfcheckpt":
+		return &MsgGetCFCheckpt{}, nil
+	case "cfcheckpt":
+		return &MsgCFCheckpt{}, nil
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnknownCommand, command)
 	}
