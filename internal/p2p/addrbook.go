@@ -159,6 +159,34 @@ func (ab *AddressBook) AddAddresses(addrs []NetAddress, source string) {
 	}
 }
 
+// AddAddressV2 adds a BIP155 ADDRv2 address to the book.
+// Currently, only IPv4 and IPv6 addresses are stored.
+// Tor v3, I2P, and CJDNS addresses are accepted but not used for connections.
+func (ab *AddressBook) AddAddressV2(addr NetAddressV2, source string) {
+	// Convert to legacy format if possible
+	// Currently we only connect to IPv4/IPv6 addresses
+	switch addr.NetworkID {
+	case NetIPv4, NetIPv6:
+		legacy := addr.ToLegacy()
+		if legacy != nil {
+			ab.AddAddress(*legacy, source)
+		}
+	case NetTorV3, NetI2P, NetCJDNS:
+		// TODO: In the future, we could store these separately
+		// for relay to other peers or for Tor/I2P proxy connections.
+		// For now, we ignore them.
+	default:
+		// Unknown network types are silently ignored per BIP155
+	}
+}
+
+// AddAddressesV2 adds multiple BIP155 ADDRv2 addresses.
+func (ab *AddressBook) AddAddressesV2(addrs []NetAddressV2, source string) {
+	for _, addr := range addrs {
+		ab.AddAddressV2(addr, source)
+	}
+}
+
 // PickAddress returns a random address to connect to, preferring addresses
 // that haven't been tried recently and have a history of success.
 func (ab *AddressBook) PickAddress() *KnownAddress {

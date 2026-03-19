@@ -1,10 +1,12 @@
 package p2p
 
 import (
-	"crypto/rand"
+	cryptorand "crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -19,6 +21,21 @@ const (
 	PingInterval     = 2 * time.Minute
 	PingTimeout      = 30 * time.Second
 	SendQueueSize    = 50
+)
+
+// BIP133 feefilter constants.
+const (
+	// FeeFilterBroadcastInterval is the average interval between feefilter broadcasts.
+	// Bitcoin Core uses 10 minutes on average.
+	FeeFilterBroadcastInterval = 10 * time.Minute
+
+	// FeeFilterMaxChangeDelay is the maximum delay when feefilter changes significantly.
+	// If the filter changes by >33% we reschedule to within this window.
+	FeeFilterMaxChangeDelay = 5 * time.Minute
+
+	// FeeFilterVersion is the minimum protocol version for feefilter support.
+	// BIP133 was activated with protocol version 70013.
+	FeeFilterVersion = 70013
 )
 
 // Errors for peer connections.
@@ -38,6 +55,7 @@ type PeerConfig struct {
 	BestHeight      int32          // Our best block height
 	DisableRelayTx  bool           // Whether to disable tx relay
 	Listeners       *PeerListeners // Callbacks for received messages
+	PreferV2        bool           // Whether to prefer BIP324 v2 transport
 }
 
 // PeerListeners contains callbacks invoked when messages are received.
@@ -56,6 +74,31 @@ type PeerListeners struct {
 	OnNotFound    func(p *Peer, msg *MsgNotFound)
 	OnFeeFilter   func(p *Peer, msg *MsgFeeFilter)
 	OnSendHeaders func(p *Peer, msg *MsgSendHeaders)
+	// BIP152 compact block callbacks
+	OnSendCmpct   func(p *Peer, msg *MsgSendCmpct)
+	OnCmpctBlock  func(p *Peer, msg *MsgCmpctBlock)
+	OnGetBlockTxn func(p *Peer, msg *MsgGetBlockTxn)
+	OnBlockTxn    func(p *Peer, msg *MsgBlockTxn)
+	// BIP155 ADDRv2 callbacks
+	OnSendAddrv2 func(p *Peer, msg *MsgSendAddrv2)
+	OnAddrv2     func(p *Peer, msg *MsgAddrv2)
+	// BIP330 Erlay callbacks
+	OnSendTxRcncl  func(p *Peer, msg *MsgSendTxRcncl)
+	OnReqReconcil  func(p *Peer, msg *MsgReqReconcil)
+	OnSketch       func(p *Peer, msg *MsgSketch)
+	OnReconcilDiff func(p *Peer, msg *MsgReconcilDiff)
+	// BIP37 bloom filter callbacks
+	OnFilterLoad  func(p *Peer, msg *MsgFilterLoad)
+	OnFilterAdd   func(p *Peer, msg *MsgFilterAdd)
+	OnFilterClear func(p *Peer, msg *MsgFilterClear)
+	OnMerkleBlock func(p *Peer, msg *MsgMerkleBlock)
+	// BIP157/158 compact block filter callbacks
+	OnGetCFilters  func(p *Peer, msg *MsgGetCFilters)
+	OnCFilter      func(p *Peer, msg *MsgCFilter)
+	OnGetCFHeaders func(p *Peer, msg *MsgGetCFHeaders)
+	OnCFHeaders    func(p *Peer, msg *MsgCFHeaders)
+	OnGetCFCheckpt func(p *Peer, msg *MsgGetCFCheckpt)
+	OnCFCheckpt    func(p *Peer, msg *MsgCFCheckpt)
 }
 
 // PeerState represents the connection state.
@@ -87,10 +130,14 @@ func (s PeerState) String() string {
 	}
 }
 
+// Misbehavior score threshold — at this score, peer is disconnected and banned.
+const MisbehaviorThreshold = 100
+
 // Peer represents a connection to a remote Bitcoin node.
 type Peer struct {
 	config        PeerConfig
 	conn          net.Conn
+	transport     Transport    // v1 or v2 transport layer
 	addr          string // "host:port"
 	state         PeerState
 	mu            sync.RWMutex
@@ -118,9 +165,31 @@ type Peer struct {
 	// Protocol negotiation results
 	sendHeadersPreferred bool // Peer prefers headers announcements (BIP130)
 	wtxidRelaySupported  bool // Peer supports wtxid-based relay (BIP339)
+	v2Transport          bool // Whether using BIP324 v2 transport
+	wantsAddrv2          bool // Peer supports BIP155 ADDRv2 messages
+
+	// BIP152 compact block state
+	compactBlockState *CompactBlockState
+
+	// BIP330 Erlay state
+	erlaySupported    bool   // Peer supports Erlay (received sendtxrcncl)
+	erlaySalt         uint64 // Peer's Erlay salt from sendtxrcncl
+	erlayVersion      uint32 // Peer's Erlay protocol version
+	erlaySentTxRcncl  bool   // Whether we sent sendtxrcncl to peer
+
+	// BIP133 feefilter state
+	feeFilterReceived int64         // Peer's minimum fee rate (sat/kvB), atomic
+	feeFilterSent     int64         // Last fee filter we sent to peer (sat/kvB)
+	nextFeeFilterTime time.Time     // When to next send feefilter
+	feeFilterMu       sync.Mutex    // Protects feefilter state
 
 	// Handshake completion signal
 	handshakeDone chan struct{}
+
+	// Misbehavior tracking
+	misbehaviorScore int           // Accumulated misbehavior score
+	shouldBan        bool          // Set to true when threshold reached
+	banCallback      func(*Peer)   // Called when peer should be banned
 }
 
 // NewOutboundPeer creates a new outbound peer and initiates the TCP connection.
@@ -132,14 +201,15 @@ func NewOutboundPeer(addr string, config PeerConfig) (*Peer, error) {
 	}
 
 	p := &Peer{
-		config:        config,
-		addr:          addr,
-		state:         PeerStateConnecting,
-		inbound:       false,
-		sendQueue:     make(chan Message, SendQueueSize),
-		quit:          make(chan struct{}),
-		localNonce:    localNonce,
-		handshakeDone: make(chan struct{}),
+		config:            config,
+		addr:              addr,
+		state:             PeerStateConnecting,
+		inbound:           false,
+		sendQueue:         make(chan Message, SendQueueSize),
+		quit:              make(chan struct{}),
+		localNonce:        localNonce,
+		handshakeDone:     make(chan struct{}),
+		compactBlockState: NewCompactBlockState(),
 	}
 
 	// Connect with timeout
@@ -151,6 +221,21 @@ func NewOutboundPeer(addr string, config PeerConfig) (*Peer, error) {
 	p.conn = conn
 	p.setupConn()
 
+	// Negotiate transport (v1 or v2)
+	if config.PreferV2 {
+		transport, err := NegotiateTransport(conn, config.Network, true, true)
+		if err != nil {
+			// Fall back to v1 on error
+			log.Printf("v2 transport negotiation failed, using v1: %v", err)
+			p.transport = NewV1Transport(conn, config.Network)
+		} else {
+			p.transport = transport
+			p.v2Transport = transport.IsEncrypted()
+		}
+	} else {
+		p.transport = NewV1Transport(conn, config.Network)
+	}
+
 	return p, nil
 }
 
@@ -160,18 +245,24 @@ func NewInboundPeer(conn net.Conn, config PeerConfig) *Peer {
 	localNonce, _ := randomUint64()
 
 	p := &Peer{
-		config:        config,
-		conn:          conn,
-		addr:          conn.RemoteAddr().String(),
-		state:         PeerStateHandshaking,
-		inbound:       true,
-		sendQueue:     make(chan Message, SendQueueSize),
-		quit:          make(chan struct{}),
-		localNonce:    localNonce,
-		handshakeDone: make(chan struct{}),
+		config:            config,
+		conn:              conn,
+		addr:              conn.RemoteAddr().String(),
+		state:             PeerStateHandshaking,
+		inbound:           true,
+		sendQueue:         make(chan Message, SendQueueSize),
+		quit:              make(chan struct{}),
+		localNonce:        localNonce,
+		handshakeDone:     make(chan struct{}),
+		compactBlockState: NewCompactBlockState(),
 	}
 
 	p.setupConn()
+
+	// For inbound, we'll negotiate transport during Start() since we need to
+	// detect whether the peer is using v1 or v2 based on first bytes.
+	// For now, default to v1 - the actual negotiation happens in Start().
+	p.transport = NewV1Transport(conn, config.Network)
 
 	return p
 }
@@ -273,9 +364,9 @@ func (p *Peer) readHandler() {
 		}
 
 		// Set read deadline to detect dead connections
-		p.conn.SetReadDeadline(time.Now().Add(IdleTimeout))
+		p.transport.SetReadDeadline(time.Now().Add(IdleTimeout))
 
-		msg, err := ReadMessage(p.conn, p.config.Network)
+		msg, err := p.transport.ReadMessage()
 		if err != nil {
 			// Connection closed or read error
 			return
@@ -349,6 +440,20 @@ func (p *Peer) pingHandler() {
 
 // handleMessage dispatches received messages to the appropriate handler.
 func (p *Peer) handleMessage(msg Message) {
+	// Check for messages sent before handshake (except version/verack/wtxidrelay/sendcmpct/sendaddrv2/sendtxrcncl)
+	switch msg.(type) {
+	case *MsgVersion, *MsgVerAck, *MsgWTxidRelay, *MsgSendCmpct, *MsgSendAddrv2, *MsgSendTxRcncl:
+		// These are allowed before handshake
+	default:
+		p.mu.RLock()
+		handshaking := p.state == PeerStateHandshaking
+		p.mu.RUnlock()
+		if handshaking {
+			p.Misbehaving(10, "message before handshake complete")
+			return
+		}
+	}
+
 	switch m := msg.(type) {
 	case *MsgVersion:
 		p.handleVersion(m)
@@ -402,6 +507,7 @@ func (p *Peer) handleMessage(msg Message) {
 			p.config.Listeners.OnNotFound(p, m)
 		}
 	case *MsgFeeFilter:
+		p.handleFeeFilter(m)
 		if p.config.Listeners != nil && p.config.Listeners.OnFeeFilter != nil {
 			p.config.Listeners.OnFeeFilter(p, m)
 		}
@@ -409,14 +515,92 @@ func (p *Peer) handleMessage(msg Message) {
 		p.mu.Lock()
 		p.wtxidRelaySupported = true
 		p.mu.Unlock()
+	case *MsgSendAddrv2:
+		p.handleSendAddrv2(m)
+	case *MsgAddrv2:
+		if p.config.Listeners != nil && p.config.Listeners.OnAddrv2 != nil {
+			p.config.Listeners.OnAddrv2(p, m)
+		}
 	case *MsgSendCmpct:
-		// Record compact block preferences (handled in BIP152 negotiation)
+		// Record compact block preferences (BIP152)
+		if p.compactBlockState != nil {
+			p.compactBlockState.SetSendCmpct(m.AnnounceUsingCmpctBlock, m.CmpctBlockVersion)
+		}
+		if p.config.Listeners != nil && p.config.Listeners.OnSendCmpct != nil {
+			p.config.Listeners.OnSendCmpct(p, m)
+		}
 	case *MsgCmpctBlock:
-		// Compact block received - would need reconstruction logic
+		// Compact block received
+		if p.config.Listeners != nil && p.config.Listeners.OnCmpctBlock != nil {
+			p.config.Listeners.OnCmpctBlock(p, m)
+		}
 	case *MsgGetBlockTxn:
 		// Peer requesting missing transactions for compact block
+		if p.config.Listeners != nil && p.config.Listeners.OnGetBlockTxn != nil {
+			p.config.Listeners.OnGetBlockTxn(p, m)
+		}
 	case *MsgBlockTxn:
 		// Missing transactions received for compact block reconstruction
+		if p.config.Listeners != nil && p.config.Listeners.OnBlockTxn != nil {
+			p.config.Listeners.OnBlockTxn(p, m)
+		}
+	// BIP330 Erlay messages
+	case *MsgSendTxRcncl:
+		p.handleSendTxRcncl(m)
+	case *MsgReqReconcil:
+		if p.config.Listeners != nil && p.config.Listeners.OnReqReconcil != nil {
+			p.config.Listeners.OnReqReconcil(p, m)
+		}
+	case *MsgSketch:
+		if p.config.Listeners != nil && p.config.Listeners.OnSketch != nil {
+			p.config.Listeners.OnSketch(p, m)
+		}
+	case *MsgReconcilDiff:
+		if p.config.Listeners != nil && p.config.Listeners.OnReconcilDiff != nil {
+			p.config.Listeners.OnReconcilDiff(p, m)
+		}
+	// BIP37 bloom filter messages — accepted but not actively served
+	case *MsgFilterLoad:
+		if p.config.Listeners != nil && p.config.Listeners.OnFilterLoad != nil {
+			p.config.Listeners.OnFilterLoad(p, m)
+		}
+	case *MsgFilterAdd:
+		if p.config.Listeners != nil && p.config.Listeners.OnFilterAdd != nil {
+			p.config.Listeners.OnFilterAdd(p, m)
+		}
+	case *MsgFilterClear:
+		if p.config.Listeners != nil && p.config.Listeners.OnFilterClear != nil {
+			p.config.Listeners.OnFilterClear(p, m)
+		}
+	case *MsgMerkleBlock:
+		if p.config.Listeners != nil && p.config.Listeners.OnMerkleBlock != nil {
+			p.config.Listeners.OnMerkleBlock(p, m)
+		}
+	// BIP157/158 compact block filter messages
+	case *MsgGetCFilters:
+		if p.config.Listeners != nil && p.config.Listeners.OnGetCFilters != nil {
+			p.config.Listeners.OnGetCFilters(p, m)
+		}
+	case *MsgCFilter:
+		if p.config.Listeners != nil && p.config.Listeners.OnCFilter != nil {
+			p.config.Listeners.OnCFilter(p, m)
+		}
+	case *MsgGetCFHeaders:
+		if p.config.Listeners != nil && p.config.Listeners.OnGetCFHeaders != nil {
+			p.config.Listeners.OnGetCFHeaders(p, m)
+		}
+	case *MsgCFHeaders:
+		if p.config.Listeners != nil && p.config.Listeners.OnCFHeaders != nil {
+			p.config.Listeners.OnCFHeaders(p, m)
+		}
+	case *MsgGetCFCheckpt:
+		if p.config.Listeners != nil && p.config.Listeners.OnGetCFCheckpt != nil {
+			p.config.Listeners.OnGetCFCheckpt(p, m)
+		}
+	case *MsgCFCheckpt:
+		if p.config.Listeners != nil && p.config.Listeners.OnCFCheckpt != nil {
+			p.config.Listeners.OnCFCheckpt(p, m)
+		}
 	}
 }
 
@@ -448,9 +632,11 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 		p.sendVersionMessage()
 	}
 
-	// Send wtxidrelay (BIP339) before verack if peer supports protocol >= 70016
+	// Send feature negotiation messages before verack if peer supports protocol >= 70016
 	if msg.ProtocolVersion >= 70016 {
 		p.SendMessage(&MsgWTxidRelay{})
+		// BIP155: Signal ADDRv2 support
+		p.SendMessage(&MsgSendAddrv2{})
 	}
 
 	// Send verack
@@ -474,6 +660,59 @@ func (p *Peer) handleVerAck(msg *MsgVerAck) {
 
 	// Check if handshake is complete
 	p.checkHandshakeComplete()
+}
+
+// handleSendAddrv2 processes a received sendaddrv2 message (BIP155).
+// This must be received before verack to enable ADDRv2 support.
+func (p *Peer) handleSendAddrv2(msg *MsgSendAddrv2) {
+	p.mu.Lock()
+	// Only accept sendaddrv2 before handshake complete
+	if p.verAckRecvd {
+		p.mu.Unlock()
+		// BIP155: sendaddrv2 after verack is a protocol violation
+		p.Misbehaving(10, "sendaddrv2 received after verack")
+		return
+	}
+	p.wantsAddrv2 = true
+	listeners := p.config.Listeners
+	p.mu.Unlock()
+
+	// Call listener if set
+	if listeners != nil && listeners.OnSendAddrv2 != nil {
+		listeners.OnSendAddrv2(p, msg)
+	}
+}
+
+// handleSendTxRcncl processes a received sendtxrcncl message (BIP330 Erlay).
+// This must be received before verack to enable Erlay support.
+func (p *Peer) handleSendTxRcncl(msg *MsgSendTxRcncl) {
+	p.mu.Lock()
+	// Only accept sendtxrcncl before handshake complete
+	if p.verAckRecvd {
+		p.mu.Unlock()
+		// BIP330: sendtxrcncl after verack is a protocol violation
+		p.Misbehaving(10, "sendtxrcncl received after verack")
+		return
+	}
+
+	// Validate version
+	if msg.Version < MinReconciliationVersion {
+		p.mu.Unlock()
+		p.Misbehaving(10, "invalid sendtxrcncl version")
+		return
+	}
+
+	// Store peer's Erlay info
+	p.erlaySupported = true
+	p.erlaySalt = msg.Salt
+	p.erlayVersion = msg.Version
+	listeners := p.config.Listeners
+	p.mu.Unlock()
+
+	// Call listener if set
+	if listeners != nil && listeners.OnSendTxRcncl != nil {
+		listeners.OnSendTxRcncl(p, msg)
+	}
 }
 
 // checkHandshakeComplete checks if the handshake is done and transitions state.
@@ -501,6 +740,14 @@ func (p *Peer) checkHandshakeComplete() {
 
 	// Send sendheaders (BIP130) to request header announcements
 	p.SendMessage(&MsgSendHeaders{})
+
+	// Send sendcmpct (BIP152) to indicate we support compact blocks
+	// Version 2 indicates segwit support (wtxid-based short IDs)
+	// announce=false means low-bandwidth mode (we'll receive inv/headers first)
+	p.SendMessage(&MsgSendCmpct{
+		AnnounceUsingCmpctBlock: false,
+		CmpctBlockVersion:       CmpctBlockVersion,
+	})
 }
 
 // handlePong processes a received pong message.
@@ -517,6 +764,139 @@ func (p *Peer) handlePong(msg *MsgPong) {
 	if listeners != nil && listeners.OnPong != nil {
 		listeners.OnPong(p, msg)
 	}
+}
+
+// handleFeeFilter processes a received feefilter message (BIP133).
+// The feefilter message tells us the minimum fee rate the peer will relay.
+func (p *Peer) handleFeeFilter(msg *MsgFeeFilter) {
+	// Validate the fee filter value (must be within valid money range)
+	// Max satoshis is 21M BTC = 2,100,000,000,000,000 satoshis
+	const maxMoney = 21_000_000 * 100_000_000
+	if msg.MinFeeRate < 0 || msg.MinFeeRate > maxMoney {
+		// Invalid value, ignore it
+		return
+	}
+
+	// Store atomically
+	atomic.StoreInt64(&p.feeFilterReceived, msg.MinFeeRate)
+}
+
+// FeeFilterReceived returns the peer's minimum fee rate in sat/kvB.
+// A value of 0 means no filtering (send all transactions).
+func (p *Peer) FeeFilterReceived() int64 {
+	return atomic.LoadInt64(&p.feeFilterReceived)
+}
+
+// ShouldRelayTx returns true if the transaction should be relayed to this peer
+// based on the peer's feefilter setting.
+// fee is the transaction fee in satoshis, vsize is the virtual size in vbytes.
+func (p *Peer) ShouldRelayTx(fee int64, vsize int64) bool {
+	filterRate := atomic.LoadInt64(&p.feeFilterReceived)
+	if filterRate == 0 {
+		// No filter set, relay everything
+		return true
+	}
+
+	// Calculate the minimum fee required for this transaction size
+	// filterRate is in sat/kvB (satoshis per 1000 virtual bytes)
+	minFee := (filterRate * vsize + 999) / 1000 // Round up
+
+	return fee >= minFee
+}
+
+// MaybeSendFeeFilter sends a feefilter message to the peer if conditions are met.
+// currentMinFee is the current minimum fee rate in sat/kvB that our node requires.
+// This should be called periodically (e.g., every time the mempool state changes).
+func (p *Peer) MaybeSendFeeFilter(currentMinFee int64) {
+	// Don't send feefilter to peers that don't want tx relay
+	if !p.WantsTxRelay() {
+		return
+	}
+
+	// Check if peer supports feefilter (protocol version >= 70013)
+	if p.ProtocolVersion() < FeeFilterVersion {
+		return
+	}
+
+	p.feeFilterMu.Lock()
+	defer p.feeFilterMu.Unlock()
+
+	now := time.Now()
+
+	// Check if it's time to send a feefilter
+	shouldSend := false
+
+	if now.After(p.nextFeeFilterTime) {
+		// Regular broadcast interval elapsed
+		shouldSend = true
+	} else if currentMinFee != p.feeFilterSent {
+		// Check for significant change (>33% increase or <25% decrease)
+		// This triggers an early update if the fee environment changed dramatically
+		if p.feeFilterSent > 0 {
+			// Significant increase: currentMinFee > 4/3 * sent (>33% increase)
+			if currentMinFee > (p.feeFilterSent*4)/3 {
+				// Check if we're far from next scheduled send
+				if now.Add(FeeFilterMaxChangeDelay).Before(p.nextFeeFilterTime) {
+					// Reschedule to sooner
+					p.nextFeeFilterTime = now.Add(time.Duration(rand.Int63n(int64(FeeFilterMaxChangeDelay))))
+				}
+			}
+			// Significant decrease: currentMinFee < 3/4 * sent (<25% decrease)
+			if currentMinFee < (p.feeFilterSent*3)/4 {
+				if now.Add(FeeFilterMaxChangeDelay).Before(p.nextFeeFilterTime) {
+					p.nextFeeFilterTime = now.Add(time.Duration(rand.Int63n(int64(FeeFilterMaxChangeDelay))))
+				}
+			}
+		}
+	}
+
+	if !shouldSend {
+		return
+	}
+
+	// Add privacy noise: ±10% randomization to prevent fingerprinting
+	// (peers cannot determine exact mempool state from our feefilter)
+	noisy := currentMinFee
+	if currentMinFee > 0 {
+		// Add noise in range [-10%, +10%]
+		noise := currentMinFee / 10
+		if noise > 0 {
+			noisy = currentMinFee + rand.Int63n(noise*2) - noise
+			if noisy < 0 {
+				noisy = 0
+			}
+		}
+	}
+
+	// Send the feefilter message
+	p.SendMessage(&MsgFeeFilter{MinFeeRate: noisy})
+
+	// Update state
+	p.feeFilterSent = currentMinFee
+	// Schedule next send with exponential distribution for timing privacy
+	delay := FeeFilterBroadcastInterval + time.Duration(rand.Int63n(int64(FeeFilterBroadcastInterval/2)))
+	p.nextFeeFilterTime = now.Add(delay)
+}
+
+// SendFeeFilter immediately sends a feefilter message to the peer.
+// This is typically called right after handshake completion.
+func (p *Peer) SendFeeFilter(minFeeRate int64) {
+	if !p.WantsTxRelay() {
+		return
+	}
+	if p.ProtocolVersion() < FeeFilterVersion {
+		return
+	}
+
+	p.feeFilterMu.Lock()
+	defer p.feeFilterMu.Unlock()
+
+	p.SendMessage(&MsgFeeFilter{MinFeeRate: minFeeRate})
+	p.feeFilterSent = minFeeRate
+
+	// Schedule next regular update
+	delay := FeeFilterBroadcastInterval + time.Duration(rand.Int63n(int64(FeeFilterBroadcastInterval/2)))
+	p.nextFeeFilterTime = time.Now().Add(delay)
 }
 
 // signalDisconnect is called by handlers when they exit due to errors.
@@ -693,10 +1073,128 @@ func (p *Peer) WTxidRelay() bool {
 	return p.wtxidRelaySupported
 }
 
+// WantsAddrv2 returns true if the peer supports BIP155 ADDRv2 messages.
+func (p *Peer) WantsAddrv2() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.wantsAddrv2
+}
+
+// SupportsErlay returns true if the peer supports BIP330 Erlay reconciliation.
+func (p *Peer) SupportsErlay() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.erlaySupported
+}
+
+// ErlaySalt returns the peer's Erlay salt from sendtxrcncl.
+func (p *Peer) ErlaySalt() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.erlaySalt
+}
+
+// ErlayVersion returns the peer's Erlay protocol version.
+func (p *Peer) ErlayVersion() uint32 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.erlayVersion
+}
+
+// ProvidesCompactBlocks returns true if the peer supports BIP152 compact blocks.
+func (p *Peer) ProvidesCompactBlocks() bool {
+	if p.compactBlockState == nil {
+		return false
+	}
+	return p.compactBlockState.ProvidesCompactBlocks()
+}
+
+// WantsHBCompactBlocks returns true if the peer wants high-bandwidth compact blocks.
+func (p *Peer) WantsHBCompactBlocks() bool {
+	if p.compactBlockState == nil {
+		return false
+	}
+	return p.compactBlockState.WantsHBCompactBlocks()
+}
+
+// CompactBlockState returns the peer's compact block state.
+func (p *Peer) CompactBlockState() *CompactBlockState {
+	return p.compactBlockState
+}
+
+// WantsTxRelay returns true if the peer wants to receive transaction announcements.
+// This is based on the fRelay flag in the version message and whether we're configured
+// to disable tx relay to this peer (block-relay-only connections).
+func (p *Peer) WantsTxRelay() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	// If we're configured not to relay txs to this peer, respect that
+	if p.config.DisableRelayTx {
+		return false
+	}
+
+	// Check the peer's version message Relay flag
+	if p.peerVersion == nil {
+		return false
+	}
+	return p.peerVersion.Relay
+}
+
+// SetBanCallback sets the callback invoked when peer exceeds misbehavior threshold.
+func (p *Peer) SetBanCallback(cb func(*Peer)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.banCallback = cb
+}
+
+// Misbehaving adds a misbehavior score to the peer.
+// If the score reaches MisbehaviorThreshold (100), the peer is flagged for disconnect/ban.
+// Returns true if the threshold was reached.
+func (p *Peer) Misbehaving(score int, reason string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.misbehaviorScore += score
+	log.Printf("peer %s misbehaving (%+d → %d): %s",
+		p.addr, score, p.misbehaviorScore, reason)
+
+	if p.misbehaviorScore >= MisbehaviorThreshold && !p.shouldBan {
+		p.shouldBan = true
+		log.Printf("peer %s: misbehavior threshold reached, flagging for ban", p.addr)
+
+		// Call ban callback if set (this will trigger disconnect and ban)
+		if p.banCallback != nil {
+			// Execute callback outside the lock
+			cb := p.banCallback
+			addr := p.addr
+			go func() {
+				cb(&Peer{addr: addr}) // Pass a minimal peer object
+			}()
+		}
+		return true
+	}
+	return false
+}
+
+// MisbehaviorScore returns the current misbehavior score.
+func (p *Peer) MisbehaviorScore() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.misbehaviorScore
+}
+
+// ShouldBan returns true if the peer has exceeded the misbehavior threshold.
+func (p *Peer) ShouldBan() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.shouldBan
+}
+
 // randomUint64 generates a cryptographically random uint64.
 func randomUint64() (uint64, error) {
 	var buf [8]byte
-	_, err := rand.Read(buf[:])
+	_, err := cryptorand.Read(buf[:])
 	if err != nil {
 		return 0, err
 	}

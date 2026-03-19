@@ -43,6 +43,23 @@ func (m *mockHeaderIndex) GetNode(hash wire.Hash256) *consensus.BlockNode {
 	return m.nodes[hash]
 }
 
+func (m *mockHeaderIndex) AddHeader(header wire.BlockHeader) (*consensus.BlockNode, error) {
+	hash := header.BlockHash()
+	parent := m.nodes[header.PrevBlock]
+	var height int32
+	if parent != nil {
+		height = parent.Height + 1
+	}
+	node := &consensus.BlockNode{
+		Hash:   hash,
+		Header: header,
+		Height: height,
+		Parent: parent,
+	}
+	m.nodes[hash] = node
+	return node, nil
+}
+
 // createTestTx creates a simple test transaction.
 func createTestTx(value int64) *wire.MsgTx {
 	return &wire.MsgTx{
@@ -681,5 +698,326 @@ func TestBlockPassesSanity(t *testing.T) {
 	expectedRoot := consensus.CalcMerkleRoot(txHashes)
 	if template.Block.Header.MerkleRoot != expectedRoot {
 		t.Error("merkle root mismatch")
+	}
+}
+
+// mockBlockConnector implements BlockConnector for testing.
+type mockBlockConnector struct {
+	tipHash   wire.Hash256
+	tipHeight int32
+	blocks    []*wire.MsgBlock
+}
+
+func (m *mockBlockConnector) BestBlock() (wire.Hash256, int32) {
+	return m.tipHash, m.tipHeight
+}
+
+func (m *mockBlockConnector) ConnectBlock(block *wire.MsgBlock) error {
+	m.blocks = append(m.blocks, block)
+	m.tipHash = block.Header.BlockHash()
+	m.tipHeight++
+	return nil
+}
+
+// mockBlockStorage implements BlockStorage for testing.
+type mockBlockStorage struct {
+	blocks map[wire.Hash256]*wire.MsgBlock
+}
+
+func (m *mockBlockStorage) StoreBlock(hash wire.Hash256, block *wire.MsgBlock) error {
+	if m.blocks == nil {
+		m.blocks = make(map[wire.Hash256]*wire.MsgBlock)
+	}
+	m.blocks[hash] = block
+	return nil
+}
+
+// TestRegtestMining tests instant block mining on regtest.
+func TestRegtestMining(t *testing.T) {
+	params := consensus.RegtestParams()
+
+	genesisHash := params.GenesisHash
+	tipNode := &consensus.BlockNode{
+		Hash:   genesisHash,
+		Header: params.GenesisBlock.Header,
+		Height: 0,
+	}
+
+	chainState := &mockChainState{
+		tipHash:   genesisHash,
+		tipHeight: 0,
+		tipNode:   tipNode,
+	}
+
+	mp := &mockMempool{entries: nil}
+
+	headerIndex := &mockHeaderIndex{
+		nodes: map[wire.Hash256]*consensus.BlockNode{
+			genesisHash: tipNode,
+		},
+	}
+
+	tg := NewTemplateGenerator(params, chainState, mp, headerIndex)
+
+	t.Run("mine single block", func(t *testing.T) {
+		connector := &mockBlockConnector{
+			tipHash:   genesisHash,
+			tipHeight: 0,
+		}
+		storage := &mockBlockStorage{}
+
+		miner := NewBlockMiner(tg, connector, storage, headerIndex, params)
+
+		// P2WPKH script for testing
+		minerScript := []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}
+
+		hash, err := miner.GenerateBlock(minerScript, nil, DefaultMaxTries)
+		if err != nil {
+			t.Fatalf("GenerateBlock failed: %v", err)
+		}
+
+		// Verify block was stored
+		if storage.blocks[hash] == nil {
+			t.Error("block was not stored")
+		}
+
+		// Verify block was connected
+		if len(connector.blocks) != 1 {
+			t.Errorf("expected 1 connected block, got %d", len(connector.blocks))
+		}
+
+		// Verify the hash matches
+		if connector.tipHash != hash {
+			t.Error("connector tip doesn't match generated block hash")
+		}
+
+		// Verify the block passes PoW check
+		block := storage.blocks[hash]
+		err = consensus.CheckProofOfWork(hash, block.Header.Bits, params.PowLimit)
+		if err != nil {
+			t.Errorf("block failed PoW check: %v", err)
+		}
+	})
+
+	t.Run("mine multiple blocks", func(t *testing.T) {
+		connector := &mockBlockConnector{
+			tipHash:   genesisHash,
+			tipHeight: 0,
+		}
+		storage := &mockBlockStorage{}
+
+		miner := NewBlockMiner(tg, connector, storage, headerIndex, params)
+
+		minerScript := []byte{0x51} // OP_1 for testing
+
+		hashes, err := miner.GenerateBlocks(5, minerScript, DefaultMaxTries)
+		if err != nil {
+			t.Fatalf("GenerateBlocks failed: %v", err)
+		}
+
+		if len(hashes) != 5 {
+			t.Errorf("expected 5 block hashes, got %d", len(hashes))
+		}
+
+		// All blocks should be stored
+		for _, h := range hashes {
+			if storage.blocks[h] == nil {
+				t.Errorf("block %s was not stored", h)
+			}
+		}
+
+		// Final tip height should be 5
+		if connector.tipHeight != 5 {
+			t.Errorf("expected tip height 5, got %d", connector.tipHeight)
+		}
+	})
+
+	t.Run("regtest difficulty never adjusts", func(t *testing.T) {
+		// On regtest, PowNoRetargeting is true, so bits should always be
+		// the genesis difficulty (0x207fffff)
+		connector := &mockBlockConnector{
+			tipHash:   genesisHash,
+			tipHeight: 0,
+		}
+		storage := &mockBlockStorage{}
+
+		miner := NewBlockMiner(tg, connector, storage, headerIndex, params)
+
+		minerScript := []byte{0x51}
+
+		// Generate a block
+		hash, err := miner.GenerateBlock(minerScript, nil, DefaultMaxTries)
+		if err != nil {
+			t.Fatalf("GenerateBlock failed: %v", err)
+		}
+
+		block := storage.blocks[hash]
+		if block.Header.Bits != params.PowLimitBits {
+			t.Errorf("expected bits %08x, got %08x", params.PowLimitBits, block.Header.Bits)
+		}
+	})
+}
+
+// TestMineBlockFindValidNonce tests that mineBlock finds a valid nonce.
+func TestMineBlockFindValidNonce(t *testing.T) {
+	params := consensus.RegtestParams()
+
+	genesisHash := params.GenesisHash
+	tipNode := &consensus.BlockNode{
+		Hash:   genesisHash,
+		Header: params.GenesisBlock.Header,
+		Height: 0,
+	}
+
+	headerIndex := &mockHeaderIndex{
+		nodes: map[wire.Hash256]*consensus.BlockNode{
+			genesisHash: tipNode,
+		},
+	}
+
+	miner := &BlockMiner{
+		chainParams: params,
+		headerIndex: headerIndex,
+	}
+
+	// Create a simple block to mine
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:   0x20000000,
+			PrevBlock: genesisHash,
+			Timestamp: uint32(time.Now().Unix()),
+			Bits:      params.PowLimitBits,
+			Nonce:     0,
+		},
+		Transactions: []*wire.MsgTx{
+			CreateCoinbaseTx(1, []byte{0x51}, nil, consensus.CalcBlockSubsidy(1), 0, nil),
+		},
+	}
+
+	// Calculate merkle root
+	block.Header.MerkleRoot = consensus.CalcMerkleRoot([]wire.Hash256{block.Transactions[0].TxHash()})
+
+	// Mine the block
+	hash, err := miner.mineBlock(block, DefaultMaxTries)
+	if err != nil {
+		t.Fatalf("mineBlock failed: %v", err)
+	}
+
+	// Verify the hash is valid
+	err = consensus.CheckProofOfWork(hash, block.Header.Bits, params.PowLimit)
+	if err != nil {
+		t.Errorf("mined block failed PoW check: %v", err)
+	}
+
+	// Verify nonce was set
+	if block.Header.Nonce == 0 {
+		// It's possible (but unlikely) that nonce 0 works on regtest
+		// Just make sure the hash is valid
+		actualHash := block.Header.BlockHash()
+		if actualHash != hash {
+			t.Error("hash mismatch")
+		}
+	}
+}
+
+// TestGenerateBlockWithTxs tests generating a block with specific transactions.
+func TestGenerateBlockWithTxs(t *testing.T) {
+	params := consensus.RegtestParams()
+
+	genesisHash := params.GenesisHash
+	tipNode := &consensus.BlockNode{
+		Hash:   genesisHash,
+		Header: params.GenesisBlock.Header,
+		Height: 0,
+	}
+
+	chainState := &mockChainState{
+		tipHash:   genesisHash,
+		tipHeight: 0,
+		tipNode:   tipNode,
+	}
+
+	mp := &mockMempool{entries: nil}
+
+	headerIndex := &mockHeaderIndex{
+		nodes: map[wire.Hash256]*consensus.BlockNode{
+			genesisHash: tipNode,
+		},
+	}
+
+	tg := NewTemplateGenerator(params, chainState, mp, headerIndex)
+
+	connector := &mockBlockConnector{
+		tipHash:   genesisHash,
+		tipHeight: 0,
+	}
+	storage := &mockBlockStorage{}
+
+	miner := NewBlockMiner(tg, connector, storage, headerIndex, params)
+
+	// Create some test transactions
+	tx1 := createTestTx(100000)
+	tx2 := createTestTx(200000)
+
+	minerScript := []byte{0x51}
+
+	hash, err := miner.GenerateBlock(minerScript, []*wire.MsgTx{tx1, tx2}, DefaultMaxTries)
+	if err != nil {
+		t.Fatalf("GenerateBlock failed: %v", err)
+	}
+
+	block := storage.blocks[hash]
+
+	// Should have coinbase + 2 transactions
+	if len(block.Transactions) != 3 {
+		t.Errorf("expected 3 transactions, got %d", len(block.Transactions))
+	}
+
+	// First should be coinbase
+	if !consensus.IsCoinbaseTx(block.Transactions[0]) {
+		t.Error("first transaction should be coinbase")
+	}
+
+	// Next should be our transactions
+	if block.Transactions[1].TxHash() != tx1.TxHash() {
+		t.Error("transaction 1 mismatch")
+	}
+	if block.Transactions[2].TxHash() != tx2.TxHash() {
+		t.Error("transaction 2 mismatch")
+	}
+}
+
+// TestUpdateCoinbaseWitnessCommitment tests the witness commitment update function.
+func TestUpdateCoinbaseWitnessCommitment(t *testing.T) {
+	// Create a coinbase with witness commitment
+	commitment := make([]byte, 32)
+	for i := range commitment {
+		commitment[i] = byte(i)
+	}
+
+	tx := CreateCoinbaseTx(100, []byte{0x51}, nil, 5000000000, 0, commitment)
+
+	// Verify initial commitment
+	if len(tx.TxOut) != 2 {
+		t.Fatalf("expected 2 outputs, got %d", len(tx.TxOut))
+	}
+
+	initialCommit := tx.TxOut[1].PkScript[6:38]
+	if !bytes.Equal(initialCommit, commitment) {
+		t.Error("initial commitment mismatch")
+	}
+
+	// Update with new commitment
+	newCommitment := make([]byte, 32)
+	for i := range newCommitment {
+		newCommitment[i] = byte(255 - i)
+	}
+
+	UpdateCoinbaseWitnessCommitment(tx, newCommitment)
+
+	// Verify new commitment
+	updatedCommit := tx.TxOut[1].PkScript[6:38]
+	if !bytes.Equal(updatedCommit, newCommitment) {
+		t.Error("updated commitment mismatch")
 	}
 }

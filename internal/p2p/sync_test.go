@@ -80,7 +80,7 @@ func TestSyncManagerSelectSyncPeer(t *testing.T) {
 
 	// Create a mock peer manager with peers
 	pm := &PeerManager{
-		peers: make(map[string]*Peer),
+		peers: make(map[string]*PeerInfo),
 	}
 
 	// Add peers with different heights
@@ -88,9 +88,9 @@ func TestSyncManagerSelectSyncPeer(t *testing.T) {
 	peer2 := createMockPeer("5.6.7.8:8333", 500)
 	peer3 := createMockPeer("9.10.11.12:8333", 200)
 
-	pm.peers["1.2.3.4:8333"] = peer1
-	pm.peers["5.6.7.8:8333"] = peer2
-	pm.peers["9.10.11.12:8333"] = peer3
+	pm.peers["1.2.3.4:8333"] = &PeerInfo{peer: peer1, connType: ConnFullRelay}
+	pm.peers["5.6.7.8:8333"] = &PeerInfo{peer: peer2, connType: ConnFullRelay}
+	pm.peers["9.10.11.12:8333"] = &PeerInfo{peer: peer3, connType: ConnFullRelay}
 
 	sm := NewSyncManager(SyncManagerConfig{
 		ChainParams: params,
@@ -357,7 +357,7 @@ func TestSyncManagerPeerDisconnect(t *testing.T) {
 	idx := consensus.NewHeaderIndex(params)
 
 	pm := &PeerManager{
-		peers: make(map[string]*Peer),
+		peers: make(map[string]*PeerInfo),
 	}
 
 	sm := NewSyncManager(SyncManagerConfig{
@@ -386,7 +386,7 @@ func TestSyncManagerStartStop(t *testing.T) {
 	idx := consensus.NewHeaderIndex(params)
 
 	pm := &PeerManager{
-		peers: make(map[string]*Peer),
+		peers: make(map[string]*PeerInfo),
 	}
 
 	sm := NewSyncManager(SyncManagerConfig{
@@ -441,7 +441,7 @@ func TestSyncManagerHandlesInvalidHeader(t *testing.T) {
 	idx := consensus.NewHeaderIndex(params)
 
 	pm := &PeerManager{
-		peers:  make(map[string]*Peer),
+		peers:  make(map[string]*PeerInfo),
 		banned: make(map[string]*BanInfo),
 		quit:   make(chan struct{}),
 	}
@@ -460,7 +460,7 @@ func TestSyncManagerHandlesInvalidHeader(t *testing.T) {
 		handshakeDone: make(chan struct{}),
 	}
 
-	pm.peers[peer.addr] = peer
+	pm.peers[peer.addr] = &PeerInfo{peer: peer, connType: ConnFullRelay}
 
 	sm := NewSyncManager(SyncManagerConfig{
 		ChainParams: params,

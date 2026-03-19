@@ -11,6 +11,7 @@ import (
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
+	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -335,6 +336,50 @@ func TestGetRawMempool(t *testing.T) {
 	}
 }
 
+func TestSubmitPackageRPC(t *testing.T) {
+	// Create a mempool for testing
+	mp := mempool.New(mempool.DefaultConfig(), nil)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithMempool(mp),
+	)
+
+	// Test with empty package - should fail
+	resp := testRPCRequest(t, server.handleRPC, "submitpackage", []interface{}{[]interface{}{}}, "", "")
+	if resp.Error == nil {
+		t.Error("expected error for empty package")
+	}
+
+	// Test with invalid hex - should fail
+	resp = testRPCRequest(t, server.handleRPC, "submitpackage", []interface{}{[]interface{}{"not_hex"}}, "", "")
+	if resp.Error == nil {
+		t.Error("expected error for invalid hex")
+	}
+
+	// Test with missing array parameter
+	resp = testRPCRequest(t, server.handleRPC, "submitpackage", []interface{}{}, "", "")
+	if resp.Error == nil {
+		t.Error("expected error for missing parameter")
+	}
+
+	// Test with a simple valid raw transaction hex (P2WPKH spend)
+	// This will fail validation because we don't have UTXOs, but tests the parsing path
+	validTxHex := "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff0100f2052a010000001600140000000000000000000000000000000000000000ffffffff"
+	resp = testRPCRequest(t, server.handleRPC, "submitpackage", []interface{}{[]interface{}{validTxHex}}, "", "")
+	// Should return a result (even if it's an error in the package_msg)
+	// because parsing succeeded
+	if resp.Error == nil {
+		// Check that we got a package result
+		result, ok := resp.Result.(map[string]interface{})
+		if ok {
+			if packageMsg, ok := result["package_msg"].(string); ok {
+				t.Logf("Package message: %s", packageMsg)
+			}
+		}
+	}
+}
+
 func TestGetConnectionCount(t *testing.T) {
 	server := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0"})
 
@@ -635,5 +680,470 @@ func TestNullID(t *testing.T) {
 	// ID should be null in response
 	if resp.ID != nil {
 		t.Errorf("expected null ID, got %v", resp.ID)
+	}
+}
+
+func TestGetRawTransactionFromMempool(t *testing.T) {
+	// Create a simple transaction
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{
+				Hash:  wire.Hash256{0x01, 0x02, 0x03},
+				Index: 0,
+			},
+			SignatureScript: []byte{0x00},
+			Sequence:        0xFFFFFFFF,
+		}},
+		TxOut: []*wire.TxOut{{
+			Value:    1000000,
+			PkScript: []byte{0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac},
+		}},
+		LockTime: 0,
+	}
+
+	txid := tx.TxHash()
+
+	// Create mempool and add transaction
+	mp := mempool.New(mempool.DefaultConfig(), nil)
+	mp.AddTransaction(tx)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithMempool(mp),
+	)
+
+	// Test non-verbose mode
+	resp := testRPCRequest(t, server.handleRPC, "getrawtransaction", []interface{}{txid.String(), false}, "", "")
+
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	hexStr, ok := resp.Result.(string)
+	if !ok {
+		t.Fatalf("expected string result, got %T", resp.Result)
+	}
+
+	// Should be valid hex
+	if _, err := hex.DecodeString(hexStr); err != nil {
+		t.Errorf("expected valid hex string, got error: %v", err)
+	}
+
+	// Test verbose mode
+	resp = testRPCRequest(t, server.handleRPC, "getrawtransaction", []interface{}{txid.String(), true}, "", "")
+
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map result for verbose mode, got %T", resp.Result)
+	}
+
+	if result["txid"] != txid.String() {
+		t.Errorf("expected txid %s, got %v", txid.String(), result["txid"])
+	}
+
+	// Mempool tx should not have blockhash
+	if _, ok := result["blockhash"]; ok && result["blockhash"] != "" {
+		t.Error("expected no blockhash for mempool transaction")
+	}
+}
+
+func TestGetRawTransactionNotFound(t *testing.T) {
+	mp := mempool.New(mempool.DefaultConfig(), nil)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0", TxIndex: false},
+		WithMempool(mp),
+	)
+
+	// Request non-existent transaction without txindex
+	resp := testRPCRequest(t, server.handleRPC, "getrawtransaction",
+		[]interface{}{"0000000000000000000000000000000000000000000000000000000000000001", false}, "", "")
+
+	if resp.Error == nil {
+		t.Fatal("expected error for non-existent transaction")
+	}
+
+	if resp.Error.Code != RPCErrTxNotFound {
+		t.Errorf("expected error code %d, got %d", RPCErrTxNotFound, resp.Error.Code)
+	}
+
+	// Error message should mention txindex
+	if !bytes.Contains([]byte(resp.Error.Message), []byte("txindex")) {
+		t.Errorf("expected error message to mention txindex, got: %s", resp.Error.Message)
+	}
+}
+
+func TestGetRawTransactionFromBlockhash(t *testing.T) {
+	// Create a block with a coinbase transaction
+	coinbaseTx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{
+				Hash:  wire.Hash256{},
+				Index: 0xFFFFFFFF,
+			},
+			SignatureScript: []byte{0x03, 0x01, 0x00, 0x00},
+			Sequence:        0xFFFFFFFF,
+		}},
+		TxOut: []*wire.TxOut{{
+			Value:    5000000000,
+			PkScript: []byte{0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac},
+		}},
+		LockTime: 0,
+	}
+
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    1,
+			PrevBlock:  wire.Hash256{},
+			MerkleRoot: wire.Hash256{},
+			Timestamp:  1231006505,
+			Bits:       0x1d00ffff,
+			Nonce:      2083236893,
+		},
+		Transactions: []*wire.MsgTx{coinbaseTx},
+	}
+
+	blockHash := block.Header.BlockHash()
+	txid := coinbaseTx.TxHash()
+
+	// Create chain state with block stored
+	params := consensus.MainnetParams()
+	idx := consensus.NewHeaderIndex(params)
+	chainDB := storage.NewChainDB(storage.NewMemDB())
+
+	// Store the block
+	if err := chainDB.StoreBlock(blockHash, block); err != nil {
+		t.Fatalf("failed to store block: %v", err)
+	}
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithHeaderIndex(idx),
+		WithChainDB(chainDB),
+	)
+
+	// Request transaction with blockhash
+	resp := testRPCRequest(t, server.handleRPC, "getrawtransaction",
+		[]interface{}{txid.String(), true, blockHash.String()}, "", "")
+
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map result, got %T", resp.Result)
+	}
+
+	if result["txid"] != txid.String() {
+		t.Errorf("expected txid %s, got %v", txid.String(), result["txid"])
+	}
+
+	// Should have blockhash
+	if result["blockhash"] != blockHash.String() {
+		t.Errorf("expected blockhash %s, got %v", blockHash.String(), result["blockhash"])
+	}
+
+	// Should have coinbase field in vin
+	vin, ok := result["vin"].([]interface{})
+	if !ok || len(vin) != 1 {
+		t.Fatal("expected 1 input")
+	}
+	vinEntry, ok := vin[0].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected vin entry to be a map")
+	}
+	if _, ok := vinEntry["coinbase"]; !ok {
+		t.Error("expected coinbase field for coinbase transaction")
+	}
+}
+
+func TestGetRawTransactionFromTxIndex(t *testing.T) {
+	// Create a transaction
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{
+				Hash:  wire.Hash256{0x01, 0x02, 0x03},
+				Index: 0,
+			},
+			SignatureScript: []byte{0x00},
+			Sequence:        0xFFFFFFFF,
+		}},
+		TxOut: []*wire.TxOut{{
+			Value:    1000000,
+			PkScript: []byte{0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac},
+		}},
+		LockTime: 0,
+	}
+
+	// Create a block containing the transaction
+	coinbaseTx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{
+				Hash:  wire.Hash256{},
+				Index: 0xFFFFFFFF,
+			},
+			SignatureScript: []byte{0x03, 0x01, 0x00, 0x00},
+			Sequence:        0xFFFFFFFF,
+		}},
+		TxOut: []*wire.TxOut{{
+			Value:    5000000000,
+			PkScript: []byte{0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac},
+		}},
+		LockTime: 0,
+	}
+
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    1,
+			PrevBlock:  wire.Hash256{},
+			MerkleRoot: wire.Hash256{},
+			Timestamp:  1231006505,
+			Bits:       0x1d00ffff,
+			Nonce:      2083236893,
+		},
+		Transactions: []*wire.MsgTx{coinbaseTx, tx},
+	}
+
+	blockHash := block.Header.BlockHash()
+	txid := tx.TxHash()
+
+	// Set up storage
+	params := consensus.MainnetParams()
+	idx := consensus.NewHeaderIndex(params)
+	chainDB := storage.NewChainDB(storage.NewMemDB())
+
+	// Store block and txindex
+	if err := chainDB.StoreBlock(blockHash, block); err != nil {
+		t.Fatalf("failed to store block: %v", err)
+	}
+	if err := chainDB.WriteTxIndex(txid, blockHash); err != nil {
+		t.Fatalf("failed to write txindex: %v", err)
+	}
+
+	// Create chain manager
+	cmConfig := consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		UTXOSet:     consensus.NewInMemoryUTXOView(),
+	}
+	chainMgr := consensus.NewChainManager(cmConfig)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0", TxIndex: true},
+		WithChainParams(params),
+		WithHeaderIndex(idx),
+		WithChainDB(chainDB),
+		WithChainManager(chainMgr),
+	)
+
+	// Request transaction without blockhash - should find via txindex
+	resp := testRPCRequest(t, server.handleRPC, "getrawtransaction",
+		[]interface{}{txid.String(), true}, "", "")
+
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map result, got %T", resp.Result)
+	}
+
+	if result["txid"] != txid.String() {
+		t.Errorf("expected txid %s, got %v", txid.String(), result["txid"])
+	}
+
+	// Should have blockhash
+	if result["blockhash"] != blockHash.String() {
+		t.Errorf("expected blockhash %s, got %v", blockHash.String(), result["blockhash"])
+	}
+
+	// Non-verbose mode should also work
+	resp = testRPCRequest(t, server.handleRPC, "getrawtransaction",
+		[]interface{}{txid.String(), false}, "", "")
+
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+
+	hexStr, ok := resp.Result.(string)
+	if !ok {
+		t.Fatalf("expected string result, got %T", resp.Result)
+	}
+
+	if _, err := hex.DecodeString(hexStr); err != nil {
+		t.Errorf("expected valid hex string, got error: %v", err)
+	}
+}
+
+func TestGetRawTransactionInvalidParams(t *testing.T) {
+	server := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0"})
+
+	// Missing txid
+	resp := testRPCRequest(t, server.handleRPC, "getrawtransaction", []interface{}{}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected invalid params error for missing txid")
+	}
+
+	// Invalid txid format
+	resp = testRPCRequest(t, server.handleRPC, "getrawtransaction", []interface{}{"invalid"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected invalid params error for invalid txid")
+	}
+
+	// Invalid blockhash format
+	resp = testRPCRequest(t, server.handleRPC, "getrawtransaction",
+		[]interface{}{"0000000000000000000000000000000000000000000000000000000000000001", false, "invalid"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected invalid params error for invalid blockhash")
+	}
+}
+
+// ============================================================================
+// Chain Management RPC Tests
+// ============================================================================
+
+func TestInvalidateBlockRPC(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithChainManager(cm),
+		WithHeaderIndex(idx),
+		WithChainDB(db),
+	)
+
+	// Missing blockhash parameter
+	resp := testRPCRequest(t, server.handleRPC, "invalidateblock", []interface{}{}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected error for missing blockhash")
+	}
+
+	// Invalid blockhash format
+	resp = testRPCRequest(t, server.handleRPC, "invalidateblock", []interface{}{"invalid"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected error for invalid blockhash format")
+	}
+
+	// Block not found
+	resp = testRPCRequest(t, server.handleRPC, "invalidateblock",
+		[]interface{}{"0000000000000000000000000000000000000000000000000000000000000001"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrBlockNotFound {
+		t.Errorf("expected block not found error, got %v", resp.Error)
+	}
+
+	// Valid request (genesis - should fail because genesis cannot be invalidated)
+	resp = testRPCRequest(t, server.handleRPC, "invalidateblock",
+		[]interface{}{params.GenesisHash.String()}, "", "")
+	if resp.Error == nil {
+		t.Error("expected error when invalidating genesis")
+	}
+}
+
+func TestReconsiderBlockRPC(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithChainManager(cm),
+		WithHeaderIndex(idx),
+		WithChainDB(db),
+	)
+
+	// Missing blockhash parameter
+	resp := testRPCRequest(t, server.handleRPC, "reconsiderblock", []interface{}{}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected error for missing blockhash")
+	}
+
+	// Invalid blockhash format
+	resp = testRPCRequest(t, server.handleRPC, "reconsiderblock", []interface{}{"invalid"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected error for invalid blockhash format")
+	}
+
+	// Block not found
+	resp = testRPCRequest(t, server.handleRPC, "reconsiderblock",
+		[]interface{}{"0000000000000000000000000000000000000000000000000000000000000001"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrBlockNotFound {
+		t.Errorf("expected block not found error, got %v", resp.Error)
+	}
+
+	// Valid request (genesis - should succeed, though no-op)
+	resp = testRPCRequest(t, server.handleRPC, "reconsiderblock",
+		[]interface{}{params.GenesisHash.String()}, "", "")
+	if resp.Error != nil {
+		t.Errorf("unexpected error: %v", resp.Error)
+	}
+}
+
+func TestPreciousBlockRPC(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithChainManager(cm),
+		WithHeaderIndex(idx),
+		WithChainDB(db),
+	)
+
+	// Missing blockhash parameter
+	resp := testRPCRequest(t, server.handleRPC, "preciousblock", []interface{}{}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected error for missing blockhash")
+	}
+
+	// Invalid blockhash format
+	resp = testRPCRequest(t, server.handleRPC, "preciousblock", []interface{}{"invalid"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
+		t.Error("expected error for invalid blockhash format")
+	}
+
+	// Block not found
+	resp = testRPCRequest(t, server.handleRPC, "preciousblock",
+		[]interface{}{"0000000000000000000000000000000000000000000000000000000000000001"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrBlockNotFound {
+		t.Errorf("expected block not found error, got %v", resp.Error)
+	}
+
+	// Valid request (genesis - should succeed)
+	resp = testRPCRequest(t, server.handleRPC, "preciousblock",
+		[]interface{}{params.GenesisHash.String()}, "", "")
+	if resp.Error != nil {
+		t.Errorf("unexpected error: %v", resp.Error)
 	}
 }

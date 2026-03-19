@@ -476,6 +476,17 @@ func IsP2TR(script []byte) bool {
 		script[1] == 0x20 // Push 32 bytes
 }
 
+// IsPayToAnchor checks if script is Pay-to-Anchor.
+// Format: OP_1 OP_PUSHBYTES_2 0x4e 0x73 (exactly 4 bytes)
+// P2A is a standardized anyone-can-spend output for anchor outputs in L2 protocols.
+func IsPayToAnchor(script []byte) bool {
+	return len(script) == 4 &&
+		script[0] == 0x51 && // OP_1
+		script[1] == 0x02 && // Push 2 bytes
+		script[2] == 0x4e &&
+		script[3] == 0x73
+}
+
 // CompressScript compresses common script patterns for storage.
 // - P2PKH (25 bytes) -> 21 bytes (type 0x00 + 20 byte hash)
 // - P2SH (23 bytes) -> 21 bytes (type 0x01 + 20 byte hash)

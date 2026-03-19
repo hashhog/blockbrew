@@ -2,6 +2,8 @@
 package mining
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -50,6 +52,7 @@ type MempoolProvider interface {
 // HeaderIndexProvider provides header index access for template generation.
 type HeaderIndexProvider interface {
 	GetNode(hash wire.Hash256) *consensus.BlockNode
+	AddHeader(header wire.BlockHeader) (*consensus.BlockNode, error)
 }
 
 // NewTemplateGenerator creates a new block template generator.
@@ -325,3 +328,182 @@ func scriptNumSerialize(n int64) []byte {
 
 	return result
 }
+
+// DefaultMaxTries is the default number of nonce attempts for block mining.
+const DefaultMaxTries = 1000000
+
+// BlockMiner handles instant block generation for regtest mode.
+type BlockMiner struct {
+	templateGen *TemplateGenerator
+	chainMgr    BlockConnector
+	chainDB     BlockStorage
+	headerIndex HeaderIndexProvider
+	chainParams *consensus.ChainParams
+}
+
+// BlockConnector is the interface for connecting mined blocks to the chain.
+type BlockConnector interface {
+	ConnectBlock(block *wire.MsgBlock) error
+	BestBlock() (wire.Hash256, int32)
+}
+
+// BlockStorage is the interface for storing mined blocks.
+type BlockStorage interface {
+	StoreBlock(hash wire.Hash256, block *wire.MsgBlock) error
+}
+
+// NewBlockMiner creates a new block miner for instant mining.
+func NewBlockMiner(
+	tg *TemplateGenerator,
+	cm BlockConnector,
+	db BlockStorage,
+	idx HeaderIndexProvider,
+	params *consensus.ChainParams,
+) *BlockMiner {
+	return &BlockMiner{
+		templateGen: tg,
+		chainMgr:    cm,
+		chainDB:     db,
+		headerIndex: idx,
+		chainParams: params,
+	}
+}
+
+// GenerateBlocks mines nblocks blocks instantly, paying the coinbase to the given script.
+// Returns the hashes of the generated blocks.
+func (m *BlockMiner) GenerateBlocks(nblocks int, coinbaseScript []byte, maxTries int) ([]wire.Hash256, error) {
+	if maxTries == 0 {
+		maxTries = DefaultMaxTries
+	}
+
+	hashes := make([]wire.Hash256, 0, nblocks)
+
+	for i := 0; i < nblocks; i++ {
+		hash, err := m.GenerateBlock(coinbaseScript, nil, maxTries)
+		if err != nil {
+			return hashes, err
+		}
+		hashes = append(hashes, hash)
+	}
+
+	return hashes, nil
+}
+
+// GenerateBlock mines a single block with the given coinbase script and optional transactions.
+// If txs is nil, transactions are selected from the mempool.
+// Returns the hash of the generated block.
+func (m *BlockMiner) GenerateBlock(coinbaseScript []byte, txs []*wire.MsgTx, maxTries int) (wire.Hash256, error) {
+	if maxTries == 0 {
+		maxTries = DefaultMaxTries
+	}
+
+	// Generate block template
+	config := TemplateConfig{
+		MinerAddress: coinbaseScript,
+	}
+
+	template, err := m.templateGen.GenerateTemplate(config)
+	if err != nil {
+		return wire.Hash256{}, err
+	}
+
+	block := template.Block
+
+	// If specific transactions are provided, use them instead of mempool txs
+	if txs != nil {
+		// Keep only the coinbase transaction
+		coinbase := block.Transactions[0]
+
+		// Rebuild transaction list with coinbase + provided txs
+		block.Transactions = make([]*wire.MsgTx, 0, len(txs)+1)
+		block.Transactions = append(block.Transactions, coinbase)
+		block.Transactions = append(block.Transactions, txs...)
+
+		// Recalculate the merkle root
+		txHashes := make([]wire.Hash256, len(block.Transactions))
+		for i, tx := range block.Transactions {
+			txHashes[i] = tx.TxHash()
+		}
+		block.Header.MerkleRoot = consensus.CalcMerkleRoot(txHashes)
+
+		// Recalculate witness commitment if segwit is active
+		if m.chainParams.SegwitHeight <= template.Height {
+			wtxids := make([]wire.Hash256, len(block.Transactions))
+			wtxids[0] = wire.Hash256{} // Coinbase wtxid is all zeros
+			for i := 1; i < len(block.Transactions); i++ {
+				wtxids[i] = block.Transactions[i].WTxHash()
+			}
+			witnessReserved := make([]byte, 32)
+			commitment := consensus.CalcWitnessCommitment(wtxids, witnessReserved)
+
+			// Update coinbase witness commitment output
+			UpdateCoinbaseWitnessCommitment(coinbase, commitment[:])
+		}
+	}
+
+	// Mine the block by iterating nonces
+	hash, err := m.mineBlock(block, maxTries)
+	if err != nil {
+		return wire.Hash256{}, err
+	}
+
+	// Store and connect the block
+	if m.chainDB != nil {
+		if err := m.chainDB.StoreBlock(hash, block); err != nil {
+			return wire.Hash256{}, err
+		}
+	}
+
+	// Add the block header to the header index so ConnectBlock can find it
+	if m.headerIndex != nil {
+		if _, err := m.headerIndex.AddHeader(block.Header); err != nil {
+			return wire.Hash256{}, fmt.Errorf("failed to add header to index: %w", err)
+		}
+	}
+
+	if m.chainMgr != nil {
+		if err := m.chainMgr.ConnectBlock(block); err != nil {
+			return wire.Hash256{}, err
+		}
+	}
+
+	return hash, nil
+}
+
+// mineBlock iterates nonces until a valid proof-of-work is found.
+func (m *BlockMiner) mineBlock(block *wire.MsgBlock, maxTries int) (wire.Hash256, error) {
+	target := consensus.CompactToBig(block.Header.Bits)
+
+	for nonce := uint32(0); nonce < uint32(maxTries); nonce++ {
+		block.Header.Nonce = nonce
+		hash := block.Header.BlockHash()
+
+		hashNum := consensus.HashToBig(hash)
+		if hashNum.Cmp(target) <= 0 {
+			return hash, nil
+		}
+	}
+
+	return wire.Hash256{}, ErrMaxTriesExceeded
+}
+
+// UpdateCoinbaseWitnessCommitment updates the witness commitment in the coinbase transaction.
+func UpdateCoinbaseWitnessCommitment(coinbase *wire.MsgTx, commitment []byte) {
+	// Find the witness commitment output (OP_RETURN with 0xaa21a9ed magic)
+	for i, out := range coinbase.TxOut {
+		if len(out.PkScript) >= 38 &&
+			out.PkScript[0] == 0x6a && // OP_RETURN
+			out.PkScript[1] == 0x24 && // Push 36 bytes
+			out.PkScript[2] == 0xaa &&
+			out.PkScript[3] == 0x21 &&
+			out.PkScript[4] == 0xa9 &&
+			out.PkScript[5] == 0xed {
+			// Update the commitment
+			copy(coinbase.TxOut[i].PkScript[6:], commitment)
+			return
+		}
+	}
+}
+
+// ErrMaxTriesExceeded is returned when mining fails to find a valid nonce.
+var ErrMaxTriesExceeded = errors.New("maximum nonce tries exceeded")

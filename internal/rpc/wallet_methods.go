@@ -51,13 +51,17 @@ func (s *Server) handleListUnspent() (interface{}, *RPCError) {
 			confs = tipHeight - u.Height + 1
 		}
 
+		// Check if spendable (wallet unlocked AND not immature coinbase)
+		spendable := !s.wallet.IsLocked() && s.wallet.IsUTXOSpendable(u, tipHeight)
+
 		result = append(result, ListUnspentResult{
 			TxID:          u.OutPoint.Hash.String(),
 			Vout:          u.OutPoint.Index,
 			Address:       u.Address,
+			Label:         s.wallet.GetLabel(u.Address),
 			Amount:        float64(u.Amount) / satoshiPerBitcoin,
 			Confirmations: confs,
-			Spendable:     !s.wallet.IsLocked(),
+			Spendable:     spendable,
 			Solvable:      true,
 			Safe:          u.Confirmed,
 		})
@@ -107,7 +111,13 @@ func (s *Server) handleSendToAddress(params json.RawMessage) (interface{}, *RPCE
 		}
 	}
 
-	tx, err := s.wallet.CreateTransaction(addr, amountSat, feeRate)
+	// Get current tip height for coinbase maturity check
+	tipHeight := int32(0)
+	if s.chainMgr != nil {
+		_, tipHeight = s.chainMgr.BestBlock()
+	}
+
+	tx, err := s.wallet.CreateTransactionWithTip(addr, amountSat, feeRate, tipHeight)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
 	}
@@ -247,4 +257,118 @@ func (s *Server) handleGetWalletInfo() (interface{}, *RPCError) {
 		PayTxFee:           0,
 		Locked:             s.wallet.IsLocked(),
 	}, nil
+}
+
+// ============================================================================
+// Address Label RPCs
+// ============================================================================
+
+func (s *Server) handleSetLabel(params json.RawMessage) (interface{}, *RPCError) {
+	if s.wallet == nil {
+		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
+	}
+
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing address and/or label"}
+	}
+
+	addr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
+	}
+
+	label, ok := args[1].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid label"}
+	}
+
+	if err := s.wallet.SetLabel(addr, label); err != nil {
+		return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
+	}
+
+	return nil, nil
+}
+
+func (s *Server) handleListLabels(params json.RawMessage) (interface{}, *RPCError) {
+	if s.wallet == nil {
+		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
+	}
+
+	// Optional purpose filter (receive or send), ignored for now
+	labels := s.wallet.ListLabels()
+	return labels, nil
+}
+
+func (s *Server) handleGetAddressesByLabel(params json.RawMessage) (interface{}, *RPCError) {
+	if s.wallet == nil {
+		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
+	}
+
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing label"}
+	}
+
+	label, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid label"}
+	}
+
+	addrs := s.wallet.GetAddressesByLabel(label)
+
+	// Return as map of address -> purpose (Bitcoin Core format)
+	result := make(map[string]AddressByLabelResult)
+	for _, addr := range addrs {
+		result[addr] = AddressByLabelResult{Purpose: "receive"}
+	}
+	return result, nil
+}
+
+func (s *Server) handleGetAddressInfo(params json.RawMessage) (interface{}, *RPCError) {
+	if s.wallet == nil {
+		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
+	}
+
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing address"}
+	}
+
+	addr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
+	}
+
+	isMine := s.wallet.IsOwnAddress(addr)
+	label := s.wallet.GetLabel(addr)
+
+	result := &AddressInfoResult{
+		Address:     addr,
+		IsMine:      isMine,
+		IsWatchOnly: false,
+		Solvable:    isMine,
+		Label:       label,
+	}
+
+	if label != "" {
+		result.Labels = []struct {
+			Name    string `json:"name"`
+			Purpose string `json:"purpose"`
+		}{{Name: label, Purpose: "receive"}}
+	}
+
+	return result, nil
 }

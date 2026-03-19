@@ -18,3 +18,5 @@ vendor/
 
 # Windows
 *.exe
+
+.claude/skills/
