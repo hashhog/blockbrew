@@ -33,6 +33,15 @@ type ChainParams struct {
 	MinDiffReductionTime   bool // Testnet allows min-difficulty blocks after 20min gap
 	PowNoRetargeting       bool // Regtest: never adjust difficulty
 	EnforceBIP94           bool // Testnet4: use first block of period for retarget base
+
+	// BIP9 deployments tracked via version bits.
+	Deployments []*BIP9Deployment
+
+	// AssumeUTXO parameters for snapshot-based sync.
+	AssumeUTXO *AssumeUTXOParams
+
+	// NetworkMagic is the 4-byte message start bytes for this network.
+	NetworkMagic [4]byte
 }
 
 // mainnetPowLimit is the highest proof of work value a Bitcoin block can have
@@ -111,6 +120,27 @@ func MainnetParams() *ChainParams {
 		MinDiffReductionTime:   false,
 		PowNoRetargeting:       false,
 		EnforceBIP94:           false,
+
+		// BIP9 deployments - mainnet uses height-based activation (buried deployments)
+		// These are historical for reference; actual activation uses hardcoded heights.
+		Deployments: []*BIP9Deployment{
+			// DEPLOYMENT_TESTDUMMY - only used for testing BIP9 mechanics
+			{
+				Name:                "testdummy",
+				Bit:                 28,
+				StartTime:           NeverActive,
+				Timeout:             NoTimeout,
+				MinActivationHeight: 0,
+				Period:              2016,
+				Threshold:           1815, // 90%
+			},
+		},
+
+		// AssumeUTXO snapshot data
+		AssumeUTXO: &MainnetAssumeUTXOParams,
+
+		// Network magic (message start bytes)
+		NetworkMagic: [4]byte{0xf9, 0xbe, 0xb4, 0xd9},
 	}
 	return mainnetParams
 }
@@ -155,6 +185,25 @@ func TestnetParams() *ChainParams {
 		MinDiffReductionTime:   true,
 		PowNoRetargeting:       false,
 		EnforceBIP94:           false,
+
+		// BIP9 deployments for testnet3
+		Deployments: []*BIP9Deployment{
+			{
+				Name:                "testdummy",
+				Bit:                 28,
+				StartTime:           NeverActive,
+				Timeout:             NoTimeout,
+				MinActivationHeight: 0,
+				Period:              2016,
+				Threshold:           1512, // 75%
+			},
+		},
+
+		// No assumeUTXO data for testnet3 (deprecated)
+		AssumeUTXO: nil,
+
+		// Network magic
+		NetworkMagic: [4]byte{0x0b, 0x11, 0x09, 0x07},
 	}
 	return testnetParams
 }
@@ -193,6 +242,25 @@ func RegtestParams() *ChainParams {
 		HDCoinType:             1,
 		MinDiffReductionTime:   true,
 		PowNoRetargeting:       true,
+
+		// BIP9 deployments for regtest - always active for easy testing
+		Deployments: []*BIP9Deployment{
+			{
+				Name:                "testdummy",
+				Bit:                 28,
+				StartTime:           AlwaysActive, // Always active on regtest
+				Timeout:             NoTimeout,
+				MinActivationHeight: 0,
+				Period:              144, // Shorter period for regtest
+				Threshold:           108, // 75%
+			},
+		},
+
+		// No assumeUTXO data for regtest (create your own snapshots)
+		AssumeUTXO: nil,
+
+		// Network magic
+		NetworkMagic: [4]byte{0xfa, 0xbf, 0xb5, 0xda},
 	}
 	return regtestParams
 }
@@ -234,6 +302,25 @@ func SignetParams() *ChainParams {
 		MinDiffReductionTime:   false,
 		PowNoRetargeting:       false,
 		EnforceBIP94:           false,
+
+		// BIP9 deployments for signet
+		Deployments: []*BIP9Deployment{
+			{
+				Name:                "testdummy",
+				Bit:                 28,
+				StartTime:           NeverActive,
+				Timeout:             NoTimeout,
+				MinActivationHeight: 0,
+				Period:              2016,
+				Threshold:           1815, // 90%
+			},
+		},
+
+		// No assumeUTXO data for signet
+		AssumeUTXO: nil,
+
+		// Network magic
+		NetworkMagic: [4]byte{0x0a, 0x03, 0xcf, 0x40},
 	}
 	return signetParams
 }
@@ -276,6 +363,25 @@ func Testnet4Params() *ChainParams {
 		MinDiffReductionTime:   true,
 		PowNoRetargeting:       false,
 		EnforceBIP94:           true,
+
+		// BIP9 deployments for testnet4
+		Deployments: []*BIP9Deployment{
+			{
+				Name:                "testdummy",
+				Bit:                 28,
+				StartTime:           NeverActive,
+				Timeout:             NoTimeout,
+				MinActivationHeight: 0,
+				Period:              2016,
+				Threshold:           1512, // 75%
+			},
+		},
+
+		// AssumeUTXO data for testnet4
+		AssumeUTXO: &Testnet4AssumeUTXOParams,
+
+		// Network magic
+		NetworkMagic: [4]byte{0x1c, 0x16, 0x3f, 0x28},
 	}
 	return testnet4Params
 }

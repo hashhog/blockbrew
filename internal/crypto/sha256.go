@@ -203,6 +203,23 @@ func MerklePairHash(left, right [32]byte) [32]byte {
 	return sha256.Sum256(first[:])
 }
 
+// SHA256HWInfo returns a human-readable string describing the detected SHA-256
+// hardware acceleration in use. Go's crypto/sha256 automatically selects the
+// best implementation (SHA-NI on x86_64 Zen+/Goldmont+, SHA2 on ARM64) but
+// this function provides explicit visibility into what's available.
+func SHA256HWInfo() string {
+	impl := DetectSHA256Implementation()
+	info := "arch=" + impl.Arch + " impl=" + impl.Name
+	if impl.HasSHANI {
+		info += " hw=sha-extensions"
+	} else if impl.HasAVX2 {
+		info += " hw=avx2"
+	} else {
+		info += " hw=none"
+	}
+	return info
+}
+
 // SHA256 round constants
 var k = [64]uint32{
 	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5,

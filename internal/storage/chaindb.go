@@ -163,3 +163,42 @@ func (c *ChainDB) DeleteBlockUndo(hash wire.Hash256) error {
 	key := MakeUndoBlockKey(hash)
 	return c.db.Delete(key)
 }
+
+// TxIndexEntry stores the block location for a transaction.
+type TxIndexEntry struct {
+	BlockHash wire.Hash256 // Hash of the block containing the transaction
+}
+
+// WriteTxIndex stores a mapping from txid to block hash.
+func (c *ChainDB) WriteTxIndex(txid wire.Hash256, blockHash wire.Hash256) error {
+	key := MakeTxIndexKey(txid)
+	return c.db.Put(key, blockHash[:])
+}
+
+// GetTxIndex retrieves the block hash for a transaction.
+// Returns ErrNotFound if the txid is not in the index.
+func (c *ChainDB) GetTxIndex(txid wire.Hash256) (*TxIndexEntry, error) {
+	key := MakeTxIndexKey(txid)
+
+	data, err := c.db.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, ErrNotFound
+	}
+
+	if len(data) < 32 {
+		return nil, errors.New("invalid txindex entry")
+	}
+
+	entry := &TxIndexEntry{}
+	copy(entry.BlockHash[:], data[:32])
+	return entry, nil
+}
+
+// DeleteTxIndex removes a txid from the index.
+func (c *ChainDB) DeleteTxIndex(txid wire.Hash256) error {
+	key := MakeTxIndexKey(txid)
+	return c.db.Delete(key)
+}

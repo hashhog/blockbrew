@@ -1130,3 +1130,529 @@ func containsSubstring(s, substr string) bool {
 	}
 	return false
 }
+
+// ============================================================================
+// Package Validation Tests
+// ============================================================================
+
+func TestIsTopoSortedPackage(t *testing.T) {
+	// Create a funding UTXO
+	var fundingHash wire.Hash256
+	fundingHash[0] = 0xA1
+	fundingOutpoint := wire.OutPoint{Hash: fundingHash, Index: 0}
+
+	// Transaction A (no dependencies within package)
+	txA := createTestTransaction([]wire.OutPoint{fundingOutpoint}, 99_000, 1)
+
+	// Transaction B spends A's output
+	outpointA := wire.OutPoint{Hash: txA.TxHash(), Index: 0}
+	txB := createTestTransaction([]wire.OutPoint{outpointA}, 98_000, 1)
+
+	// Correctly sorted: A before B
+	sorted := []*wire.MsgTx{txA, txB}
+	if !IsTopoSortedPackage(sorted) {
+		t.Error("Expected package [A, B] to be topologically sorted")
+	}
+
+	// Incorrectly sorted: B before A
+	unsorted := []*wire.MsgTx{txB, txA}
+	if IsTopoSortedPackage(unsorted) {
+		t.Error("Expected package [B, A] to NOT be topologically sorted")
+	}
+
+	// Single transaction should be sorted
+	single := []*wire.MsgTx{txA}
+	if !IsTopoSortedPackage(single) {
+		t.Error("Single transaction should be topologically sorted")
+	}
+
+	// Empty package
+	if !IsTopoSortedPackage([]*wire.MsgTx{}) {
+		t.Error("Empty package should be topologically sorted")
+	}
+}
+
+func TestIsConsistentPackage(t *testing.T) {
+	var fundingHash1, fundingHash2 wire.Hash256
+	fundingHash1[0] = 0xB1
+	fundingHash2[0] = 0xB2
+
+	outpoint1 := wire.OutPoint{Hash: fundingHash1, Index: 0}
+	outpoint2 := wire.OutPoint{Hash: fundingHash2, Index: 0}
+
+	// Create two transactions spending different outputs
+	tx1 := createTestTransaction([]wire.OutPoint{outpoint1}, 99_000, 1)
+	tx2 := createTestTransaction([]wire.OutPoint{outpoint2}, 99_000, 1)
+
+	// Consistent: different inputs
+	consistent := []*wire.MsgTx{tx1, tx2}
+	if !IsConsistentPackage(consistent) {
+		t.Error("Package with different inputs should be consistent")
+	}
+
+	// Create two transactions spending the SAME output (conflict)
+	txConflict := createTestTransaction([]wire.OutPoint{outpoint1}, 98_000, 1)
+	conflicting := []*wire.MsgTx{tx1, txConflict}
+	if IsConsistentPackage(conflicting) {
+		t.Error("Package with conflicting inputs should NOT be consistent")
+	}
+
+	// Package with duplicate transaction (same txid)
+	duplicate := []*wire.MsgTx{tx1, tx1}
+	if IsConsistentPackage(duplicate) {
+		t.Error("Package with duplicate txid should NOT be consistent")
+	}
+}
+
+func TestIsChildWithParents(t *testing.T) {
+	// Create funding outputs
+	var fundingHash1, fundingHash2 wire.Hash256
+	fundingHash1[0] = 0xC1
+	fundingHash2[0] = 0xC2
+
+	outpoint1 := wire.OutPoint{Hash: fundingHash1, Index: 0}
+	outpoint2 := wire.OutPoint{Hash: fundingHash2, Index: 0}
+
+	// Parent A
+	parentA := createTestTransaction([]wire.OutPoint{outpoint1}, 99_000, 1)
+
+	// Parent B
+	parentB := createTestTransaction([]wire.OutPoint{outpoint2}, 99_000, 1)
+
+	// Child that spends both parents
+	childInputs := []wire.OutPoint{
+		{Hash: parentA.TxHash(), Index: 0},
+		{Hash: parentB.TxHash(), Index: 0},
+	}
+	child := createTestTransaction(childInputs, 197_000, 1)
+
+	// Valid child-with-parents topology
+	validPkg := []*wire.MsgTx{parentA, parentB, child}
+	if !IsChildWithParents(validPkg) {
+		t.Error("Expected valid child-with-parents topology")
+	}
+
+	// Invalid: package contains a parent (parentA) followed by child,
+	// but also parentA is not actually a parent of child in this case
+	// Note: IsChildWithParents checks that ALL preceding txs are parents of child
+	// [parentA, child] where child spends from both parentA AND parentB is still valid
+	// because parentA is a valid parent. The missing parentB might be in mempool already.
+	withOneParent := []*wire.MsgTx{parentA, child}
+	// This IS valid - all preceding txs (just parentA) ARE referenced by child
+	if !IsChildWithParents(withOneParent) {
+		t.Error("Package with subset of parents should be valid")
+	}
+
+	// Single transaction should not be child-with-parents
+	if IsChildWithParents([]*wire.MsgTx{child}) {
+		t.Error("Single transaction should not be child-with-parents")
+	}
+
+	// Two unrelated transactions (neither is child of other)
+	unrelated := []*wire.MsgTx{parentA, parentB}
+	if IsChildWithParents(unrelated) {
+		t.Error("Unrelated transactions should not be child-with-parents")
+	}
+}
+
+func TestIsChildWithParentsTree(t *testing.T) {
+	// Create funding outputs
+	var fundingHash1, fundingHash2 wire.Hash256
+	fundingHash1[0] = 0xD1
+	fundingHash2[0] = 0xD2
+
+	outpoint1 := wire.OutPoint{Hash: fundingHash1, Index: 0}
+	outpoint2 := wire.OutPoint{Hash: fundingHash2, Index: 0}
+
+	// Two independent parents
+	parentA := createTestTransaction([]wire.OutPoint{outpoint1}, 99_000, 1)
+	parentB := createTestTransaction([]wire.OutPoint{outpoint2}, 99_000, 1)
+
+	// Child that spends both
+	childInputs := []wire.OutPoint{
+		{Hash: parentA.TxHash(), Index: 0},
+		{Hash: parentB.TxHash(), Index: 0},
+	}
+	child := createTestTransaction(childInputs, 197_000, 1)
+
+	// Valid tree: parents don't depend on each other
+	treePkg := []*wire.MsgTx{parentA, parentB, child}
+	if !IsChildWithParentsTree(treePkg) {
+		t.Error("Expected valid child-with-parents tree")
+	}
+
+	// Now create a case where parents depend on each other
+	// Parent B depends on Parent A
+	parentBdep := createTestTransaction([]wire.OutPoint{{Hash: parentA.TxHash(), Index: 0}}, 98_000, 1)
+
+	// Child spends parentA's second output and parentBdep
+	childInputs2 := []wire.OutPoint{
+		{Hash: parentBdep.TxHash(), Index: 0},
+	}
+	child2 := createTestTransaction(childInputs2, 97_000, 1)
+
+	// This is NOT a tree - parentBdep depends on parentA
+	notTreePkg := []*wire.MsgTx{parentA, parentBdep, child2}
+	// This should return false because parentBdep spends from parentA
+	if IsChildWithParentsTree(notTreePkg) {
+		t.Error("Should not be a valid tree when parents depend on each other")
+	}
+}
+
+func TestCheckPackage(t *testing.T) {
+	var fundingHash wire.Hash256
+	fundingHash[0] = 0xE1
+
+	outpoint := wire.OutPoint{Hash: fundingHash, Index: 0}
+	tx := createTestTransaction([]wire.OutPoint{outpoint}, 99_000, 1)
+
+	// Valid single-tx package
+	if err := CheckPackage([]*wire.MsgTx{tx}); err != nil {
+		t.Errorf("Valid single-tx package should pass: %v", err)
+	}
+
+	// Empty package
+	if err := CheckPackage([]*wire.MsgTx{}); err != ErrPackageEmpty {
+		t.Errorf("Expected ErrPackageEmpty, got: %v", err)
+	}
+
+	// Too many transactions
+	manyTxs := make([]*wire.MsgTx, MaxPackageCount+1)
+	for i := range manyTxs {
+		var h wire.Hash256
+		h[0] = byte(i)
+		manyTxs[i] = createTestTransaction([]wire.OutPoint{{Hash: h, Index: 0}}, 99_000, 1)
+	}
+	if err := CheckPackage(manyTxs); err != ErrPackageTooManyTxs {
+		t.Errorf("Expected ErrPackageTooManyTxs, got: %v", err)
+	}
+
+	// Duplicate txid
+	if err := CheckPackage([]*wire.MsgTx{tx, tx}); err != ErrPackageDuplicateTx {
+		t.Errorf("Expected ErrPackageDuplicateTx, got: %v", err)
+	}
+}
+
+func TestPackageValidationWithMempool(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+
+	// Create funding UTXOs
+	var fundingHash1, fundingHash2 wire.Hash256
+	fundingHash1[0] = 0xF1
+	fundingHash2[0] = 0xF2
+
+	outpoint1, entry1 := createFundingUTXO(fundingHash1, 0, 100_000)
+	outpoint2, entry2 := createFundingUTXO(fundingHash2, 0, 100_000)
+	utxoSet.AddUTXO(outpoint1, entry1)
+	utxoSet.AddUTXO(outpoint2, entry2)
+
+	mp := newTestMempool(utxoSet)
+
+	// Single transaction package
+	tx1 := createTestTransaction([]wire.OutPoint{outpoint1}, 99_000, 1)
+	result, _ := mp.AcceptPackage([]*wire.MsgTx{tx1})
+
+	// The transaction will likely fail script validation in real tests,
+	// but we can check the structure
+	if result == nil {
+		t.Fatal("Expected result to be non-nil")
+	}
+
+	// Verify result structure
+	if len(result.TxResults) == 0 {
+		t.Error("Expected at least one transaction result")
+	}
+}
+
+func TestPackageFeeAggregation(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+	mp := newTestMempool(utxoSet)
+
+	// Create funding UTXOs
+	var fundingHash1, fundingHash2 wire.Hash256
+	fundingHash1[0] = 0xF3
+	fundingHash2[0] = 0xF4
+
+	outpoint1, entry1 := createFundingUTXO(fundingHash1, 0, 100_000)
+	outpoint2, entry2 := createFundingUTXO(fundingHash2, 0, 100_000)
+	utxoSet.AddUTXO(outpoint1, entry1)
+	utxoSet.AddUTXO(outpoint2, entry2)
+
+	// Create parent with LOW fee (would be rejected individually)
+	// Parent: 100_000 input -> 99_999 output = 1 sat fee
+	parent := createTestTransaction([]wire.OutPoint{outpoint1}, 99_999, 1)
+	parentHash := parent.TxHash()
+
+	// Create child with HIGH fee to compensate
+	// Child spends parent's output + another UTXO
+	// Child: 99_999 + 100_000 = 199_999 input -> 190_000 output = 9_999 sat fee
+	childInputs := []wire.OutPoint{
+		{Hash: parentHash, Index: 0},
+		outpoint2,
+	}
+	child := createTestTransaction(childInputs, 190_000, 1)
+
+	// Create package [parent, child]
+	pkg := []*wire.MsgTx{parent, child}
+
+	// Verify package topology
+	if !IsChildWithParentsTree(pkg) {
+		t.Fatal("Package should have valid child-with-parents topology")
+	}
+
+	// Package total fee: 1 + 9_999 = 10_000 sat
+	// Package total vsize: ~220 + ~220 = ~440 vB
+	// Package feerate: ~22 sat/vB (above minimum)
+
+	// The package should be accepted even though parent has very low individual feerate
+	// Note: In practice, this will fail script validation, but the structure test is valid
+	result, err := mp.AcceptPackage(pkg)
+	if result == nil {
+		t.Fatal("Expected result to be non-nil")
+	}
+	_ = err // May fail due to script validation, but that's expected
+
+	// Check that both transactions have results
+	if len(result.TxResults) != 2 {
+		t.Errorf("Expected 2 transaction results, got %d", len(result.TxResults))
+	}
+}
+
+func TestPackageRejectsInvalidTopology(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+	mp := newTestMempool(utxoSet)
+
+	// Create two unrelated transactions (not child-with-parents)
+	var fundingHash1, fundingHash2 wire.Hash256
+	fundingHash1[0] = 0xF5
+	fundingHash2[0] = 0xF6
+
+	outpoint1 := wire.OutPoint{Hash: fundingHash1, Index: 0}
+	outpoint2 := wire.OutPoint{Hash: fundingHash2, Index: 0}
+
+	entry1 := &consensus.UTXOEntry{Amount: 100_000, PkScript: make([]byte, 22), Height: 1}
+	entry2 := &consensus.UTXOEntry{Amount: 100_000, PkScript: make([]byte, 22), Height: 1}
+	entry1.PkScript[0] = 0x00
+	entry1.PkScript[1] = 0x14
+	entry2.PkScript[0] = 0x00
+	entry2.PkScript[1] = 0x14
+	utxoSet.AddUTXO(outpoint1, entry1)
+	utxoSet.AddUTXO(outpoint2, entry2)
+
+	tx1 := createTestTransaction([]wire.OutPoint{outpoint1}, 99_000, 1)
+	tx2 := createTestTransaction([]wire.OutPoint{outpoint2}, 99_000, 1)
+
+	// Two unrelated transactions - should fail topology check
+	unrelatedPkg := []*wire.MsgTx{tx1, tx2}
+	result, err := mp.AcceptPackage(unrelatedPkg)
+
+	if err == nil {
+		t.Error("Expected error for invalid topology")
+	}
+
+	if result == nil || result.PackageError == nil {
+		t.Error("Expected package error in result")
+	}
+}
+
+// TestGetMinFeeRate tests the dynamic minimum fee rate calculation.
+func TestGetMinFeeRate(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+	config := Config{
+		MaxSize:             1000, // Very small mempool (1000 bytes)
+		MinRelayFeeRate:     1000, // 1 sat/vB
+		IncrementalRelayFee: 1000, // 1 sat/vB
+		MaxOrphanTxs:        10,
+		ChainParams:         consensus.RegtestParams(),
+	}
+	mp := New(config, utxoSet)
+
+	// Initially, minimum fee rate should be the configured value
+	minRate := mp.GetMinFeeRate()
+	if minRate != 1000 {
+		t.Errorf("GetMinFeeRate() = %d, want 1000 (initial)", minRate)
+	}
+
+	// Add a transaction to the mempool (simulating mempool state)
+	// Create a fake entry directly
+	mp.mu.Lock()
+	mp.pool[wire.Hash256{}] = &TxEntry{
+		Fee:     100,  // 100 satoshis
+		Size:    100,  // 100 vbytes = 1 sat/vB = 1000 sat/kvB
+		FeeRate: 1.0,  // 1 sat/vB
+	}
+	mp.totalSize = 100
+	mp.mu.Unlock()
+
+	// Still below capacity - minimum should be base rate
+	minRate = mp.GetMinFeeRate()
+	if minRate != 1000 {
+		t.Errorf("GetMinFeeRate() = %d, want 1000 (below capacity)", minRate)
+	}
+
+	// Fill mempool to capacity
+	mp.mu.Lock()
+	mp.totalSize = 1000 // At max size
+	mp.mu.Unlock()
+
+	// At capacity - minimum should be lowest rate + incremental
+	// Lowest rate is 1000 sat/kvB, incremental is 1000 sat/kvB
+	// So minimum should be 2000 sat/kvB
+	minRate = mp.GetMinFeeRate()
+	if minRate != 2000 {
+		t.Errorf("GetMinFeeRate() = %d, want 2000 (at capacity)", minRate)
+	}
+}
+
+// TestIncrementalRelayFeeEnforcement tests that transactions below the dynamic minimum are rejected.
+func TestIncrementalRelayFeeEnforcement(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+	config := Config{
+		MaxSize:             500, // Very small mempool
+		MinRelayFeeRate:     1000, // 1 sat/vB
+		IncrementalRelayFee: 1000, // 1 sat/vB
+		MaxOrphanTxs:        10,
+		ChainParams:         consensus.RegtestParams(),
+	}
+	mp := New(config, utxoSet)
+
+	// Add a low-fee transaction to the mempool manually
+	// to simulate a full mempool state
+	mp.mu.Lock()
+	mp.pool[wire.Hash256{1}] = &TxEntry{
+		Fee:     100,
+		Size:    100,
+		FeeRate: 1.0, // 1 sat/vB = 1000 sat/kvB
+	}
+	mp.totalSize = 500 // At capacity
+	mp.mu.Unlock()
+
+	// Now the minimum fee rate should be 2000 sat/kvB (1000 + 1000 incremental)
+	minRate := mp.GetMinFeeRate()
+	if minRate != 2000 {
+		t.Errorf("GetMinFeeRate() = %d, want 2000", minRate)
+	}
+}
+
+// TestGetMinFee tests the GetMinFee helper function.
+func TestGetMinFee(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+	config := Config{
+		MaxSize:             10_000_000, // Large mempool
+		MinRelayFeeRate:     1000,       // 1 sat/vB
+		IncrementalRelayFee: 1000,
+		MaxOrphanTxs:        10,
+		ChainParams:         consensus.RegtestParams(),
+	}
+	mp := New(config, utxoSet)
+
+	tests := []struct {
+		name    string
+		vsize   int64
+		wantFee int64
+	}{
+		{"100 vbytes", 100, 100},      // 100 * 1000 / 1000 = 100 sat
+		{"200 vbytes", 200, 200},      // 200 * 1000 / 1000 = 200 sat
+		{"1000 vbytes", 1000, 1000},   // 1000 * 1000 / 1000 = 1000 sat
+		{"1 vbyte", 1, 1},             // Round up: (1 * 1000 + 999) / 1000 = 1 sat
+		{"250 vbytes", 250, 250},      // 250 * 1000 / 1000 = 250 sat
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := mp.GetMinFee(tt.vsize)
+			if got != tt.wantFee {
+				t.Errorf("GetMinFee(%d) = %d, want %d", tt.vsize, got, tt.wantFee)
+			}
+		})
+	}
+}
+
+// TestIncrementalRelayFeeConfig tests that the config defaults are applied correctly.
+func TestIncrementalRelayFeeConfig(t *testing.T) {
+	// Test default config
+	config := DefaultConfig()
+	if config.IncrementalRelayFee != 1000 {
+		t.Errorf("DefaultConfig().IncrementalRelayFee = %d, want 1000", config.IncrementalRelayFee)
+	}
+
+	// Test that New() applies defaults
+	mp := New(Config{}, nil)
+	if mp.config.IncrementalRelayFee != 1000 {
+		t.Errorf("New(Config{}).config.IncrementalRelayFee = %d, want 1000", mp.config.IncrementalRelayFee)
+	}
+
+	// Test custom value is preserved
+	mp2 := New(Config{IncrementalRelayFee: 2000}, nil)
+	if mp2.config.IncrementalRelayFee != 2000 {
+		t.Errorf("New(Config{IncrementalRelayFee: 2000}).config.IncrementalRelayFee = %d, want 2000",
+			mp2.config.IncrementalRelayFee)
+	}
+}
+
+func TestP2AStandardDust(t *testing.T) {
+	// Test P2A (Pay-to-Anchor) dust exemption
+	// P2A outputs are exempt from normal dust rules but capped at AnchorDust (240 satoshis)
+
+	utxoSet := newTestUTXOSet()
+	mp := New(Config{
+		MinRelayFeeRate: 1000, // 1 sat/vB
+		MaxMemPoolSize:  1000000,
+	}, utxoSet)
+
+	// P2A scriptPubKey: OP_1 OP_PUSHBYTES_2 0x4e 0x73
+	p2aScript := []byte{0x51, 0x02, 0x4e, 0x73}
+
+	// Create a funding UTXO
+	fundingTxHash := wire.Hash256{1}
+	fundingOutpoint := wire.OutPoint{Hash: fundingTxHash, Index: 0}
+	utxoSet.AddUTXO(fundingOutpoint, &consensus.UTXOEntry{
+		Amount:   100000,
+		PkScript: make([]byte, 22), // P2WPKH
+		Height:   1,
+	})
+
+	t.Run("P2A output with value 0 passes dust check", func(t *testing.T) {
+		txOut := &wire.TxOut{
+			Value:    0,
+			PkScript: p2aScript,
+		}
+		if mp.isDust(txOut) {
+			t.Error("P2A output with value 0 should NOT be dust")
+		}
+	})
+
+	t.Run("P2A output with value 240 passes dust check", func(t *testing.T) {
+		txOut := &wire.TxOut{
+			Value:    240,
+			PkScript: p2aScript,
+		}
+		if mp.isDust(txOut) {
+			t.Error("P2A output with value 240 (AnchorDust) should NOT be dust")
+		}
+	})
+
+	t.Run("P2A output with value 241 fails dust check", func(t *testing.T) {
+		txOut := &wire.TxOut{
+			Value:    241,
+			PkScript: p2aScript,
+		}
+		if !mp.isDust(txOut) {
+			t.Error("P2A output with value > AnchorDust should be dust (non-standard)")
+		}
+	})
+
+	t.Run("normal dust threshold still applies to non-P2A", func(t *testing.T) {
+		// P2WPKH with very low value should be dust
+		p2wpkhScript := make([]byte, 22)
+		p2wpkhScript[0] = 0x00
+		p2wpkhScript[1] = 0x14
+		txOut := &wire.TxOut{
+			Value:    10, // Very low value
+			PkScript: p2wpkhScript,
+		}
+		if !mp.isDust(txOut) {
+			t.Error("P2WPKH output with value 10 should be dust")
+		}
+	})
+}

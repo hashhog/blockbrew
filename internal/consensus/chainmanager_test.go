@@ -618,3 +618,313 @@ func TestBlockUndoPersistence(t *testing.T) {
 		t.Errorf("undo data should be deleted after disconnect, got err=%v", err)
 	}
 }
+
+// TestInvalidateBlock tests the InvalidateBlock functionality.
+func TestInvalidateBlock(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// Build a chain: genesis -> block1 -> block2 -> block3
+	block1 := createTestBlock(t, params, genesis, nil)
+	node1, err := idx.AddHeader(block1.Header)
+	if err != nil {
+		t.Fatalf("failed to add block1 header: %v", err)
+	}
+	db.StoreBlock(block1.Header.BlockHash(), block1)
+	if err := cm.ConnectBlock(block1); err != nil {
+		t.Fatalf("failed to connect block1: %v", err)
+	}
+
+	block2 := createTestBlock(t, params, node1, nil)
+	node2, err := idx.AddHeader(block2.Header)
+	if err != nil {
+		t.Fatalf("failed to add block2 header: %v", err)
+	}
+	db.StoreBlock(block2.Header.BlockHash(), block2)
+	if err := cm.ConnectBlock(block2); err != nil {
+		t.Fatalf("failed to connect block2: %v", err)
+	}
+
+	block3 := createTestBlock(t, params, node2, nil)
+	node3, err := idx.AddHeader(block3.Header)
+	if err != nil {
+		t.Fatalf("failed to add block3 header: %v", err)
+	}
+	db.StoreBlock(block3.Header.BlockHash(), block3)
+	if err := cm.ConnectBlock(block3); err != nil {
+		t.Fatalf("failed to connect block3: %v", err)
+	}
+
+	// Verify we're at height 3
+	_, tipHeight := cm.BestBlock()
+	if tipHeight != 3 {
+		t.Errorf("expected height 3, got %d", tipHeight)
+	}
+
+	// Invalidate block2
+	err = cm.InvalidateBlock(node2.Hash)
+	if err != nil {
+		t.Fatalf("InvalidateBlock failed: %v", err)
+	}
+
+	// Verify block2 is marked as invalid
+	if node2.Status&StatusInvalid == 0 {
+		t.Error("block2 should be marked as invalid")
+	}
+
+	// Verify block3 is marked as invalid child
+	if node3.Status&StatusInvalidChild == 0 {
+		t.Error("block3 should be marked as invalid child")
+	}
+
+	// Verify tip is now at block1
+	tipHash, tipHeight := cm.BestBlock()
+	if tipHeight != 1 {
+		t.Errorf("expected height 1 after invalidation, got %d", tipHeight)
+	}
+	if tipHash != node1.Hash {
+		t.Errorf("expected tip to be block1 after invalidation")
+	}
+}
+
+// TestInvalidateBlockNonMainChain tests invalidating a block not in the main chain.
+func TestInvalidateBlockNonMainChain(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// Build main chain: genesis -> block1
+	block1 := createTestBlock(t, params, genesis, nil)
+	node1, err := idx.AddHeader(block1.Header)
+	if err != nil {
+		t.Fatalf("failed to add block1 header: %v", err)
+	}
+	db.StoreBlock(block1.Header.BlockHash(), block1)
+	if err := cm.ConnectBlock(block1); err != nil {
+		t.Fatalf("failed to connect block1: %v", err)
+	}
+
+	// Create a fork at genesis (not connected to main chain)
+	forkBlock := createTestBlock(t, params, genesis, nil)
+	forkBlock.Header.Nonce += 1000000 // Different nonce
+	// Re-mine
+	target := CompactToBig(forkBlock.Header.Bits)
+	for i := uint32(2000000); i < 30000000; i++ {
+		forkBlock.Header.Nonce = i
+		hash := forkBlock.Header.BlockHash()
+		if HashToBig(hash).Cmp(target) <= 0 {
+			break
+		}
+	}
+	forkNode, err := idx.AddHeader(forkBlock.Header)
+	if err != nil {
+		t.Fatalf("failed to add fork header: %v", err)
+	}
+	db.StoreBlock(forkBlock.Header.BlockHash(), forkBlock)
+
+	// Invalidate the fork block (which is not in main chain)
+	err = cm.InvalidateBlock(forkNode.Hash)
+	if err != nil {
+		t.Fatalf("InvalidateBlock failed: %v", err)
+	}
+
+	// Verify fork block is marked as invalid
+	if forkNode.Status&StatusInvalid == 0 {
+		t.Error("fork block should be marked as invalid")
+	}
+
+	// Verify main chain is unaffected
+	tipHash, tipHeight := cm.BestBlock()
+	if tipHeight != 1 {
+		t.Errorf("expected height 1, got %d", tipHeight)
+	}
+	if tipHash != node1.Hash {
+		t.Errorf("expected tip to still be block1")
+	}
+}
+
+// TestReconsiderBlock tests the ReconsiderBlock functionality.
+func TestReconsiderBlock(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// Build a chain: genesis -> block1 -> block2
+	block1 := createTestBlock(t, params, genesis, nil)
+	node1, err := idx.AddHeader(block1.Header)
+	if err != nil {
+		t.Fatalf("failed to add block1 header: %v", err)
+	}
+	db.StoreBlock(block1.Header.BlockHash(), block1)
+	if err := cm.ConnectBlock(block1); err != nil {
+		t.Fatalf("failed to connect block1: %v", err)
+	}
+
+	block2 := createTestBlock(t, params, node1, nil)
+	node2, err := idx.AddHeader(block2.Header)
+	if err != nil {
+		t.Fatalf("failed to add block2 header: %v", err)
+	}
+	db.StoreBlock(block2.Header.BlockHash(), block2)
+	if err := cm.ConnectBlock(block2); err != nil {
+		t.Fatalf("failed to connect block2: %v", err)
+	}
+
+	// Invalidate block2
+	err = cm.InvalidateBlock(node2.Hash)
+	if err != nil {
+		t.Fatalf("InvalidateBlock failed: %v", err)
+	}
+
+	// Verify tip is at block1
+	_, tipHeight := cm.BestBlock()
+	if tipHeight != 1 {
+		t.Errorf("expected height 1 after invalidation, got %d", tipHeight)
+	}
+
+	// Reconsider block2
+	err = cm.ReconsiderBlock(node2.Hash)
+	if err != nil {
+		t.Fatalf("ReconsiderBlock failed: %v", err)
+	}
+
+	// Verify block2 is no longer marked as invalid
+	if node2.Status&StatusInvalid != 0 {
+		t.Error("block2 should not be marked as invalid after reconsideration")
+	}
+
+	// Verify tip is back at block2 (since it has more work)
+	tipHash, tipHeight := cm.BestBlock()
+	if tipHeight != 2 {
+		t.Errorf("expected height 2 after reconsideration, got %d", tipHeight)
+	}
+	if tipHash != node2.Hash {
+		t.Errorf("expected tip to be block2 after reconsideration")
+	}
+}
+
+// TestPreciousBlock tests the PreciousBlock functionality.
+func TestPreciousBlock(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// Build chain A: genesis -> A1
+	blockA1 := createTestBlock(t, params, genesis, nil)
+	nodeA1, err := idx.AddHeader(blockA1.Header)
+	if err != nil {
+		t.Fatalf("failed to add A1 header: %v", err)
+	}
+	db.StoreBlock(blockA1.Header.BlockHash(), blockA1)
+	if err := cm.ConnectBlock(blockA1); err != nil {
+		t.Fatalf("failed to connect A1: %v", err)
+	}
+
+	// Build competing chain B at same height: genesis -> B1
+	blockB1 := createTestBlock(t, params, genesis, nil)
+	blockB1.Header.Nonce += 1000000 // Different nonce
+	// Re-mine
+	target := CompactToBig(blockB1.Header.Bits)
+	for i := uint32(2000000); i < 30000000; i++ {
+		blockB1.Header.Nonce = i
+		hash := blockB1.Header.BlockHash()
+		if HashToBig(hash).Cmp(target) <= 0 {
+			break
+		}
+	}
+	nodeB1, err := idx.AddHeader(blockB1.Header)
+	if err != nil {
+		t.Fatalf("failed to add B1 header: %v", err)
+	}
+	db.StoreBlock(blockB1.Header.BlockHash(), blockB1)
+
+	// Currently on chain A (it was connected first)
+	tipHash, _ := cm.BestBlock()
+	if tipHash != nodeA1.Hash {
+		t.Errorf("expected tip to be A1 initially")
+	}
+
+	// Mark B1 as precious - should trigger a reorg since equal work
+	err = cm.PreciousBlock(nodeB1.Hash)
+	if err != nil {
+		t.Fatalf("PreciousBlock failed: %v", err)
+	}
+
+	// Verify tip is now B1
+	tipHash, _ = cm.BestBlock()
+	if tipHash != nodeB1.Hash {
+		t.Errorf("expected tip to be B1 after marking as precious")
+	}
+}
+
+// TestInvalidateGenesisBlock tests that genesis block cannot be invalidated.
+func TestInvalidateGenesisBlock(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	// Try to invalidate genesis
+	err := cm.InvalidateBlock(params.GenesisHash)
+	if err == nil {
+		t.Error("should not be able to invalidate genesis block")
+	}
+}
+
+// TestInvalidateBlockNotFound tests that invalidating unknown block returns error.
+func TestInvalidateBlockNotFound(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	// Try to invalidate non-existent block
+	unknownHash := wire.Hash256{0x12, 0x34, 0x56}
+	err := cm.InvalidateBlock(unknownHash)
+	if err == nil {
+		t.Error("should return error for unknown block")
+	}
+}

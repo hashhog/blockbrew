@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/mempool"
 	"github.com/hashhog/blockbrew/internal/script"
+	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -94,6 +96,176 @@ func (s *Server) handleGetTxOut(params json.RawMessage) (interface{}, *RPCError)
 		},
 		Coinbase: utxo.IsCoinbase,
 	}, nil
+}
+
+// ============================================================================
+// Mempool entry RPCs
+// ============================================================================
+
+// mempoolEntryFromTxEntry builds an RPC MempoolEntry from a mempool.TxEntry.
+func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
+	depends := make([]string, len(entry.Depends))
+	for i, d := range entry.Depends {
+		depends[i] = d.String()
+	}
+	spentBy := make([]string, len(entry.SpentBy))
+	for i, sb := range entry.SpentBy {
+		spentBy[i] = sb.String()
+	}
+	return MempoolEntry{
+		VSize:           entry.Size,
+		Weight:          entry.Size * 4,
+		Fee:             float64(entry.Fee) / satoshiPerBitcoin,
+		ModifiedFee:     float64(entry.Fee) / satoshiPerBitcoin,
+		Time:            entry.Time.Unix(),
+		Height:          entry.Height,
+		DescendantCount: len(entry.SpentBy) + 1,
+		DescendantSize:  entry.DescendantSize,
+		DescendantFees:  float64(entry.DescendantFee) / satoshiPerBitcoin,
+		AncestorCount:   len(entry.Depends) + 1,
+		AncestorSize:    entry.AncestorSize,
+		AncestorFees:    float64(entry.AncestorFee) / satoshiPerBitcoin,
+		WTxID:           entry.Tx.WTxHash().String(),
+		Depends:         depends,
+		SpentBy:         spentBy,
+	}
+}
+
+func (s *Server) handleGetMempoolEntry(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing txid parameter"}
+	}
+	txidStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid"}
+	}
+
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
+	}
+
+	txid, err := wire.NewHash256FromHex(txidStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid format"}
+	}
+
+	entry := s.mempool.GetEntry(txid)
+	if entry == nil {
+		return nil, &RPCError{Code: RPCErrTxNotFound, Message: fmt.Sprintf("Transaction not in mempool: %s", txidStr)}
+	}
+
+	result := s.mempoolEntryFromTxEntry(entry)
+	return &result, nil
+}
+
+func (s *Server) handleGetMempoolAncestors(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing txid parameter"}
+	}
+	txidStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid"}
+	}
+
+	verbose := false
+	if len(args) >= 2 {
+		if v, ok := args[1].(bool); ok {
+			verbose = v
+		}
+	}
+
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
+	}
+
+	txid, err := wire.NewHash256FromHex(txidStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid format"}
+	}
+
+	if !s.mempool.HasTransaction(txid) {
+		return nil, &RPCError{Code: RPCErrTxNotFound, Message: fmt.Sprintf("Transaction not in mempool: %s", txidStr)}
+	}
+
+	ancestors := s.mempool.GetAncestors(txid)
+
+	if !verbose {
+		result := make([]string, len(ancestors))
+		for i, h := range ancestors {
+			result[i] = h.String()
+		}
+		return result, nil
+	}
+
+	result := make(map[string]MempoolEntry)
+	for _, h := range ancestors {
+		entry := s.mempool.GetEntry(h)
+		if entry != nil {
+			result[h.String()] = s.mempoolEntryFromTxEntry(entry)
+		}
+	}
+	return result, nil
+}
+
+func (s *Server) handleGetMempoolDescendants(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing txid parameter"}
+	}
+	txidStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid"}
+	}
+
+	verbose := false
+	if len(args) >= 2 {
+		if v, ok := args[1].(bool); ok {
+			verbose = v
+		}
+	}
+
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
+	}
+
+	txid, err := wire.NewHash256FromHex(txidStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid format"}
+	}
+
+	if !s.mempool.HasTransaction(txid) {
+		return nil, &RPCError{Code: RPCErrTxNotFound, Message: fmt.Sprintf("Transaction not in mempool: %s", txidStr)}
+	}
+
+	descendants := s.mempool.GetDescendants(txid)
+
+	if !verbose {
+		result := make([]string, len(descendants))
+		for i, h := range descendants {
+			result[i] = h.String()
+		}
+		return result, nil
+	}
+
+	result := make(map[string]MempoolEntry)
+	for _, h := range descendants {
+		entry := s.mempool.GetEntry(h)
+		if entry != nil {
+			result[h.String()] = s.mempoolEntryFromTxEntry(entry)
+		}
+	}
+	return result, nil
 }
 
 // ============================================================================
@@ -186,6 +358,105 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 		PooledTx:   pooledTx,
 		Chain:      chain,
 	}, nil
+}
+
+// ============================================================================
+// Index RPCs
+// ============================================================================
+
+func (s *Server) handleGetIndexInfo() (interface{}, *RPCError) {
+	result := make(map[string]interface{})
+
+	if s.indexManager == nil {
+		return result, nil
+	}
+
+	for _, idx := range s.indexManager.AllIndexes() {
+		status := idx.Status()
+		result[status.Name] = map[string]interface{}{
+			"synced":      status.Synced,
+			"best_height": status.BestHeight,
+			"best_hash":   status.BestHash.String(),
+		}
+	}
+
+	return result, nil
+}
+
+func (s *Server) handleGetBlockFilter(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing blockhash parameter"}
+	}
+
+	hashStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash"}
+	}
+
+	// Parse filtertype (default: "basic")
+	filterType := "basic"
+	if len(args) >= 2 {
+		if ft, ok := args[1].(string); ok {
+			filterType = ft
+		}
+	}
+
+	if filterType != "basic" {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Unknown filtertype"}
+	}
+
+	// Get the block filter index
+	if s.indexManager == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "No indexes available"}
+	}
+
+	idx := s.indexManager.GetIndex("blockfilterindex")
+	if idx == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Block filter index not available. Enable with -blockfilterindex"}
+	}
+
+	bfi, ok := idx.(*storage.BlockFilterIndex)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Block filter index not properly initialized"}
+	}
+
+	// Parse the block hash
+	hash, err := wire.NewHash256FromHex(hashStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+	}
+
+	// Get block height from header index
+	if s.headerIndex == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+
+	node := s.headerIndex.GetNode(hash)
+	if node == nil {
+		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+	}
+
+	// Get the filter
+	filterData, err := bfi.GetFilter(node.Height)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Block filter not available for this height"}
+	}
+
+	return &BlockFilterResult{
+		Filter: hex.EncodeToString(filterData.Filter),
+		Header: filterData.FilterHeader.String(),
+	}, nil
+}
+
+// BlockFilterResult is the result of getblockfilter RPC.
+type BlockFilterResult struct {
+	Filter string `json:"filter"`
+	Header string `json:"header"`
 }
 
 // ============================================================================

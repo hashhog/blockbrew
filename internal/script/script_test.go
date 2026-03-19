@@ -1008,6 +1008,20 @@ func TestScriptTypes(t *testing.T) {
 	if !IsP2TR(p2tr) {
 		t.Error("IsP2TR failed to detect P2TR")
 	}
+
+	// P2A (Pay-to-Anchor): OP_1 OP_PUSHBYTES_2 0x4e 0x73
+	p2a := []byte{OP_1, 0x02, 0x4e, 0x73}
+	if !IsPayToAnchor(p2a) {
+		t.Error("IsPayToAnchor failed to detect P2A")
+	}
+	// P2A should not match P2TR
+	if IsP2TR(p2a) {
+		t.Error("IsP2TR incorrectly matched P2A")
+	}
+	// P2TR should not match P2A
+	if IsPayToAnchor(p2tr) {
+		t.Error("IsPayToAnchor incorrectly matched P2TR")
+	}
 }
 
 func TestExtractWitnessProgram(t *testing.T) {
@@ -1034,6 +1048,12 @@ func TestExtractWitnessProgram(t *testing.T) {
 			script:        append([]byte{OP_1, 32}, make([]byte, 32)...),
 			wantVersion:   1,
 			wantProgramLen: 32,
+		},
+		{
+			name:          "P2A (v1, 2 bytes)",
+			script:        []byte{OP_1, 0x02, 0x4e, 0x73},
+			wantVersion:   1,
+			wantProgramLen: 2,
 		},
 		{
 			name:          "Not a witness program",
@@ -2054,4 +2074,134 @@ func TestSighashRemovesCodeSeparator(t *testing.T) {
 	if !bytes.Equal(hash1[:], hash2[:]) {
 		t.Errorf("Sighash should be equal after removing OP_CODESEPARATOR\nhash1: %x\nhash2: %x", hash1, hash2)
 	}
+}
+
+func TestP2ADetection(t *testing.T) {
+	// P2A scriptPubKey: OP_1 OP_PUSHBYTES_2 0x4e 0x73 (exactly 4 bytes)
+	p2a := []byte{0x51, 0x02, 0x4e, 0x73}
+
+	t.Run("IsPayToAnchor", func(t *testing.T) {
+		if !IsPayToAnchor(p2a) {
+			t.Error("IsPayToAnchor should return true for valid P2A script")
+		}
+	})
+
+	t.Run("IsPayToAnchorWitnessProgram", func(t *testing.T) {
+		version, program := ExtractWitnessProgram(p2a)
+		if version != 1 {
+			t.Errorf("version = %d, want 1", version)
+		}
+		if !IsPayToAnchorWitnessProgram(version, program) {
+			t.Error("IsPayToAnchorWitnessProgram should return true for P2A")
+		}
+	})
+
+	t.Run("P2A not confused with P2TR", func(t *testing.T) {
+		// P2TR is 34 bytes: OP_1 + 32 bytes
+		p2tr := make([]byte, 34)
+		p2tr[0] = 0x51 // OP_1
+		p2tr[1] = 0x20 // push 32 bytes
+
+		if IsPayToAnchor(p2tr) {
+			t.Error("IsPayToAnchor should return false for P2TR")
+		}
+		if IsP2TR(p2a) {
+			t.Error("IsP2TR should return false for P2A")
+		}
+	})
+
+	t.Run("invalid P2A scripts", func(t *testing.T) {
+		tests := [][]byte{
+			{0x51, 0x02, 0x4e},       // too short
+			{0x51, 0x02, 0x4e, 0x74}, // wrong byte
+			{0x51, 0x03, 0x4e, 0x73}, // wrong push length
+			{0x00, 0x02, 0x4e, 0x73}, // wrong version (v0)
+			{0x52, 0x02, 0x4e, 0x73}, // wrong version (v2)
+		}
+		for i, script := range tests {
+			if IsPayToAnchor(script) {
+				t.Errorf("test %d: IsPayToAnchor incorrectly returned true for %x", i, script)
+			}
+		}
+	})
+}
+
+func TestP2AExecution(t *testing.T) {
+	// Test that P2A outputs can be spent with empty witness (anyone-can-spend)
+	p2aScript := []byte{0x51, 0x02, 0x4e, 0x73}
+
+	// Create a transaction spending from a P2A output
+	prevOut := &wire.TxOut{
+		Value:    1000,
+		PkScript: p2aScript,
+	}
+
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Index: 0},
+				Witness:          [][]byte{}, // empty witness for P2A
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 500, PkScript: []byte{OP_TRUE}},
+		},
+	}
+
+	t.Run("P2A spendable with empty witness", func(t *testing.T) {
+		err := VerifyScript(
+			nil,          // scriptSig
+			p2aScript,    // scriptPubKey
+			tx,
+			0,
+			ScriptVerifyWitness|ScriptVerifyTaproot,
+			prevOut.Value,
+			[]*wire.TxOut{prevOut},
+		)
+		if err != nil {
+			t.Errorf("P2A verification failed with empty witness: %v", err)
+		}
+	})
+
+	t.Run("P2A spendable without Taproot flag", func(t *testing.T) {
+		// P2A should be anyone-can-spend even if Taproot is not enabled
+		err := VerifyScript(
+			nil,
+			p2aScript,
+			tx,
+			0,
+			ScriptVerifyWitness, // No Taproot flag
+			prevOut.Value,
+			[]*wire.TxOut{prevOut},
+		)
+		if err != nil {
+			t.Errorf("P2A verification failed without Taproot flag: %v", err)
+		}
+	})
+}
+
+func TestP2AStandard(t *testing.T) {
+	// Test P2A output standardness checks
+	p2aScript := []byte{0x51, 0x02, 0x4e, 0x73}
+
+	t.Run("P2A output with value 0 is standard", func(t *testing.T) {
+		txOut := &wire.TxOut{
+			Value:    0,
+			PkScript: p2aScript,
+		}
+		if !IsPayToAnchor(txOut.PkScript) {
+			t.Error("should be recognized as P2A")
+		}
+	})
+
+	t.Run("P2A output with value 240 is standard", func(t *testing.T) {
+		txOut := &wire.TxOut{
+			Value:    240,
+			PkScript: p2aScript,
+		}
+		if !IsPayToAnchor(txOut.PkScript) {
+			t.Error("should be recognized as P2A")
+		}
+	})
 }

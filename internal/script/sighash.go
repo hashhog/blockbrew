@@ -21,7 +21,7 @@ const (
 )
 
 // SigHashType is the final byte of a signature, indicating what parts of the tx are signed.
-type SigHashType byte
+type SigHashType uint32
 
 // BaseType returns the base sighash type (without ANYONECANPAY flag).
 func (s SigHashType) BaseType() SigHashType {

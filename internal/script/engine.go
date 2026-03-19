@@ -66,6 +66,9 @@ const (
 	ScriptVerifyNullFail          ScriptFlags = 1 << 11 // BIP146 - NULLFAIL
 	ScriptVerifySigPushOnly       ScriptFlags = 1 << 12 // Require scriptSig is push-only
 	ScriptVerifyWitnessPubKeyType ScriptFlags = 1 << 13 // BIP141 - compressed keys in witness v0
+	ScriptVerifyDiscourageUpgradableNops ScriptFlags = 1 << 14 // Discourage upgradable NOPs
+	ScriptVerifyConstScriptCode          ScriptFlags = 1 << 15 // OP_CODESEPARATOR forbidden in witness v0
+	ScriptVerifyDiscourageOpSuccess      ScriptFlags = 1 << 16 // Discourage OP_SUCCESSx in tapscript
 )
 
 // SigVersion indicates the signature validation rules to use.
@@ -245,23 +248,29 @@ func (e *Engine) Execute() error {
 
 // executeWitnessProgram executes a witness program.
 func (e *Engine) executeWitnessProgram(version int, program []byte, witness [][]byte) error {
-	// Reverse witness stack for execution (wire order is bottom-to-top)
-	reversedWitness := make([][]byte, len(witness))
-	for i, w := range witness {
-		reversedWitness[len(witness)-1-i] = w
-	}
-
 	switch version {
 	case 0:
-		// Segwit v0
+		// Segwit v0: reverse witness stack for execution (wire order is bottom-to-top)
+		reversedWitness := make([][]byte, len(witness))
+		for i, w := range witness {
+			reversedWitness[len(witness)-1-i] = w
+		}
 		return e.executeWitnessV0(program, reversedWitness)
 	case 1:
-		// Taproot (v1)
+		// P2A (Pay-to-Anchor) is witness v1 with a 2-byte program (0x4e73).
+		// It's anyone-can-spend and requires an empty witness.
+		if IsPayToAnchorWitnessProgram(version, program) {
+			// P2A is always anyone-can-spend, no verification needed
+			return nil
+		}
+		// Taproot (v1) with 32-byte program
 		if e.flags&ScriptVerifyTaproot == 0 {
 			// If Taproot not enabled, treat as anyone-can-spend
 			return nil
 		}
-		return e.executeTaproot(program, reversedWitness)
+		// Taproot uses witness in wire order (not reversed); the control block
+		// and script are the last elements, and executeTaproot indexes from the end.
+		return e.executeTaproot(program, witness)
 	default:
 		// Future witness versions are anyone-can-spend (for forward compatibility)
 		if e.flags&ScriptVerifyWitness != 0 && version > 16 {
@@ -476,9 +485,11 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 		return nil
 	}
 
-	// Set up stack and execute the script
+	// Set up stack and execute the script.
+	// Wire-order stackItems: index 0 = bottom of stack, last = top.
+	// Push in wire order so that stackItems[0] ends up at the bottom.
 	e.stack = NewStack()
-	for i := len(stackItems) - 1; i >= 0; i-- {
+	for i := 0; i < len(stackItems); i++ {
 		e.stack.Push(stackItems[i])
 	}
 
@@ -514,7 +525,7 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 func IsOpSuccess(op byte) bool {
 	return op == 80 || op == 98 || (op >= 126 && op <= 129) ||
 		(op >= 131 && op <= 134) || (op >= 137 && op <= 138) ||
-		(op >= 141 && op <= 142) || (op >= 149 && op <= 153) ||
+		(op >= 141 && op <= 142) || (op >= 149 && op <= 185) ||
 		(op >= 187 && op <= 254)
 }
 
@@ -528,6 +539,58 @@ func compactSizeLen(n int) int {
 		return 5
 	}
 	return 9
+}
+
+// requireMinimalData returns true if minimal push encoding must be enforced.
+// This is mandatory for witness v0 and tapscript (consensus), and for legacy
+// scripts when ScriptVerifyMinimalData flag is set.
+func (e *Engine) requireMinimalData() bool {
+	return e.sigVersion == SigVersionWitnessV0 ||
+		e.sigVersion == SigVersionTapscript ||
+		(e.flags&ScriptVerifyMinimalData != 0)
+}
+
+// checkMinimalPush verifies that a push operation uses the minimal encoding.
+// op is the opcode used, data is the data being pushed, dataLen is len(data).
+// Returns an error if the push is non-minimal.
+func checkMinimalPush(op byte, data []byte, dataLen int) error {
+	if dataLen == 0 {
+		// Empty data should use OP_0.
+		if op != OP_0 {
+			return ErrMinimalData
+		}
+	} else if dataLen == 1 {
+		b := data[0]
+		if b >= 1 && b <= 16 {
+			// Single byte 1-16 should use OP_1 through OP_16.
+			if op != OP_1+b-1 {
+				return ErrMinimalData
+			}
+		} else if b == 0x81 {
+			// 0x81 should use OP_1NEGATE.
+			if op != OP_1NEGATE {
+				return ErrMinimalData
+			}
+		}
+		// Any other single byte value is fine with a direct 1-byte push (op == 0x01).
+	}
+	if dataLen >= 1 && dataLen <= 75 {
+		// Should use direct push (0x01-0x4b), not OP_PUSHDATA1/2/4.
+		if op == OP_PUSHDATA1 || op == OP_PUSHDATA2 || op == OP_PUSHDATA4 {
+			return ErrMinimalData
+		}
+	} else if dataLen <= 255 {
+		// Should use OP_PUSHDATA1, not OP_PUSHDATA2/4.
+		if op == OP_PUSHDATA2 || op == OP_PUSHDATA4 {
+			return ErrMinimalData
+		}
+	} else if dataLen <= 65535 {
+		// Should use OP_PUSHDATA2, not OP_PUSHDATA4.
+		if op == OP_PUSHDATA4 {
+			return ErrMinimalData
+		}
+	}
+	return nil
 }
 
 // executeScript executes a single script.
@@ -567,6 +630,9 @@ func (e *Engine) executeScript(script []byte) error {
 				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8 | int(script[scanPC+2])<<16 | int(script[scanPC+3])<<24
 				scanPC += 4 + dataLen
 			} else if IsOpSuccess(op) {
+				if e.flags&ScriptVerifyDiscourageOpSuccess != 0 {
+					return errors.New("discouraged OP_SUCCESS opcode in tapscript")
+				}
 				return nil
 			}
 		}
@@ -605,6 +671,11 @@ func (e *Engine) executeScript(script []byte) error {
 				return ErrPushSize
 			}
 			if executing {
+				if e.requireMinimalData() {
+					if err := checkMinimalPush(op, script[pc:pc+dataLen], dataLen); err != nil {
+						return err
+					}
+				}
 				e.stack.Push(script[pc : pc+dataLen])
 			}
 			pc += dataLen
@@ -625,6 +696,11 @@ func (e *Engine) executeScript(script []byte) error {
 				return ErrPushSize
 			}
 			if executing {
+				if e.requireMinimalData() {
+					if err := checkMinimalPush(op, script[pc:pc+dataLen], dataLen); err != nil {
+						return err
+					}
+				}
 				e.stack.Push(script[pc : pc+dataLen])
 			}
 			pc += dataLen
@@ -645,6 +721,11 @@ func (e *Engine) executeScript(script []byte) error {
 				return ErrPushSize
 			}
 			if executing {
+				if e.requireMinimalData() {
+					if err := checkMinimalPush(op, script[pc:pc+dataLen], dataLen); err != nil {
+						return err
+					}
+				}
 				e.stack.Push(script[pc : pc+dataLen])
 			}
 			pc += dataLen
@@ -665,6 +746,11 @@ func (e *Engine) executeScript(script []byte) error {
 				return ErrPushSize
 			}
 			if executing {
+				if e.requireMinimalData() {
+					if err := checkMinimalPush(op, script[pc:pc+dataLen], dataLen); err != nil {
+						return err
+					}
+				}
 				e.stack.Push(script[pc : pc+dataLen])
 			}
 			pc += dataLen
@@ -801,6 +887,9 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int, opcodePos uint32)
 
 	case OP_NOP1, OP_NOP4, OP_NOP5, OP_NOP6, OP_NOP7, OP_NOP8, OP_NOP9, OP_NOP10:
 		// Reserved for future upgrades, treated as NOP for now
+		if e.flags&ScriptVerifyDiscourageUpgradableNops != 0 {
+			return errors.New("discouraged upgradable NOP")
+		}
 		return nil
 
 	case OP_VERIFY:
@@ -945,6 +1034,10 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int, opcodePos uint32)
 		return e.opHash256()
 
 	case OP_CODESEPARATOR:
+		// In witness v0, OP_CODESEPARATOR is forbidden if CONST_SCRIPTCODE is set
+		if e.sigVersion == SigVersionWitnessV0 && e.flags&ScriptVerifyConstScriptCode != 0 {
+			return errors.New("OP_CODESEPARATOR in witness v0 script")
+		}
 		// For tapscript, update codesep_pos (opcode index)
 		e.codesepPos = opcodePos
 		// For legacy scripts, track byte position after this opcode
@@ -1045,6 +1138,27 @@ func IsP2TR(script []byte) bool {
 	return len(script) == 34 &&
 		script[0] == OP_1 &&
 		script[1] == 32
+}
+
+// IsPayToAnchor returns true if the script is a Pay-to-Anchor output script.
+// P2A is exactly 4 bytes: OP_1 OP_PUSHBYTES_2 0x4e 0x73 (witness v1, 2-byte program).
+// This is a standardized anyone-can-spend output used for anchor outputs in
+// Lightning and other L2 protocols.
+func IsPayToAnchor(script []byte) bool {
+	return len(script) == 4 &&
+		script[0] == OP_1 && // 0x51
+		script[1] == 0x02 && // push 2 bytes
+		script[2] == 0x4e &&
+		script[3] == 0x73
+}
+
+// IsPayToAnchorWitnessProgram checks if a witness version and program represent P2A.
+// This is the static variant that checks after ExtractWitnessProgram has been called.
+func IsPayToAnchorWitnessProgram(version int, program []byte) bool {
+	return version == 1 &&
+		len(program) == 2 &&
+		program[0] == 0x4e &&
+		program[1] == 0x73
 }
 
 // ExtractWitnessProgram extracts the witness version and program from a script.

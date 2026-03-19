@@ -684,3 +684,100 @@ func TestPeerStateString(t *testing.T) {
 		}
 	}
 }
+
+// TestFeeFilterReceived tests receiving feefilter messages from peers.
+func TestFeeFilterReceived(t *testing.T) {
+	tests := []struct {
+		name       string
+		filterRate int64
+		wantStored int64
+	}{
+		{"zero filter", 0, 0},
+		{"1 sat/vB", 1000, 1000},
+		{"10 sat/vB", 10000, 10000},
+		{"high fee", 1_000_000, 1_000_000},
+		{"negative (invalid)", -100, 0}, // Should be ignored
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			peer := &Peer{}
+			msg := &MsgFeeFilter{MinFeeRate: tt.filterRate}
+			peer.handleFeeFilter(msg)
+
+			got := peer.FeeFilterReceived()
+			if got != tt.wantStored {
+				t.Errorf("FeeFilterReceived() = %d, want %d", got, tt.wantStored)
+			}
+		})
+	}
+}
+
+// TestFeeFilterValidation tests that invalid feefilter values are rejected.
+func TestFeeFilterValidation(t *testing.T) {
+	peer := &Peer{}
+
+	// Set a valid value first
+	peer.handleFeeFilter(&MsgFeeFilter{MinFeeRate: 1000})
+	if got := peer.FeeFilterReceived(); got != 1000 {
+		t.Fatalf("initial feefilter = %d, want 1000", got)
+	}
+
+	// Try to set an invalid value (exceeds max money)
+	const maxMoney = 21_000_000 * 100_000_000
+	peer.handleFeeFilter(&MsgFeeFilter{MinFeeRate: maxMoney + 1})
+
+	// Should remain unchanged
+	if got := peer.FeeFilterReceived(); got != 1000 {
+		t.Errorf("feefilter after invalid update = %d, want 1000 (unchanged)", got)
+	}
+}
+
+// TestShouldRelayTx tests the transaction relay filtering based on feefilter.
+func TestShouldRelayTx(t *testing.T) {
+	tests := []struct {
+		name       string
+		filterRate int64 // peer's feefilter in sat/kvB
+		fee        int64 // tx fee in satoshis
+		vsize      int64 // tx vsize in vbytes
+		wantRelay  bool
+	}{
+		{"no filter", 0, 1000, 100, true},          // Any tx passes with no filter
+		{"no filter zero fee", 0, 0, 100, true},    // Even zero fee passes with no filter
+		{"exact threshold", 1000, 100, 100, true},  // 100 sat / 100 vB = 1 sat/vB = 1000 sat/kvB
+		{"above threshold", 1000, 200, 100, true},  // 200 sat / 100 vB = 2 sat/vB
+		{"below threshold", 1000, 50, 100, false},  // 50 sat / 100 vB = 0.5 sat/vB < 1 sat/vB
+		{"high filter", 10000, 500, 100, false},    // 500 sat / 100 vB = 5 sat/vB < 10 sat/vB
+		{"high filter pass", 10000, 1000, 100, true}, // 1000 sat / 100 vB = 10 sat/vB
+		{"large tx below", 1000, 100, 200, false},  // 100 sat / 200 vB = 0.5 sat/vB < 1 sat/vB
+		{"large tx above", 1000, 250, 200, true},   // 250 sat / 200 vB = 1.25 sat/vB > 1 sat/vB
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			peer := &Peer{}
+			atomic.StoreInt64(&peer.feeFilterReceived, tt.filterRate)
+
+			got := peer.ShouldRelayTx(tt.fee, tt.vsize)
+			if got != tt.wantRelay {
+				t.Errorf("ShouldRelayTx(fee=%d, vsize=%d) with filter=%d = %v, want %v",
+					tt.fee, tt.vsize, tt.filterRate, got, tt.wantRelay)
+			}
+		})
+	}
+}
+
+// TestFeeFilterConstants verifies the BIP133 constants.
+func TestFeeFilterConstants(t *testing.T) {
+	if FeeFilterVersion != 70013 {
+		t.Errorf("FeeFilterVersion = %d, want 70013", FeeFilterVersion)
+	}
+
+	if FeeFilterBroadcastInterval != 10*time.Minute {
+		t.Errorf("FeeFilterBroadcastInterval = %v, want 10m", FeeFilterBroadcastInterval)
+	}
+
+	if FeeFilterMaxChangeDelay != 5*time.Minute {
+		t.Errorf("FeeFilterMaxChangeDelay = %v, want 5m", FeeFilterMaxChangeDelay)
+	}
+}
