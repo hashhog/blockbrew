@@ -1,5 +1,7 @@
 # Binary (root level only)
 /blockbrew
+/script_test
+/sighash_test
 
 # Test binaries
 *.test
