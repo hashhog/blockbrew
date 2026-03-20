@@ -425,18 +425,46 @@ func parseFlags(s string) script.ScriptFlags {
 	return flags
 }
 
-// makeDummyTx creates a minimal spending transaction for script verification.
-// This follows the script_tests.json convention:
-//   - A crediting coinbase transaction creates the UTXO with scriptPubKey.
-//   - A spending transaction spends that UTXO using scriptSig.
-func makeDummyTx(scriptSig, scriptPubKey []byte) *wire.MsgTx {
-	tx := &wire.MsgTx{
+// makeCreditingTx creates the crediting transaction per Bitcoin Core's convention:
+//   version 1, locktime 0, one input (null prevout, scriptSig = OP_0 OP_0,
+//   sequence 0xFFFFFFFF), one output (scriptPubKey = test's scriptPubKey, value = 0).
+func makeCreditingTx(scriptPubKey []byte) *wire.MsgTx {
+	return &wire.MsgTx{
 		Version: 1,
 		TxIn: []*wire.TxIn{
 			{
-				PreviousOutPoint: wire.OutPoint{},
-				SignatureScript:  scriptSig,
-				Sequence:         0xFFFFFFFF,
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  wire.Hash256{},
+					Index: 0xFFFFFFFF,
+				},
+				SignatureScript: []byte{script.OP_0, script.OP_0},
+				Sequence:        0xFFFFFFFF,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    0,
+				PkScript: scriptPubKey,
+			},
+		},
+		LockTime: 0,
+	}
+}
+
+// makeSpendingTx creates the spending transaction per Bitcoin Core's convention:
+//   version 1, locktime 0, one input (prevout = hash of crediting tx : 0,
+//   scriptSig = test's scriptSig, sequence 0xFFFFFFFF), one output (empty scriptPubKey, value = 0).
+func makeSpendingTx(creditingTx *wire.MsgTx, scriptSig []byte) *wire.MsgTx {
+	return &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  creditingTx.TxHash(),
+					Index: 0,
+				},
+				SignatureScript: scriptSig,
+				Sequence:        0xFFFFFFFF,
 			},
 		},
 		TxOut: []*wire.TxOut{
@@ -447,7 +475,6 @@ func makeDummyTx(scriptSig, scriptPubKey []byte) *wire.MsgTx {
 		},
 		LockTime: 0,
 	}
-	return tx
 }
 
 func main() {
@@ -526,7 +553,8 @@ func main() {
 		}
 
 		flags := parseFlags(flagsStr)
-		tx := makeDummyTx(scriptSig, scriptPubKey)
+		creditingTx := makeCreditingTx(scriptPubKey)
+		tx := makeSpendingTx(creditingTx, scriptSig)
 
 		prevOuts := []*wire.TxOut{
 			{Value: 0, PkScript: scriptPubKey},
