@@ -42,6 +42,8 @@ var (
 	ErrWitnessUnexpected        = errors.New("unexpected witness data for non-witness script")
 	ErrSigDER                   = errors.New("signature is not valid DER encoding")
 	ErrSigHighS                 = errors.New("signature S value is not low")
+	ErrSigHashType              = errors.New("signature has undefined hashtype")
+	ErrPubKeyType               = errors.New("public key is not compressed or uncompressed")
 	ErrWitnessPubKeyType        = errors.New("witness v0 requires compressed public key")
 	ErrEvalFalse                = errors.New("script evaluated to false")
 	ErrCleanStack               = errors.New("stack not clean after witness script execution")
