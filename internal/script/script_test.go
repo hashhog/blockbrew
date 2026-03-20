@@ -38,7 +38,7 @@ func TestScriptNumSerialize(t *testing.T) {
 		}
 
 		// Verify round-trip
-		back, err := ScriptNumDeserialize(got, 4)
+		back, err := ScriptNumDeserialize(got, 4, true)
 		if err != nil {
 			t.Errorf("ScriptNumDeserialize(%x) error: %v", got, err)
 		}
@@ -137,7 +137,7 @@ func TestStackIntOps(t *testing.T) {
 	s := NewStack()
 
 	s.PushInt(42)
-	n, err := s.PopInt(4)
+	n, err := s.PopInt(4, false)
 	if err != nil {
 		t.Fatalf("PopInt() error: %v", err)
 	}
@@ -146,7 +146,7 @@ func TestStackIntOps(t *testing.T) {
 	}
 
 	s.PushInt(-100)
-	n, err = s.PopInt(4)
+	n, err = s.PopInt(4, false)
 	if err != nil {
 		t.Fatalf("PopInt() error: %v", err)
 	}
@@ -374,7 +374,7 @@ func TestArithmetic(t *testing.T) {
 				t.Fatalf("executeScript error: %v", err)
 			}
 
-			got, err := engine.stack.PopInt(4)
+			got, err := engine.stack.PopInt(4, false)
 			if err != nil {
 				t.Fatalf("PopInt error: %v", err)
 			}

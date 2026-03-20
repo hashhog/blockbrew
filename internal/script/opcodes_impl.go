@@ -209,7 +209,7 @@ func (e *Engine) opIfDup() error {
 }
 
 func (e *Engine) opPick() error {
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -222,7 +222,7 @@ func (e *Engine) opPick() error {
 }
 
 func (e *Engine) opRoll() error {
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -249,7 +249,7 @@ func (e *Engine) opEqual() error {
 // Arithmetic operations
 
 func (e *Engine) op1Add() error {
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -258,7 +258,7 @@ func (e *Engine) op1Add() error {
 }
 
 func (e *Engine) op1Sub() error {
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -267,7 +267,7 @@ func (e *Engine) op1Sub() error {
 }
 
 func (e *Engine) opNegate() error {
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -276,7 +276,7 @@ func (e *Engine) opNegate() error {
 }
 
 func (e *Engine) opAbs() error {
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -288,7 +288,7 @@ func (e *Engine) opAbs() error {
 }
 
 func (e *Engine) opNot() error {
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -301,7 +301,7 @@ func (e *Engine) opNot() error {
 }
 
 func (e *Engine) op0NotEqual() error {
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -317,8 +317,8 @@ func (e *Engine) opAdd() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -330,8 +330,8 @@ func (e *Engine) opSub() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -343,8 +343,8 @@ func (e *Engine) opBoolAnd() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -360,8 +360,8 @@ func (e *Engine) opBoolOr() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -377,8 +377,8 @@ func (e *Engine) opNumEqual() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -390,8 +390,8 @@ func (e *Engine) opNumNotEqual() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -403,8 +403,8 @@ func (e *Engine) opLessThan() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -416,8 +416,8 @@ func (e *Engine) opGreaterThan() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -429,8 +429,8 @@ func (e *Engine) opLessThanOrEqual() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -442,8 +442,8 @@ func (e *Engine) opGreaterThanOrEqual() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -455,8 +455,8 @@ func (e *Engine) opMin() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -472,8 +472,8 @@ func (e *Engine) opMax() error {
 	if e.stack.Size() < 2 {
 		return ErrStackUnderflow
 	}
-	b, _ := e.stack.PopInt(MaxScriptNumLen)
-	a, err := e.stack.PopInt(MaxScriptNumLen)
+	b, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	a, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -489,9 +489,9 @@ func (e *Engine) opWithin() error {
 	if e.stack.Size() < 3 {
 		return ErrStackUnderflow
 	}
-	max, _ := e.stack.PopInt(MaxScriptNumLen)
-	min, _ := e.stack.PopInt(MaxScriptNumLen)
-	x, err := e.stack.PopInt(MaxScriptNumLen)
+	max, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	min, _ := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
+	x, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -701,7 +701,7 @@ func (e *Engine) opCheckSig(script []byte) error {
 
 func (e *Engine) opCheckMultiSig(script []byte) error {
 	// Get number of public keys
-	nPubKeys, err := e.stack.PopInt(MaxScriptNumLen)
+	nPubKeys, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -725,7 +725,7 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 	}
 
 	// Get number of signatures
-	nSigs, err := e.stack.PopInt(MaxScriptNumLen)
+	nSigs, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -862,7 +862,7 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 
 	// Pop pubkey (top), n, sig
 	pubKeyBytes, _ := e.stack.Pop()
-	n, err := e.stack.PopInt(MaxScriptNumLen)
+	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
 		return err
 	}
@@ -943,7 +943,7 @@ func (e *Engine) opCheckLockTimeVerify() error {
 
 	// Peek at the value (don't pop - CLTV leaves the value on stack)
 	lockTimeBytes, _ := e.stack.Peek()
-	lockTime, err := ScriptNumDeserialize(lockTimeBytes, 5) // 5 bytes allowed for CLTV
+	lockTime, err := ScriptNumDeserialize(lockTimeBytes, 5, false) // 5 bytes allowed for CLTV
 	if err != nil {
 		return ErrCLTVFailed
 	}
@@ -982,7 +982,7 @@ func (e *Engine) opCheckSequenceVerify() error {
 
 	// Peek at the value (don't pop - CSV leaves the value on stack)
 	sequenceBytes, _ := e.stack.Peek()
-	sequence, err := ScriptNumDeserialize(sequenceBytes, 5) // 5 bytes allowed for CSV
+	sequence, err := ScriptNumDeserialize(sequenceBytes, 5, false) // 5 bytes allowed for CSV
 	if err != nil {
 		return ErrCSVFailed
 	}

@@ -70,12 +70,12 @@ func (s *Stack) IsEmpty() bool {
 
 // PopInt pops the top item and decodes it as a script number.
 // maxLen is the maximum byte length allowed (typically 4 for most operations).
-func (s *Stack) PopInt(maxLen int) (int64, error) {
+func (s *Stack) PopInt(maxLen int, requireMinimal bool) (int64, error) {
 	item, err := s.Pop()
 	if err != nil {
 		return 0, err
 	}
-	return ScriptNumDeserialize(item, maxLen)
+	return ScriptNumDeserialize(item, maxLen, requireMinimal)
 }
 
 // PushInt encodes an integer as a script number and pushes it.
@@ -184,7 +184,7 @@ func ScriptNumSerialize(n int64) []byte {
 
 // ScriptNumDeserialize deserializes a script number from bytes to int64.
 // maxLen limits the maximum byte length (typically 4 bytes).
-func ScriptNumDeserialize(b []byte, maxLen int) (int64, error) {
+func ScriptNumDeserialize(b []byte, maxLen int, requireMinimal bool) (int64, error) {
 	if len(b) == 0 {
 		return 0, nil
 	}
@@ -193,14 +193,15 @@ func ScriptNumDeserialize(b []byte, maxLen int) (int64, error) {
 		return 0, ErrScriptNumOverflow
 	}
 
-	// Check for minimal encoding (no unnecessary leading zero bytes)
-	// Unless the byte before it has its high bit set
-	if len(b) > 1 {
-		if b[len(b)-1] == 0x00 && b[len(b)-2]&0x80 == 0 {
-			return 0, ErrScriptNumOverflow
-		}
-		if b[len(b)-1] == 0x80 && b[len(b)-2]&0x80 == 0 {
-			return 0, ErrScriptNumOverflow
+	// Check for minimal encoding (no unnecessary leading zero bytes).
+	// Bitcoin Core's CScriptNum checks: if the last byte (ignoring sign bit) is 0x00,
+	// then either the vector has only one byte (which means it's a non-minimal zero)
+	// or the second-to-last byte doesn't have its high bit set (unnecessary padding).
+	if requireMinimal && len(b) > 0 {
+		if b[len(b)-1]&0x7f == 0 {
+			if len(b) <= 1 || b[len(b)-2]&0x80 == 0 {
+				return 0, ErrScriptNumOverflow
+			}
 		}
 	}
 
