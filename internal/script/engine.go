@@ -155,6 +155,11 @@ func (e *Engine) Execute() error {
 		return ErrSigPushOnly
 	}
 
+	// P2SH requires scriptSig to be push-only (BIP16 consensus rule)
+	if (e.flags&ScriptVerifyP2SH != 0) && IsP2SH(scriptPubKey) && !IsPushOnly(scriptSig) {
+		return ErrSigPushOnly
+	}
+
 	// Execute scriptSig (for non-segwit or P2SH-wrapped segwit)
 	if len(scriptSig) > 0 {
 		e.sigVersion = SigVersionBase
@@ -165,6 +170,13 @@ func (e *Engine) Execute() error {
 
 	// Save the stack state for P2SH
 	savedStack := e.stack.Copy()
+
+	// Clear altstack between scriptSig and scriptPubKey execution.
+	// Bitcoin Core does this implicitly by creating separate execution contexts.
+	e.altStack = NewStack()
+
+	// Reset condition stack between scriptSig and scriptPubKey
+	e.condStack = e.condStack[:0]
 
 	// Execute scriptPubKey
 	e.sigVersion = SigVersionBase
@@ -882,6 +894,10 @@ func (e *Engine) isExecuting() bool {
 // executeOpcode executes a single opcode.
 func (e *Engine) executeOpcode(op byte, script []byte, pc int, opcodePos uint32) error {
 	switch op {
+	case OP_VER:
+		// OP_VER is only an error when actually executed (not in unexecuted branches).
+		return ErrDisabledOpcode
+
 	case OP_NOP:
 		return nil
 

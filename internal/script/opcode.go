@@ -332,6 +332,9 @@ func IsPushOpcode(op byte) bool {
 }
 
 // IsDisabledOpcode returns true if the opcode is disabled.
+// OP_VERIF and OP_VERNOTIF are always disabled (even in unexecuted branches).
+// OP_VER is NOT in this list because it should only error when actually executed;
+// in an unexecuted IF branch, OP_VER is a no-op.
 func IsDisabledOpcode(op byte) bool {
 	switch op {
 	case OP_CAT, OP_SUBSTR, OP_LEFT, OP_RIGHT:
@@ -340,7 +343,7 @@ func IsDisabledOpcode(op byte) bool {
 		return true
 	case OP_2MUL, OP_2DIV, OP_MUL, OP_DIV, OP_MOD, OP_LSHIFT, OP_RSHIFT:
 		return true
-	case OP_VER, OP_VERIF, OP_VERNOTIF:
+	case OP_VERIF, OP_VERNOTIF:
 		return true
 	}
 	return false
