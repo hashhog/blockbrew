@@ -23,7 +23,7 @@ import (
 )
 
 // vectorPath is the default location for the test vectors.
-const vectorPath = "/home/max/hashhog/ouroboros/bitcoin/src/test/data/script_tests.json"
+const vectorPath = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
 
 // opcodeMap maps assembly names (without OP_ prefix where appropriate) to byte values.
 var opcodeMap map[string]byte
