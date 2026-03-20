@@ -634,6 +634,21 @@ func (e *Engine) opCheckSig(script []byte) error {
 			}
 		}
 
+		// STRICTENC: check hashtype is defined
+		if e.flags&ScriptVerifyStrictEncoding != 0 {
+			if !IsDefinedHashtype(sigBytes) {
+				return ErrSigHashType
+			}
+		}
+
+		// STRICTENC: check pubkey is compressed or uncompressed (reject hybrid)
+		// Only check non-empty pubkeys; empty pubkeys just fail verification.
+		if e.flags&ScriptVerifyStrictEncoding != 0 && len(pubKeyBytes) > 0 {
+			if !IsCompressedOrUncompressedPubKey(pubKeyBytes) {
+				return ErrPubKeyType
+			}
+		}
+
 		// WITNESS_PUBKEYTYPE: witness v0 requires compressed pubkeys
 		if e.sigVersion == SigVersionWitnessV0 && (e.flags&ScriptVerifyWitnessPubKeyType != 0) {
 			if !IsCompressedPubKey(pubKeyBytes) {
@@ -664,7 +679,7 @@ func (e *Engine) opCheckSig(script []byte) error {
 			e.stack.PushBool(false)
 			return nil
 		}
-		valid = crypto.VerifyECDSA(pubKey, sighash, sig)
+		valid = crypto.VerifyECDSALax(pubKey, sighash, sig)
 
 		// NULLFAIL: non-empty signature that fails verification must cause error
 		if !valid && len(sigBytes) > 0 && (e.flags&ScriptVerifyNullFail != 0) {
@@ -808,10 +823,18 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 		}
 	}
 
-	// Verify signatures
+	// Verify signatures — matches Bitcoin Core's CHECKMULTISIG logic:
+	// iterate sigs; for each sig, iterate pubkeys from where we left off.
+	// After each pubkey attempt (hit or miss), check if enough pubkeys remain.
 	success := true
+	sigIdx := 0
 	pubKeyIdx := 0
-	for _, sigBytes := range sigs {
+	nSigsRemaining := int(nSigs)
+	nPubKeysRemaining := int(nPubKeys)
+
+	for success && nSigsRemaining > 0 {
+		sigBytes := sigs[sigIdx]
+
 		if len(sigBytes) == 0 {
 			success = false
 			break
@@ -831,51 +854,60 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 			}
 		}
 
-		hashType := SigHashType(sigBytes[len(sigBytes)-1])
-		sig := sigBytes[:len(sigBytes)-1]
-
-		// Find a matching public key
-		matched := false
-		for pubKeyIdx < len(pubKeys) {
-			pubKeyBytes := pubKeys[pubKeyIdx]
-			pubKeyIdx++
-
-			// WITNESS_PUBKEYTYPE: witness v0 requires compressed pubkeys
-			if e.sigVersion == SigVersionWitnessV0 && (e.flags&ScriptVerifyWitnessPubKeyType != 0) {
-				if !IsCompressedPubKey(pubKeyBytes) {
-					return ErrWitnessPubKeyType
-				}
-			}
-
-			var sighash [32]byte
-			switch e.sigVersion {
-			case SigVersionBase:
-				// Use the pre-computed scriptCode with all sigs removed
-				sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
-			case SigVersionWitnessV0:
-				// For witness v0, use BIP143 sighash (no FindAndDelete needed)
-				sighash, err = CalcWitnessSignatureHash(script, hashType, e.tx, e.txIdx, e.amount)
-			default:
-				continue
-			}
-			if err != nil {
-				continue
-			}
-
-			pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
-			if err != nil {
-				continue
-			}
-
-			if crypto.VerifyECDSA(pubKey, sighash, sig) {
-				matched = true
-				break
+		// STRICTENC: check hashtype is defined
+		if e.flags&ScriptVerifyStrictEncoding != 0 {
+			if !IsDefinedHashtype(sigBytes) {
+				return ErrSigHashType
 			}
 		}
 
-		if !matched {
+		hashType := SigHashType(sigBytes[len(sigBytes)-1])
+		sig := sigBytes[:len(sigBytes)-1]
+
+		pubKeyBytes := pubKeys[pubKeyIdx]
+
+		// STRICTENC: check pubkey is compressed or uncompressed (reject hybrid)
+		if e.flags&ScriptVerifyStrictEncoding != 0 {
+			if !IsCompressedOrUncompressedPubKey(pubKeyBytes) {
+				return ErrPubKeyType
+			}
+		}
+
+		// WITNESS_PUBKEYTYPE: witness v0 requires compressed pubkeys
+		if e.sigVersion == SigVersionWitnessV0 && (e.flags&ScriptVerifyWitnessPubKeyType != 0) {
+			if !IsCompressedPubKey(pubKeyBytes) {
+				return ErrWitnessPubKeyType
+			}
+		}
+
+		// Attempt verification
+		matched := false
+		var sighash [32]byte
+		switch e.sigVersion {
+		case SigVersionBase:
+			sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
+		case SigVersionWitnessV0:
+			sighash, err = CalcWitnessSignatureHash(script, hashType, e.tx, e.txIdx, e.amount)
+		}
+		if err == nil {
+			pubKey, pkErr := crypto.PublicKeyFromBytes(pubKeyBytes)
+			if pkErr == nil {
+				if crypto.VerifyECDSALax(pubKey, sighash, sig) {
+					matched = true
+				}
+			}
+		}
+
+		if matched {
+			sigIdx++
+			nSigsRemaining--
+		}
+		pubKeyIdx++
+		nPubKeysRemaining--
+
+		// Early exit: not enough pubkeys left for remaining sigs
+		if nSigsRemaining > nPubKeysRemaining {
 			success = false
-			break
 		}
 	}
 
@@ -1200,4 +1232,31 @@ func IsLowSSignature(sig []byte) bool {
 // (33 bytes starting with 0x02 or 0x03).
 func IsCompressedPubKey(pubKey []byte) bool {
 	return len(pubKey) == 33 && (pubKey[0] == 0x02 || pubKey[0] == 0x03)
+}
+
+// IsCompressedOrUncompressedPubKey returns true if the public key is either a
+// compressed (33-byte, prefix 0x02/0x03) or uncompressed (65-byte, prefix 0x04)
+// public key. Hybrid keys (prefix 0x06/0x07) return false.
+func IsCompressedOrUncompressedPubKey(pk []byte) bool {
+	if len(pk) < 33 {
+		return false
+	}
+	if pk[0] == 0x04 {
+		return len(pk) == 65
+	}
+	if pk[0] == 0x02 || pk[0] == 0x03 {
+		return len(pk) == 33
+	}
+	return false
+}
+
+// IsDefinedHashtype returns true if the sighash type byte (last byte of signature)
+// is one of the three defined types (ALL=1, NONE=2, SINGLE=3), with or without
+// ANYONECANPAY (0x80).
+func IsDefinedHashtype(sig []byte) bool {
+	if len(sig) == 0 {
+		return false
+	}
+	ht := sig[len(sig)-1] &^ 0x80 // strip ANYONECANPAY bit
+	return ht >= 1 && ht <= 3
 }
