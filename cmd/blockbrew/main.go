@@ -89,6 +89,8 @@ func main() {
 		chainParams = consensus.RegtestParams()
 	case "signet":
 		chainParams = consensus.SignetParams()
+	case "testnet4":
+		chainParams = consensus.Testnet4Params()
 	default:
 		log.Fatalf("Unknown network: %s", cfg.Network)
 	}
@@ -146,6 +148,8 @@ func chainPortForNetwork(network string) uint16 {
 		return 8333
 	case "testnet":
 		return 18333
+	case "testnet4":
+		return 48333
 	case "regtest":
 		return 18444
 	case "signet":
@@ -161,6 +165,8 @@ func rpcPortForNetwork(network string) uint16 {
 		return 8332
 	case "testnet":
 		return 18332
+	case "testnet4":
+		return 48332
 	case "regtest":
 		return 18443
 	case "signet":
@@ -176,6 +182,8 @@ func networkMagic(params *consensus.ChainParams) uint32 {
 		return p2p.MainnetMagic
 	case "testnet3":
 		return p2p.Testnet3Magic
+	case "testnet4":
+		return p2p.Testnet4Magic
 	case "regtest":
 		return p2p.RegtestMagic
 	case "signet":
@@ -190,6 +198,8 @@ func networkToAddressNetwork(params *consensus.ChainParams) address.Network {
 	case "mainnet":
 		return address.Mainnet
 	case "testnet3":
+		return address.Testnet
+	case "testnet4":
 		return address.Testnet
 	case "regtest":
 		return address.Regtest

@@ -26,6 +26,7 @@ const (
 const (
 	MainnetMagic  uint32 = 0xD9B4BEF9
 	Testnet3Magic uint32 = 0x0709110B
+	Testnet4Magic uint32 = 0x283F161C
 	RegtestMagic  uint32 = 0xDAB5BFFA
 	SignetMagic   uint32 = 0x40CF030A
 )
