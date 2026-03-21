@@ -19,9 +19,70 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
+
+// internalKeyXOnly is the x-only public key for private key 1 (secp256k1 generator G).
+var internalKeyXOnly = mustDecodeHex("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798")
+
+func mustDecodeHex(s string) []byte {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
+// resolveTaprootPlaceholders detects #SCRIPT#, #CONTROLBLOCK#, and #TAPROOTOUTPUT#
+// placeholders in witness items and scriptPubKey ASM, resolving them in place.
+// Returns the modified witness items and scriptPubKey ASM string.
+func resolveTaprootPlaceholders(witnessStrs []string, scriptPubKeyAsm string) ([]string, string, error) {
+	// Find the #SCRIPT# item and resolve it
+	var leafScript []byte
+	for i, ws := range witnessStrs {
+		if strings.HasPrefix(ws, "#SCRIPT# ") {
+			asm := ws[len("#SCRIPT# "):]
+			var err error
+			leafScript, err = parseScriptAsm(asm)
+			if err != nil {
+				return nil, "", fmt.Errorf("parse #SCRIPT# ASM %q: %v", asm, err)
+			}
+			witnessStrs[i] = hex.EncodeToString(leafScript)
+		}
+	}
+	if leafScript == nil {
+		return witnessStrs, scriptPubKeyAsm, nil
+	}
+
+	// Compute tapleaf hash (single leaf tree, merkle root = leaf hash)
+	leafHash := script.TapLeaf(0xc0, leafScript)
+
+	// Compute tweak and output key
+	tweak := script.TapTweak(internalKeyXOnly, leafHash[:])
+	outputKeyXOnly, outputParity := crypto.ComputeTaprootOutputKey(internalKeyXOnly, tweak)
+	if outputKeyXOnly == nil {
+		return nil, "", fmt.Errorf("failed to compute taproot output key")
+	}
+
+	// Build control block: (0xc0 | parity) || internal_key (33 bytes, no merkle path)
+	controlBlock := make([]byte, 33)
+	controlBlock[0] = 0xc0 | outputParity
+	copy(controlBlock[1:], internalKeyXOnly)
+
+	// Replace #CONTROLBLOCK# in witness
+	for i, ws := range witnessStrs {
+		if ws == "#CONTROLBLOCK#" {
+			witnessStrs[i] = hex.EncodeToString(controlBlock)
+		}
+	}
+
+	// Replace #TAPROOTOUTPUT# in scriptPubKey ASM (prefix with 0x for the ASM parser)
+	scriptPubKeyAsm = strings.ReplaceAll(scriptPubKeyAsm, "#TAPROOTOUTPUT#", "0x"+hex.EncodeToString(outputKeyXOnly))
+
+	return witnessStrs, scriptPubKeyAsm, nil
+}
 
 // vectorPath is the default location for the test vectors.
 const vectorPath = "/home/max/hashhog/bitcoin/src/test/data/script_tests.json"
@@ -576,7 +637,8 @@ func main() {
 			}
 			amount = int64(math.Round(amountFloat * 1e8))
 
-			// All elements before the last are hex-encoded witness items
+			// All elements before the last are witness item strings (hex or placeholders)
+			var witnessStrs []string
 			for j := 0; j < len(witnessRaw)-1; j++ {
 				var wh string
 				if err := json.Unmarshal(witnessRaw[j], &wh); err != nil {
@@ -584,13 +646,7 @@ func main() {
 					fmt.Fprintf(os.Stderr, "test %d: parse witness item %d error: %v\n", i, j, err)
 					continue
 				}
-				wb, err := hex.DecodeString(wh)
-				if err != nil {
-					parseErrors++
-					fmt.Fprintf(os.Stderr, "test %d: decode witness hex %q error: %v\n", i, wh, err)
-					continue
-				}
-				witnessItems = append(witnessItems, wb)
+				witnessStrs = append(witnessStrs, wh)
 			}
 
 			json.Unmarshal(entry[1], &scriptSigAsm)
@@ -599,6 +655,35 @@ func main() {
 			json.Unmarshal(entry[4], &expected)
 			if len(entry) >= 6 {
 				json.Unmarshal(entry[5], &comment)
+			}
+
+			// Resolve taproot placeholders if present
+			hasTaprootPlaceholders := false
+			for _, ws := range witnessStrs {
+				if strings.HasPrefix(ws, "#SCRIPT#") || ws == "#CONTROLBLOCK#" {
+					hasTaprootPlaceholders = true
+					break
+				}
+			}
+			if hasTaprootPlaceholders || strings.Contains(scriptPubKeyAsm, "#TAPROOTOUTPUT#") {
+				var resolveErr error
+				witnessStrs, scriptPubKeyAsm, resolveErr = resolveTaprootPlaceholders(witnessStrs, scriptPubKeyAsm)
+				if resolveErr != nil {
+					parseErrors++
+					fmt.Fprintf(os.Stderr, "test %d: resolve taproot placeholders: %v\n", i, resolveErr)
+					continue
+				}
+			}
+
+			// Hex-decode witness items
+			for _, wh := range witnessStrs {
+				wb, err := hex.DecodeString(wh)
+				if err != nil {
+					parseErrors++
+					fmt.Fprintf(os.Stderr, "test %d: decode witness hex %q error: %v\n", i, wh, err)
+					continue
+				}
+				witnessItems = append(witnessItems, wb)
 			}
 		} else {
 			// Non-witness vector: [scriptSig, scriptPubKey, flags, expected, ?comment]

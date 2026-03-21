@@ -135,3 +135,47 @@ func VerifyTaprootCommitment(outputKeyXOnly, internalKeyXOnly []byte, tweakHash 
 
 	return true
 }
+
+// ComputeTaprootOutputKey computes the tweaked output key from an internal key
+// and tweak hash. Returns the 32-byte x-only output key and the parity byte
+// (0=even, 1=odd).
+func ComputeTaprootOutputKey(internalKeyXOnly []byte, tweakHash [32]byte) ([]byte, byte) {
+	if len(internalKeyXOnly) != 32 {
+		return nil, 0
+	}
+
+	// Parse the internal key (assume even y for x-only key per BIP340)
+	compressedInternal := make([]byte, 33)
+	compressedInternal[0] = 0x02
+	copy(compressedInternal[1:], internalKeyXOnly)
+
+	internalKey, err := secp256k1.ParsePubKey(compressedInternal)
+	if err != nil {
+		return nil, 0
+	}
+
+	// Compute tweak*G
+	tweakScalar := new(secp256k1.ModNScalar)
+	if tweakScalar.SetByteSlice(tweakHash[:]) {
+		return nil, 0
+	}
+
+	// tweakedKey = internalKey + tweak*G
+	var tweakPoint secp256k1.JacobianPoint
+	secp256k1.ScalarBaseMultNonConst(tweakScalar, &tweakPoint)
+
+	var internalPoint secp256k1.JacobianPoint
+	internalKey.AsJacobian(&internalPoint)
+
+	var resultPoint secp256k1.JacobianPoint
+	secp256k1.AddNonConst(&internalPoint, &tweakPoint, &resultPoint)
+	resultPoint.ToAffine()
+
+	resultPubKey := secp256k1.NewPublicKey(&resultPoint.X, &resultPoint.Y)
+	resultCompressed := resultPubKey.SerializeCompressed()
+
+	parity := resultCompressed[0] - 0x02
+	xOnly := make([]byte, 32)
+	copy(xOnly, resultCompressed[1:33])
+	return xOnly, parity
+}
