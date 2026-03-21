@@ -22,7 +22,7 @@ const (
 	SyncRetryInterval = 5 * time.Second
 
 	// DefaultDownloadWindow is the max concurrent blocks in flight.
-	DefaultDownloadWindow = 1024
+	DefaultDownloadWindow = 256
 
 	// MaxBlocksPerPeer is the max concurrent requests per peer.
 	MaxBlocksPerPeer = 16
@@ -34,7 +34,10 @@ const (
 	BaseStallTimeout = 5 * time.Second
 
 	// MaxStallTimeout is the maximum stall timeout after adaptive backoff.
-	MaxStallTimeout = 64 * time.Second
+	MaxStallTimeout = 30 * time.Second
+
+	// MaxRetriesBeforeRotate is how many timeouts before we avoid a peer.
+	MaxRetriesBeforeRotate = 1
 
 	// ProgressLogInterval is how often to log IBD progress.
 	ProgressLogInterval = 10 * time.Second
@@ -103,7 +106,8 @@ type SyncManager struct {
 	chainMgr ChainConnector
 
 	// IBD state
-	ibdActive bool // True when downloading blocks
+	ibdActive    bool // True when downloading blocks
+	peerRoundIdx int  // Round-robin index for peer selection
 }
 
 // ChainConnector is the interface for connecting blocks to the chain.
@@ -149,6 +153,16 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		peerStallTimeout: make(map[string]time.Duration),
 		chainMgr:         config.ChainManager,
 	}
+}
+
+// SetPeerManager sets or updates the peer manager reference.
+// This is needed to break the circular dependency between SyncManager and PeerManager
+// during initialization: SyncManager needs PeerManager for block downloads, and
+// PeerManager needs SyncManager's listeners for message handling.
+func (sm *SyncManager) SetPeerManager(pm *PeerManager) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	sm.peerMgr = pm
 }
 
 // Start begins the sync process.
@@ -266,7 +280,9 @@ func (sm *SyncManager) selectSyncPeer() *Peer {
 		// We're already caught up
 		sm.headersSynced = true
 		if sm.onSyncComplete != nil {
-			sm.onSyncComplete()
+			// Run callback in a goroutine to avoid deadlock
+			// (caller holds sm.mu, callback may also need sm.mu)
+			go sm.onSyncComplete()
 		}
 		return nil
 	}
@@ -344,7 +360,10 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 		}
 
 		if sm.onSyncComplete != nil {
-			sm.onSyncComplete()
+			// Run callback in a goroutine to avoid deadlock:
+			// HandleHeaders holds sm.mu, and StartBlockDownload
+			// also needs sm.mu
+			go sm.onSyncComplete()
 		}
 	}
 }
@@ -514,6 +533,7 @@ func (sm *SyncManager) StartBlockDownload() {
 	defer sm.mu.Unlock()
 
 	if sm.ibdActive {
+		log.Printf("sync: StartBlockDownload called but IBD already active")
 		return
 	}
 
@@ -526,19 +546,28 @@ func (sm *SyncManager) StartBlockDownload() {
 	// Build the block queue from headers
 	bestTip := sm.headerIndex.BestTip()
 	if bestTip == nil || bestTip.Height <= startHeight {
-		log.Printf("sync: no blocks to download, already at height %d", startHeight)
+		log.Printf("sync: no blocks to download, already at height %d (bestTip=%v)", startHeight, bestTip)
 		return
 	}
 
-	sm.blockQueue = make([]*blockRequest, 0, bestTip.Height-startHeight)
-	for height := startHeight + 1; height <= bestTip.Height; height++ {
-		node := bestTip.GetAncestor(height)
-		if node == nil {
-			continue
-		}
+	// Walk from tip back to startHeight to collect all block hashes,
+	// then reverse. This is O(n) instead of O(n^2) from repeated GetAncestor calls.
+	count := int(bestTip.Height - startHeight)
+	nodes := make([]*consensus.BlockNode, 0, count)
+	node := bestTip
+	for node != nil && node.Height > startHeight {
+		nodes = append(nodes, node)
+		node = node.Parent
+	}
+	// Reverse to get ascending order
+	for i, j := 0, len(nodes)-1; i < j; i, j = i+1, j-1 {
+		nodes[i], nodes[j] = nodes[j], nodes[i]
+	}
+	sm.blockQueue = make([]*blockRequest, 0, len(nodes))
+	for _, n := range nodes {
 		sm.blockQueue = append(sm.blockQueue, &blockRequest{
-			Hash:   node.Hash,
-			Height: height,
+			Hash:   n.Hash,
+			Height: n.Height,
 			State:  BlockDownloadPending,
 		})
 	}
@@ -611,6 +640,9 @@ func (sm *SyncManager) requestBlocks() {
 	// Batch getdata requests per peer
 	peerRequests := make(map[*Peer][]*InvVect)
 
+	// Use round-robin peer index for better distribution (persists across calls)
+	peerIdx := sm.peerRoundIdx
+
 	for _, req := range sm.blockQueue {
 		if req.State != BlockDownloadPending {
 			continue
@@ -619,9 +651,18 @@ func (sm *SyncManager) requestBlocks() {
 			break
 		}
 
-		// Find a peer that can serve this block
+		// Find a peer that can serve this block using round-robin.
+		// After a failure, skip the previously-failed peer.
 		var selectedPeer *Peer
-		for _, peer := range peers {
+		var lastFailedAddr string
+		if req.Peer != nil && req.RetryCount >= MaxRetriesBeforeRotate {
+			lastFailedAddr = req.Peer.Address()
+		}
+
+		// Try all peers starting from the round-robin index
+		for i := 0; i < len(peers); i++ {
+			idx := (peerIdx + i) % len(peers)
+			peer := peers[idx]
 			if !peer.IsConnected() {
 				continue
 			}
@@ -629,8 +670,26 @@ func (sm *SyncManager) requestBlocks() {
 			if peerInflight[addr] >= MaxBlocksPerPeer {
 				continue
 			}
+			// Skip the peer that just timed out on this block
+			if lastFailedAddr != "" && addr == lastFailedAddr {
+				continue
+			}
 			selectedPeer = peer
+			peerIdx = (idx + 1) % len(peers)
 			break
+		}
+		// If no alternative found, fall back to any available peer
+		if selectedPeer == nil && lastFailedAddr != "" {
+			for _, peer := range peers {
+				if !peer.IsConnected() {
+					continue
+				}
+				if peerInflight[peer.Address()] >= MaxBlocksPerPeer {
+					continue
+				}
+				selectedPeer = peer
+				break
+			}
 		}
 
 		if selectedPeer == nil {
@@ -652,6 +711,9 @@ func (sm *SyncManager) requestBlocks() {
 		})
 	}
 
+	// Save round-robin index for next call
+	sm.peerRoundIdx = peerIdx
+
 	// Send batched getdata requests
 	for peer, invList := range peerRequests {
 		if len(invList) > 0 {
@@ -666,24 +728,27 @@ func (sm *SyncManager) checkStaleRequests() {
 	defer sm.mu.Unlock()
 
 	now := time.Now()
+	timedOut := 0
 	for hash, req := range sm.inflight {
 		// Get the adaptive timeout for this peer
 		timeout := sm.getStallTimeout(req.Peer)
 
 		if now.Sub(req.RequestAt) > timeout {
-			// Request timed out
-			log.Printf("sync: block %s timed out from %s (retry %d)",
-				hash.String()[:16], req.Peer.Address(), req.RetryCount)
+			timedOut++
 
 			// Increase timeout for this peer (adaptive backoff)
 			sm.increaseStallTimeout(req.Peer)
 
-			// Reset request for retry
+			// Reset request for retry — keep Peer reference so requestBlocks
+			// can rotate to a different peer on the next attempt.
 			delete(sm.inflight, hash)
 			req.State = BlockDownloadPending
-			req.Peer = nil
 			req.RetryCount++
+			// Don't nil out req.Peer — requestBlocks uses it to avoid the same peer
 		}
+	}
+	if timedOut > 0 {
+		log.Printf("sync: %d block requests timed out, will retry with peer rotation", timedOut)
 	}
 }
 
@@ -738,20 +803,25 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 	sm.mu.Lock()
 	req, ok := sm.inflight[hash]
 	if !ok {
-		sm.mu.Unlock()
-		// Unsolicited block - penalize with moderate score (20)
-		if peer != nil && sm.ibdActive {
-			peer.Misbehaving(20, "unsolicited block during IBD")
+		// Block not in-flight — it may have timed out but the peer sent it late.
+		// Check if it's still in our queue (pending retry). If so, accept it.
+		req = sm.findInQueue(hash)
+		if req == nil {
+			sm.mu.Unlock()
+			// Truly unsolicited — ignore silently during IBD
+			return
 		}
-		return
+		// Accept the late block: remove from queue's pending state
+		req.State = BlockDownloadReceived
+		sm.mu.Unlock()
+	} else {
+		delete(sm.inflight, hash)
+		req.State = BlockDownloadReceived
+
+		// Reduce stall timeout for successful peer
+		sm.decreaseStallTimeout(peer)
+		sm.mu.Unlock()
 	}
-
-	delete(sm.inflight, hash)
-	req.State = BlockDownloadReceived
-
-	// Reduce stall timeout for successful peer
-	sm.decreaseStallTimeout(peer)
-	sm.mu.Unlock()
 
 	// Store block to database
 	if sm.chainDB != nil {
@@ -781,8 +851,8 @@ func (sm *SyncManager) validationWorker() {
 			// Basic sanity check
 			err := consensus.CheckBlockSanity(bwr.block, sm.chainParams.PowLimit)
 			if err != nil {
-				log.Printf("sync: block %s failed sanity check: %v",
-					bwr.req.Hash.String()[:16], err)
+				log.Printf("sync: block %s (height %d) failed sanity check: %v",
+					bwr.req.Hash.String()[:16], bwr.req.Height, err)
 				// Mark as invalid in header index
 				node := sm.headerIndex.GetNode(bwr.req.Hash)
 				if node != nil {
@@ -791,6 +861,15 @@ func (sm *SyncManager) validationWorker() {
 				// Penalize the peer that sent the invalid block
 				if bwr.req.Peer != nil {
 					bwr.req.Peer.Misbehaving(100, fmt.Sprintf("invalid block: %v", err))
+				}
+				// Still send to connection pipeline so it can skip this height
+				// and continue with subsequent blocks. Mark it as failed so
+				// connectionWorker knows to skip it.
+				bwr.req.State = BlockDownloadValidated
+				select {
+				case sm.connectionChan <- bwr:
+				case <-sm.quit:
+					return
 				}
 				continue
 			}
@@ -842,7 +921,6 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 	nextHeight := sm.nextHeight
 	sm.mu.Unlock()
 
-	connected := 0
 	for {
 		bwr, ok := pending[nextHeight]
 		if !ok {
@@ -853,15 +931,28 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 		if sm.chainMgr != nil {
 			err := sm.chainMgr.ConnectBlock(bwr.block)
 			if err != nil {
-				log.Printf("sync: failed to connect block %d: %v", nextHeight, err)
-				// Mark as invalid
+				log.Printf("sync: failed to connect block %d (%s): %v",
+					nextHeight, bwr.req.Hash.String()[:16], err)
+				// Mark as invalid in header index
 				node := sm.headerIndex.GetNode(bwr.req.Hash)
 				if node != nil {
 					node.Status |= consensus.StatusInvalid
 				}
 				delete(pending, nextHeight)
+
+				// Remove from queue and advance past the failed block
 				nextHeight++
-				continue
+				sm.mu.Lock()
+				sm.removeFromQueue(bwr.req.Hash)
+				sm.nextHeight = nextHeight
+				sm.mu.Unlock()
+
+				// Stop connecting further blocks: the chain tip is now behind
+				// nextHeight, so subsequent blocks will also fail because their
+				// PrevBlock won't match the tip. The download loop will
+				// re-request the next block, which should connect once the
+				// chain catches up.
+				break
 			}
 		}
 
@@ -873,21 +964,24 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 			sm.onBlockConnected(bwr.block, nextHeight)
 		}
 
-		// Remove from queue
+		// Remove from queue and advance nextHeight
+		nextHeight++
 		sm.mu.Lock()
 		sm.removeFromQueue(bwr.req.Hash)
-		sm.nextHeight = nextHeight + 1
-		sm.mu.Unlock()
-
-		nextHeight++
-		connected++
-	}
-
-	if connected > 0 {
-		sm.mu.Lock()
 		sm.nextHeight = nextHeight
 		sm.mu.Unlock()
 	}
+}
+
+// findInQueue looks up a block request in the queue by hash.
+// Must be called with sm.mu held.
+func (sm *SyncManager) findInQueue(hash wire.Hash256) *blockRequest {
+	for _, req := range sm.blockQueue {
+		if req.Hash == hash {
+			return req
+		}
+	}
+	return nil
 }
 
 // removeFromQueue removes a block request from the queue.

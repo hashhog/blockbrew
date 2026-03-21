@@ -662,6 +662,14 @@ func (pm *PeerManager) maybeRotateBlockRelayPeer() {
 		return
 	}
 
+	// Don't rotate if we have very few total peers — rotating our only
+	// peers during IBD would stall block download
+	totalOutbound := pm.outbound + pm.blockRelayOnly
+	if totalOutbound <= 2 {
+		pm.mu.RUnlock()
+		return
+	}
+
 	// Find a block-relay-only peer to disconnect
 	var candidates []*PeerInfo
 	for _, info := range pm.peers {
@@ -786,8 +794,12 @@ func (pm *PeerManager) connectToPeer(ka *KnownAddress) {
 func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType) {
 	addr := ka.Key()
 
-	// Mark the attempt
-	pm.addrBook.MarkAttempt(addr)
+	// Mark the attempt (but not for feelers — feeler probes should not
+	// prevent the address from being selected for full-relay or block-relay
+	// connections, especially on networks with small address pools like testnet4)
+	if connType != ConnFeeler {
+		pm.addrBook.MarkAttempt(addr)
+	}
 
 	// Check if already connected or banned
 	pm.mu.RLock()

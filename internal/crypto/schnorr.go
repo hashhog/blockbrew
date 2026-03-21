@@ -1,70 +1,189 @@
 package crypto
 
 import (
+	"crypto/sha256"
+
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
-	"github.com/decred/dcrd/dcrec/secp256k1/v4/schnorr"
 )
 
+// BIP340 tagged hash: SHA256(SHA256(tag) || SHA256(tag) || msg)
+func taggedHash(tag string, msg []byte) [32]byte {
+	tagHash := sha256.Sum256([]byte(tag))
+	h := sha256.New()
+	h.Write(tagHash[:])
+	h.Write(tagHash[:])
+	h.Write(msg)
+	var result [32]byte
+	copy(result[:], h.Sum(nil))
+	return result
+}
+
 // SignSchnorr creates a BIP340 Schnorr signature (64 bytes).
+// This uses a simple deterministic nonce k = tagged_hash("BIP0340/aux", rand) XOR'd
+// with the private key, following a simplified version of BIP340.
 func SignSchnorr(privKey *PrivateKey, hash [32]byte) ([]byte, error) {
-	sig, err := schnorr.Sign(privKey.key, hash[:])
-	if err != nil {
-		return nil, err
+	// Get the private key scalar
+	d := privKey.key
+
+	// Ensure the public key has even Y (negate d if needed)
+	pubKey := d.PubKey()
+	pubCompressed := pubKey.SerializeCompressed()
+	if pubCompressed[0] == 0x03 {
+		// Negate the private key
+		var dScalar secp256k1.ModNScalar
+		dScalar.Set(&d.Key)
+		dScalar.Negate()
+		d = secp256k1.NewPrivateKey(&dScalar)
 	}
-	return sig.Serialize(), nil
+
+	pubXOnly := pubCompressed[1:33]
+
+	// Deterministic nonce: k = tagged_hash("BIP0340/nonce", d_bytes || pubXOnly || msg) mod n
+	var nonceInput []byte
+	dBytes := d.Serialize()
+	nonceInput = append(nonceInput, dBytes[:]...)
+	nonceInput = append(nonceInput, pubXOnly...)
+	nonceInput = append(nonceInput, hash[:]...)
+	kHash := taggedHash("BIP0340/nonce", nonceInput)
+
+	var kScalar secp256k1.ModNScalar
+	kScalar.SetByteSlice(kHash[:])
+	if kScalar.IsZero() {
+		// Extremely unlikely but handle it
+		kScalar.SetInt(1)
+	}
+
+	// R = k*G
+	var R secp256k1.JacobianPoint
+	secp256k1.ScalarBaseMultNonConst(&kScalar, &R)
+	R.ToAffine()
+
+	// If R.y is odd, negate k
+	rPubKey := secp256k1.NewPublicKey(&R.X, &R.Y)
+	rCompressed := rPubKey.SerializeCompressed()
+	if rCompressed[0] == 0x03 {
+		kScalar.Negate()
+	}
+	rXOnly := rCompressed[1:33]
+
+	// e = tagged_hash("BIP0340/challenge", R.x || P || m) mod n
+	var challengeInput []byte
+	challengeInput = append(challengeInput, rXOnly...)
+	challengeInput = append(challengeInput, pubXOnly...)
+	challengeInput = append(challengeInput, hash[:]...)
+	eHash := taggedHash("BIP0340/challenge", challengeInput)
+
+	var eScalar secp256k1.ModNScalar
+	eScalar.SetByteSlice(eHash[:])
+
+	// s = k + e*d mod n
+	var dNScalar secp256k1.ModNScalar
+	dNScalar.Set(&d.Key)
+	eScalar.Mul(&dNScalar)
+	sScalar := kScalar
+	sScalar.Add(&eScalar)
+
+	// Signature = r_bytes || s_bytes
+	sig := make([]byte, 64)
+	copy(sig[0:32], rXOnly)
+	sBytes := sScalar.Bytes()
+	copy(sig[32:64], sBytes[:])
+
+	return sig, nil
 }
 
 // VerifySchnorr verifies a BIP340 Schnorr signature.
 // pubKeyXOnly is the 32-byte x-only public key.
-// sig is the 64-byte Schnorr signature.
+// hash is the 32-byte message hash.
+// sig is the 64-byte Schnorr signature (r || s).
 //
-// Note: This function tries both possible y-coordinates (even and odd)
-// because the dcrd library's Schnorr implementation preserves y-parity
-// rather than always using even y as specified in BIP340.
+// BIP340 verification algorithm:
+// 1. P = lift_x(pk) — use even Y
+// 2. r = int(sig[0:32]), s = int(sig[32:64])
+// 3. e = int(tagged_hash("BIP0340/challenge", r_bytes || P_bytes || m)) mod n
+// 4. R = s*G - e*P
+// 5. Fail if R is infinite, or R.y is odd, or R.x != r
 func VerifySchnorr(pubKeyXOnly []byte, hash [32]byte, sig []byte) bool {
 	if len(pubKeyXOnly) != 32 || len(sig) != 64 {
 		return false
 	}
 
-	// Parse the signature
-	signature, err := schnorr.ParseSignature(sig)
+	// Parse public key as x-only with even Y (BIP340: lift_x)
+	compressedPubKey := make([]byte, 33)
+	compressedPubKey[0] = 0x02 // even Y
+	copy(compressedPubKey[1:], pubKeyXOnly)
+
+	pubKey, err := secp256k1.ParsePubKey(compressedPubKey)
 	if err != nil {
 		return false
 	}
 
-	// Try even y-coordinate first (BIP340 default)
-	compressedEven := make([]byte, 33)
-	compressedEven[0] = 0x02
-	copy(compressedEven[1:], pubKeyXOnly)
-
-	if evenPubKey, err := secp256k1.ParsePubKey(compressedEven); err == nil {
-		if signature.Verify(hash[:], evenPubKey) {
-			return true
-		}
+	// Parse r as a field element (first 32 bytes of sig)
+	rBytes := sig[0:32]
+	var rField secp256k1.FieldVal
+	if overflow := rField.SetByteSlice(rBytes); overflow {
+		return false
 	}
 
-	// Try odd y-coordinate
-	compressedOdd := make([]byte, 33)
-	compressedOdd[0] = 0x03
-	copy(compressedOdd[1:], pubKeyXOnly)
-
-	if oddPubKey, err := secp256k1.ParsePubKey(compressedOdd); err == nil {
-		if signature.Verify(hash[:], oddPubKey) {
-			return true
-		}
+	// Parse s as a scalar (last 32 bytes of sig)
+	sBytes := sig[32:64]
+	var sScalar secp256k1.ModNScalar
+	if overflow := sScalar.SetByteSlice(sBytes); overflow {
+		return false
 	}
 
-	return false
+	// Compute e = tagged_hash("BIP0340/challenge", r_bytes || P_bytes || m) mod n
+	var challengeInput []byte
+	challengeInput = append(challengeInput, rBytes...)
+	challengeInput = append(challengeInput, pubKeyXOnly...)
+	challengeInput = append(challengeInput, hash[:]...)
+	eHash := taggedHash("BIP0340/challenge", challengeInput)
+
+	var eScalar secp256k1.ModNScalar
+	eScalar.SetByteSlice(eHash[:])
+
+	// R = s*G - e*P
+	// Compute s*G
+	var sG secp256k1.JacobianPoint
+	secp256k1.ScalarBaseMultNonConst(&sScalar, &sG)
+
+	// Compute e*P
+	var eP secp256k1.JacobianPoint
+	var P secp256k1.JacobianPoint
+	pubKey.AsJacobian(&P)
+	secp256k1.ScalarMultNonConst(&eScalar, &P, &eP)
+
+	// Negate e*P to get -e*P
+	eP.Y.Negate(1).Normalize()
+
+	// R = s*G + (-e*P) = s*G - e*P
+	var R secp256k1.JacobianPoint
+	secp256k1.AddNonConst(&sG, &eP, &R)
+
+	// Fail if R is the point at infinity
+	if (R.X.IsZero() && R.Y.IsZero()) || R.Z.IsZero() {
+		return false
+	}
+
+	// Convert R to affine coordinates
+	R.ToAffine()
+
+	// Fail if R.y is odd
+	if R.Y.IsOdd() {
+		return false
+	}
+
+	// Verify R.x == r
+	R.X.Normalize()
+	rField.Normalize()
+	return R.X.Equals(&rField)
 }
 
 // VerifySchnorrWithPubKey verifies a BIP340 Schnorr signature using a PublicKey.
 func VerifySchnorrWithPubKey(pubKey *PublicKey, hash [32]byte, sig []byte) bool {
-	// For Schnorr verification, we need to use the full public key directly
-	signature, err := schnorr.ParseSignature(sig)
-	if err != nil {
-		return false
-	}
-	return signature.Verify(hash[:], pubKey.key)
+	// Extract x-only public key
+	xOnly := SerializePubKeyXOnly(pubKey.key)
+	return VerifySchnorr(xOnly, hash, sig)
 }
 
 // SerializePubKeyXOnly returns the 32-byte x-only public key representation

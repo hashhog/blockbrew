@@ -156,6 +156,9 @@ func TestSyncManagerHandleHeaders(t *testing.T) {
 		t.Error("sync should be complete after receiving < 2000 headers")
 	}
 
+	// OnSyncComplete runs in a goroutine, give it a moment
+	time.Sleep(50 * time.Millisecond)
+
 	if !syncComplete.Load() {
 		t.Error("OnSyncComplete callback should have been called")
 	}
