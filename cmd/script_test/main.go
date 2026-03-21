@@ -5,7 +5,7 @@
 // Formats:
 //   [scriptSig_asm, scriptPubKey_asm, flags, expected_result]              (4 fields)
 //   [scriptSig_asm, scriptPubKey_asm, flags, expected_result, comment]     (5 fields)
-//   [[witness...], amount, scriptSig_asm, scriptPubKey_asm, flags, result] (6+ fields, skipped)
+//   [[witness...], amount, scriptSig_asm, scriptPubKey_asm, flags, result] (6+ fields, witness)
 //
 // Single-element arrays are comments and are skipped.
 package main
@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -413,9 +414,9 @@ func parseFlags(s string) script.ScriptFlags {
 		case "TAPROOT":
 			flags |= script.ScriptVerifyTaproot
 		case "DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM":
-			// Not all flags may be implemented; silently ignore
+			flags |= script.ScriptVerifyDiscourageUpgradableWitnessProgram
 		case "MINIMALIF":
-			// May not have a dedicated flag; ignore
+			flags |= script.ScriptVerifyMinimalIf
 		case "DISCOURAGE_OP_SUCCESS":
 			flags |= script.ScriptVerifyDiscourageOpSuccess
 		case "CONST_SCRIPTCODE":
@@ -451,9 +452,34 @@ func makeCreditingTx(scriptPubKey []byte) *wire.MsgTx {
 	}
 }
 
+// makeCreditingTxWithAmount is like makeCreditingTx but sets the output value.
+func makeCreditingTxWithAmount(scriptPubKey []byte, amount int64) *wire.MsgTx {
+	return &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  wire.Hash256{},
+					Index: 0xFFFFFFFF,
+				},
+				SignatureScript: []byte{script.OP_0, script.OP_0},
+				Sequence:        0xFFFFFFFF,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    amount,
+				PkScript: scriptPubKey,
+			},
+		},
+		LockTime: 0,
+	}
+}
+
 // makeSpendingTx creates the spending transaction per Bitcoin Core's convention:
 //   version 1, locktime 0, one input (prevout = hash of crediting tx : 0,
-//   scriptSig = test's scriptSig, sequence 0xFFFFFFFF), one output (empty scriptPubKey, value = 0).
+//   scriptSig = test's scriptSig, sequence 0xFFFFFFFF), one output (empty scriptPubKey,
+//   value = crediting tx output value).
 func makeSpendingTx(creditingTx *wire.MsgTx, scriptSig []byte) *wire.MsgTx {
 	return &wire.MsgTx{
 		Version: 1,
@@ -469,7 +495,7 @@ func makeSpendingTx(creditingTx *wire.MsgTx, scriptSig []byte) *wire.MsgTx {
 		},
 		TxOut: []*wire.TxOut{
 			{
-				Value:    0,
+				Value:    creditingTx.TxOut[0].Value,
 				PkScript: nil,
 			},
 		},
@@ -513,29 +539,80 @@ func main() {
 			continue
 		}
 
-		// Skip witness tests (first element is an array -- detected by trying to
-		// unmarshal entry[0] as an array)
+		// Detect witness tests (first element is an array)
 		var firstArr []json.RawMessage
-		if json.Unmarshal(entry[0], &firstArr) == nil {
-			skipped++
-			continue
-		}
+		isWitness := json.Unmarshal(entry[0], &firstArr) == nil
 
-		// Must have 4 or 5 elements: scriptSig, scriptPubKey, flags, expected [, comment]
-		if len(entry) < 4 {
-			skipped++
-			continue
-		}
+		var scriptSigAsm, scriptPubKeyAsm, flagsStr, expected, comment string
+		var witnessItems [][]byte
+		var amount int64
 
-		var scriptSigAsm, scriptPubKeyAsm, flagsStr, expected string
-		json.Unmarshal(entry[0], &scriptSigAsm)
-		json.Unmarshal(entry[1], &scriptPubKeyAsm)
-		json.Unmarshal(entry[2], &flagsStr)
-		json.Unmarshal(entry[3], &expected)
+		if isWitness {
+			// Witness vector: [[witness_hex..., amount_float], scriptSig, scriptPubKey, flags, expected, ?comment]
+			if len(entry) < 5 {
+				skipped++
+				continue
+			}
 
-		var comment string
-		if len(entry) >= 5 {
-			json.Unmarshal(entry[4], &comment)
+			// Parse witness+amount array (mixed types: strings then a float at the end)
+			var witnessRaw []json.RawMessage
+			if err := json.Unmarshal(entry[0], &witnessRaw); err != nil {
+				parseErrors++
+				fmt.Fprintf(os.Stderr, "test %d: parse witness array error: %v\n", i, err)
+				continue
+			}
+			if len(witnessRaw) < 1 {
+				parseErrors++
+				fmt.Fprintf(os.Stderr, "test %d: empty witness array\n", i)
+				continue
+			}
+
+			// Last element of the inner array is the amount (float)
+			var amountFloat float64
+			if err := json.Unmarshal(witnessRaw[len(witnessRaw)-1], &amountFloat); err != nil {
+				parseErrors++
+				fmt.Fprintf(os.Stderr, "test %d: parse witness amount error: %v\n", i, err)
+				continue
+			}
+			amount = int64(math.Round(amountFloat * 1e8))
+
+			// All elements before the last are hex-encoded witness items
+			for j := 0; j < len(witnessRaw)-1; j++ {
+				var wh string
+				if err := json.Unmarshal(witnessRaw[j], &wh); err != nil {
+					parseErrors++
+					fmt.Fprintf(os.Stderr, "test %d: parse witness item %d error: %v\n", i, j, err)
+					continue
+				}
+				wb, err := hex.DecodeString(wh)
+				if err != nil {
+					parseErrors++
+					fmt.Fprintf(os.Stderr, "test %d: decode witness hex %q error: %v\n", i, wh, err)
+					continue
+				}
+				witnessItems = append(witnessItems, wb)
+			}
+
+			json.Unmarshal(entry[1], &scriptSigAsm)
+			json.Unmarshal(entry[2], &scriptPubKeyAsm)
+			json.Unmarshal(entry[3], &flagsStr)
+			json.Unmarshal(entry[4], &expected)
+			if len(entry) >= 6 {
+				json.Unmarshal(entry[5], &comment)
+			}
+		} else {
+			// Non-witness vector: [scriptSig, scriptPubKey, flags, expected, ?comment]
+			if len(entry) < 4 {
+				skipped++
+				continue
+			}
+			json.Unmarshal(entry[0], &scriptSigAsm)
+			json.Unmarshal(entry[1], &scriptPubKeyAsm)
+			json.Unmarshal(entry[2], &flagsStr)
+			json.Unmarshal(entry[3], &expected)
+			if len(entry) >= 5 {
+				json.Unmarshal(entry[4], &comment)
+			}
 		}
 
 		scriptSig, err := parseScriptAsm(scriptSigAsm)
@@ -553,14 +630,24 @@ func main() {
 		}
 
 		flags := parseFlags(flagsStr)
-		creditingTx := makeCreditingTx(scriptPubKey)
-		tx := makeSpendingTx(creditingTx, scriptSig)
 
-		prevOuts := []*wire.TxOut{
-			{Value: 0, PkScript: scriptPubKey},
+		var creditingTx *wire.MsgTx
+		var tx *wire.MsgTx
+
+		if isWitness {
+			creditingTx = makeCreditingTxWithAmount(scriptPubKey, amount)
+			tx = makeSpendingTx(creditingTx, scriptSig)
+			tx.TxIn[0].Witness = witnessItems
+		} else {
+			creditingTx = makeCreditingTx(scriptPubKey)
+			tx = makeSpendingTx(creditingTx, scriptSig)
 		}
 
-		verifyErr := script.VerifyScript(scriptSig, scriptPubKey, tx, 0, flags, 0, prevOuts)
+		prevOuts := []*wire.TxOut{
+			{Value: amount, PkScript: scriptPubKey},
+		}
+
+		verifyErr := script.VerifyScript(scriptSig, scriptPubKey, tx, 0, flags, amount, prevOuts)
 
 		expectOK := expected == "OK"
 		gotOK := verifyErr == nil
