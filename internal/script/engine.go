@@ -547,7 +547,7 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 func IsOpSuccess(op byte) bool {
 	return op == 80 || op == 98 || (op >= 126 && op <= 129) ||
 		(op >= 131 && op <= 134) || (op >= 137 && op <= 138) ||
-		(op >= 141 && op <= 142) || (op >= 149 && op <= 185) ||
+		(op >= 141 && op <= 142) || (op >= 149 && op <= 153) ||
 		(op >= 187 && op <= 254)
 }
 
