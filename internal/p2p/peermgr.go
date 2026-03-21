@@ -690,10 +690,16 @@ func (pm *PeerManager) maybeRotateBlockRelayPeer() {
 // resolveDNSSeeds queries DNS seeds and adds addresses to the address book.
 func (pm *PeerManager) resolveDNSSeeds() {
 	if pm.config.ChainParams == nil || len(pm.config.ChainParams.DNSSeeds) == 0 {
+		log.Printf("dns seed: no chain params or no seeds configured")
 		return
 	}
 
+	log.Printf("dns seed: resolving %d seeds for %s (default port %d)",
+		len(pm.config.ChainParams.DNSSeeds), pm.config.ChainParams.Name, pm.config.ChainParams.DefaultPort)
+
 	ips := ResolveDNSSeeds(pm.config.ChainParams.DNSSeeds)
+	log.Printf("dns seed: resolved %d addresses", len(ips))
+
 	for _, ip := range ips {
 		netIP := net.ParseIP(ip)
 		if netIP == nil {
@@ -704,6 +710,8 @@ func (pm *PeerManager) resolveDNSSeeds() {
 			Port: pm.config.ChainParams.DefaultPort,
 		}, "dnsseed")
 	}
+
+	log.Printf("dns seed: address book now has %d entries", pm.addrBook.Size())
 }
 
 // pickAddressWithDiversity selects an address that maintains subnet diversity.
