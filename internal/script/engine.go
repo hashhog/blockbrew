@@ -70,7 +70,9 @@ const (
 	ScriptVerifyWitnessPubKeyType ScriptFlags = 1 << 13 // BIP141 - compressed keys in witness v0
 	ScriptVerifyDiscourageUpgradableNops ScriptFlags = 1 << 14 // Discourage upgradable NOPs
 	ScriptVerifyConstScriptCode          ScriptFlags = 1 << 15 // OP_CODESEPARATOR forbidden in witness v0
-	ScriptVerifyDiscourageOpSuccess      ScriptFlags = 1 << 16 // Discourage OP_SUCCESSx in tapscript
+	ScriptVerifyDiscourageOpSuccess                ScriptFlags = 1 << 16 // Discourage OP_SUCCESSx in tapscript
+	ScriptVerifyDiscourageUpgradableWitnessProgram ScriptFlags = 1 << 17 // Discourage unknown witness versions
+	ScriptVerifyMinimalIf                          ScriptFlags = 1 << 18 // Require minimal IF/NOTIF arguments
 )
 
 // SigVersion indicates the signature validation rules to use.
@@ -278,16 +280,22 @@ func (e *Engine) executeWitnessProgram(version int, program []byte, witness [][]
 			return nil
 		}
 		// Taproot (v1) with 32-byte program
-		if e.flags&ScriptVerifyTaproot == 0 {
-			// If Taproot not enabled, treat as anyone-can-spend
-			return nil
+		if len(program) == 32 && e.flags&ScriptVerifyTaproot != 0 {
+			// Taproot uses witness in wire order (not reversed); the control block
+			// and script are the last elements, and executeTaproot indexes from the end.
+			return e.executeTaproot(program, witness)
 		}
-		// Taproot uses witness in wire order (not reversed); the control block
-		// and script are the last elements, and executeTaproot indexes from the end.
-		return e.executeTaproot(program, witness)
+		// Non-taproot v1 (or taproot not enabled): future anyone-can-spend
+		if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
+			return ErrWitnessProgram
+		}
+		return nil
 	default:
 		// Future witness versions are anyone-can-spend (for forward compatibility)
 		if e.flags&ScriptVerifyWitness != 0 && version > 16 {
+			return ErrWitnessProgram
+		}
+		if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
 			return ErrWitnessProgram
 		}
 		return nil
@@ -810,7 +818,9 @@ func (e *Engine) executeScript(script []byte) error {
 
 				// BIP342: Tapscript requires minimal IF — condition must be
 				// exactly empty (false) or exactly {0x01} (true).
-				if e.sigVersion == SigVersionTapscript {
+				// MINIMALIF flag enforces the same for witness v0 (not base scripts).
+				if e.sigVersion == SigVersionTapscript ||
+					(e.sigVersion == SigVersionWitnessV0 && e.flags&ScriptVerifyMinimalIf != 0) {
 					if len(val) > 1 || (len(val) == 1 && val[0] != 1) {
 						return fmt.Errorf("tapscript requires minimal IF/NOTIF argument")
 					}
