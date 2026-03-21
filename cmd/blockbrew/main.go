@@ -307,7 +307,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		ChainParams:  chainParams,
 		HeaderIndex:  headerIndex,
 		ChainDB:      chainDB,
-		PeerManager:  peerMgr,
+		PeerManager:  nil, // Will be set below after peerMgr is created
 		ChainManager: chainMgr,
 		OnSyncComplete: func() {
 			log.Printf("Header synchronization complete, starting block download")
@@ -338,19 +338,8 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		},
 	})
 
-	// Update sync manager with new peer manager (the variable is captured by closures)
-	syncMgr = p2p.NewSyncManager(p2p.SyncManagerConfig{
-		ChainParams:  chainParams,
-		HeaderIndex:  headerIndex,
-		ChainDB:      chainDB,
-		PeerManager:  peerMgr,
-		ChainManager: chainMgr,
-		OnSyncComplete: func() {
-			log.Printf("Header synchronization complete, starting block download")
-			syncMgr.StartBlockDownload()
-		},
-		OnBlockConnected: onBlockConnected,
-	})
+	// Wire the peer manager back into the sync manager (breaks circular dependency)
+	syncMgr.SetPeerManager(peerMgr)
 
 	// 9. Initialize mining template generator
 	templateGen := mining.NewTemplateGenerator(chainParams, chainMgr, mp, headerIndex)

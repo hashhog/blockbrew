@@ -9,6 +9,22 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// cachedUTXOView wraps a UTXOView with a cache of entries that may have been
+// spent from the underlying view. This is used during block connection so that
+// script validation (second pass) can still access UTXOs that were spent in the
+// first pass.
+type cachedUTXOView struct {
+	cache    map[wire.OutPoint]*UTXOEntry
+	fallback UTXOView
+}
+
+func (c *cachedUTXOView) GetUTXO(outpoint wire.OutPoint) *UTXOEntry {
+	if entry, ok := c.cache[outpoint]; ok {
+		return entry
+	}
+	return c.fallback.GetUTXO(outpoint)
+}
+
 // ChainManager maintains the active chain and processes new blocks.
 type ChainManager struct {
 	mu          sync.RWMutex
@@ -141,7 +157,14 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 
 	// Verify this block connects to our current tip
 	if block.Header.PrevBlock != cm.tipNode.Hash {
-		// This might be a fork
+		// During IBD, never attempt reorgs — blocks must arrive in order.
+		// The sync pipeline ensures ordering; a mismatch here means a block
+		// was skipped or failed, so just return an error.
+		if cm.isIBD {
+			return fmt.Errorf("block does not connect to tip during IBD (prev=%s, tip=%s, height=%d)",
+				block.Header.PrevBlock.String()[:16], cm.tipNode.Hash.String()[:16], node.Height)
+		}
+		// Post-IBD: this might be a fork
 		if node.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
 			// New chain has more work - reorg
 			cm.mu.Unlock()
@@ -203,6 +226,14 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		return nil
 	}
 
+	// Cache prevouts for script validation BEFORE spending them.
+	// The first pass spends UTXOs, so the second pass (script validation)
+	// needs a cached view of the original UTXOs.
+	cachedView := &cachedUTXOView{
+		cache:    make(map[wire.OutPoint]*UTXOEntry),
+		fallback: cm.utxoSet,
+	}
+
 	// First pass: validate transaction structure and inputs (not scripts)
 	for i, tx := range block.Transactions {
 		// Check transaction sanity
@@ -214,6 +245,14 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// Coinbase - add outputs to UTXO view
 			cm.utxoSet.AddTxOutputs(tx, node.Height)
 			continue
+		}
+
+		// Cache all input UTXOs before they get spent
+		for _, in := range tx.TxIn {
+			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
+			if utxo != nil {
+				cachedView.cache[in.PreviousOutPoint] = utxo
+			}
 		}
 
 		// Check transaction inputs
@@ -280,18 +319,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	skipScripts := cm.assumeValidHeight > 0 && node.Height <= cm.assumeValidHeight
 
 	if !skipScripts {
+		// Use the cached UTXO view so script validation can find spent UTXOs
 		if cm.parallelScripts {
-			// Use parallel script validation with signature cache for better performance
-			if err := ParallelScriptValidationCached(block, cm.utxoSet, flags, cm.sigCache); err != nil {
+			if err := ParallelScriptValidationCached(block, cachedView, flags, cm.sigCache); err != nil {
 				return fmt.Errorf("script validation failed: %w", err)
 			}
 		} else {
-			// Sequential script validation
 			for i, tx := range block.Transactions {
 				if i == 0 {
 					continue // Skip coinbase
 				}
-				if err := ValidateTransactionScripts(tx, cm.utxoSet, flags); err != nil {
+				if err := ValidateTransactionScripts(tx, cachedView, flags); err != nil {
 					return fmt.Errorf("tx %d script validation failed: %w", i, err)
 				}
 			}

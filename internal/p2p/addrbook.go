@@ -76,8 +76,16 @@ func (ka *KnownAddress) IsRecentlyAttempted() bool {
 
 // Chance returns a selection score (higher = better candidate).
 // Addresses with successful connections and not recently attempted get higher scores.
+// Addresses that have had a recent successful connection are always eligible,
+// even if recently attempted — this prevents feeler probes from exhausting
+// the address pool on networks with few nodes (e.g., testnet4).
 func (ka *KnownAddress) Chance() float64 {
 	if ka.IsRecentlyAttempted() {
+		// If we've successfully connected before, still allow selection
+		// with a reduced score rather than excluding entirely
+		if !ka.LastSuccess.IsZero() {
+			return 0.5
+		}
 		return 0
 	}
 	if ka.IsBad() {

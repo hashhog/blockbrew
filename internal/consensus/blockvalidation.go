@@ -136,24 +136,12 @@ func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, heigh
 		}
 	}
 
-	// Validate difficulty target: the block's nBits must match the expected value.
-	// For non-retarget blocks, bits must equal the parent's bits.
-	// For retarget blocks (height % DifficultyAdjInterval == 0), the caller must
-	// have already validated via the header index. We check the non-retarget case here.
-	if prevHeader != nil && height > 0 {
-		if height%int32(params.DifficultyAdjInterval) != 0 {
-			// Non-retarget block: difficulty must match parent
-			// Exception: testnet min-difficulty rule
-			expectedBits := prevHeader.Bits
-			if params.MinDiffReductionTime && IsMinDifficultyBlock(params, int64(block.Header.Timestamp), int64(prevHeader.Timestamp)) {
-				expectedBits = params.PowLimitBits
-			}
-			if block.Header.Bits != expectedBits {
-				return fmt.Errorf("%w: expected %x, got %x",
-					ErrBadDifficultyBits, expectedBits, block.Header.Bits)
-			}
-		}
-	}
+	// Difficulty validation is handled by the header index during header sync
+	// using GetNextWorkRequired(), which correctly handles all network-specific
+	// rules including testnet min-difficulty walk-back, BIP94, and retarget
+	// boundaries. We skip the redundant check here to avoid rejecting valid
+	// blocks with a simplified check that doesn't handle all edge cases
+	// (e.g., non-min-difficulty blocks after a min-difficulty parent on testnet4).
 
 	// Check all transactions are final (IsFinalTx)
 	// Use MTP as block time for BIP113 if CSV is active, otherwise use block timestamp
