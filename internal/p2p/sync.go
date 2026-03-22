@@ -499,6 +499,39 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 		OnGetData: func(p *Peer, msg *MsgGetData) {
 			sm.HandleGetData(p, msg)
 		},
+		OnNotFound: func(p *Peer, msg *MsgNotFound) {
+			sm.HandleNotFound(p, msg)
+		},
+	}
+}
+
+// HandleNotFound processes a notfound message from a peer.
+// When a peer doesn't have a requested block, it responds with notfound.
+// We need to remove the block from inflight and mark it for retry with a
+// different peer, otherwise it stays in-flight until it times out.
+func (sm *SyncManager) HandleNotFound(peer *Peer, msg *MsgNotFound) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	for _, inv := range msg.InvList {
+		baseType := inv.Type &^ InvWitnessFlag
+		if baseType != InvTypeBlock {
+			continue
+		}
+
+		req, ok := sm.inflight[inv.Hash]
+		if !ok {
+			continue
+		}
+
+		log.Printf("sync: peer %s does not have block height=%d hash=%s, will retry with different peer",
+			peer.Address(), req.Height, inv.Hash.String()[:16])
+
+		// Remove from inflight and mark for retry with a different peer
+		delete(sm.inflight, inv.Hash)
+		req.State = BlockDownloadPending
+		req.RetryCount++
+		// Keep req.Peer so requestBlocks can avoid this peer
 	}
 }
 
@@ -720,6 +753,7 @@ func (sm *SyncManager) requestBlocks() {
 			peer.SendMessage(&MsgGetData{InvList: invList})
 		}
 	}
+
 }
 
 // checkStaleRequests detects and handles timed-out block requests.
@@ -830,10 +864,25 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 		}
 	}
 
-	// Send to validation pipeline
+	// Send to validation pipeline.
+	// Use a non-blocking send with a goroutine fallback to avoid blocking the
+	// peer's readHandler. If the validation channel is full (pipeline backed up),
+	// the readHandler would be unable to read ANY messages from this peer,
+	// including responses to new block requests. This causes all in-flight
+	// requests to time out, creating an infinite timeout/retry loop that
+	// completely stalls IBD.
 	select {
 	case sm.validationChan <- &blockWithRequest{block: msg.Block, req: req}:
-	case <-sm.quit:
+		// Sent immediately
+	default:
+		// Channel full — send in a background goroutine so the readHandler
+		// is not blocked. The goroutine will complete once the pipeline drains.
+		go func() {
+			select {
+			case sm.validationChan <- &blockWithRequest{block: msg.Block, req: req}:
+			case <-sm.quit:
+			}
+		}()
 	}
 }
 
@@ -1029,8 +1078,11 @@ func (sm *SyncManager) progressLogger() {
 			}
 
 			pct := float64(height) / float64(tipHeight) * 100
-			log.Printf("sync: IBD progress %d/%d (%.1f%%) [queue=%d, inflight=%d]",
-				height, tipHeight, pct, queueLen, inflightLen)
+			log.Printf("sync: IBD progress %d/%d (%.1f%%) [queue=%d, inflight=%d, validCh=%d/%d, connCh=%d/%d, nextH=%d]",
+				height, tipHeight, pct, queueLen, inflightLen,
+				len(sm.validationChan), cap(sm.validationChan),
+				len(sm.connectionChan), cap(sm.connectionChan),
+				nextHeight)
 
 		case <-sm.quit:
 			return
