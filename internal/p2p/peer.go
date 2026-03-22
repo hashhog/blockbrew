@@ -368,7 +368,9 @@ func (p *Peer) readHandler() {
 
 		msg, err := p.transport.ReadMessage()
 		if err != nil {
-			// Connection closed or read error
+			// Log the error for debugging (e.g., deserialization failures that
+			// silently kill connections and stall block downloads)
+			log.Printf("peer %s: read error: %v", p.addr, err)
 			return
 		}
 

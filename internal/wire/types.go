@@ -348,9 +348,11 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 			}
 			in.Witness = make([][]byte, witnessCount)
 			for j := range in.Witness {
-				// Witness items can be up to max script element size (520 bytes)
-				// but let's allow up to 10000 for safety
-				in.Witness[j], err = ReadVarBytes(r, 10000)
+				// Witness items have no per-item consensus size limit beyond the
+				// block weight limit (4M WU). Taproot scripts, inscriptions, and
+				// other witness data can be very large. Use MaxCompactSize (32 MB)
+				// as a safe upper bound to avoid rejecting valid blocks.
+				in.Witness[j], err = ReadVarBytes(r, MaxCompactSize)
 				if err != nil {
 					return err
 				}
