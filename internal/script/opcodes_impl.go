@@ -667,8 +667,11 @@ func (e *Engine) opCheckSig(script []byte) error {
 			scriptCode = FindAndDelete(scriptCode, sigBytes)
 			sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
 		} else {
-			// For witness v0, use BIP143 sighash (no FindAndDelete, no OP_CODESEPARATOR handling needed)
-			sighash, err = CalcWitnessSignatureHash(script, hashType, e.tx, e.txIdx, e.amount)
+			// For witness v0, use BIP143 sighash.
+			// BIP143 scriptCode: use the witness script from after the last
+			// OP_CODESEPARATOR (no FindAndDelete in witness v0).
+			scriptCode := e.currentScript[e.lastCodeSepIdx:]
+			sighash, err = CalcWitnessSignatureHash(scriptCode, hashType, e.tx, e.txIdx, e.amount)
 		}
 		if err != nil {
 			e.stack.PushBool(false)
@@ -887,7 +890,10 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 		case SigVersionBase:
 			sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
 		case SigVersionWitnessV0:
-			sighash, err = CalcWitnessSignatureHash(script, hashType, e.tx, e.txIdx, e.amount)
+			// BIP143 scriptCode: use witness script from after the last
+			// OP_CODESEPARATOR (no FindAndDelete in witness v0).
+			witnessScriptCode := e.currentScript[e.lastCodeSepIdx:]
+			sighash, err = CalcWitnessSignatureHash(witnessScriptCode, hashType, e.tx, e.txIdx, e.amount)
 		}
 		if err == nil {
 			pubKey, pkErr := crypto.PublicKeyFromBytes(pubKeyBytes)
