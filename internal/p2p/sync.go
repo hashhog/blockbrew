@@ -642,28 +642,56 @@ func (sm *SyncManager) blockDownloadLoop() {
 			sm.mu.Lock()
 			nh := sm.nextHeight
 			inflightLen := len(sm.inflight)
+			stallDuration := time.Since(lastAdvanceTime)
 
-			if nh == lastNextHeight && inflightLen == 0 && time.Since(lastAdvanceTime) > 30*time.Second {
-				// nextHeight hasn't advanced for 30s and nothing is in flight.
-				// Find the block at nextHeight in the queue and reset it to pending.
-				resetCount := 0
+			if nh == lastNextHeight && stallDuration > 30*time.Second {
+				// nextHeight hasn't advanced for 30s. Diagnose the stall.
+				found := false
 				for _, req := range sm.blockQueue {
-					if req.Height == nh && req.State != BlockDownloadPending {
-						log.Printf("sync: stall detected at height %d (state=%d), resetting to pending",
-							nh, req.State)
-						req.State = BlockDownloadPending
-						req.Peer = nil
-						resetCount++
+					if req.Height == nh {
+						found = true
+						log.Printf("sync: stall detected at height %d: state=%d, inflight=%d, peer=%v, retries=%d, stallDuration=%v",
+							nh, req.State, inflightLen, req.Peer != nil, req.RetryCount, stallDuration)
+
+						if req.State == BlockDownloadPending {
+							// Block is pending but not being downloaded.
+							// This happens when all peers are busy or disconnected.
+							// Force a re-request by logging and letting requestBlocks
+							// pick it up on next tick. Also reset peer to allow any peer.
+							log.Printf("sync: block %d is pending but not downloading, clearing peer restriction",
+								nh)
+							req.Peer = nil
+							req.RetryCount = 0
+						} else if req.State != BlockDownloadPending {
+							// Block is in some intermediate state (InFlight, Received, Validated).
+							// It may be stuck in the pipeline. Reset to pending.
+							log.Printf("sync: block %d stuck in state %d, resetting to pending", nh, req.State)
+							req.State = BlockDownloadPending
+							req.Peer = nil
+							// Also remove from inflight if it's there
+							delete(sm.inflight, req.Hash)
+						}
 						break
 					}
 				}
-				// Also reset a window of blocks around nextHeight to ensure
-				// we have blocks flowing through the pipeline
-				if resetCount == 0 {
-					// The block at nextHeight may not be in the queue anymore,
-					// which means connection failed and it was removed. Log it.
-					log.Printf("sync: stall at height %d but block not in queue, inflight=%d queue=%d",
+				if !found {
+					// Block not in queue at all - it was removed (connected or skipped).
+					// This shouldn't happen if nextH points to it. Log for debugging.
+					log.Printf("sync: stall at height %d but block NOT IN QUEUE, inflight=%d queue=%d",
 						nh, inflightLen, len(sm.blockQueue))
+				}
+
+				// Also reset any blocks in non-pending states near nextHeight
+				// to ensure the pipeline can flow
+				resetWindow := int32(16)
+				for _, req := range sm.blockQueue {
+					if req.Height > nh && req.Height <= nh+resetWindow {
+						if req.State != BlockDownloadPending && req.State != BlockDownloadConnected {
+							req.State = BlockDownloadPending
+							req.Peer = nil
+							delete(sm.inflight, req.Hash)
+						}
+					}
 				}
 			}
 			if nh != lastNextHeight {
@@ -876,6 +904,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 	hash := msg.Block.Header.BlockHash()
 
 	sm.mu.Lock()
+	nh := sm.nextHeight
 	req, ok := sm.inflight[hash]
 	if !ok {
 		// Block not in-flight — it may have timed out but the peer sent it late.
@@ -887,9 +916,17 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 			return
 		}
 		// Accept the late block: remove from queue's pending state
+		if req.Height == nh || req.Height == nh+1 {
+			log.Printf("sync: received late block height=%d (nextH=%d) from %s",
+				req.Height, nh, peer.Address())
+		}
 		req.State = BlockDownloadReceived
 		sm.mu.Unlock()
 	} else {
+		if req.Height == nh || req.Height == nh+1 {
+			log.Printf("sync: received block height=%d (nextH=%d) from %s, sending to validation",
+				req.Height, nh, peer.Address())
+		}
 		delete(sm.inflight, hash)
 		req.State = BlockDownloadReceived
 
@@ -935,40 +972,55 @@ func (sm *SyncManager) validationWorker() {
 				continue
 			}
 
-			// Basic sanity check
-			err := consensus.CheckBlockSanity(bwr.block, sm.chainParams.PowLimit)
-			if err != nil {
-				log.Printf("sync: block %s (height %d) failed sanity check: %v",
-					bwr.req.Hash.String()[:16], bwr.req.Height, err)
-				// Mark as invalid in header index
-				node := sm.headerIndex.GetNode(bwr.req.Hash)
-				if node != nil {
-					node.Status |= consensus.StatusInvalid
+			// Recover from panics to keep the pipeline alive
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						log.Printf("sync: PANIC in validation worker for block height=%d hash=%s: %v",
+							bwr.req.Height, bwr.req.Hash.String()[:16], r)
+						// Reset block to pending so stall detector can retry
+						sm.mu.Lock()
+						bwr.req.State = BlockDownloadPending
+						bwr.req.Peer = nil
+						sm.mu.Unlock()
+					}
+				}()
+
+				// Basic sanity check
+				err := consensus.CheckBlockSanity(bwr.block, sm.chainParams.PowLimit)
+				if err != nil {
+					log.Printf("sync: block %s (height %d) failed sanity check: %v",
+						bwr.req.Hash.String()[:16], bwr.req.Height, err)
+					// Mark as invalid in header index
+					node := sm.headerIndex.GetNode(bwr.req.Hash)
+					if node != nil {
+						node.Status |= consensus.StatusInvalid
+					}
+					// Penalize the peer that sent the invalid block
+					if bwr.req.Peer != nil {
+						bwr.req.Peer.Misbehaving(100, fmt.Sprintf("invalid block: %v", err))
+					}
+					// Still send to connection pipeline so it can skip this height
+					// and continue with subsequent blocks. Mark it as failed so
+					// connectionWorker knows to skip it.
+					bwr.req.State = BlockDownloadValidated
+					select {
+					case sm.connectionChan <- bwr:
+					case <-sm.quit:
+						return
+					}
+					return
 				}
-				// Penalize the peer that sent the invalid block
-				if bwr.req.Peer != nil {
-					bwr.req.Peer.Misbehaving(100, fmt.Sprintf("invalid block: %v", err))
-				}
-				// Still send to connection pipeline so it can skip this height
-				// and continue with subsequent blocks. Mark it as failed so
-				// connectionWorker knows to skip it.
+
 				bwr.req.State = BlockDownloadValidated
+
+				// Send to connection pipeline
 				select {
 				case sm.connectionChan <- bwr:
 				case <-sm.quit:
 					return
 				}
-				continue
-			}
-
-			bwr.req.State = BlockDownloadValidated
-
-			// Send to connection pipeline
-			select {
-			case sm.connectionChan <- bwr:
-			case <-sm.quit:
-				return
-			}
+			}()
 
 		case <-sm.quit:
 			return
@@ -988,6 +1040,66 @@ func (sm *SyncManager) connectionWorker() {
 	// Buffer for out-of-order blocks
 	pending := make(map[int32]*blockWithRequest)
 
+	// Periodic retry timer: if the block at nextHeight is in pending but
+	// ConnectBlock previously failed, we retry periodically instead of
+	// waiting for new blocks to arrive on connectionChan.
+	retryTicker := time.NewTicker(5 * time.Second)
+	defer retryTicker.Stop()
+
+	connectPending := func() {
+		// Evict blocks that are behind nextHeight (already connected or skipped)
+		sm.mu.RLock()
+		nh := sm.nextHeight
+		sm.mu.RUnlock()
+		for h := range pending {
+			if h < nh {
+				delete(pending, h)
+			}
+		}
+
+		// If pending is too large, drop blocks that are far ahead
+		// to prevent unbounded memory growth
+		if len(pending) > MaxPendingBlocks {
+			log.Printf("sync: pending map too large (%d entries), evicting distant blocks", len(pending))
+			maxKeep := nh + int32(MaxPendingBlocks)
+			for h := range pending {
+				if h > maxKeep {
+					sm.mu.Lock()
+					for _, req := range sm.blockQueue {
+						if req.Height == h {
+							req.State = BlockDownloadPending
+							req.Peer = nil
+							break
+						}
+					}
+					sm.mu.Unlock()
+					delete(pending, h)
+				}
+			}
+		}
+
+		// Try to connect blocks in order, with panic recovery
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("sync: PANIC in connectionWorker while connecting blocks: %v", r)
+					sm.mu.Lock()
+					nh := sm.nextHeight
+					for _, req := range sm.blockQueue {
+						if req.Height == nh {
+							req.State = BlockDownloadPending
+							req.Peer = nil
+							break
+						}
+					}
+					sm.mu.Unlock()
+					delete(pending, nh)
+				}
+			}()
+			sm.connectPendingBlocks(pending)
+		}()
+	}
+
 	for {
 		select {
 		case bwr := <-sm.connectionChan:
@@ -998,41 +1110,15 @@ func (sm *SyncManager) connectionWorker() {
 			// Add to pending
 			pending[bwr.req.Height] = bwr
 
-			// Evict blocks that are behind nextHeight (already connected or skipped)
-			sm.mu.RLock()
-			nh := sm.nextHeight
-			sm.mu.RUnlock()
-			for h := range pending {
-				if h < nh {
-					delete(pending, h)
-				}
-			}
+			connectPending()
 
-			// If pending is too large, drop blocks that are far ahead
-			// to prevent unbounded memory growth
-			if len(pending) > MaxPendingBlocks {
-				log.Printf("sync: pending map too large (%d entries), evicting distant blocks", len(pending))
-				// Find the min height to keep: nextHeight + MaxPendingBlocks
-				maxKeep := nh + int32(MaxPendingBlocks)
-				for h := range pending {
-					if h > maxKeep {
-						// Reset block state in queue so it gets re-requested later
-						sm.mu.Lock()
-						for _, req := range sm.blockQueue {
-							if req.Height == h {
-								req.State = BlockDownloadPending
-								req.Peer = nil
-								break
-							}
-						}
-						sm.mu.Unlock()
-						delete(pending, h)
-					}
-				}
+		case <-retryTicker.C:
+			// Periodically retry connecting pending blocks.
+			// This handles the case where ConnectBlock failed previously
+			// and no new blocks are arriving on connectionChan.
+			if len(pending) > 0 {
+				connectPending()
 			}
-
-			// Try to connect blocks in order
-			sm.connectPendingBlocks(pending)
 
 		case <-sm.quit:
 			return
@@ -1054,19 +1140,26 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 
 		// Connect the block
 		if sm.chainMgr != nil {
-			err := sm.chainMgr.ConnectBlock(bwr.block)
-			if err != nil {
+			// Recover from panics in ConnectBlock
+			var connectErr error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						connectErr = fmt.Errorf("PANIC in ConnectBlock: %v", r)
+					}
+				}()
+				connectErr = sm.chainMgr.ConnectBlock(bwr.block)
+			}()
+
+			if connectErr != nil {
 				log.Printf("sync: failed to connect block %d (%s): %v",
-					nextHeight, bwr.req.Hash.String()[:16], err)
+					nextHeight, bwr.req.Hash.String()[:16], connectErr)
 
 				// Check if this is a genuine validation failure vs. an ordering issue.
 				// "does not connect to tip during IBD" means the previous block
 				// was not connected — this is a cascading failure, NOT a bad block.
-				errStr := err.Error()
-				isCascade := len(errStr) > 30 && (errStr[:30] == "block does not connect to tip " ||
-					// Also detect UTXO-not-found which happens when prev block
-					// was skipped and UTXOs from it are missing
-					errStr == "utxo not found")
+				errStr := connectErr.Error()
+				isCascade := len(errStr) > 30 && errStr[:30] == "block does not connect to tip "
 
 				if isCascade {
 					// Don't advance past this block — keep it in pending.
@@ -1075,6 +1168,8 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				}
 
 				// Genuine validation error: mark as invalid and skip
+				log.Printf("sync: GENUINE validation failure at height %d, skipping block: %v",
+					nextHeight, connectErr)
 				node := sm.headerIndex.GetNode(bwr.req.Hash)
 				if node != nil {
 					node.Status |= consensus.StatusInvalid

@@ -111,12 +111,14 @@ func CheckTransactionSanity(tx *wire.MsgTx) error {
 		}
 	}
 
-	// 8. Output scripts must not exceed MaxScriptSize
-	for _, out := range tx.TxOut {
-		if len(out.PkScript) > MaxScriptSize {
-			return ErrOutputScriptTooLarge
-		}
-	}
+	// NOTE: There is no consensus limit on output script (scriptPubKey) size
+	// during CheckTransaction. The MAX_SCRIPT_SIZE (10,000 bytes) limit in
+	// Bitcoin Core is only enforced during script EXECUTION by the interpreter,
+	// not during block/transaction validation. A valid block can contain outputs
+	// with arbitrarily large scriptPubKeys — they simply become unspendable if
+	// the script exceeds the execution limit. Checking it here would reject
+	// valid blocks (e.g., testnet4 block 59173 tx 137 has a large OP_RETURN
+	// output script).
 
 	return nil
 }

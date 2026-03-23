@@ -152,6 +152,12 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		return fmt.Errorf("block %s not found in header index", hash.String()[:16])
 	}
 
+	// Log every 5000th block and any block that might be problematic
+	if node.Height%5000 == 0 || (node.Height >= 59170 && node.Height <= 59180) {
+		log.Printf("chainmgr: ConnectBlock height=%d hash=%s txCount=%d tipHeight=%d",
+			node.Height, hash.String()[:16], len(block.Transactions), cm.tipHeight)
+	}
+
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -234,16 +240,59 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		fallback: cm.utxoSet,
 	}
 
+	// Track UTXO modifications so we can roll back if validation fails.
+	// Each entry records a tx index and the outputs it added / inputs it spent.
+	type utxoModification struct {
+		txIdx       int
+		addedOuts   []wire.OutPoint    // outputs added to UTXO set
+		spentInputs []wire.OutPoint    // inputs spent from UTXO set
+		spentCoins  []storage.SpentCoin // original UTXOs for rollback
+	}
+	var utxoMods []utxoModification
+
+	// rollbackUTXOs undoes all UTXO changes made during the first pass.
+	// This is critical: without rollback, a failed ConnectBlock corrupts the
+	// UTXO set and causes all subsequent blocks to fail validation too.
+	rollbackUTXOs := func() {
+		// Undo in reverse order
+		for i := len(utxoMods) - 1; i >= 0; i-- {
+			mod := utxoMods[i]
+			// Remove outputs that were added
+			for _, op := range mod.addedOuts {
+				cm.utxoSet.SpendUTXO(op)
+			}
+			// Restore inputs that were spent
+			for _, sc := range mod.spentCoins {
+				cm.utxoSet.AddUTXO(mod.spentInputs[0], &UTXOEntry{
+					Amount:     sc.TxOut.Value,
+					PkScript:   sc.TxOut.PkScript,
+					Height:     sc.Height,
+					IsCoinbase: sc.Coinbase,
+				})
+				mod.spentInputs = mod.spentInputs[1:]
+			}
+		}
+	}
+
 	// First pass: validate transaction structure and inputs (not scripts)
 	for i, tx := range block.Transactions {
 		// Check transaction sanity
 		if err := CheckTransactionSanity(tx); err != nil {
+			rollbackUTXOs()
 			return fmt.Errorf("tx %d sanity failed: %w", i, err)
 		}
+
+		txHash := tx.TxHash()
 
 		if i == 0 {
 			// Coinbase - add outputs to UTXO view
 			cm.utxoSet.AddTxOutputs(tx, node.Height)
+			// Track coinbase outputs for rollback
+			var addedOuts []wire.OutPoint
+			for idx := range tx.TxOut {
+				addedOuts = append(addedOuts, wire.OutPoint{Hash: txHash, Index: uint32(idx)})
+			}
+			utxoMods = append(utxoMods, utxoModification{txIdx: i, addedOuts: addedOuts})
 			continue
 		}
 
@@ -258,10 +307,12 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// Check transaction inputs
 		fee, err := CheckTransactionInputs(tx, node.Height, cm.utxoSet)
 		if err != nil {
+			rollbackUTXOs()
 			return fmt.Errorf("tx %d input validation failed: %w", i, err)
 		}
 		totalFees += fee
 		if totalFees > MaxMoney {
+			rollbackUTXOs()
 			return fmt.Errorf("accumulated fee in the block out of range: %d > %d", totalFees, MaxMoney)
 		}
 
@@ -286,6 +337,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			}
 			seqLock := CalculateSequenceLocks(tx, prevHeights, getMTP)
 			if !EvaluateSequenceLocks(seqLock, node.Height, int64(mtp)) {
+				rollbackUTXOs()
 				return fmt.Errorf("tx %d: %w", i, ErrSequenceLockNotMet)
 			}
 		}
@@ -294,6 +346,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		txUndo := storage.TxUndo{
 			SpentCoins: make([]storage.SpentCoin, 0, len(tx.TxIn)),
 		}
+		var spentInputs []wire.OutPoint
 		for _, in := range tx.TxIn {
 			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
 			if utxo != nil {
@@ -306,12 +359,25 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 					Coinbase: utxo.IsCoinbase,
 				})
 			}
+			spentInputs = append(spentInputs, in.PreviousOutPoint)
 		}
 		blockUndo.TxUndos = append(blockUndo.TxUndos, txUndo)
 
 		// Update UTXO view: spend inputs and add outputs
 		cm.utxoSet.SpendTxInputs(tx)
 		cm.utxoSet.AddTxOutputs(tx, node.Height)
+
+		// Track modifications for rollback
+		var addedOuts []wire.OutPoint
+		for idx := range tx.TxOut {
+			addedOuts = append(addedOuts, wire.OutPoint{Hash: txHash, Index: uint32(idx)})
+		}
+		utxoMods = append(utxoMods, utxoModification{
+			txIdx:       i,
+			addedOuts:   addedOuts,
+			spentInputs: spentInputs,
+			spentCoins:  txUndo.SpentCoins,
+		})
 	}
 
 	// Second pass: validate scripts (can be skipped for assume-valid or parallelized)
@@ -322,6 +388,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// Use the cached UTXO view so script validation can find spent UTXOs
 		if cm.parallelScripts {
 			if err := ParallelScriptValidationCached(block, cachedView, flags, cm.sigCache); err != nil {
+				rollbackUTXOs()
 				return fmt.Errorf("script validation failed: %w", err)
 			}
 		} else {
@@ -330,6 +397,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 					continue // Skip coinbase
 				}
 				if err := ValidateTransactionScripts(tx, cachedView, flags); err != nil {
+					rollbackUTXOs()
 					return fmt.Errorf("tx %d script validation failed: %w", i, err)
 				}
 			}
@@ -343,6 +411,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		coinbaseValue += out.Value
 	}
 	if coinbaseValue > subsidy+totalFees {
+		rollbackUTXOs()
 		return fmt.Errorf("coinbase value %d exceeds allowed %d (subsidy %d + fees %d)",
 			coinbaseValue, subsidy+totalFees, subsidy, totalFees)
 	}

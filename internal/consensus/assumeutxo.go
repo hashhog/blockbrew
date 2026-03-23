@@ -490,7 +490,10 @@ func readCoin(r io.Reader) (*UTXOEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if scriptLen > MaxScriptSize {
+	// Use a generous limit for UTXO script deserialization. The consensus
+	// MAX_SCRIPT_SIZE only applies during script evaluation, not serialization.
+	// Valid blocks can contain outputs with scripts larger than 10KB.
+	if scriptLen > 4*1024*1024 {
 		return nil, fmt.Errorf("script too large: %d", scriptLen)
 	}
 	compressed := make([]byte, scriptLen)
