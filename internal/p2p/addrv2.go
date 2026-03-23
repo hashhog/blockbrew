@@ -230,8 +230,9 @@ func (na *NetAddressV2) Deserialize(r io.Reader) error {
 		return err
 	}
 
-	// Read services as CompactSize
-	na.Services, err = wire.ReadCompactSize(r)
+	// Read services as CompactSize (use unchecked variant since BIP155
+	// service flags are uint64 values that may exceed MaxCompactSize)
+	na.Services, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return err
 	}

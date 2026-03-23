@@ -44,6 +44,28 @@ var (
 	ErrTooManyLocators  = errors.New("p2p: too many block locators")
 )
 
+// NonFatalMessageError indicates a deserialization failure for a non-critical
+// message where the TCP stream remains valid (payload was fully consumed and
+// checksum verified). The peer connection should NOT be killed for this error.
+type NonFatalMessageError struct {
+	Command string
+	Err     error
+}
+
+func (e *NonFatalMessageError) Error() string {
+	return fmt.Sprintf("deserialize %s (non-fatal): %v", e.Command, e.Err)
+}
+
+func (e *NonFatalMessageError) Unwrap() error {
+	return e.Err
+}
+
+// IsNonFatalMessageError returns true if err is a NonFatalMessageError.
+func IsNonFatalMessageError(err error) bool {
+	var nfe *NonFatalMessageError
+	return errors.As(err, &nfe)
+}
+
 // Maximum counts for various message fields.
 const (
 	MaxInvVects     = 50000
@@ -162,6 +184,9 @@ func WriteMessage(w io.Writer, magic uint32, msg Message) error {
 }
 
 // ReadMessage reads a complete message from r, validates checksum, returns the Message.
+// Deserialization errors for non-critical messages (e.g., addrv2) are logged and
+// the message is skipped rather than killing the connection, since the payload
+// was fully consumed and the stream remains valid.
 func ReadMessage(r io.Reader, magic uint32) (Message, error) {
 	// Read header
 	h, err := ReadMessageHeader(r)
@@ -195,15 +220,41 @@ func ReadMessage(r io.Reader, magic uint32) (Message, error) {
 	cmd := h.CommandString()
 	msg, err := makeMessage(cmd)
 	if err != nil {
-		return nil, err
+		// Unknown command — not fatal, skip the message.
+		// The payload was fully consumed so the stream is still aligned.
+		return nil, &NonFatalMessageError{Command: cmd, Err: err}
 	}
 
 	// Deserialize payload
 	if err := msg.Deserialize(bytes.NewReader(payload)); err != nil {
+		// The payload was fully read and checksum-verified, so the TCP stream
+		// is still properly aligned. For non-critical messages (addr, addrv2,
+		// inv, etc.), a deserialization failure should not kill the connection.
+		// Only fail for messages critical to the sync pipeline.
+		if isNonCriticalMessage(cmd) {
+			return nil, &NonFatalMessageError{Command: cmd, Err: err}
+		}
 		return nil, fmt.Errorf("deserialize %s: %w", cmd, err)
 	}
 
 	return msg, nil
+}
+
+// isNonCriticalMessage returns true for message types where a deserialization
+// failure should not kill the peer connection. These messages are informational
+// and not required for block sync.
+func isNonCriticalMessage(cmd string) bool {
+	switch cmd {
+	case "addr", "addrv2", "inv", "feefilter", "sendcmpct", "sendheaders",
+		"sendaddrv2", "wtxidrelay", "sendtxrcncl", "ping", "pong",
+		"filterload", "filteradd", "filterclear", "merkleblock",
+		"cmpctblock", "getblocktxn", "blocktxn",
+		"getcfilters", "cfilter", "getcfheaders", "cfheaders",
+		"getcfcheckpt", "cfcheckpt":
+		return true
+	default:
+		return false
+	}
 }
 
 // makeMessage creates a new empty message for the given command string.

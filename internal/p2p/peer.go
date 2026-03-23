@@ -368,8 +368,14 @@ func (p *Peer) readHandler() {
 
 		msg, err := p.transport.ReadMessage()
 		if err != nil {
-			// Log the error for debugging (e.g., deserialization failures that
-			// silently kill connections and stall block downloads)
+			// Non-fatal errors (e.g., failed addrv2 deserialization) should not
+			// kill the connection. The payload was fully consumed and checksum-
+			// verified, so the TCP stream remains valid.
+			if IsNonFatalMessageError(err) {
+				log.Printf("peer %s: skipping bad message: %v", p.addr, err)
+				continue
+			}
+			// Fatal errors (IO errors, bad magic, bad checksum) kill the connection
 			log.Printf("peer %s: read error: %v", p.addr, err)
 			return
 		}
