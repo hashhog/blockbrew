@@ -37,6 +37,10 @@ type ChainParams struct {
 	// BIP9 deployments tracked via version bits.
 	Deployments []*BIP9Deployment
 
+	// AssumeValidHash is the hash of the block below which script
+	// verification is skipped during IBD (in internal/little-endian byte order).
+	AssumeValidHash wire.Hash256
+
 	// AssumeUTXO parameters for snapshot-based sync.
 	AssumeUTXO *AssumeUTXOParams
 
@@ -375,6 +379,15 @@ func Testnet4Params() *ChainParams {
 				Period:              2016,
 				Threshold:           1512, // 75%
 			},
+		},
+
+		// Assume-valid block hash for testnet4 (height 123613)
+		// Display: 0000000002368b1e4ee27e2e85676ae6f9f9e69579b29093e9a82c170bf7cf8a
+		AssumeValidHash: wire.Hash256{
+			0x8a, 0xcf, 0xf7, 0x0b, 0x17, 0x2c, 0xa8, 0xe9,
+			0x93, 0x90, 0xb2, 0x79, 0x95, 0xe6, 0xf9, 0xf9,
+			0xe6, 0x6a, 0x67, 0x85, 0x2e, 0x7e, 0xe2, 0x4e,
+			0x1e, 0x8b, 0x36, 0x02, 0x00, 0x00, 0x00, 0x00,
 		},
 
 		// AssumeUTXO data for testnet4

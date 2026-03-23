@@ -257,6 +257,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		HeaderIndex:     headerIndex,
 		ChainDB:         chainDB,
 		UTXOSet:         utxoSet,
+		AssumeValidHash: chainParams.AssumeValidHash,
 		ParallelScripts: cfg.ParallelScripts,
 	})
 	log.Printf("Chain manager initialized (parallel scripts: %v)", cfg.ParallelScripts)
