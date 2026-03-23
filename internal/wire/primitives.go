@@ -12,6 +12,35 @@ const MaxCompactSize = 0x02000000
 // ErrCompactSizeTooLarge is returned when a CompactSize value exceeds MaxCompactSize.
 var ErrCompactSizeTooLarge = errors.New("compact size too large")
 
+// ReadCompactSizeUnchecked reads a CompactSize-encoded integer without any upper
+// bound check. This is needed for fields like BIP155 service flags which are
+// valid uint64 values that may exceed MaxCompactSize.
+func ReadCompactSizeUnchecked(r io.Reader) (uint64, error) {
+	first, err := ReadUint8(r)
+	if err != nil {
+		return 0, err
+	}
+
+	switch first {
+	case 0xFD:
+		v, err := ReadUint16LE(r)
+		if err != nil {
+			return 0, err
+		}
+		return uint64(v), nil
+	case 0xFE:
+		v, err := ReadUint32LE(r)
+		if err != nil {
+			return 0, err
+		}
+		return uint64(v), nil
+	case 0xFF:
+		return ReadUint64LE(r)
+	default:
+		return uint64(first), nil
+	}
+}
+
 // WriteUint8 writes a uint8 to the writer.
 func WriteUint8(w io.Writer, v uint8) error {
 	_, err := w.Write([]byte{v})

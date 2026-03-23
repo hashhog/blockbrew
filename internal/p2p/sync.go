@@ -623,6 +623,13 @@ func (sm *SyncManager) blockDownloadLoop() {
 	staleTicker := time.NewTicker(time.Second)
 	defer staleTicker.Stop()
 
+	// Stall detection: if nextHeight hasn't advanced for this long,
+	// re-request the block at nextHeight.
+	stallCheckTicker := time.NewTicker(10 * time.Second)
+	defer stallCheckTicker.Stop()
+	lastNextHeight := int32(-1)
+	lastAdvanceTime := time.Now()
+
 	for {
 		select {
 		case <-requestTicker.C:
@@ -630,6 +637,40 @@ func (sm *SyncManager) blockDownloadLoop() {
 
 		case <-staleTicker.C:
 			sm.checkStaleRequests()
+
+		case <-stallCheckTicker.C:
+			sm.mu.Lock()
+			nh := sm.nextHeight
+			inflightLen := len(sm.inflight)
+
+			if nh == lastNextHeight && inflightLen == 0 && time.Since(lastAdvanceTime) > 30*time.Second {
+				// nextHeight hasn't advanced for 30s and nothing is in flight.
+				// Find the block at nextHeight in the queue and reset it to pending.
+				resetCount := 0
+				for _, req := range sm.blockQueue {
+					if req.Height == nh && req.State != BlockDownloadPending {
+						log.Printf("sync: stall detected at height %d (state=%d), resetting to pending",
+							nh, req.State)
+						req.State = BlockDownloadPending
+						req.Peer = nil
+						resetCount++
+						break
+					}
+				}
+				// Also reset a window of blocks around nextHeight to ensure
+				// we have blocks flowing through the pipeline
+				if resetCount == 0 {
+					// The block at nextHeight may not be in the queue anymore,
+					// which means connection failed and it was removed. Log it.
+					log.Printf("sync: stall at height %d but block not in queue, inflight=%d queue=%d",
+						nh, inflightLen, len(sm.blockQueue))
+				}
+			}
+			if nh != lastNextHeight {
+				lastNextHeight = nh
+				lastAdvanceTime = time.Now()
+			}
+			sm.mu.Unlock()
 
 		case <-sm.quit:
 			return
@@ -865,24 +906,21 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 	}
 
 	// Send to validation pipeline.
-	// Use a non-blocking send with a goroutine fallback to avoid blocking the
-	// peer's readHandler. If the validation channel is full (pipeline backed up),
-	// the readHandler would be unable to read ANY messages from this peer,
-	// including responses to new block requests. This causes all in-flight
-	// requests to time out, creating an infinite timeout/retry loop that
-	// completely stalls IBD.
+	// Use a non-blocking send to avoid blocking the peer's readHandler.
+	// If the channel is full, the block is already persisted to DB, so we
+	// reset its state to pending. The stall detector or next request cycle
+	// will re-download it (from DB via fast path). This prevents unbounded
+	// goroutine/memory growth from the old goroutine-fallback approach.
 	select {
 	case sm.validationChan <- &blockWithRequest{block: msg.Block, req: req}:
 		// Sent immediately
 	default:
-		// Channel full — send in a background goroutine so the readHandler
-		// is not blocked. The goroutine will complete once the pipeline drains.
-		go func() {
-			select {
-			case sm.validationChan <- &blockWithRequest{block: msg.Block, req: req}:
-			case <-sm.quit:
-			}
-		}()
+		// Pipeline backed up — block is already stored to DB.
+		// Reset state so it gets re-requested when pipeline drains.
+		sm.mu.Lock()
+		req.State = BlockDownloadPending
+		req.Peer = nil
+		sm.mu.Unlock()
 	}
 }
 
@@ -938,6 +976,11 @@ func (sm *SyncManager) validationWorker() {
 	}
 }
 
+// MaxPendingBlocks is the maximum number of blocks to buffer in the
+// connection worker's pending map before dropping the oldest entries.
+// This prevents unbounded memory growth when the chain tip is stalled.
+const MaxPendingBlocks = 1024
+
 // connectionWorker connects validated blocks to the chain in order.
 func (sm *SyncManager) connectionWorker() {
 	defer sm.wg.Done()
@@ -954,6 +997,39 @@ func (sm *SyncManager) connectionWorker() {
 
 			// Add to pending
 			pending[bwr.req.Height] = bwr
+
+			// Evict blocks that are behind nextHeight (already connected or skipped)
+			sm.mu.RLock()
+			nh := sm.nextHeight
+			sm.mu.RUnlock()
+			for h := range pending {
+				if h < nh {
+					delete(pending, h)
+				}
+			}
+
+			// If pending is too large, drop blocks that are far ahead
+			// to prevent unbounded memory growth
+			if len(pending) > MaxPendingBlocks {
+				log.Printf("sync: pending map too large (%d entries), evicting distant blocks", len(pending))
+				// Find the min height to keep: nextHeight + MaxPendingBlocks
+				maxKeep := nh + int32(MaxPendingBlocks)
+				for h := range pending {
+					if h > maxKeep {
+						// Reset block state in queue so it gets re-requested later
+						sm.mu.Lock()
+						for _, req := range sm.blockQueue {
+							if req.Height == h {
+								req.State = BlockDownloadPending
+								req.Peer = nil
+								break
+							}
+						}
+						sm.mu.Unlock()
+						delete(pending, h)
+					}
+				}
+			}
 
 			// Try to connect blocks in order
 			sm.connectPendingBlocks(pending)
@@ -982,7 +1058,23 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 			if err != nil {
 				log.Printf("sync: failed to connect block %d (%s): %v",
 					nextHeight, bwr.req.Hash.String()[:16], err)
-				// Mark as invalid in header index
+
+				// Check if this is a genuine validation failure vs. an ordering issue.
+				// "does not connect to tip during IBD" means the previous block
+				// was not connected — this is a cascading failure, NOT a bad block.
+				errStr := err.Error()
+				isCascade := len(errStr) > 30 && (errStr[:30] == "block does not connect to tip " ||
+					// Also detect UTXO-not-found which happens when prev block
+					// was skipped and UTXOs from it are missing
+					errStr == "utxo not found")
+
+				if isCascade {
+					// Don't advance past this block — keep it in pending.
+					// It will connect once the preceding block is resolved.
+					break
+				}
+
+				// Genuine validation error: mark as invalid and skip
 				node := sm.headerIndex.GetNode(bwr.req.Hash)
 				if node != nil {
 					node.Status |= consensus.StatusInvalid
@@ -998,9 +1090,7 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 
 				// Stop connecting further blocks: the chain tip is now behind
 				// nextHeight, so subsequent blocks will also fail because their
-				// PrevBlock won't match the tip. The download loop will
-				// re-request the next block, which should connect once the
-				// chain catches up.
+				// PrevBlock won't match the tip.
 				break
 			}
 		}
