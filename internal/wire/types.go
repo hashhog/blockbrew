@@ -138,8 +138,13 @@ func (ti *TxIn) Deserialize(r io.Reader) error {
 		return err
 	}
 	var err error
-	// Max script size is 10,000 bytes
-	ti.SignatureScript, err = ReadVarBytes(r, 10000)
+	// scriptSig size limit during deserialization: use MaxCompactSize (32 MB).
+	// The consensus MAX_SCRIPT_SIZE (10,000) is enforced during script evaluation,
+	// NOT during deserialization. A valid block can contain scriptSigs larger than
+	// 10KB (e.g. large P2SH redeemscripts, legacy multisig). Using a tight limit
+	// here causes "compact size too large" errors and makes the node unable to
+	// deserialize valid blocks.
+	ti.SignatureScript, err = ReadVarBytes(r, MaxCompactSize)
 	if err != nil {
 		return err
 	}
@@ -168,8 +173,10 @@ func (to *TxOut) Deserialize(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	// Max script size is 10,000 bytes
-	to.PkScript, err = ReadVarBytes(r, 10000)
+	// pkScript size limit during deserialization: use MaxCompactSize (32 MB).
+	// Like scriptSig, the consensus MAX_SCRIPT_SIZE is checked during evaluation.
+	// Deserialization must accept whatever is in the block.
+	to.PkScript, err = ReadVarBytes(r, MaxCompactSize)
 	return err
 }
 
