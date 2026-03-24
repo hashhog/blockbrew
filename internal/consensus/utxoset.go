@@ -24,7 +24,7 @@ const DefaultCacheMaxBytes = 450 * 1024 * 1024
 
 // IBDFlushInterval is the number of blocks between forced UTXO flushes during IBD.
 // Larger values improve IBD performance but use more memory.
-const IBDFlushInterval = 500
+const IBDFlushInterval = 2000
 
 // UTXOCacheStats tracks cache performance metrics.
 type UTXOCacheStats struct {
@@ -60,11 +60,15 @@ func NewUTXOSet(db *storage.ChainDB) *UTXOSet {
 
 // NewUTXOSetWithMaxCache creates a UTXO set with a custom cache size limit.
 func NewUTXOSetWithMaxCache(db *storage.ChainDB, maxCacheBytes int64) *UTXOSet {
+	// Pre-size maps to reduce rehashing during IBD.
+	// 500k is a reasonable initial size for testnet4/mainnet UTXOs.
+	const initialCacheSize = 500_000
+	const initialDirtySize = 100_000
 	return &UTXOSet{
 		db:            db,
-		cache:         make(map[wire.OutPoint]*UTXOEntry),
-		dirty:         make(map[wire.OutPoint]bool),
-		deleted:       make(map[wire.OutPoint]bool),
+		cache:         make(map[wire.OutPoint]*UTXOEntry, initialCacheSize),
+		dirty:         make(map[wire.OutPoint]bool, initialDirtySize),
+		deleted:       make(map[wire.OutPoint]bool, initialDirtySize),
 		maxCacheBytes: maxCacheBytes,
 	}
 }
@@ -252,9 +256,9 @@ func (u *UTXOSet) flushLocked() error {
 		return err
 	}
 
-	// Clear dirty and deleted tracking
-	u.dirty = make(map[wire.OutPoint]bool)
-	u.deleted = make(map[wire.OutPoint]bool)
+	// Clear dirty and deleted tracking (pre-size for next batch)
+	u.dirty = make(map[wire.OutPoint]bool, 100_000)
+	u.deleted = make(map[wire.OutPoint]bool, 100_000)
 	u.flushes++
 	u.blocksSinceFlush = 0
 
