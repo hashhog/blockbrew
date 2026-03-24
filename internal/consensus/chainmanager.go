@@ -144,6 +144,40 @@ func (cm *ChainManager) loadChainState() {
 	log.Printf("chainmgr: loaded chain state at height %d", cm.tipHeight)
 }
 
+// ReloadChainState re-resolves the chain tip from the database after the
+// header index has been populated (e.g. after P2P header sync completes).
+// This is needed because on startup the header index only contains the genesis
+// block, so loadChainState cannot find the saved tip.
+func (cm *ChainManager) ReloadChainState() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Only reload if currently at genesis — don't clobber a valid tip
+	if cm.tipHeight > 0 {
+		return
+	}
+
+	if cm.chainDB == nil {
+		return
+	}
+
+	state, err := cm.chainDB.GetChainState()
+	if err != nil {
+		return
+	}
+
+	node := cm.headerIndex.GetNode(state.BestHash)
+	if node == nil {
+		log.Printf("chainmgr: ReloadChainState: saved tip %s still not in header index",
+			state.BestHash.String()[:16])
+		return
+	}
+
+	cm.tipNode = node
+	cm.tipHeight = state.BestHeight
+	log.Printf("chainmgr: reloaded chain state at height %d after header sync", cm.tipHeight)
+}
+
 // ConnectBlock validates and connects a block to the active chain.
 func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	hash := block.Header.BlockHash()
@@ -182,10 +216,22 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			block.Header.PrevBlock.String()[:16], cm.tipNode.Hash.String()[:16])
 	}
 
-	// Full block validation
-	err := CheckBlockSanity(block, cm.params.PowLimit)
-	if err != nil {
-		return fmt.Errorf("block sanity check failed: %w", err)
+	// Resolve assume-valid early so we can skip expensive work during IBD.
+	if cm.assumeValidHeight == 0 && !cm.assumeValidHash.IsZero() {
+		avNode := cm.headerIndex.GetNode(cm.assumeValidHash)
+		if avNode != nil {
+			cm.assumeValidHeight = avNode.Height
+			log.Printf("chainmgr: assume-valid block resolved at height %d", cm.assumeValidHeight)
+		}
+	}
+	skipScripts := cm.assumeValidHeight > 0 && node.Height <= cm.assumeValidHeight
+
+	// Full block validation (skip sanity during IBD -- already done by validationWorker)
+	if !cm.isIBD {
+		err := CheckBlockSanity(block, cm.params.PowLimit)
+		if err != nil {
+			return fmt.Errorf("block sanity check failed: %w", err)
+		}
 	}
 
 	// Collect MTP timestamps from previous 11 blocks
@@ -196,7 +242,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	}
 
 	prevHeader := cm.tipNode.Header
-	err = CheckBlockContext(block, &prevHeader, node.Height, cm.params, mtp)
+	err := CheckBlockContext(block, &prevHeader, node.Height, cm.params, mtp)
 	if err != nil {
 		return fmt.Errorf("block context check failed: %w", err)
 	}
@@ -207,11 +253,15 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Calculate expected subsidy
 	subsidy := CalcBlockSubsidy(node.Height)
 
-	// Track total fees and undo data
+	// Track total fees and undo data.
+	// Skip undo data generation during assume-valid IBD for performance.
 	var totalFees int64
-	// Undo data: one TxUndo per non-coinbase transaction
-	blockUndo := &storage.BlockUndo{
-		TxUndos: make([]storage.TxUndo, 0, len(block.Transactions)-1),
+	generateUndo := !skipScripts || !cm.isIBD
+	var blockUndo *storage.BlockUndo
+	if generateUndo {
+		blockUndo = &storage.BlockUndo{
+			TxUndos: make([]storage.TxUndo, 0, len(block.Transactions)-1),
+		}
 	}
 
 	// Genesis block special case: the genesis coinbase is unspendable.
@@ -222,7 +272,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		cm.tipHeight = node.Height
 		node.Status |= StatusFullyValid
 		if cm.chainDB != nil {
-			cm.chainDB.WriteBlockUndo(hash, blockUndo)
+			emptyUndo := &storage.BlockUndo{}
+			cm.chainDB.WriteBlockUndo(hash, emptyUndo)
 			cm.chainDB.SetBlockHeight(node.Height, hash)
 			cm.chainDB.SetChainState(&storage.ChainState{
 				BestHash:   hash,
@@ -343,25 +394,29 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		}
 
 		// Record spent UTXOs for undo data before spending (one TxUndo per transaction)
-		txUndo := storage.TxUndo{
-			SpentCoins: make([]storage.SpentCoin, 0, len(tx.TxIn)),
-		}
 		var spentInputs []wire.OutPoint
-		for _, in := range tx.TxIn {
-			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
-			if utxo != nil {
-				txUndo.SpentCoins = append(txUndo.SpentCoins, storage.SpentCoin{
-					TxOut: wire.TxOut{
-						Value:    utxo.Amount,
-						PkScript: utxo.PkScript,
-					},
-					Height:   utxo.Height,
-					Coinbase: utxo.IsCoinbase,
-				})
+		var spentCoins []storage.SpentCoin
+		if generateUndo {
+			txUndo := storage.TxUndo{
+				SpentCoins: make([]storage.SpentCoin, 0, len(tx.TxIn)),
 			}
-			spentInputs = append(spentInputs, in.PreviousOutPoint)
+			for _, in := range tx.TxIn {
+				utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
+				if utxo != nil {
+					txUndo.SpentCoins = append(txUndo.SpentCoins, storage.SpentCoin{
+						TxOut: wire.TxOut{
+							Value:    utxo.Amount,
+							PkScript: utxo.PkScript,
+						},
+						Height:   utxo.Height,
+						Coinbase: utxo.IsCoinbase,
+					})
+				}
+				spentInputs = append(spentInputs, in.PreviousOutPoint)
+			}
+			blockUndo.TxUndos = append(blockUndo.TxUndos, txUndo)
+			spentCoins = txUndo.SpentCoins
 		}
-		blockUndo.TxUndos = append(blockUndo.TxUndos, txUndo)
 
 		// Update UTXO view: spend inputs and add outputs
 		cm.utxoSet.SpendTxInputs(tx)
@@ -376,14 +431,11 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			txIdx:       i,
 			addedOuts:   addedOuts,
 			spentInputs: spentInputs,
-			spentCoins:  txUndo.SpentCoins,
+			spentCoins:  spentCoins,
 		})
 	}
 
 	// Second pass: validate scripts (can be skipped for assume-valid or parallelized)
-	// Assume-valid optimization: skip script validation for blocks before assume-valid point
-	skipScripts := cm.assumeValidHeight > 0 && node.Height <= cm.assumeValidHeight
-
 	if !skipScripts {
 		// Use the cached UTXO view so script validation can find spent UTXOs
 		if cm.parallelScripts {
@@ -430,14 +482,20 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Persist undo data and chain state
 	if cm.chainDB != nil {
 		// Write undo data keyed by block hash (not height, since heights can change during reorgs)
-		if err := cm.chainDB.WriteBlockUndo(hash, blockUndo); err != nil {
-			return fmt.Errorf("failed to write undo data: %w", err)
+		if generateUndo {
+			if err := cm.chainDB.WriteBlockUndo(hash, blockUndo); err != nil {
+				return fmt.Errorf("failed to write undo data: %w", err)
+			}
 		}
 		cm.chainDB.SetBlockHeight(node.Height, hash)
-		cm.chainDB.SetChainState(&storage.ChainState{
-			BestHash:   hash,
-			BestHeight: node.Height,
-		})
+		// During IBD, batch chain state writes (every flushInterval blocks)
+		// to reduce disk I/O. Post-IBD, write every block for crash safety.
+		if !cm.isIBD || cm.blocksSinceFlush+1 >= cm.flushInterval {
+			cm.chainDB.SetChainState(&storage.ChainState{
+				BestHash:   hash,
+				BestHeight: node.Height,
+			})
+		}
 	}
 
 	// Periodic UTXO flush during IBD
@@ -473,9 +531,17 @@ func (cm *ChainManager) SetParallelScripts(parallel bool) {
 
 // flushUTXOs persists the UTXO set to disk.
 func (cm *ChainManager) flushUTXOs() {
-	// This is a placeholder - actual implementation would persist the UTXO set
-	// to the database. For InMemoryUTXOView, we'd need a database-backed version.
-	log.Printf("chainmgr: UTXO flush at height %d", cm.tipHeight)
+	// Check if the UTXO set supports flushing (database-backed UTXOSet)
+	type flusher interface {
+		Flush() error
+	}
+	if f, ok := cm.utxoSet.(flusher); ok {
+		if err := f.Flush(); err != nil {
+			log.Printf("chainmgr: UTXO flush error at height %d: %v", cm.tipHeight, err)
+		} else {
+			log.Printf("chainmgr: UTXO flush at height %d", cm.tipHeight)
+		}
+	}
 }
 
 // collectPrevTimestamps collects timestamps from the previous N blocks.
