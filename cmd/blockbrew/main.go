@@ -312,6 +312,12 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		ChainManager: chainMgr,
 		OnSyncComplete: func() {
 			log.Printf("Header synchronization complete, starting block download")
+			// Re-resolve the chain tip now that headers are available.
+			// On startup the header index only has genesis, so the chain
+			// manager's tip defaults to genesis even when the DB has a
+			// higher tip. This call restores the correct tip so that
+			// StartBlockDownload resumes from where we left off.
+			chainMgr.ReloadChainState()
 			syncMgr.StartBlockDownload()
 		},
 		OnBlockConnected: onBlockConnected,

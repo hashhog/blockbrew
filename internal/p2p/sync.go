@@ -22,7 +22,7 @@ const (
 	SyncRetryInterval = 5 * time.Second
 
 	// DefaultDownloadWindow is the max concurrent blocks in flight.
-	DefaultDownloadWindow = 256
+	DefaultDownloadWindow = 1024
 
 	// MaxBlocksPerPeer is the max concurrent requests per peer.
 	MaxBlocksPerPeer = 16
