@@ -1139,18 +1139,32 @@ func (s *Server) handleAddNode(params json.RawMessage) (interface{}, *RPCError) 
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing parameters"}
 	}
 
-	_, ok := args[0].(string)
+	addr, ok := args[0].(string)
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
 	}
 
-	_, ok = args[1].(string)
+	command, ok := args[1].(string)
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid command"}
 	}
 
-	// TODO: Implement addnode functionality
-	// For now, just acknowledge the request
+	if s.peerMgr == nil {
+		return nil, &RPCError{Code: RPCErrClientP2PDisabled, Message: "P2P networking is disabled"}
+	}
+
+	switch command {
+	case "onetry", "add":
+		s.peerMgr.ConnectManualPeer(addr)
+	case "remove":
+		// Disconnect if connected
+		if peer := s.peerMgr.GetPeer(addr); peer != nil {
+			peer.Disconnect()
+		}
+	default:
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid command (use add, remove, or onetry)"}
+	}
+
 	return nil, nil
 }
 
