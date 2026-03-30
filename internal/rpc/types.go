@@ -19,6 +19,7 @@ const (
 	RPCErrVerify               = -25    // Error during verification
 	RPCErrInWarmup             = -28    // Client still warming up
 	RPCErrClientNodeNotConnected = -29  // Node not found/connected
+	RPCErrClientP2PDisabled      = -9   // P2P networking is disabled
 	RPCErrWallet               = -4     // Wallet error (general)
 )
 
