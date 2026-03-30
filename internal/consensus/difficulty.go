@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"errors"
+	"log"
 	"math/big"
 
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -177,6 +178,7 @@ func CheckProofOfWork(hash wire.Hash256, bits uint32, powLimit *big.Int) error {
 	// Convert hash to big.Int and compare
 	hashNum := HashToBig(hash)
 	if hashNum.Cmp(target) > 0 {
+		log.Printf("PoW FAIL: hash=%064x target=%064x bits=%08x", hashNum, target, bits)
 		return ErrDifficultyTooLow
 	}
 
