@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"os"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
 	"github.com/hashhog/blockbrew/internal/mining"
+	"github.com/hashhog/blockbrew/internal/p2p"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -1913,6 +1915,16 @@ func (s *Server) handleGenerateToAddress(params json.RawMessage) (interface{}, *
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Block generation failed: %v", err)}
 	}
 
+	// Broadcast inv(MSG_BLOCK) to all connected peers for each new block
+	if s.peerMgr != nil {
+		for _, h := range hashes {
+			inv := &p2p.MsgInv{}
+			inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: h})
+			s.peerMgr.BroadcastMessage(inv)
+			log.Printf("rpc: broadcast block inv %x to peers", h[:4])
+		}
+	}
+
 	// Convert hashes to strings
 	result := make([]string, len(hashes))
 	for i, h := range hashes {
@@ -1980,6 +1992,15 @@ func (s *Server) handleGenerateToDescriptor(params json.RawMessage) (interface{}
 	hashes, err := miner.GenerateBlocks(int(numBlocks), coinbaseScript, maxTries)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Block generation failed: %v", err)}
+	}
+
+	// Broadcast inv(MSG_BLOCK) to all connected peers for each new block
+	if s.peerMgr != nil {
+		for _, h := range hashes {
+			inv := &p2p.MsgInv{}
+			inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: h})
+			s.peerMgr.BroadcastMessage(inv)
+		}
 	}
 
 	// Convert hashes to strings
@@ -2162,6 +2183,13 @@ func (s *Server) handleGenerateBlock(params json.RawMessage) (interface{}, *RPCE
 		if err := s.chainMgr.ConnectBlock(block); err != nil {
 			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Block connection failed: %v", err)}
 		}
+	}
+
+	// Broadcast inv(MSG_BLOCK) to all connected peers
+	if s.peerMgr != nil {
+		inv := &p2p.MsgInv{}
+		inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: blockHash})
+		s.peerMgr.BroadcastMessage(inv)
 	}
 
 	return result, nil
