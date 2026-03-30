@@ -393,29 +393,32 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			}
 		}
 
-		// Record spent UTXOs for undo data before spending (one TxUndo per transaction)
-		var spentInputs []wire.OutPoint
-		var spentCoins []storage.SpentCoin
+		// Always record spent UTXOs for in-memory rollback. Without this,
+		// a validation failure mid-block leaves the UTXO set corrupted
+		// because spent inputs cannot be restored.
+		spentInputs := make([]wire.OutPoint, 0, len(tx.TxIn))
+		spentCoins := make([]storage.SpentCoin, 0, len(tx.TxIn))
+		for _, in := range tx.TxIn {
+			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
+			if utxo != nil {
+				spentCoins = append(spentCoins, storage.SpentCoin{
+					TxOut: wire.TxOut{
+						Value:    utxo.Amount,
+						PkScript: utxo.PkScript,
+					},
+					Height:   utxo.Height,
+					Coinbase: utxo.IsCoinbase,
+				})
+			}
+			spentInputs = append(spentInputs, in.PreviousOutPoint)
+		}
+
+		// Persist undo data to disk only when needed (not during assume-valid IBD)
 		if generateUndo {
 			txUndo := storage.TxUndo{
-				SpentCoins: make([]storage.SpentCoin, 0, len(tx.TxIn)),
-			}
-			for _, in := range tx.TxIn {
-				utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
-				if utxo != nil {
-					txUndo.SpentCoins = append(txUndo.SpentCoins, storage.SpentCoin{
-						TxOut: wire.TxOut{
-							Value:    utxo.Amount,
-							PkScript: utxo.PkScript,
-						},
-						Height:   utxo.Height,
-						Coinbase: utxo.IsCoinbase,
-					})
-				}
-				spentInputs = append(spentInputs, in.PreviousOutPoint)
+				SpentCoins: spentCoins,
 			}
 			blockUndo.TxUndos = append(blockUndo.TxUndos, txUndo)
-			spentCoins = txUndo.SpentCoins
 		}
 
 		// Update UTXO view: spend inputs and add outputs
