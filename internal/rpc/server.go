@@ -2,10 +2,14 @@ package rpc
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -41,6 +45,8 @@ type Server struct {
 	walletMgr    *wallet.Manager        // multi-wallet manager
 	indexManager *storage.IndexManager
 	httpServer   *http.Server
+
+	cookiePassword string // hex-encoded cookie secret (empty if unused)
 
 	mu        sync.RWMutex
 	startTime time.Time
@@ -127,6 +133,14 @@ func WithIndexManager(im *storage.IndexManager) ServerOption {
 	}
 }
 
+// WithCookiePassword stores the pre-generated cookie password in the server
+// so that checkAuth can accept "__cookie__" credentials.
+func WithCookiePassword(password string) ServerOption {
+	return func(s *Server) {
+		s.cookiePassword = password
+	}
+}
+
 // NewServer creates a new RPC server with the given configuration.
 func NewServer(config RPCConfig, opts ...ServerOption) *Server {
 	s := &Server{
@@ -140,6 +154,34 @@ func NewServer(config RPCConfig, opts ...ServerOption) *Server {
 	}
 
 	return s
+}
+
+// GenerateCookie generates a 32-byte random cookie, writes
+// "__cookie__:<hex>" to {datadir}/.cookie with permissions 0600, and
+// returns the hex-encoded password.  The cookie lets local tools
+// authenticate without a user-supplied password, matching Bitcoin Core
+// behaviour.
+func GenerateCookie(datadir string) (string, error) {
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("cookie: failed to generate random bytes: %w", err)
+	}
+	password := hex.EncodeToString(raw)
+	cookiePath := filepath.Join(datadir, ".cookie")
+	content := "__cookie__:" + password
+	if err := os.WriteFile(cookiePath, []byte(content), 0600); err != nil {
+		return "", fmt.Errorf("cookie: failed to write %s: %w", cookiePath, err)
+	}
+	return password, nil
+}
+
+// DeleteCookie removes the .cookie file from datadir.  Call on clean
+// shutdown so stale cookies are not left on disk.
+func DeleteCookie(datadir string) {
+	cookiePath := filepath.Join(datadir, ".cookie")
+	if err := os.Remove(cookiePath); err != nil && !os.IsNotExist(err) {
+		log.Printf("RPC: warning: failed to remove cookie file %s: %v", cookiePath, err)
+	}
 }
 
 // Start begins listening for RPC requests.
@@ -265,9 +307,13 @@ func (s *Server) getWalletForRPC(walletName string) (*wallet.Wallet, *RPCError) 
 }
 
 // checkAuth verifies basic authentication.
+// It accepts two credential pairs:
+//  1. The configured rpcuser/rpcpassword (explicit credentials).
+//  2. The "__cookie__" username with the generated cookie password
+//     (used by local tools that read the .cookie file).
 func (s *Server) checkAuth(r *http.Request) bool {
-	// If no auth configured, allow all requests
-	if s.config.Username == "" && s.config.Password == "" {
+	// If no credentials are configured at all, allow every request.
+	if s.config.Username == "" && s.config.Password == "" && s.cookiePassword == "" {
 		return true
 	}
 
@@ -276,12 +322,19 @@ func (s *Server) checkAuth(r *http.Request) bool {
 		return false
 	}
 
+	// Cookie auth: username must be literally "__cookie__".
+	if user == "__cookie__" && s.cookiePassword != "" {
+		return pass == s.cookiePassword
+	}
+
+	// Explicit rpcuser/rpcpassword auth.
 	return user == s.config.Username && pass == s.config.Password
 }
 
 // sendResponse writes a JSON-RPC response.
 func (s *Server) sendResponse(w http.ResponseWriter, resp RPCResponse) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Connection", "close")
 	if err := json.NewEncoder(w).Encode(resp); err != nil {
 		log.Printf("RPC: failed to encode response: %v", err)
 	}

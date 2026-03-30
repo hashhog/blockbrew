@@ -113,7 +113,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.DataDir, "datadir", defaultDataDir, "Data directory")
 	flag.StringVar(&cfg.Network, "network", "mainnet", "Network (mainnet, testnet, regtest, signet)")
 	flag.StringVar(&cfg.ListenP2P, "listen", "", "P2P listen address (default: based on network)")
-	flag.StringVar(&cfg.ListenRPC, "rpcbind", "127.0.0.1:8332", "RPC listen address")
+	flag.StringVar(&cfg.ListenRPC, "rpcbind", "", "RPC listen address (default: based on network)")
 	flag.StringVar(&cfg.RPCUser, "rpcuser", "blockbrew", "RPC username")
 	flag.StringVar(&cfg.RPCPassword, "rpcpassword", "", "RPC password")
 	flag.IntVar(&cfg.MaxOutbound, "maxoutbound", 8, "Maximum outbound connections")
@@ -132,6 +132,9 @@ func parseFlags() *Config {
 
 	if cfg.ListenP2P == "" {
 		cfg.ListenP2P = fmt.Sprintf(":%d", chainPortForNetwork(cfg.Network))
+	}
+	if cfg.ListenRPC == "" {
+		cfg.ListenRPC = fmt.Sprintf("127.0.0.1:%d", rpcPortForNetwork(cfg.Network))
 	}
 
 	// For non-mainnet networks, create a subdirectory
@@ -374,12 +377,23 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	}
 
 	// 11. Initialize RPC server
+	// Generate a cookie file so local tools can authenticate without an
+	// explicit password (mirrors Bitcoin Core's .cookie mechanism).
+	cookiePassword, err := rpc.GenerateCookie(cfg.DataDir)
+	if err != nil {
+		log.Printf("WARNING: could not write RPC cookie file: %v", err)
+		cookiePassword = ""
+	} else {
+		log.Printf("RPC cookie written to %s/.cookie", cfg.DataDir)
+	}
+
 	rpcServer := rpc.NewServer(
 		rpc.RPCConfig{
 			ListenAddr: cfg.ListenRPC,
 			Username:   cfg.RPCUser,
 			Password:   cfg.RPCPassword,
 		},
+		rpc.WithCookiePassword(cookiePassword),
 		rpc.WithChainParams(chainParams),
 		rpc.WithChainManager(chainMgr),
 		rpc.WithHeaderIndex(headerIndex),
@@ -427,6 +441,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		log.Printf("Warning: RPC server stop error: %v", err)
 	}
 	log.Printf("RPC server stopped")
+	rpc.DeleteCookie(cfg.DataDir)
 
 	syncMgr.Stop()
 	log.Printf("Sync manager stopped")
@@ -518,7 +533,7 @@ func handleWalletCommand(args []string) {
 
 	case "info":
 		fmt.Println("Wallet info requires a running node.")
-		fmt.Println("Use RPC: curl --user blockbrew:password --data-binary '{\"method\":\"getwalletinfo\"}' http://127.0.0.1:8332/")
+		fmt.Println("Use RPC: curl --user blockbrew:password --data-binary '{\"method\":\"getwalletinfo\"}' http://127.0.0.1:<rpcport>/")
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown wallet command: %s\n", args[0])
@@ -540,7 +555,7 @@ func printHelp() {
 	fmt.Println("  --datadir       Data directory (default: ~/.blockbrew)")
 	fmt.Println("  --network       Network: mainnet, testnet, regtest, signet (default: mainnet)")
 	fmt.Println("  --listen        P2P listen address (default: based on network)")
-	fmt.Println("  --rpcbind       RPC listen address (default: 127.0.0.1:8332)")
+	fmt.Println("  --rpcbind       RPC listen address (default: based on network)")
 	fmt.Println("  --rpcuser       RPC username (default: blockbrew)")
 	fmt.Println("  --rpcpassword   RPC password")
 	fmt.Println("  --maxoutbound   Maximum outbound connections (default: 8)")
