@@ -493,6 +493,33 @@ func (pm *PeerManager) AddressBook() *AddressBook {
 	return pm.addrBook
 }
 
+// ConnectManualPeer adds an address to the address book and immediately
+// attempts an outbound connection. Used by the addnode RPC.
+func (pm *PeerManager) ConnectManualPeer(addr string) {
+	// Parse the address
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		log.Printf("addnode: invalid address %q: %v", addr, err)
+		return
+	}
+	na := NetAddress{
+		Services: 0,
+		IP:       tcpAddr.IP,
+		Port:     uint16(tcpAddr.Port),
+	}
+	pm.addrBook.AddAddress(na, "manual")
+	ka := pm.addrBook.GetAddress(addr)
+	if ka == nil {
+		// Address may have been rejected (e.g., unspecified IP); create inline
+		ka = &KnownAddress{
+			Addr:     na,
+			Source:   "manual",
+			LastSeen: time.Now(),
+		}
+	}
+	go pm.connectToPeerWithType(ka, ConnFullRelay)
+}
+
 // MarkBlockReceived records that we received a block from a peer.
 // This is used for eviction scoring - peers that send us blocks are more valuable.
 func (pm *PeerManager) MarkBlockReceived(addr string) {
