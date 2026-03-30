@@ -167,6 +167,13 @@ func (sm *SyncManager) SetPeerManager(pm *PeerManager) {
 
 // Start begins the sync process.
 func (sm *SyncManager) Start() {
+	// Initialize nextHeight from the current chain tip so that unsolicited
+	// blocks received before IBD starts are connected at the right height.
+	if sm.chainMgr != nil {
+		_, tipHeight := sm.chainMgr.BestBlock()
+		sm.nextHeight = tipHeight + 1
+	}
+
 	sm.wg.Add(1)
 	go sm.syncHandler()
 
@@ -911,8 +918,30 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 		// Check if it's still in our queue (pending retry). If so, accept it.
 		req = sm.findInQueue(hash)
 		if req == nil {
+			nh := sm.nextHeight
 			sm.mu.Unlock()
-			// Truly unsolicited — ignore silently during IBD
+			// Not in queue either — process as an unsolicited block
+			// (e.g., announced via inv from a miner).
+			// First, add its header to the header index (headers-first requirement).
+			log.Printf("sync: received unsolicited block %s from %s, processing header first", hash, peer.Address())
+			if sm.headerIndex != nil {
+				node, err := sm.headerIndex.AddHeader(msg.Block.Header)
+				if err == nil && node != nil {
+					log.Printf("sync: added header for unsolicited block (height %d)", node.Height)
+					nh = node.Height
+				} else if err != nil {
+					log.Printf("sync: failed to add header for unsolicited block: %v", err)
+				}
+			}
+			// Now pass to validation
+			select {
+			case sm.validationChan <- &blockWithRequest{
+				block: msg.Block,
+				req:   &blockRequest{Hash: hash, Height: nh, State: BlockDownloadReceived},
+			}:
+			default:
+				log.Printf("sync: validation channel full, dropping unsolicited block")
+			}
 			return
 		}
 		// Accept the late block: remove from queue's pending state
