@@ -1191,8 +1191,65 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				isCascade := len(errStr) > 30 && errStr[:30] == "block does not connect to tip "
 
 				if isCascade {
-					// Don't advance past this block — keep it in pending.
-					// It will connect once the preceding block is resolved.
+					// Check if a previous block was skipped, creating an
+					// unrecoverable gap. If the chain tip is behind
+					// nextHeight-1, the missing block was marked invalid and
+					// removed from the queue. We need to re-download it.
+					if sm.chainMgr != nil {
+						_, tipH := sm.chainMgr.BestBlock()
+						missingHeight := tipH + 1
+						if missingHeight < nextHeight {
+							// There is a gap: block at missingHeight was
+							// skipped. Look it up in the header index and
+							// re-insert it into the queue for re-download.
+							sm.mu.Lock()
+							alreadyQueued := false
+							for _, req := range sm.blockQueue {
+								if req.Height == missingHeight {
+									alreadyQueued = true
+									// Clear any invalid status so it gets re-downloaded
+									if req.State != BlockDownloadPending {
+										req.State = BlockDownloadPending
+										req.Peer = nil
+										delete(sm.inflight, req.Hash)
+									}
+									node := sm.headerIndex.GetNode(req.Hash)
+									if node != nil {
+										node.Status &^= consensus.StatusInvalid
+									}
+									break
+								}
+							}
+							if !alreadyQueued {
+								// Find the block hash from the header index
+								bestTip := sm.headerIndex.BestTip()
+								if bestTip != nil {
+									ancestor := bestTip.GetAncestor(missingHeight)
+									if ancestor != nil {
+										log.Printf("sync: gap detected — re-queuing skipped block at height %d (%s)",
+											missingHeight, ancestor.Hash.String()[:16])
+										// Clear invalid status
+										ancestor.Status &^= consensus.StatusInvalid
+										// Insert at the front of the queue
+										newReq := &blockRequest{
+											Hash:   ancestor.Hash,
+											Height: missingHeight,
+											State:  BlockDownloadPending,
+										}
+										sm.blockQueue = append([]*blockRequest{newReq}, sm.blockQueue...)
+									}
+								}
+							}
+							// Reset nextHeight to fill the gap
+							sm.nextHeight = missingHeight
+							sm.mu.Unlock()
+							log.Printf("sync: resetting nextHeight to %d to fill gap (tip=%d, was=%d)",
+								missingHeight, tipH, nextHeight)
+							break
+						}
+					}
+					// No gap — the preceding block just hasn't been
+					// connected yet. Wait for it.
 					break
 				}
 
