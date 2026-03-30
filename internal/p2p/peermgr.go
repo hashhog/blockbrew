@@ -1257,6 +1257,24 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 		}
 	}
 
+	// Handle inv messages: request blocks we don't have
+	listeners.OnInv = func(p *Peer, msg *MsgInv) {
+		var blockItems []*InvVect
+		for _, iv := range msg.InvList {
+			if iv.Type == InvTypeBlock || iv.Type == InvTypeWitnessBlock {
+				blockItems = append(blockItems, &InvVect{
+					Type: InvTypeWitnessBlock, // Request witness data
+					Hash: iv.Hash,
+				})
+			}
+		}
+		if len(blockItems) > 0 {
+			log.Printf("Requesting %d blocks from %s", len(blockItems), p.Address())
+			getdata := &MsgGetData{InvList: blockItems}
+			p.SendMessage(getdata)
+		}
+	}
+
 	return listeners
 }
 
