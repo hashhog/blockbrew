@@ -19,8 +19,8 @@ var (
 // This corresponds roughly to 450 MB of memory usage.
 const DefaultCacheMaxEntries = 5_000_000
 
-// DefaultCacheMaxBytes is the maximum approximate cache size in bytes (450MB).
-const DefaultCacheMaxBytes = 450 * 1024 * 1024
+// DefaultCacheMaxBytes is the maximum approximate cache size in bytes (256MB).
+const DefaultCacheMaxBytes = 256 * 1024 * 1024
 
 // IBDFlushInterval is the number of blocks between forced UTXO flushes during IBD.
 // Larger values improve IBD performance but use more memory.
@@ -261,6 +261,22 @@ func (u *UTXOSet) flushLocked() error {
 	u.deleted = make(map[wire.OutPoint]bool, 100_000)
 	u.flushes++
 	u.blocksSinceFlush = 0
+
+	// Evict clean cache entries to bring memory under the limit.
+	// After flushing, all cache entries are clean (persisted to disk)
+	// and can be safely evicted — they'll be re-read from LevelDB
+	// on the next GetUTXO call.
+	if u.cacheBytes > u.maxCacheBytes/2 {
+		// Evict ~half the cache to avoid thrashing
+		target := u.maxCacheBytes / 4
+		for op, entry := range u.cache {
+			if u.cacheBytes <= target {
+				break
+			}
+			u.cacheBytes -= estimateEntrySize(entry)
+			delete(u.cache, op)
+		}
+	}
 
 	return nil
 }
