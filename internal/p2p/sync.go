@@ -216,9 +216,14 @@ func (sm *SyncManager) syncHandler() {
 			syncPeer := sm.syncPeer
 			sm.mu.RUnlock()
 
-			// If not synced and no sync peer, try again
 			if !synced && syncPeer == nil {
+				// Not yet synced — try to start header sync
 				sm.startHeaderSync()
+			} else if synced {
+				// Already synced — send periodic getheaders to discover
+				// new blocks.  This catches blocks missed by inv messages.
+				// Reference: Bitcoin Core SendMessages() periodic header fetch.
+				sm.sendPeriodicGetHeaders()
 			}
 
 		case <-sm.quit:
@@ -509,7 +514,63 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 		OnNotFound: func(p *Peer, msg *MsgNotFound) {
 			sm.HandleNotFound(p, msg)
 		},
+		OnInv: func(p *Peer, msg *MsgInv) {
+			sm.HandleInv(p, msg)
+		},
 	}
+}
+
+// HandleInv processes an inv message from a peer.
+// When a peer announces new blocks via inv, request headers to learn
+// about them.  This is how nodes at tip discover new blocks.
+// Reference: Bitcoin Core net_processing.cpp ProcessMessage("inv").
+// HandleInv processes an inv message from a peer.
+// When a peer announces new blocks via inv, request headers to learn
+// about them.  This is how nodes at tip discover new blocks.
+// Reference: Bitcoin Core net_processing.cpp ProcessMessage("inv").
+func (sm *SyncManager) HandleInv(peer *Peer, msg *MsgInv) {
+	hasBlock := false
+	for _, inv := range msg.InvList {
+		baseType := inv.Type &^ InvWitnessFlag
+		if baseType == InvTypeBlock {
+			hasBlock = true
+			break
+		}
+	}
+	if !hasBlock {
+		return
+	}
+
+	sm.sendGetHeadersTo(peer)
+}
+
+// sendPeriodicGetHeaders sends getheaders to a random peer to discover
+// new blocks.  Called periodically after IBD completes.
+func (sm *SyncManager) sendPeriodicGetHeaders() {
+	sm.mu.RLock()
+	pm := sm.peerMgr
+	sm.mu.RUnlock()
+	if pm == nil {
+		return
+	}
+
+	peers := pm.ConnectedPeers()
+	if len(peers) == 0 {
+		return
+	}
+	// Pick a random peer
+	peer := peers[time.Now().UnixNano()%int64(len(peers))]
+	sm.sendGetHeadersTo(peer)
+}
+
+// sendGetHeadersTo sends a getheaders message to a specific peer using
+// our current chain tip as the locator.
+func (sm *SyncManager) sendGetHeadersTo(peer *Peer) {
+	if sm.chainMgr == nil {
+		return
+	}
+	bestHash, _ := sm.chainMgr.BestBlock()
+	sm.sendGetHeaders(peer, []wire.Hash256{bestHash})
 }
 
 // HandleNotFound processes a notfound message from a peer.
