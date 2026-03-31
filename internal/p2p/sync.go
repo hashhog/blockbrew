@@ -779,6 +779,9 @@ func (sm *SyncManager) blockDownloadLoop() {
 
 		if done {
 			log.Printf("sync: IBD complete")
+			sm.mu.Lock()
+			sm.ibdActive = false
+			sm.mu.Unlock()
 			return
 		}
 	}
