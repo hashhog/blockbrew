@@ -267,15 +267,21 @@ func (u *UTXOSet) flushLocked() error {
 	// and can be safely evicted — they'll be re-read from LevelDB
 	// on the next GetUTXO call.
 	if u.cacheBytes > u.maxCacheBytes/2 {
-		// Evict ~half the cache to avoid thrashing
+		// Rebuild the cache map with only entries we want to keep.
+		// Go maps never shrink their hash table on delete(), so we must
+		// allocate a new map to actually free memory.
 		target := u.maxCacheBytes / 4
+		newCache := make(map[wire.OutPoint]*UTXOEntry, len(u.cache)/2)
+		var newBytes int64
 		for op, entry := range u.cache {
-			if u.cacheBytes <= target {
-				break
+			if newBytes >= target {
+				continue // Skip — already at target
 			}
-			u.cacheBytes -= estimateEntrySize(entry)
-			delete(u.cache, op)
+			newCache[op] = entry
+			newBytes += estimateEntrySize(entry)
 		}
+		u.cache = newCache
+		u.cacheBytes = newBytes
 	}
 
 	return nil
