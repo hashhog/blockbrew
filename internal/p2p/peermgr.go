@@ -1257,23 +1257,10 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 		}
 	}
 
-	// Handle inv messages: request blocks we don't have
-	listeners.OnInv = func(p *Peer, msg *MsgInv) {
-		var blockItems []*InvVect
-		for _, iv := range msg.InvList {
-			if iv.Type == InvTypeBlock || iv.Type == InvTypeWitnessBlock {
-				blockItems = append(blockItems, &InvVect{
-					Type: InvTypeWitnessBlock, // Request witness data
-					Hash: iv.Hash,
-				})
-			}
-		}
-		if len(blockItems) > 0 {
-			log.Printf("Requesting %d blocks from %s", len(blockItems), p.Address())
-			getdata := &MsgGetData{InvList: blockItems}
-			p.SendMessage(getdata)
-		}
-	}
+	// Block inv handling is done by the sync manager, not here.
+	// The sync manager uses headers-first download with its own getdata
+	// pipeline. Requesting blocks from inv here during IBD causes
+	// unsolicited tip blocks to arrive and corrupt the download queue.
 
 	return listeners
 }
