@@ -665,7 +665,12 @@ func (sm *SyncManager) StartBlockDownload() {
 		nodes[i], nodes[j] = nodes[j], nodes[i]
 	}
 	sm.blockQueue = make([]*blockRequest, 0, len(nodes))
+	zeroHash := wire.Hash256{}
 	for _, n := range nodes {
+		if n.Hash == zeroHash {
+			log.Printf("sync: WARNING: zero hash for block at height %d (parent=%v)", n.Height, n.Parent)
+			continue // Skip zero-hash nodes
+		}
 		sm.blockQueue = append(sm.blockQueue, &blockRequest{
 			Hash:   n.Hash,
 			Height: n.Height,
