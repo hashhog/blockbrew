@@ -31,13 +31,13 @@ const (
 	BlockRequestTimeout = 2 * time.Minute
 
 	// BaseStallTimeout is the initial stall detection timeout.
-	BaseStallTimeout = 5 * time.Second
+	BaseStallTimeout = 30 * time.Second
 
 	// MaxStallTimeout is the maximum stall timeout after adaptive backoff.
-	MaxStallTimeout = 30 * time.Second
+	MaxStallTimeout = 120 * time.Second
 
 	// MaxRetriesBeforeRotate is how many timeouts before we avoid a peer.
-	MaxRetriesBeforeRotate = 1
+	MaxRetriesBeforeRotate = 3
 
 	// ProgressLogInterval is how often to log IBD progress.
 	ProgressLogInterval = 10 * time.Second
