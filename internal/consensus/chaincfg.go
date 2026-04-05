@@ -3,6 +3,7 @@ package consensus
 import (
 	"math/big"
 
+	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -33,6 +34,12 @@ type ChainParams struct {
 	MinDiffReductionTime   bool // Testnet allows min-difficulty blocks after 20min gap
 	PowNoRetargeting       bool // Regtest: never adjust difficulty
 	EnforceBIP94           bool // Testnet4: use first block of period for retarget base
+
+	// ScriptFlagExceptions maps block hashes to override script verification
+	// flags. Bitcoin Core uses this to handle historical blocks that would fail
+	// under current rules (e.g., BIP16 P2SH exception at block 170,060 on
+	// mainnet, and one Taproot exception block).
+	ScriptFlagExceptions map[wire.Hash256]script.ScriptFlags
 
 	// BIP9 deployments tracked via version bits.
 	Deployments []*BIP9Deployment
@@ -125,6 +132,20 @@ func MainnetParams() *ChainParams {
 		PowNoRetargeting:       false,
 		EnforceBIP94:           false,
 
+		// Script flag exceptions for historical blocks that violate current rules.
+		// BIP16 exception: block 170,060 has a transaction that fails P2SH validation.
+		// Taproot exception: one historical block violates taproot rules.
+		ScriptFlagExceptions: func() map[wire.Hash256]script.ScriptFlags {
+			m := make(map[wire.Hash256]script.ScriptFlags)
+			// BIP16 exception (block 170,060) — skip all script flags
+			bip16Ex, _ := wire.NewHash256FromHex("00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22")
+			m[bip16Ex] = script.ScriptFlags(0) // SCRIPT_VERIFY_NONE
+			// Taproot exception — allow P2SH + witness but not taproot
+			taprootEx, _ := wire.NewHash256FromHex("0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad")
+			m[taprootEx] = script.ScriptVerifyP2SH | script.ScriptVerifyWitness
+			return m
+		}(),
+
 		// BIP9 deployments - mainnet uses height-based activation (buried deployments)
 		// These are historical for reference; actual activation uses hardcoded heights.
 		Deployments: []*BIP9Deployment{
@@ -138,6 +159,15 @@ func MainnetParams() *ChainParams {
 				Period:              2016,
 				Threshold:           1815, // 90%
 			},
+		},
+
+		// Assume-valid block hash for mainnet (height 938343)
+		// Display: 00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac
+		AssumeValidHash: wire.Hash256{
+			0xac, 0xa5, 0x1b, 0xd5, 0xfa, 0x4b, 0x09, 0x8e,
+			0x47, 0x7c, 0x17, 0x1d, 0xdc, 0xdc, 0xd8, 0x94,
+			0x91, 0x4d, 0xd7, 0xd6, 0xeb, 0xcc, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		},
 
 		// AssumeUTXO snapshot data
@@ -189,6 +219,14 @@ func TestnetParams() *ChainParams {
 		MinDiffReductionTime:   true,
 		PowNoRetargeting:       false,
 		EnforceBIP94:           false,
+
+		// Script flag exceptions for testnet3 (BIP16 exception)
+		ScriptFlagExceptions: func() map[wire.Hash256]script.ScriptFlags {
+			m := make(map[wire.Hash256]script.ScriptFlags)
+			bip16Ex, _ := wire.NewHash256FromHex("00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105")
+			m[bip16Ex] = script.ScriptFlags(0)
+			return m
+		}(),
 
 		// BIP9 deployments for testnet3
 		Deployments: []*BIP9Deployment{

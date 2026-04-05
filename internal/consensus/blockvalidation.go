@@ -368,8 +368,9 @@ func ValidateBlockWithOptions(block *wire.MsgBlock, prevHeader *wire.BlockHeader
 		}
 	}
 
-	// Get script flags for this block height
-	scriptFlags := GetBlockScriptFlags(height, params)
+	// Get script flags for this block (hash checked against exception map)
+	blockHash := block.Header.BlockHash()
+	scriptFlags := GetBlockScriptFlags(height, params, blockHash)
 
 	// Calculate expected subsidy
 	subsidy := CalcBlockSubsidy(height)
