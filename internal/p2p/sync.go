@@ -117,6 +117,9 @@ type ChainConnector interface {
 	ConnectBlock(block *wire.MsgBlock) error
 	// BestBlock returns the current chain tip hash and height.
 	BestBlock() (wire.Hash256, int32)
+	// ReloadChainState re-resolves the chain tip and assume-valid height
+	// from the database after the header index has been populated.
+	ReloadChainState()
 }
 
 // SyncManagerConfig configures the sync manager.
@@ -1144,6 +1147,8 @@ func (sm *SyncManager) connectionWorker() {
 	retryTicker := time.NewTicker(5 * time.Second)
 	defer retryTicker.Stop()
 
+	var lastPendingWarn time.Time // rate-limit "pending map too large" warnings
+
 	connectPending := func() {
 		// Evict blocks that are behind nextHeight (already connected or skipped)
 		sm.mu.RLock()
@@ -1158,7 +1163,10 @@ func (sm *SyncManager) connectionWorker() {
 		// If pending is too large, drop blocks that are far ahead
 		// to prevent unbounded memory growth
 		if len(pending) > MaxPendingBlocks {
-			log.Printf("sync: pending map too large (%d entries), evicting distant blocks", len(pending))
+			if time.Since(lastPendingWarn) >= 30*time.Second {
+				log.Printf("sync: pending map too large (%d entries), evicting distant blocks", len(pending))
+				lastPendingWarn = time.Now()
+			}
 			maxKeep := nh + int32(MaxPendingBlocks)
 			for h := range pending {
 				if h > maxKeep {
@@ -1320,6 +1328,25 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 					// No gap — the preceding block just hasn't been
 					// connected yet. Wait for it.
 					break
+				}
+
+				// Check if this block has a script flag exception (e.g., the
+				// BIP16 exception at height 170,060).  If so, the failure is
+				// almost certainly because assume-valid was not resolved and
+				// the flags override alone was insufficient.  Rather than
+				// permanently skipping the block, force assume-valid resolution
+				// and keep it pending so it gets retried.
+				if sm.chainParams != nil && sm.chainParams.ScriptFlagExceptions != nil {
+					if _, isException := sm.chainParams.ScriptFlagExceptions[bwr.req.Hash]; isException {
+						log.Printf("sync: block %d (%s) is a script-flag exception — will not skip; retrying",
+							nextHeight, bwr.req.Hash.String()[:16])
+						// Try to force assume-valid resolution in the chain manager
+						if sm.chainMgr != nil {
+							sm.chainMgr.ReloadChainState()
+						}
+						// Leave the block pending for the retry timer
+						break
+					}
 				}
 
 				// Genuine validation error: mark as invalid and skip

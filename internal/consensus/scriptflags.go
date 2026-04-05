@@ -5,10 +5,23 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
-// GetBlockScriptFlags returns the script verification flags for a given block height.
+// GetBlockScriptFlags returns the script verification flags for a given block.
 // This function returns ONLY consensus-critical flags. Adding policy flags here
 // will cause valid blocks to be rejected.
-func GetBlockScriptFlags(height int32, params *ChainParams) script.ScriptFlags {
+//
+// The blockHash parameter is checked against ScriptFlagExceptions in the chain
+// params, matching Bitcoin Core's handling of historical blocks that violate
+// current rules (BIP16 exception at block 170,060, taproot exception, etc.).
+func GetBlockScriptFlags(height int32, params *ChainParams, blockHash wire.Hash256) script.ScriptFlags {
+	// Check for per-block script flag exceptions (e.g., BIP16 exception at
+	// block 170,060 on mainnet). Bitcoin Core does this in GetBlockScriptFlags
+	// in validation.cpp.
+	if params.ScriptFlagExceptions != nil {
+		if overrideFlags, ok := params.ScriptFlagExceptions[blockHash]; ok {
+			return overrideFlags
+		}
+	}
+
 	var flags script.ScriptFlags
 
 	// P2SH is always active (activated at height 173805 on mainnet, but we

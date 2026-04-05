@@ -452,7 +452,10 @@ func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 
 // getStandardScriptFlags returns script validation flags for mempool validation.
 func (mp *Mempool) getStandardScriptFlags() script.ScriptFlags {
-	return consensus.GetBlockScriptFlags(mp.chainHeight, mp.config.ChainParams)
+	// Mempool uses current chain tip flags — no exception hash needed
+	// (exceptions are only for historical blocks during IBD).
+	var zeroHash wire.Hash256
+	return consensus.GetBlockScriptFlags(mp.chainHeight, mp.config.ChainParams, zeroHash)
 }
 
 // validateScriptsLocked validates transaction scripts.
