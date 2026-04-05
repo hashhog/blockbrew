@@ -148,11 +148,23 @@ func (cm *ChainManager) loadChainState() {
 // header index has been populated (e.g. after P2P header sync completes).
 // This is needed because on startup the header index only contains the genesis
 // block, so loadChainState cannot find the saved tip.
+// It also resolves the assume-valid height if not yet resolved.
 func (cm *ChainManager) ReloadChainState() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Only reload if currently at genesis — don't clobber a valid tip
+	// Resolve assume-valid height if not yet done.  This must happen even
+	// when the chain tip is already known, because the assume-valid block
+	// might not have been in the header index at startup.
+	if cm.assumeValidHeight == 0 && !cm.assumeValidHash.IsZero() {
+		avNode := cm.headerIndex.GetNode(cm.assumeValidHash)
+		if avNode != nil {
+			cm.assumeValidHeight = avNode.Height
+			log.Printf("chainmgr: assume-valid resolved at height %d during ReloadChainState", cm.assumeValidHeight)
+		}
+	}
+
+	// Only reload chain tip if currently at genesis — don't clobber a valid tip
 	if cm.tipHeight > 0 {
 		return
 	}
@@ -247,8 +259,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		return fmt.Errorf("block context check failed: %w", err)
 	}
 
-	// Get script flags for this height
-	flags := GetBlockScriptFlags(node.Height, cm.params)
+	// Get script flags for this block (hash checked against exception map)
+	flags := GetBlockScriptFlags(node.Height, cm.params, hash)
 
 	// Calculate expected subsidy
 	subsidy := CalcBlockSubsidy(node.Height)
@@ -482,7 +494,9 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		log.Printf("chainmgr: exiting IBD mode at height %d", cm.tipHeight)
 	}
 
-	// Persist undo data and chain state
+	// Persist undo data and chain state.
+	// IMPORTANT: UTXO flush MUST happen BEFORE chain state is written so
+	// that a crash never leaves the chain tip ahead of the UTXO set.
 	if cm.chainDB != nil {
 		// Write undo data keyed by block hash (not height, since heights can change during reorgs)
 		if generateUndo {
@@ -491,14 +505,6 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			}
 		}
 		cm.chainDB.SetBlockHeight(node.Height, hash)
-		// During IBD, batch chain state writes (every flushInterval blocks)
-		// to reduce disk I/O. Post-IBD, write every block for crash safety.
-		if !cm.isIBD || cm.blocksSinceFlush+1 >= cm.flushInterval {
-			cm.chainDB.SetChainState(&storage.ChainState{
-				BestHash:   hash,
-				BestHeight: node.Height,
-			})
-		}
 	}
 
 	// Periodic UTXO flush during IBD
@@ -506,6 +512,18 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	if cm.blocksSinceFlush >= cm.flushInterval {
 		cm.flushUTXOs()
 		cm.blocksSinceFlush = 0
+	}
+
+	// Write chain state AFTER UTXO flush to ensure consistency on crash.
+	// During IBD, batch writes every flushInterval blocks to reduce I/O.
+	// Post-IBD, write every block for crash safety.
+	if cm.chainDB != nil {
+		if !cm.isIBD || cm.blocksSinceFlush == 0 {
+			cm.chainDB.SetChainState(&storage.ChainState{
+				BestHash:   hash,
+				BestHeight: node.Height,
+			})
+		}
 	}
 
 	return nil

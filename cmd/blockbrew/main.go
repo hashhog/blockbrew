@@ -2,9 +2,12 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -463,6 +466,19 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	}
 	log.Printf("UTXO set flushed")
 
+	// Persist chain state AFTER UTXO flush for crash consistency
+	bestHash, bestHeight := chainMgr.BestBlock()
+	if bestHeight > 0 {
+		if err := chainDB.SetChainState(&storage.ChainState{
+			BestHash:   bestHash,
+			BestHeight: bestHeight,
+		}); err != nil {
+			log.Printf("Warning: chain state save failed: %v", err)
+		} else {
+			log.Printf("Chain state saved at height %d", bestHeight)
+		}
+	}
+
 	if err := db.Close(); err != nil {
 		log.Printf("Warning: database close failed: %v", err)
 	}
@@ -485,6 +501,9 @@ func handleSubcommands(args []string) bool {
 		return true
 	case "wallet":
 		handleWalletCommand(args[1:])
+		return true
+	case "import-blocks":
+		handleImportBlocks(args[1:])
 		return true
 	case "help":
 		printHelp()
@@ -542,14 +561,183 @@ func handleWalletCommand(args []string) {
 	}
 }
 
+// handleImportBlocks reads framed blocks from stdin and connects them.
+// Frame format: [4 bytes height LE] [4 bytes size LE] [size bytes raw block]
+func handleImportBlocks(args []string) {
+	log.SetPrefix("[blockbrew] ")
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
+	// Parse flags for import-blocks subcommand
+	fs := flag.NewFlagSet("import-blocks", flag.ExitOnError)
+	homeDir, _ := os.UserHomeDir()
+	defaultDataDir := filepath.Join(homeDir, defaultDir)
+
+	dataDir := fs.String("datadir", defaultDataDir, "Data directory")
+	network := fs.String("network", "mainnet", "Network (mainnet, testnet, regtest, signet, testnet4)")
+	parallelScripts := fs.Bool("parallelscripts", true, "Enable parallel script validation")
+	fs.Parse(args)
+
+	var chainParams *consensus.ChainParams
+	switch *network {
+	case "mainnet":
+		chainParams = consensus.MainnetParams()
+	case "testnet":
+		chainParams = consensus.TestnetParams()
+	case "regtest":
+		chainParams = consensus.RegtestParams()
+	case "signet":
+		chainParams = consensus.SignetParams()
+	case "testnet4":
+		chainParams = consensus.Testnet4Params()
+	default:
+		log.Fatalf("Unknown network: %s", *network)
+	}
+
+	// For non-mainnet networks, create a subdirectory
+	actualDataDir := *dataDir
+	if *network != "mainnet" {
+		actualDataDir = filepath.Join(*dataDir, *network)
+	}
+
+	if err := os.MkdirAll(actualDataDir, 0700); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
+
+	log.Printf("import-blocks: network=%s datadir=%s", *network, actualDataDir)
+
+	// Open database
+	dbPath := filepath.Join(actualDataDir, "chaindata")
+	db, err := storage.NewPebbleDB(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+	chainDB := storage.NewChainDB(db)
+
+	// Initialize header index
+	headerIndex := consensus.NewHeaderIndex(chainParams)
+
+	// Load persisted chain state
+	chainState, err := chainDB.GetChainState()
+	if err != nil {
+		log.Printf("No existing chain state found, starting fresh")
+		genesisHash := chainParams.GenesisBlock.Header.BlockHash()
+		if err := chainDB.StoreBlock(genesisHash, chainParams.GenesisBlock); err != nil {
+			log.Printf("Warning: failed to store genesis block: %v", err)
+		}
+		if err := chainDB.SetBlockHeight(0, genesisHash); err != nil {
+			log.Printf("Warning: failed to set genesis height: %v", err)
+		}
+		if err := chainDB.SetChainState(&storage.ChainState{BestHash: genesisHash, BestHeight: 0}); err != nil {
+			log.Printf("Warning: failed to set chain state: %v", err)
+		}
+	} else {
+		log.Printf("Loaded chain state: height=%d hash=%s", chainState.BestHeight, chainState.BestHash.String()[:16])
+	}
+
+	// Initialize UTXO set and chain manager
+	utxoSet := consensus.NewUTXOSet(chainDB)
+	chainMgr := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:          chainParams,
+		HeaderIndex:     headerIndex,
+		ChainDB:         chainDB,
+		UTXOSet:         utxoSet,
+		AssumeValidHash: chainParams.AssumeValidHash,
+		ParallelScripts: *parallelScripts,
+	})
+
+	_, tipHeight := chainMgr.BestBlock()
+	log.Printf("Chain tip at height %d, starting import from stdin", tipHeight)
+
+	// Read framed blocks from stdin
+	reader := bufio.NewReaderSize(os.Stdin, 4*1024*1024) // 4MB buffer
+	frameBuf := make([]byte, 8)
+	imported := 0
+	skipped := 0
+	startTime := time.Now()
+	lastLogTime := startTime
+
+	for {
+		// Read frame header: [4 bytes height LE] [4 bytes size LE]
+		_, err := io.ReadFull(reader, frameBuf)
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			log.Fatalf("Error reading frame header: %v", err)
+		}
+
+		frameHeight := int32(binary.LittleEndian.Uint32(frameBuf[0:4]))
+		frameSize := binary.LittleEndian.Uint32(frameBuf[4:8])
+
+		if frameSize == 0 || frameSize > 4*1024*1024 { // 4MB max block
+			log.Fatalf("Invalid frame size %d at height %d", frameSize, frameHeight)
+		}
+
+		// Read block data
+		blockData := make([]byte, frameSize)
+		_, err = io.ReadFull(reader, blockData)
+		if err != nil {
+			log.Fatalf("Error reading block data at height %d: %v", frameHeight, err)
+		}
+
+		// Skip blocks we already have
+		if frameHeight <= tipHeight {
+			skipped++
+			continue
+		}
+
+		// Deserialize the block
+		var block wire.MsgBlock
+		blockReader := bytes.NewReader(blockData)
+		if err := block.Deserialize(blockReader); err != nil {
+			log.Fatalf("Error deserializing block at height %d: %v", frameHeight, err)
+		}
+
+		// Add header to header index (required by ConnectBlock)
+		_, err = headerIndex.AddHeader(block.Header)
+		if err != nil && err != consensus.ErrDuplicateHeader {
+			log.Fatalf("Error adding header at height %d: %v", frameHeight, err)
+		}
+
+		// Connect the block
+		if err := chainMgr.ConnectBlock(&block); err != nil {
+			log.Fatalf("Error connecting block at height %d: %v", frameHeight, err)
+		}
+
+		imported++
+
+		// Log progress periodically
+		now := time.Now()
+		if now.Sub(lastLogTime) >= 10*time.Second || imported%10000 == 0 {
+			elapsed := now.Sub(startTime).Seconds()
+			rate := float64(imported) / elapsed
+			log.Printf("import-blocks: height=%d imported=%d skipped=%d rate=%.1f blk/s",
+				frameHeight, imported, skipped, rate)
+			lastLogTime = now
+		}
+	}
+
+	// Final flush
+	if err := utxoSet.Flush(); err != nil {
+		log.Printf("Warning: UTXO flush failed: %v", err)
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	rate := float64(imported) / elapsed
+	log.Printf("import-blocks complete: imported=%d skipped=%d elapsed=%.1fs rate=%.1f blk/s",
+		imported, skipped, elapsed, rate)
+}
+
 func printHelp() {
 	fmt.Printf("blockbrew v%s - A Bitcoin full node in Go\n\n", version)
 	fmt.Println("Usage: blockbrew [options] [command]")
 	fmt.Println()
 	fmt.Println("Commands:")
-	fmt.Println("  version       Print version and exit")
-	fmt.Println("  wallet        Wallet management commands")
-	fmt.Println("  help          Print this help message")
+	fmt.Println("  version          Print version and exit")
+	fmt.Println("  wallet           Wallet management commands")
+	fmt.Println("  import-blocks    Import blocks from stdin (framed format)")
+	fmt.Println("  help             Print this help message")
 	fmt.Println()
 	fmt.Println("Options:")
 	fmt.Println("  --datadir       Data directory (default: ~/.blockbrew)")
@@ -572,8 +760,9 @@ func printHelp() {
 	fmt.Println("  --parallelscripts  Enable parallel script validation (default: true)")
 	fmt.Println()
 	fmt.Println("Examples:")
-	fmt.Println("  blockbrew                          Start node on mainnet")
-	fmt.Println("  blockbrew --network regtest        Start node on regtest")
-	fmt.Println("  blockbrew wallet create            Generate new wallet")
-	fmt.Println("  blockbrew --version                Print version")
+	fmt.Println("  blockbrew                                           Start node on mainnet")
+	fmt.Println("  blockbrew --network regtest                         Start node on regtest")
+	fmt.Println("  blockbrew wallet create                             Generate new wallet")
+	fmt.Println("  blockbrew import-blocks --network mainnet < blocks  Import blocks from stdin")
+	fmt.Println("  blockbrew --version                                 Print version")
 }

@@ -837,7 +837,9 @@ func TestGetBlockScriptFlags(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run("", func(t *testing.T) {
-			flags := GetBlockScriptFlags(tt.height, params)
+			// Use a zero hash — tests are for height-based flag logic, not exceptions
+			var zeroHash wire.Hash256
+			flags := GetBlockScriptFlags(tt.height, params, zeroHash)
 
 			// Note: We import script package for ScriptFlags constants
 			hasP2SH := flags&0x01 != 0
