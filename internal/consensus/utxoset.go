@@ -19,8 +19,8 @@ var (
 // This corresponds roughly to 450 MB of memory usage.
 const DefaultCacheMaxEntries = 5_000_000
 
-// DefaultCacheMaxBytes is the maximum approximate cache size in bytes (256MB).
-const DefaultCacheMaxBytes = 256 * 1024 * 1024
+// DefaultCacheMaxBytes is the maximum approximate cache size in bytes (2GB).
+const DefaultCacheMaxBytes = 2 * 1024 * 1024 * 1024
 
 // IBDFlushInterval is the number of blocks between forced UTXO flushes during IBD.
 // Larger values improve IBD performance but use more memory.
