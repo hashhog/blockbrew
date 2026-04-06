@@ -284,13 +284,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		cm.tipHeight = node.Height
 		node.Status |= StatusFullyValid
 		if cm.chainDB != nil {
+			batch := cm.chainDB.NewBatch()
 			emptyUndo := &storage.BlockUndo{}
-			cm.chainDB.WriteBlockUndo(hash, emptyUndo)
-			cm.chainDB.SetBlockHeight(node.Height, hash)
-			cm.chainDB.SetChainState(&storage.ChainState{
+			cm.chainDB.WriteBlockUndoBatch(batch, hash, emptyUndo)
+			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
+			cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
 				BestHash:   hash,
 				BestHeight: node.Height,
 			})
+			if err := batch.Write(); err != nil {
+				return fmt.Errorf("failed to write genesis block batch: %w", err)
+			}
 		}
 		return nil
 	}
