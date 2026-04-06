@@ -494,36 +494,68 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		log.Printf("chainmgr: exiting IBD mode at height %d", cm.tipHeight)
 	}
 
-	// Persist undo data and chain state.
-	// IMPORTANT: UTXO flush MUST happen BEFORE chain state is written so
-	// that a crash never leaves the chain tip ahead of the UTXO set.
-	if cm.chainDB != nil {
-		// Write undo data keyed by block hash (not height, since heights can change during reorgs)
-		if generateUndo {
-			if err := cm.chainDB.WriteBlockUndo(hash, blockUndo); err != nil {
-				return fmt.Errorf("failed to write undo data: %w", err)
-			}
-		}
-		cm.chainDB.SetBlockHeight(node.Height, hash)
-	}
-
 	// Periodic UTXO flush during IBD
 	cm.blocksSinceFlush++
-	if cm.blocksSinceFlush >= cm.flushInterval {
-		cm.flushUTXOs()
-		cm.blocksSinceFlush = 0
+	shouldFlush := cm.blocksSinceFlush >= cm.flushInterval
+
+	// Persist block data atomically: undo data, block height, UTXO set, and
+	// chain state are written in a single batch so a crash can never leave the
+	// chain tip ahead of (or behind) the UTXO set.
+	if cm.chainDB != nil {
+		writeChainState := !cm.isIBD || shouldFlush
+
+		if writeChainState || generateUndo {
+			batch := cm.chainDB.NewBatch()
+
+			// Undo data keyed by block hash (not height, since heights can change during reorgs)
+			if generateUndo {
+				cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
+			}
+
+			// Height -> hash mapping
+			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
+
+			// UTXO flush into the same batch when it's time
+			if shouldFlush {
+				type batchFlusher interface {
+					FlushBatch(storage.Batch) error
+				}
+				if f, ok := cm.utxoSet.(batchFlusher); ok {
+					if err := f.FlushBatch(batch); err != nil {
+						return fmt.Errorf("failed to flush UTXOs to batch: %w", err)
+					}
+				}
+			}
+
+			// Chain state (tip hash + height) in the same atomic batch
+			if writeChainState {
+				cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+					BestHash:   hash,
+					BestHeight: node.Height,
+				})
+			}
+
+			if err := batch.Write(); err != nil {
+				return fmt.Errorf("failed to write atomic block batch: %w", err)
+			}
+
+			if shouldFlush {
+				log.Printf("chainmgr: UTXO flush at height %d (atomic)", cm.tipHeight)
+			}
+		} else {
+			// During IBD between flushes, still persist height mapping
+			cm.chainDB.SetBlockHeight(node.Height, hash)
+			// Write undo data individually between flush intervals
+			if generateUndo {
+				if err := cm.chainDB.WriteBlockUndo(hash, blockUndo); err != nil {
+					return fmt.Errorf("failed to write undo data: %w", err)
+				}
+			}
+		}
 	}
 
-	// Write chain state AFTER UTXO flush to ensure consistency on crash.
-	// During IBD, batch writes every flushInterval blocks to reduce I/O.
-	// Post-IBD, write every block for crash safety.
-	if cm.chainDB != nil {
-		if !cm.isIBD || cm.blocksSinceFlush == 0 {
-			cm.chainDB.SetChainState(&storage.ChainState{
-				BestHash:   hash,
-				BestHeight: node.Height,
-			})
-		}
+	if shouldFlush {
+		cm.blocksSinceFlush = 0
 	}
 
 	return nil

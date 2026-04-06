@@ -130,6 +130,28 @@ func (c *ChainDB) SetChainState(state *ChainState) error {
 	return c.db.Put(ChainStateKey, state.Serialize())
 }
 
+// SetChainStateBatch adds a chain state write to an existing batch (for atomic writes).
+func (c *ChainDB) SetChainStateBatch(batch Batch, state *ChainState) {
+	batch.Put(ChainStateKey, state.Serialize())
+}
+
+// SetBlockHeightBatch adds a height->hash mapping to an existing batch (for atomic writes).
+func (c *ChainDB) SetBlockHeightBatch(batch Batch, height int32, hash wire.Hash256) {
+	key := MakeBlockHeightKey(height)
+	batch.Put(key, hash[:])
+}
+
+// WriteBlockUndoBatch adds undo data to an existing batch (for atomic writes).
+func (c *ChainDB) WriteBlockUndoBatch(batch Batch, hash wire.Hash256, undo *BlockUndo) {
+	key := MakeUndoBlockKey(hash)
+	batch.Put(key, undo.Serialize())
+}
+
+// NewBatch creates a new write batch from the underlying database.
+func (c *ChainDB) NewBatch() Batch {
+	return c.db.NewBatch()
+}
+
 // Close closes the underlying database.
 func (c *ChainDB) Close() error {
 	return c.db.Close()
