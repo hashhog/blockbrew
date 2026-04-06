@@ -385,8 +385,28 @@ func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 	}
 
 	// Clear dirty and deleted tracking (caller will write the batch)
-	u.dirty = make(map[wire.OutPoint]bool)
-	u.deleted = make(map[wire.OutPoint]bool)
+	u.dirty = make(map[wire.OutPoint]bool, 100_000)
+	u.deleted = make(map[wire.OutPoint]bool, 100_000)
+	u.flushes++
+	u.blocksSinceFlush = 0
+
+	// Evict clean cache entries to bring memory under the limit,
+	// same as Flush(). After the caller writes the batch, all entries
+	// are persisted and can be safely re-read from disk.
+	if u.cacheBytes > u.maxCacheBytes/2 {
+		target := u.maxCacheBytes / 4
+		newCache := make(map[wire.OutPoint]*UTXOEntry, len(u.cache)/2)
+		var newBytes int64
+		for op, entry := range u.cache {
+			if newBytes >= target {
+				continue
+			}
+			newCache[op] = entry
+			newBytes += estimateEntrySize(entry)
+		}
+		u.cache = newCache
+		u.cacheBytes = newBytes
+	}
 
 	return nil
 }
