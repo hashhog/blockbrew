@@ -1291,9 +1291,10 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (interface{}, *RPCErr
 		}
 	}
 
-	// Add header to index before connecting
+	// Add header to index before connecting (ignore duplicate — headers may
+	// already be present from P2P header sync).
 	if s.chainMgr != nil {
-		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil {
+		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil && err != consensus.ErrDuplicateHeader {
 			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to add header to index: %v", err)}
 		}
 		if err := s.chainMgr.ConnectBlock(block); err != nil {
