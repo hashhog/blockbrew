@@ -35,9 +35,9 @@ type PebbleDBConfig struct {
 // DefaultPebbleDBConfig returns the default configuration optimized for Bitcoin workloads.
 func DefaultPebbleDBConfig() PebbleDBConfig {
 	return PebbleDBConfig{
-		BlockCacheSize: 256 * 1024 * 1024, // 256MB block cache
-		MemTableSize:   64 * 1024 * 1024,  // 64MB memtable
-		MaxOpenFiles:   1000,
+		BlockCacheSize: 512 * 1024 * 1024, // 512MB block cache
+		MemTableSize:   128 * 1024 * 1024, // 128MB memtable — reduces L0 write stalls
+		MaxOpenFiles:   2000,
 		Sync:           true,
 	}
 }
@@ -70,9 +70,10 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		MaxOpenFiles:                cfg.MaxOpenFiles,
 		WALBytesPerSync:             1024 * 1024, // Sync WAL every 1MB
 
-		// L0 compaction settings
-		L0CompactionThreshold: 2, // Start compaction when L0 has 2 files
-		L0StopWritesThreshold: 8, // Stop writes when L0 has 8 files
+		// L0 compaction settings — relaxed for IBD write throughput.
+		// Default of 2 triggers compaction too eagerly during bulk writes.
+		L0CompactionThreshold: 4,  // Start compaction when L0 has 4 files
+		L0StopWritesThreshold: 12, // Stop writes when L0 has 12 files
 	}
 
 	db, err := pebble.Open(path, opts)
@@ -102,13 +103,16 @@ func (p *PebbleDB) Get(key []byte) ([]byte, error) {
 }
 
 // Put stores a key-value pair.
+// Uses NoSync by default — durable writes happen via batch Flush with Sync.
+// During IBD, crash recovery replays from the last flushed chain-state
+// checkpoint, so per-key durability is unnecessary.
 func (p *PebbleDB) Put(key, value []byte) error {
-	return p.db.Set(key, value, pebble.Sync)
+	return p.db.Set(key, value, pebble.NoSync)
 }
 
 // Delete removes a key.
 func (p *PebbleDB) Delete(key []byte) error {
-	return p.db.Delete(key, pebble.Sync)
+	return p.db.Delete(key, pebble.NoSync)
 }
 
 // Has returns true if the key exists.
@@ -129,6 +133,17 @@ func (p *PebbleDB) NewBatch() Batch {
 	return &pebbleBatch{
 		db:    p.db,
 		batch: p.db.NewBatch(),
+	}
+}
+
+// NewBatchNoSync creates a batch that skips fsync on commit.
+// Use during IBD where crash recovery is handled by replaying from a
+// persisted chain-state checkpoint.
+func (p *PebbleDB) NewBatchNoSync() Batch {
+	return &pebbleBatch{
+		db:     p.db,
+		batch:  p.db.NewBatch(),
+		noSync: true,
 	}
 }
 
@@ -186,8 +201,9 @@ func prefixUpperBound(prefix []byte) []byte {
 
 // pebbleBatch wraps a Pebble batch.
 type pebbleBatch struct {
-	db    *pebble.DB
-	batch *pebble.Batch
+	db     *pebble.DB
+	batch  *pebble.Batch
+	noSync bool // Skip fsync on commit (for IBD performance)
 }
 
 // Put adds a write operation to the batch.
@@ -202,6 +218,9 @@ func (b *pebbleBatch) Delete(key []byte) {
 
 // Write atomically applies all operations in the batch.
 func (b *pebbleBatch) Write() error {
+	if b.noSync {
+		return b.batch.Commit(pebble.NoSync)
+	}
 	return b.batch.Commit(pebble.Sync)
 }
 

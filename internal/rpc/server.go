@@ -437,6 +437,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetBlockTemplate(params)
 	case "submitblock":
 		return s.handleSubmitBlock(params)
+	case "submitblockbatch":
+		return s.handleSubmitBlockBatch(params)
 	case "getmininginfo":
 		return s.handleGetMiningInfo()
 	case "generatetoaddress":

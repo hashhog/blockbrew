@@ -509,7 +509,14 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		writeChainState := !cm.isIBD || shouldFlush
 
 		if writeChainState || generateUndo {
-			batch := cm.chainDB.NewBatch()
+			// Use NoSync for non-flush IBD batches — only the flush batch
+			// (which persists chain state) needs durability.
+			var batch storage.Batch
+			if cm.isIBD && !shouldFlush {
+				batch = cm.chainDB.NewBatchNoSync()
+			} else {
+				batch = cm.chainDB.NewBatch()
+			}
 
 			// Undo data keyed by block hash (not height, since heights can change during reorgs)
 			if generateUndo {

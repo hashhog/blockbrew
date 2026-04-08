@@ -1310,6 +1310,80 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (interface{}, *RPCErr
 	return nil, nil // Success returns null
 }
 
+// handleSubmitBlockBatch processes multiple blocks in a single RPC call.
+// Params: [[hex1, hex2, ...]]  — array of hex-encoded block strings.
+// Returns: [null, null, "error-string", ...] — per-block results.
+func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing hex array parameter"}
+	}
+
+	hexArr, ok := args[0].([]interface{})
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "First parameter must be an array of hex strings"}
+	}
+
+	results := make([]interface{}, len(hexArr))
+	for i, raw := range hexArr {
+		hexStr, ok := raw.(string)
+		if !ok {
+			results[i] = "invalid hex string"
+			continue
+		}
+
+		blockBytes, err := hex.DecodeString(hexStr)
+		if err != nil {
+			results[i] = "invalid hex encoding"
+			continue
+		}
+
+		block := &wire.MsgBlock{}
+		if err := block.Deserialize(bytes.NewReader(blockBytes)); err != nil {
+			results[i] = fmt.Sprintf("block decode failed: %v", err)
+			continue
+		}
+
+		if s.chainParams != nil {
+			if err := consensus.CheckBlockSanity(block, s.chainParams.PowLimit); err != nil {
+				results[i] = fmt.Sprintf("block sanity check failed: %v", err)
+				continue
+			}
+		}
+
+		hash := block.Header.BlockHash()
+		if _, err := s.headerIndex.AddHeader(block.Header); err != nil && err != consensus.ErrDuplicateHeader {
+			results[i] = fmt.Sprintf("header validation failed: %v", err)
+			continue
+		}
+
+		if s.chainDB != nil {
+			if err := s.chainDB.StoreBlock(hash, block); err != nil {
+				results[i] = fmt.Sprintf("failed to store block: %v", err)
+				continue
+			}
+		}
+
+		if s.chainMgr != nil {
+			if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil && err != consensus.ErrDuplicateHeader {
+				results[i] = fmt.Sprintf("failed to add header: %v", err)
+				continue
+			}
+			if err := s.chainMgr.ConnectBlock(block); err != nil {
+				results[i] = fmt.Sprintf("block connection failed: %v", err)
+				continue
+			}
+		}
+
+		results[i] = nil // success
+	}
+
+	return results, nil
+}
+
 // ============================================================================
 // Fee Estimation RPCs
 // ============================================================================
