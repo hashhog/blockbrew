@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -57,6 +58,18 @@ type Config struct {
 }
 
 func main() {
+	// Tune Go GC for large-heap IBD workloads. The default GOGC=100
+	// causes excessive GC scanning of the multi-million-entry UTXO map.
+	// GOGC=400 lets the heap grow 4x before triggering GC, dramatically
+	// reducing GC CPU overhead. GOMEMLIMIT provides a safety net so the
+	// runtime will still GC if memory approaches the limit.
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(400)
+	}
+	if os.Getenv("GOMEMLIMIT") == "" {
+		debug.SetMemoryLimit(12 * 1024 * 1024 * 1024) // 12 GiB soft limit
+	}
+
 	// Check for subcommands first
 	if len(os.Args) > 1 {
 		if handleSubcommands(os.Args[1:]) {

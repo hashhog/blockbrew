@@ -43,6 +43,10 @@ type UTXOSet struct {
 	dirty map[wire.OutPoint]bool        // Modified entries needing flush
 	// Track deletions separately since deleted entries should be flushed too
 	deleted map[wire.OutPoint]bool
+	// FRESH flag: entries created since the last flush that have never been
+	// written to the database. If a FRESH entry is spent before the next
+	// flush, we can skip both the write and the delete — a major IBD win.
+	fresh map[wire.OutPoint]bool
 
 	// Performance tracking
 	cacheBytes   int64  // Approximate memory usage of cache
@@ -50,6 +54,7 @@ type UTXOSet struct {
 	hits         uint64 // Cache hits
 	misses       uint64 // Cache misses
 	flushes      uint64 // Number of flush operations
+	freshHits    uint64 // Spends of FRESH entries (saved a write+delete)
 	blocksSinceFlush int // Blocks connected since last flush
 }
 
@@ -69,6 +74,7 @@ func NewUTXOSetWithMaxCache(db *storage.ChainDB, maxCacheBytes int64) *UTXOSet {
 		cache:         make(map[wire.OutPoint]*UTXOEntry, initialCacheSize),
 		dirty:         make(map[wire.OutPoint]bool, initialDirtySize),
 		deleted:       make(map[wire.OutPoint]bool, initialDirtySize),
+		fresh:         make(map[wire.OutPoint]bool, initialDirtySize),
 		maxCacheBytes: maxCacheBytes,
 	}
 }
@@ -136,6 +142,9 @@ func (u *UTXOSet) AddUTXO(outpoint wire.OutPoint, entry *UTXOEntry) {
 
 	u.cache[outpoint] = entry
 	u.dirty[outpoint] = true
+	// Mark as FRESH: this entry has never been written to disk.
+	// If it's spent before the next flush, we skip the write entirely.
+	u.fresh[outpoint] = true
 	delete(u.deleted, outpoint) // Clear any pending deletion
 }
 
@@ -152,6 +161,15 @@ func (u *UTXOSet) SpendUTXO(outpoint wire.OutPoint) {
 
 	delete(u.cache, outpoint)
 	delete(u.dirty, outpoint)
+
+	// FRESH optimization: if this UTXO was created since the last flush,
+	// it was never written to disk, so we don't need to delete it either.
+	if u.fresh[outpoint] {
+		delete(u.fresh, outpoint)
+		u.freshHits++
+		return
+	}
+
 	u.deleted[outpoint] = true
 }
 
@@ -171,6 +189,14 @@ func (u *UTXOSet) SpendUTXOChecked(outpoint wire.OutPoint) error {
 		u.cacheBytes -= estimateEntrySize(existing)
 		delete(u.cache, outpoint)
 		delete(u.dirty, outpoint)
+
+		// FRESH optimization: never written to disk, skip delete
+		if u.fresh[outpoint] {
+			delete(u.fresh, outpoint)
+			u.freshHits++
+			return nil
+		}
+
 		u.deleted[outpoint] = true
 		return nil
 	}
@@ -256,15 +282,16 @@ func (u *UTXOSet) flushLocked() error {
 		return err
 	}
 
-	// Clear dirty and deleted tracking (pre-size for next batch)
+	// Clear dirty, deleted, and fresh tracking (pre-size for next batch)
 	u.dirty = make(map[wire.OutPoint]bool, 100_000)
 	u.deleted = make(map[wire.OutPoint]bool, 100_000)
+	u.fresh = make(map[wire.OutPoint]bool, 100_000)
 	u.flushes++
 	u.blocksSinceFlush = 0
 
 	// Evict clean cache entries to bring memory under the limit.
 	// After flushing, all cache entries are clean (persisted to disk)
-	// and can be safely evicted — they'll be re-read from LevelDB
+	// and can be safely evicted — they'll be re-read from PebbleDB
 	// on the next GetUTXO call.
 	if u.cacheBytes > u.maxCacheBytes/2 {
 		// Rebuild the cache map with only entries we want to keep.
@@ -384,9 +411,10 @@ func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 		batch.Delete(key)
 	}
 
-	// Clear dirty and deleted tracking (caller will write the batch)
+	// Clear dirty, deleted, and fresh tracking (caller will write the batch)
 	u.dirty = make(map[wire.OutPoint]bool, 100_000)
 	u.deleted = make(map[wire.OutPoint]bool, 100_000)
+	u.fresh = make(map[wire.OutPoint]bool, 100_000)
 	u.flushes++
 	u.blocksSinceFlush = 0
 
@@ -699,6 +727,7 @@ func writeVaruint(w *bytes.Buffer, val uint64) {
 }
 
 // readVaruint reads a variable-length unsigned integer without the 32MB limit.
+// Uses stack-allocated arrays to avoid heap allocations in the hot path.
 func readVaruint(r *bytes.Reader) (uint64, error) {
 	first, err := r.ReadByte()
 	if err != nil {
@@ -708,20 +737,20 @@ func readVaruint(r *bytes.Reader) (uint64, error) {
 	var val uint64
 	switch first {
 	case 0xFD:
-		buf := make([]byte, 2)
-		if _, err := r.Read(buf); err != nil {
+		var buf [2]byte
+		if _, err := r.Read(buf[:]); err != nil {
 			return 0, err
 		}
 		val = uint64(buf[0]) | uint64(buf[1])<<8
 	case 0xFE:
-		buf := make([]byte, 4)
-		if _, err := r.Read(buf); err != nil {
+		var buf [4]byte
+		if _, err := r.Read(buf[:]); err != nil {
 			return 0, err
 		}
 		val = uint64(buf[0]) | uint64(buf[1])<<8 | uint64(buf[2])<<16 | uint64(buf[3])<<24
 	case 0xFF:
-		buf := make([]byte, 8)
-		if _, err := r.Read(buf); err != nil {
+		var buf [8]byte
+		if _, err := r.Read(buf[:]); err != nil {
 			return 0, err
 		}
 		val = uint64(buf[0]) | uint64(buf[1])<<8 | uint64(buf[2])<<16 | uint64(buf[3])<<24 |
