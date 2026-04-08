@@ -152,6 +152,19 @@ func (c *ChainDB) NewBatch() Batch {
 	return c.db.NewBatch()
 }
 
+// NewBatchNoSync creates a batch that skips fsync on commit.
+// Safe during IBD where chain-state checkpoints handle crash recovery.
+func (c *ChainDB) NewBatchNoSync() Batch {
+	type noSyncer interface {
+		NewBatchNoSync() Batch
+	}
+	if ns, ok := c.db.(noSyncer); ok {
+		return ns.NewBatchNoSync()
+	}
+	// Fallback to regular batch if backend doesn't support NoSync
+	return c.db.NewBatch()
+}
+
 // Close closes the underlying database.
 func (c *ChainDB) Close() error {
 	return c.db.Close()
