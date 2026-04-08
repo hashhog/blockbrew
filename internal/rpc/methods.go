@@ -1240,7 +1240,17 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 	}, nil
 }
 
-func (s *Server) handleSubmitBlock(params json.RawMessage) (interface{}, *RPCError) {
+func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, rpcErr *RPCError) {
+	// Recover from any panic during block deserialization or processing to
+	// prevent a malformed submitblock from crashing the node (DoS vector).
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("WARN: panic in handleSubmitBlock recovered: %v", r)
+			result = nil
+			rpcErr = &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Block processing panic: %v", r)}
+		}
+	}()
+
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
@@ -1255,10 +1265,20 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (interface{}, *RPCErr
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hex string"}
 	}
 
+	// Reject obviously oversized payloads before decoding hex.
+	// A 4MB block encodes to 8MB of hex characters.
+	if len(hexStr) > wire.MaxBlockSerializedSize*2 {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Block hex data exceeds maximum block size"}
+	}
+
 	// Decode block
 	blockBytes, err := hex.DecodeString(hexStr)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Invalid hex encoding"}
+	}
+
+	if len(blockBytes) > wire.MaxBlockSerializedSize {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Block data exceeds maximum serialized size"}
 	}
 
 	block := &wire.MsgBlock{}
@@ -1313,7 +1333,16 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (interface{}, *RPCErr
 // handleSubmitBlockBatch processes multiple blocks in a single RPC call.
 // Params: [[hex1, hex2, ...]]  — array of hex-encoded block strings.
 // Returns: [null, null, "error-string", ...] — per-block results.
-func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (interface{}, *RPCError) {
+func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interface{}, rpcErr *RPCError) {
+	// Recover from any panic during batch block processing.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("WARN: panic in handleSubmitBlockBatch recovered: %v", r)
+			result = nil
+			rpcErr = &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Batch block processing panic: %v", r)}
+		}
+	}()
+
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
@@ -1335,9 +1364,19 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (interface{}, *R
 			continue
 		}
 
+		if len(hexStr) > wire.MaxBlockSerializedSize*2 {
+			results[i] = "block hex data exceeds maximum block size"
+			continue
+		}
+
 		blockBytes, err := hex.DecodeString(hexStr)
 		if err != nil {
 			results[i] = "invalid hex encoding"
+			continue
+		}
+
+		if len(blockBytes) > wire.MaxBlockSerializedSize {
+			results[i] = "block data exceeds maximum serialized size"
 			continue
 		}
 
