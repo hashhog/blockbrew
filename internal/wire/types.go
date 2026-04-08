@@ -8,6 +8,28 @@ import (
 	"io"
 )
 
+// Sanity limits for deserialization to prevent OOM from malformed data.
+// These are generous upper bounds — consensus validation happens later.
+const (
+	// MaxBlockTransactions is the maximum number of transactions in a block.
+	// A 4MB block of minimum-size (60 byte) transactions fits ~66K txs.
+	MaxBlockTransactions = 100_000
+
+	// MaxTxInputs is the maximum number of inputs in a single transaction.
+	MaxTxInputs = 100_000
+
+	// MaxTxOutputs is the maximum number of outputs in a single transaction.
+	MaxTxOutputs = 100_000
+
+	// MaxWitnessItems is the maximum number of witness items per input.
+	MaxWitnessItems = 100_000
+
+	// MaxBlockSerializedSize is the maximum serialized block size we will
+	// attempt to deserialize (slightly above MAX_BLOCK_SERIALIZED_SIZE to
+	// allow for witness discount, matching Bitcoin Core's 4MB limit).
+	MaxBlockSerializedSize = 4_000_000
+)
+
 // Serializable is the interface for types that can be serialized to and from
 // the Bitcoin wire format.
 type Serializable interface {
@@ -325,6 +347,9 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 	}
 
 	// Read inputs
+	if inputCount > MaxTxInputs {
+		return fmt.Errorf("transaction input count %d exceeds maximum %d", inputCount, MaxTxInputs)
+	}
 	tx.TxIn = make([]*TxIn, inputCount)
 	for i := range tx.TxIn {
 		tx.TxIn[i] = &TxIn{}
@@ -337,6 +362,9 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 	outputCount, err := ReadCompactSize(r)
 	if err != nil {
 		return err
+	}
+	if outputCount > MaxTxOutputs {
+		return fmt.Errorf("transaction output count %d exceeds maximum %d", outputCount, MaxTxOutputs)
 	}
 	tx.TxOut = make([]*TxOut, outputCount)
 	for i := range tx.TxOut {
@@ -352,6 +380,9 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 			witnessCount, err := ReadCompactSize(r)
 			if err != nil {
 				return err
+			}
+			if witnessCount > MaxWitnessItems {
+				return fmt.Errorf("witness item count %d exceeds maximum %d", witnessCount, MaxWitnessItems)
 			}
 			in.Witness = make([][]byte, witnessCount)
 			for j := range in.Witness {
@@ -503,6 +534,9 @@ func (b *MsgBlock) Deserialize(r io.Reader) error {
 	txCount, err := ReadCompactSize(r)
 	if err != nil {
 		return err
+	}
+	if txCount > MaxBlockTransactions {
+		return fmt.Errorf("block transaction count %d exceeds maximum %d", txCount, MaxBlockTransactions)
 	}
 	b.Transactions = make([]*MsgTx, txCount)
 	for i := range b.Transactions {
