@@ -505,6 +505,9 @@ func handleSubcommands(args []string) bool {
 	case "import-blocks":
 		handleImportBlocks(args[1:])
 		return true
+	case "import-utxo":
+		handleImportUTXO(args[1:])
+		return true
 	case "help":
 		printHelp()
 		return true
@@ -729,6 +732,201 @@ func handleImportBlocks(args []string) {
 		imported, skipped, elapsed, rate)
 }
 
+// handleImportUTXO loads a UTXO snapshot from an HDOG file into the chainstate database.
+// HDOG format:
+//
+//	Header (52 bytes): Magic "HDOG" (4) + Version uint32 LE (4) + BlockHash (32 LE) + Height uint32 LE (4) + UTXOCount uint64 LE (8)
+//	Per UTXO: TxID (32 LE) + Vout uint32 LE (4) + Amount int64 LE (8) + HeightCB uint32 LE (4) + ScriptLen uint16 LE (2) + Script (N)
+func handleImportUTXO(args []string) {
+	log.SetPrefix("[blockbrew] ")
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+
+	fs := flag.NewFlagSet("import-utxo", flag.ExitOnError)
+	homeDir, _ := os.UserHomeDir()
+	defaultDataDir := filepath.Join(homeDir, defaultDir)
+
+	dataDir := fs.String("datadir", defaultDataDir, "Data directory")
+	network := fs.String("network", "mainnet", "Network (mainnet, testnet, regtest, signet, testnet4)")
+	filePath := fs.String("file", "", "Path to HDOG snapshot file (required)")
+	batchSize := fs.Int("batchsize", 100000, "Number of UTXOs per write batch")
+	fs.Parse(args)
+
+	if *filePath == "" {
+		fmt.Fprintln(os.Stderr, "Error: -file is required")
+		fmt.Fprintln(os.Stderr, "Usage: blockbrew import-utxo -file <path> [-datadir <dir>] [-network <net>]")
+		os.Exit(1)
+	}
+
+	// Resolve data directory
+	actualDataDir := *dataDir
+	if *network != "mainnet" {
+		actualDataDir = filepath.Join(*dataDir, *network)
+	}
+	if err := os.MkdirAll(actualDataDir, 0700); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
+
+	log.Printf("import-utxo: network=%s datadir=%s file=%s", *network, actualDataDir, *filePath)
+
+	// Open snapshot file
+	f, err := os.Open(*filePath)
+	if err != nil {
+		log.Fatalf("Failed to open snapshot file: %v", err)
+	}
+	defer f.Close()
+
+	reader := bufio.NewReaderSize(f, 8*1024*1024) // 8MB read buffer
+
+	// --- Parse HDOG header (52 bytes) ---
+	var magic [4]byte
+	if _, err := io.ReadFull(reader, magic[:]); err != nil {
+		log.Fatalf("Failed to read magic: %v", err)
+	}
+	if string(magic[:]) != "HDOG" {
+		log.Fatalf("Invalid magic: %q (expected \"HDOG\")", magic)
+	}
+
+	var hdrVersion uint32
+	if err := binary.Read(reader, binary.LittleEndian, &hdrVersion); err != nil {
+		log.Fatalf("Failed to read version: %v", err)
+	}
+	if hdrVersion != 1 {
+		log.Fatalf("Unsupported HDOG version: %d (expected 1)", hdrVersion)
+	}
+
+	var blockHash wire.Hash256
+	if _, err := io.ReadFull(reader, blockHash[:]); err != nil {
+		log.Fatalf("Failed to read block hash: %v", err)
+	}
+
+	var blockHeight uint32
+	if err := binary.Read(reader, binary.LittleEndian, &blockHeight); err != nil {
+		log.Fatalf("Failed to read block height: %v", err)
+	}
+
+	var utxoCount uint64
+	if err := binary.Read(reader, binary.LittleEndian, &utxoCount); err != nil {
+		log.Fatalf("Failed to read UTXO count: %v", err)
+	}
+
+	log.Printf("HDOG header: version=%d height=%d utxos=%d block=%s",
+		hdrVersion, blockHeight, utxoCount, blockHash.String())
+
+	// --- Open database (delete and recreate for clean import) ---
+	dbPath := filepath.Join(actualDataDir, "chaindata")
+	if _, statErr := os.Stat(dbPath); statErr == nil {
+		log.Printf("Removing existing chaindata directory for clean import...")
+		if err := os.RemoveAll(dbPath); err != nil {
+			log.Fatalf("Failed to remove existing chaindata: %v", err)
+		}
+		log.Printf("Existing chaindata removed")
+	}
+	db, err := storage.NewPebbleDB(dbPath)
+	if err != nil {
+		log.Fatalf("Failed to open database: %v", err)
+	}
+	defer db.Close()
+
+	// --- Stream UTXOs into database ---
+	batch := db.NewBatch()
+	startTime := time.Now()
+	lastLogTime := startTime
+
+	// Pre-allocate read buffer for fixed-size UTXO fields:
+	// TxID(32) + Vout(4) + Amount(8) + HeightCB(4) + ScriptLen(2) = 50 bytes
+	fixedBuf := make([]byte, 50)
+
+	for i := uint64(0); i < utxoCount; i++ {
+		// Read fixed-size fields in one call
+		if _, err := io.ReadFull(reader, fixedBuf); err != nil {
+			log.Fatalf("Failed to read UTXO %d: %v", i, err)
+		}
+
+		// Parse fields from buffer (all little-endian)
+		// txid: fixedBuf[0:32]
+		vout := binary.LittleEndian.Uint32(fixedBuf[32:36])
+		amount := int64(binary.LittleEndian.Uint64(fixedBuf[36:44]))
+		heightCB := binary.LittleEndian.Uint32(fixedBuf[44:48])
+		scriptLen := binary.LittleEndian.Uint16(fixedBuf[48:50])
+
+		// Read Script
+		script := make([]byte, scriptLen)
+		if scriptLen > 0 {
+			if _, err := io.ReadFull(reader, script); err != nil {
+				log.Fatalf("Failed to read script at UTXO %d: %v", i, err)
+			}
+		}
+
+		// Construct DB key: "U" + txid (32 bytes) + vout (4 bytes BE)
+		keyCopy := make([]byte, 1+32+4)
+		keyCopy[0] = 'U'
+		copy(keyCopy[1:33], fixedBuf[0:32])
+		binary.BigEndian.PutUint32(keyCopy[33:], vout)
+
+		// Construct DB value using the same serialization as consensus.SerializeUTXOEntry:
+		//   varint(height << 1 | coinbase) + varint(amount) + varint(compressed_script_len) + compressed_script
+		height := int32(heightCB >> 1)
+		isCoinbase := (heightCB & 1) == 1
+
+		entry := &consensus.UTXOEntry{
+			Amount:     amount,
+			PkScript:   script,
+			Height:     height,
+			IsCoinbase: isCoinbase,
+		}
+		value := consensus.SerializeUTXOEntry(entry)
+
+		batch.Put(keyCopy, value)
+
+		// Flush batch every batchSize entries
+		if (i+1)%uint64(*batchSize) == 0 {
+			if err := batch.Write(); err != nil {
+				log.Fatalf("Batch write failed at UTXO %d: %v", i, err)
+			}
+			batch.Reset()
+		}
+
+		// Log progress every 1M UTXOs
+		if (i+1)%1_000_000 == 0 {
+			now := time.Now()
+			elapsed := now.Sub(startTime).Seconds()
+			rate := float64(i+1) / elapsed
+			pct := float64(i+1) * 100 / float64(utxoCount)
+			sinceLog := now.Sub(lastLogTime).Seconds()
+			log.Printf("import-utxo: %d / %d (%.2f%%) %.0f utxo/s [%.1fs since last log, %.1fs total]",
+				i+1, utxoCount, pct, rate, sinceLog, elapsed)
+			lastLogTime = now
+		}
+	}
+
+	// Flush remaining batch
+	if batch.Len() > 0 {
+		if err := batch.Write(); err != nil {
+			log.Fatalf("Final batch write failed: %v", err)
+		}
+	}
+
+	// --- Set chain state ---
+	chainDB := storage.NewChainDB(db)
+	chainState := &storage.ChainState{
+		BestHash:   blockHash,
+		BestHeight: int32(blockHeight),
+	}
+	if err := chainDB.SetChainState(chainState); err != nil {
+		log.Fatalf("Failed to set chain state: %v", err)
+	}
+
+	// Also set the height -> hash mapping for the snapshot block
+	if err := chainDB.SetBlockHeight(int32(blockHeight), blockHash); err != nil {
+		log.Fatalf("Failed to set block height mapping: %v", err)
+	}
+
+	elapsed := time.Since(startTime).Seconds()
+	rate := float64(utxoCount) / elapsed
+	log.Printf("import-utxo complete: %d UTXOs imported in %.1fs (%.0f utxo/s)", utxoCount, elapsed, rate)
+	log.Printf("Chain tip set to height=%d hash=%s", blockHeight, blockHash.String())
+}
+
 func printHelp() {
 	fmt.Printf("blockbrew v%s - A Bitcoin full node in Go\n\n", version)
 	fmt.Println("Usage: blockbrew [options] [command]")
@@ -737,6 +935,7 @@ func printHelp() {
 	fmt.Println("  version          Print version and exit")
 	fmt.Println("  wallet           Wallet management commands")
 	fmt.Println("  import-blocks    Import blocks from stdin (framed format)")
+	fmt.Println("  import-utxo      Import UTXO snapshot from HDOG file")
 	fmt.Println("  help             Print this help message")
 	fmt.Println()
 	fmt.Println("Options:")
@@ -764,5 +963,6 @@ func printHelp() {
 	fmt.Println("  blockbrew --network regtest                         Start node on regtest")
 	fmt.Println("  blockbrew wallet create                             Generate new wallet")
 	fmt.Println("  blockbrew import-blocks --network mainnet < blocks  Import blocks from stdin")
+	fmt.Println("  blockbrew import-utxo -file snapshot.hdog           Import UTXO snapshot")
 	fmt.Println("  blockbrew --version                                 Print version")
 }
