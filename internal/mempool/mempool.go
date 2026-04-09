@@ -228,6 +228,15 @@ func (mp *Mempool) ChainHeight() int32 {
 	return mp.chainHeight
 }
 
+// AcceptToMemoryPool validates and adds a transaction to the mempool.
+// This is the canonical entry point matching Bitcoin Core's naming convention.
+// Performs all policy checks including BIP125 RBF, fee-rate validation,
+// script verification, and cluster mempool limits.
+// Returns nil if accepted, error with reason if rejected.
+func (mp *Mempool) AcceptToMemoryPool(tx *wire.MsgTx) error {
+	return mp.AddTransaction(tx)
+}
+
 // AddTransaction validates and adds a transaction to the mempool.
 // Returns nil if accepted, error with reason if rejected.
 func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
