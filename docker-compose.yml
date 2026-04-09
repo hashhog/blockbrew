@@ -1,0 +1,13 @@
+services:
+  blockbrew:
+    build: .
+    container_name: blockbrew
+    restart: unless-stopped
+    volumes:
+      - blockbrew-data:/data
+    ports:
+      - "8333:8333"
+      - "8332:8332"
+
+volumes:
+  blockbrew-data:
