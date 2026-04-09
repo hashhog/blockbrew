@@ -44,6 +44,18 @@ const (
 
 	// UTXOFlushInterval is how many blocks between UTXO flushes during IBD.
 	UTXOFlushInterval = 2000
+
+	// StaleTipCheckInterval is how often to check if our chain tip is stale.
+	// Reference: Bitcoin Core STALE_CHECK_INTERVAL (10 minutes)
+	StaleTipCheckInterval = 10 * time.Minute
+
+	// StaleTipThreshold is how long without a new block before we consider the tip stale.
+	// Reference: Bitcoin Core nPowTargetSpacing * 3 = 30 minutes
+	StaleTipThreshold = 30 * time.Minute
+
+	// PeriodicHeaderInterval is how often to send getheaders to a random peer
+	// when synced, to discover new blocks missed by inv messages.
+	PeriodicHeaderInterval = 5 * time.Minute
 )
 
 // BlockDownloadState tracks the download state of a block.
@@ -108,6 +120,10 @@ type SyncManager struct {
 	// IBD state
 	ibdActive    bool // True when downloading blocks
 	peerRoundIdx int  // Round-robin index for peer selection
+
+	// Stale tip detection (Bitcoin Core: CheckForStaleTipAndEvictPeers)
+	lastTipUpdate      time.Time // When our chain tip last advanced
+	nextStaleTipCheck  time.Time // When to next check for stale tip
 }
 
 // ChainConnector is the interface for connecting blocks to the chain.
@@ -141,20 +157,23 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		downloadWindow = DefaultDownloadWindow
 	}
 
+	now := time.Now()
 	return &SyncManager{
-		chainParams:      config.ChainParams,
-		headerIndex:      config.HeaderIndex,
-		chainDB:          config.ChainDB,
-		peerMgr:          config.PeerManager,
-		quit:             make(chan struct{}),
-		onSyncComplete:   config.OnSyncComplete,
-		onBlockConnected: config.OnBlockConnected,
-		inflight:         make(map[wire.Hash256]*blockRequest),
-		downloadWindow:   downloadWindow,
-		validationChan:   make(chan *blockWithRequest, downloadWindow),
-		connectionChan:   make(chan *blockWithRequest, downloadWindow),
-		peerStallTimeout: make(map[string]time.Duration),
-		chainMgr:         config.ChainManager,
+		chainParams:       config.ChainParams,
+		headerIndex:       config.HeaderIndex,
+		chainDB:           config.ChainDB,
+		peerMgr:           config.PeerManager,
+		quit:              make(chan struct{}),
+		onSyncComplete:    config.OnSyncComplete,
+		onBlockConnected:  config.OnBlockConnected,
+		inflight:          make(map[wire.Hash256]*blockRequest),
+		downloadWindow:    downloadWindow,
+		validationChan:    make(chan *blockWithRequest, downloadWindow),
+		connectionChan:    make(chan *blockWithRequest, downloadWindow),
+		peerStallTimeout:  make(map[string]time.Duration),
+		chainMgr:          config.ChainManager,
+		lastTipUpdate:     now,
+		nextStaleTipCheck: now.Add(StaleTipCheckInterval),
 	}
 }
 
@@ -211,6 +230,10 @@ func (sm *SyncManager) syncHandler() {
 	ticker := time.NewTicker(SyncRetryInterval)
 	defer ticker.Stop()
 
+	// Stale tip check timer — runs every 60s to detect stuck sync
+	staleTipTicker := time.NewTicker(60 * time.Second)
+	defer staleTipTicker.Stop()
+
 	for {
 		select {
 		case <-ticker.C:
@@ -228,6 +251,9 @@ func (sm *SyncManager) syncHandler() {
 				// Reference: Bitcoin Core SendMessages() periodic header fetch.
 				sm.sendPeriodicGetHeaders()
 			}
+
+		case <-staleTipTicker.C:
+			sm.checkStaleTip()
 
 		case <-sm.quit:
 			return
@@ -564,6 +590,103 @@ func (sm *SyncManager) sendPeriodicGetHeaders() {
 	// Pick a random peer
 	peer := peers[time.Now().UnixNano()%int64(len(peers))]
 	sm.sendGetHeadersTo(peer)
+}
+
+// tipMayBeStale checks if our chain tip hasn't advanced in StaleTipThreshold.
+// Reference: Bitcoin Core TipMayBeStale()
+func (sm *SyncManager) tipMayBeStale() bool {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	// Don't consider stale during active IBD with blocks in flight
+	if len(sm.inflight) > 0 {
+		return false
+	}
+	return time.Since(sm.lastTipUpdate) > StaleTipThreshold
+}
+
+// checkStaleTip detects when our chain tip hasn't advanced and triggers re-sync.
+// Reference: Bitcoin Core CheckForStaleTipAndEvictPeers()
+func (sm *SyncManager) checkStaleTip() {
+	sm.mu.RLock()
+	now := time.Now()
+	nextCheck := sm.nextStaleTipCheck
+	sm.mu.RUnlock()
+
+	if now.Before(nextCheck) {
+		return
+	}
+
+	// Schedule next check
+	sm.mu.Lock()
+	sm.nextStaleTipCheck = now.Add(StaleTipCheckInterval)
+	sm.mu.Unlock()
+
+	if !sm.tipMayBeStale() {
+		return
+	}
+
+	sm.mu.RLock()
+	staleDuration := time.Since(sm.lastTipUpdate)
+	sm.mu.RUnlock()
+
+	log.Printf("sync: potential stale tip detected (last tip update: %v ago), requesting headers from peers",
+		staleDuration.Round(time.Second))
+
+	// Get peer manager
+	sm.mu.RLock()
+	pm := sm.peerMgr
+	sm.mu.RUnlock()
+	if pm == nil {
+		return
+	}
+
+	peers := pm.ConnectedPeers()
+	if len(peers) == 0 {
+		return
+	}
+
+	// Find our current height
+	var ourHeight int32
+	if sm.chainMgr != nil {
+		_, ourHeight = sm.chainMgr.BestBlock()
+	}
+
+	// Find the peer with the highest tip and disconnect the worst peer
+	var bestPeer *Peer
+	var bestHeight int32
+	var worstPeer *Peer
+	var worstHeight int32 = int32(1<<31 - 1) // MaxInt32
+
+	for _, p := range peers {
+		peerHeight := p.StartHeight()
+		if peerHeight > bestHeight {
+			bestHeight = peerHeight
+			bestPeer = p
+		}
+		if peerHeight < worstHeight {
+			worstHeight = peerHeight
+			worstPeer = p
+		}
+	}
+
+	// If any peer reports a higher tip than ours, we're behind
+	if bestPeer != nil && bestHeight > ourHeight {
+		// Disconnect the worst peer to make room for better ones
+		if worstPeer != nil && worstPeer != bestPeer && worstHeight < ourHeight {
+			log.Printf("sync: disconnecting stale peer %s (height %d, ours %d)",
+				worstPeer.Address(), worstHeight, ourHeight)
+			worstPeer.Disconnect()
+		}
+
+		// Request headers from the best peer
+		log.Printf("sync: requesting headers from best peer %s (height %d)",
+			bestPeer.Address(), bestHeight)
+		sm.sendGetHeadersTo(bestPeer)
+	} else {
+		// No peer ahead of us — send getheaders to random peer to discover
+		sm.sendPeriodicGetHeaders()
+	}
 }
 
 // sendGetHeadersTo sends a getheaders message to a specific peer using
@@ -1379,6 +1502,11 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 		if sm.onBlockConnected != nil {
 			sm.onBlockConnected(bwr.block, nextHeight)
 		}
+
+		// Update stale tip tracker — our chain tip just advanced
+		sm.mu.Lock()
+		sm.lastTipUpdate = time.Now()
+		sm.mu.Unlock()
 
 		// Remove from queue and advance nextHeight
 		nextHeight++
