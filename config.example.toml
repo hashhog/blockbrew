@@ -1,0 +1,45 @@
+# Blockbrew - Bitcoin Full Node (Go)
+# Example configuration file
+# Copy to your data directory and modify as needed.
+
+[network]
+# Network: mainnet, testnet, testnet4, regtest, signet
+network = "mainnet"
+
+[storage]
+# Data directory for blockchain data
+datadir = "~/.blockbrew"
+# Enable transaction indexing
+txindex = false
+
+[rpc]
+# RPC listen address (host:port)
+rpcbind = "127.0.0.1:8332"
+# RPC authentication
+rpcuser = "blockbrew"
+rpcpassword = ""
+
+[p2p]
+# P2P listen address
+# listen = ":8333"
+# Maximum outbound connections
+maxoutbound = 8
+# Maximum inbound connections
+maxinbound = 117
+# Disable inbound P2P connections
+nolisten = false
+
+[mempool]
+# Maximum mempool size in MB
+maxmempool = 300
+# Minimum relay fee (BTC/kvB)
+minrelayfee = 0.00001
+
+[logging]
+# Log level: debug, info, warn, error
+loglevel = "info"
+
+[metrics]
+# Prometheus metrics endpoint
+# enabled = true
+# port = 9332
