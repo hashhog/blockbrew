@@ -133,6 +133,14 @@ func (s PeerState) String() string {
 // Misbehavior score threshold — at this score, peer is disconnected and banned.
 const MisbehaviorThreshold = 100
 
+// Misbehavior score values for specific infractions.
+const (
+	ScoreInvalidBlock       = 100 // Instant ban
+	ScoreHeadersDontConnect = 20  // Headers that don't connect to our chain
+	ScoreBlockDownloadStall = 50  // Stalling block download
+	ScoreUnrequestedData    = 5   // Sending unrequested data
+)
+
 // Peer represents a connection to a remote Bitcoin node.
 type Peer struct {
 	config        PeerConfig

@@ -359,10 +359,14 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 				continue
 			}
 
-			// Invalid header — misbehavior score 100 causes immediate ban
+			// Score depends on error type: orphan/disconnected = 20, invalid PoW = 100
+			score := ScoreInvalidBlock
+			if err == consensus.ErrOrphanHeader {
+				score = ScoreHeadersDontConnect
+			}
 			log.Printf("sync: bad header from %s at height %d: %v",
 				peer.Address(), sm.headerIndex.BestHeight()+1, err)
-			peer.Misbehaving(100, fmt.Sprintf("invalid header: %v", err))
+			peer.Misbehaving(score, fmt.Sprintf("invalid header: %v", err))
 			peer.Disconnect()
 			sm.syncPeer = nil
 			go sm.startHeaderSync() // Try another peer
@@ -1068,6 +1072,11 @@ func (sm *SyncManager) checkStaleRequests() {
 
 		if now.Sub(req.RequestAt) > timeout {
 			timedOut++
+
+			// Score misbehavior for stalling block downloads (+50)
+			if req.Peer != nil {
+				req.Peer.Misbehaving(ScoreBlockDownloadStall, "block download stalling")
+			}
 
 			// Increase timeout for this peer (adaptive backoff)
 			sm.increaseStallTimeout(req.Peer)
