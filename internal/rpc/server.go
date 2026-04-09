@@ -250,6 +250,11 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Apply a per-request timeout so RPC calls don't hang indefinitely
+	// when ConnectBlock holds the chain manager write lock during IBD.
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
 	// Extract wallet name from URL path if present
 	// URL pattern: /wallet/<walletname>
 	walletName := s.extractWalletName(r.URL.Path)
@@ -259,6 +264,12 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&req); err != nil {
 		s.sendError(w, nil, RPCErrParseError, "Parse error")
+		return
+	}
+
+	// Check if context already expired before dispatching
+	if ctx.Err() != nil {
+		s.sendError(w, req.ID, RPCErrMisc, "Request timeout")
 		return
 	}
 

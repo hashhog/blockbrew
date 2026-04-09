@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -34,6 +35,11 @@ type ChainManager struct {
 	utxoSet     UpdatableUTXOView
 	tipNode     *BlockNode
 	tipHeight   int32
+
+	// Lock-free tip cache for RPC reads (updated atomically after tip changes).
+	// This avoids RLock contention with ConnectBlock's write lock during IBD.
+	cachedTipHash   atomic.Value // wire.Hash256
+	cachedTipHeight atomic.Int32
 
 	// Flush tracking for IBD
 	blocksSinceFlush int
@@ -106,6 +112,9 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 	// Set initial tip to genesis
 	cm.tipNode = config.HeaderIndex.Genesis()
 	cm.tipHeight = 0
+	if cm.tipNode != nil {
+		cm.updateTipCache(cm.tipNode.Hash, 0)
+	}
 
 	// Try to load chain state from database
 	if config.ChainDB != nil {
@@ -141,6 +150,7 @@ func (cm *ChainManager) loadChainState() {
 
 	cm.tipNode = node
 	cm.tipHeight = state.BestHeight
+	cm.updateTipCache(node.Hash, state.BestHeight)
 	log.Printf("chainmgr: loaded chain state at height %d", cm.tipHeight)
 }
 
@@ -187,6 +197,7 @@ func (cm *ChainManager) ReloadChainState() {
 
 	cm.tipNode = node
 	cm.tipHeight = state.BestHeight
+	cm.updateTipCache(node.Hash, state.BestHeight)
 	log.Printf("chainmgr: reloaded chain state at height %d after header sync", cm.tipHeight)
 }
 
@@ -282,6 +293,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// Store empty undo data and update chain state
 		cm.tipNode = node
 		cm.tipHeight = node.Height
+		cm.updateTipCache(node.Hash, node.Height)
 		node.Status |= StatusFullyValid
 		if cm.chainDB != nil {
 			batch := cm.chainDB.NewBatch()
@@ -490,6 +502,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Update chain state
 	cm.tipNode = node
 	cm.tipHeight = node.Height
+	cm.updateTipCache(node.Hash, node.Height)
 	node.Status |= StatusFullyValid
 
 	// Exit IBD mode when close to current time
@@ -713,6 +726,7 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 
 	cm.tipNode = parent
 	cm.tipHeight = parent.Height
+	cm.updateTipCache(parent.Hash, parent.Height)
 
 	// Persist updated chain state
 	if cm.chainDB != nil {
@@ -773,14 +787,22 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 	return nil
 }
 
+// updateTipCache atomically publishes the current tip for lock-free reads.
+// Must be called while cm.mu is held (or during init before any readers).
+func (cm *ChainManager) updateTipCache(hash wire.Hash256, height int32) {
+	cm.cachedTipHash.Store(hash)
+	cm.cachedTipHeight.Store(height)
+}
+
 // BestBlock returns the current chain tip hash and height.
+// Uses atomic cache so it never blocks on the write lock held by ConnectBlock.
 func (cm *ChainManager) BestBlock() (wire.Hash256, int32) {
-	cm.mu.RLock()
-	defer cm.mu.RUnlock()
-	if cm.tipNode == nil {
+	height := cm.cachedTipHeight.Load()
+	hash, ok := cm.cachedTipHash.Load().(wire.Hash256)
+	if !ok {
 		return wire.Hash256{}, 0
 	}
-	return cm.tipNode.Hash, cm.tipHeight
+	return hash, height
 }
 
 // IsInMainChain checks if a block hash is in the active (main) chain.

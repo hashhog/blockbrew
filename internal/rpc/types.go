@@ -21,6 +21,7 @@ const (
 	RPCErrClientNodeNotConnected = -29  // Node not found/connected
 	RPCErrClientP2PDisabled      = -9   // P2P networking is disabled
 	RPCErrWallet               = -4     // Wallet error (general)
+	RPCErrMisc                 = -1     // Miscellaneous error
 )
 
 // RPCRequest is a JSON-RPC request.
