@@ -38,6 +38,7 @@ type Server struct {
 	headerIndex  *consensus.HeaderIndex
 	chainDB      *storage.ChainDB
 	mempool      *mempool.Mempool
+	feeEstimator *mempool.FeeEstimator
 	peerMgr      *p2p.PeerManager
 	syncMgr      *p2p.SyncManager
 	templateGen  *mining.TemplateGenerator
@@ -88,6 +89,13 @@ func WithChainDB(db *storage.ChainDB) ServerOption {
 func WithMempool(mp *mempool.Mempool) ServerOption {
 	return func(s *Server) {
 		s.mempool = mp
+	}
+}
+
+// WithFeeEstimator sets the fee estimator.
+func WithFeeEstimator(fe *mempool.FeeEstimator) ServerOption {
+	return func(s *Server) {
+		s.feeEstimator = fe
 	}
 }
 

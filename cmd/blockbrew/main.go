@@ -291,6 +291,14 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	}, utxoSet)
 	log.Printf("Mempool initialized (max %d MB)", cfg.MaxMempool)
 
+	// 6b. Initialize fee estimator
+	feeEstimator := mempool.NewFeeEstimator()
+	if err := feeEstimator.Load(cfg.DataDir); err != nil {
+		log.Printf("Warning: could not load fee estimates: %v", err)
+	} else if feeEstimator.BestHeight() > 0 {
+		log.Printf("Loaded fee estimates from disk (height %d)", feeEstimator.BestHeight())
+	}
+
 	// 7. Initialize peer manager
 	listenAddr := cfg.ListenP2P
 	if cfg.NoListen {
@@ -344,6 +352,23 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	// Wire up sync manager listeners to peer manager
 	syncListeners := syncMgr.CreatePeerListeners()
+
+	// Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
+	// and relay them to peers on success.
+	syncListeners.OnTx = func(peer *p2p.Peer, msg *p2p.MsgTx) {
+		if err := mp.AcceptToMemoryPool(msg.Tx); err != nil {
+			log.Printf("[mempool] Rejected tx from %s: %v", peer.Address(), err)
+			return
+		}
+		txHash := msg.Tx.TxHash()
+		entry := mp.GetEntry(txHash)
+		if entry != nil {
+			peerMgr.RelayTransaction(txHash, entry.Fee, entry.Size, peer.Address())
+		}
+		log.Printf("[mempool] Accepted tx %s from %s (fee: %d, size: %d)",
+			txHash, peer.Address(), entry.Fee, entry.Size)
+	}
+
 	peerMgr = p2p.NewPeerManager(p2p.PeerManagerConfig{
 		Network:     networkMagic(chainParams),
 		ChainParams: chainParams,
@@ -415,6 +440,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		rpc.WithHeaderIndex(headerIndex),
 		rpc.WithChainDB(chainDB),
 		rpc.WithMempool(mp),
+		rpc.WithFeeEstimator(feeEstimator),
 		rpc.WithPeerManager(peerMgr),
 		rpc.WithSyncManager(syncMgr),
 		rpc.WithTemplateGenerator(templateGen),
@@ -464,6 +490,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	peerMgr.Stop()
 	log.Printf("Peer manager stopped")
+
+	// Save fee estimates
+	if err := feeEstimator.Save(cfg.DataDir); err != nil {
+		log.Printf("Warning: fee estimates save failed: %v", err)
+	} else {
+		log.Printf("Fee estimates saved")
+	}
 
 	// Save wallet state
 	if w != nil {
