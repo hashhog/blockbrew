@@ -81,6 +81,13 @@ const (
 	// MaxPeersPerSubnet is the maximum outbound connections to the same /16 subnet.
 	// This provides ASN-like diversity without requiring ASN lookup tables.
 	MaxPeersPerSubnet = 2
+
+	// MaxBlockRelayOnlyAnchors is the maximum number of block-relay-only anchors
+	// to persist across restarts. Reference: Bitcoin Core net.h MAX_BLOCK_RELAY_ONLY_ANCHORS.
+	MaxBlockRelayOnlyAnchors = 2
+
+	// AnchorsFilename is the file used to persist block-relay-only peer addresses.
+	AnchorsFilename = "anchors.json"
 )
 
 // PeerManagerConfig configures the peer manager.
@@ -174,6 +181,9 @@ func (pm *PeerManager) Start() error {
 	pm.started = true
 	pm.mu.Unlock()
 
+	// Load anchor connections from previous session (block-relay-only peers)
+	pm.loadAnchors()
+
 	// Start TCP listener if configured
 	if pm.config.ListenAddr != "" {
 		listener, err := net.Listen("tcp", pm.config.ListenAddr)
@@ -196,6 +206,9 @@ func (pm *PeerManager) Start() error {
 // Stop gracefully disconnects all peers and stops the manager.
 func (pm *PeerManager) Stop() {
 	pm.quitOnce.Do(func() {
+		// Save block-relay-only peers as anchors before disconnecting
+		pm.saveAnchors()
+
 		close(pm.quit)
 
 		// Close the listener to unblock Accept
@@ -1376,5 +1389,98 @@ func (pm *PeerManager) loadBanList() {
 
 	if loaded > 0 {
 		log.Printf("loaded %d banned addresses", loaded)
+	}
+}
+
+// anchorsFilePath returns the path to the anchors file.
+func (pm *PeerManager) anchorsFilePath() string {
+	return filepath.Join(pm.config.DataDir, AnchorsFilename)
+}
+
+// anchorEntry is persisted to anchors.json for block-relay-only peers.
+type anchorEntry struct {
+	Address string `json:"address"`
+	Port    uint16 `json:"port"`
+}
+
+// saveAnchors persists block-relay-only peer addresses to disk on shutdown.
+// Reference: Bitcoin Core net.cpp DumpAnchors / addrdb.cpp
+func (pm *PeerManager) saveAnchors() {
+	if pm.config.DataDir == "" {
+		return
+	}
+
+	pm.mu.RLock()
+	var anchors []anchorEntry
+	for addr, info := range pm.peers {
+		if info.connType == ConnBlockRelayOnly && info.peer.IsConnected() {
+			host, portStr, err := net.SplitHostPort(addr)
+			if err != nil {
+				continue
+			}
+			port := uint16(0)
+			fmt.Sscanf(portStr, "%d", &port)
+			anchors = append(anchors, anchorEntry{Address: host, Port: port})
+			if len(anchors) >= MaxBlockRelayOnlyAnchors {
+				break
+			}
+		}
+	}
+	pm.mu.RUnlock()
+
+	data, err := json.MarshalIndent(anchors, "", "  ")
+	if err != nil {
+		log.Printf("failed to marshal anchors: %v", err)
+		return
+	}
+
+	path := pm.anchorsFilePath()
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		log.Printf("failed to write anchors file %s: %v", path, err)
+		return
+	}
+
+	log.Printf("saved %d block-relay-only anchor(s) to %s", len(anchors), path)
+}
+
+// loadAnchors reads anchor connections from disk and attempts to connect to them
+// before DNS seeds. The file is deleted after reading (one-time use per session).
+// Reference: Bitcoin Core net.cpp ReadAnchors
+func (pm *PeerManager) loadAnchors() {
+	if pm.config.DataDir == "" {
+		return
+	}
+
+	path := pm.anchorsFilePath()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// No anchors file is normal on first run
+		return
+	}
+
+	// Delete after reading — anchors are one-time use per startup
+	os.Remove(path)
+
+	var anchors []anchorEntry
+	if err := json.Unmarshal(data, &anchors); err != nil {
+		log.Printf("failed to parse anchors file: %v", err)
+		return
+	}
+
+	if len(anchors) > MaxBlockRelayOnlyAnchors {
+		anchors = anchors[:MaxBlockRelayOnlyAnchors]
+	}
+
+	log.Printf("loaded %d anchor(s) from %s", len(anchors), path)
+
+	for _, a := range anchors {
+		// Connect as block-relay-only (same type they were saved as)
+		ka := &KnownAddress{
+			Addr: NetAddress{
+				IP:   net.ParseIP(a.Address).To16(),
+				Port: a.Port,
+			},
+		}
+		go pm.connectToPeerWithType(ka, ConnBlockRelayOnly)
 	}
 }
