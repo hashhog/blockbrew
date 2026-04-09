@@ -375,7 +375,7 @@ func (s *Server) handleSendToAddressWithWallet(params json.RawMessage, walletNam
 	}
 
 	if s.mempool != nil {
-		if err := s.mempool.AddTransaction(tx); err != nil {
+		if err := s.mempool.AcceptToMemoryPool(tx); err != nil {
 			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Transaction rejected: %v", err)}
 		}
 	}

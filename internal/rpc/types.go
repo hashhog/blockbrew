@@ -154,12 +154,17 @@ type ScriptPubKey struct {
 
 // MempoolInfo represents the result of getmempoolinfo.
 type MempoolInfo struct {
-	Loaded        bool    `json:"loaded"`
-	Size          int     `json:"size"`
-	Bytes         int64   `json:"bytes"`
-	Usage         int64   `json:"usage"`
-	MaxMempool    int64   `json:"maxmempool"`
-	MinRelayTxFee float64 `json:"mempoolminfee"`
+	Loaded             bool    `json:"loaded"`
+	Size               int     `json:"size"`
+	Bytes              int64   `json:"bytes"`
+	Usage              int64   `json:"usage"`
+	TotalFee           float64 `json:"total_fee"`
+	MaxMempool         int64   `json:"maxmempool"`
+	MempoolMinFee      float64 `json:"mempoolminfee"`
+	MinRelayTxFee      float64 `json:"minrelaytxfee"`
+	IncrementalRelayFee float64 `json:"incrementalrelayfee"`
+	UnbroadcastCount   int     `json:"unbroadcastcount"`
+	FullRBF            bool    `json:"fullrbf"`
 }
 
 // MempoolEntry represents a mempool entry (verbose getrawmempool).
@@ -184,36 +189,58 @@ type MempoolEntry struct {
 
 // PeerInfo represents peer information in RPC responses.
 type PeerInfo struct {
-	ID          int     `json:"id"`
-	Addr        string  `json:"addr"`
-	Services    string  `json:"services"`
-	LastSend    int64   `json:"lastsend"`
-	LastRecv    int64   `json:"lastrecv"`
-	BytesSent   uint64  `json:"bytessent"`
-	BytesRecv   uint64  `json:"bytesrecv"`
-	ConnTime    int64   `json:"conntime"`
-	TimeOffset  int64   `json:"timeoffset"`
-	PingTime    float64 `json:"pingtime"`
-	Version     int32   `json:"version"`
-	SubVer      string  `json:"subver"`
-	Inbound     bool    `json:"inbound"`
-	StartHeight int32   `json:"startingheight"`
-	SyncedHeaders int32 `json:"synced_headers"`
-	SyncedBlocks  int32 `json:"synced_blocks"`
+	ID             int      `json:"id"`
+	Addr           string   `json:"addr"`
+	Network        string   `json:"network"`
+	Services       string   `json:"services"`
+	ServicesNames  []string `json:"servicesnames"`
+	RelayTxes      bool     `json:"relaytxes"`
+	LastSend       int64    `json:"lastsend"`
+	LastRecv       int64    `json:"lastrecv"`
+	BytesSent      uint64   `json:"bytessent"`
+	BytesRecv      uint64   `json:"bytesrecv"`
+	ConnTime       int64    `json:"conntime"`
+	TimeOffset     int64    `json:"timeoffset"`
+	PingTime       float64  `json:"pingtime"`
+	Version        int32    `json:"version"`
+	SubVer         string   `json:"subver"`
+	Inbound        bool     `json:"inbound"`
+	BIP152HBTo     bool     `json:"bip152_hb_to"`
+	BIP152HBFrom   bool     `json:"bip152_hb_from"`
+	StartHeight    int32    `json:"startingheight"`
+	SyncedHeaders  int32    `json:"synced_headers"`
+	SyncedBlocks   int32    `json:"synced_blocks"`
+	Inflight       []int    `json:"inflight"`
+	ConnectionType string   `json:"connection_type"`
 }
 
 // NetworkInfo represents the result of getnetworkinfo.
 type NetworkInfo struct {
-	Version         int32  `json:"version"`
-	SubVersion      string `json:"subversion"`
-	ProtocolVersion int32  `json:"protocolversion"`
-	LocalServices   string `json:"localservices"`
-	LocalRelay      bool   `json:"localrelay"`
-	TimeOffset      int64  `json:"timeoffset"`
-	NetworkActive   bool   `json:"networkactive"`
-	Connections     int    `json:"connections"`
-	ConnectionsIn   int    `json:"connections_in"`
-	ConnectionsOut  int    `json:"connections_out"`
+	Version            int32          `json:"version"`
+	SubVersion         string         `json:"subversion"`
+	ProtocolVersion    int32          `json:"protocolversion"`
+	LocalServices      string         `json:"localservices"`
+	LocalServicesNames []string       `json:"localservicesnames"`
+	LocalRelay         bool           `json:"localrelay"`
+	TimeOffset         int64          `json:"timeoffset"`
+	NetworkActive      bool           `json:"networkactive"`
+	Connections        int            `json:"connections"`
+	ConnectionsIn      int            `json:"connections_in"`
+	ConnectionsOut     int            `json:"connections_out"`
+	Networks           []NetworkEntry `json:"networks"`
+	RelayFee           float64        `json:"relayfee"`
+	IncrementalFee     float64        `json:"incrementalfee"`
+	LocalAddresses     []interface{}  `json:"localaddresses"`
+	Warnings           string         `json:"warnings"`
+}
+
+// NetworkEntry represents a network in getnetworkinfo.
+type NetworkEntry struct {
+	Name                     string `json:"name"`
+	Limited                  bool   `json:"limited"`
+	Reachable                bool   `json:"reachable"`
+	Proxy                    string `json:"proxy"`
+	ProxyRandomizeCredentials bool  `json:"proxy_randomize_credentials"`
 }
 
 // SmartFeeResult represents the result of estimatesmartfee.
