@@ -635,8 +635,8 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		return txid.String(), nil
 	}
 
-	// Add to mempool
-	if err := s.mempool.AddTransaction(tx); err != nil {
+	// Add to mempool via AcceptToMemoryPool (canonical Bitcoin Core entry point)
+	if err := s.mempool.AcceptToMemoryPool(tx); err != nil {
 		return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Transaction rejected: %v", err)}
 	}
 
@@ -891,13 +891,26 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		return &MempoolInfo{Loaded: false}, nil
 	}
 
+	// Calculate total fees
+	totalFee := 0.0
+	for _, h := range s.mempool.GetAllTxHashes() {
+		if entry := s.mempool.GetEntry(h); entry != nil {
+			totalFee += float64(entry.Fee) / satoshiPerBitcoin
+		}
+	}
+
 	return &MempoolInfo{
-		Loaded:        true,
-		Size:          s.mempool.Count(),
-		Bytes:         s.mempool.TotalSize(),
-		Usage:         s.mempool.TotalSize(), // Simplified: actual usage would include overhead
-		MaxMempool:    300_000_000,            // 300 MB default
-		MinRelayTxFee: 0.00001,                // 1 sat/vB in BTC/kvB
+		Loaded:             true,
+		Size:               s.mempool.Count(),
+		Bytes:              s.mempool.TotalSize(),
+		Usage:              s.mempool.TotalSize(), // Simplified: actual usage would include overhead
+		TotalFee:           totalFee,
+		MaxMempool:         300_000_000, // 300 MB default
+		MempoolMinFee:      0.00001,     // 1 sat/vB in BTC/kvB
+		MinRelayTxFee:      0.00001,     // 1 sat/vB in BTC/kvB
+		IncrementalRelayFee: 0.00001,
+		UnbroadcastCount:   0,
+		FullRBF:            true,
 	}, nil
 }
 
@@ -974,6 +987,24 @@ func (s *Server) handleGetRawMempool(params json.RawMessage) (interface{}, *RPCE
 // Network RPCs
 // ============================================================================
 
+// decodeServiceNames returns human-readable names for service flags.
+func decodeServiceNames(services uint64) []string {
+	var names []string
+	if services&1 != 0 {
+		names = append(names, "NETWORK")
+	}
+	if services&8 != 0 {
+		names = append(names, "WITNESS")
+	}
+	if services&1024 != 0 {
+		names = append(names, "NETWORK_LIMITED")
+	}
+	if len(names) == 0 {
+		return []string{}
+	}
+	return names
+}
+
 func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 	if s.peerMgr == nil {
 		return []PeerInfo{}, nil
@@ -983,20 +1014,34 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 	result := make([]PeerInfo, 0, len(peers))
 
 	for i, p := range peers {
+		services := p.Services()
+		connType := "outbound-full-relay"
+		if p.Inbound() {
+			connType = "inbound"
+		}
 		result = append(result, PeerInfo{
-			ID:          i,
-			Addr:        p.Address(),
-			Services:    fmt.Sprintf("%016x", p.Services()),
-			LastSend:    p.LastSend().Unix(),
-			LastRecv:    p.LastRecv().Unix(),
-			BytesSent:   p.BytesSent(),
-			BytesRecv:   p.BytesRecvd(),
-			ConnTime:    time.Now().Add(-p.ConnTime()).Unix(),
-			PingTime:    p.PingLatency().Seconds(),
-			Version:     p.ProtocolVersion(),
-			SubVer:      p.UserAgent(),
-			Inbound:     p.Inbound(),
-			StartHeight: p.StartHeight(),
+			ID:             i,
+			Addr:           p.Address(),
+			Network:        "ipv4",
+			Services:       fmt.Sprintf("%016x", services),
+			ServicesNames:  decodeServiceNames(services),
+			RelayTxes:      true,
+			LastSend:       p.LastSend().Unix(),
+			LastRecv:       p.LastRecv().Unix(),
+			BytesSent:      p.BytesSent(),
+			BytesRecv:      p.BytesRecvd(),
+			ConnTime:       time.Now().Add(-p.ConnTime()).Unix(),
+			PingTime:       p.PingLatency().Seconds(),
+			Version:        p.ProtocolVersion(),
+			SubVer:         p.UserAgent(),
+			Inbound:        p.Inbound(),
+			BIP152HBTo:     false,
+			BIP152HBFrom:   false,
+			StartHeight:    p.StartHeight(),
+			SyncedHeaders:  -1,
+			SyncedBlocks:   -1,
+			Inflight:       []int{},
+			ConnectionType: connType,
 		})
 	}
 
@@ -1019,15 +1064,25 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 	}
 
 	return &NetworkInfo{
-		Version:         1,
-		SubVersion:      "/blockbrew:0.1.0/",
-		ProtocolVersion: 70016,
-		LocalServices:   "0000000000000009", // NODE_NETWORK | NODE_WITNESS
-		LocalRelay:      true,
-		NetworkActive:   true,
-		Connections:     outbound + inbound,
-		ConnectionsIn:   inbound,
-		ConnectionsOut:  outbound,
+		Version:            250000,
+		SubVersion:         "/blockbrew:0.1.0/",
+		ProtocolVersion:    70016,
+		LocalServices:      "0000000000000009", // NODE_NETWORK | NODE_WITNESS
+		LocalServicesNames: []string{"NETWORK", "WITNESS"},
+		LocalRelay:         true,
+		NetworkActive:      true,
+		Connections:        outbound + inbound,
+		ConnectionsIn:      inbound,
+		ConnectionsOut:     outbound,
+		Networks: []NetworkEntry{
+			{Name: "ipv4", Limited: false, Reachable: true, Proxy: "", ProxyRandomizeCredentials: false},
+			{Name: "ipv6", Limited: false, Reachable: true, Proxy: "", ProxyRandomizeCredentials: false},
+			{Name: "onion", Limited: true, Reachable: false, Proxy: "", ProxyRandomizeCredentials: false},
+		},
+		RelayFee:       0.00001,
+		IncrementalFee: 0.00001,
+		LocalAddresses: []interface{}{},
+		Warnings:       "",
 	}, nil
 }
 
@@ -1440,22 +1495,33 @@ func (s *Server) handleEstimateSmartFee(params json.RawMessage) (interface{}, *R
 		}
 	}
 
-	if s.mempool == nil {
+	// Use the bucket-based fee estimator if available, otherwise fall back to mempool heuristic
+	var feeRate float64
+	var actualTarget int
+	if s.feeEstimator != nil {
+		feeRate, actualTarget = s.feeEstimator.EstimateSmartFee(confTarget)
+	} else if s.mempool != nil {
+		feeRate = s.mempool.EstimateFee(confTarget)
+		actualTarget = confTarget
+	}
+
+	if feeRate <= 0 {
 		return &SmartFeeResult{
-			Errors: []string{"Fee estimation unavailable"},
+			Errors: []string{"Insufficient data or no feerate found"},
 			Blocks: confTarget,
 		}, nil
 	}
 
-	// Get fee estimate from mempool
-	feeRate := s.mempool.EstimateFee(confTarget)
-
 	// Convert from sat/vB to BTC/kvB
 	feeRateBTC := feeRate / satoshiPerBitcoin * 1000
 
+	blocks := confTarget
+	if actualTarget > 0 {
+		blocks = actualTarget
+	}
 	return &SmartFeeResult{
 		FeeRate: feeRateBTC,
-		Blocks:  confTarget,
+		Blocks:  blocks,
 	}, nil
 }
 
