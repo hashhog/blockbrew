@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"time"
 
+	"net/http"
+
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
@@ -55,6 +57,9 @@ type Config struct {
 	// Performance profiling
 	PprofAddr       string
 	ParallelScripts bool
+
+	// Prometheus metrics
+	MetricsPort int
 }
 
 func main() {
@@ -144,6 +149,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "Print version and exit")
 	flag.StringVar(&cfg.PprofAddr, "pprof", "", "pprof HTTP server address (e.g., localhost:6060)")
 	flag.BoolVar(&cfg.ParallelScripts, "parallelscripts", true, "Enable parallel script validation")
+	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
 	flag.Parse()
 
 	if cfg.ListenP2P == "" {
@@ -466,6 +472,35 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		return fmt.Errorf("RPC server start failed: %w", err)
 	}
 	log.Printf("RPC server listening on %s", cfg.ListenRPC)
+
+	// Start Prometheus metrics server
+	if cfg.MetricsPort > 0 {
+		metricsAddr := fmt.Sprintf("0.0.0.0:%d", cfg.MetricsPort)
+		metricsMux := http.NewServeMux()
+		metricsMux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+			_, height := chainMgr.BestBlock()
+			outbound, inbound := peerMgr.PeerCount()
+			peers := outbound + inbound
+			mempoolSize := mp.Count()
+
+			w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+			fmt.Fprintf(w, "# HELP bitcoin_blocks_total Current block height\n")
+			fmt.Fprintf(w, "# TYPE bitcoin_blocks_total gauge\n")
+			fmt.Fprintf(w, "bitcoin_blocks_total %d\n", height)
+			fmt.Fprintf(w, "# HELP bitcoin_peers_connected Number of connected peers\n")
+			fmt.Fprintf(w, "# TYPE bitcoin_peers_connected gauge\n")
+			fmt.Fprintf(w, "bitcoin_peers_connected %d\n", peers)
+			fmt.Fprintf(w, "# HELP bitcoin_mempool_size Mempool transaction count\n")
+			fmt.Fprintf(w, "# TYPE bitcoin_mempool_size gauge\n")
+			fmt.Fprintf(w, "bitcoin_mempool_size %d\n", mempoolSize)
+		})
+		go func() {
+			log.Printf("Prometheus metrics server listening on %s", metricsAddr)
+			if err := http.ListenAndServe(metricsAddr, metricsMux); err != nil {
+				log.Printf("Metrics server error: %v", err)
+			}
+		}()
+	}
 
 	log.Printf("blockbrew v%s started successfully", version)
 
