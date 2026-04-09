@@ -546,6 +546,34 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 		OnInv: func(p *Peer, msg *MsgInv) {
 			sm.HandleInv(p, msg)
 		},
+		// BIP152: Handle compact block relay messages
+		OnSendCmpct: func(p *Peer, msg *MsgSendCmpct) {
+			log.Printf("[compact] Peer %s supports compact blocks: version=%d, announce=%v",
+				p.Address(), msg.CmpctBlockVersion, msg.AnnounceUsingCmpctBlock)
+		},
+		OnCmpctBlock: func(p *Peer, msg *MsgCmpctBlock) {
+			// We don't have a mempool, so we can't reconstruct the block from
+			// short IDs. Fall back to requesting the full block via getdata.
+			blockHash := msg.Header.BlockHash()
+			log.Printf("[compact] Received cmpctblock from %s, falling back to full block request (hash=%s)",
+				p.Address(), blockHash)
+			inv := &MsgGetData{
+				InvList: []*InvVect{
+					{Type: InvTypeWitnessBlock, Hash: blockHash},
+				},
+			}
+			p.SendMessage(inv)
+		},
+		OnGetBlockTxn: func(p *Peer, _ *MsgGetBlockTxn) {
+			// Peer requesting missing transactions for compact block reconstruction.
+			// We don't serve compact blocks yet, so ignore.
+			log.Printf("[compact] Received getblocktxn from %s, ignoring", p.Address())
+		},
+		OnBlockTxn: func(p *Peer, _ *MsgBlockTxn) {
+			// Response to our getblocktxn request. Since we fall back to full
+			// block download, we shouldn't receive these. Ignore.
+			log.Printf("[compact] Received blocktxn from %s, ignoring", p.Address())
+		},
 	}
 }
 
