@@ -1242,6 +1242,9 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 		}
 		pm.addrBook.AddAddresses(addrs, source)
 
+		// Relay to up to 2 random peers (not back to source)
+		pm.relayAddrToRandomPeers(p, msg)
+
 		// Call original handler if set
 		if originalOnAddr != nil {
 			originalOnAddr(p, msg)
@@ -1263,6 +1266,9 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 			source = p.Address()
 		}
 		pm.addrBook.AddAddressesV2(addrs, source)
+
+		// Relay addrv2 to up to 2 random peers (not back to source)
+		pm.relayAddrv2ToRandomPeers(p, msg)
 
 		// Call original handler if set
 		if originalOnAddrv2 != nil {
@@ -1286,6 +1292,60 @@ func extractIP(addr string) string {
 		return strings.TrimSpace(addr)
 	}
 	return host
+}
+
+// relayAddrToRandomPeers relays an addr message to up to 2 random connected
+// peers, excluding the source peer. This implements Bitcoin Core's RelayAddress.
+func (pm *PeerManager) relayAddrToRandomPeers(source *Peer, msg *MsgAddr) {
+	pm.mu.RLock()
+	var candidates []*Peer
+	for _, pi := range pm.peers {
+		if pi.peer != nil && pi.peer != source && pi.peer.WantsTxRelay() {
+			candidates = append(candidates, pi.peer)
+		}
+	}
+	pm.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return
+	}
+	rand.Shuffle(len(candidates), func(i, j int) {
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	})
+	n := 2
+	if len(candidates) < n {
+		n = len(candidates)
+	}
+	for _, p := range candidates[:n] {
+		p.SendMessage(msg)
+	}
+}
+
+// relayAddrv2ToRandomPeers relays an addrv2 message to up to 2 random connected
+// peers that support addrv2, excluding the source peer.
+func (pm *PeerManager) relayAddrv2ToRandomPeers(source *Peer, msg *MsgAddrv2) {
+	pm.mu.RLock()
+	var candidates []*Peer
+	for _, pi := range pm.peers {
+		if pi.peer != nil && pi.peer != source && pi.peer.WantsTxRelay() && pi.peer.WantsAddrv2() {
+			candidates = append(candidates, pi.peer)
+		}
+	}
+	pm.mu.RUnlock()
+
+	if len(candidates) == 0 {
+		return
+	}
+	rand.Shuffle(len(candidates), func(i, j int) {
+		candidates[i], candidates[j] = candidates[j], candidates[i]
+	})
+	n := 2
+	if len(candidates) < n {
+		n = len(candidates)
+	}
+	for _, p := range candidates[:n] {
+		p.SendMessage(msg)
+	}
 }
 
 // banListFile returns the path to the ban list file.
