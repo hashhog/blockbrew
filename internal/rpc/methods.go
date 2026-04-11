@@ -43,7 +43,10 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 
 	tipHash, tipHeight := s.chainMgr.BestBlock()
 	headersHeight := s.headerIndex.BestHeight()
-	tipNode := s.headerIndex.GetNode(tipHash)
+	// Use the atomic tip cache instead of headerIndex.GetNode(tipHash),
+	// which would block on idx.mu.RLock while AddHeader holds the write
+	// lock during sync. BestBlockNode is lock-free. See chainmanager.go.
+	tipNode := s.chainMgr.BestBlockNode()
 
 	// Calculate difficulty: genesis_target / current_target
 	var difficulty float64
@@ -374,8 +377,8 @@ func (s *Server) handleGetDifficulty() (interface{}, *RPCError) {
 		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
 	}
 
-	tipHash, _ := s.chainMgr.BestBlock()
-	node := s.headerIndex.GetNode(tipHash)
+	// Lock-free read via chainMgr tip cache — avoids idx.mu.RLock contention.
+	node := s.chainMgr.BestBlockNode()
 	if node == nil {
 		return 1.0, nil
 	}
@@ -1964,7 +1967,8 @@ func (s *Server) handleGetChainStates() (interface{}, *RPCError) {
 		tipHash, tipHeight := s.chainMgr.BestBlock()
 
 		var difficulty float64
-		tipNode := s.headerIndex.GetNode(tipHash)
+		// Lock-free read via chainMgr tip cache — avoids idx.mu.RLock contention.
+		tipNode := s.chainMgr.BestBlockNode()
 		if tipNode != nil {
 			genesisTarget := consensus.CompactToBig(0x1d00ffff)
 			currentTarget := consensus.CompactToBig(tipNode.Header.Bits)
