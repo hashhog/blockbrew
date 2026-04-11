@@ -2482,6 +2482,182 @@ func (s *Server) handleReconsiderBlock(params json.RawMessage) (interface{}, *RP
 // handlePreciousBlock treats a block as if it were received before others with the same work.
 // This gives the block's chain priority in chain selection when there are ties.
 // The effect is ephemeral - lost on restart - and new calls override previous ones.
+// handleGetDeploymentInfo implements the getdeploymentinfo RPC.
+// It accepts an optional block hash parameter (default: chain tip) and returns
+// deployment state for all known soft-fork deployments (buried and BIP9).
+func (s *Server) handleGetDeploymentInfo(params json.RawMessage) (interface{}, *RPCError) {
+	if s.headerIndex == nil || s.chainMgr == nil || s.chainParams == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+
+	// Parse optional blockhash parameter.
+	var blockNode *consensus.BlockNode
+	if len(params) > 0 && string(params) != "null" && string(params) != "[]" {
+		var args []interface{}
+		if err := json.Unmarshal(params, &args); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid params"}
+		}
+		if len(args) > 0 && args[0] != nil {
+			hashStr, ok := args[0].(string)
+			if !ok {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "blockhash must be a string"}
+			}
+			hash, err := wire.NewHash256FromHex(hashStr)
+			if err != nil {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+			}
+			blockNode = s.headerIndex.GetNode(hash)
+			if blockNode == nil {
+				return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+			}
+		}
+	}
+	if blockNode == nil {
+		blockNode = s.headerIndex.BestTip()
+		if blockNode == nil {
+			return nil, &RPCError{Code: RPCErrInternal, Message: "No chain tip available"}
+		}
+	}
+
+	cp := s.chainParams
+	// Pass a nil cache; GetDeploymentState accepts nil and simply skips caching.
+	// A shared cache can be wired in later as an optimisation.
+	var cache *consensus.VersionBitsCache
+
+	deployments := make(map[string]DeploymentEntry)
+
+	// ---- Buried deployments ----
+	// BIP34: coinbase height in scriptSig
+	addBuriedDeployment(deployments, "bip34", blockNode.Height, cp.BIP34Height)
+	// BIP65: CHECKLOCKTIMEVERIFY
+	addBuriedDeployment(deployments, "bip65", blockNode.Height, cp.BIP65Height)
+	// BIP66: strict DER signatures
+	addBuriedDeployment(deployments, "bip66", blockNode.Height, cp.BIP66Height)
+	// CSV (BIP68/BIP112/BIP113)
+	addBuriedDeployment(deployments, "csv", blockNode.Height, cp.CSVHeight)
+	// Segwit (BIP141/BIP143/BIP147)
+	addBuriedDeployment(deployments, "segwit", blockNode.Height, cp.SegwitHeight)
+	// Taproot (BIP341/BIP342)
+	addBuriedDeployment(deployments, "taproot", blockNode.Height, cp.TaprootHeight)
+
+	// ---- BIP9 deployments ----
+	for i, dep := range cp.Deployments {
+		entry := buildBIP9DeploymentEntry(dep, i, blockNode, cp, cache)
+		deployments[dep.Name] = entry
+	}
+
+	result := &DeploymentInfoResult{
+		Hash:        blockNode.Hash.String(),
+		Height:      blockNode.Height,
+		Deployments: deployments,
+	}
+	return result, nil
+}
+
+// addBuriedDeployment adds a buried (height-activated) deployment entry to the map.
+// active is true when the current block height is at or above the activation height.
+// Following Bitcoin Core getdeploymentinfo semantics: active means "enforced for
+// the mempool and next block", so we check height >= activationHeight.
+func addBuriedDeployment(deployments map[string]DeploymentEntry, name string, tipHeight, activationHeight int32) {
+	active := tipHeight >= activationHeight
+	h := activationHeight
+	entry := DeploymentEntry{
+		Type:   "buried",
+		Height: &h,
+		Active: active,
+	}
+	deployments[name] = entry
+}
+
+// buildBIP9DeploymentEntry builds a DeploymentEntry for a BIP9 deployment.
+func buildBIP9DeploymentEntry(
+	dep *consensus.BIP9Deployment,
+	depIndex int,
+	tip *consensus.BlockNode,
+	params *consensus.ChainParams,
+	cache *consensus.VersionBitsCache,
+) DeploymentEntry {
+	// The state for the next block after tip is determined by passing tip as pindexPrev.
+	currentState := consensus.GetDeploymentState(dep, depIndex, tip, params, cache)
+	nextState := consensus.GetDeploymentState(dep, depIndex, tip, params, cache)
+	// next state: state for the block after (tip+1), i.e. pass tip itself
+	// currentState is state for blocks at the tip (pindexPrev = tip.Parent)
+	// To match Bitcoin Core: current = GetStateFor(tip.Parent), next = GetStateFor(tip)
+	var parentState consensus.DeploymentState
+	if tip.Parent != nil {
+		parentState = consensus.GetDeploymentState(dep, depIndex, tip.Parent, params, cache)
+	} else {
+		parentState = consensus.GetDeploymentState(dep, depIndex, nil, params, cache)
+	}
+	_ = nextState
+	currentState = parentState
+	nextState = consensus.GetDeploymentState(dep, depIndex, tip, params, cache)
+
+	sinceHeight := consensus.GetStateSinceHeight(dep, depIndex, tip.Parent, params, cache)
+	if tip.Parent == nil {
+		sinceHeight = 0
+	}
+
+	// Determine if the bit should be shown (started or locked_in states).
+	hasSignal := currentState == consensus.DeploymentStarted || currentState == consensus.DeploymentLockedIn
+
+	var bitPtr *int
+	if hasSignal {
+		bit := dep.Bit
+		bitPtr = &bit
+	}
+
+	bip9 := &BIP9Info{
+		Bit:                 bitPtr,
+		StartTime:           dep.StartTime,
+		Timeout:             dep.Timeout,
+		MinActivationHeight: dep.MinActivationHeight,
+		Status:              currentState.String(),
+		Since:               sinceHeight,
+		StatusNext:          nextState.String(),
+	}
+
+	// Add statistics for started/locked_in states.
+	if hasSignal {
+		stats := consensus.GetDeploymentStats(dep, tip, params)
+		if stats != nil {
+			possible := stats.Possible
+			statsResult := &BIP9StatsResult{
+				Period:  stats.Period,
+				Elapsed: stats.Elapsed,
+				Count:   stats.Count,
+			}
+			if currentState == consensus.DeploymentStarted {
+				statsResult.Threshold = stats.Threshold
+				statsResult.Possible = &possible
+			}
+			bip9.Statistics = statsResult
+		}
+	}
+
+	// Determine active status and height.
+	// A BIP9 deployment is "active" if currentState == ACTIVE.
+	// height is set to the activation height when active or becoming active next block.
+	isActive := currentState == consensus.DeploymentActive
+	var activationHeight *int32
+	if isActive {
+		// Find the height at which it became active (same as sinceHeight for active state).
+		activeSince := consensus.GetStateSinceHeight(dep, depIndex, tip.Parent, params, cache)
+		activationHeight = &activeSince
+	} else if nextState == consensus.DeploymentActive {
+		// Will become active with the next block.
+		nextHeight := tip.Height + 1
+		activationHeight = &nextHeight
+	}
+
+	return DeploymentEntry{
+		Type:   "bip9",
+		Height: activationHeight,
+		Active: isActive,
+		BIP9:   bip9,
+	}
+}
+
 func (s *Server) handlePreciousBlock(params json.RawMessage) (interface{}, *RPCError) {
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
