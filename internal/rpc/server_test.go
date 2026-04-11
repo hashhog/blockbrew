@@ -1156,3 +1156,182 @@ func TestPreciousBlockRPC(t *testing.T) {
 		t.Errorf("unexpected error: %v", resp.Error)
 	}
 }
+
+// TestGetDeploymentInfoRegtest verifies that getdeploymentinfo returns a non-empty
+// deployments map on regtest and that segwit and taproot are present and active
+// (both are active from genesis height 0 on regtest).
+func TestGetDeploymentInfoRegtest(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithChainManager(cm),
+		WithHeaderIndex(idx),
+		WithChainDB(db),
+	)
+
+	// No params — should default to chain tip (genesis on an empty chain).
+	resp := testRPCRequest(t, server.handleRPC, "getdeploymentinfo", []interface{}{}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	if resp.Result == nil {
+		t.Fatal("expected non-nil result")
+	}
+
+	resultMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map result, got %T", resp.Result)
+	}
+
+	// Top-level fields.
+	if _, ok := resultMap["hash"]; !ok {
+		t.Error("expected 'hash' field in result")
+	}
+	if _, ok := resultMap["height"]; !ok {
+		t.Error("expected 'height' field in result")
+	}
+
+	deploymentsRaw, ok := resultMap["deployments"]
+	if !ok {
+		t.Fatal("expected 'deployments' field in result")
+	}
+	deployments, ok := deploymentsRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected deployments to be a map, got %T", deploymentsRaw)
+	}
+	if len(deployments) == 0 {
+		t.Fatal("expected non-empty deployments map")
+	}
+
+	// segwit must be present and active on regtest (SegwitHeight == 0).
+	segwitRaw, ok := deployments["segwit"]
+	if !ok {
+		t.Fatal("expected 'segwit' deployment")
+	}
+	segwit, ok := segwitRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("segwit entry has unexpected type %T", segwitRaw)
+	}
+	if segwit["type"] != "buried" {
+		t.Errorf("expected segwit type 'buried', got %v", segwit["type"])
+	}
+	if active, ok := segwit["active"].(bool); !ok || !active {
+		t.Errorf("expected segwit to be active on regtest, got %v", segwit["active"])
+	}
+
+	// taproot must be present and active on regtest (TaprootHeight == 0).
+	taprootRaw, ok := deployments["taproot"]
+	if !ok {
+		t.Fatal("expected 'taproot' deployment")
+	}
+	taproot, ok := taprootRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("taproot entry has unexpected type %T", taprootRaw)
+	}
+	if taproot["type"] != "buried" {
+		t.Errorf("expected taproot type 'buried', got %v", taproot["type"])
+	}
+	if active, ok := taproot["active"].(bool); !ok || !active {
+		t.Errorf("expected taproot to be active on regtest, got %v", taproot["active"])
+	}
+}
+
+// TestGetDeploymentInfoByHash verifies that getdeploymentinfo accepts an explicit
+// block hash parameter and returns the correct result for that block.
+func TestGetDeploymentInfoByHash(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithChainManager(cm),
+		WithHeaderIndex(idx),
+		WithChainDB(db),
+	)
+
+	// Query by genesis hash — should succeed.
+	resp := testRPCRequest(t, server.handleRPC, "getdeploymentinfo",
+		[]interface{}{params.GenesisHash.String()}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("unexpected error querying genesis: %v", resp.Error)
+	}
+	if resp.Result == nil {
+		t.Fatal("expected non-nil result for genesis")
+	}
+
+	// Query with an unknown hash — should return block-not-found error.
+	resp = testRPCRequest(t, server.handleRPC, "getdeploymentinfo",
+		[]interface{}{"0000000000000000000000000000000000000000000000000000000000000001"}, "", "")
+	if resp.Error == nil || resp.Error.Code != RPCErrBlockNotFound {
+		t.Errorf("expected block-not-found error, got %v", resp.Error)
+	}
+}
+
+// TestGetDeploymentInfoBIP9Testdummy verifies that the testdummy BIP9 deployment
+// (always-active on regtest) is returned as a bip9 deployment that is active.
+func TestGetDeploymentInfoBIP9Testdummy(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithChainManager(cm),
+		WithHeaderIndex(idx),
+		WithChainDB(db),
+	)
+
+	resp := testRPCRequest(t, server.handleRPC, "getdeploymentinfo", []interface{}{}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	resultMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected map result, got %T", resp.Result)
+	}
+	deployments, ok := resultMap["deployments"].(map[string]interface{})
+	if !ok {
+		t.Fatal("expected deployments map")
+	}
+
+	// testdummy has StartTime == AlwaysActive on regtest, so it should be active.
+	tdRaw, ok := deployments["testdummy"]
+	if !ok {
+		t.Fatal("expected 'testdummy' deployment")
+	}
+	td, ok := tdRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("testdummy entry has unexpected type %T", tdRaw)
+	}
+	if td["type"] != "bip9" {
+		t.Errorf("expected testdummy type 'bip9', got %v", td["type"])
+	}
+	if active, ok := td["active"].(bool); !ok || !active {
+		t.Errorf("expected testdummy to be active on regtest, got %v", td["active"])
+	}
+	if td["bip9"] == nil {
+		t.Error("expected bip9 sub-object for testdummy")
+	}
+}
