@@ -38,8 +38,13 @@ type ChainManager struct {
 
 	// Lock-free tip cache for RPC reads (updated atomically after tip changes).
 	// This avoids RLock contention with ConnectBlock's write lock during IBD.
+	// cachedTipNode holds the full BlockNode so RPCs like getblockchaininfo,
+	// getmininginfo and getdifficulty can read header fields (bits, time,
+	// medianTime) without taking headerIndex.mu.RLock — which contends with
+	// AddHeader's write lock and causes multi-second tail latency during sync.
 	cachedTipHash   atomic.Value // wire.Hash256
 	cachedTipHeight atomic.Int32
+	cachedTipNode   atomic.Pointer[BlockNode]
 
 	// Flush tracking for IBD
 	blocksSinceFlush int
@@ -789,9 +794,14 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 
 // updateTipCache atomically publishes the current tip for lock-free reads.
 // Must be called while cm.mu is held (or during init before any readers).
+//
+// Every call site assigns cm.tipNode = <node> immediately before invoking
+// this, so we read cm.tipNode here and publish the pointer atomically.
+// Readers using BestBlockNode() get a consistent snapshot without any lock.
 func (cm *ChainManager) updateTipCache(hash wire.Hash256, height int32) {
 	cm.cachedTipHash.Store(hash)
 	cm.cachedTipHeight.Store(height)
+	cm.cachedTipNode.Store(cm.tipNode)
 }
 
 // BestBlock returns the current chain tip hash and height.
@@ -803,6 +813,17 @@ func (cm *ChainManager) BestBlock() (wire.Hash256, int32) {
 		return wire.Hash256{}, 0
 	}
 	return hash, height
+}
+
+// BestBlockNode returns the current chain tip BlockNode via atomic cache.
+// Returns nil if the cache has not yet been populated (pre-init only).
+//
+// This is the lock-free alternative to headerIndex.GetNode(tipHash), which
+// must take idx.mu.RLock and therefore contends with AddHeader's write lock
+// during header sync. RPC handlers that only need the tip header fields
+// (bits, time, medianTime) should use BestBlockNode instead.
+func (cm *ChainManager) BestBlockNode() *BlockNode {
+	return cm.cachedTipNode.Load()
 }
 
 // IsInMainChain checks if a block hash is in the active (main) chain.
