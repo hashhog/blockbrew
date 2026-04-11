@@ -353,13 +353,84 @@ func (g *DepGraph) AddDependencies(parents BitSet, child int) {
 
 // RemoveTransactions removes the specified transactions from the graph.
 func (g *DepGraph) RemoveTransactions(del BitSet) {
-	g.used = g.used.Difference(del)
+	// Before removing, compute the direct parents of each transaction that had
+	// a deleted transaction in its ancestor set. These are the transactions whose
+	// transitive ancestor sets may change after the removal.
+	//
+	// We must use GetReducedParents BEFORE removing from g.used, since
+	// GetReducedParents relies on g.entries[i].Ancestors being correct.
+	type parentRecord struct {
+		directParents BitSet
+	}
+	affected := make(map[int]parentRecord)
+	remaining := g.used.Difference(del)
+	remaining.ForEach(func(i int) {
+		// If any ancestor of i is being deleted, i's ancestor set needs rebuilding.
+		if !g.entries[i].Ancestors.Intersection(del).None() {
+			affected[i] = parentRecord{directParents: g.GetReducedParents(i)}
+		}
+	})
 
-	// Remove deleted transactions from ancestors/descendants of remaining
+	g.used = remaining
+
+	// For transactions with no deleted ancestors, just strip the deleted bits.
 	for i := 0; i < len(g.entries); i++ {
 		if g.used.Has(i) {
-			g.entries[i].Ancestors = g.entries[i].Ancestors.Intersection(g.used)
-			g.entries[i].Descendants = g.entries[i].Descendants.Intersection(g.used)
+			if _, needsRebuild := affected[i]; !needsRebuild {
+				g.entries[i].Ancestors = g.entries[i].Ancestors.Intersection(g.used)
+				g.entries[i].Descendants = g.entries[i].Descendants.Intersection(g.used)
+			}
+		}
+	}
+
+	// For affected transactions, recompute ancestors from direct parents.
+	// We need a topological order (ancestors before descendants). The simplest
+	// approach: iterate until stable (propagate in dependency order).
+	if len(affected) > 0 {
+		// Reset ancestor sets for affected nodes to just themselves, then rebuild.
+		for i := range affected {
+			g.entries[i].Ancestors = Singleton(i)
+		}
+		// Also strip deleted bits from direct parents of affected nodes.
+		for i, rec := range affected {
+			cleanParents := rec.directParents.Intersection(g.used)
+			affected[i] = parentRecord{directParents: cleanParents}
+		}
+		// Re-propagate ancestors in topological order (repeat until stable).
+		changed := true
+		for changed {
+			changed = false
+			for i, rec := range affected {
+				rec.directParents.ForEach(func(par int) {
+					if !g.used.Has(par) {
+						return
+					}
+					newAnc := g.entries[par].Ancestors
+					before := g.entries[i].Ancestors
+					g.entries[i].Ancestors = g.entries[i].Ancestors.Union(newAnc)
+					if !g.entries[i].Ancestors.Equal(before) {
+						changed = true
+					}
+				})
+			}
+		}
+		// Rebuild descendants for all nodes from ancestors.
+		// Reset descendants of all remaining nodes to just themselves.
+		for i := 0; i < len(g.entries); i++ {
+			if g.used.Has(i) {
+				g.entries[i].Descendants = Singleton(i)
+			}
+		}
+		// For each node, add it to all its ancestors' descendant sets.
+		for i := 0; i < len(g.entries); i++ {
+			if !g.used.Has(i) {
+				continue
+			}
+			anc := g.entries[i].Ancestors
+			anc.Reset(i) // skip self
+			anc.ForEach(func(a int) {
+				g.entries[a].Descendants = g.entries[a].Descendants.Union(Singleton(i))
+			})
 		}
 	}
 }

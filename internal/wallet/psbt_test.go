@@ -2,7 +2,6 @@ package wallet
 
 import (
 	"bytes"
-	"encoding/hex"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -195,16 +194,22 @@ func TestPSBTEmptyInput(t *testing.T) {
 
 func TestPSBTPartialSigs(t *testing.T) {
 	// Test that partial signatures are stored correctly
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
+			},
+		},
+	}
 
 	// Create a compressed public key (33 bytes, starts with 02 or 03)
 	pubKey := make([]byte, 33)
@@ -227,8 +232,9 @@ func TestPSBTPartialSigs(t *testing.T) {
 		Outputs:    make([]PSBTOutput, 1),
 	}
 
+	// PartialSigs map key is the raw pubkey bytes cast to string (matches production decode logic)
 	psbt.Inputs[0].PartialSigs = map[string][]byte{
-		hex.EncodeToString(pubKey): sig,
+		string(pubKey): sig,
 	}
 
 	// Encode and decode
@@ -246,7 +252,7 @@ func TestPSBTPartialSigs(t *testing.T) {
 		t.Fatalf("Expected 1 partial sig, got %d", len(decoded.Inputs[0].PartialSigs))
 	}
 
-	decodedSig, exists := decoded.Inputs[0].PartialSigs[hex.EncodeToString(pubKey)]
+	decodedSig, exists := decoded.Inputs[0].PartialSigs[string(pubKey)]
 	if !exists {
 		t.Fatal("Partial sig not found")
 	}
@@ -258,16 +264,22 @@ func TestPSBTPartialSigs(t *testing.T) {
 
 func TestPSBTBIP32Derivation(t *testing.T) {
 	// Test BIP32 derivation path encoding
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
+			},
+		},
+	}
 
 	// BIP84 path: m/84'/0'/0'/0/5
 	derivation := BIP32Derivation{
@@ -287,8 +299,9 @@ func TestPSBTBIP32Derivation(t *testing.T) {
 		Outputs:    make([]PSBTOutput, 1),
 	}
 
-	psbt.Inputs[0].BIP32Derivations = map[string]BIP32Derivation{
-		hex.EncodeToString(pubKey): derivation,
+	// BIP32Derivation map key is the raw pubkey bytes cast to string (matches production decode logic)
+	psbt.Inputs[0].BIP32Derivation = map[string]*BIP32Derivation{
+		string(pubKey): &derivation,
 	}
 
 	// Encode and decode
@@ -302,7 +315,7 @@ func TestPSBTBIP32Derivation(t *testing.T) {
 		t.Fatalf("Failed to decode PSBT: %v", err)
 	}
 
-	decodedDeriv, exists := decoded.Inputs[0].BIP32Derivations[hex.EncodeToString(pubKey)]
+	decodedDeriv, exists := decoded.Inputs[0].BIP32Derivation[string(pubKey)]
 	if !exists {
 		t.Fatal("BIP32 derivation not found")
 	}
@@ -324,16 +337,22 @@ func TestPSBTBIP32Derivation(t *testing.T) {
 
 func TestPSBTSighashType(t *testing.T) {
 	// Test sighash type encoding
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
+			},
+		},
+	}
 
 	psbt := &PSBT{
 		UnsignedTx: tx,
@@ -361,16 +380,22 @@ func TestPSBTSighashType(t *testing.T) {
 
 func TestPSBTFinalizedInput(t *testing.T) {
 	// Test finalized script sig and witness
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
+			},
+		},
+	}
 
 	psbt := &PSBT{
 		UnsignedTx: tx,
@@ -412,16 +437,22 @@ func TestPSBTFinalizedInput(t *testing.T) {
 
 func TestCombinePSBTs(t *testing.T) {
 	// Create base PSBT
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
+			},
+		},
+	}
 
 	// Create two PSBTs with different partial signatures
 	pubKey1 := make([]byte, 33)
@@ -444,8 +475,9 @@ func TestCombinePSBTs(t *testing.T) {
 		Inputs:     make([]PSBTInput, 1),
 		Outputs:    make([]PSBTOutput, 1),
 	}
+	// PartialSigs map key is the raw pubkey bytes cast to string (matches production decode logic)
 	psbt1.Inputs[0].PartialSigs = map[string][]byte{
-		hex.EncodeToString(pubKey1): sig1,
+		string(pubKey1): sig1,
 	}
 
 	psbt2 := &PSBT{
@@ -454,7 +486,7 @@ func TestCombinePSBTs(t *testing.T) {
 		Outputs:    make([]PSBTOutput, 1),
 	}
 	psbt2.Inputs[0].PartialSigs = map[string][]byte{
-		hex.EncodeToString(pubKey2): sig2,
+		string(pubKey2): sig2,
 	}
 
 	// Combine
@@ -468,27 +500,33 @@ func TestCombinePSBTs(t *testing.T) {
 		t.Errorf("Expected 2 partial sigs, got %d", len(combined.Inputs[0].PartialSigs))
 	}
 
-	if _, exists := combined.Inputs[0].PartialSigs[hex.EncodeToString(pubKey1)]; !exists {
+	if _, exists := combined.Inputs[0].PartialSigs[string(pubKey1)]; !exists {
 		t.Error("Missing signature from pubKey1")
 	}
 
-	if _, exists := combined.Inputs[0].PartialSigs[hex.EncodeToString(pubKey2)]; !exists {
+	if _, exists := combined.Inputs[0].PartialSigs[string(pubKey2)]; !exists {
 		t.Error("Missing signature from pubKey2")
 	}
 }
 
 func TestPSBTTaprootFields(t *testing.T) {
 	// Test taproot-specific fields (BIP371)
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x51, 0x20, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x51, 0x20, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20},
+			},
+		},
+	}
 
 	psbt := &PSBT{
 		UnsignedTx: tx,
@@ -532,16 +570,22 @@ func TestPSBTTaprootFields(t *testing.T) {
 
 func TestPSBTVersion(t *testing.T) {
 	// Test PSBT version field
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
+			},
+		},
+	}
 
 	psbt := &PSBT{
 		Version:    0, // PSBTv0
@@ -586,16 +630,22 @@ func TestPSBTTooShort(t *testing.T) {
 
 func TestFinalizePSBT(t *testing.T) {
 	// Test finalizing a PSBT with a P2WPKH input
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
+			},
+		},
+	}
 
 	// Create compressed public key
 	pubKey := make([]byte, 33)
@@ -637,12 +687,13 @@ func TestFinalizePSBT(t *testing.T) {
 		PkScript: witnessProgram,
 	}
 
+	// PartialSigs map key is the raw pubkey bytes cast to string (matches production decode logic)
 	psbt.Inputs[0].PartialSigs = map[string][]byte{
-		hex.EncodeToString(pubKey): sig,
+		string(pubKey): sig,
 	}
 
-	// Finalize
-	finalized, complete, err := FinalizePSBT(psbt)
+	// Finalize (mutates psbt in place, returns (complete bool, error))
+	complete, err := FinalizePSBT(psbt)
 	if err != nil {
 		t.Fatalf("Failed to finalize PSBT: %v", err)
 	}
@@ -651,27 +702,33 @@ func TestFinalizePSBT(t *testing.T) {
 		t.Error("Expected PSBT to be complete after finalization")
 	}
 
-	if finalized.Inputs[0].FinalScriptWitness == nil {
+	if psbt.Inputs[0].FinalScriptWitness == nil {
 		t.Error("Expected FinalScriptWitness to be set")
 	}
 
-	if len(finalized.Inputs[0].FinalScriptWitness) != 2 {
-		t.Errorf("Expected 2 witness items, got %d", len(finalized.Inputs[0].FinalScriptWitness))
+	if len(psbt.Inputs[0].FinalScriptWitness) != 2 {
+		t.Errorf("Expected 2 witness items, got %d", len(psbt.Inputs[0].FinalScriptWitness))
 	}
 }
 
 func TestExtractTransaction(t *testing.T) {
 	// Test extracting a finalized transaction
-	tx := wire.NewMsgTx(2)
-	prevHash, _ := wire.NewHashFromStr("0000000000000000000000000000000000000000000000000000000000000001")
-	tx.AddTxIn(&wire.TxIn{
-		PreviousOutPoint: wire.OutPoint{Hash: *prevHash, Index: 0},
-		Sequence:         0xffffffff,
-	})
-	tx.AddTxOut(&wire.TxOut{
-		Value:    100000,
-		PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
-	})
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14},
+			},
+		},
+	}
 
 	psbt := &PSBT{
 		UnsignedTx: tx,

@@ -382,25 +382,36 @@ func TestRESTBlockNoTxDetails(t *testing.T) {
 }
 
 func TestRESTTx(t *testing.T) {
-	// Create a transaction and add to mempool
+	// Create a transaction and add to mempool.
+	// Use OP_1 (0x51) as the output script (anyone-can-spend) so script
+	// validation passes with an empty scriptSig.
 	tx := &wire.MsgTx{
 		Version: 2,
 		TxIn: []*wire.TxIn{{
 			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01, 0x02, 0x03}, Index: 0},
-			SignatureScript:  []byte{0x00},
+			SignatureScript:  []byte{},
 			Sequence:         0xFFFFFFFF,
 		}},
 		TxOut: []*wire.TxOut{{
 			Value:    1000000,
-			PkScript: []byte{0x76, 0xa9, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac},
+			PkScript: []byte{0x51}, // OP_1 (anyone-can-spend)
 		}},
 		LockTime: 0,
 	}
 
 	txid := tx.TxHash()
 
-	mp := mempool.New(mempool.DefaultConfig(), nil)
-	mp.AddTransaction(tx)
+	// Provide a UTXO set with OP_1 output and excess value for fees.
+	utxoView := consensus.NewInMemoryUTXOView()
+	utxoView.AddUTXO(tx.TxIn[0].PreviousOutPoint, &consensus.UTXOEntry{
+		Amount:   tx.TxOut[0].Value + 100000, // excess = fees
+		PkScript: []byte{0x51},               // OP_1 (anyone-can-spend)
+		Height:   1,
+	})
+	mp := mempool.New(mempool.DefaultConfig(), utxoView)
+	if err := mp.AddTransaction(tx); err != nil {
+		t.Fatalf("AddTransaction failed: %v", err)
+	}
 
 	server := NewServer(
 		RPCConfig{ListenAddr: "127.0.0.1:0", RESTEnabled: true},
@@ -656,7 +667,7 @@ func TestBitmapFromString(t *testing.T) {
 		{"11", []byte{0x03}},
 		{"10101010", []byte{0x55}},
 		{"11111111", []byte{0xFF}},
-		{"100000000", []byte{0x01, 0x01}}, // 9 bits
+		{"100000000", []byte{0x01, 0x00}}, // 9 bits: '1' at position 0 sets byte[0] bit 0; positions 1-8 are '0'
 	}
 
 	for _, tt := range tests {

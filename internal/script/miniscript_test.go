@@ -169,8 +169,10 @@ func TestParseMiniscript(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			// pk_k(KEY) has type K, not B — it can't be used standalone.
+			// Wrap it with c: to get a valid B-type top-level expression.
 			name:    "pk_k",
-			input:   "pk_k(" + hex.EncodeToString(testKey) + ")",
+			input:   "c:pk_k(" + hex.EncodeToString(testKey) + ")",
 			wantErr: false,
 		},
 		{
@@ -204,8 +206,11 @@ func TestParseMiniscript(t *testing.T) {
 			wantErr: false,
 		},
 		{
+			// a: wraps B→W, c: wraps K→B. Combined in and_b(B,W) to give B (top-level valid).
+			// The original a:s:c:pk_k is invalid because a: applied to s: produces
+			// no base type (a: needs a B-type input; s: on pk_k produces W not B).
 			name:    "wrappers_asc",
-			input:   "a:s:c:pk_k(" + hex.EncodeToString(testKey) + ")",
+			input:   "and_b(pk(" + hex.EncodeToString(testKey) + "),a:c:pk_k(" + hex.EncodeToString(testKey2) + "))",
 			wantErr: false,
 		},
 		{
