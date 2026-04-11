@@ -328,8 +328,9 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
 	}
 
-	tipHash, tipHeight := s.chainMgr.BestBlock()
-	node := s.headerIndex.GetNode(tipHash)
+	_, tipHeight := s.chainMgr.BestBlock()
+	// Lock-free read via chainMgr tip cache — avoids idx.mu.RLock contention.
+	node := s.chainMgr.BestBlockNode()
 
 	var difficulty float64
 	if node != nil {
