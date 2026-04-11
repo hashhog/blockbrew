@@ -76,12 +76,6 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		medianTime = tipNode.GetMedianTimePast()
 	}
 
-	// Determine chain name
-	chain := "main"
-	if s.chainParams != nil {
-		chain = s.chainParams.Name
-	}
-
 	// Check if IBD is active
 	ibd := false
 	if s.syncMgr != nil {
@@ -89,7 +83,7 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 	}
 
 	return &BlockchainInfo{
-		Chain:                chain,
+		Chain:                s.rpcChainName(),
 		Blocks:               tipHeight,
 		Headers:              headersHeight,
 		BestBlockHash:        tipHash.String(),
