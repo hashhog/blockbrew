@@ -37,6 +37,7 @@ func TestPeerHandshakeOutbound(t *testing.T) {
 		startTime:     time.Now(),
 		lastRecv:      time.Now(),
 		lastSend:      time.Now(),
+		transport:     NewV1Transport(clientConn, config.Network),
 	}
 
 	// Run the mock server in a goroutine
@@ -259,6 +260,7 @@ func TestPeerPingPong(t *testing.T) {
 		startTime:     time.Now(),
 		lastRecv:      time.Now(),
 		lastSend:      time.Now(),
+		transport:     NewV1Transport(clientConn, config.Network),
 	}
 	close(peer.handshakeDone) // Mark handshake as done
 
@@ -338,6 +340,7 @@ func TestPeerDisconnectCleanup(t *testing.T) {
 		startTime:     time.Now(),
 		lastRecv:      time.Now(),
 		lastSend:      time.Now(),
+		transport:     NewV1Transport(clientConn, config.Network),
 	}
 	close(peer.handshakeDone)
 
@@ -395,6 +398,7 @@ func TestPeerSelfConnectionDetection(t *testing.T) {
 		startTime:     time.Now(),
 		lastRecv:      time.Now(),
 		lastSend:      time.Now(),
+		transport:     NewV1Transport(clientConn, config.Network),
 	}
 
 	// Start handlers
@@ -455,6 +459,7 @@ func TestPeerProtocolVersionNegotiation(t *testing.T) {
 		startTime:     time.Now(),
 		lastRecv:      time.Now(),
 		lastSend:      time.Now(),
+		transport:     NewV1Transport(clientConn, config.Network),
 	}
 
 	// Server with older protocol version
@@ -551,6 +556,7 @@ func TestPeerListeners(t *testing.T) {
 		startTime:     time.Now(),
 		lastRecv:      time.Now(),
 		lastSend:      time.Now(),
+		transport:     NewV1Transport(clientConn, config.Network),
 	}
 	close(peer.handshakeDone)
 

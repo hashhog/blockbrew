@@ -730,8 +730,10 @@ func (w *Wallet) CreateTransactionWithTip(destAddr string, amount int64, feeRate
 
 	result, err := SelectCoins(available, target, feeRate, costOfChange)
 	if err != nil {
-		// Fall back to simple selection if advanced selection fails
-		utxos := w.selectCoins(amount, feeRate)
+		// Fall back to simple selection if advanced selection fails.
+		// Pass the already-filtered spendable list so immature coinbase UTXOs
+		// are excluded here too (selectCoins only checks Confirmed, not maturity).
+		utxos := w.selectCoinsFrom(available, amount, feeRate)
 		if utxos == nil {
 			return nil, ErrInsufficientFunds
 		}
@@ -812,6 +814,8 @@ func (w *Wallet) newChangeAddressLocked() (string, error) {
 }
 
 // selectCoins selects UTXOs for a transaction using largest-first selection.
+// It uses all confirmed UTXOs without maturity filtering; use selectCoinsFrom
+// when the caller has already filtered the UTXO set (e.g., to exclude immature coinbase).
 func (w *Wallet) selectCoins(amount int64, feeRate float64) []*WalletUTXO {
 	// Get all confirmed UTXOs
 	var available []*WalletUTXO
@@ -820,6 +824,13 @@ func (w *Wallet) selectCoins(amount int64, feeRate float64) []*WalletUTXO {
 			available = append(available, utxo)
 		}
 	}
+	return w.selectCoinsFrom(available, amount, feeRate)
+}
+
+// selectCoinsFrom selects UTXOs from the provided list using largest-first selection.
+func (w *Wallet) selectCoinsFrom(utxos []*WalletUTXO, amount int64, feeRate float64) []*WalletUTXO {
+	available := make([]*WalletUTXO, len(utxos))
+	copy(available, utxos)
 
 	// Sort by value descending (largest first)
 	sort.Slice(available, func(i, j int) bool {
