@@ -348,16 +348,11 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 		pooledTx = s.mempool.Count()
 	}
 
-	chain := "main"
-	if s.chainParams != nil {
-		chain = s.chainParams.Name
-	}
-
 	return &MiningInfo{
 		Blocks:     tipHeight,
 		Difficulty: difficulty,
 		PooledTx:   pooledTx,
-		Chain:      chain,
+		Chain:      s.rpcChainName(),
 	}, nil
 }
 
