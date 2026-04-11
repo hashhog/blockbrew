@@ -190,10 +190,13 @@ func (u *UTXOSet) SpendUTXOChecked(outpoint wire.OutPoint) error {
 		delete(u.cache, outpoint)
 		delete(u.dirty, outpoint)
 
-		// FRESH optimization: never written to disk, skip delete
+		// FRESH optimization: never written to disk, skip writing a tombstone.
+		// Still mark as deleted in memory so double-spend detection works within
+		// this UTXOSet instance's lifetime.
 		if u.fresh[outpoint] {
 			delete(u.fresh, outpoint)
 			u.freshHits++
+			u.deleted[outpoint] = true
 			return nil
 		}
 

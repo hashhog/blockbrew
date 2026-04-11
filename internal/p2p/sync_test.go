@@ -595,6 +595,9 @@ func TestHeaderSyncFlow(t *testing.T) {
 		t.Error("should be synced after second batch (< 2000 headers)")
 	}
 
+	// OnSyncComplete is called in a goroutine (to avoid deadlock on sm.mu),
+	// so give it a moment to run before checking.
+	time.Sleep(50 * time.Millisecond)
 	if !syncComplete.Load() {
 		t.Error("OnSyncComplete should have been called")
 	}

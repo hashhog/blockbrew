@@ -150,12 +150,14 @@ func DeserializeBlockFileInfo(r io.Reader) (*BlockFileInfo, error) {
 	}
 	fi.HeightLast = uint32(v)
 
-	fi.TimeFirst, err = wire.ReadCompactSize(r)
+	// Use ReadCompactSizeUnchecked for timestamps: Unix timestamps (e.g., 1609459200)
+	// exceed MaxCompactSize (32 MB) so the standard ReadCompactSize would reject them.
+	fi.TimeFirst, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return nil, err
 	}
 
-	fi.TimeLast, err = wire.ReadCompactSize(r)
+	fi.TimeLast, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return nil, err
 	}

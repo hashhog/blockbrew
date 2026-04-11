@@ -1597,7 +1597,7 @@ func TestP2AStandardDust(t *testing.T) {
 	utxoSet := newTestUTXOSet()
 	mp := New(Config{
 		MinRelayFeeRate: 1000, // 1 sat/vB
-		MaxMemPoolSize:  1000000,
+		MaxSize:         1000000,
 	}, utxoSet)
 
 	// P2A scriptPubKey: OP_1 OP_PUSHBYTES_2 0x4e 0x73

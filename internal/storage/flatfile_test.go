@@ -463,7 +463,8 @@ func TestBlockStorePersistence(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBlockStore (reopen) failed: %v", err)
 	}
-	defer bs2.Close()
+	// Do not defer bs2.Close() here — it must be closed before db.Close().
+	// See explicit bs2.Close() + db.Close() at end of test.
 
 	// Current file should be preserved
 	if bs2.CurrentFile() != pos.FileNum {
@@ -489,6 +490,9 @@ func TestBlockStorePersistence(t *testing.T) {
 		t.Error("NumBlocks = 0 after reopen")
 	}
 
+	// Close bs2 before closing db: bs2.Close() flushes state to db,
+	// so db must still be open when bs2.Close() runs.
+	bs2.Close()
 	db.Close()
 }
 

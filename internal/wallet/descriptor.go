@@ -78,8 +78,8 @@ func (t DescriptorType) String() string {
 // DescriptorChecksum computes the checksum for a descriptor string.
 // The checksum is an 8-character string using the character set qpzry9x8gf2tvdw0s3jn54khce6mua7l.
 func DescriptorChecksum(desc string) string {
-	// Character set for input
-	const inputCharset = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ABCDEFGHijklmnopqrstuvwxyz "
+	// Character set for input (matches Bitcoin Core descriptor.cpp INPUT_CHARSET exactly)
+	const inputCharset = "0123456789()[],'/*abcdefgh@:$%{}IJKLMNOPQRSTUVWXYZ&+-.;<=>?!^_|~ijklmnopqrstuvwxyzABCDEFGH`#\"\\ "
 	// Character set for checksum output
 	const checksumCharset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
