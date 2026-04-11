@@ -282,6 +282,30 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	s.sendResponse(w, RPCResponse{Result: result, ID: req.ID})
 }
 
+// rpcChainName returns the Bitcoin Core–canonical chain ID for RPC responses.
+//
+// blockbrew's ChainParams.Name uses the internal identifiers "mainnet",
+// "testnet3", "testnet4", "regtest", "signet". Bitcoin Core's
+// getblockchaininfo returns the shorter CBaseChainParams strings ("main",
+// "test", "regtest", "signet", "testnet4"). Consensus-diff and other
+// Core-compatible clients expect the Core values, so we translate at the
+// RPC boundary without touching the internal name (which is still used
+// for logging, peer messages, and config lookup).
+func (s *Server) rpcChainName() string {
+	if s.chainParams == nil {
+		return "main"
+	}
+	switch s.chainParams.Name {
+	case "mainnet":
+		return "main"
+	case "testnet", "testnet3":
+		return "test"
+	default:
+		// regtest, signet, testnet4 — Core uses these identifiers verbatim.
+		return s.chainParams.Name
+	}
+}
+
 // extractWalletName extracts wallet name from URL path.
 // Returns empty string if no wallet specified or path is "/".
 func (s *Server) extractWalletName(path string) string {
