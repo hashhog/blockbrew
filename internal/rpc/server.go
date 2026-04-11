@@ -412,6 +412,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetDifficulty()
 	case "getchaintips":
 		return s.handleGetChainTips()
+	case "getdeploymentinfo":
+		return s.handleGetDeploymentInfo(params)
 	case "gettxout":
 		return s.handleGetTxOut(params)
 	case "getindexinfo":
