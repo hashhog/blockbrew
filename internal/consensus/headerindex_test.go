@@ -614,3 +614,53 @@ func TestBlockNodeChildren(t *testing.T) {
 		t.Error("not all children found in genesis.Children")
 	}
 }
+
+// TestBestHeightCache verifies that BestHeight uses atomic cache and returns correct values.
+func TestBestHeightCache(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	// Genesis starts at height 0
+	if idx.BestHeight() != 0 {
+		t.Errorf("initial best height = %d, want 0", idx.BestHeight())
+	}
+
+	// Verify cache is initialized
+	if idx.cachedBestHeight.Load() != 0 {
+		t.Errorf("initial cache value = %d, want 0", idx.cachedBestHeight.Load())
+	}
+
+	// Add headers and verify cache is updated
+	prevNode := idx.genesis
+	for i := 1; i <= 5; i++ {
+		header := createTestHeader(
+			prevNode.Hash,
+			prevNode.Header.Timestamp+600,
+			uint32(i),
+		)
+
+		node, err := idx.AddHeader(header)
+		if err != nil {
+			t.Fatalf("failed to add header %d: %v", i, err)
+		}
+
+		// Verify BestHeight returns correct value
+		if idx.BestHeight() != int32(i) {
+			t.Errorf("after adding header %d, best height = %d, want %d", i, idx.BestHeight(), i)
+		}
+
+		// Verify cache is updated
+		if idx.cachedBestHeight.Load() != int32(i) {
+			t.Errorf("after adding header %d, cached height = %d, want %d", i, idx.cachedBestHeight.Load(), i)
+		}
+
+		prevNode = node
+	}
+
+	// Verify BestHeight and cache are consistent with BestTip
+	bestHeight := idx.BestHeight()
+	bestTip := idx.BestTip()
+	if bestHeight != bestTip.Height {
+		t.Errorf("BestHeight(%d) != BestTip.Height(%d)", bestHeight, bestTip.Height)
+	}
+}
