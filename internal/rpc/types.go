@@ -458,3 +458,40 @@ type ListWalletDirResult struct {
 	Wallets []WalletDirEntry `json:"wallets"`
 }
 
+// BIP9Stats contains statistics about the current signaling period for a BIP9 deployment.
+type BIP9StatsResult struct {
+	Period    int32 `json:"period"`
+	Threshold int32 `json:"threshold,omitempty"`
+	Elapsed   int32 `json:"elapsed"`
+	Count     int32 `json:"count"`
+	Possible  *bool `json:"possible,omitempty"`
+}
+
+// BIP9Info contains BIP9 deployment state information.
+type BIP9Info struct {
+	Bit                 *int             `json:"bit,omitempty"`
+	StartTime           int64            `json:"start_time"`
+	Timeout             int64            `json:"timeout"`
+	MinActivationHeight int32            `json:"min_activation_height"`
+	Status              string           `json:"status"`
+	Since               int32            `json:"since"`
+	StatusNext          string           `json:"status_next"`
+	Statistics          *BIP9StatsResult `json:"statistics,omitempty"`
+	Signalling          string           `json:"signalling,omitempty"`
+}
+
+// DeploymentEntry represents a single deployment in getdeploymentinfo.
+type DeploymentEntry struct {
+	Type   string    `json:"type"`
+	Height *int32    `json:"height,omitempty"`
+	Active bool      `json:"active"`
+	BIP9   *BIP9Info `json:"bip9,omitempty"`
+}
+
+// DeploymentInfoResult represents the result of getdeploymentinfo.
+type DeploymentInfoResult struct {
+	Hash        string                     `json:"hash"`
+	Height      int32                      `json:"height"`
+	Deployments map[string]DeploymentEntry `json:"deployments"`
+}
+
