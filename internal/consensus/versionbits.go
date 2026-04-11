@@ -475,3 +475,67 @@ func DeploymentActiveAfter(
 	state := GetDeploymentState(deployment, deploymentIndex, tip, params, cache)
 	return state == DeploymentActive
 }
+
+// GetStateSinceHeight returns the height of the first block for which the
+// current deployment state applied.  It mirrors Bitcoin Core's
+// AbstractThresholdConditionChecker::GetStateSinceHeightFor.
+//
+// The caller passes the block PRIOR to the one being evaluated (pindexPrev in
+// Core nomenclature), which matches the convention used by GetDeploymentState.
+func GetStateSinceHeight(
+	deployment *BIP9Deployment,
+	deploymentIndex int,
+	tip *BlockNode, // the block prior to the one being evaluated
+	params *ChainParams,
+	cache *VersionBitsCache,
+) int32 {
+	// Special modes: always-active or never-active deployments are treated as
+	// active/failed from genesis height 0.
+	if deployment.StartTime == AlwaysActive || deployment.StartTime == NeverActive {
+		return 0
+	}
+
+	currentState := GetDeploymentState(deployment, deploymentIndex, tip, params, cache)
+
+	// DEFINED state has been active since genesis.
+	if currentState == DeploymentDefined {
+		return 0
+	}
+
+	period := deployment.Period
+	if period == 0 {
+		period = int32(params.DifficultyAdjInterval)
+	}
+
+	// Align tip to the last block of its retarget period so that we walk
+	// period-by-period backwards.  Bitcoin Core: pindexPrev->GetAncestor(
+	//   pindexPrev->nHeight - ((pindexPrev->nHeight + 1) % nPeriod))
+	if tip == nil {
+		return 0
+	}
+	alignedHeight := tip.Height - ((tip.Height + 1) % period)
+	pindexPrev := tip.GetAncestor(alignedHeight)
+	if pindexPrev == nil {
+		return 0
+	}
+
+	// Walk backwards one period at a time while the state matches.
+	for {
+		parentHeight := pindexPrev.Height - period
+		if parentHeight < 0 {
+			break
+		}
+		parent := pindexPrev.GetAncestor(parentHeight)
+		if parent == nil {
+			break
+		}
+		if GetDeploymentState(deployment, deploymentIndex, parent, params, cache) != currentState {
+			break
+		}
+		pindexPrev = parent
+	}
+
+	// pindexPrev now points to the last block of the period before the
+	// state change; the state first applies to the block at height+1.
+	return pindexPrev.Height + 1
+}
