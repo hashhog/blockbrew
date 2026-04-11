@@ -57,6 +57,12 @@ const (
 	// PeriodicHeaderInterval is how often to send getheaders to a random peer
 	// when synced, to discover new blocks missed by inv messages.
 	PeriodicHeaderInterval = 5 * time.Minute
+
+	// MaxTipAge is the maximum age of our best block tip before we consider
+	// the node still in IBD.  Matches Bitcoin Core's DEFAULT_MAX_TIP_AGE (24h).
+	// If the chain tip's block timestamp is older than this, IsIBDActive returns
+	// true regardless of block height.
+	MaxTipAge = 24 * time.Hour
 )
 
 // BlockDownloadState tracks the download state of a block.
@@ -125,7 +131,13 @@ type SyncManager struct {
 	// write lock for long intervals during header/block processing. Go's
 	// sync.RWMutex has writer preference, so a naive RLock-guarded read
 	// starves the RPC goroutine indefinitely during IBD. See L1-7b.
-	ibdActive    atomic.Bool // True when downloading blocks
+	//
+	// Semantics match Bitcoin Core's m_cached_is_ibd (validation.h):
+	// the flag starts true and is latched to false (never back to true)
+	// once the chain tip has a timestamp within MaxTipAge of wall-clock
+	// time.  This means header sync is correctly reported as IBD, not
+	// just block download.  See updateIBDStatus().
+	ibdActive    atomic.Bool // True while in IBD (header sync OR block download)
 	peerRoundIdx int         // Round-robin index for peer selection
 
 	// Stale tip detection (Bitcoin Core: CheckForStaleTipAndEvictPeers)
@@ -140,6 +152,10 @@ type ChainConnector interface {
 	ConnectBlock(block *wire.MsgBlock) error
 	// BestBlock returns the current chain tip hash and height.
 	BestBlock() (wire.Hash256, int32)
+	// BestBlockNode returns the BlockNode for the current chain tip via
+	// an atomic cache.  Used by updateIBDStatus to read the tip timestamp
+	// without holding any lock.
+	BestBlockNode() *consensus.BlockNode
 	// ReloadChainState re-resolves the chain tip and assume-valid height
 	// from the database after the header index has been populated.
 	ReloadChainState()
@@ -165,7 +181,7 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 	}
 
 	now := time.Now()
-	return &SyncManager{
+	sm := &SyncManager{
 		chainParams:       config.ChainParams,
 		headerIndex:       config.HeaderIndex,
 		chainDB:           config.ChainDB,
@@ -182,6 +198,12 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		lastTipUpdate:     now,
 		nextStaleTipCheck: now.Add(StaleTipCheckInterval),
 	}
+	// IBD starts true from the moment the sync manager is created; it is
+	// only latched to false by updateIBDStatus() once the chain tip is
+	// recent.  This matches Bitcoin Core's m_cached_is_ibd{true} initial
+	// value in validation.h.
+	sm.ibdActive.Store(true)
+	return sm
 }
 
 // SetPeerManager sets or updates the peer manager reference.
@@ -798,8 +820,11 @@ func (sm *SyncManager) StartBlockDownload() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if sm.ibdActive.Load() {
-		log.Printf("sync: StartBlockDownload called but IBD already active")
+	// Guard against duplicate invocations: check whether blockQueue was
+	// already populated rather than ibdActive (which is now always true
+	// until the tip is recent, not just during block download).
+	if len(sm.blockQueue) > 0 {
+		log.Printf("sync: StartBlockDownload called but block queue already populated")
 		return
 	}
 
@@ -844,7 +869,6 @@ func (sm *SyncManager) StartBlockDownload() {
 	}
 
 	sm.nextHeight = startHeight + 1
-	sm.ibdActive.Store(true)
 
 	log.Printf("sync: starting block download from height %d to %d (%d blocks)",
 		startHeight+1, bestTip.Height, len(sm.blockQueue))
@@ -948,8 +972,16 @@ func (sm *SyncManager) blockDownloadLoop() {
 		sm.mu.RUnlock()
 
 		if done {
-			log.Printf("sync: IBD complete")
-			sm.ibdActive.Store(false)
+			// Block queue drained: run the IBD status check.  This should
+			// latch ibdActive to false now that we have a recent tip, but
+			// also handles the edge case where the queue was empty from the
+			// start (e.g., already synced before StartBlockDownload ran).
+			sm.updateIBDStatus()
+			if sm.ibdActive.Load() {
+				log.Printf("sync: block queue empty but tip is not yet recent — IBD remains active")
+			} else {
+				log.Printf("sync: IBD complete")
+			}
 			return
 		}
 	}
@@ -1545,6 +1577,11 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 			sm.onBlockConnected(bwr.block, nextHeight)
 		}
 
+		// Check whether IBD should be considered complete now that this
+		// block is connected.  updateIBDStatus latches ibdActive to false
+		// once the tip is recent enough; it is a no-op once already false.
+		sm.updateIBDStatus()
+
 		// Update stale tip tracker — our chain tip just advanced
 		sm.mu.Lock()
 		sm.lastTipUpdate = time.Now()
@@ -1634,6 +1671,45 @@ func (sm *SyncManager) progressLogger() {
 // writer-preference starvation that made L1-7 also trip this path.
 func (sm *SyncManager) IsIBDActive() bool {
 	return sm.ibdActive.Load()
+}
+
+// updateIBDStatus checks whether IBD should be considered complete and, if so,
+// latches ibdActive to false.  It is the Go equivalent of Bitcoin Core's
+// ChainstateManager::UpdateIBDStatus() in validation.cpp.
+//
+// Rules (must ALL be true to leave IBD):
+//  1. ibdActive is currently true (latch — never re-enters IBD once false).
+//  2. The chain manager reports a best block (not at genesis-only state).
+//  3. The best block's timestamp is within MaxTipAge (24h) of wall-clock time.
+//
+// This is called lock-free (no sm.mu needed) because ibdActive is an
+// atomic.Bool and the chain manager's BestBlock / BestBlockNode are also
+// designed to be read without the sync-manager lock.
+func (sm *SyncManager) updateIBDStatus() {
+	// Fast path: already left IBD — never flip back.
+	if !sm.ibdActive.Load() {
+		return
+	}
+	if sm.chainMgr == nil {
+		return
+	}
+	_, tipHeight := sm.chainMgr.BestBlock()
+	if tipHeight < 0 {
+		return
+	}
+	tipNode := sm.chainMgr.BestBlockNode()
+	if tipNode == nil {
+		return
+	}
+	tipTime := time.Unix(int64(tipNode.Header.Timestamp), 0)
+	if time.Since(tipTime) <= MaxTipAge {
+		// Tip is recent enough — latch IBD to false.
+		// CompareAndSwap ensures only one goroutine does the log line.
+		if sm.ibdActive.CompareAndSwap(true, false) {
+			log.Printf("sync: leaving InitialBlockDownload (tip age %v, height %d)",
+				time.Since(tipTime).Round(time.Second), tipHeight)
+		}
+	}
 }
 
 // BlocksInFlight returns the number of blocks currently being downloaded.

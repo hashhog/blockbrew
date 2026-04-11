@@ -885,7 +885,43 @@ func TestCreatePeerListenersIncludesOnBlock(t *testing.T) {
 	}
 }
 
-func TestIsIBDActive(t *testing.T) {
+// ---------------------------------------------------------------------------
+// IBD-flag regression tests (L1-7c)
+//
+// These three tests guard the Bitcoin-Core-matching semantics introduced by
+// L1-7c: ibdActive starts true, is latched to false only when the chain tip
+// is recent, and never returns to true.
+// ---------------------------------------------------------------------------
+
+// mockChainConnector is a minimal ChainConnector for IBD-flag tests.
+// It lets callers control the tip timestamp so we can simulate a recent vs.
+// stale tip without actually connecting blocks.
+type mockChainConnector struct {
+	tipHash      wire.Hash256
+	tipHeight    int32
+	tipTimestamp uint32 // Unix seconds for the simulated tip block
+}
+
+func (m *mockChainConnector) BestBlock() (wire.Hash256, int32) {
+	return m.tipHash, m.tipHeight
+}
+
+func (m *mockChainConnector) BestBlockNode() *consensus.BlockNode {
+	return &consensus.BlockNode{
+		Hash:   m.tipHash,
+		Height: m.tipHeight,
+		Header: wire.BlockHeader{Timestamp: m.tipTimestamp},
+	}
+}
+
+func (m *mockChainConnector) ConnectBlock(_ *wire.MsgBlock) error { return nil }
+func (m *mockChainConnector) ReloadChainState()                   {}
+
+// TestIsIBDActive_TrueAtStartup verifies that a freshly created SyncManager
+// reports IsIBDActive()=true before any blocks have connected.
+// Regression for L1-7c: the old code initialised ibdActive=false so the
+// flag stayed false during the entire header-sync phase.
+func TestIsIBDActive_TrueAtStartup(t *testing.T) {
 	params := consensus.RegtestParams()
 	idx := consensus.NewHeaderIndex(params)
 
@@ -894,15 +930,112 @@ func TestIsIBDActive(t *testing.T) {
 		HeaderIndex: idx,
 	})
 
-	// Initially IBD should not be active
-	if sm.IsIBDActive() {
-		t.Error("IBD should not be active initially")
+	// A fresh sync manager must report IBD active — we are definitely not
+	// at tip when we have no peers and no blocks.
+	if !sm.IsIBDActive() {
+		t.Fatal("new sync manager should report IsIBDActive()=true before any blocks connect")
+	}
+}
+
+// TestIsIBDActive_FalseWhenTipIsRecent verifies that updateIBDStatus latches
+// ibdActive to false once the chain tip's timestamp is within MaxTipAge (24h),
+// and that it never flips back to true.
+func TestIsIBDActive_FalseWhenTipIsRecent(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	// Simulate a tip whose block timestamp is 1 minute ago — well within MaxTipAge.
+	recentTimestamp := uint32(time.Now().Add(-1 * time.Minute).Unix())
+	mock := &mockChainConnector{tipHeight: 1000, tipTimestamp: recentTimestamp}
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:  params,
+		HeaderIndex:  idx,
+		ChainManager: mock,
+	})
+
+	// Should start in IBD.
+	if !sm.IsIBDActive() {
+		t.Fatal("expected IsIBDActive()=true at startup")
 	}
 
-	// Set IBD active
-	sm.ibdActive.Store(true)
+	// After calling updateIBDStatus the flag should latch to false.
+	sm.updateIBDStatus()
+	if sm.IsIBDActive() {
+		t.Fatal("expected IsIBDActive()=false after tip age < MaxTipAge")
+	}
 
+	// Confirm latch: calling updateIBDStatus again must not re-set the flag.
+	sm.updateIBDStatus()
+	if sm.IsIBDActive() {
+		t.Fatal("IsIBDActive() must never return true once latched false")
+	}
+
+	// Confirm lock-freedom: IsIBDActive must be callable concurrently without
+	// data races.  The race detector will flag any violation.
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 1000; j++ {
+				_ = sm.IsIBDActive()
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestIsIBDActive_TrueDuringHeaderSync exercises the scenario that triggered
+// the L1-7c bug: blockbrew returned initialblockdownload:false while syncing
+// headers (blocks=0, headers>0).
+//
+// The test feeds the sync manager 10 headers as if a peer sent them, then
+// verifies IBD is still active because the headers' timestamps are old (the
+// genesis timestamp is from 2009, far older than MaxTipAge).
+func TestIsIBDActive_TrueDuringHeaderSync(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	// Stale-tip chain manager: tip is at height 0, timestamp epoch 0 (very old).
+	staleMock := &mockChainConnector{tipHeight: 0, tipTimestamp: 0}
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:  params,
+		HeaderIndex:  idx,
+		ChainManager: staleMock,
+	})
+
+	// Feed some headers (old timestamps, as regtest genesis is from 2011).
+	peer := createMockPeer("1.2.3.4:8333", 10)
+	sm.mu.Lock()
+	sm.syncPeer = peer
+	sm.mu.Unlock()
+
+	headers := make([]wire.BlockHeader, 10)
+	prevHash := params.GenesisHash
+	prevTS := params.GenesisBlock.Header.Timestamp // 2011 — very old
+	for i := 0; i < 10; i++ {
+		headers[i] = createTestBlockHeader(prevHash, prevTS+uint32((i+1)*600), uint32(i+1))
+		prevHash = headers[i].BlockHash()
+		prevTS = headers[i].Timestamp
+	}
+	sm.HandleHeaders(peer, &MsgHeaders{Headers: headers})
+
+	// Header sync completed (< 2000 headers), but we have no connected blocks
+	// and the timestamps are old → IBD must still be active.
+	sm.updateIBDStatus()
 	if !sm.IsIBDActive() {
-		t.Error("IBD should be active after setting")
+		t.Fatal("IBD should remain active during header sync with stale timestamps")
+	}
+
+	// Simulate tip advancing to a recent block (tip caught up).
+	recentTS := uint32(time.Now().Add(-30 * time.Second).Unix())
+	staleMock.tipTimestamp = recentTS
+	staleMock.tipHeight = 10
+
+	sm.updateIBDStatus()
+	if sm.IsIBDActive() {
+		t.Fatal("IBD should be false once tip is recent")
 	}
 }
