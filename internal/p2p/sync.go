@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -118,8 +119,14 @@ type SyncManager struct {
 	chainMgr ChainConnector
 
 	// IBD state
-	ibdActive    bool // True when downloading blocks
-	peerRoundIdx int  // Round-robin index for peer selection
+	//
+	// ibdActive is accessed lock-free via atomic operations so that RPC
+	// readers (IsIBDActive) don't contend with sm.mu, which is held as a
+	// write lock for long intervals during header/block processing. Go's
+	// sync.RWMutex has writer preference, so a naive RLock-guarded read
+	// starves the RPC goroutine indefinitely during IBD. See L1-7b.
+	ibdActive    atomic.Bool // True when downloading blocks
+	peerRoundIdx int         // Round-robin index for peer selection
 
 	// Stale tip detection (Bitcoin Core: CheckForStaleTipAndEvictPeers)
 	lastTipUpdate      time.Time // When our chain tip last advanced
@@ -791,7 +798,7 @@ func (sm *SyncManager) StartBlockDownload() {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
-	if sm.ibdActive {
+	if sm.ibdActive.Load() {
 		log.Printf("sync: StartBlockDownload called but IBD already active")
 		return
 	}
@@ -837,7 +844,7 @@ func (sm *SyncManager) StartBlockDownload() {
 	}
 
 	sm.nextHeight = startHeight + 1
-	sm.ibdActive = true
+	sm.ibdActive.Store(true)
 
 	log.Printf("sync: starting block download from height %d to %d (%d blocks)",
 		startHeight+1, bestTip.Height, len(sm.blockQueue))
@@ -942,9 +949,7 @@ func (sm *SyncManager) blockDownloadLoop() {
 
 		if done {
 			log.Printf("sync: IBD complete")
-			sm.mu.Lock()
-			sm.ibdActive = false
-			sm.mu.Unlock()
+			sm.ibdActive.Store(false)
 			return
 		}
 	}
@@ -1585,8 +1590,8 @@ func (sm *SyncManager) progressLogger() {
 	for {
 		select {
 		case <-ticker.C:
+			active := sm.ibdActive.Load()
 			sm.mu.RLock()
-			active := sm.ibdActive
 			queueLen := len(sm.blockQueue)
 			inflightLen := len(sm.inflight)
 			nextHeight := sm.nextHeight
@@ -1623,10 +1628,12 @@ func (sm *SyncManager) progressLogger() {
 }
 
 // IsIBDActive returns true if initial block download is in progress.
+// Lock-free: the RPC handler (handleGetBlockchainInfo) calls this on every
+// getblockchaininfo, and sm.mu is held as a write lock for seconds at a
+// time during header/block processing. Using an atomic.Bool avoids the
+// writer-preference starvation that made L1-7 also trip this path.
 func (sm *SyncManager) IsIBDActive() bool {
-	sm.mu.RLock()
-	defer sm.mu.RUnlock()
-	return sm.ibdActive
+	return sm.ibdActive.Load()
 }
 
 // BlocksInFlight returns the number of blocks currently being downloaded.
