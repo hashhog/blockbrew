@@ -900,9 +900,7 @@ func TestIsIBDActive(t *testing.T) {
 	}
 
 	// Set IBD active
-	sm.mu.Lock()
-	sm.ibdActive = true
-	sm.mu.Unlock()
+	sm.ibdActive.Store(true)
 
 	if !sm.IsIBDActive() {
 		t.Error("IBD should be active after setting")
