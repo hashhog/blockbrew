@@ -5,6 +5,7 @@ import (
 	"math/big"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -183,6 +184,10 @@ type HeaderIndex struct {
 	preciousBlock       *BlockNode // The block designated as precious (ephemeral)
 	lastPreciousWork    *big.Int   // Chainwork when last precious call was made
 	blockSequenceID     int32      // Sequence counter for precious block tie-breaking
+
+	// Lock-free best height cache for RPC reads (updated atomically when best tip changes).
+	// This avoids RLock contention with header validation during rapid header sync in IBD.
+	cachedBestHeight atomic.Int32
 }
 
 // Ensure HeaderIndex implements BlockProvider
@@ -227,6 +232,7 @@ func NewHeaderIndex(params *ChainParams) *HeaderIndex {
 	idx.nodes[genesisNode.Hash] = genesisNode
 	idx.genesis = genesisNode
 	idx.bestTip = genesisNode
+	idx.cachedBestHeight.Store(0)
 
 	return idx
 }
@@ -369,6 +375,8 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 	// Update best tip if this chain has more work
 	if totalWork.Cmp(idx.bestTip.TotalWork) > 0 {
 		idx.bestTip = node
+		// Update atomic cache so RPC reads don't need to take RLock
+		idx.cachedBestHeight.Store(node.Height)
 	}
 
 	return node, nil
@@ -433,10 +441,9 @@ func (idx *HeaderIndex) BestTip() *BlockNode {
 }
 
 // BestHeight returns the height of the best chain tip.
+// Uses atomic cache so it never blocks on the write lock held by header validation.
 func (idx *HeaderIndex) BestHeight() int32 {
-	idx.mu.RLock()
-	defer idx.mu.RUnlock()
-	return idx.bestTip.Height
+	return idx.cachedBestHeight.Load()
 }
 
 // Genesis returns the genesis block node.
@@ -617,6 +624,8 @@ func (idx *HeaderIndex) recalculateBestTipLocked() {
 
 	if bestCandidate != nil {
 		idx.bestTip = bestCandidate
+		// Update atomic cache so RPC reads don't need to take RLock
+		idx.cachedBestHeight.Store(bestCandidate.Height)
 	}
 }
 
