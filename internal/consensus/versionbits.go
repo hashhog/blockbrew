@@ -265,20 +265,31 @@ func GetDeploymentState(
 	return state
 }
 
-// getPeriodEndHeight returns the height of the last block in the PREVIOUS period.
-// BIP9 states are computed per-period, and the state for blocks in period N
-// is determined by the state at the END of period N-1.
+// getPeriodEndHeight returns the height used to determine the deployment state
+// applicable to the block AFTER height. This follows Bitcoin Core semantics where
+// GetStateFor(pindexPrev) returns the state for the next block.
 //
-// For period=2016:
-//   - Heights 0-2015 are in period 0, state is computed at height -1 (before genesis, so DEFINED)
-//   - Heights 2016-4031 are in period 1, state is computed at height 2015
-//   - Heights 4032-6047 are in period 2, state is computed at height 4031
+// If height is exactly at a period boundary (height % period == period-1), the
+// state for the next block is determined by counting signals in the CURRENT period
+// (ending at height), so we return height itself.
+//
+// Otherwise, the next block is mid-period and inherits the state computed at the
+// end of the PREVIOUS period.
+//
+// For period=2016, where ^ marks the evaluated boundary:
+//   - Heights 0-2015 are in period 0; computing for block 2016 uses height 2015^
+//   - Heights 2016-4031 are in period 1; computing for block 4032 uses height 4031^
+//   - Computing for any block 2016-4031 mid-period uses height 2015^ (previous end)
 func getPeriodEndHeight(height int32, period int32) int32 {
-	// Period N contains heights [N*period, (N+1)*period - 1]
-	// The previous period's end is (N*period) - 1
+	if height >= 0 && (height+1)%period == 0 {
+		// height is the last block of its period; state for the next block is
+		// computed from this period's signaling.
+		return height
+	}
+	// height is mid-period; the next block inherits the state from the previous
+	// period boundary.
 	periodNum := height / period
-	previousPeriodEnd := periodNum*period - 1
-	return previousPeriodEnd
+	return periodNum*period - 1
 }
 
 // computeNextState calculates the next deployment state given the current state

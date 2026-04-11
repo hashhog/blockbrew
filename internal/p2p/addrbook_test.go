@@ -321,10 +321,18 @@ func TestKnownAddressChance(t *testing.T) {
 		t.Error("address with success should have higher chance")
 	}
 
-	// Recently attempted should have zero chance
+	// Recently attempted address with prior success gets a reduced but non-zero
+	// chance (0.5) to prevent feeler probes from exhausting small networks.
 	ka.LastAttempt = time.Now()
+	recentlyAttemptedChance := ka.Chance()
+	if recentlyAttemptedChance >= chanceWithSuccess {
+		t.Errorf("recently attempted address should have lower chance than successful, got %f >= %f", recentlyAttemptedChance, chanceWithSuccess)
+	}
+
+	// Recently attempted address with NO prior success should have zero chance
+	ka.LastSuccess = time.Time{}
 	if ka.Chance() != 0 {
-		t.Error("recently attempted address should have zero chance")
+		t.Error("recently attempted address with no success should have zero chance")
 	}
 
 	// Bad address should have zero chance

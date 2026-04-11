@@ -768,22 +768,27 @@ func TestDeploymentActiveAfter(t *testing.T) {
 }
 
 func TestGetPeriodEndHeight(t *testing.T) {
+	// getPeriodEndHeight returns the boundary height used to compute the state
+	// for the block AFTER height (Bitcoin Core GetStateFor(pindexPrev) semantics).
+	// When height is at the END of a period (height+1 divisible by period), the
+	// state for the next block is determined by counting signals in the CURRENT
+	// period, so we return height itself. Otherwise we return the previous period end.
 	tests := []struct {
 		height   int32
 		period   int32
 		expected int32
 	}{
-		{0, 10, -1},   // Before first period
-		{5, 10, -1},   // Still before first period
-		{9, 10, -1},   // Still before first period
-		{10, 10, 9},   // Second period, previous end is 9
-		{15, 10, 9},   // Still in second period
-		{19, 10, 9},   // End of second period
-		{20, 10, 19},  // Third period
-		{2015, 2016, -1}, // Bitcoin-style period
-		{2016, 2016, 2015},
-		{4031, 2016, 2015},
-		{4032, 2016, 4031},
+		{0, 10, -1},   // Mid-period 0; previous period end = -1 (before genesis)
+		{5, 10, -1},   // Mid-period 0; previous period end = -1
+		{9, 10, 9},    // End of period 0 (9+1=10, divisible by 10); return 9
+		{10, 10, 9},   // Mid-period 1; previous end = 9
+		{15, 10, 9},   // Mid-period 1; previous end = 9
+		{19, 10, 19},  // End of period 1 (19+1=20, divisible by 10); return 19
+		{20, 10, 19},  // Mid-period 2; previous end = 19
+		{2015, 2016, 2015}, // End of period 0 (Bitcoin-style); return 2015
+		{2016, 2016, 2015}, // Mid-period 1; previous end = 2015
+		{4031, 2016, 4031}, // End of period 1; return 4031
+		{4032, 2016, 4031}, // Mid-period 2; previous end = 4031
 	}
 
 	for _, tc := range tests {

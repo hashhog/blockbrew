@@ -20,18 +20,19 @@ func TestTxIndex(t *testing.T) {
 		t.Errorf("expected best height -1, got %d", idx.BestHeight())
 	}
 
-	// Create a test block with some transactions
-	block := createTestBlock(0)
+	// Create a test block with some transactions.
+	// Use height > 0: WriteBlock skips indexing for height 0 (genesis).
+	block := createTestBlock(1)
 	hash := block.Header.BlockHash()
 
 	// Write block to index
-	if err := idx.WriteBlock(block, 0, hash, nil); err != nil {
+	if err := idx.WriteBlock(block, 1, hash, nil); err != nil {
 		t.Fatalf("WriteBlock failed: %v", err)
 	}
 
 	// Best height should be updated
-	if idx.BestHeight() != 0 {
-		t.Errorf("expected best height 0, got %d", idx.BestHeight())
+	if idx.BestHeight() != 1 {
+		t.Errorf("expected best height 1, got %d", idx.BestHeight())
 	}
 
 	// Look up each transaction
