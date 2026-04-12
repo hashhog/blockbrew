@@ -82,6 +82,15 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		ibd = s.syncMgr.IsIBDActive()
 	}
 
+	// Build softforks using the same shared helper as getdeploymentinfo so both
+	// RPCs always read from the same canonical data source (chainparams + chain
+	// state).  tipNode may be nil only if the chain is completely uninitialized;
+	// in that case we omit softforks rather than panic.
+	var softforks map[string]DeploymentEntry
+	if tipNode != nil && s.chainParams != nil {
+		softforks = buildDeploymentMap(tipNode, s.chainParams)
+	}
+
 	return &BlockchainInfo{
 		Chain:                s.rpcChainName(),
 		Blocks:               tipHeight,
@@ -92,6 +101,7 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		VerificationProgress: verificationProgress,
 		InitialBlockDownload: ibd,
 		Pruned:               false,
+		Softforks:            softforks,
 	}, nil
 }
 
@@ -2519,39 +2529,47 @@ func (s *Server) handleGetDeploymentInfo(params json.RawMessage) (interface{}, *
 		}
 	}
 
-	cp := s.chainParams
+	result := &DeploymentInfoResult{
+		Hash:        blockNode.Hash.String(),
+		Height:      blockNode.Height,
+		Deployments: buildDeploymentMap(blockNode, s.chainParams),
+	}
+	return result, nil
+}
+
+// buildDeploymentMap is the single shared source-of-truth for softfork deployment
+// state.  Both getblockchaininfo (.softforks) and getdeploymentinfo (.deployments)
+// call this helper so the two RPCs always read from the same data source:
+// chainparams + active chain state via GetDeploymentState / GetStateSinceHeight.
+// No hard-coded tables; every entry is derived from cp.BIP*Height / cp.Deployments.
+func buildDeploymentMap(tip *consensus.BlockNode, cp *consensus.ChainParams) map[string]DeploymentEntry {
 	// Pass a nil cache; GetDeploymentState accepts nil and simply skips caching.
 	// A shared cache can be wired in later as an optimisation.
 	var cache *consensus.VersionBitsCache
 
 	deployments := make(map[string]DeploymentEntry)
 
-	// ---- Buried deployments ----
+	// ---- Buried deployments (height-activated) ----
 	// BIP34: coinbase height in scriptSig
-	addBuriedDeployment(deployments, "bip34", blockNode.Height, cp.BIP34Height)
+	addBuriedDeployment(deployments, "bip34", tip.Height, cp.BIP34Height)
 	// BIP65: CHECKLOCKTIMEVERIFY
-	addBuriedDeployment(deployments, "bip65", blockNode.Height, cp.BIP65Height)
+	addBuriedDeployment(deployments, "bip65", tip.Height, cp.BIP65Height)
 	// BIP66: strict DER signatures
-	addBuriedDeployment(deployments, "bip66", blockNode.Height, cp.BIP66Height)
+	addBuriedDeployment(deployments, "bip66", tip.Height, cp.BIP66Height)
 	// CSV (BIP68/BIP112/BIP113)
-	addBuriedDeployment(deployments, "csv", blockNode.Height, cp.CSVHeight)
+	addBuriedDeployment(deployments, "csv", tip.Height, cp.CSVHeight)
 	// Segwit (BIP141/BIP143/BIP147)
-	addBuriedDeployment(deployments, "segwit", blockNode.Height, cp.SegwitHeight)
+	addBuriedDeployment(deployments, "segwit", tip.Height, cp.SegwitHeight)
 	// Taproot (BIP341/BIP342)
-	addBuriedDeployment(deployments, "taproot", blockNode.Height, cp.TaprootHeight)
+	addBuriedDeployment(deployments, "taproot", tip.Height, cp.TaprootHeight)
 
 	// ---- BIP9 deployments ----
 	for i, dep := range cp.Deployments {
-		entry := buildBIP9DeploymentEntry(dep, i, blockNode, cp, cache)
+		entry := buildBIP9DeploymentEntry(dep, i, tip, cp, cache)
 		deployments[dep.Name] = entry
 	}
 
-	result := &DeploymentInfoResult{
-		Hash:        blockNode.Hash.String(),
-		Height:      blockNode.Height,
-		Deployments: deployments,
-	}
-	return result, nil
+	return deployments
 }
 
 // addBuriedDeployment adds a buried (height-activated) deployment entry to the map.
