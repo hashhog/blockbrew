@@ -1335,3 +1335,136 @@ func TestGetDeploymentInfoBIP9Testdummy(t *testing.T) {
 		t.Error("expected bip9 sub-object for testdummy")
 	}
 }
+
+// TestSoftforksDeploymentInfoConsistency is a regtest-only round-trip test that
+// verifies getblockchaininfo.softforks and getdeploymentinfo.deployments are
+// populated from the same shared helper (buildDeploymentMap).  For every
+// deployment id that appears in both responses, the following shared fields
+// must be identical: type, active, height, and (for bip9 entries) bip9.status,
+// bip9.start_time, bip9.timeout, bip9.since.
+func TestSoftforksDeploymentInfoConsistency(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithChainManager(cm),
+		WithHeaderIndex(idx),
+		WithChainDB(db),
+	)
+
+	// ---- Fetch getblockchaininfo ----
+	gbiResp := testRPCRequest(t, server.handleRPC, "getblockchaininfo", []interface{}{}, "", "")
+	if gbiResp.Error != nil {
+		t.Fatalf("getblockchaininfo error: %v", gbiResp.Error)
+	}
+	gbiMap, ok := gbiResp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("getblockchaininfo: expected map result, got %T", gbiResp.Result)
+	}
+	softforksRaw, ok := gbiMap["softforks"]
+	if !ok {
+		t.Fatal("getblockchaininfo: missing 'softforks' field")
+	}
+	softforks, ok := softforksRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("getblockchaininfo: softforks has unexpected type %T", softforksRaw)
+	}
+	if len(softforks) == 0 {
+		t.Fatal("getblockchaininfo: softforks map is empty")
+	}
+
+	// ---- Fetch getdeploymentinfo ----
+	gdiResp := testRPCRequest(t, server.handleRPC, "getdeploymentinfo", []interface{}{}, "", "")
+	if gdiResp.Error != nil {
+		t.Fatalf("getdeploymentinfo error: %v", gdiResp.Error)
+	}
+	gdiMap, ok := gdiResp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("getdeploymentinfo: expected map result, got %T", gdiResp.Result)
+	}
+	deploymentsRaw, ok := gdiMap["deployments"]
+	if !ok {
+		t.Fatal("getdeploymentinfo: missing 'deployments' field")
+	}
+	deployments, ok := deploymentsRaw.(map[string]interface{})
+	if !ok {
+		t.Fatalf("getdeploymentinfo: deployments has unexpected type %T", deploymentsRaw)
+	}
+	if len(deployments) == 0 {
+		t.Fatal("getdeploymentinfo: deployments map is empty")
+	}
+
+	// ---- Cross-check every shared deployment id ----
+	// Both maps must have identical keys because both call buildDeploymentMap.
+	if len(softforks) != len(deployments) {
+		t.Errorf("softforks key count %d != deployments key count %d", len(softforks), len(deployments))
+	}
+
+	for id, sfRaw := range softforks {
+		diRaw, exists := deployments[id]
+		if !exists {
+			t.Errorf("deployment %q present in getblockchaininfo.softforks but missing from getdeploymentinfo.deployments", id)
+			continue
+		}
+
+		sf, ok := sfRaw.(map[string]interface{})
+		if !ok {
+			t.Errorf("softforks[%q] has unexpected type %T", id, sfRaw)
+			continue
+		}
+		di, ok := diRaw.(map[string]interface{})
+		if !ok {
+			t.Errorf("deployments[%q] has unexpected type %T", id, diRaw)
+			continue
+		}
+
+		// type must match
+		if sf["type"] != di["type"] {
+			t.Errorf("deployment %q: type mismatch: softforks=%v deploymentinfo=%v", id, sf["type"], di["type"])
+		}
+
+		// active must match
+		if sf["active"] != di["active"] {
+			t.Errorf("deployment %q: active mismatch: softforks=%v deploymentinfo=%v", id, sf["active"], di["active"])
+		}
+
+		// height: both should be absent, or both present with equal value
+		sfHeight, sfHasHeight := sf["height"]
+		diHeight, diHasHeight := di["height"]
+		if sfHasHeight != diHasHeight {
+			t.Errorf("deployment %q: height presence mismatch: softforks=%v deploymentinfo=%v", id, sfHasHeight, diHasHeight)
+		} else if sfHasHeight && sfHeight != diHeight {
+			t.Errorf("deployment %q: height value mismatch: softforks=%v deploymentinfo=%v", id, sfHeight, diHeight)
+		}
+
+		// For bip9 entries, check the sub-object fields that affect consensus.
+		if sf["type"] == "bip9" {
+			sfBip9, sfHasBip9 := sf["bip9"].(map[string]interface{})
+			diBip9, diHasBip9 := di["bip9"].(map[string]interface{})
+			if !sfHasBip9 || !diHasBip9 {
+				t.Errorf("deployment %q: bip9 sub-object missing in one response (softforks=%v deploymentinfo=%v)", id, sfHasBip9, diHasBip9)
+				continue
+			}
+			for _, field := range []string{"status", "start_time", "timeout", "since"} {
+				if sfBip9[field] != diBip9[field] {
+					t.Errorf("deployment %q: bip9.%s mismatch: softforks=%v deploymentinfo=%v", id, field, sfBip9[field], diBip9[field])
+				}
+			}
+		}
+	}
+
+	// All deployments in getdeploymentinfo must also appear in softforks.
+	for id := range deployments {
+		if _, exists := softforks[id]; !exists {
+			t.Errorf("deployment %q present in getdeploymentinfo.deployments but missing from getblockchaininfo.softforks", id)
+		}
+	}
+}
