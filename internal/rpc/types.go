@@ -52,15 +52,18 @@ func (e *RPCError) Error() string {
 
 // BlockchainInfo represents the result of getblockchaininfo.
 type BlockchainInfo struct {
-	Chain                string  `json:"chain"`
-	Blocks               int32   `json:"blocks"`
-	Headers              int32   `json:"headers"`
-	BestBlockHash        string  `json:"bestblockhash"`
-	Difficulty           float64 `json:"difficulty"`
-	MedianTime           int64   `json:"mediantime"`
-	VerificationProgress float64 `json:"verificationprogress"`
-	InitialBlockDownload bool    `json:"initialblockdownload"`
-	Pruned               bool    `json:"pruned"`
+	Chain                string                     `json:"chain"`
+	Blocks               int32                      `json:"blocks"`
+	Headers              int32                      `json:"headers"`
+	BestBlockHash        string                     `json:"bestblockhash"`
+	Difficulty           float64                    `json:"difficulty"`
+	MedianTime           int64                      `json:"mediantime"`
+	VerificationProgress float64                    `json:"verificationprogress"`
+	InitialBlockDownload bool                       `json:"initialblockdownload"`
+	Pruned               bool                       `json:"pruned"`
+	// Softforks mirrors getdeploymentinfo.deployments: both RPCs read from the
+	// same buildDeploymentMap helper so their data is always consistent.
+	Softforks            map[string]DeploymentEntry `json:"softforks"`
 }
 
 // BlockResult represents a block in RPC responses.
