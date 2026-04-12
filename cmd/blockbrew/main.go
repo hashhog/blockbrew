@@ -504,69 +504,123 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	log.Printf("blockbrew v%s started successfully", version)
 
-	// 13. Wait for shutdown signal
+	// 13. Wait for shutdown signal. Catches both SIGINT (Ctrl-C) and SIGTERM
+	// (systemd, kill, rolling restarts). Previously only the first signal was
+	// handled and the shutdown sequence ran on the main goroutine with no hard
+	// deadline, so any blocked goroutine (P2P listener accept loop, DB
+	// compaction, UTXO flush) would hang indefinitely and force an external
+	// SIGKILL to escalate.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	sig := <-sigChan
-	log.Printf("Received signal %s, shutting down...", sig)
-
-	// 14. Graceful shutdown in reverse order
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := rpcServer.Stop(); err != nil {
-		log.Printf("Warning: RPC server stop error: %v", err)
-	}
-	log.Printf("RPC server stopped")
-	rpc.DeleteCookie(cfg.DataDir)
-
-	syncMgr.Stop()
-	log.Printf("Sync manager stopped")
-
-	peerMgr.Stop()
-	log.Printf("Peer manager stopped")
-
-	// Save fee estimates
-	if err := feeEstimator.Save(cfg.DataDir); err != nil {
-		log.Printf("Warning: fee estimates save failed: %v", err)
+	if sig == syscall.SIGTERM {
+		log.Printf("received SIGTERM, beginning graceful shutdown")
 	} else {
-		log.Printf("Fee estimates saved")
+		log.Printf("received SIGINT, beginning graceful shutdown")
 	}
 
-	// Save wallet state
-	if w != nil {
-		if err := w.SaveToFile(""); err != nil {
-			log.Printf("Warning: wallet save failed: %v", err)
-		} else {
-			log.Printf("Wallet saved")
+	// 14. Hard 30-second deadline watchdog. If graceful shutdown has not
+	// completed by then we best-effort close the DB and os.Exit(1). This
+	// guarantees the process never hangs longer than 30s after a signal,
+	// matching Bitcoin Core's init.cpp shutdown semantics (StartShutdown +
+	// bounded thread join).
+	shutdownDone := make(chan struct{})
+	const shutdownDeadline = 30 * time.Second
+	watchdog := time.AfterFunc(shutdownDeadline, func() {
+		log.Printf("shutdown deadline (%s) exceeded, forcing exit", shutdownDeadline)
+		// Best-effort DB close so we don't leave the LSM in a corrupt state.
+		// We ignore errors — we're about to die anyway.
+		_ = db.Close()
+		log.Printf("exit (forced)")
+		os.Exit(1)
+	})
+
+	// Second signal escalates immediately.
+	go func() {
+		s, ok := <-sigChan
+		if !ok {
+			return
 		}
-	}
+		log.Printf("received second signal %s, forcing exit", s)
+		_ = db.Close()
+		os.Exit(1)
+	}()
 
-	if err := utxoSet.Flush(); err != nil {
-		log.Printf("Warning: UTXO flush failed: %v", err)
-	}
-	log.Printf("UTXO set flushed")
-
-	// Persist chain state AFTER UTXO flush for crash consistency
-	bestHash, bestHeight := chainMgr.BestBlock()
-	if bestHeight > 0 {
-		if err := chainDB.SetChainState(&storage.ChainState{
-			BestHash:   bestHash,
-			BestHeight: bestHeight,
-		}); err != nil {
-			log.Printf("Warning: chain state save failed: %v", err)
-		} else {
-			log.Printf("Chain state saved at height %d", bestHeight)
-		}
-	}
-
-	if err := db.Close(); err != nil {
-		log.Printf("Warning: database close failed: %v", err)
-	}
-	log.Printf("Database closed")
-
+	// Cancel contexts and stop long-running goroutines in reverse startup
+	// order, each phase logged so operators can see where shutdown is stuck
+	// if it ever does exceed the deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownDeadline)
+	defer cancel()
 	_ = ctx
+
+	go func() {
+		defer close(shutdownDone)
+
+		// Stop RPC first so no new client requests start mid-shutdown.
+		if err := rpcServer.Stop(); err != nil {
+			log.Printf("Warning: RPC server stop error: %v", err)
+		}
+		log.Printf("RPC server stopped")
+		rpc.DeleteCookie(cfg.DataDir)
+
+		// Stop P2P: sync manager (block/header download loop) then peer
+		// manager (listener + all peer goroutines).
+		log.Printf("stopping P2P")
+		syncMgr.Stop()
+		log.Printf("Sync manager stopped")
+		peerMgr.Stop()
+		log.Printf("Peer manager stopped")
+
+		// Save auxiliary state.
+		if err := feeEstimator.Save(cfg.DataDir); err != nil {
+			log.Printf("Warning: fee estimates save failed: %v", err)
+		} else {
+			log.Printf("Fee estimates saved")
+		}
+		if w != nil {
+			if err := w.SaveToFile(""); err != nil {
+				log.Printf("Warning: wallet save failed: %v", err)
+			} else {
+				log.Printf("Wallet saved")
+			}
+		}
+
+		// Flush chainstate: UTXO set, then chain tip pointer. Order matters
+		// for crash consistency — tip must reference an already-flushed UTXO.
+		log.Printf("flushing chainstate")
+		if err := utxoSet.Flush(); err != nil {
+			log.Printf("Warning: UTXO flush failed: %v", err)
+		}
+		log.Printf("UTXO set flushed")
+
+		bestHash, bestHeight := chainMgr.BestBlock()
+		if bestHeight > 0 {
+			if err := chainDB.SetChainState(&storage.ChainState{
+				BestHash:   bestHash,
+				BestHeight: bestHeight,
+			}); err != nil {
+				log.Printf("Warning: chain state save failed: %v", err)
+			} else {
+				log.Printf("Chain state saved at height %d", bestHeight)
+			}
+		}
+
+		log.Printf("closing DB")
+		if err := db.Close(); err != nil {
+			log.Printf("Warning: database close failed: %v", err)
+		}
+		log.Printf("Database closed")
+	}()
+
+	<-shutdownDone
+	if !watchdog.Stop() {
+		// AfterFunc already fired concurrently; it will os.Exit(1) for us.
+		// Park the main goroutine so we don't race it.
+		select {}
+	}
 	log.Printf("blockbrew shutdown complete")
+	log.Printf("exit")
+	os.Exit(0)
 	return nil
 }
 
