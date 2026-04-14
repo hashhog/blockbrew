@@ -286,13 +286,19 @@ func TestKnownAddressIsBad(t *testing.T) {
 		t.Error("fresh address should not be bad")
 	}
 
-	// Too many attempts without success is bad
+	// MaxAttempts alone no longer permanently excludes — only MaxNewAttempts does.
 	ka.Attempts = MaxAttempts
-	if !ka.IsBad() {
-		t.Error("address with max attempts and no success should be bad")
+	if ka.IsBad() {
+		t.Error("address at MaxAttempts (below MaxNewAttempts) should not be bad")
 	}
 
-	// With success, not bad
+	// Too many attempts without success is bad
+	ka.Attempts = MaxNewAttempts
+	if !ka.IsBad() {
+		t.Error("address with max-new-attempts and no success should be bad")
+	}
+
+	// With success, not bad — even if Attempts is high, success gates IsBad.
 	ka.LastSuccess = time.Now()
 	if ka.IsBad() {
 		t.Error("address with success should not be bad")
@@ -338,7 +344,7 @@ func TestKnownAddressChance(t *testing.T) {
 	// Bad address should have zero chance
 	ka.LastAttempt = time.Time{}
 	ka.LastSuccess = time.Time{}
-	ka.Attempts = MaxAttempts
+	ka.Attempts = MaxNewAttempts
 	if ka.Chance() != 0 {
 		t.Error("bad address should have zero chance")
 	}
