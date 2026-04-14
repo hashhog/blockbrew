@@ -69,8 +69,17 @@ const (
 	// DNSSeedRefreshInterval is how often to re-query DNS seeds if address book is low.
 	DNSSeedRefreshInterval = 11 * time.Minute
 
-	// MinAddressesBeforeRefresh is the threshold below which we refresh DNS seeds.
+	// MinAddressesBeforeRefresh is the threshold below which we refresh DNS seeds
+	// regardless of peer health. Acts as a hard floor — a book this small can't
+	// supply diverse candidates.
 	MinAddressesBeforeRefresh = 1000
+
+	// MinGoodAddrsBeforeRefresh is the threshold of addresses with a prior
+	// successful handshake below which we also refresh DNS. This catches the
+	// stale-but-large-book case: a node with thousands of gossip-learned
+	// addresses, none of which still accept connections, would otherwise
+	// never re-seed. Set to roughly 2× the default outbound target.
+	MinGoodAddrsBeforeRefresh = 16
 
 	// DefaultBanDuration is the default time to ban a misbehaving peer.
 	DefaultBanDuration = 24 * time.Hour
@@ -654,8 +663,15 @@ func (pm *PeerManager) connectionHandler() {
 			}
 
 		case <-dnsRefreshTicker.C:
-			// Refresh DNS seeds if address book is too small
-			if pm.addrBook.Size() < MinAddressesBeforeRefresh {
+			// Refresh DNS seeds when peer health is poor. Two triggers:
+			//   (a) book is too small to provide candidates, or
+			//   (b) too few addresses have a known-good handshake history
+			//       (stale-but-large-book case).
+			// (b) is essential — without it, a node whose entire book has
+			// become stale after long downtime would accumulate failures on
+			// every gossip entry and never replenish the pool.
+			if pm.addrBook.Size() < MinAddressesBeforeRefresh ||
+				len(pm.addrBook.Good()) < MinGoodAddrsBeforeRefresh {
 				pm.resolveDNSSeeds()
 			}
 
@@ -878,7 +894,12 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 	// Attempt connection
 	peer, err := NewOutboundPeer(addr, peerConfig)
 	if err != nil {
-		// Connection failed
+		// Connection failed. Mark the outcome so Attempts doesn't climb
+		// unbounded toward the IsBad cliff (MarkAttempt already incremented
+		// it at dial start for non-feelers).
+		if connType != ConnFeeler {
+			pm.addrBook.MarkFailed(addr)
+		}
 		return
 	}
 	peer.SetBanCallback(pm.handlePeerBan)
@@ -916,6 +937,9 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 	err = peer.Start()
 	if err != nil {
 		pm.removePeer(peer)
+		if connType != ConnFeeler {
+			pm.addrBook.MarkFailed(addr)
+		}
 		return
 	}
 
@@ -1504,8 +1528,10 @@ func (pm *PeerManager) saveAnchors() {
 }
 
 // loadAnchors reads anchor connections from disk and attempts to connect to them
-// before DNS seeds. The file is deleted after reading (one-time use per session).
-// Reference: Bitcoin Core net.cpp ReadAnchors
+// before DNS seeds. The file is rewritten on clean shutdown via saveAnchors,
+// so it is preserved across restarts (including after a crash, where the
+// previous anchor list is the best signal we have of known-good peers).
+// Reference: Bitcoin Core net.cpp ReadAnchors.
 func (pm *PeerManager) loadAnchors() {
 	if pm.config.DataDir == "" {
 		return
@@ -1517,9 +1543,6 @@ func (pm *PeerManager) loadAnchors() {
 		// No anchors file is normal on first run
 		return
 	}
-
-	// Delete after reading — anchors are one-time use per startup
-	os.Remove(path)
 
 	var anchors []anchorEntry
 	if err := json.Unmarshal(data, &anchors); err != nil {

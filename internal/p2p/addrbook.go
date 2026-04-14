@@ -12,8 +12,19 @@ const (
 	// MinRetryInterval is the minimum time between connection attempts to the same address.
 	MinRetryInterval = 10 * time.Minute
 
-	// MaxAttempts is the number of failed attempts before deprioritizing an address.
+	// MaxAttempts is the number of failed attempts before deprioritizing an
+	// address via the Chance() score. It still influences selection weight
+	// but does not permanently exclude.
 	MaxAttempts = 3
+
+	// MaxNewAttempts is the attempt budget for addresses that have never
+	// completed a successful handshake (LastSuccess is zero). Gossip-learned
+	// addresses can need many retries before an initial success — especially
+	// behind NAT or during IBD — so a small budget like 3 causes permanent
+	// exclusion of otherwise-healthy peers. Bitcoin Core's AddrMan tolerates
+	// up to 10 retries before discarding a never-succeeded address; we use
+	// the same value here.
+	MaxNewAttempts = 10
 
 	// AddressBookMaxSize is the maximum number of addresses to store.
 	AddressBookMaxSize = 10000
@@ -58,9 +69,16 @@ func itoa(i int) string {
 }
 
 // IsBad returns true if this address should not be selected for connection.
+//
+// Addresses that have never succeeded are allowed up to MaxNewAttempts
+// retries before being excluded — a gossip-learned address frequently
+// needs several attempts before the first handshake lands, and the old
+// 3-strike rule permanently poisoned the candidate pool after a single
+// outage. Addresses that have previously succeeded are never IsBad on
+// attempt count alone; transient failures are absorbed by MarkSuccess
+// resetting Attempts to zero on the next successful reconnect.
 func (ka *KnownAddress) IsBad() bool {
-	// Too many failed attempts with no success
-	if ka.Attempts >= MaxAttempts && ka.LastSuccess.IsZero() {
+	if ka.LastSuccess.IsZero() && ka.Attempts >= MaxNewAttempts {
 		return true
 	}
 	return false
