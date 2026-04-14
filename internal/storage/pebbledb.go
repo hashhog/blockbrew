@@ -1,11 +1,81 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"syscall"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
 )
+
+// pebbleLockFilename is the name pebble uses for its directory lockfile.
+// See cockroachdb/pebble internal/base/filenames.go ("LOCK").
+const pebbleLockFilename = "LOCK"
+
+// removeStalePebbleLock detects and removes a stale pebble LOCK file left
+// behind by a SIGKILL/OOM/crash. The strategy:
+//
+//  1. If <path>/LOCK does not exist, do nothing.
+//  2. Open the LOCK file and attempt a non-blocking exclusive flock on it.
+//     If the flock SUCCEEDS, no live process holds the lock — pebble's own
+//     Open() would also acquire it, so the file is safe to remove. We unlock
+//     and remove it so the subsequent pebble.Open() starts clean.
+//  3. If the flock FAILS with EWOULDBLOCK/EAGAIN, another process (presumably
+//     another blockbrew) is holding the DB. Return an error so startup aborts
+//     loudly — never delete a held lock, that would corrupt the DB.
+//
+// Any other error (cannot open file, etc.) is returned as-is and pebble.Open()
+// will surface it. We deliberately do NOT try to read a PID from the file:
+// pebble's LOCK is a zero-byte flock'd file, not a PID file.
+func removeStalePebbleLock(path string) error {
+	lockPath := filepath.Join(path, pebbleLockFilename)
+
+	info, err := os.Stat(lockPath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("stat pebble lock %q: %w", lockPath, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("pebble lock path %q is a directory", lockPath)
+	}
+
+	f, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open pebble lock %q: %w", lockPath, err)
+	}
+
+	// Non-blocking exclusive flock probe. If this succeeds the lock was
+	// not actually held — i.e. it is stale.
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return fmt.Errorf("pebble LOCK at %q is held by another live process; refusing to start", lockPath)
+		}
+		return fmt.Errorf("flock pebble lock %q: %w", lockPath, err)
+	}
+
+	// We hold the lock. Release before unlinking so we don't leave a dangling
+	// flock entry in the kernel (it would be cleaned up on close anyway).
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_UN); err != nil {
+		f.Close()
+		return fmt.Errorf("unlock pebble lock %q: %w", lockPath, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close pebble lock %q: %w", lockPath, err)
+	}
+
+	log.Printf("storage: stale pebble lockfile detected at %q, removing", lockPath)
+	if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale pebble lock %q: %w", lockPath, err)
+	}
+	return nil
+}
 
 // PebbleDB wraps a Pebble database to implement the DB interface.
 type PebbleDB struct {
@@ -49,6 +119,18 @@ func NewPebbleDB(path string) (*PebbleDB, error) {
 
 // NewPebbleDBWithConfig opens or creates a Pebble database with custom configuration.
 func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
+	// Best-effort cleanup of a stale LOCK file left by a SIGKILL/OOM/crash.
+	// Safe: only removes the file if a non-blocking flock probe succeeds,
+	// proving no live process is holding it. If another blockbrew is running,
+	// this returns an error and we abort startup before pebble.Open() runs.
+	// Pre-existing dir is required; if path doesn't exist yet pebble.Open()
+	// will create it and there is no LOCK to clean up.
+	if _, err := os.Stat(path); err == nil {
+		if cleanupErr := removeStalePebbleLock(path); cleanupErr != nil {
+			return nil, cleanupErr
+		}
+	}
+
 	// Create block cache (shared across all SSTs)
 	cache := pebble.NewCache(cfg.BlockCacheSize)
 
