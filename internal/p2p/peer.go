@@ -135,10 +135,11 @@ const MisbehaviorThreshold = 100
 
 // Misbehavior score values for specific infractions.
 const (
-	ScoreInvalidBlock       = 100 // Instant ban
-	ScoreHeadersDontConnect = 20  // Headers that don't connect to our chain
-	ScoreBlockDownloadStall = 50  // Stalling block download
-	ScoreUnrequestedData    = 5   // Sending unrequested data
+	ScoreInvalidBlock          = 100 // Instant ban
+	ScoreHeadersDontConnect    = 20  // Headers that don't connect to our chain
+	ScoreHeadersDontConnectIBD = 10  // IBD-time soft penalty for transient header errors (W15)
+	ScoreBlockDownloadStall    = 50  // Stalling block download
+	ScoreUnrequestedData       = 5   // Sending unrequested data
 )
 
 // Peer represents a connection to a remote Bitcoin node.

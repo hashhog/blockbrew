@@ -49,6 +49,17 @@ type BlockNode struct {
 	SequenceID int32         // Sequence ID for precious block ordering (lower = more precious)
 }
 
+// GetAncestorHashAtHeight returns the hash of this node's ancestor at the given
+// height, and a boolean indicating whether the ancestor was found.  Used by
+// CheckForkConflictsWithCheckpoint without exposing the full BlockNode.
+func (n *BlockNode) GetAncestorHashAtHeight(height int32) (wire.Hash256, bool) {
+	anc := n.GetAncestor(height)
+	if anc == nil {
+		return wire.Hash256{}, false
+	}
+	return anc.Hash, true
+}
+
 // GetAncestor returns the ancestor of a node at a given height.
 // Returns nil if the height is invalid or this node doesn't have an ancestor at that height.
 func (n *BlockNode) GetAncestor(height int32) *BlockNode {
@@ -344,10 +355,17 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 		return nil, err
 	}
 
-	// Checkpoint fork rejection: reject headers that would fork before the last checkpoint.
-	// A header creates a fork if there's already a different block at this height on the best chain.
-	isFork := idx.wouldCreateFork(parent, height)
-	if err := CheckForkBeforeLastCheckpoint(idx.checkpointData, height, isFork); err != nil {
+	// Checkpoint fork rejection (W15 root-cause fix):
+	// Previously we rejected any header whose parent was off-best-chain when the
+	// candidate height was <= last checkpoint, which fired for every honest peer
+	// during IBD catch-up and, coupled with a +100 misbehavior penalty, drained
+	// the outbound peer pool (W8/W12/W13/W14 cascade, ref:
+	// wave14-2026-04-14/BLOCKBREW-DURABILITY.md).  Replace with a conservative
+	// Core-like check: reject only on an ACTUAL conflict — the candidate's
+	// ancestor chain has a hash at a known-checkpoint height that differs from
+	// the known checkpoint hash.  VerifyCheckpoint() already handles the
+	// exact-height case for the candidate itself.
+	if err := CheckForkConflictsWithCheckpoint(idx.checkpointData, parent, height); err != nil {
 		return nil, err
 	}
 

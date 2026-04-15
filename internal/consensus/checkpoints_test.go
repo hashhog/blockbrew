@@ -319,8 +319,16 @@ func TestCheckpointForkRejectionInHeaderIndex(t *testing.T) {
 	}
 	idx.checkpointData = NewCheckpointData([]Checkpoint{fakeCheckpoint})
 
-	// Now try to create a fork at height 2 (before checkpoint)
-	// This should fail because it would fork before the checkpoint
+	// W15 root-cause fix (wave14-2026-04-14/BLOCKBREW-DURABILITY.md):
+	// A fork that diverges BELOW a checkpoint height is only rejected when its
+	// ancestor at the checkpoint height conflicts with the known checkpoint
+	// hash.  A short fork whose chain doesn't even reach the checkpoint height
+	// is NOT a checkpoint conflict — it's just an unconfirmed side branch, and
+	// Core accepts it at the header level.  Previously blockbrew over-rejected
+	// this case with +100 misbehavior, draining the peer pool during IBD.
+	//
+	// Fork from height 1 → candidate at height 2 < checkpoint height 3.
+	// The fork's ancestor chain doesn't reach height 3, so no conflict: accept.
 	forkHeader := createTestHeader(
 		nodes[1].Hash, // Fork from height 1
 		nodes[1].Header.Timestamp+700, // Different timestamp
@@ -328,8 +336,8 @@ func TestCheckpointForkRejectionInHeaderIndex(t *testing.T) {
 	)
 
 	_, err := idx.AddHeader(forkHeader)
-	if err != ErrForkBeforeCheckpoint {
-		t.Errorf("expected ErrForkBeforeCheckpoint, got %v", err)
+	if err != nil {
+		t.Errorf("fork below checkpoint with no checkpoint-conflict should be accepted, got %v", err)
 	}
 
 	// But extending the main chain should still work
@@ -353,6 +361,44 @@ func TestCheckpointForkRejectionInHeaderIndex(t *testing.T) {
 	_, err = idx.AddHeader(afterCheckpointFork)
 	if err != nil {
 		t.Errorf("fork after checkpoint should work, got error: %v", err)
+	}
+}
+
+// TestCheckpointForkActualConflict exercises the W15 root-cause fix path:
+// a candidate header whose parent chain HAS an ancestor at a checkpoint height
+// that conflicts with the known checkpoint hash must be rejected with
+// ErrForkBeforeCheckpoint.  This is the only legitimate trigger for the rule.
+func TestCheckpointForkActualConflict(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	// Build a 5-header chain as the "main" chain.
+	nodes := make([]*BlockNode, 6)
+	nodes[0] = idx.genesis
+	prev := idx.genesis
+	for i := 1; i <= 5; i++ {
+		h := createTestHeader(prev.Hash, prev.Header.Timestamp+600, uint32(i))
+		n, err := idx.AddHeader(h)
+		if err != nil {
+			t.Fatalf("main chain header %d: %v", i, err)
+		}
+		nodes[i] = n
+		prev = n
+	}
+
+	// Install a checkpoint at height 2 that points to a DIFFERENT hash than
+	// nodes[2] — i.e., the main chain's height-2 block is not the "real"
+	// checkpoint.  Any extension whose ancestor at height 2 is nodes[2] now
+	// contradicts the checkpoint.
+	bogusHash := mustParseHash("000000000000000000000000000000000000000000000000000000000000aa02")
+	idx.checkpointData = NewCheckpointData([]Checkpoint{{2, bogusHash}})
+
+	// Candidate extending main chain from nodes[5] → height 6.
+	// Its ancestor at height 2 is nodes[2].Hash != bogusHash → conflict.
+	cand := createTestHeader(nodes[5].Hash, nodes[5].Header.Timestamp+600, uint32(777))
+	_, err := idx.AddHeader(cand)
+	if err != ErrForkBeforeCheckpoint {
+		t.Errorf("expected ErrForkBeforeCheckpoint on actual checkpoint conflict, got %v", err)
 	}
 }
 
