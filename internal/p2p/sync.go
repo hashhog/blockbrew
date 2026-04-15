@@ -824,6 +824,26 @@ func (sm *SyncManager) StartBlockDownload() {
 	// already populated rather than ibdActive (which is now always true
 	// until the tip is recent, not just during block download).
 	if len(sm.blockQueue) > 0 {
+		// W13 fix: before short-circuiting, sweep the queue for entries
+		// whose owning peer has been disconnected/banned. W8/W12 post-mortem
+		// showed this guard firing repeatedly while the queue was populated
+		// entirely with stale in-flight slots held by banned peers, which
+		// prevented any progress.
+		evicted := 0
+		for _, req := range sm.blockQueue {
+			if req.Peer != nil && (!req.Peer.IsConnected() || req.Peer.ShouldBan()) {
+				if req.State == BlockDownloadInFlight {
+					delete(sm.inflight, req.Hash)
+				}
+				req.State = BlockDownloadPending
+				req.Peer = nil
+				req.RetryCount = 0
+				evicted++
+			}
+		}
+		if evicted > 0 {
+			log.Printf("sync: StartBlockDownload evicted %d stale slots owned by dead peers", evicted)
+		}
 		log.Printf("sync: StartBlockDownload called but block queue already populated")
 		return
 	}
@@ -1036,7 +1056,7 @@ func (sm *SyncManager) requestBlocks() {
 		for i := 0; i < len(peers); i++ {
 			idx := (peerIdx + i) % len(peers)
 			peer := peers[idx]
-			if !peer.IsConnected() {
+			if !peer.IsConnected() || peer.ShouldBan() {
 				continue
 			}
 			addr := peer.Address()
@@ -1103,14 +1123,28 @@ func (sm *SyncManager) checkStaleRequests() {
 
 	now := time.Now()
 	timedOut := 0
+	evictedDead := 0
 	for hash, req := range sm.inflight {
+		// W13 fix: if the owning peer is gone (disconnected or flagged for
+		// ban), free the slot immediately — don't wait for the adaptive
+		// timeout (up to 120 s × 16 slots per dead peer = the W8/W12 wedge).
+		if req.Peer == nil || !req.Peer.IsConnected() || req.Peer.ShouldBan() {
+			delete(sm.inflight, hash)
+			req.State = BlockDownloadPending
+			req.Peer = nil
+			req.RetryCount = 0
+			evictedDead++
+			continue
+		}
+
 		// Get the adaptive timeout for this peer
 		timeout := sm.getStallTimeout(req.Peer)
 
 		if now.Sub(req.RequestAt) > timeout {
 			timedOut++
 
-			// Score misbehavior for stalling block downloads (+50)
+			// Score misbehavior for stalling block downloads (+50).
+			// Misbehaving is idempotent past threshold (W13 fix in peer.go).
 			if req.Peer != nil {
 				req.Peer.Misbehaving(ScoreBlockDownloadStall, "block download stalling")
 			}
@@ -1125,6 +1159,9 @@ func (sm *SyncManager) checkStaleRequests() {
 			req.RetryCount++
 			// Don't nil out req.Peer — requestBlocks uses it to avoid the same peer
 		}
+	}
+	if evictedDead > 0 {
+		log.Printf("sync: evicted %d in-flight blocks from disconnected/banned peers", evictedDead)
 	}
 	if timedOut > 0 {
 		log.Printf("sync: %d block requests timed out, will retry with peer rotation", timedOut)

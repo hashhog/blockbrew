@@ -1166,30 +1166,42 @@ func (p *Peer) SetBanCallback(cb func(*Peer)) {
 
 // Misbehaving adds a misbehavior score to the peer.
 // If the score reaches MisbehaviorThreshold (100), the peer is flagged for disconnect/ban.
-// Returns true if the threshold was reached.
+// Returns true if the threshold was reached (on this call or a prior one).
+//
+// W13 fix: once shouldBan is latched, further scoring is a no-op. Previously
+// a stalling peer could accumulate score +50 → 450 → 750 → 800+ (visible in
+// the pre-freeze log) because checkStaleRequests kept calling Misbehaving on
+// the same in-flight block slots before the async ban callback had a chance
+// to disconnect. The callback also received a phantom &Peer{addr:addr} so
+// handlePeerBan could not observe any per-peer state on the banned peer.
 func (p *Peer) Misbehaving(score int, reason string) bool {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+
+	if p.shouldBan {
+		// Already flagged for ban — stop amplifying the score and don't
+		// re-fire the callback. The ban is already in flight.
+		p.mu.Unlock()
+		return true
+	}
 
 	p.misbehaviorScore += score
 	log.Printf("peer %s misbehaving (%+d → %d): %s",
 		p.addr, score, p.misbehaviorScore, reason)
 
-	if p.misbehaviorScore >= MisbehaviorThreshold && !p.shouldBan {
+	if p.misbehaviorScore >= MisbehaviorThreshold {
 		p.shouldBan = true
+		cb := p.banCallback
 		log.Printf("peer %s: misbehavior threshold reached, flagging for ban", p.addr)
+		p.mu.Unlock()
 
-		// Call ban callback if set (this will trigger disconnect and ban)
-		if p.banCallback != nil {
-			// Execute callback outside the lock
-			cb := p.banCallback
-			addr := p.addr
-			go func() {
-				cb(&Peer{addr: addr}) // Pass a minimal peer object
-			}()
+		// Call ban callback outside the lock with the real peer so
+		// handlePeerBan → BanPeer can correctly match and disconnect.
+		if cb != nil {
+			go cb(p)
 		}
 		return true
 	}
+	p.mu.Unlock()
 	return false
 }
 
