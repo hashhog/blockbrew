@@ -269,7 +269,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("Warning: failed to set chain state: %v", err)
 		}
 	} else {
-		log.Printf("Loaded chain state: height=%d hash=%s", chainState.BestHeight, chainState.BestHash.String()[:16])
+		log.Printf("Loaded chain state: height=%d hash=%s", chainState.BestHeight, chainState.BestHash.String())
 	}
 
 	// 4. Initialize UTXO set
@@ -770,7 +770,7 @@ func handleImportBlocks(args []string) {
 			log.Printf("Warning: failed to set chain state: %v", err)
 		}
 	} else {
-		log.Printf("Loaded chain state: height=%d hash=%s", chainState.BestHeight, chainState.BestHash.String()[:16])
+		log.Printf("Loaded chain state: height=%d hash=%s", chainState.BestHeight, chainState.BestHash.String())
 	}
 
 	// Initialize UTXO set and chain manager

@@ -928,3 +928,231 @@ func TestInvalidateBlockNotFound(t *testing.T) {
 		t.Error("should return error for unknown block")
 	}
 }
+
+// TestStartupRecoverySavedTipPresent is the happy-path regression for the
+// W17 chainmgr-startup fix: when the header index already contains the
+// saved tip at startup (e.g. after a hot restart where the header-index
+// was never torn down) the chain manager must adopt the saved height
+// without spuriously setting pendingRecovery or emitting a rewind warning.
+func TestStartupRecoverySavedTipPresent(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	// Seed the header index with one real block beyond genesis.
+	genesis := idx.Genesis()
+	block := createTestBlock(t, params, genesis, nil)
+	blockHash := block.Header.BlockHash()
+	if _, err := idx.AddHeader(block.Header); err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+	// Persist the height->hash mapping and saved chain state at height 1.
+	if err := db.SetBlockHeight(1, blockHash); err != nil {
+		t.Fatalf("SetBlockHeight: %v", err)
+	}
+	if err := db.SetChainState(&storage.ChainState{BestHash: blockHash, BestHeight: 1}); err != nil {
+		t.Fatalf("SetChainState: %v", err)
+	}
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	gotHash, gotHeight := cm.BestBlock()
+	if gotHeight != 1 {
+		t.Errorf("saved-tip-present: height = %d, want 1", gotHeight)
+	}
+	if gotHash != blockHash {
+		t.Errorf("saved-tip-present: hash = %s, want %s", gotHash.String(), blockHash.String())
+	}
+	if cm.HasPendingRecovery() {
+		t.Error("saved-tip-present: pendingRecovery should be false when tip was resolved")
+	}
+}
+
+// TestStartupRecoverySavedTipMissingThenReload is the deferred-recovery
+// regression for the W17 chainmgr-startup fix.  At construction time the
+// header index contains only genesis, so a saved tip at height > 0 cannot
+// be resolved; the manager must defer (pendingRecovery=true) rather than
+// silently resetting to genesis.  Once P2P header sync has added the
+// saved tip's header, ReloadChainState must restore it without warning.
+func TestStartupRecoverySavedTipMissingThenReload(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	// Build a chain of 2 headers past genesis OUTSIDE the header index
+	// so we can simulate "saved tip exists on disk but index has only
+	// genesis" — mimicking the real startup path.
+	genesis := idx.Genesis()
+	block1 := createTestBlock(t, params, genesis, nil)
+	block1Hash := block1.Header.BlockHash()
+
+	// Persist the saved state pointing at height 1.
+	if err := db.SetBlockHeight(1, block1Hash); err != nil {
+		t.Fatalf("SetBlockHeight: %v", err)
+	}
+	if err := db.SetChainState(&storage.ChainState{BestHash: block1Hash, BestHeight: 1}); err != nil {
+		t.Fatalf("SetChainState: %v", err)
+	}
+
+	// Construct the chain manager BEFORE the block1 header is added
+	// to the index.  This is the mainnet startup shape.
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	if !cm.HasPendingRecovery() {
+		t.Fatal("saved-tip-missing: pendingRecovery should be true pre-reload")
+	}
+	if _, h := cm.BestBlock(); h != 0 {
+		t.Errorf("saved-tip-missing: tip should still be at genesis pre-reload, got height %d", h)
+	}
+
+	// Simulate P2P header sync catching up.
+	if _, err := idx.AddHeader(block1.Header); err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+
+	// Reloading now should adopt the saved tip.
+	cm.ReloadChainState()
+
+	gotHash, gotHeight := cm.BestBlock()
+	if gotHeight != 1 {
+		t.Errorf("saved-tip-missing: height after reload = %d, want 1", gotHeight)
+	}
+	if gotHash != block1Hash {
+		t.Errorf("saved-tip-missing: hash after reload = %s, want %s", gotHash.String(), block1Hash.String())
+	}
+	if cm.HasPendingRecovery() {
+		t.Error("saved-tip-missing: pendingRecovery should clear after successful reload")
+	}
+}
+
+// TestStartupRecoveryAncestorRewind exercises the rewind-to-ancestor fallback.
+// Simulates the case where the saved tip itself is unreachable (e.g. the
+// previously-active chain is a fork the peers don't advertise) but an
+// earlier height on the persisted chain has a header the P2P layer has
+// re-fetched.  The chain manager must rewind to that ancestor with a
+// clear warning rather than reset silently to genesis.
+func TestStartupRecoveryAncestorRewind(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	genesis := idx.Genesis()
+	block1 := createTestBlock(t, params, genesis, nil)
+	block1Hash := block1.Header.BlockHash()
+
+	// Ancestor height 1 is recorded in both the header index and the
+	// height->hash mapping.
+	if _, err := idx.AddHeader(block1.Header); err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+	if err := db.SetBlockHeight(1, block1Hash); err != nil {
+		t.Fatalf("SetBlockHeight: %v", err)
+	}
+
+	// Saved tip sits at height 2 with a hash that is NOT in the index
+	// (the fork head the peers never offered us back).  We still record
+	// the height->hash mapping so we can confirm the walker steps past
+	// an unresolvable height and recovers at the next-deepest one.
+	unreachableHash := wire.Hash256{0x99, 0x99, 0x99, 0x99}
+	if err := db.SetBlockHeight(2, unreachableHash); err != nil {
+		t.Fatalf("SetBlockHeight 2: %v", err)
+	}
+	if err := db.SetChainState(&storage.ChainState{BestHash: unreachableHash, BestHeight: 2}); err != nil {
+		t.Fatalf("SetChainState: %v", err)
+	}
+
+	// Build the real height-2 block (child of block1) so we can add its
+	// header to the index to simulate "header sync has reached past the
+	// saved tip height on a different fork".  This satisfies the
+	// guard that rewind only fires once headers are at or past the
+	// saved tip height.  block2.Header.Hash != unreachableHash so the
+	// saved tip is genuinely unreachable even though the fork at height
+	// 2 now exists in the index.
+	block2 := createTestBlock(t, params, &BlockNode{
+		Hash:   block1Hash,
+		Height: 1,
+		Header: block1.Header,
+	}, nil)
+	if _, err := idx.AddHeader(block2.Header); err != nil {
+		t.Fatalf("AddHeader block2: %v", err)
+	}
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	// Initial load cannot find the saved tip (it isn't in the index).
+	if !cm.HasPendingRecovery() {
+		t.Fatal("rewind: pendingRecovery should be true when saved tip is missing")
+	}
+
+	// ReloadChainState must rewind to block1 (the deepest reachable ancestor).
+	cm.ReloadChainState()
+	gotHash, gotHeight := cm.BestBlock()
+	if gotHeight != 1 {
+		t.Errorf("rewind: height after reload = %d, want 1", gotHeight)
+	}
+	if gotHash != block1Hash {
+		t.Errorf("rewind: hash after reload = %s, want %s", gotHash.String(), block1Hash.String())
+	}
+	if cm.HasPendingRecovery() {
+		t.Error("rewind: pendingRecovery should clear after ancestor rewind")
+	}
+}
+
+// TestStartupRecoveryDeferredUntilHeadersPast verifies the W17 rewind
+// guard: when the saved tip's hash is missing from the header index
+// AND the header index is still below the saved tip height, the chain
+// manager must defer (pendingRecovery=true) instead of rewinding.
+// Without this guard the recovery walker would pick the deepest ancestor
+// currently in the index (e.g. block at height 2000) and discard
+// ~500k blocks of already-validated persisted state.
+func TestStartupRecoveryDeferredUntilHeadersPast(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	genesis := idx.Genesis()
+	block1 := createTestBlock(t, params, genesis, nil)
+	block1Hash := block1.Header.BlockHash()
+	if _, err := idx.AddHeader(block1.Header); err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+	if err := db.SetBlockHeight(1, block1Hash); err != nil {
+		t.Fatalf("SetBlockHeight: %v", err)
+	}
+
+	// Saved tip pretends to be at height 100 — far above what the
+	// header index knows (only genesis + block1 = height 1).
+	savedHash := wire.Hash256{0xaa, 0xbb, 0xcc, 0xdd}
+	if err := db.SetChainState(&storage.ChainState{BestHash: savedHash, BestHeight: 100}); err != nil {
+		t.Fatalf("SetChainState: %v", err)
+	}
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+	if !cm.HasPendingRecovery() {
+		t.Fatal("deferred: pendingRecovery should be true pre-reload")
+	}
+
+	cm.ReloadChainState()
+	if _, h := cm.BestBlock(); h != 0 {
+		t.Errorf("deferred: tip should stay at genesis while headers < saved height; got %d", h)
+	}
+	if !cm.HasPendingRecovery() {
+		t.Error("deferred: pendingRecovery must remain true so later header batches retry")
+	}
+}
