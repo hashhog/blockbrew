@@ -10,6 +10,13 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// maxRecoveryWalkback bounds the ancestor-walk performed when the saved chain
+// tip is missing from the freshly-initialized header index.  Walking back more
+// than this many heights without finding a valid ancestor indicates the
+// chainstate is unrecoverable, and we fall back to genesis with a warning.
+// (See W17 chainmgr-startup recovery fix.)
+const maxRecoveryWalkback = 1 << 20
+
 // cachedUTXOView wraps a UTXOView with a cache of entries that may have been
 // spent from the underlying view. This is used during block connection so that
 // script validation (second pass) can still access UTXOs that were spent in the
@@ -58,6 +65,16 @@ type ChainManager struct {
 
 	// Signature cache for faster block connection
 	sigCache *SigCache
+
+	// pendingRecovery is set when loadChainState read a saved tip from
+	// the database but could not resolve it against the header index
+	// (expected on startup, where the header index is freshly seeded with
+	// only the genesis block).  While this flag is true, callers that add
+	// headers should invoke ReloadChainState so the tip can be restored as
+	// soon as the saved-tip header becomes available.  Lock-free so the
+	// P2P header-handler can read it without contending with cm.mu.
+	// (See W17 chainmgr-startup recovery fix.)
+	pendingRecovery atomic.Bool
 }
 
 // ChainManagerConfig configures the chain manager.
@@ -139,6 +156,13 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 }
 
 // loadChainState loads the chain state from the database.
+//
+// On startup the header index contains only the genesis block, so a saved
+// tip at height > 0 cannot be resolved here.  In that case we mark the
+// chain manager as pendingRecovery so the P2P layer will retry via
+// ReloadChainState after headers have been re-synced.  We do NOT silently
+// reset the tip to genesis — that would lose the saved chainstate height
+// and cause the node to wedge at block 0 (see W16 BLOCKBREW-DURABILITY-VERIFIED).
 func (cm *ChainManager) loadChainState() {
 	state, err := cm.chainDB.GetChainState()
 	if err != nil {
@@ -146,24 +170,96 @@ func (cm *ChainManager) loadChainState() {
 		return
 	}
 
-	node := cm.headerIndex.GetNode(state.BestHash)
-	if node == nil {
-		log.Printf("chainmgr: saved chain tip %s not found in header index",
-			state.BestHash.String()[:16])
+	log.Printf("chainmgr: loaded chain state from DB: height=%d hash=%s",
+		state.BestHeight, state.BestHash.String())
+
+	if state.BestHeight == 0 || state.BestHash == cm.params.GenesisHash {
+		// Already at genesis — nothing to recover.
 		return
 	}
 
-	cm.tipNode = node
-	cm.tipHeight = state.BestHeight
-	cm.updateTipCache(node.Hash, state.BestHeight)
-	log.Printf("chainmgr: loaded chain state at height %d", cm.tipHeight)
+	node := cm.headerIndex.GetNode(state.BestHash)
+	if node != nil {
+		cm.tipNode = node
+		cm.tipHeight = state.BestHeight
+		cm.updateTipCache(node.Hash, state.BestHeight)
+		log.Printf("chainmgr: restored chain tip at height %d hash=%s from saved state",
+			cm.tipHeight, node.Hash.String())
+		return
+	}
+
+	// Saved tip is not in the header index yet.  This is the normal
+	// startup condition: only genesis is in the index until the P2P
+	// layer has re-synced headers.  Mark the manager as pending
+	// recovery and let ReloadChainState retry once headers arrive.
+	cm.pendingRecovery.Store(true)
+	log.Printf("chainmgr: saved chain tip %s at height %d not yet in header index; "+
+		"deferring recovery until headers are re-synced",
+		state.BestHash.String(), state.BestHeight)
+}
+
+// HasPendingRecovery returns true iff the chain manager loaded a saved
+// chain tip from the database that has not yet been reconciled with the
+// header index.  The P2P header-handler polls this (lock-free) after
+// each header batch so it can invoke ReloadChainState as soon as the
+// saved tip becomes reachable.
+// (See W17 chainmgr-startup recovery fix.)
+func (cm *ChainManager) HasPendingRecovery() bool {
+	return cm.pendingRecovery.Load()
+}
+
+// findRecoveryTip searches the header index for the deepest ancestor of
+// the saved chainstate tip that is now present and locally reconstructible.
+// It consults the persisted height->hash mapping (populated as blocks are
+// connected) and returns the corresponding BlockNode once it finds a match.
+// Returns (nil, false) if no ancestor on the previously-active chain can
+// be resolved — the caller should then fall back to genesis with a warning.
+//
+// This mirrors Bitcoin Core's rewind-to-valid-ancestor behavior in
+// LoadBlockIndex / VerifyDB rather than silently resetting to genesis.
+func (cm *ChainManager) findRecoveryTip(savedHeight int32) (*BlockNode, int32) {
+	if cm.chainDB == nil || savedHeight <= 0 {
+		return nil, 0
+	}
+
+	maxWalk := int32(maxRecoveryWalkback)
+	if savedHeight < maxWalk {
+		maxWalk = savedHeight
+	}
+
+	// Walk downward from the saved tip height.  We stop at the first
+	// height whose recorded hash has a corresponding entry in the
+	// header index — that is the deepest locally-validated ancestor
+	// we can safely resume from.
+	for h := savedHeight; h >= 1 && savedHeight-h <= maxWalk; h-- {
+		hash, err := cm.chainDB.GetBlockHashByHeight(h)
+		if err != nil {
+			// Missing mapping at this height — try a shallower one.
+			continue
+		}
+		if node := cm.headerIndex.GetNode(hash); node != nil {
+			return node, h
+		}
+	}
+
+	return nil, 0
 }
 
 // ReloadChainState re-resolves the chain tip from the database after the
-// header index has been populated (e.g. after P2P header sync completes).
-// This is needed because on startup the header index only contains the genesis
-// block, so loadChainState cannot find the saved tip.
-// It also resolves the assume-valid height if not yet resolved.
+// header index has been populated (e.g. after P2P header sync progresses
+// past the saved tip height).  On mainnet the header index starts with
+// only genesis, so the initial loadChainState cannot restore a saved
+// multi-hundred-thousand-height tip; this method is the retry hook.
+//
+// Recovery strategy (W17):
+//  1. Happy path: saved tip hash is now in the header index → adopt it.
+//  2. Recovery path: saved tip hash is NOT in the index but a deeper
+//     ancestor IS → adopt that ancestor, resume block-download from there.
+//  3. Fallback: no ancestor resolves → warn loudly and leave the tip at
+//     whatever was set earlier (typically genesis), log an explicit
+//     "re-syncing from genesis due to corrupted chainstate" message.
+//
+// Also resolves the assume-valid height if it was not yet known.
 func (cm *ChainManager) ReloadChainState() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -179,8 +275,9 @@ func (cm *ChainManager) ReloadChainState() {
 		}
 	}
 
-	// Only reload chain tip if currently at genesis — don't clobber a valid tip
+	// Nothing to do if we have a non-genesis tip already.
 	if cm.tipHeight > 0 {
+		cm.pendingRecovery.Store(false)
 		return
 	}
 
@@ -193,17 +290,60 @@ func (cm *ChainManager) ReloadChainState() {
 		return
 	}
 
-	node := cm.headerIndex.GetNode(state.BestHash)
-	if node == nil {
-		log.Printf("chainmgr: ReloadChainState: saved tip %s still not in header index",
-			state.BestHash.String()[:16])
+	if state.BestHeight == 0 {
+		// Genuinely at genesis.
+		cm.pendingRecovery.Store(false)
 		return
 	}
 
-	cm.tipNode = node
-	cm.tipHeight = state.BestHeight
-	cm.updateTipCache(node.Hash, state.BestHeight)
-	log.Printf("chainmgr: reloaded chain state at height %d after header sync", cm.tipHeight)
+	// 1. Happy path.
+	if node := cm.headerIndex.GetNode(state.BestHash); node != nil {
+		cm.tipNode = node
+		cm.tipHeight = state.BestHeight
+		cm.updateTipCache(node.Hash, state.BestHeight)
+		cm.pendingRecovery.Store(false)
+		log.Printf("chainmgr: reloaded chain state at height %d after header sync (saved tip %s)",
+			cm.tipHeight, node.Hash.String())
+		return
+	}
+
+	// 2. Recovery path is only valid AFTER header sync has passed the saved
+	//    height.  If the header index is still shallower than the saved
+	//    tip, the saved tip's header simply hasn't been re-fetched yet —
+	//    any rewind now would discard known-good persisted work for
+	//    nothing.  Wait; the next header batch will re-trigger us.
+	headerHeight := cm.headerIndex.BestHeight()
+	if headerHeight < state.BestHeight {
+		// Keep pendingRecovery = true so we retry after more headers arrive.
+		return
+	}
+
+	// 3. Header sync is at or past the saved tip height but the saved-tip
+	//    hash is not in the index, so the previously-active chain is a
+	//    fork the peers no longer advertise.  Walk back to find the
+	//    deepest locally-validated ancestor now present in the index
+	//    and rewind to it.
+	ancestor, ancestorHeight := cm.findRecoveryTip(state.BestHeight)
+	if ancestor != nil {
+		cm.tipNode = ancestor
+		cm.tipHeight = ancestorHeight
+		cm.updateTipCache(ancestor.Hash, ancestorHeight)
+		cm.pendingRecovery.Store(false)
+		log.Printf("chainmgr: WARNING saved chain tip %s at height %d unreachable; "+
+			"rewound to deepest valid ancestor at height %d hash=%s — "+
+			"block download will resume from there",
+			state.BestHash.String(), state.BestHeight,
+			ancestorHeight, ancestor.Hash.String())
+		return
+	}
+
+	// 4. Fallback: nothing on the saved chain resolves.  Leave the tip
+	//    at its current value (genesis) and log loudly.  We keep
+	//    pendingRecovery=true so that if the header index grows further
+	//    we'll retry on the next header batch.
+	log.Printf("chainmgr: WARNING saved chain tip %s at height %d still not in header index "+
+		"and no ancestor is reconstructible — re-syncing from genesis due to corrupted chainstate",
+		state.BestHash.String(), state.BestHeight)
 }
 
 // ConnectBlock validates and connects a block to the active chain.
@@ -211,7 +351,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	hash := block.Header.BlockHash()
 	node := cm.headerIndex.GetNode(hash)
 	if node == nil {
-		return fmt.Errorf("block %s not found in header index", hash.String()[:16])
+		return fmt.Errorf("block %s not found in header index", hash.String())
 	}
 
 	// Log every 5000th block and any block that might be problematic
