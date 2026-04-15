@@ -144,6 +144,15 @@ func VerifyCheckpoint(cd *CheckpointData, height int32, hash wire.Hash256) error
 //   - isFork: true if this header creates a fork (i.e., there's already a different block at this height on the best chain)
 //
 // Returns ErrForkBeforeCheckpoint if the header would create a fork at or below the checkpoint.
+//
+// NOTE (W15 root-cause fix): this function is preserved for test compatibility but
+// is no longer used in the live header-validation path.  It was over-aggressive —
+// "would create a fork" as computed by wouldCreateFork() fires for ANY header whose
+// parent is off the current best chain, which during IBD catch-up includes every
+// honest peer's legitimate header batch (W8/W12/W13/W14 cascade).  The production
+// path now calls CheckForkConflictsWithCheckpoint (below), which only rejects
+// when an ancestor of the new header AT a known-checkpoint height hashes
+// differently from the known checkpoint — matching Bitcoin Core semantics.
 func CheckForkBeforeLastCheckpoint(cd *CheckpointData, headerHeight int32, isFork bool) error {
 	if cd == nil || cd.IsEmpty() {
 		return nil
@@ -160,5 +169,54 @@ func CheckForkBeforeLastCheckpoint(cd *CheckpointData, headerHeight int32, isFor
 		return ErrForkBeforeCheckpoint
 	}
 
+	return nil
+}
+
+// checkpointAncestorGetter is the minimal interface a BlockNode satisfies for
+// the checkpoint-conflict check.  Kept as a tiny interface so checkpoints.go
+// has no dependency on the BlockNode struct layout.
+type checkpointAncestorGetter interface {
+	GetAncestorHashAtHeight(height int32) (wire.Hash256, bool)
+}
+
+// CheckForkConflictsWithCheckpoint rejects a candidate header ONLY when its
+// ancestor chain has an ACTUAL hash conflict with a known checkpoint.
+//
+// Semantics (Core-like, per src/validation.cpp checkpoint handling):
+//   - Walk each known checkpoint at height h where h <= headerHeight.
+//   - If the candidate's parent chain has an ancestor at height h with a hash
+//     different from the known checkpoint hash, reject: this peer is feeding
+//     us a chain that contradicts a hard-coded checkpoint.
+//   - If the candidate's parent chain doesn't reach height h (e.g. candidate
+//     is itself below h or ancestor lookup returns not-found), do NOT reject —
+//     we simply don't have the evidence to call it a conflict.  The caller's
+//     orphan / PoW / VerifyCheckpoint checks will handle those paths.
+//
+// This replaces the W8-era rule "fork before last checkpoint is not allowed"
+// which fired on every wouldCreateFork() == true at height <= lastCP, and
+// which (with a +100 misbehavior penalty) drained the outbound peer pool
+// during IBD catch-up.  See wave14-2026-04-14/BLOCKBREW-DURABILITY.md.
+func CheckForkConflictsWithCheckpoint(cd *CheckpointData, parent checkpointAncestorGetter, headerHeight int32) error {
+	if cd == nil || cd.IsEmpty() || parent == nil {
+		return nil
+	}
+
+	for i := range cd.Checkpoints {
+		cp := &cd.Checkpoints[i]
+		if cp.Height > headerHeight-1 {
+			// Checkpoint is above parent's height; the candidate's ancestor
+			// chain cannot contradict it yet.
+			continue
+		}
+		ancestorHash, ok := parent.GetAncestorHashAtHeight(cp.Height)
+		if !ok {
+			// Parent chain doesn't reach this checkpoint height in-memory.
+			// Don't treat missing evidence as a conflict.
+			continue
+		}
+		if ancestorHash != cp.Hash {
+			return ErrForkBeforeCheckpoint
+		}
+	}
 	return nil
 }

@@ -916,6 +916,7 @@ func (m *mockChainConnector) BestBlockNode() *consensus.BlockNode {
 
 func (m *mockChainConnector) ConnectBlock(_ *wire.MsgBlock) error { return nil }
 func (m *mockChainConnector) ReloadChainState()                   {}
+func (m *mockChainConnector) IsIBD() bool                         { return true }
 
 // TestIsIBDActive_TrueAtStartup verifies that a freshly created SyncManager
 // reports IsIBDActive()=true before any blocks have connected.
