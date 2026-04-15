@@ -10,12 +10,6 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
-// maxRecoveryWalkback bounds the ancestor-walk performed when the saved chain
-// tip is missing from the freshly-initialized header index.  Walking back more
-// than this many heights without finding a valid ancestor indicates the
-// chainstate is unrecoverable, and we fall back to genesis with a warning.
-// (See W17 chainmgr-startup recovery fix.)
-const maxRecoveryWalkback = 1 << 20
 
 // cachedUTXOView wraps a UTXOView with a cache of entries that may have been
 // spent from the underlying view. This is used during block connection so that
@@ -160,9 +154,10 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 // On startup the header index contains only the genesis block, so a saved
 // tip at height > 0 cannot be resolved here.  In that case we mark the
 // chain manager as pendingRecovery so the P2P layer will retry via
-// ReloadChainState after headers have been re-synced.  We do NOT silently
-// reset the tip to genesis — that would lose the saved chainstate height
-// and cause the node to wedge at block 0 (see W16 BLOCKBREW-DURABILITY-VERIFIED).
+// ReloadChainState after headers have been re-synced.  We deliberately
+// emit a diagnostic log (not silent) so operators can see the startup
+// recovery path fire (see W16 BLOCKBREW-DURABILITY-VERIFIED for the
+// pre-fix silent-reset failure mode).
 func (cm *ChainManager) loadChainState() {
 	state, err := cm.chainDB.GetChainState()
 	if err != nil {
@@ -208,43 +203,6 @@ func (cm *ChainManager) HasPendingRecovery() bool {
 	return cm.pendingRecovery.Load()
 }
 
-// findRecoveryTip searches the header index for the deepest ancestor of
-// the saved chainstate tip that is now present and locally reconstructible.
-// It consults the persisted height->hash mapping (populated as blocks are
-// connected) and returns the corresponding BlockNode once it finds a match.
-// Returns (nil, false) if no ancestor on the previously-active chain can
-// be resolved — the caller should then fall back to genesis with a warning.
-//
-// This mirrors Bitcoin Core's rewind-to-valid-ancestor behavior in
-// LoadBlockIndex / VerifyDB rather than silently resetting to genesis.
-func (cm *ChainManager) findRecoveryTip(savedHeight int32) (*BlockNode, int32) {
-	if cm.chainDB == nil || savedHeight <= 0 {
-		return nil, 0
-	}
-
-	maxWalk := int32(maxRecoveryWalkback)
-	if savedHeight < maxWalk {
-		maxWalk = savedHeight
-	}
-
-	// Walk downward from the saved tip height.  We stop at the first
-	// height whose recorded hash has a corresponding entry in the
-	// header index — that is the deepest locally-validated ancestor
-	// we can safely resume from.
-	for h := savedHeight; h >= 1 && savedHeight-h <= maxWalk; h-- {
-		hash, err := cm.chainDB.GetBlockHashByHeight(h)
-		if err != nil {
-			// Missing mapping at this height — try a shallower one.
-			continue
-		}
-		if node := cm.headerIndex.GetNode(hash); node != nil {
-			return node, h
-		}
-	}
-
-	return nil, 0
-}
-
 // ReloadChainState re-resolves the chain tip from the database after the
 // header index has been populated (e.g. after P2P header sync progresses
 // past the saved tip height).  On mainnet the header index starts with
@@ -253,11 +211,17 @@ func (cm *ChainManager) findRecoveryTip(savedHeight int32) (*BlockNode, int32) {
 //
 // Recovery strategy (W17):
 //  1. Happy path: saved tip hash is now in the header index → adopt it.
-//  2. Recovery path: saved tip hash is NOT in the index but a deeper
-//     ancestor IS → adopt that ancestor, resume block-download from there.
-//  3. Fallback: no ancestor resolves → warn loudly and leave the tip at
-//     whatever was set earlier (typically genesis), log an explicit
-//     "re-syncing from genesis due to corrupted chainstate" message.
+//  2. Header sync is still shallower than the saved tip height → keep
+//     pendingRecovery = true and retry on the next batch.
+//  3. Header sync has passed the saved tip but the saved hash is still
+//     missing (the previously-active chain is a fork peers don't advertise)
+//     → log loudly and leave the tip at genesis.  We deliberately do NOT
+//     rewind to an ancestor because the persisted UTXO set is in the
+//     post-state of the saved tip; re-pointing the tip to an ancestor
+//     without replaying undo data would corrupt UTXO validation for
+//     every subsequent ConnectBlock.  UTXO-consistent rewind via undo
+//     replay is a W18 follow-up; for now the operator must wipe
+//     chaindata/ to recover from this state.
 //
 // Also resolves the assume-valid height if it was not yet known.
 func (cm *ChainManager) ReloadChainState() {
@@ -310,7 +274,7 @@ func (cm *ChainManager) ReloadChainState() {
 	// 2. Recovery path is only valid AFTER header sync has passed the saved
 	//    height.  If the header index is still shallower than the saved
 	//    tip, the saved tip's header simply hasn't been re-fetched yet —
-	//    any rewind now would discard known-good persisted work for
+	//    any fallback now would discard known-good persisted work for
 	//    nothing.  Wait; the next header batch will re-trigger us.
 	headerHeight := cm.headerIndex.BestHeight()
 	if headerHeight < state.BestHeight {
@@ -319,31 +283,24 @@ func (cm *ChainManager) ReloadChainState() {
 	}
 
 	// 3. Header sync is at or past the saved tip height but the saved-tip
-	//    hash is not in the index, so the previously-active chain is a
-	//    fork the peers no longer advertise.  Walk back to find the
-	//    deepest locally-validated ancestor now present in the index
-	//    and rewind to it.
-	ancestor, ancestorHeight := cm.findRecoveryTip(state.BestHeight)
-	if ancestor != nil {
-		cm.tipNode = ancestor
-		cm.tipHeight = ancestorHeight
-		cm.updateTipCache(ancestor.Hash, ancestorHeight)
-		cm.pendingRecovery.Store(false)
-		log.Printf("chainmgr: WARNING saved chain tip %s at height %d unreachable; "+
-			"rewound to deepest valid ancestor at height %d hash=%s — "+
-			"block download will resume from there",
-			state.BestHash.String(), state.BestHeight,
-			ancestorHeight, ancestor.Hash.String())
-		return
-	}
-
-	// 4. Fallback: nothing on the saved chain resolves.  Leave the tip
-	//    at its current value (genesis) and log loudly.  We keep
-	//    pendingRecovery=true so that if the header index grows further
-	//    we'll retry on the next header batch.
-	log.Printf("chainmgr: WARNING saved chain tip %s at height %d still not in header index "+
-		"and no ancestor is reconstructible — re-syncing from genesis due to corrupted chainstate",
-		state.BestHash.String(), state.BestHeight)
+	//    hash is still not in the index.  A naive rewind to a deeper
+	//    ancestor would corrupt the UTXO set: the persisted UTXOs reflect
+	//    the saved tip's post-state, but the rewound tip height would
+	//    have them looking "un-spent-too-early".  Proper recovery requires
+	//    replaying undo data back to the ancestor, which is beyond the
+	//    scope of the W17 startup-recovery patch.  For now we log loudly,
+	//    clear pendingRecovery so we stop retrying every batch, and
+	//    leave the tip at its current (genesis) value.  Operator must
+	//    wipe chaindata/ to force a full re-sync.  See
+	//    wave17-2026-04-15/BLOCKBREW-CHAINMGR-STARTUP-RECOVERY-FIX.md
+	//    (W18 follow-up: UTXO-consistent rewind with undo replay).
+	cm.pendingRecovery.Store(false)
+	log.Printf("chainmgr: WARNING saved chain tip %s at height %d is not in the header index "+
+		"even after header sync reached height %d — the previously-active chain appears to "+
+		"be a fork no peers advertise.  UTXO-consistent rewind is not yet implemented; the "+
+		"node will remain at genesis and will not advance.  Operator action required: wipe "+
+		"chaindata/ to force a full re-sync.  See W18 follow-up.",
+		state.BestHash.String(), state.BestHeight, headerHeight)
 }
 
 // ConnectBlock validates and connects a block to the active chain.

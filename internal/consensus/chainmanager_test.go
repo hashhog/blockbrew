@@ -1033,13 +1033,20 @@ func TestStartupRecoverySavedTipMissingThenReload(t *testing.T) {
 	}
 }
 
-// TestStartupRecoveryAncestorRewind exercises the rewind-to-ancestor fallback.
-// Simulates the case where the saved tip itself is unreachable (e.g. the
-// previously-active chain is a fork the peers don't advertise) but an
-// earlier height on the persisted chain has a header the P2P layer has
-// re-fetched.  The chain manager must rewind to that ancestor with a
-// clear warning rather than reset silently to genesis.
-func TestStartupRecoveryAncestorRewind(t *testing.T) {
+// TestStartupRecoveryUnreachableTipStaysAtGenesis verifies that when the
+// saved chain tip is genuinely unreachable (e.g. the previously-active
+// chain is a fork no peer advertises) AND header sync has passed the
+// saved height, the chain manager refuses to rewind and stays at
+// genesis with a loud warning.
+//
+// Rationale: the persisted UTXO set reflects the saved tip's post-state.
+// Rewinding the tip pointer to an ancestor without replaying undo data
+// leaves the UTXO set inconsistent, causing every subsequent
+// ConnectBlock at low heights to fail with "missing UTXO" errors
+// (observed on maxbox during the W17 first deploy when an earlier
+// rewind-to-ancestor variant corrupted the UTXO set).  Proper
+// UTXO-consistent rewind is deferred to W18.
+func TestStartupRecoveryUnreachableTipStaysAtGenesis(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 	db := storage.NewChainDB(storage.NewMemDB())
@@ -1047,9 +1054,6 @@ func TestStartupRecoveryAncestorRewind(t *testing.T) {
 	genesis := idx.Genesis()
 	block1 := createTestBlock(t, params, genesis, nil)
 	block1Hash := block1.Header.BlockHash()
-
-	// Ancestor height 1 is recorded in both the header index and the
-	// height->hash mapping.
 	if _, err := idx.AddHeader(block1.Header); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
@@ -1057,10 +1061,7 @@ func TestStartupRecoveryAncestorRewind(t *testing.T) {
 		t.Fatalf("SetBlockHeight: %v", err)
 	}
 
-	// Saved tip sits at height 2 with a hash that is NOT in the index
-	// (the fork head the peers never offered us back).  We still record
-	// the height->hash mapping so we can confirm the walker steps past
-	// an unresolvable height and recovers at the next-deepest one.
+	// Saved tip sits at height 2 on an unreachable fork.
 	unreachableHash := wire.Hash256{0x99, 0x99, 0x99, 0x99}
 	if err := db.SetBlockHeight(2, unreachableHash); err != nil {
 		t.Fatalf("SetBlockHeight 2: %v", err)
@@ -1069,13 +1070,8 @@ func TestStartupRecoveryAncestorRewind(t *testing.T) {
 		t.Fatalf("SetChainState: %v", err)
 	}
 
-	// Build the real height-2 block (child of block1) so we can add its
-	// header to the index to simulate "header sync has reached past the
-	// saved tip height on a different fork".  This satisfies the
-	// guard that rewind only fires once headers are at or past the
-	// saved tip height.  block2.Header.Hash != unreachableHash so the
-	// saved tip is genuinely unreachable even though the fork at height
-	// 2 now exists in the index.
+	// Simulate header sync having reached past the saved height on the
+	// canonical chain (block2 is a child of block1, not of unreachableHash).
 	block2 := createTestBlock(t, params, &BlockNode{
 		Hash:   block1Hash,
 		Height: 1,
@@ -1090,23 +1086,16 @@ func TestStartupRecoveryAncestorRewind(t *testing.T) {
 		HeaderIndex: idx,
 		ChainDB:     db,
 	})
-
-	// Initial load cannot find the saved tip (it isn't in the index).
 	if !cm.HasPendingRecovery() {
-		t.Fatal("rewind: pendingRecovery should be true when saved tip is missing")
+		t.Fatal("unreachable: pendingRecovery should be true when saved tip is missing")
 	}
 
-	// ReloadChainState must rewind to block1 (the deepest reachable ancestor).
 	cm.ReloadChainState()
-	gotHash, gotHeight := cm.BestBlock()
-	if gotHeight != 1 {
-		t.Errorf("rewind: height after reload = %d, want 1", gotHeight)
-	}
-	if gotHash != block1Hash {
-		t.Errorf("rewind: hash after reload = %s, want %s", gotHash.String(), block1Hash.String())
+	if _, h := cm.BestBlock(); h != 0 {
+		t.Errorf("unreachable: tip must stay at genesis to preserve UTXO consistency, got height %d", h)
 	}
 	if cm.HasPendingRecovery() {
-		t.Error("rewind: pendingRecovery should clear after ancestor rewind")
+		t.Error("unreachable: pendingRecovery should clear after loud warning (no further retries)")
 	}
 }
 
