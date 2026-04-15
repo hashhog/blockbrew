@@ -159,6 +159,14 @@ type ChainConnector interface {
 	// ReloadChainState re-resolves the chain tip and assume-valid height
 	// from the database after the header index has been populated.
 	ReloadChainState()
+	// HasPendingRecovery reports whether the chain manager is holding a
+	// saved chain tip that hasn't yet been reconciled with the header
+	// index.  Polled (lock-free) after each header batch so we can
+	// invoke ReloadChainState as soon as the saved tip becomes reachable,
+	// instead of waiting for OnSyncComplete which may never fire on a
+	// long chain where every batch is a full MaxHeadersPerRequest.
+	// (See W17 chainmgr-startup recovery fix.)
+	HasPendingRecovery() bool
 	// IsIBD reports whether the node is in Initial Block Download mode.
 	// Sync uses this to soften misbehavior penalties during catch-up so a
 	// transient header-ambiguity burst can't drain the outbound peer pool
@@ -435,6 +443,28 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	newHeight := sm.headerIndex.BestHeight()
 	if headersAdded > 0 {
 		log.Printf("sync: added %d headers (%d -> %d)", headersAdded, startHeight, newHeight)
+	}
+
+	// W17 chainmgr-startup recovery: if the chain manager is holding a
+	// saved tip that wasn't yet in the header index at boot, retry the
+	// reconciliation now that more headers have arrived.  Without this
+	// hook the tip stays at genesis until OnSyncComplete fires — which
+	// never happens on mainnet when every header batch is a full
+	// MaxHeadersPerRequest (stale-tip detection re-triggers before a
+	// short final batch is ever returned).  See
+	// wave16-2026-04-15/BLOCKBREW-DURABILITY-VERIFIED.md.
+	if headersAdded > 0 && sm.chainMgr != nil && sm.chainMgr.HasPendingRecovery() {
+		sm.chainMgr.ReloadChainState()
+		if _, tipHeight := sm.chainMgr.BestBlock(); tipHeight > 0 && len(sm.blockQueue) == 0 {
+			// Recovery succeeded and block-download hasn't started yet.
+			// Kick it off inline — the OnSyncComplete hook may not fire
+			// for a long time on a fully-saturated header sync.
+			// Release sm.mu first because StartBlockDownload takes it.
+			sm.mu.Unlock()
+			log.Printf("sync: chainmgr recovered tip at height %d during header sync, starting block download", tipHeight)
+			sm.StartBlockDownload()
+			sm.mu.Lock()
+		}
 	}
 
 	// Check if we received a full batch
