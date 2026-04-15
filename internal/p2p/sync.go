@@ -445,8 +445,8 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 		log.Printf("sync: added %d headers (%d -> %d)", headersAdded, startHeight, newHeight)
 	}
 
-	// W17 chainmgr-startup recovery: if the chain manager is holding a
-	// saved tip that wasn't yet in the header index at boot, retry the
+	// W17 chainmgr-startup recovery: if the chain manager is still holding
+	// a saved tip that wasn't yet in the header index at boot, retry the
 	// reconciliation now that more headers have arrived.  Without this
 	// hook the tip stays at genesis until OnSyncComplete fires — which
 	// never happens on mainnet when every header batch is a full
@@ -455,13 +455,23 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	// wave16-2026-04-15/BLOCKBREW-DURABILITY-VERIFIED.md.
 	if headersAdded > 0 && sm.chainMgr != nil && sm.chainMgr.HasPendingRecovery() {
 		sm.chainMgr.ReloadChainState()
-		if _, tipHeight := sm.chainMgr.BestBlock(); tipHeight > 0 && len(sm.blockQueue) == 0 {
-			// Recovery succeeded and block-download hasn't started yet.
-			// Kick it off inline — the OnSyncComplete hook may not fire
-			// for a long time on a fully-saturated header sync.
+	}
+
+	// W17 block-download kickoff: once the chain manager has a non-genesis
+	// tip AND headers have advanced past it AND no download pipeline is
+	// active yet, start block download inline.  We check this every
+	// header batch (not just immediately after recovery) because the
+	// initial recovery may land at a height exactly equal to the current
+	// bestTip height — StartBlockDownload short-circuits on
+	// bestTip.Height <= startHeight, and we rely on the next header
+	// batch to push bestTip above the restored tip before we can queue
+	// any downloads.
+	if headersAdded > 0 && sm.chainMgr != nil && len(sm.blockQueue) == 0 && !sm.headersSynced {
+		if _, tipHeight := sm.chainMgr.BestBlock(); tipHeight > 0 && sm.headerIndex.BestHeight() > tipHeight {
 			// Release sm.mu first because StartBlockDownload takes it.
 			sm.mu.Unlock()
-			log.Printf("sync: chainmgr recovered tip at height %d during header sync, starting block download", tipHeight)
+			log.Printf("sync: chain manager tip at height %d, headers at %d, starting block download",
+				tipHeight, sm.headerIndex.BestHeight())
 			sm.StartBlockDownload()
 			sm.mu.Lock()
 		}
