@@ -159,6 +159,11 @@ type ChainConnector interface {
 	// ReloadChainState re-resolves the chain tip and assume-valid height
 	// from the database after the header index has been populated.
 	ReloadChainState()
+	// IsIBD reports whether the node is in Initial Block Download mode.
+	// Sync uses this to soften misbehavior penalties during catch-up so a
+	// transient header-ambiguity burst can't drain the outbound peer pool
+	// (W15 root-cause fix).
+	IsIBD() bool
 }
 
 // SyncManagerConfig configures the sync manager.
@@ -388,10 +393,25 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 				continue
 			}
 
-			// Score depends on error type: orphan/disconnected = 20, invalid PoW = 100
+			// Score depends on error type: orphan/disconnected = 20, invalid PoW = 100.
+			// W15 root-cause fix (ref: wave14-2026-04-14/BLOCKBREW-DURABILITY.md):
+			// during IBD catch-up we intentionally cap non-PoW header errors at a
+			// small score so a transient chain-ambiguity burst from a single peer
+			// (orphan window, checkpoint-fork false positive after a header-index
+			// race) cannot drain the outbound peer pool in one hit.  A peer that
+			// is genuinely feeding invalid PoW or a checkpoint-contradicting chain
+			// still gets the full +100 — we key off error type, not peer identity.
 			score := ScoreInvalidBlock
-			if err == consensus.ErrOrphanHeader {
+			switch err {
+			case consensus.ErrOrphanHeader:
 				score = ScoreHeadersDontConnect
+			case consensus.ErrForkBeforeCheckpoint:
+				// Reduced during IBD to avoid banning honest peers whose batches
+				// briefly expose a cross-branch ancestor during catch-up.  Outside
+				// IBD this error is unlikely and still deserves a heavier penalty.
+				if sm.chainMgr != nil && sm.chainMgr.IsIBD() {
+					score = ScoreHeadersDontConnectIBD
+				}
 			}
 			log.Printf("sync: bad header from %s at height %d: %v",
 				peer.Address(), sm.headerIndex.BestHeight()+1, err)
