@@ -1203,11 +1203,17 @@ func (sm *SyncManager) checkStaleRequests() {
 		if now.Sub(req.RequestAt) > timeout {
 			timedOut++
 
-			// Score misbehavior for stalling block downloads (+50).
-			// Misbehaving is idempotent past threshold (W13 fix in peer.go).
-			if req.Peer != nil {
-				req.Peer.Misbehaving(ScoreBlockDownloadStall, "block download stalling")
-			}
+			// W35: do NOT score misbehavior for block-download timeouts.
+			// Bitcoin Core's policy: BLOCK_DOWNLOAD_STALLING isn't banned;
+			// only INVALID_BLOCK etc. score heavily. During IBD, peers
+			// legitimately time out under load (16 parallel reqs/peer,
+			// slow links, pruned nodes). +50 per timeout × threshold 100
+			// caused cascade bans — observed W35 at height 194,098 where
+			// 15+ peers got banned in ~5 minutes, wedging progress. Rely
+			// on per-peer adaptive timeout backoff + peer rotation to
+			// deprioritise slow peers without permanent bans.
+			// (ScoreBlockDownloadStall/Misbehaving still used for actual
+			// protocol violations elsewhere.)
 
 			// Increase timeout for this peer (adaptive backoff)
 			sm.increaseStallTimeout(req.Peer)
