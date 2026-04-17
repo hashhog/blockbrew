@@ -1630,9 +1630,42 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 								missingHeight, tipH, nextHeight)
 							break
 						}
+						// missingHeight >= nextHeight: tip is at or ahead of
+						// this slot, so the block in pending[nextHeight] cannot
+						// connect (its PrevBlock does not match current tip).
+						// Treat the delivered block as stale or mis-delivered:
+						// evict the pending entry and re-queue the download, so
+						// the retry ticker does not infinite-loop on a slot it
+						// can never make progress on.
+						log.Printf("sync: evicting stuck block at height %d (hash=%s, tip=%d) — re-requesting",
+							nextHeight, bwr.req.Hash.String()[:16], tipH)
+						delete(pending, nextHeight)
+						sm.mu.Lock()
+						requeued := false
+						for _, req := range sm.blockQueue {
+							if req.Height == nextHeight {
+								req.State = BlockDownloadPending
+								req.Peer = nil
+								delete(sm.inflight, req.Hash)
+								requeued = true
+								break
+							}
+						}
+						if !requeued {
+							if bestTip := sm.headerIndex.BestTip(); bestTip != nil {
+								if ancestor := bestTip.GetAncestor(nextHeight); ancestor != nil {
+									sm.blockQueue = append([]*blockRequest{{
+										Hash:   ancestor.Hash,
+										Height: nextHeight,
+										State:  BlockDownloadPending,
+									}}, sm.blockQueue...)
+								}
+							}
+						}
+						sm.mu.Unlock()
+						break
 					}
-					// No gap — the preceding block just hasn't been
-					// connected yet. Wait for it.
+					// chainMgr nil — can't verify; wait for next signal.
 					break
 				}
 
