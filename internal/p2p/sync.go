@@ -1302,14 +1302,32 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 			// (e.g., announced via inv from a miner).
 			// First, add its header to the header index (headers-first requirement).
 			log.Printf("sync: received unsolicited block %s from %s, processing header first", hash, peer.Address())
+			resolvedHeight := false
 			if sm.headerIndex != nil {
 				node, err := sm.headerIndex.AddHeader(msg.Block.Header)
 				if err == nil && node != nil {
 					log.Printf("sync: added header for unsolicited block (height %d)", node.Height)
 					nh = node.Height
+					resolvedHeight = true
+				} else if err == consensus.ErrDuplicateHeader {
+					// Header already in the index — look up its canonical height.
+					// Without this we would slot the block at pending[sm.nextHeight]
+					// even though its true height differs, causing ConnectBlock
+					// to reject it every retry ("prev != tip") for the lifetime
+					// of the stuck slot. See W49 cascade-loop investigation.
+					if existing := sm.headerIndex.GetNode(hash); existing != nil {
+						nh = existing.Height
+						resolvedHeight = true
+					}
 				} else if err != nil {
-					log.Printf("sync: failed to add header for unsolicited block: %v", err)
+					log.Printf("sync: failed to add header for unsolicited block: %v — dropping", err)
 				}
+			}
+			if !resolvedHeight {
+				// Can't position this block in the pipeline without a known
+				// height — dropping is safer than slotting at an arbitrary
+				// cursor.
+				return
 			}
 			// Now pass to validation
 			select {
