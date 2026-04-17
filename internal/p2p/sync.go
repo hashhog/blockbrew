@@ -1004,6 +1004,12 @@ func (sm *SyncManager) blockDownloadLoop() {
 								nh)
 							req.Peer = nil
 							req.RetryCount = 0
+							// W48: state invariant says Pending blocks must not be in
+							// sm.inflight; otherwise requestBlocks skips them and the
+							// stall never clears. Sibling branches (line ~1014, ~1034)
+							// already do this; match them here. Delete is a no-op if
+							// the block isn't actually in the map.
+							delete(sm.inflight, req.Hash)
 						} else if req.State != BlockDownloadPending {
 							// Block is in some intermediate state (InFlight, Received, Validated).
 							// It may be stuck in the pipeline. Reset to pending.
