@@ -1573,10 +1573,12 @@ func (sm *SyncManager) requeueForRedownload(bwr *blockWithRequest) {
 	}
 }
 
-// MaxPendingBlocks is the maximum number of blocks to buffer in the
-// connection worker's pending map before dropping the oldest entries.
-// This prevents unbounded memory growth when the chain tip is stalled.
-const MaxPendingBlocks = 1024
+// MaxPendingBlocks bounds the connection worker's pending map. W69a
+// raised it 1024 → 2048 to absorb burst-arrival pileups during IBD
+// without triggering the eviction path (which forces re-download of a
+// validated block body). Invariant: DownloadWindow ≤ MaxPendingBlocks,
+// enforced at startup (W67d).
+const MaxPendingBlocks = 2048
 
 // connectionWorker connects validated blocks to the chain in order.
 func (sm *SyncManager) connectionWorker() {
