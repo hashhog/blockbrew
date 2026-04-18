@@ -3,6 +3,7 @@ package p2p
 import (
 	"fmt"
 	"log"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -63,7 +64,40 @@ const (
 	// If the chain tip's block timestamp is older than this, IsIBDActive returns
 	// true regardless of block height.
 	MaxTipAge = 24 * time.Hour
+
+	// MaxValidationWorkers caps how many concurrent validationWorker
+	// goroutines Start() will spawn.  CheckBlockSanity (the main work the
+	// validation worker does) is independent per block and CPU-bound, so
+	// parallelising it drains validationChan faster and prevents the
+	// "validation channel full, dropping unsolicited block" back-pressure
+	// regime that caused the 6-minute stall cycle diagnosed in W63.
+	// Reference: wave63-2026-04-18/BLOCKBREW-PROFILE.md (validation
+	// state-machine stalled; validCh=1024/1024, connCh=1024/1024).
+	MaxValidationWorkers = 4
+
+	// MinValidationWorkers is the floor for validation-worker parallelism
+	// so even on a 1-core VM we get at least two so the non-blocking
+	// connection-channel send path keeps making forward progress under
+	// transient connectionChan pressure.
+	MinValidationWorkers = 2
 )
+
+// numValidationWorkers returns how many validationWorker goroutines to
+// spawn.  The policy is runtime.NumCPU()/2, clamped to
+// [MinValidationWorkers, MaxValidationWorkers].  We deliberately do NOT
+// use all cores: the connectionWorker must remain the single serialisation
+// point for chain extension, and over-parallelising CheckBlockSanity
+// would only push back-pressure onto connectionChan sooner.
+func numValidationWorkers() int {
+	n := runtime.NumCPU() / 2
+	if n < MinValidationWorkers {
+		n = MinValidationWorkers
+	}
+	if n > MaxValidationWorkers {
+		n = MaxValidationWorkers
+	}
+	return n
+}
 
 // BlockDownloadState tracks the download state of a block.
 type BlockDownloadState int
@@ -143,6 +177,14 @@ type SyncManager struct {
 	// Stale tip detection (Bitcoin Core: CheckForStaleTipAndEvictPeers)
 	lastTipUpdate      time.Time // When our chain tip last advanced
 	nextStaleTipCheck  time.Time // When to next check for stale tip
+
+	// lastRequeueLog holds the UnixNano timestamp of the last
+	// "connection channel saturated, re-queued" message so
+	// requeueForRedownload can rate-limit logging when
+	// validationWorkers' non-blocking connectionChan sends fall back
+	// under sustained back-pressure.  Accessed via atomic to avoid
+	// contention between parallel validationWorkers.  W64 thread A.
+	lastRequeueLog atomic.Int64
 }
 
 // ChainConnector is the interface for connecting blocks to the chain.
@@ -241,9 +283,23 @@ func (sm *SyncManager) Start() {
 	sm.wg.Add(1)
 	go sm.syncHandler()
 
-	// Start IBD pipeline workers
-	sm.wg.Add(3)
-	go sm.validationWorker()
+	// Start IBD pipeline workers.
+	//
+	// W64 (thread A) — validationWorker is now parallelised: CheckBlockSanity
+	// is independent per block, so running N of them drains validationChan
+	// fast enough to prevent the 6-min "validation channel full, dropping
+	// unsolicited block" stall cycle diagnosed in W63.  connectionWorker
+	// remains a single goroutine because ConnectBlock must be ordered and
+	// must own the chain-extension critical section.  Combined with the
+	// non-blocking send to connectionChan inside validationWorker (which
+	// falls back to re-queueing the block for re-download rather than
+	// parking the goroutine), this breaks the pipeline deadlock.
+	// Reference: wave63-2026-04-18/BLOCKBREW-PROFILE.md.
+	nVal := numValidationWorkers()
+	sm.wg.Add(2 + nVal)
+	for i := 0; i < nVal; i++ {
+		go sm.validationWorker()
+	}
 	go sm.connectionWorker()
 	go sm.progressLogger()
 }
@@ -1428,27 +1484,82 @@ func (sm *SyncManager) validationWorker() {
 					// Still send to connection pipeline so it can skip this height
 					// and continue with subsequent blocks. Mark it as failed so
 					// connectionWorker knows to skip it.
+					//
+					// W64 (thread A): non-blocking send.  If connectionChan is
+					// saturated we used to park here, which backed up
+					// validationChan and caused the net handler to drop incoming
+					// blocks ("validation channel full, dropping unsolicited
+					// block" — see W63 profile).  Falling through to re-queue
+					// lets validationChan keep draining; the block is already
+					// stored to DB (handleBlock) and will be re-delivered via
+					// the stall detector's re-request path once pressure eases.
 					bwr.req.State = BlockDownloadValidated
 					select {
 					case sm.connectionChan <- bwr:
 					case <-sm.quit:
 						return
+					default:
+						sm.requeueForRedownload(bwr)
 					}
 					return
 				}
 
 				bwr.req.State = BlockDownloadValidated
 
-				// Send to connection pipeline
+				// Send to connection pipeline.
+				//
+				// W64 (thread A): non-blocking send with re-queue fallback.
+				// See the comment above the failed-sanity send for context —
+				// same rationale, same fallback path.  Dropping validated
+				// work here is safe because the block body is persisted to
+				// chainDB before this point (handleBlock line ~1365) and
+				// the stall detector will re-request it once connectionChan
+				// drains.
 				select {
 				case sm.connectionChan <- bwr:
 				case <-sm.quit:
 					return
+				default:
+					sm.requeueForRedownload(bwr)
 				}
 			}()
 
 		case <-sm.quit:
 			return
+		}
+	}
+}
+
+// requeueForRedownload resets a block's download state so the stall
+// detector / next request cycle will re-download it.  Used as the
+// back-pressure fallback when the validationWorker cannot push to
+// connectionChan without blocking.  The block body has already been
+// persisted to chainDB by handleBlock(), so re-download hits the DB
+// fast path — no network round-trip is forced by the requeue.
+//
+// Rate-limited logging prevents a saturated pipeline from flooding the
+// log; the progressLogger already reports validCh/connCh saturation
+// every 10s, which is sufficient telemetry for this condition.
+//
+// W64 (thread A): added to break the single-validationWorker deadlock
+// where a blocking send to a full connectionChan backed up validationChan
+// and caused the 6-min stall cycle diagnosed in W63.
+func (sm *SyncManager) requeueForRedownload(bwr *blockWithRequest) {
+	if bwr == nil || bwr.req == nil {
+		return
+	}
+	sm.mu.Lock()
+	bwr.req.State = BlockDownloadPending
+	bwr.req.Peer = nil
+	delete(sm.inflight, bwr.req.Hash)
+	sm.mu.Unlock()
+
+	now := time.Now()
+	last := sm.lastRequeueLog.Load()
+	if last == 0 || now.Sub(time.Unix(0, last)) >= 30*time.Second {
+		if sm.lastRequeueLog.CompareAndSwap(last, now.UnixNano()) {
+			log.Printf("sync: connection channel saturated, re-queued block %d (%s) for later re-download",
+				bwr.req.Height, bwr.req.Hash.String()[:16])
 		}
 	}
 }
