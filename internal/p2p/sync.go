@@ -2039,3 +2039,24 @@ func (sm *SyncManager) BlockQueueLength() int {
 	defer sm.mu.RUnlock()
 	return len(sm.blockQueue)
 }
+
+// PendingConnectCount returns the number of validated blocks queued for
+// connection but not yet connected to the tip. Reads the connection
+// channel's current length (O(1), no lock). Used by the getsyncstate RPC
+// to expose the same counter the W69 post-deploy diagnosis found
+// saturated at 1024/1024.
+func (sm *SyncManager) PendingConnectCount() int {
+	return len(sm.connectionChan)
+}
+
+// LastTipUpdateTime returns the unix-seconds timestamp of when this node
+// last advanced its best-chain tip. Returns 0 if the tip has never
+// advanced (fresh datadir, pre-IBD). Used by the getsyncstate RPC.
+func (sm *SyncManager) LastTipUpdateTime() int64 {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if sm.lastTipUpdate.IsZero() {
+		return 0
+	}
+	return sm.lastTipUpdate.Unix()
+}
