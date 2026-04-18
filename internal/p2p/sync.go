@@ -3,6 +3,7 @@ package p2p
 import (
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -1138,6 +1139,16 @@ func (sm *SyncManager) blockDownloadLoop() {
 	}
 }
 
+// requestJitter returns a random 0–500 ms offset added to each request's
+// RequestAt timestamp. Without it, a batch of ~140 getdata requests all
+// stamp RequestAt within the same millisecond, so their timeouts fire as
+// a thundering herd 120 s later — producing the oscillating drain-refill
+// pattern observed in W63's profile. Spreading the deadlines keeps the
+// connection worker fed with a steady trickle of validated blocks (W69b).
+func requestJitter() time.Duration {
+	return time.Duration(rand.IntN(500)) * time.Millisecond
+}
+
 // requestBlocks sends block requests to peers up to the download window.
 func (sm *SyncManager) requestBlocks() {
 	sm.mu.Lock()
@@ -1224,7 +1235,7 @@ func (sm *SyncManager) requestBlocks() {
 		// Mark request as in-flight
 		req.Peer = selectedPeer
 		req.State = BlockDownloadInFlight
-		req.RequestAt = time.Now()
+		req.RequestAt = time.Now().Add(requestJitter())
 		sm.inflight[req.Hash] = req
 		peerInflight[selectedPeer.Address()]++
 
