@@ -398,6 +398,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	// Blockchain RPCs
 	case "getblockchaininfo":
 		return s.handleGetBlockchainInfo()
+	case "getsyncstate":
+		return s.handleGetSyncState()
 	case "getblock":
 		return s.handleGetBlock(params)
 	case "getblockhash":

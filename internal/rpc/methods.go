@@ -105,6 +105,80 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 	}, nil
 }
 
+// handleGetSyncState implements the W70 getsyncstate RPC. Spec:
+// spec/getsyncstate.md. Returns the node's chain/sync state in a single
+// canonical shape every hashhog node honors, so fleet-rate.py and
+// friends can stop special-casing each node's getblockcount +
+// getbestblockhash + ad-hoc counters.
+func (s *Server) handleGetSyncState() (interface{}, *RPCError) {
+	if s.chainMgr == nil || s.headerIndex == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+
+	tipHash, tipHeight := s.chainMgr.BestBlock()
+	bestHeaderHeight := s.headerIndex.BestHeight()
+
+	// BestTip acquires idx.mu.RLock; acceptable here because this RPC
+	// is called infrequently (fleet-rate probes ~1/min) and the lock is
+	// not held long. If this becomes a hotspot later, promote to the
+	// same atomic-cache pattern used by BestHeight().
+	var bestHeaderHash string
+	if tip := s.headerIndex.BestTip(); tip != nil {
+		bestHeaderHash = tip.Hash.String()
+	} else {
+		bestHeaderHash = tipHash.String()
+	}
+
+	// Default IBD to true: until the sync manager is attached and has
+	// observed a recent-timestamped tip, we cannot safely claim to be
+	// out of IBD. Spec (spec/getsyncstate.md): "Node's own judgment".
+	ibd := true
+	var blocksInFlight, blocksPendingConnect *int
+	var lastBlockRecv *int64
+	if s.syncMgr != nil {
+		ibd = s.syncMgr.IsIBDActive()
+		inflight := s.syncMgr.BlocksInFlight()
+		pending := s.syncMgr.PendingConnectCount()
+		blocksInFlight = &inflight
+		blocksPendingConnect = &pending
+		if t := s.syncMgr.LastTipUpdateTime(); t > 0 {
+			lastBlockRecv = &t
+		}
+	}
+
+	numPeers := 0
+	if s.peerMgr != nil {
+		numPeers = len(s.peerMgr.ConnectedPeers())
+	}
+
+	var vp *float64
+	if bestHeaderHeight > 0 {
+		v := float64(tipHeight) / float64(bestHeaderHeight)
+		if v > 1.0 {
+			v = 1.0
+		}
+		vp = &v
+	}
+
+	chain := s.rpcChainName()
+	pv := int(p2p.ProtocolVersion)
+
+	return &SyncStateResult{
+		TipHeight:             tipHeight,
+		TipHash:               tipHash.String(),
+		BestHeaderHeight:      bestHeaderHeight,
+		BestHeaderHash:        bestHeaderHash,
+		InitialBlockDownload:  ibd,
+		NumPeers:              numPeers,
+		VerificationProgress:  vp,
+		BlocksInFlight:        blocksInFlight,
+		BlocksPendingConnect:  blocksPendingConnect,
+		LastBlockReceivedTime: lastBlockRecv,
+		Chain:                 &chain,
+		ProtocolVersion:       &pv,
+	}, nil
+}
+
 func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError) {
 	// Parse parameters: [hash, verbosity]
 	var args []interface{}

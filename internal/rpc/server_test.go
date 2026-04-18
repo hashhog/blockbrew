@@ -1468,3 +1468,81 @@ func TestSoftforksDeploymentInfoConsistency(t *testing.T) {
 		}
 	}
 }
+
+// TestGetSyncStateW70 verifies the W70 getsyncstate RPC contract: the
+// six MUST fields are present and well-typed, and the SHOULD fields are
+// either produced or returned as JSON null (never omitted).
+func TestGetSyncStateW70(t *testing.T) {
+	params := consensus.MainnetParams()
+	idx := consensus.NewHeaderIndex(params)
+	cmConfig := consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		UTXOSet:     consensus.NewInMemoryUTXOView(),
+	}
+	chainMgr := consensus.NewChainManager(cmConfig)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithHeaderIndex(idx),
+		WithChainManager(chainMgr),
+	)
+
+	resp := testRPCRequest(t, server.handleRPC, "getsyncstate", []interface{}{}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("getsyncstate returned RPC error: %v", resp.Error)
+	}
+
+	// Re-marshal through JSON so we exercise the null-for-SHOULD-fields
+	// encoding that consumers will actually see on the wire.
+	raw, err := json.Marshal(resp.Result)
+	if err != nil {
+		t.Fatalf("marshal getsyncstate result: %v", err)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal getsyncstate result: %v", err)
+	}
+
+	mustFields := []string{
+		"tip_height", "tip_hash", "best_header_height", "best_header_hash",
+		"initial_block_download", "num_peers",
+	}
+	for _, f := range mustFields {
+		v, present := got[f]
+		if !present {
+			t.Errorf("MUST field %q missing from response", f)
+			continue
+		}
+		if v == nil {
+			t.Errorf("MUST field %q is null (spec violation)", f)
+		}
+	}
+
+	shouldFields := []string{
+		"verification_progress", "blocks_in_flight", "blocks_pending_connect",
+		"last_block_received_time", "chain", "protocol_version",
+	}
+	for _, f := range shouldFields {
+		if _, present := got[f]; !present {
+			t.Errorf("SHOULD field %q missing — spec requires null, not omission", f)
+		}
+	}
+
+	// Type + invariant checks on fields that are produced.
+	if h, ok := got["tip_hash"].(string); !ok {
+		t.Error("tip_hash not a string")
+	} else if len(h) != 64 {
+		t.Errorf("tip_hash length %d, want 64", len(h))
+	}
+	if ibd, ok := got["initial_block_download"].(bool); !ok {
+		t.Error("initial_block_download not a bool")
+	} else if !ibd {
+		// At genesis + no peers + mainnet params, IBD should be true.
+		t.Error("expected initial_block_download=true on empty chain")
+	}
+	if chain, ok := got["chain"].(string); !ok || chain != "main" {
+		t.Errorf("chain = %v, want \"main\"", got["chain"])
+	}
+}
