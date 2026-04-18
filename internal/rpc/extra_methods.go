@@ -485,6 +485,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"getblockheader \"blockhash\" ( verbose )",
 		"getchaintips",
 		"getdifficulty",
+		"getsyncstate",
 		"gettxout \"txid\" n ( include_mempool )",
 		"",
 		"== Mining ==",
@@ -597,6 +598,8 @@ func getMethodHelp(method string) string {
 		return "getblockhash height\nReturns hash of block at given height in the main chain."
 	case "getblockcount":
 		return "getblockcount\nReturns the height of the most-work fully-validated chain."
+	case "getsyncstate":
+		return "getsyncstate\nReturns the node's chain/sync state in the W70 v1 canonical shape. See spec/getsyncstate.md."
 	case "gettxout":
 		return "gettxout \"txid\" n ( include_mempool )\nReturns details about an unspent transaction output."
 	case "sendtoaddress":

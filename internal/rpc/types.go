@@ -50,6 +50,25 @@ func (e *RPCError) Error() string {
 	return e.Message
 }
 
+// SyncStateResult is the JSON response for the getsyncstate RPC (W70).
+// See spec/getsyncstate.md for field semantics and invariants. SHOULD
+// fields are *int64 / *float64 / *string so they can serialize to JSON
+// null when the node can't produce them (blockbrew produces all of them).
+type SyncStateResult struct {
+	TipHeight             int32    `json:"tip_height"`
+	TipHash               string   `json:"tip_hash"`
+	BestHeaderHeight      int32    `json:"best_header_height"`
+	BestHeaderHash        string   `json:"best_header_hash"`
+	InitialBlockDownload  bool     `json:"initial_block_download"`
+	NumPeers              int      `json:"num_peers"`
+	VerificationProgress  *float64 `json:"verification_progress"`
+	BlocksInFlight        *int     `json:"blocks_in_flight"`
+	BlocksPendingConnect  *int     `json:"blocks_pending_connect"`
+	LastBlockReceivedTime *int64   `json:"last_block_received_time"`
+	Chain                 *string  `json:"chain"`
+	ProtocolVersion       *int     `json:"protocol_version"`
+}
+
 // BlockchainInfo represents the result of getblockchaininfo.
 type BlockchainInfo struct {
 	Chain                string                     `json:"chain"`
