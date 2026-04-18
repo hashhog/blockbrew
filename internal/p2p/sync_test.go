@@ -1041,3 +1041,194 @@ func TestIsIBDActive_TrueDuringHeaderSync(t *testing.T) {
 		t.Fatal("IBD should be false once tip is recent")
 	}
 }
+
+// TestNumValidationWorkers verifies the worker-count policy: we clamp
+// runtime.NumCPU()/2 into [MinValidationWorkers, MaxValidationWorkers].
+// A bogus policy (e.g. 0 workers, or >MaxValidationWorkers) would either
+// deadlock Start() or pin every core to block-sanity checks, so this
+// guards the constants that W64 introduced.
+func TestNumValidationWorkers(t *testing.T) {
+	n := numValidationWorkers()
+	if n < MinValidationWorkers {
+		t.Errorf("numValidationWorkers()=%d, want >= %d", n, MinValidationWorkers)
+	}
+	if n > MaxValidationWorkers {
+		t.Errorf("numValidationWorkers()=%d, want <= %d", n, MaxValidationWorkers)
+	}
+}
+
+// stallingChainConnector blocks forever inside ConnectBlock so the test
+// can saturate connectionChan without the connectionWorker draining it.
+// Used by TestValidationWorkerNoDeadlockUnderBackpressure.
+type stallingChainConnector struct {
+	mockChainConnector
+	release chan struct{}
+}
+
+func (s *stallingChainConnector) ConnectBlock(_ *wire.MsgBlock) error {
+	<-s.release
+	return nil
+}
+
+// TestValidationWorkerNoDeadlockUnderBackpressure is the W63 / W64-thread-A
+// regression test.  The old single-goroutine validationWorker did a
+// blocking send to connectionChan; when connectionChan was full (because
+// connectionWorker was stuck on a slow ConnectBlock or a missing
+// nextHeight) the validation worker parked forever, which backed up
+// validationChan and caused the peer readHandler to drop incoming blocks.
+// The new implementation must:
+//   1. Spawn N parallel validation workers (so one slow ConnectBlock
+//      can't stop validation globally).
+//   2. Fall back to requeueForRedownload() when connectionChan is full,
+//      instead of parking the goroutine.
+//
+// This test stuffs both channels past capacity with a wedged connection
+// worker, then asserts the validation workers drained validationChan
+// (the blocks ended up in BlockDownloadPending via requeue) within a
+// short deadline.  If the old blocking-send code were still in place,
+// validationChan would stay saturated and the test would time out.
+func TestValidationWorkerNoDeadlockUnderBackpressure(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseFn := func() { releaseOnce.Do(func() { close(release) }) }
+
+	stall := &stallingChainConnector{
+		mockChainConnector: mockChainConnector{tipHeight: 0, tipTimestamp: 1},
+		release:            release,
+	}
+
+	// Small downloadWindow keeps the channel caps tight so we can
+	// saturate them quickly without allocating thousands of blocks.
+	const window = 8
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		ChainManager:   stall,
+		DownloadWindow: window,
+	})
+	sm.Start()
+	// Cleanup: release the wedged ConnectBlock FIRST so the connectionWorker
+	// unblocks, then Stop() can complete and wg.Wait() returns.  If we Stop
+	// before releasing, the connectionWorker stays wedged and we leak
+	// goroutines into subsequent tests — which makes `go test -race` flag
+	// the whole package as FAIL even when every individual test passes.
+	defer func() {
+		releaseFn()
+		done := make(chan struct{})
+		go func() {
+			sm.Stop()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("Stop did not complete within 3s — goroutine leak")
+		}
+	}()
+
+	// Seed connectionChan directly with `window` validated blocks so the
+	// connectionWorker picks one up, enters the wedged ConnectBlock, and
+	// can no longer drain connectionChan — the rest stays buffered.
+	// Then seed validationChan with >window blocks.  If the validation
+	// workers' connectionChan send is still blocking, none of these will
+	// be drained and the inflight map will stay full.
+	seedBlock := func(height int32) *blockWithRequest {
+		hdr := createTestBlockHeader(wire.Hash256{}, uint32(100+height), uint32(height))
+		return &blockWithRequest{
+			block: &wire.MsgBlock{
+				Header: hdr,
+				Transactions: []*wire.MsgTx{
+					{
+						Version: 1,
+						TxIn: []*wire.TxIn{{
+							PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+							SignatureScript:  []byte{0x01, byte(height)},
+							Sequence:         0xFFFFFFFF,
+						}},
+						TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x51}}},
+					},
+				},
+			},
+			req: &blockRequest{
+				Hash:   hdr.BlockHash(),
+				Height: height,
+				State:  BlockDownloadReceived,
+			},
+		}
+	}
+
+	// Record some inflight entries so requeueForRedownload's delete
+	// path actually has something to delete (exercises the full code
+	// path, not just the state reset).
+	for h := int32(1); h <= window*3; h++ {
+		bwr := seedBlock(h)
+		sm.mu.Lock()
+		sm.inflight[bwr.req.Hash] = bwr.req
+		sm.mu.Unlock()
+	}
+
+	// Fill connectionChan to capacity (non-blocking pre-seed).
+	for i := 0; i < window; i++ {
+		bwr := seedBlock(int32(1000 + i))
+		select {
+		case sm.connectionChan <- bwr:
+		default:
+			// Expected once we hit cap — that's fine.
+		}
+	}
+
+	// Push enough blocks onto validationChan to overflow connectionChan
+	// capacity after validation.  If the fix works, the surplus blocks
+	// are re-queued (state=Pending, removed from inflight) rather than
+	// parking goroutines.  We need to retain references so we can assert
+	// on their final state.
+	pushed := make([]*blockWithRequest, 0, window*3)
+	for h := int32(1); h <= window*3; h++ {
+		bwr := seedBlock(h)
+		// Track the already-registered inflight req so we can observe
+		// the state mutation driven by requeueForRedownload.
+		sm.mu.Lock()
+		if existing, ok := sm.inflight[bwr.req.Hash]; ok {
+			bwr.req = existing
+		}
+		sm.mu.Unlock()
+		pushed = append(pushed, bwr)
+		select {
+		case sm.validationChan <- bwr:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("validationChan send blocked at h=%d — workers likely deadlocked", h)
+		}
+	}
+
+	// Give the validation workers time to drain validationChan and
+	// requeue the surplus.  200ms is generous for CheckBlockSanity on
+	// tiny regtest blocks + channel ops.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(sm.validationChan) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := len(sm.validationChan); got != 0 {
+		t.Fatalf("validationChan still has %d entries after 2s — workers are deadlocked", got)
+	}
+
+	// Additional invariant: inflight must shrink because
+	// requeueForRedownload() deletes from the inflight map on the
+	// re-queue path.  We pre-seeded `window*3` inflight entries and
+	// pushed the same number through validationChan; in a healthy run
+	// some non-zero fraction will have taken the requeue path (the
+	// rest landed in connectionChan before it saturated).  We only
+	// assert that the pipeline drained — we do NOT read bwr.req.State
+	// from the test goroutine because the validationWorker mutates
+	// that field without holding sm.mu (pre-existing invariant: state
+	// is owned by the stage currently processing the block, handed
+	// off via channels).
+	_ = pushed
+	t.Logf("backpressure test: validationChan drained, no deadlock (len=%d, cap=%d)",
+		len(sm.validationChan), cap(sm.validationChan))
+}
