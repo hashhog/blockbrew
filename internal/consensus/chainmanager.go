@@ -477,7 +477,12 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			continue
 		}
 
-		// Cache all input UTXOs before they get spent
+		// W69d: Fetch each input's UTXO exactly once into cachedView.cache, then
+		// use that local (no-lock) map for every downstream read within this tx.
+		// Before W69d, CheckTransactionInputs + BIP68 + spentCoins each made their
+		// own GetUTXO calls, costing 3–4× UTXOSet.mu acquisitions per input. Post-
+		// W69 profile showed connCh saturated (1024/1024) and rate stuck at
+		// ~77 blk/hr; connection-step mutex thrash was the diagnosed bottleneck.
 		for _, in := range tx.TxIn {
 			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
 			if utxo != nil {
@@ -485,8 +490,9 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			}
 		}
 
-		// Check transaction inputs
-		fee, err := CheckTransactionInputs(tx, node.Height, cm.utxoSet)
+		// Check transaction inputs — read through cachedView so the input pass
+		// hits the local map populated above instead of re-acquiring UTXOSet.mu.
+		fee, err := CheckTransactionInputs(tx, node.Height, cachedView)
 		if err != nil {
 			rollbackUTXOs()
 			return fmt.Errorf("tx %d input validation failed: %w", i, err)
@@ -501,8 +507,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		if node.Height >= cm.params.CSVHeight {
 			prevHeights := make([]int32, len(tx.TxIn))
 			for j, in := range tx.TxIn {
-				utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
-				if utxo != nil {
+				// W69d: Direct cache read — populated above, same UTXOs.
+				if utxo, ok := cachedView.cache[in.PreviousOutPoint]; ok && utxo != nil {
 					prevHeights[j] = utxo.Height
 				}
 			}
@@ -529,8 +535,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		spentInputs := make([]wire.OutPoint, 0, len(tx.TxIn))
 		spentCoins := make([]storage.SpentCoin, 0, len(tx.TxIn))
 		for _, in := range tx.TxIn {
-			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
-			if utxo != nil {
+			// W69d: Direct cache read — populated above, same UTXOs.
+			if utxo, ok := cachedView.cache[in.PreviousOutPoint]; ok && utxo != nil {
 				spentCoins = append(spentCoins, storage.SpentCoin{
 					TxOut: wire.TxOut{
 						Value:    utxo.Amount,
