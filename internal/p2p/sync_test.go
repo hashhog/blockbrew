@@ -1276,3 +1276,33 @@ func TestSyncManagerClampsOversizedDownloadWindow(t *testing.T) {
 			sm.downloadWindow, MaxPendingBlocks)
 	}
 }
+
+// TestRequestJitterSpread guards the W69b request-jitter contract: 100
+// consecutive requestJitter() draws must span at least 100 ms of
+// wall-clock. Without the jitter, 144 getdata stamps fall in the same
+// millisecond and their timeouts fire as a thundering herd 120 s later.
+func TestRequestJitterSpread(t *testing.T) {
+	const draws = 100
+	const minSpreadMs = 100
+
+	var minV, maxV time.Duration = time.Hour, -time.Hour
+	for i := 0; i < draws; i++ {
+		d := requestJitter()
+		if d < 0 || d >= 500*time.Millisecond {
+			t.Fatalf("draw %d = %v out of [0, 500ms)", i, d)
+		}
+		if d < minV {
+			minV = d
+		}
+		if d > maxV {
+			maxV = d
+		}
+	}
+	spread := maxV - minV
+	if spread < minSpreadMs*time.Millisecond {
+		t.Fatalf("jitter spread over %d draws = %v, want >= %dms; "+
+			"without enough spread, 144 getdata timeouts fire as a "+
+			"thundering herd instead of a trickle",
+			draws, spread, minSpreadMs)
+	}
+}
