@@ -1591,6 +1591,40 @@ func (sm *SyncManager) requeueForRedownload(bwr *blockWithRequest) {
 // enforced at startup (W67d).
 const MaxPendingBlocks = 2048
 
+// evictDistantPending re-queues blocks whose heights are beyond maxKeep
+// for re-download. W69c: takes sm.mu once for a single pass over
+// blockQueue instead of per evicted height (the old path held the lock
+// O(N) times inside an inner O(M) scan, blocking requestBlocks for the
+// duration of an eviction burst). `pending` is the connectionWorker's
+// goroutine-local map, so deletes here need no lock.
+func (sm *SyncManager) evictDistantPending(pending map[int32]*blockWithRequest, maxKeep int32) int {
+	var evict []int32
+	for h := range pending {
+		if h > maxKeep {
+			evict = append(evict, h)
+		}
+	}
+	if len(evict) == 0 {
+		return 0
+	}
+	evictSet := make(map[int32]struct{}, len(evict))
+	for _, h := range evict {
+		evictSet[h] = struct{}{}
+	}
+	sm.mu.Lock()
+	for _, req := range sm.blockQueue {
+		if _, ok := evictSet[req.Height]; ok {
+			req.State = BlockDownloadPending
+			req.Peer = nil
+		}
+	}
+	sm.mu.Unlock()
+	for _, h := range evict {
+		delete(pending, h)
+	}
+	return len(evict)
+}
+
 // connectionWorker connects validated blocks to the chain in order.
 func (sm *SyncManager) connectionWorker() {
 	defer sm.wg.Done()
@@ -1625,20 +1659,7 @@ func (sm *SyncManager) connectionWorker() {
 				lastPendingWarn = time.Now()
 			}
 			maxKeep := nh + int32(MaxPendingBlocks)
-			for h := range pending {
-				if h > maxKeep {
-					sm.mu.Lock()
-					for _, req := range sm.blockQueue {
-						if req.Height == h {
-							req.State = BlockDownloadPending
-							req.Peer = nil
-							break
-						}
-					}
-					sm.mu.Unlock()
-					delete(pending, h)
-				}
-			}
+			sm.evictDistantPending(pending, maxKeep)
 		}
 
 		// Try to connect blocks in order, with panic recovery
