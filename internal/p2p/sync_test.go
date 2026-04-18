@@ -1232,3 +1232,47 @@ func TestValidationWorkerNoDeadlockUnderBackpressure(t *testing.T) {
 	t.Logf("backpressure test: validationChan drained, no deadlock (len=%d, cap=%d)",
 		len(sm.validationChan), cap(sm.validationChan))
 }
+
+// TestMaxPendingBlocksInvariant guards a silent-data-loss class of bug
+// (W67d). The connection worker's pending map evicts entries when its
+// size exceeds MaxPendingBlocks. If MaxPendingBlocks is ever smaller
+// than the download window actually in use, the worker will throw away
+// blocks that are still in flight — producing the same cursor-skip
+// stall we debugged in lunarblock's sync loop.
+//
+// Two layers of defense:
+//  1. MaxPendingBlocks must not drop below DefaultDownloadWindow
+//     (compile-time invariant).
+//  2. A custom DownloadWindow configured larger than MaxPendingBlocks
+//     must be clamped by NewSyncManager, not silently accepted.
+func TestMaxPendingBlocksInvariant(t *testing.T) {
+	if MaxPendingBlocks < DefaultDownloadWindow {
+		t.Fatalf("MaxPendingBlocks (%d) must be >= DefaultDownloadWindow (%d): "+
+			"any default-config blockbrew would lose in-flight blocks to "+
+			"pending-map eviction, stalling IBD",
+			MaxPendingBlocks, DefaultDownloadWindow)
+	}
+}
+
+func TestSyncManagerClampsOversizedDownloadWindow(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	// Ask for a window 2× the pending cap; NewSyncManager must clamp.
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		DownloadWindow: MaxPendingBlocks * 2,
+	})
+
+	if sm.downloadWindow > MaxPendingBlocks {
+		t.Fatalf("downloadWindow = %d, want <= MaxPendingBlocks (%d): "+
+			"without clamping, the connection worker's pending map would "+
+			"evict in-flight blocks",
+			sm.downloadWindow, MaxPendingBlocks)
+	}
+	if sm.downloadWindow != MaxPendingBlocks {
+		t.Errorf("downloadWindow = %d, want exactly MaxPendingBlocks (%d)",
+			sm.downloadWindow, MaxPendingBlocks)
+	}
+}
