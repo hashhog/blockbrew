@@ -1145,3 +1145,135 @@ func TestStartupRecoveryDeferredUntilHeadersPast(t *testing.T) {
 		t.Error("deferred: pendingRecovery must remain true so later header batches retry")
 	}
 }
+
+// TestConnectBlockOneGetUTXOPerInputW69d proves the W69d optimization:
+// ConnectBlock must call the underlying UTXOSet's GetUTXO *exactly once*
+// per non-coinbase input, by populating cachedView.cache up front and
+// reading through it for CheckTransactionInputs, BIP68, and spentCoins.
+//
+// Before W69d those three passes each made their own GetUTXO calls, so a
+// block with N non-coinbase inputs produced 3N–4N mutex acquisitions on
+// UTXOSet.mu. The post-W69 profile showed connCh saturated at 1024/1024
+// and the connector stuck at ~77 blk/hr; per-input mutex thrash inside
+// ConnectBlock was the diagnosed bottleneck. This test guards against a
+// future change silently re-introducing redundant fetches.
+func TestConnectBlockOneGetUTXOPerInputW69d(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	utxoSet := NewUTXOSet(db)
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:       params,
+		HeaderIndex:  idx,
+		ChainDB:      db,
+		UTXOSet:      utxoSet,
+		SigCacheSize: -1, // disable cache so it doesn't affect counts
+	})
+
+	// Pre-seed three mature non-coinbase UTXOs with OP_TRUE scriptPubKeys.
+	// Using a synthetic prevTxid so we don't need to mine 100 blocks to
+	// satisfy CoinbaseMaturity.
+	prevTxid := wire.Hash256{0xfe, 0xed, 0xfa, 0xce}
+	preOutpoints := []wire.OutPoint{
+		{Hash: prevTxid, Index: 0},
+		{Hash: prevTxid, Index: 1},
+		{Hash: prevTxid, Index: 2},
+	}
+	for _, op := range preOutpoints {
+		utxoSet.AddUTXO(op, &UTXOEntry{
+			Amount:     1_000_000_000,
+			PkScript:   []byte{0x51}, // OP_TRUE
+			Height:     0,
+			IsCoinbase: false,
+		})
+	}
+
+	// Build a spending tx with three inputs (Sequence=MaxSequence disables
+	// BIP68 locks but the BIP68 loop still runs — which is exactly what we
+	// want to cover, since pre-W69d that loop called GetUTXO per input).
+	spendTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: preOutpoints[0], Sequence: 0xFFFFFFFF},
+			{PreviousOutPoint: preOutpoints[1], Sequence: 0xFFFFFFFF},
+			{PreviousOutPoint: preOutpoints[2], Sequence: 0xFFFFFFFF},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 2_500_000_000, PkScript: []byte{0x51}},
+		},
+		LockTime: 0,
+	}
+
+	block := createTestBlock(t, params, idx.Genesis(), []*wire.MsgTx{spendTx})
+	blockHash := block.Header.BlockHash()
+
+	if _, err := idx.AddHeader(block.Header); err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+	if err := db.StoreBlock(blockHash, block); err != nil {
+		t.Fatalf("StoreBlock: %v", err)
+	}
+
+	before := utxoSet.Stats()
+	if err := cm.ConnectBlock(block); err != nil {
+		t.Fatalf("ConnectBlock: %v", err)
+	}
+	after := utxoSet.Stats()
+
+	// Expected: exactly one Hits-or-Misses bump per non-coinbase input.
+	// Pre-W69d this would have been 3× (CheckTransactionInputs + BIP68 +
+	// spentCoins), or 4× with the original cache-populate loop.
+	nonCoinbaseInputs := uint64(len(spendTx.TxIn))
+	delta := (after.Hits - before.Hits) + (after.Misses - before.Misses)
+	if delta != nonCoinbaseInputs {
+		t.Errorf("UTXOSet.GetUTXO called %d times; want %d (one per non-coinbase input). "+
+			"A count of 2×, 3×, or 4× indicates a redundant fetch regression.",
+			delta, nonCoinbaseInputs)
+	}
+
+	// Sanity: the block actually connected.
+	if _, h := cm.BestBlock(); h != 1 {
+		t.Fatalf("tip height = %d, want 1", h)
+	}
+}
+
+// TestCachedUTXOViewHitBypassesFallbackW69d documents the cachedUTXOView
+// contract that W69d leans on: a cache hit must not call the fallback
+// UTXOView. If a future refactor breaks this invariant, the ConnectBlock
+// hot path regresses back to the 3N–4N mutex-acquisition shape.
+func TestCachedUTXOViewHitBypassesFallbackW69d(t *testing.T) {
+	op := wire.OutPoint{Hash: wire.Hash256{0x01, 0x02, 0x03}, Index: 0}
+	entry := &UTXOEntry{Amount: 100, PkScript: []byte{0x51}, Height: 10}
+
+	fallback := &countingUTXOView{}
+	cached := &cachedUTXOView{
+		cache:    map[wire.OutPoint]*UTXOEntry{op: entry},
+		fallback: fallback,
+	}
+
+	got := cached.GetUTXO(op)
+	if got != entry {
+		t.Errorf("cached.GetUTXO returned wrong entry")
+	}
+	if fallback.calls != 0 {
+		t.Errorf("fallback called %d times on a cache hit; want 0", fallback.calls)
+	}
+
+	// Cache miss must fall through.
+	missOP := wire.OutPoint{Hash: wire.Hash256{0x99}, Index: 0}
+	cached.GetUTXO(missOP)
+	if fallback.calls != 1 {
+		t.Errorf("fallback called %d times on a cache miss; want 1", fallback.calls)
+	}
+}
+
+// countingUTXOView is a test-only UTXOView that counts GetUTXO calls.
+type countingUTXOView struct {
+	calls int
+}
+
+func (c *countingUTXOView) GetUTXO(wire.OutPoint) *UTXOEntry {
+	c.calls++
+	return nil
+}
