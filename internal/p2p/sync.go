@@ -234,6 +234,15 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 	if downloadWindow <= 0 {
 		downloadWindow = DefaultDownloadWindow
 	}
+	// W67d: clamp the download window to MaxPendingBlocks so the
+	// connection worker's pending-map eviction never throws away blocks
+	// that are still in flight. Violating this invariant produces a
+	// cursor-skip stall (same shape as lunarblock's W65 bug).
+	if downloadWindow > MaxPendingBlocks {
+		log.Printf("sync: clamping configured DownloadWindow %d to MaxPendingBlocks %d "+
+			"to preserve pending-map invariant", downloadWindow, MaxPendingBlocks)
+		downloadWindow = MaxPendingBlocks
+	}
 
 	now := time.Now()
 	sm := &SyncManager{
