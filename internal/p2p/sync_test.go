@@ -1277,6 +1277,84 @@ func TestSyncManagerClampsOversizedDownloadWindow(t *testing.T) {
 	}
 }
 
+// TestEvictDistantPendingBatchesLock guards the W69c eviction-path
+// contract: one lock acquisition batches all state transitions, and
+// every evicted height is both re-queued as Pending and removed from
+// the caller's local pending map.
+func TestEvictDistantPendingBatchesLock(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	peer := createMockPeer("peer1:8333", 0)
+	sm.blockQueue = []*blockRequest{
+		{Height: 100, State: BlockDownloadInFlight, Peer: peer},
+		{Height: 200, State: BlockDownloadInFlight, Peer: peer},
+		{Height: 300, State: BlockDownloadInFlight, Peer: peer},
+	}
+	pending := map[int32]*blockWithRequest{
+		100: {},
+		200: {},
+		300: {},
+	}
+
+	removed := sm.evictDistantPending(pending, 150)
+
+	if removed != 2 {
+		t.Fatalf("removed = %d, want 2", removed)
+	}
+	if _, ok := pending[100]; !ok {
+		t.Error("height 100 should remain in pending (100 <= maxKeep=150)")
+	}
+	if _, ok := pending[200]; ok {
+		t.Error("height 200 should be evicted from pending")
+	}
+	if _, ok := pending[300]; ok {
+		t.Error("height 300 should be evicted from pending")
+	}
+	if sm.blockQueue[0].State != BlockDownloadInFlight {
+		t.Errorf("height 100 state = %v, want InFlight", sm.blockQueue[0].State)
+	}
+	if sm.blockQueue[1].State != BlockDownloadPending || sm.blockQueue[1].Peer != nil {
+		t.Errorf("height 200 state/peer = %v/%v, want Pending/nil",
+			sm.blockQueue[1].State, sm.blockQueue[1].Peer)
+	}
+	if sm.blockQueue[2].State != BlockDownloadPending || sm.blockQueue[2].Peer != nil {
+		t.Errorf("height 300 state/peer = %v/%v, want Pending/nil",
+			sm.blockQueue[2].State, sm.blockQueue[2].Peer)
+	}
+}
+
+// TestEvictDistantPendingNoop: when every pending height is within the
+// keep window, evictDistantPending must not take the lock at all and
+// must leave blockQueue untouched.
+func TestEvictDistantPendingNoop(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	peer := createMockPeer("peer1:8333", 0)
+	sm.blockQueue = []*blockRequest{
+		{Height: 100, State: BlockDownloadInFlight, Peer: peer},
+	}
+	pending := map[int32]*blockWithRequest{100: {}}
+
+	removed := sm.evictDistantPending(pending, 1000)
+
+	if removed != 0 {
+		t.Fatalf("removed = %d, want 0", removed)
+	}
+	if sm.blockQueue[0].State != BlockDownloadInFlight {
+		t.Errorf("state changed to %v, want InFlight (noop path)", sm.blockQueue[0].State)
+	}
+}
+
 // TestRequestJitterSpread guards the W69b request-jitter contract: 100
 // consecutive requestJitter() draws must span at least 100 ms of
 // wall-clock. Without the jitter, 144 getdata stamps fall in the same
