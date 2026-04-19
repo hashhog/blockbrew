@@ -1139,6 +1139,18 @@ func (p *Peer) CompactBlockState() *CompactBlockState {
 	return p.compactBlockState
 }
 
+// RelayTxes returns the peer's fRelay flag from their version message
+// (BIP37). This matches Bitcoin Core's getpeerinfo.relaytxes semantics:
+// whether the peer has asked us to relay transactions to it.
+func (p *Peer) RelayTxes() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.peerVersion == nil {
+		return false
+	}
+	return p.peerVersion.Relay
+}
+
 // WantsTxRelay returns true if the peer wants to receive transaction announcements.
 // This is based on the fRelay flag in the version message and whether we're configured
 // to disable tx relay to this peer (block-relay-only connections).

@@ -1106,7 +1106,7 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 			Network:        "ipv4",
 			Services:       fmt.Sprintf("%016x", services),
 			ServicesNames:  decodeServiceNames(services),
-			RelayTxes:      true,
+			RelayTxes:      p.RelayTxes(),
 			LastSend:       p.LastSend().Unix(),
 			LastRecv:       p.LastRecv().Unix(),
 			BytesSent:      p.BytesSent(),
