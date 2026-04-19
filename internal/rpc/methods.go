@@ -1112,6 +1112,7 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 			BytesSent:      p.BytesSent(),
 			BytesRecv:      p.BytesRecvd(),
 			ConnTime:       time.Now().Add(-p.ConnTime()).Unix(),
+			TimeOffset:     p.TimeOffset(),
 			PingTime:       p.PingLatency().Seconds(),
 			Version:        p.ProtocolVersion(),
 			SubVer:         p.UserAgent(),
