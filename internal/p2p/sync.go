@@ -81,6 +81,13 @@ const (
 	// connection-channel send path keeps making forward progress under
 	// transient connectionChan pressure.
 	MinValidationWorkers = 2
+
+	// ConnStatsLogEvery is how many successfully-connected blocks the
+	// connectionWorker accumulates before emitting a [W75-CONN] line.
+	// Matches the W72-DESER / W75-CONN cadence used in lunarblock so the
+	// two logs line up visually at 500-block boundaries during a side-by-
+	// side comparison between implementations.
+	ConnStatsLogEvery = 500
 )
 
 // numValidationWorkers returns how many validationWorker goroutines to
@@ -186,6 +193,22 @@ type SyncManager struct {
 	// under sustained back-pressure.  Accessed via atomic to avoid
 	// contention between parallel validationWorkers.  W64 thread A.
 	lastRequeueLog atomic.Int64
+
+	// W75 instrumentation — per-block ConnectBlock latency window,
+	// accumulated inside connectionWorker's goroutine.  All reads and
+	// writes happen from that single goroutine (retry-ticker and
+	// channel-receive branches both run inside the same for-select),
+	// so no atomics or lock are needed.  Emitted as a [W75-CONN] log
+	// line every connStatsLogEvery blocks.  connCh saturates at
+	// 1024/1024 with observed IBD rate ≈ 290 blk/hr → per-block ceiling
+	// around 12 s.  This probe attributes that to ConnectBlock wall
+	// time so we can decide whether the lever is UTXO cache, RocksDB
+	// batch flush, script validation, or lock contention.
+	connStatsN        int64         // blocks in current window
+	connStatsTotalNs  int64         // summed ConnectBlock latency (ns)
+	connStatsMaxNs    int64         // max ConnectBlock latency in window (ns)
+	connStatsTotalTxs int64         // summed tx count across window
+	connStatsLifetime int64         // cumulative count since process start
 }
 
 // ChainConnector is the interface for connecting blocks to the chain.
@@ -1726,6 +1749,10 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 		if sm.chainMgr != nil {
 			// Recover from panics in ConnectBlock
 			var connectErr error
+			// W75 instrumentation: wall-clock timing around the
+			// ConnectBlock call.  Only success-path timings feed the
+			// rolling window below (see post-call accumulator).
+			_connStart := time.Now()
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
@@ -1734,6 +1761,7 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				}()
 				connectErr = sm.chainMgr.ConnectBlock(bwr.block)
 			}()
+			_connDurNs := time.Since(_connStart).Nanoseconds()
 
 			if connectErr != nil {
 				log.Printf("sync: failed to connect block %d (%s): %v",
@@ -1880,6 +1908,30 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				// nextHeight, so subsequent blocks will also fail because their
 				// PrevBlock won't match the tip.
 				break
+			}
+
+			// W75 instrumentation: success-path ConnectBlock latency.
+			// Only connectionWorker's goroutine mutates these fields
+			// (connectPendingBlocks is invoked only from there), so
+			// plain reads/writes are race-free.
+			sm.connStatsN++
+			sm.connStatsTotalNs += _connDurNs
+			sm.connStatsTotalTxs += int64(len(bwr.block.Transactions))
+			if _connDurNs > sm.connStatsMaxNs {
+				sm.connStatsMaxNs = _connDurNs
+			}
+			sm.connStatsLifetime++
+			if sm.connStatsN >= ConnStatsLogEvery {
+				avgMs := float64(sm.connStatsTotalNs/sm.connStatsN) / 1e6
+				maxMs := float64(sm.connStatsMaxNs) / 1e6
+				txsAvg := float64(sm.connStatsTotalTxs) / float64(sm.connStatsN)
+				log.Printf(
+					"[W75-CONN] window=%d total=%d connect_avg=%.1fms connect_max=%.0fms txs_avg=%.0f",
+					sm.connStatsN, sm.connStatsLifetime, avgMs, maxMs, txsAvg)
+				sm.connStatsN = 0
+				sm.connStatsTotalNs = 0
+				sm.connStatsMaxNs = 0
+				sm.connStatsTotalTxs = 0
 			}
 		}
 
