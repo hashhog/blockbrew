@@ -5,10 +5,15 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
+
+// W76: log a ConnectBlock sub-phase breakdown every N successful connects.
+// Complements the [W75-CONN] outer-latency line emitted from sync.go.
+const PhaseStatsLogEvery = 500
 
 
 // cachedUTXOView wraps a UTXOView with a cache of entries that may have been
@@ -69,6 +74,21 @@ type ChainManager struct {
 	// P2P header-handler can read it without contending with cm.mu.
 	// (See W17 chainmgr-startup recovery fix.)
 	pendingRecovery atomic.Bool
+
+	// W76: ConnectBlock sub-phase timing accumulators.
+	// Writer is ConnectBlock only, which runs under cm.mu — no extra
+	// synchronization needed. Reset every PhaseStatsLogEvery successful
+	// connects so operators see rolling per-window averages.
+	phaseStatsN            int64 // successful connects in current window
+	phaseStatsPreNs        int64 // summed prelude latency (header/MTP/context)
+	phaseStatsFirstPassNs  int64 // summed first-pass latency (UTXO reads + in-memory apply)
+	phaseStatsScriptNs     int64 // summed script-validation latency (zero during assume-valid IBD)
+	phaseStatsPersistNs    int64 // summed persistence latency (RocksDB batch write)
+	phaseStatsMaxPreNs     int64
+	phaseStatsMaxFirstNs   int64
+	phaseStatsMaxScriptNs  int64
+	phaseStatsMaxPersistNs int64
+	phaseStatsLifetime     int64 // cumulative successful connects since process start
 }
 
 // ChainManagerConfig configures the chain manager.
@@ -320,6 +340,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
+	// W76: phase-timing stamps. Only the successful-return path at the
+	// bottom of this function accumulates into the stats window, so early
+	// returns (tip-mismatch, context check, validation failure, genesis
+	// special-case) are naturally excluded.
+	_phaseStart := time.Now()
+	var _phaseFirstStart, _phaseScriptStart, _phasePersistStart time.Time
+
 	// Verify this block connects to our current tip
 	if block.Header.PrevBlock != cm.tipNode.Hash {
 		// During IBD, never attempt reorgs — blocks must arrive in order.
@@ -455,6 +482,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		}
 	}
 
+	_phaseFirstStart = time.Now() // W76: prelude → first-pass boundary
+
 	// First pass: validate transaction structure and inputs (not scripts)
 	for i, tx := range block.Transactions {
 		// Check transaction sanity
@@ -574,6 +603,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		})
 	}
 
+	_phaseScriptStart = time.Now() // W76: first-pass → script-validation boundary
+
 	// Second pass: validate scripts (can be skipped for assume-valid or parallelized)
 	if !skipScripts {
 		// Use the cached UTXO view so script validation can find spent UTXOs
@@ -622,6 +653,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Periodic UTXO flush during IBD
 	cm.blocksSinceFlush++
 	shouldFlush := cm.blocksSinceFlush >= cm.flushInterval
+
+	_phasePersistStart = time.Now() // W76: script-validation → persistence boundary
 
 	// Persist block data atomically: undo data, block height, UTXO set, and
 	// chain state are written in a single batch so a crash can never leave the
@@ -688,6 +721,58 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 
 	if shouldFlush {
 		cm.blocksSinceFlush = 0
+	}
+
+	// W76: phase accumulator. Only reached on the successful-return path,
+	// so rollback + early-error paths never poison the window.
+	_phaseEnd := time.Now()
+	preNs := _phaseFirstStart.Sub(_phaseStart).Nanoseconds()
+	firstNs := _phaseScriptStart.Sub(_phaseFirstStart).Nanoseconds()
+	scriptNs := _phasePersistStart.Sub(_phaseScriptStart).Nanoseconds()
+	persistNs := _phaseEnd.Sub(_phasePersistStart).Nanoseconds()
+
+	cm.phaseStatsN++
+	cm.phaseStatsPreNs += preNs
+	cm.phaseStatsFirstPassNs += firstNs
+	cm.phaseStatsScriptNs += scriptNs
+	cm.phaseStatsPersistNs += persistNs
+	if preNs > cm.phaseStatsMaxPreNs {
+		cm.phaseStatsMaxPreNs = preNs
+	}
+	if firstNs > cm.phaseStatsMaxFirstNs {
+		cm.phaseStatsMaxFirstNs = firstNs
+	}
+	if scriptNs > cm.phaseStatsMaxScriptNs {
+		cm.phaseStatsMaxScriptNs = scriptNs
+	}
+	if persistNs > cm.phaseStatsMaxPersistNs {
+		cm.phaseStatsMaxPersistNs = persistNs
+	}
+	cm.phaseStatsLifetime++
+	if cm.phaseStatsN >= PhaseStatsLogEvery {
+		n := cm.phaseStatsN
+		log.Printf(
+			"[W76-PHASE] window=%d total=%d pre_avg=%.1fms first_avg=%.1fms script_avg=%.1fms persist_avg=%.1fms pre_max=%.0fms first_max=%.0fms script_max=%.0fms persist_max=%.0fms",
+			n,
+			cm.phaseStatsLifetime,
+			float64(cm.phaseStatsPreNs/n)/1e6,
+			float64(cm.phaseStatsFirstPassNs/n)/1e6,
+			float64(cm.phaseStatsScriptNs/n)/1e6,
+			float64(cm.phaseStatsPersistNs/n)/1e6,
+			float64(cm.phaseStatsMaxPreNs)/1e6,
+			float64(cm.phaseStatsMaxFirstNs)/1e6,
+			float64(cm.phaseStatsMaxScriptNs)/1e6,
+			float64(cm.phaseStatsMaxPersistNs)/1e6,
+		)
+		cm.phaseStatsN = 0
+		cm.phaseStatsPreNs = 0
+		cm.phaseStatsFirstPassNs = 0
+		cm.phaseStatsScriptNs = 0
+		cm.phaseStatsPersistNs = 0
+		cm.phaseStatsMaxPreNs = 0
+		cm.phaseStatsMaxFirstNs = 0
+		cm.phaseStatsMaxScriptNs = 0
+		cm.phaseStatsMaxPersistNs = 0
 	}
 
 	return nil
