@@ -89,6 +89,17 @@ type ChainManager struct {
 	phaseStatsMaxScriptNs  int64
 	phaseStatsMaxPersistNs int64
 	phaseStatsLifetime     int64 // cumulative successful connects since process start
+
+	// W74: split of the [W76-PHASE] first phase into UTXO-read vs the rest
+	// (CheckTransactionInputs, BIP68, in-memory spend/add, undo tracking).
+	// Emitted as a parallel [W74-FIRST] line so operators can tell whether
+	// blockbrew's ConnectBlock is UTXO-read bound (the symptom clearbit's
+	// W73 Fix 1 targeted via multi-get prefetch) or compute-bound. Same
+	// writer-only-under-cm.mu discipline as the W76 fields above.
+	phaseStatsFirstUtxoNs    int64
+	phaseStatsFirstValNs     int64
+	phaseStatsMaxFirstUtxoNs int64
+	phaseStatsMaxFirstValNs  int64
 }
 
 // ChainManagerConfig configures the chain manager.
@@ -347,6 +358,11 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	_phaseStart := time.Now()
 	var _phaseFirstStart, _phaseScriptStart, _phasePersistStart time.Time
 
+	// W74: accumulate just the UTXO-read time inside the first-pass loop
+	// so we can report how much of `first` is RocksDB reads vs in-memory
+	// validate/spend/add work.
+	var _firstUtxoNs int64
+
 	// Verify this block connects to our current tip
 	if block.Header.PrevBlock != cm.tipNode.Hash {
 		// During IBD, never attempt reorgs — blocks must arrive in order.
@@ -512,12 +528,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// own GetUTXO calls, costing 3–4× UTXOSet.mu acquisitions per input. Post-
 		// W69 profile showed connCh saturated (1024/1024) and rate stuck at
 		// ~77 blk/hr; connection-step mutex thrash was the diagnosed bottleneck.
+		//
+		// W74: time just this inner loop so the rollup can show UTXO-read cost
+		// separately from the rest of the first-pass work.
+		_utxoStart := time.Now()
 		for _, in := range tx.TxIn {
 			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
 			if utxo != nil {
 				cachedView.cache[in.PreviousOutPoint] = utxo
 			}
 		}
+		_firstUtxoNs += time.Since(_utxoStart).Nanoseconds()
 
 		// Check transaction inputs — read through cachedView so the input pass
 		// hits the local map populated above instead of re-acquiring UTXOSet.mu.
@@ -748,6 +769,22 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	if persistNs > cm.phaseStatsMaxPersistNs {
 		cm.phaseStatsMaxPersistNs = persistNs
 	}
+
+	// W74: split first into utxo-read vs the rest. Clamp the val delta at
+	// zero to guard against clock skew making firstNs < _firstUtxoNs.
+	firstValNs := firstNs - _firstUtxoNs
+	if firstValNs < 0 {
+		firstValNs = 0
+	}
+	cm.phaseStatsFirstUtxoNs += _firstUtxoNs
+	cm.phaseStatsFirstValNs += firstValNs
+	if _firstUtxoNs > cm.phaseStatsMaxFirstUtxoNs {
+		cm.phaseStatsMaxFirstUtxoNs = _firstUtxoNs
+	}
+	if firstValNs > cm.phaseStatsMaxFirstValNs {
+		cm.phaseStatsMaxFirstValNs = firstValNs
+	}
+
 	cm.phaseStatsLifetime++
 	if cm.phaseStatsN >= PhaseStatsLogEvery {
 		n := cm.phaseStatsN
@@ -764,6 +801,14 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			float64(cm.phaseStatsMaxScriptNs)/1e6,
 			float64(cm.phaseStatsMaxPersistNs)/1e6,
 		)
+		log.Printf(
+			"[W74-FIRST] window=%d utxo_avg=%.1fms val_avg=%.1fms utxo_max=%.0fms val_max=%.0fms",
+			n,
+			float64(cm.phaseStatsFirstUtxoNs/n)/1e6,
+			float64(cm.phaseStatsFirstValNs/n)/1e6,
+			float64(cm.phaseStatsMaxFirstUtxoNs)/1e6,
+			float64(cm.phaseStatsMaxFirstValNs)/1e6,
+		)
 		cm.phaseStatsN = 0
 		cm.phaseStatsPreNs = 0
 		cm.phaseStatsFirstPassNs = 0
@@ -773,6 +818,10 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		cm.phaseStatsMaxFirstNs = 0
 		cm.phaseStatsMaxScriptNs = 0
 		cm.phaseStatsMaxPersistNs = 0
+		cm.phaseStatsFirstUtxoNs = 0
+		cm.phaseStatsFirstValNs = 0
+		cm.phaseStatsMaxFirstUtxoNs = 0
+		cm.phaseStatsMaxFirstValNs = 0
 	}
 
 	return nil
