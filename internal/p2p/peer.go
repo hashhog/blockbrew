@@ -167,6 +167,7 @@ type Peer struct {
 	startTime     time.Time
 	bytesSent     uint64
 	bytesRecvd    uint64
+	versionReceivedAt time.Time // When we received the peer's VERSION message (for timeoffset)
 
 	// Our local nonce for self-connection detection
 	localNonce uint64
@@ -634,6 +635,7 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 	// Store the peer's version info
 	p.peerVersion = msg
 	p.versionRecvd = true
+	p.versionReceivedAt = time.Now()
 	inbound := p.inbound
 	versionSent := p.versionSent
 	listeners := p.config.Listeners
@@ -1149,6 +1151,18 @@ func (p *Peer) RelayTxes() bool {
 		return false
 	}
 	return p.peerVersion.Relay
+}
+
+// TimeOffset returns the clock-skew at connection time in seconds:
+// peer_version_timestamp - our_local_time_at_version_receipt.
+// Matches Bitcoin Core CNode::nTimeOffset semantics.
+func (p *Peer) TimeOffset() int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.peerVersion == nil || p.versionReceivedAt.IsZero() {
+		return 0
+	}
+	return p.peerVersion.Timestamp - p.versionReceivedAt.Unix()
 }
 
 // WantsTxRelay returns true if the peer wants to receive transaction announcements.
