@@ -13,7 +13,9 @@ import (
 
 // W76: log a ConnectBlock sub-phase breakdown every N successful connects.
 // Complements the [W75-CONN] outer-latency line emitted from sync.go.
-const PhaseStatsLogEvery = 500
+// Temporarily lowered 500 → 100 while diagnosing the post-4da26c8 connector
+// bottleneck: at ~60 blk/hr the old 500-window took ~8 hr to emit one rollup.
+const PhaseStatsLogEvery = 100
 
 
 // cachedUTXOView wraps a UTXOView with a cache of entries that may have been
