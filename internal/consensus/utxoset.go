@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"errors"
 	"sync"
-	"sync/atomic"
 
 	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -50,17 +49,13 @@ type UTXOSet struct {
 	fresh map[wire.OutPoint]bool
 
 	// Performance tracking
-	cacheBytes    int64 // Approximate memory usage of cache
+	cacheBytes   int64  // Approximate memory usage of cache
 	maxCacheBytes int64 // Maximum cache size in bytes
-	// W79: hits is incremented from GetUTXO's RLock-only fast path, so it
-	// must be atomic to remain race-free when ConnectBlock's prefetch calls
-	// GetUTXO from multiple goroutines. The other counters below are only
-	// written under u.mu.Lock and stay plain uint64.
-	hits             atomic.Uint64 // Cache hits
-	misses           uint64        // Cache misses
-	flushes          uint64        // Number of flush operations
-	freshHits        uint64        // Spends of FRESH entries (saved a write+delete)
-	blocksSinceFlush int           // Blocks connected since last flush
+	hits         uint64 // Cache hits
+	misses       uint64 // Cache misses
+	flushes      uint64 // Number of flush operations
+	freshHits    uint64 // Spends of FRESH entries (saved a write+delete)
+	blocksSinceFlush int // Blocks connected since last flush
 }
 
 // NewUTXOSet creates a new UTXO set backed by the given database.
@@ -96,7 +91,7 @@ func (u *UTXOSet) GetUTXO(outpoint wire.OutPoint) *UTXOEntry {
 
 	// Check cache first
 	if entry, ok := u.cache[outpoint]; ok {
-		u.hits.Add(1)
+		u.hits++
 		u.mu.RUnlock()
 		return entry
 	}
@@ -383,7 +378,7 @@ func (u *UTXOSet) Stats() UTXOCacheStats {
 	defer u.mu.RUnlock()
 
 	return UTXOCacheStats{
-		Hits:       u.hits.Load(),
+		Hits:       u.hits,
 		Misses:     u.misses,
 		Flushes:    u.flushes,
 		CacheSize:  len(u.cache),
