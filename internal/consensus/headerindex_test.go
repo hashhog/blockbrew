@@ -266,6 +266,60 @@ func TestGetAncestor(t *testing.T) {
 	}
 }
 
+// TestGetAncestorSkipList validates the O(log N) skip-list GetAncestor against a
+// naive parent-walk reference, at every height of a 2048-long chain. Guards the
+// skip-pointer rewrite against off-by-one errors.
+func TestGetAncestorSkipList(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	const chainLen = 2048
+	prev := idx.genesis
+	for i := 1; i <= chainLen; i++ {
+		header := createTestHeader(prev.Hash, prev.Header.Timestamp+600, uint32(i))
+		node, err := idx.AddHeader(header)
+		if err != nil {
+			t.Fatalf("AddHeader(%d): %v", i, err)
+		}
+		if node.Skip != nil && node.Skip.Height != getSkipHeight(node.Height) {
+			t.Fatalf("node %d: Skip height %d, want %d",
+				i, node.Skip.Height, getSkipHeight(node.Height))
+		}
+		prev = node
+	}
+
+	naive := func(n *BlockNode, h int32) *BlockNode {
+		for n != nil && n.Height > h {
+			n = n.Parent
+		}
+		return n
+	}
+
+	tip := idx.BestTip()
+	for h := int32(0); h <= chainLen; h++ {
+		got := tip.GetAncestor(h)
+		want := naive(tip, h)
+		if got != want {
+			t.Fatalf("GetAncestor(%d): skip-list result diverges from naive walk", h)
+		}
+	}
+}
+
+func TestGetSkipHeight(t *testing.T) {
+	// Values produced by running Bitcoin Core's GetSkipHeight formula directly.
+	// Odd heights skip by only 2 under this scheme — the wins come from even
+	// heights with low-order 2^k structure (6→4, 1000→992, etc.).
+	cases := []struct{ in, want int32 }{
+		{0, 0}, {1, 0}, {2, 0}, {3, 1}, {4, 0}, {5, 1}, {6, 4}, {7, 1},
+		{8, 0}, {16, 0}, {17, 1}, {32, 0}, {1000, 992}, {1024, 0},
+	}
+	for _, c := range cases {
+		if got := getSkipHeight(c.in); got != c.want {
+			t.Errorf("getSkipHeight(%d) = %d, want %d", c.in, got, c.want)
+		}
+	}
+}
+
 func TestMedianTimePast(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)

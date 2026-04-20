@@ -43,10 +43,37 @@ type BlockNode struct {
 	Header     wire.BlockHeader
 	Height     int32
 	Parent     *BlockNode
+	Skip       *BlockNode    // Skip-list pointer for O(log N) ancestor lookup (Bitcoin Core's pskip)
 	TotalWork  *big.Int      // Cumulative chain work up to this block
 	Status     BlockStatus   // Validation state
 	Children   []*BlockNode  // Potential forks
 	SequenceID int32         // Sequence ID for precious block ordering (lower = more precious)
+}
+
+// invertLowestOne clears the lowest set bit of n. Helper for getSkipHeight.
+// Mirror of Bitcoin Core's InvertLowestOne in src/chain.cpp.
+func invertLowestOne(n int32) int32 { return n & (n - 1) }
+
+// getSkipHeight returns the height that a BlockNode at `height` should skip to.
+// Chosen so that at most ~log2(N) hops are needed to walk back N blocks.
+// Mirror of Bitcoin Core's GetSkipHeight in src/chain.cpp.
+func getSkipHeight(height int32) int32 {
+	if height < 2 {
+		return 0
+	}
+	if height&1 != 0 {
+		return invertLowestOne(invertLowestOne(height-1)) + 1
+	}
+	return invertLowestOne(height)
+}
+
+// buildSkip populates the Skip pointer based on this node's Parent.
+// Must be called after Parent is set and before the node is returned.
+// Mirror of Bitcoin Core's CBlockIndex::BuildSkip.
+func (n *BlockNode) buildSkip() {
+	if n.Parent != nil {
+		n.Skip = n.Parent.GetAncestor(getSkipHeight(n.Height))
+	}
 }
 
 // GetAncestorHashAtHeight returns the hash of this node's ancestor at the given
@@ -62,20 +89,36 @@ func (n *BlockNode) GetAncestorHashAtHeight(height int32) (wire.Hash256, bool) {
 
 // GetAncestor returns the ancestor of a node at a given height.
 // Returns nil if the height is invalid or this node doesn't have an ancestor at that height.
+//
+// Uses skip-list pointers (BlockNode.Skip) for O(log N) lookup when available,
+// falling back to parent walks otherwise. Mirror of Bitcoin Core's
+// CBlockIndex::GetAncestor in src/chain.cpp.
 func (n *BlockNode) GetAncestor(height int32) *BlockNode {
 	if height < 0 || height > n.Height {
 		return nil
 	}
-	if height == n.Height {
-		return n
-	}
 
-	// Walk up the chain until we reach the target height
-	node := n
-	for node != nil && node.Height > height {
-		node = node.Parent
+	walk := n
+	heightWalk := n.Height
+	for heightWalk > height {
+		heightSkip := getSkipHeight(heightWalk)
+		heightSkipPrev := getSkipHeight(heightWalk - 1)
+		if walk.Skip != nil &&
+			(heightSkip == height ||
+				(heightSkip > height && !(heightSkipPrev < heightSkip-2 &&
+					heightSkipPrev >= height))) {
+			// Follow the skip pointer — one big jump instead of many parent steps.
+			walk = walk.Skip
+			heightWalk = heightSkip
+		} else {
+			if walk.Parent == nil {
+				return nil
+			}
+			walk = walk.Parent
+			heightWalk--
+		}
 	}
-	return node
+	return walk
 }
 
 // BuildLocator builds a block locator starting from this node.
@@ -383,6 +426,7 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 		Status:    StatusHeaderValid,
 		Children:  nil,
 	}
+	node.buildSkip()
 
 	// Add to parent's children
 	parent.Children = append(parent.Children, node)
