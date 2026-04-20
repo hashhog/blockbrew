@@ -502,6 +502,76 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 
 	_phaseFirstStart = time.Now() // W76: prelude → first-pass boundary
 
+	// W79: batch-prefetch all non-coinbase prevouts into cachedView.cache
+	// in parallel before the per-tx loop runs. The underlying cost is the
+	// Pebble round-trip inside cm.utxoSet.GetUTXO — [W74-FIRST] rollups
+	// show this as 85–95 % of first-phase time. Fanning the prefetch
+	// across N goroutines parallelises those Pebble reads (UTXOSet.GetUTXO
+	// drops UTXOSet.mu while in the DB read path, so the workers don't
+	// serialise on the same lock). The per-tx loop below then short-
+	// circuits on cachedView.cache hits — preserving W69d's "exactly one
+	// GetUTXO per non-coinbase input" invariant (the one call per input
+	// has simply moved from the serial loop into the parallel prefetch).
+	//
+	// Pattern adapted from clearbit's prefetchBlockInputs (W73 Fix 1,
+	// clearbit e319dc7, src/storage.zig:1005). Pure read: we never mutate
+	// UTXO state here. A miss (e.g. an intra-block prevout created by an
+	// earlier tx in this block, so not yet on disk) falls through to the
+	// per-tx loop, which re-tries via cm.utxoSet.GetUTXO after the
+	// producing tx's AddTxOutputs runs and populates UTXOSet.cache.
+	if len(block.Transactions) > 1 {
+		const prefetchWorkers = 4
+		// Dedup so duplicate spends (rare; only appear in invalid blocks)
+		// don't trigger redundant DB reads.
+		prefetchSeen := make(map[wire.OutPoint]struct{}, 2048)
+		prefetchOutpoints := make([]wire.OutPoint, 0, 2048)
+		for _, tx := range block.Transactions[1:] {
+			for _, in := range tx.TxIn {
+				if _, dup := prefetchSeen[in.PreviousOutPoint]; dup {
+					continue
+				}
+				prefetchSeen[in.PreviousOutPoint] = struct{}{}
+				prefetchOutpoints = append(prefetchOutpoints, in.PreviousOutPoint)
+			}
+		}
+		if len(prefetchOutpoints) > 0 {
+			shardSize := (len(prefetchOutpoints) + prefetchWorkers - 1) / prefetchWorkers
+			var wg sync.WaitGroup
+			var cacheMu sync.Mutex
+			for w := 0; w < prefetchWorkers; w++ {
+				start := w * shardSize
+				if start >= len(prefetchOutpoints) {
+					break
+				}
+				end := start + shardSize
+				if end > len(prefetchOutpoints) {
+					end = len(prefetchOutpoints)
+				}
+				wg.Add(1)
+				go func(shard []wire.OutPoint) {
+					defer wg.Done()
+					// Batch into a goroutine-local map first, merge once
+					// under the shared mutex to minimise lock hold time.
+					local := make(map[wire.OutPoint]*UTXOEntry, len(shard))
+					for i := range shard {
+						if utxo := cm.utxoSet.GetUTXO(shard[i]); utxo != nil {
+							local[shard[i]] = utxo
+						}
+					}
+					if len(local) == 0 {
+						return
+					}
+					cacheMu.Lock()
+					for k, v := range local {
+						cachedView.cache[k] = v
+					}
+					cacheMu.Unlock()
+				}(prefetchOutpoints[start:end])
+			}
+			wg.Wait()
+		}
+	}
+
 	// First pass: validate transaction structure and inputs (not scripts)
 	for i, tx := range block.Transactions {
 		// Check transaction sanity
@@ -531,10 +601,22 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// W69 profile showed connCh saturated (1024/1024) and rate stuck at
 		// ~77 blk/hr; connection-step mutex thrash was the diagnosed bottleneck.
 		//
+		// W79: cachedView.cache may already be populated by the parallel
+		// prefetch above for the common case (prevout on disk at block start).
+		// A cache hit skips the serial cm.utxoSet.GetUTXO call entirely,
+		// preserving the W69d "one GetUTXO per input" invariant across the
+		// block: the prefetch did the one call; we short-circuit here. A miss
+		// (intra-block prevout produced by an earlier tx in this same block)
+		// falls through to cm.utxoSet.GetUTXO, which hits UTXOSet.cache via
+		// the earlier tx's AddTxOutputs.
+		//
 		// W74: time just this inner loop so the rollup can show UTXO-read cost
 		// separately from the rest of the first-pass work.
 		_utxoStart := time.Now()
 		for _, in := range tx.TxIn {
+			if _, ok := cachedView.cache[in.PreviousOutPoint]; ok {
+				continue
+			}
 			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
 			if utxo != nil {
 				cachedView.cache[in.PreviousOutPoint] = utxo
