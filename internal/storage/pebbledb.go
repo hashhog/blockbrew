@@ -156,6 +156,15 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		// Default of 2 triggers compaction too eagerly during bulk writes.
 		L0CompactionThreshold: 4,  // Start compaction when L0 has 4 files
 		L0StopWritesThreshold: 12, // Stop writes when L0 has 12 files
+
+		// W84: parallel background compactions. Pebble's default is 1, which
+		// serializes all compaction work. With UTXO batches flushing every
+		// 2000 blocks, that single compaction goroutine cannot keep up:
+		// W76-PHASE rollups show persist_max spikes of ~26s and connCh
+		// saturation. Allowing 4 concurrent compactions lets L0→L1, L1→L2,
+		// etc. proceed in parallel — bounded so we don't starve the
+		// validator on a 16-core box.
+		MaxConcurrentCompactions: func() int { return 4 },
 	}
 
 	db, err := pebble.Open(path, opts)
