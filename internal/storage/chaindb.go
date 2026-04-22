@@ -11,8 +11,17 @@ import (
 var ErrNotFound = errors.New("not found")
 
 // ChainDB provides higher-level chain data access on top of DB.
+//
+// Block bodies are stored either in flat files (when blockStore is set,
+// the production path) or inline in Pebble under the legacy "B" prefix
+// (when blockStore is nil — used by tests/benchmarks against MemDB and
+// for backwards compatibility with datadirs created before the flatfile
+// migration). Reads always try the flat-file index first and fall back
+// to the legacy Pebble blob, allowing pre-existing datadirs to keep
+// working without an offline migration step.
 type ChainDB struct {
-	db DB
+	db         DB
+	blockStore *BlockStore
 }
 
 // NewChainDB creates a new ChainDB wrapping the given database.
@@ -23,6 +32,19 @@ func NewChainDB(db DB) *ChainDB {
 // DB returns the underlying database.
 func (c *ChainDB) DB() DB {
 	return c.db
+}
+
+// SetBlockStore attaches a flat-file block store. After this call,
+// StoreBlock writes block bodies to blk*.dat files (and a 6-byte position
+// index in Pebble) instead of inlining them under the "B" prefix.
+// Existing "B"-prefixed blocks remain readable via the GetBlock fallback.
+func (c *ChainDB) SetBlockStore(bs *BlockStore) {
+	c.blockStore = bs
+}
+
+// BlockStore returns the attached flat-file block store, or nil.
+func (c *ChainDB) BlockStore() *BlockStore {
+	return c.blockStore
 }
 
 // StoreBlockHeader persists a block header.
@@ -57,22 +79,65 @@ func (c *ChainDB) GetBlockHeader(hash wire.Hash256) (*wire.BlockHeader, error) {
 	return header, nil
 }
 
-// StoreBlock persists a full block.
+// StoreBlock persists a full block. Equivalent to StoreBlockAt with
+// height 0 (height is purely metadata for BlockFileInfo, not used on
+// the read path).
 func (c *ChainDB) StoreBlock(hash wire.Hash256, block *wire.MsgBlock) error {
-	key := MakeBlockDataKey(hash)
+	return c.StoreBlockAt(hash, block, 0)
+}
 
+// StoreBlockAt persists a full block, recording the height in
+// BlockFileInfo metadata. The hot path (sync.go HandleBlock) calls this
+// with the block's chain height; non-hot callers (genesis init, mining,
+// RPC submitblock) can use StoreBlock with height 0 since the metadata
+// is not consulted by reads.
+func (c *ChainDB) StoreBlockAt(hash wire.Hash256, block *wire.MsgBlock, height int32) error {
 	buf := new(bytes.Buffer)
 	if err := block.Serialize(buf); err != nil {
 		return err
 	}
 
+	if c.blockStore != nil {
+		// Flat-file path: append the serialized block to blk*.dat and
+		// write a 6-byte position index entry to Pebble. The "B" Pebble
+		// blob is NOT written, keeping the LSM small.
+		h := uint32(0)
+		if height > 0 {
+			h = uint32(height)
+		}
+		_, err := c.blockStore.WriteAndIndexBlock(hash, buf.Bytes(), h, uint64(block.Header.Timestamp))
+		return err
+	}
+
+	// Legacy path (no flat-file store attached): inline the block under
+	// the "B" prefix. Used by unit tests and benchmarks that wrap a
+	// MemDB without a flat-file store.
+	key := MakeBlockDataKey(hash)
 	return c.db.Put(key, buf.Bytes())
 }
 
-// GetBlock retrieves a full block by hash.
+// GetBlock retrieves a full block by hash. With a flat-file store
+// attached the index is consulted first; if there is no flat-file
+// position recorded the lookup falls back to the legacy "B"-prefix
+// Pebble blob. The fallback lets pre-flatfile datadirs keep serving
+// reads without a one-shot migration.
 func (c *ChainDB) GetBlock(hash wire.Hash256) (*wire.MsgBlock, error) {
-	key := MakeBlockDataKey(hash)
+	if c.blockStore != nil {
+		data, err := c.blockStore.ReadBlockByHash(hash)
+		if err == nil {
+			block := &wire.MsgBlock{}
+			if derr := block.Deserialize(bytes.NewReader(data)); derr != nil {
+				return nil, derr
+			}
+			return block, nil
+		}
+		if !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+		// fall through to legacy "B"-prefix lookup
+	}
 
+	key := MakeBlockDataKey(hash)
 	data, err := c.db.Get(key)
 	if err != nil {
 		return nil, err

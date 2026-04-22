@@ -250,6 +250,20 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	chainDB := storage.NewChainDB(db)
 	log.Printf("Database opened at %s", dbPath)
 
+	// 1b. Open the flat-file block store (blk*.dat / rev*.dat) and
+	// attach it to chainDB. New block bodies write here instead of
+	// being inlined into the Pebble LSM. Existing "B"-prefixed blocks
+	// remain readable via the GetBlock fallback (lazy migration).
+	blocksDir := filepath.Join(cfg.DataDir, "blocks")
+	blockStore, err := storage.NewBlockStore(blocksDir, networkMagic(chainParams), db)
+	if err != nil {
+		db.Close()
+		return fmt.Errorf("failed to open flat-file block store: %w", err)
+	}
+	chainDB.SetBlockStore(blockStore)
+	log.Printf("Flat-file block store opened at %s (current file=blk%05d.dat)",
+		blocksDir, blockStore.CurrentFile())
+
 	// 2. Initialize the header index
 	headerIndex := consensus.NewHeaderIndex(chainParams)
 	log.Printf("Header index initialized with genesis: %s", chainParams.GenesisHash.String()[:16])
@@ -605,6 +619,16 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			}
 		}
 
+		// Flush + close the flat-file block store BEFORE the Pebble DB.
+		// BlockStore.Close persists its state (current file num/pos and
+		// per-file BlockFileInfo) into the same Pebble DB, so the DB
+		// must still be open at this point.
+		if err := blockStore.Close(); err != nil {
+			log.Printf("Warning: block store close failed: %v", err)
+		} else {
+			log.Printf("Block store flushed")
+		}
+
 		log.Printf("closing DB")
 		if err := db.Close(); err != nil {
 			log.Printf("Warning: database close failed: %v", err)
@@ -751,6 +775,15 @@ func handleImportBlocks(args []string) {
 	}
 	defer db.Close()
 	chainDB := storage.NewChainDB(db)
+
+	// Open flat-file block store and attach (new blocks land in blk*.dat).
+	blocksDir := filepath.Join(actualDataDir, "blocks")
+	blockStore, err := storage.NewBlockStore(blocksDir, networkMagic(chainParams), db)
+	if err != nil {
+		log.Fatalf("Failed to open flat-file block store: %v", err)
+	}
+	defer blockStore.Close()
+	chainDB.SetBlockStore(blockStore)
 
 	// Initialize header index
 	headerIndex := consensus.NewHeaderIndex(chainParams)

@@ -10,7 +10,12 @@ var (
 	// BlockHeaderPrefix is the prefix for block header storage. Key: "H" + block_hash
 	BlockHeaderPrefix = []byte("H")
 
-	// BlockDataPrefix is the prefix for full block data. Key: "B" + block_hash
+	// BlockDataPrefix is the legacy prefix for full block data stored
+	// inline in Pebble. Key: "B" + block_hash.
+	//
+	// New blocks are stored in flat files (blk*.dat) and referenced via
+	// BlockPosPrefix ("P", defined in flatfile.go) — see ChainDB.StoreBlock
+	// and ChainDB.GetBlock for the lazy-migration read fallback.
 	BlockDataPrefix = []byte("B")
 
 	// BlockHeightPrefix maps height to block hash. Key: "N" + big-endian uint32 height
