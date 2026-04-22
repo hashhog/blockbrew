@@ -1459,9 +1459,10 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 		sm.mu.Unlock()
 	}
 
-	// Store block to database
+	// Store block to database. Use StoreBlockAt so the flat-file
+	// BlockFileInfo metadata records the chain height for this block.
 	if sm.chainDB != nil {
-		if err := sm.chainDB.StoreBlock(hash, msg.Block); err != nil {
+		if err := sm.chainDB.StoreBlockAt(hash, msg.Block, req.Height); err != nil {
 			log.Printf("sync: failed to store block %s: %v", hash.String()[:16], err)
 		}
 	}
