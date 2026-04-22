@@ -99,7 +99,21 @@ func DeserializeTxUndo(r io.Reader) (*TxUndo, error) {
 }
 
 // Serialize writes a BlockUndo to bytes.
+//
+// New blobs are written in the v1 compressed format (see undo_compress.go):
+// pkScript runs through compressScript and the 8-byte int64 amount becomes
+// a varuint, trimming 40-60% off undo size for typical IBD blocks.  The
+// blob's leading byte is undoTagCompressedV1 (0xFF) so the read path can
+// dispatch back to the legacy decoder when older datadirs serve up
+// uncompressed blobs.
 func (bu *BlockUndo) Serialize() []byte {
+	return serializeBlockUndoCompressed(bu)
+}
+
+// serializeBlockUndoLegacy writes a BlockUndo in the pre-compression wire
+// format.  Used only by the test suite to hand-construct a legacy blob and
+// confirm the dispatch in DeserializeBlockUndo still handles it.
+func serializeBlockUndoLegacy(bu *BlockUndo) []byte {
 	var buf bytes.Buffer
 
 	// Write number of TxUndo entries
@@ -113,8 +127,23 @@ func (bu *BlockUndo) Serialize() []byte {
 	return buf.Bytes()
 }
 
-// DeserializeBlockUndo reads a BlockUndo from bytes.
+// DeserializeBlockUndo reads a BlockUndo from bytes.  Dispatches on the
+// first byte: undoTagCompressedV1 (0xFF) → v1 compressed format,
+// anything else → legacy uncompressed format.  The legacy format starts
+// with a CompactSize TxUndo count and can never produce a 0xFF first
+// byte for a valid block, so the dispatch is unambiguous (see comment
+// at top of undo_compress.go).
 func DeserializeBlockUndo(data []byte) (*BlockUndo, error) {
+	if len(data) == 0 {
+		return nil, errors.New("undo: empty blob")
+	}
+
+	if data[0] == undoTagCompressedV1 {
+		return deserializeBlockUndoCompressed(bytes.NewReader(data[1:]))
+	}
+
+	// Legacy uncompressed path: blob starts directly with a CompactSize
+	// TxUndo count.
 	r := bytes.NewReader(data)
 
 	count, err := wire.ReadCompactSize(r)
