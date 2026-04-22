@@ -350,6 +350,91 @@ func TestChainDB(t *testing.T) {
 	})
 }
 
+// TestChainDBFlatFileStorage exercises the ChainDB→BlockStore wiring:
+//   - StoreBlock with a BlockStore attached writes to flat files (and
+//     does NOT write the legacy "B"+hash Pebble blob).
+//   - GetBlock reads from the flat-file index when present.
+//   - GetBlock falls back to a legacy "B"+hash Pebble blob if no flat-file
+//     entry exists for the hash (lazy migration: pre-existing blocks).
+func TestChainDBFlatFileStorage(t *testing.T) {
+	memdb := NewMemDB()
+	defer memdb.Close()
+	chaindb := NewChainDB(memdb)
+
+	bs, err := NewBlockStore(t.TempDir(), 0xD9B4BEF9, memdb)
+	if err != nil {
+		t.Fatalf("NewBlockStore failed: %v", err)
+	}
+	defer bs.Close()
+	chaindb.SetBlockStore(bs)
+
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version: 1, Timestamp: 1609459200, Bits: 0x1d00ffff, Nonce: 42,
+		},
+		Transactions: []*wire.MsgTx{{
+			Version: 1,
+			TxIn: []*wire.TxIn{{
+				PreviousOutPoint: wire.OutPoint{Index: 0xffffffff},
+				SignatureScript:  []byte{0x04, 0xff, 0xff, 0x00, 0x1d},
+				Sequence:         0xffffffff,
+			}},
+			TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x76, 0xa9}}},
+		}},
+	}
+	hash := block.Header.BlockHash()
+
+	// Write through ChainDB.StoreBlockAt — should land in the flat file.
+	if err := chaindb.StoreBlockAt(hash, block, 1); err != nil {
+		t.Fatalf("StoreBlockAt error: %v", err)
+	}
+
+	// Legacy "B"+hash key must NOT have been written.
+	if data, err := memdb.Get(MakeBlockDataKey(hash)); err != nil || data != nil {
+		t.Fatalf("expected no legacy B-prefix entry, got data=%v err=%v", data, err)
+	}
+
+	// Flat-file index must be present.
+	if !bs.HasBlock(hash) {
+		t.Fatal("BlockStore.HasBlock returned false for just-stored block")
+	}
+
+	// Round-trip via ChainDB.GetBlock (flat-file path).
+	got, err := chaindb.GetBlock(hash)
+	if err != nil {
+		t.Fatalf("GetBlock (flat-file) error: %v", err)
+	}
+	if got.Header.Nonce != block.Header.Nonce {
+		t.Fatalf("round-trip nonce mismatch: got %d want %d", got.Header.Nonce, block.Header.Nonce)
+	}
+
+	// Legacy fallback: write a different block under "B"+hash directly,
+	// then verify GetBlock can still read it even though the flat-file
+	// index has no entry for it.
+	legacyBlock := &wire.MsgBlock{
+		Header: wire.BlockHeader{Version: 1, Timestamp: 100, Nonce: 99},
+	}
+	legacyHash := legacyBlock.Header.BlockHash()
+	var legacyBuf bytes.Buffer
+	if err := legacyBlock.Serialize(&legacyBuf); err != nil {
+		t.Fatalf("Serialize legacy block: %v", err)
+	}
+	if err := memdb.Put(MakeBlockDataKey(legacyHash), legacyBuf.Bytes()); err != nil {
+		t.Fatalf("seed legacy block: %v", err)
+	}
+	if bs.HasBlock(legacyHash) {
+		t.Fatal("BlockStore unexpectedly indexes the legacy-only block")
+	}
+	gotLegacy, err := chaindb.GetBlock(legacyHash)
+	if err != nil {
+		t.Fatalf("GetBlock (legacy fallback) error: %v", err)
+	}
+	if gotLegacy.Header.Nonce != legacyBlock.Header.Nonce {
+		t.Fatalf("legacy round-trip nonce mismatch: got %d want %d",
+			gotLegacy.Header.Nonce, legacyBlock.Header.Nonce)
+	}
+}
+
 func TestChainStateSerialize(t *testing.T) {
 	state := &ChainState{
 		BestHash:   wire.Hash256{0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08},
