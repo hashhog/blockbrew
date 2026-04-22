@@ -551,3 +551,84 @@ func TestPrefixUpperBound(t *testing.T) {
 		})
 	}
 }
+
+// TestStoreBlockHeadersBatch confirms that StoreBlockHeadersBatch persists
+// every entry atomically and that GetBlockHeader retrieves each one
+// byte-identically.  This pins the behaviour of the batched header writer
+// used by the IBD headers-message processing path (sync.go).
+func TestStoreBlockHeadersBatch(t *testing.T) {
+	memdb := NewMemDB()
+	defer memdb.Close()
+	chaindb := NewChainDB(memdb)
+
+	const N = 100
+	originals := make([]wire.BlockHeader, N)
+	hashes := make([]wire.Hash256, N)
+	entries := make([]HeaderBatchEntry, N)
+
+	prev := wire.Hash256{}
+	for i := 0; i < N; i++ {
+		hdr := wire.BlockHeader{
+			Version:    1,
+			PrevBlock:  prev,
+			MerkleRoot: wire.Hash256{byte(i), byte(i >> 8), 0xab, 0xcd},
+			Timestamp:  uint32(1_700_000_000 + i),
+			Bits:       0x1d00ffff,
+			Nonce:      uint32(i*17 + 3),
+		}
+		originals[i] = hdr
+		hashes[i] = hdr.BlockHash()
+		entries[i] = HeaderBatchEntry{Hash: hashes[i], Header: &originals[i]}
+		prev = hashes[i]
+	}
+
+	if err := chaindb.StoreBlockHeadersBatch(entries); err != nil {
+		t.Fatalf("StoreBlockHeadersBatch: %v", err)
+	}
+
+	for i := 0; i < N; i++ {
+		got, err := chaindb.GetBlockHeader(hashes[i])
+		if err != nil {
+			t.Fatalf("GetBlockHeader[%d]: %v", i, err)
+		}
+		want := &originals[i]
+		if got.Version != want.Version ||
+			got.PrevBlock != want.PrevBlock ||
+			got.MerkleRoot != want.MerkleRoot ||
+			got.Timestamp != want.Timestamp ||
+			got.Bits != want.Bits ||
+			got.Nonce != want.Nonce {
+			t.Fatalf("header[%d] mismatch:\n got %+v\nwant %+v", i, got, want)
+		}
+	}
+
+	// Verify that an empty entry slice is a no-op (does not error and does
+	// not write anything).
+	if err := chaindb.StoreBlockHeadersBatch(nil); err != nil {
+		t.Fatalf("StoreBlockHeadersBatch(nil): %v", err)
+	}
+	if err := chaindb.StoreBlockHeadersBatch([]HeaderBatchEntry{}); err != nil {
+		t.Fatalf("StoreBlockHeadersBatch(empty): %v", err)
+	}
+
+	// Verify that the batched write produces output identical to the per-call
+	// path, by writing a second copy of one header via StoreBlockHeader to a
+	// fresh DB and comparing on-disk bytes.
+	memdb2 := NewMemDB()
+	defer memdb2.Close()
+	chaindb2 := NewChainDB(memdb2)
+	if err := chaindb2.StoreBlockHeader(hashes[0], &originals[0]); err != nil {
+		t.Fatalf("StoreBlockHeader: %v", err)
+	}
+	rawBatched, err := memdb.Get(MakeBlockHeaderKey(hashes[0]))
+	if err != nil || rawBatched == nil {
+		t.Fatalf("memdb.Get(batched) returned %v, %v", rawBatched, err)
+	}
+	rawSingle, err := memdb2.Get(MakeBlockHeaderKey(hashes[0]))
+	if err != nil || rawSingle == nil {
+		t.Fatalf("memdb2.Get(single) returned %v, %v", rawSingle, err)
+	}
+	if !bytes.Equal(rawBatched, rawSingle) {
+		t.Errorf("batched bytes %x != single-call bytes %x", rawBatched, rawSingle)
+	}
+}
