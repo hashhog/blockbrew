@@ -59,6 +59,53 @@ func (c *ChainDB) StoreBlockHeader(hash wire.Hash256, header *wire.BlockHeader) 
 	return c.db.Put(key, buf.Bytes())
 }
 
+// HeaderBatchEntry pairs a block hash with its header for batched writes.
+type HeaderBatchEntry struct {
+	Hash   wire.Hash256
+	Header *wire.BlockHeader
+}
+
+// StoreBlockHeadersBatch persists a slice of block headers in a single
+// pebble batch.  Used by the headers-message processing path to collapse
+// up to MaxHeadersPerRequest (2000) per-header WAL writes into one batched
+// write — the second-largest source of unnecessary Pebble WAL traffic
+// during IBD after the now-flatfiled block bodies.
+//
+// Uses NewBatchNoSync to match the existing per-header semantics: header
+// durability during IBD is handled by the periodic chain-state checkpoint
+// (and a subsequent re-headers fetch on the next startup), not by per-batch
+// fsync.  Empty input is a no-op.
+//
+// Each header is the only on-disk side-effect of the per-header path in
+// sync.go (no auxiliary chain-index keys are written), so batching the
+// MakeBlockHeaderKey writes is sufficient.
+func (c *ChainDB) StoreBlockHeadersBatch(entries []HeaderBatchEntry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	batch := c.NewBatchNoSync()
+
+	var buf bytes.Buffer
+	for _, e := range entries {
+		if e.Header == nil {
+			continue
+		}
+		buf.Reset()
+		if err := e.Header.Serialize(&buf); err != nil {
+			batch.Reset()
+			return err
+		}
+		key := MakeBlockHeaderKey(e.Hash)
+		// Copy because batch.Put borrows the slice and buf will be reused.
+		val := make([]byte, buf.Len())
+		copy(val, buf.Bytes())
+		batch.Put(key, val)
+	}
+
+	return batch.Write()
+}
+
 // GetBlockHeader retrieves a block header by hash.
 func (c *ChainDB) GetBlockHeader(hash wire.Hash256) (*wire.BlockHeader, error) {
 	key := MakeBlockHeaderKey(hash)

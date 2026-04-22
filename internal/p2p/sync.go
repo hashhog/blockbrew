@@ -482,7 +482,25 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	startHeight := sm.headerIndex.BestHeight()
 	headersAdded := 0
 
-	for _, hdr := range msg.Headers {
+	// Collect accepted headers for a single batched DB write at the end of
+	// the loop.  A full headers message carries up to MaxHeadersPerRequest
+	// (2000) entries; previously each triggered a separate pebble Set call
+	// (one WAL record apiece), and IBD profiling showed this as the second-
+	// biggest source of unnecessary WAL traffic after the now-flatfiled
+	// block bodies.  Buffering into a single NewBatchNoSync collapses 2000
+	// WAL records into one.
+	//
+	// On the early-return error path the buffered entries are flushed
+	// before returning: crash recovery relies on successfully-validated
+	// headers being on disk even when a later header in the same message
+	// turns out to be invalid.
+	var pendingHeaders []storage.HeaderBatchEntry
+	if sm.chainDB != nil {
+		pendingHeaders = make([]storage.HeaderBatchEntry, 0, len(msg.Headers))
+	}
+
+	for i := range msg.Headers {
+		hdr := msg.Headers[i]
 		node, err := sm.headerIndex.AddHeader(hdr)
 		if err != nil {
 			if err == consensus.ErrDuplicateHeader {
@@ -512,6 +530,14 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 			}
 			log.Printf("sync: bad header from %s at height %d: %v",
 				peer.Address(), sm.headerIndex.BestHeight()+1, err)
+			// Flush any headers we accepted before the bad one so crash
+			// recovery sees them.
+			if sm.chainDB != nil && len(pendingHeaders) > 0 {
+				if err := sm.chainDB.StoreBlockHeadersBatch(pendingHeaders); err != nil {
+					log.Printf("sync: failed to flush %d pending headers: %v",
+						len(pendingHeaders), err)
+				}
+			}
 			peer.Misbehaving(score, fmt.Sprintf("invalid header: %v", err))
 			peer.Disconnect()
 			sm.syncPeer = nil
@@ -521,11 +547,20 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 
 		headersAdded++
 
-		// Persist header to DB
+		// Buffer the header for the batched DB write below.
 		if sm.chainDB != nil {
-			if err := sm.chainDB.StoreBlockHeader(node.Hash, &hdr); err != nil {
-				log.Printf("sync: failed to store header %s: %v", node.Hash.String(), err)
-			}
+			pendingHeaders = append(pendingHeaders, storage.HeaderBatchEntry{
+				Hash:   node.Hash,
+				Header: &msg.Headers[i],
+			})
+		}
+	}
+
+	// Single batched write for every accepted header in this message.
+	if sm.chainDB != nil && len(pendingHeaders) > 0 {
+		if err := sm.chainDB.StoreBlockHeadersBatch(pendingHeaders); err != nil {
+			log.Printf("sync: failed to batch-store %d headers: %v",
+				len(pendingHeaders), err)
 		}
 	}
 
