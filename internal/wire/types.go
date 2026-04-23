@@ -22,7 +22,21 @@ const (
 	MaxTxOutputs = 100_000
 
 	// MaxWitnessItems is the maximum number of witness items per input.
-	MaxWitnessItems = 100_000
+	//
+	// Bitcoin Core imposes no explicit cap here — the only limits are the
+	// wire-level `MAX_SIZE = 0x02000000` (32 MB) for the CompactSize prefix
+	// and the 4 MB block-weight envelope.  `MAX_STACK_SIZE = 1000` in
+	// `script/script.h` is a script-execution runtime bound, not a
+	// deserialize bound.  The earlier cap of 100 000 was a DoS guard that
+	// turned out tighter than consensus: mainnet block 761 249 carries an
+	// input with 500 003 witness items, which wedged the node at that
+	// height until every peer got banned for serving a perfectly valid
+	// block (see 2026-04-23 fleet snapshot).  4 000 000 is a hard upper
+	// bound derived from `MaxBlockSerializedSize` (each item costs ≥ 1 B
+	// of witness data plus a length prefix), so this still shuts down the
+	// "peer sends a 100 GB witness count" DoS without rejecting valid
+	// mainnet blocks.
+	MaxWitnessItems = 4_000_000
 
 	// MaxBlockSerializedSize is the maximum serialized block size we will
 	// attempt to deserialize (slightly above MAX_BLOCK_SERIALIZED_SIZE to
