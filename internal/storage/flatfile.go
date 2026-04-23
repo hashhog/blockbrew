@@ -119,39 +119,44 @@ func DeserializeBlockFileInfo(r io.Reader) (*BlockFileInfo, error) {
 	fi := &BlockFileInfo{}
 	var err error
 
+	// All fields use ReadCompactSizeUnchecked: block-file Size / UndoSize routinely
+	// exceed MaxCompactSize (32 MiB) since blk*.dat files cap at 128 MiB and undo
+	// files are uncapped.  HeightFirst/HeightLast are uint32 heights (~946k today,
+	// but unbounded long-term) and timestamps are Unix epoch seconds (already well
+	// past the 32-bit second cutoff).  Gating these with ReadCompactSize made
+	// blockbrew unable to restart after any block file exceeded 32 MiB — a latent
+	// W87 regression masked by blockbrew not being restarted post-flatfile ship.
 	var v uint64
-	v, err = wire.ReadCompactSize(r)
+	v, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return nil, err
 	}
 	fi.NumBlocks = uint32(v)
 
-	v, err = wire.ReadCompactSize(r)
+	v, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return nil, err
 	}
 	fi.Size = uint32(v)
 
-	v, err = wire.ReadCompactSize(r)
+	v, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return nil, err
 	}
 	fi.UndoSize = uint32(v)
 
-	v, err = wire.ReadCompactSize(r)
+	v, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return nil, err
 	}
 	fi.HeightFirst = uint32(v)
 
-	v, err = wire.ReadCompactSize(r)
+	v, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return nil, err
 	}
 	fi.HeightLast = uint32(v)
 
-	// Use ReadCompactSizeUnchecked for timestamps: Unix timestamps (e.g., 1609459200)
-	// exceed MaxCompactSize (32 MB) so the standard ReadCompactSize would reject them.
 	fi.TimeFirst, err = wire.ReadCompactSizeUnchecked(r)
 	if err != nil {
 		return nil, err
