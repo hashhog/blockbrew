@@ -126,6 +126,13 @@ type blockRequest struct {
 	State      BlockDownloadState
 	RequestAt  time.Time
 	RetryCount int
+	// FailedPeers records peer addresses that responded notfound for this
+	// specific block hash.  Populated in HandleNotFound, consulted by
+	// requestBlocks to avoid re-asking peers that have already told us they
+	// don't have this block.  Without this, blockbrew round-robins back to
+	// the same peer, gets the same notfound, and produces millions of log
+	// lines of spam (observed haskoin flooding ~50k/min).
+	FailedPeers map[string]struct{}
 }
 
 // blockWithRequest pairs a received block with its request metadata.
@@ -963,8 +970,19 @@ func (sm *SyncManager) HandleNotFound(peer *Peer, msg *MsgNotFound) {
 			continue
 		}
 
-		log.Printf("sync: peer %s does not have block height=%d hash=%s, will retry with different peer",
-			peer.Address(), req.Height, inv.Hash.String()[:16])
+		// Record peer as unable to serve this block.  Log only on first
+		// notice per (peer, block) pair — repeat notfounds from the same
+		// peer for the same block are a spam source (14M log lines in a
+		// day on mainnet) and add no new information.
+		addr := peer.Address()
+		if req.FailedPeers == nil {
+			req.FailedPeers = make(map[string]struct{})
+		}
+		if _, seen := req.FailedPeers[addr]; !seen {
+			req.FailedPeers[addr] = struct{}{}
+			log.Printf("sync: peer %s does not have block height=%d hash=%s (failed_peers=%d), will retry with different peer",
+				addr, req.Height, inv.Hash.String()[:16], len(req.FailedPeers))
+		}
 
 		// Remove from inflight and mark for retry with a different peer
 		delete(sm.inflight, inv.Hash)
@@ -1267,12 +1285,22 @@ func (sm *SyncManager) requestBlocks() {
 			if lastFailedAddr != "" && addr == lastFailedAddr {
 				continue
 			}
+			// Skip any peer that has already told us (via notfound) it
+			// doesn't have this block — otherwise we round-robin back to
+			// haskoin / other partially-synced peers and burn CPU plus
+			// produce millions of log lines for the same misses.
+			if req.FailedPeers != nil {
+				if _, failed := req.FailedPeers[addr]; failed {
+					continue
+				}
+			}
 			selectedPeer = peer
 			peerIdx = (idx + 1) % len(peers)
 			break
 		}
 		// If no alternative found, fall back to any available peer
-		if selectedPeer == nil && lastFailedAddr != "" {
+		// (including FailedPeers — liveness > avoidance when all else fails).
+		if selectedPeer == nil && (lastFailedAddr != "" || req.FailedPeers != nil) {
 			for _, peer := range peers {
 				if !peer.IsConnected() {
 					continue
