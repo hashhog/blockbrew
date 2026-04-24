@@ -398,6 +398,10 @@ func TestChainDBFlatFileStorage(t *testing.T) {
 	if !bs.HasBlock(hash) {
 		t.Fatal("BlockStore.HasBlock returned false for just-stored block")
 	}
+	// ChainDB.HasBlock must agree (flat-file path).
+	if !chaindb.HasBlock(hash) {
+		t.Fatal("ChainDB.HasBlock returned false for flat-file block")
+	}
 
 	// Round-trip via ChainDB.GetBlock (flat-file path).
 	got, err := chaindb.GetBlock(hash)
@@ -425,6 +429,19 @@ func TestChainDBFlatFileStorage(t *testing.T) {
 	if bs.HasBlock(legacyHash) {
 		t.Fatal("BlockStore unexpectedly indexes the legacy-only block")
 	}
+	// ChainDB.HasBlock must report the legacy-only block as present
+	// (fallback path to "B"-prefix) even though the flat-file index
+	// doesn't know about it.
+	if !chaindb.HasBlock(legacyHash) {
+		t.Fatal("ChainDB.HasBlock missed legacy-only block")
+	}
+	// Unknown hash: neither layer has it, must be false.
+	var unknown wire.Hash256
+	copy(unknown[:], []byte{0xDE, 0xAD, 0xBE, 0xEF})
+	if chaindb.HasBlock(unknown) {
+		t.Fatal("ChainDB.HasBlock returned true for unknown hash")
+	}
+
 	gotLegacy, err := chaindb.GetBlock(legacyHash)
 	if err != nil {
 		t.Fatalf("GetBlock (legacy fallback) error: %v", err)

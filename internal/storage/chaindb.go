@@ -163,6 +163,18 @@ func (c *ChainDB) StoreBlockAt(hash wire.Hash256, block *wire.MsgBlock, height i
 	return c.db.Put(key, buf.Bytes())
 }
 
+// HasBlock returns true if the block data is already persisted, either in
+// the flat-file store (W87) or in the legacy "B"-prefix Pebble blob. Does
+// not read or deserialize the block body.
+func (c *ChainDB) HasBlock(hash wire.Hash256) bool {
+	if c.blockStore != nil && c.blockStore.HasBlock(hash) {
+		return true
+	}
+	key := MakeBlockDataKey(hash)
+	has, _ := c.db.Has(key)
+	return has
+}
+
 // GetBlock retrieves a full block by hash. With a flat-file store
 // attached the index is consulted first; if there is no flat-file
 // position recorded the lookup falls back to the legacy "B"-prefix
