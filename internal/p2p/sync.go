@@ -1227,7 +1227,22 @@ func requestJitter() time.Duration {
 
 // requestBlocks sends block requests to peers up to the download window.
 func (sm *SyncManager) requestBlocks() {
+	// alreadyHave collects Pending block requests whose block bodies are
+	// already persisted locally (flatfile or legacy "B"-blob). They bypass
+	// the network and are pushed to the validation pipeline after the main
+	// lock is released. See fastPathDispatch for the dispatch side.
+	var alreadyHave []*blockRequest
+
 	sm.mu.Lock()
+	// LIFO defers: unlock runs first, THEN fast-path dispatch. Dispatch
+	// reacquires the lock briefly per block; keeping it outside the main
+	// critical section avoids holding mu across chainDB.GetBlock (a disk
+	// read that can be slow during warmup).
+	defer func() {
+		for _, req := range alreadyHave {
+			sm.fastPathDispatch(req)
+		}
+	}()
 	defer sm.mu.Unlock()
 
 	if sm.peerMgr == nil {
@@ -1260,6 +1275,16 @@ func (sm *SyncManager) requestBlocks() {
 		}
 		if len(sm.inflight) >= sm.downloadWindow {
 			break
+		}
+
+		// Fast path: if the block body is already on disk (e.g. a prior
+		// requeue already persisted it, or a restart rebuilt blockQueue
+		// over indexed blocks), skip the network round-trip and queue
+		// it for validation directly. Closes the gap the requeue comment
+		// at requeueForRedownload has long claimed was already in place.
+		if sm.chainDB != nil && sm.chainDB.HasBlock(req.Hash) {
+			alreadyHave = append(alreadyHave, req)
+			continue
 		}
 
 		// Find a peer that can serve this block using round-robin.
@@ -1668,6 +1693,46 @@ func (sm *SyncManager) requeueForRedownload(bwr *blockWithRequest) {
 			log.Printf("sync: connection channel saturated, re-queued block %d (%s) for later re-download",
 				bwr.req.Height, bwr.req.Hash.String()[:16])
 		}
+	}
+}
+
+// fastPathDispatch reads a locally-persisted block from chainDB and queues
+// it for validation, bypassing the network request cycle. Called by
+// requestBlocks after the main lock is released, once per Pending block
+// whose body the local chainDB already has on disk.
+//
+// Re-checks req.State under the lock because HandleBlock (via unsolicited
+// inv or a racing arrival) may have advanced it between the outer
+// collection and this call; a disk read + re-push would cause
+// double-validation.
+//
+// On channel saturation or a surprise GetBlock miss, req stays Pending
+// and the next requestBlocks tick will retry.
+func (sm *SyncManager) fastPathDispatch(req *blockRequest) {
+	if sm.chainDB == nil {
+		return
+	}
+	block, err := sm.chainDB.GetBlock(req.Hash)
+	if err != nil {
+		return
+	}
+
+	sm.mu.Lock()
+	if req.State != BlockDownloadPending {
+		sm.mu.Unlock()
+		return
+	}
+	req.State = BlockDownloadReceived
+	sm.mu.Unlock()
+
+	select {
+	case sm.validationChan <- &blockWithRequest{block: block, req: req}:
+		// Queued for validation; state progresses via validationWorker.
+	default:
+		// Pipeline full. Revert so the next requestBlocks tick retries.
+		sm.mu.Lock()
+		req.State = BlockDownloadPending
+		sm.mu.Unlock()
 	}
 }
 
