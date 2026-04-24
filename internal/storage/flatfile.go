@@ -771,8 +771,19 @@ func (bs *BlockStore) GetUndoPos(hash wire.Hash256) (FlatFilePos, error) {
 	return pos, nil
 }
 
-// WriteAndIndexBlock writes a block and indexes it by hash.
+// WriteAndIndexBlock writes a block and indexes it by hash. Idempotent:
+// if the block is already indexed, returns the existing position without
+// re-appending to blk*.dat. Without this guard, duplicate receives
+// (pipeline-saturation requeues in sync.go, reorg rediscovery, or a
+// restart that dropped the index mid-write before IndexBlock ran) left
+// orphaned block copies on disk. A mainnet run under this path reached
+// ~3.5× the expected flatfile size before the 2026-04-24 disk-full
+// incident forced a wipe.
 func (bs *BlockStore) WriteAndIndexBlock(hash wire.Hash256, blockData []byte, height uint32, blockTime uint64) (FlatFilePos, error) {
+	if bs.HasBlock(hash) {
+		return bs.GetBlockPos(hash)
+	}
+
 	pos, err := bs.WriteBlock(blockData, height, blockTime)
 	if err != nil {
 		return FlatFilePos{FileNum: -1}, err
@@ -786,7 +797,12 @@ func (bs *BlockStore) WriteAndIndexBlock(hash wire.Hash256, blockData []byte, he
 }
 
 // WriteAndIndexUndo writes undo data and indexes it by block hash.
+// Idempotent for the same reason as WriteAndIndexBlock.
 func (bs *BlockStore) WriteAndIndexUndo(hash wire.Hash256, fileNum int32, undoData []byte) (FlatFilePos, error) {
+	if bs.HasUndo(hash) {
+		return bs.GetUndoPos(hash)
+	}
+
 	pos, err := bs.WriteUndo(fileNum, undoData)
 	if err != nil {
 		return FlatFilePos{FileNum: -1}, err
