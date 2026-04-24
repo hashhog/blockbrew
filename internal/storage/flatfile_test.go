@@ -373,6 +373,121 @@ func TestBlockStoreIndex(t *testing.T) {
 	})
 }
 
+// TestWriteAndIndexBlockIdempotent guards the W87/post-ENOSPC fix: a second
+// call to WriteAndIndexBlock with the same hash must not re-append to the
+// flatfile. Regression would re-introduce the ~3.5× disk bloat observed on
+// mainnet before 2026-04-24.
+func TestWriteAndIndexBlockIdempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	db := NewMemDB()
+	defer db.Close()
+
+	bs, err := NewBlockStore(tmpDir, testMagic, db)
+	if err != nil {
+		t.Fatalf("NewBlockStore failed: %v", err)
+	}
+	defer bs.Close()
+
+	hashA := wire.DoubleHashB([]byte("block A"))
+	hashB := wire.DoubleHashB([]byte("block B"))
+	dataA := []byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") // 32B
+	dataB := []byte("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB") // 32B
+
+	// First write: fresh append.
+	posA1, err := bs.WriteAndIndexBlock(hashA, dataA, 100, 1609459200)
+	if err != nil {
+		t.Fatalf("first WriteAndIndexBlock(A): %v", err)
+	}
+	posAfterA := bs.currentPos
+	fileAfterA := bs.currentFileNum
+
+	// Second write of the SAME hash: must be a no-op, position unchanged.
+	posA2, err := bs.WriteAndIndexBlock(hashA, dataA, 100, 1609459200)
+	if err != nil {
+		t.Fatalf("second WriteAndIndexBlock(A): %v", err)
+	}
+	if posA1 != posA2 {
+		t.Errorf("duplicate write returned new pos: first=%v second=%v", posA1, posA2)
+	}
+	if bs.currentPos != posAfterA {
+		t.Errorf("duplicate write advanced currentPos: %d -> %d (expected no change)",
+			posAfterA, bs.currentPos)
+	}
+	if bs.currentFileNum != fileAfterA {
+		t.Errorf("duplicate write rolled over file: %d -> %d", fileAfterA, bs.currentFileNum)
+	}
+
+	// Third write of the same hash but with DIFFERENT data: still idempotent —
+	// HasBlock wins. The stored block keeps the original payload (hash is
+	// authoritative; in production block hashes uniquely determine data, so
+	// this only matters as a regression guard for the dedup path itself).
+	_, err = bs.WriteAndIndexBlock(hashA, []byte("different bytes"), 100, 1609459200)
+	if err != nil {
+		t.Fatalf("third WriteAndIndexBlock(A, different data): %v", err)
+	}
+	storedA, err := bs.ReadBlockByHash(hashA)
+	if err != nil {
+		t.Fatalf("ReadBlockByHash(A): %v", err)
+	}
+	if !bytes.Equal(storedA, dataA) {
+		t.Errorf("dedup skipped write but stored payload changed: got %q, want %q",
+			storedA, dataA)
+	}
+
+	// A different hash must still write normally.
+	posB, err := bs.WriteAndIndexBlock(hashB, dataB, 101, 1609459300)
+	if err != nil {
+		t.Fatalf("WriteAndIndexBlock(B): %v", err)
+	}
+	if posB == posA1 {
+		t.Error("distinct hash reused position of earlier block")
+	}
+	if bs.currentPos <= posAfterA {
+		t.Errorf("new-hash write did not advance currentPos: %d -> %d",
+			posAfterA, bs.currentPos)
+	}
+}
+
+// TestWriteAndIndexUndoIdempotent mirrors the block-side guard for undo data.
+func TestWriteAndIndexUndoIdempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	db := NewMemDB()
+	defer db.Close()
+
+	bs, err := NewBlockStore(tmpDir, testMagic, db)
+	if err != nil {
+		t.Fatalf("NewBlockStore failed: %v", err)
+	}
+	defer bs.Close()
+
+	hash := wire.DoubleHashB([]byte("undo hash"))
+	undo := []byte("undo data payload")
+
+	pos1, err := bs.WriteAndIndexUndo(hash, 0, undo)
+	if err != nil {
+		t.Fatalf("first WriteAndIndexUndo: %v", err)
+	}
+	fi := bs.GetFileInfo(0)
+	if fi == nil {
+		t.Fatalf("GetFileInfo(0) returned nil")
+	}
+	sizeAfter1 := fi.UndoSize
+
+	pos2, err := bs.WriteAndIndexUndo(hash, 0, undo)
+	if err != nil {
+		t.Fatalf("second WriteAndIndexUndo: %v", err)
+	}
+	if pos1 != pos2 {
+		t.Errorf("duplicate undo write returned new pos: first=%v second=%v", pos1, pos2)
+	}
+	fi = bs.GetFileInfo(0)
+	if fi.UndoSize != sizeAfter1 {
+		t.Errorf("duplicate undo write grew UndoSize: %d -> %d", sizeAfter1, fi.UndoSize)
+	}
+}
+
 func TestBlockStoreFileRollover(t *testing.T) {
 	tmpDir := t.TempDir()
 
