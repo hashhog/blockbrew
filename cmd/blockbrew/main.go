@@ -60,6 +60,28 @@ type Config struct {
 
 	// Prometheus metrics
 	MetricsPort int
+
+	// Cache budget. -dbcache is in MiB and is split between the in-memory
+	// UTXO cache (80%) and Pebble's block cache (20%). The skew toward the
+	// UTXO cache follows W76-PHASE telemetry: ConnectBlock latency is
+	// dominated by `first_avg` (UTXO read), so reducing UTXO cache misses
+	// has more leverage than enlarging the LSM block cache.
+	DBCache int
+}
+
+// computeCacheSplit returns (utxoCacheBytes, pebbleBlockCacheBytes) for a
+// given -dbcache value in MiB. Clamped to [4, 65536] MiB.
+func computeCacheSplit(dbcacheMiB int) (utxoCacheBytes int64, pebbleBlockCacheBytes int64) {
+	if dbcacheMiB < 4 {
+		dbcacheMiB = 4
+	}
+	if dbcacheMiB > 65536 {
+		dbcacheMiB = 65536
+	}
+	totalBytes := int64(dbcacheMiB) * 1024 * 1024
+	utxoCacheBytes = totalBytes * 8 / 10
+	pebbleBlockCacheBytes = totalBytes - utxoCacheBytes
+	return
 }
 
 func main() {
@@ -150,6 +172,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.PprofAddr, "pprof", "", "pprof HTTP server address (e.g., localhost:6060)")
 	flag.BoolVar(&cfg.ParallelScripts, "parallelscripts", true, "Enable parallel script validation")
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
+	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
 	flag.Parse()
 
 	if cfg.ListenP2P == "" {
@@ -241,14 +264,18 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		consensus.StartProfileServer(cfg.PprofAddr)
 	}
 
-	// 1. Open the database
+	// 1. Open the database with the configured cache budget.
+	utxoCacheBytes, pebbleBlockCacheBytes := computeCacheSplit(cfg.DBCache)
 	dbPath := filepath.Join(cfg.DataDir, "chaindata")
-	db, err := storage.NewPebbleDB(dbPath)
+	pebbleCfg := storage.DefaultPebbleDBConfig()
+	pebbleCfg.BlockCacheSize = pebbleBlockCacheBytes
+	db, err := storage.NewPebbleDBWithConfig(dbPath, pebbleCfg)
 	if err != nil {
 		return fmt.Errorf("failed to open database: %w", err)
 	}
 	chainDB := storage.NewChainDB(db)
-	log.Printf("Database opened at %s", dbPath)
+	log.Printf("Database opened at %s (-dbcache=%d MiB → utxo_cache=%d MiB, pebble_block_cache=%d MiB)",
+		dbPath, cfg.DBCache, utxoCacheBytes>>20, pebbleBlockCacheBytes>>20)
 
 	// 1b. Open the flat-file block store (blk*.dat / rev*.dat) and
 	// attach it to chainDB. New block bodies write here instead of
@@ -286,9 +313,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		log.Printf("Loaded chain state: height=%d hash=%s", chainState.BestHeight, chainState.BestHash.String())
 	}
 
-	// 4. Initialize UTXO set
-	utxoSet := consensus.NewUTXOSet(chainDB)
-	log.Printf("UTXO set initialized")
+	// 4. Initialize UTXO set with the configured cache budget.
+	utxoSet := consensus.NewUTXOSetWithMaxCache(chainDB, utxoCacheBytes)
+	log.Printf("UTXO set initialized (cache_max=%d MiB)", utxoCacheBytes>>20)
 
 	// 5. Initialize chain manager
 	chainMgr := consensus.NewChainManager(consensus.ChainManagerConfig{
