@@ -74,6 +74,8 @@ type PeerListeners struct {
 	OnNotFound    func(p *Peer, msg *MsgNotFound)
 	OnFeeFilter   func(p *Peer, msg *MsgFeeFilter)
 	OnSendHeaders func(p *Peer, msg *MsgSendHeaders)
+	// BIP35 "Tx relay + mempool" callback — peer requests our mempool contents.
+	OnMempool func(p *Peer, msg *MsgMempool)
 	// BIP152 compact block callbacks
 	OnSendCmpct   func(p *Peer, msg *MsgSendCmpct)
 	OnCmpctBlock  func(p *Peer, msg *MsgCmpctBlock)
@@ -528,6 +530,14 @@ func (p *Peer) handleMessage(msg Message) {
 		p.handleFeeFilter(m)
 		if p.config.Listeners != nil && p.config.Listeners.OnFeeFilter != nil {
 			p.config.Listeners.OnFeeFilter(p, m)
+		}
+	case *MsgMempool:
+		// BIP35: peer requested our mempool contents.  Dispatched to listener
+		// which (in main wiring) replies with one or more inv messages
+		// enumerating mempool txids, mirroring Bitcoin Core's
+		// net_processing.cpp NetMsgType::MEMPOOL handler.
+		if p.config.Listeners != nil && p.config.Listeners.OnMempool != nil {
+			p.config.Listeners.OnMempool(p, m)
 		}
 	case *MsgWTxidRelay:
 		p.mu.Lock()
