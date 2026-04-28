@@ -416,6 +416,28 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			txHash, peer.Address(), entry.Fee, entry.Size)
 	}
 
+	// BIP35 "mempool" handler: peer requests our mempool contents → respond
+	// with one or more inv messages enumerating mempool txids.  Mirrors
+	// Bitcoin Core's net_processing.cpp NetMsgType::MEMPOOL handler.
+	//
+	// Gating: blockbrew does not advertise BIP111 NODE_BLOOM and has no
+	// per-peer permission system (no equivalent of Core's
+	// NetPermissionFlags::Mempool), so the only filter applied is the
+	// peer's WantsTxRelay() flag — peers that disabled tx relay in their
+	// version message are skipped.  This is more permissive than modern
+	// Core but no less safe: we never serve transactions we wouldn't
+	// otherwise relay, and the response is bounded by the local mempool
+	// size (see DefaultConfig in internal/mempool).
+	syncListeners.OnMempool = func(peer *p2p.Peer, _ *p2p.MsgMempool) {
+		if !peer.WantsTxRelay() {
+			return
+		}
+		invs := p2p.HandleMempoolRequest(peer, mp)
+		for _, inv := range invs {
+			peer.SendMessage(inv)
+		}
+	}
+
 	peerMgr = p2p.NewPeerManager(p2p.PeerManagerConfig{
 		Network:     networkMagic(chainParams),
 		ChainParams: chainParams,
