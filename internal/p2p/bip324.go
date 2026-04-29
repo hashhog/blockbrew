@@ -309,41 +309,51 @@ func CheckV1Magic(data []byte, magic uint32) bool {
 }
 
 // BIP324 short message type IDs (single-byte command encoding).
+//
+// This MUST mirror Bitcoin Core's V2_MESSAGE_IDS[1..28] in net.cpp
+// (constexpr std::array<std::string, 33>) — the only commands that have a
+// 1-byte short ID assigned by BIP-324.  Indices 29..32 are explicitly
+// reserved as "Unimplemented" placeholders in BIP-324 and MUST NOT be
+// emitted on the wire.  In particular, the handshake messages
+// `version` and `verack`, plus the negotiation messages `wtxidrelay`,
+// `sendaddrv2`, `sendheaders`, `sendtxrcncl`, and `getaddr`, are NOT in the
+// short-ID table — they are sent with the long (12-byte) command-name
+// form (first byte 0x00 followed by the padded command).  Sending one of
+// these with a fabricated short ID (e.g. our previous 0x20 for version)
+// causes BIP-324 peers to silently reject the packet as
+// "invalid message type" (Core net.cpp:1426-1428,1474-1476): the cipher
+// handshake completes, getpeerinfo reports `transport_protocol_type=v2`,
+// but `subver=""` and `version=0` because the application-layer version
+// message never decodes.
 var shortMsgTypes = map[string]byte{
-	"addr":           0x01,
-	"block":          0x02,
-	"blocktxn":       0x03,
-	"cmpctblock":     0x04,
-	"feefilter":      0x05,
-	"filteradd":      0x06,
-	"filterclear":    0x07,
-	"filterload":     0x08,
-	"getblocks":      0x09,
-	"getblocktxn":    0x0a,
-	"getdata":        0x0b,
-	"getheaders":     0x0c,
-	"headers":        0x0d,
-	"inv":            0x0e,
-	"mempool":        0x0f,
-	"merkleblock":    0x10,
-	"notfound":       0x11,
-	"ping":           0x12,
-	"pong":           0x13,
-	"sendcmpct":      0x14,
-	"tx":             0x15,
-	"getcfilters":    0x16,
-	"cfilter":        0x17,
-	"getcfheaders":   0x18,
-	"cfheaders":      0x19,
-	"getcfcheckpt":   0x1a,
-	"cfcheckpt":      0x1b,
-	"addrv2":         0x1c,
-	"wtxidrelay":     0x1d,
-	"sendaddrv2":     0x1e,
-	"sendheaders":    0x1f,
-	"version":        0x20,
-	"verack":         0x21,
-	"getaddr":        0x22,
+	"addr":         0x01,
+	"block":        0x02,
+	"blocktxn":     0x03,
+	"cmpctblock":   0x04,
+	"feefilter":    0x05,
+	"filteradd":    0x06,
+	"filterclear":  0x07,
+	"filterload":   0x08,
+	"getblocks":    0x09,
+	"getblocktxn":  0x0a,
+	"getdata":      0x0b,
+	"getheaders":   0x0c,
+	"headers":      0x0d,
+	"inv":          0x0e,
+	"mempool":      0x0f,
+	"merkleblock":  0x10,
+	"notfound":     0x11,
+	"ping":         0x12,
+	"pong":         0x13,
+	"sendcmpct":    0x14,
+	"tx":           0x15,
+	"getcfilters":  0x16,
+	"cfilter":      0x17,
+	"getcfheaders": 0x18,
+	"cfheaders":    0x19,
+	"getcfcheckpt": 0x1a,
+	"cfcheckpt":    0x1b,
+	"addrv2":       0x1c,
 }
 
 var shortMsgTypesReverse = func() map[byte]string {
