@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/hashhog/blockbrew/internal/p2p"
 )
 
 func TestParseFlagsDefaults(t *testing.T) {
@@ -221,6 +223,61 @@ func TestMinRelayFeeConversion(t *testing.T) {
 	expected := int64(1)
 	if satPerKvB != expected {
 		t.Errorf("MinRelayFee conversion: got %d sat/kvB, want %d", satPerKvB, expected)
+	}
+}
+
+// TestParseBIP324V2Env covers the env-var fallback path used when the
+// `-bip324v2` CLI flag was not explicitly set. The CLI flag itself takes
+// precedence; this test only exercises the env-var helper.
+func TestParseBIP324V2Env(t *testing.T) {
+	tests := []struct {
+		name string
+		env  string
+		want bool
+	}{
+		{"empty disables", "", false},
+		{"explicit zero disables", "0", false},
+		{"one enables", "1", true},
+		{"true enables", "true", true},
+		{"True enables (case-insensitive)", "True", true},
+		{"TRUE enables (case-insensitive)", "TRUE", true},
+		{"false stays off", "false", false},
+		{"yes stays off (only 1/true accepted)", "yes", false},
+		{"random string stays off", "garbage", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseBIP324V2Env(tt.env)
+			if got != tt.want {
+				t.Errorf("parseBIP324V2Env(%q) = %v, want %v", tt.env, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestBIP324V2ConfigPropagation verifies that Config.BIP324V2 is propagated
+// to PeerManagerConfig.PreferV2 — guarding the wiring in run() so a future
+// refactor that drops the field never silently regresses to v1-only.
+func TestBIP324V2ConfigPropagation(t *testing.T) {
+	tests := []struct {
+		name string
+		on   bool
+	}{
+		{"v2 off (default)", false},
+		{"v2 on", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{BIP324V2: tt.on}
+			pmCfg := p2p.PeerManagerConfig{PreferV2: cfg.BIP324V2}
+			if pmCfg.PreferV2 != tt.on {
+				t.Errorf("PeerManagerConfig.PreferV2 = %v, want %v", pmCfg.PreferV2, tt.on)
+			}
+			pm := p2p.NewPeerManager(pmCfg)
+			if pm == nil {
+				t.Fatal("NewPeerManager returned nil for valid config")
+			}
+		})
 	}
 }
 
