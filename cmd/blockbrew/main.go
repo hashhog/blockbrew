@@ -70,29 +70,35 @@ type Config struct {
 
 	// BIP-324 v2 transport opt-in. When true, both new outbound dials and
 	// inbound classification negotiate the v2 (encrypted) transport with a
-	// fall-through to v1 plaintext. Default OFF until the cross-impl interop
-	// matrix confirms parity with every other hashhog node — the in-process
-	// round-trip tests pass (peer_test, transport_test) but cross-impl
-	// behavior across the 10 node fleet has not yet been live-verified end
-	// to end. See `tools/bip324-interop-matrix.sh`.
+	// fall-through to v1 plaintext. Default ON since end-to-end interop
+	// matrix shows blockbrew→ouroboros and ouroboros→blockbrew as v2/v2
+	// (Phase C) and the cipher fix (`7351ce8`) plus libsecp256k1-cgo
+	// EllSwift binding (`b3ac162`) make the in-process tests stable.
+	// Bitcoin Core ≥26 defaults `-v2transport=1` since 2024; we match.
 	//
-	// Settable via `-bip324v2` CLI flag or `BLOCKBREW_BIP324_V2=1` env var.
-	// CLI flag takes precedence when both are set.
+	// Settable via `-bip324v2` CLI flag (`-bip324v2=false` to opt out) or
+	// `BLOCKBREW_BIP324_V2` env var (`0` / `false` to opt out, `1` /
+	// `true` to opt in).  CLI flag takes precedence when both are set.
 	BIP324V2 bool
 }
 
-// parseBIP324V2Env returns true iff the BLOCKBREW_BIP324_V2 env-var value
-// represents an "on" toggle. Accepts "1", "true" (case-insensitive). Anything
-// else (including empty) returns false. Kept separate from parseFlags() so
-// the propagation can be unit-tested without touching flag.Parse() globals.
-func parseBIP324V2Env(v string) bool {
+// parseBIP324V2Env interprets the BLOCKBREW_BIP324_V2 env-var value as a
+// tristate: "1"/"true" → enable, "0"/"false" → disable, anything else
+// (including empty) → use `defaultOn`.  The defaultOn parameter is the
+// compiled-in default for cases where the env var is unset or
+// unrecognised.  Kept separate from parseFlags() so the propagation can
+// be unit-tested without touching flag.Parse() globals.
+func parseBIP324V2Env(v string, defaultOn bool) bool {
 	if v == "" {
-		return false
+		return defaultOn
 	}
-	if v == "1" {
+	if v == "1" || strings.EqualFold(v, "true") {
 		return true
 	}
-	return strings.EqualFold(v, "true")
+	if v == "0" || strings.EqualFold(v, "false") {
+		return false
+	}
+	return defaultOn
 }
 
 // computeCacheSplit returns (utxoCacheBytes, pebbleBlockCacheBytes) for a
@@ -202,13 +208,14 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.ParallelScripts, "parallelscripts", true, "Enable parallel script validation")
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
-	flag.BoolVar(&cfg.BIP324V2, "bip324v2", false, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Also settable via BLOCKBREW_BIP324_V2=1.")
+	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
 	flag.Parse()
 
-	// Env-var fallback: BLOCKBREW_BIP324_V2=1 enables v2 if the CLI flag
-	// wasn't explicitly set. CLI flag wins when both are present (the env
-	// var is checked only if the user didn't pass -bip324v2 on the command
-	// line — flag.Visit walks only flags that were actually set).
+	// Env-var fallback: BLOCKBREW_BIP324_V2=0/1 overrides the compiled-in
+	// default if the CLI flag wasn't explicitly set. CLI flag wins when
+	// both are present (the env var is checked only if the user didn't
+	// pass -bip324v2 on the command line — flag.Visit walks only flags
+	// that were actually set).  Default is ON.
 	cliBIP324V2Set := false
 	flag.Visit(func(f *flag.Flag) {
 		if f.Name == "bip324v2" {
@@ -216,7 +223,7 @@ func parseFlags() *Config {
 		}
 	})
 	if !cliBIP324V2Set {
-		cfg.BIP324V2 = parseBIP324V2Env(os.Getenv("BLOCKBREW_BIP324_V2"))
+		cfg.BIP324V2 = parseBIP324V2Env(os.Getenv("BLOCKBREW_BIP324_V2"), true)
 	}
 
 	if cfg.ListenP2P == "" {
@@ -1220,8 +1227,9 @@ func printHelp() {
 	fmt.Println("  --version       Print version and exit")
 	fmt.Println("  --pprof         pprof HTTP server address (e.g., localhost:6060)")
 	fmt.Println("  --parallelscripts  Enable parallel script validation (default: true)")
-	fmt.Println("  --bip324v2      Enable BIP-324 v2 encrypted transport (default: false)")
-	fmt.Println("                  Also settable via env: BLOCKBREW_BIP324_V2=1")
+	fmt.Println("  --bip324v2      Enable BIP-324 v2 encrypted transport (default: true)")
+	fmt.Println("                  Pass -bip324v2=false to opt out. Also via env:")
+	fmt.Println("                  BLOCKBREW_BIP324_V2=0 (off) or =1 (on; default)")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  blockbrew                                           Start node on mainnet")
