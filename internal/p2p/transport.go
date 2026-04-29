@@ -104,13 +104,23 @@ const (
 )
 
 // V2Transport implements the v2 (encrypted) P2P transport per BIP324.
+//
+// Thread-safety: the BIP-324 cipher splits send and receive into independent
+// FSChaCha20 / FSChaCha20Poly1305 instances, so post-handshake reads and
+// writes never share mutable cipher state.  We therefore use separate
+// mutexes for the read and write paths so a long-running readHandler
+// (blocked in io.ReadFull waiting for the next packet) cannot starve the
+// writeHandler.  The handshake itself uses both ciphers and is single-
+// threaded by construction (only one goroutine calls Handshake), so it
+// just takes both locks.
 type V2Transport struct {
-	conn        net.Conn
-	magic       uint32
-	cipher      *BIP324Cipher
-	initiator   bool
-	state       V2TransportState
-	mu          sync.Mutex
+	conn      net.Conn
+	magic     uint32
+	cipher    *BIP324Cipher
+	initiator bool
+	state     V2TransportState
+	sendMu    sync.Mutex
+	recvMu    sync.Mutex
 
 	// Handshake data
 	ourGarbage   []byte
@@ -156,9 +166,15 @@ func NewV2TransportWithKey(conn net.Conn, magic uint32, initiator bool, privKey,
 
 // Handshake performs the v2 handshake.
 // Returns an error if the handshake fails, or if the peer only supports v1.
+//
+// The handshake mutates both send and receive cipher state, so we hold
+// both mutexes — but no concurrent Read/Write can happen while we're in
+// the handshake (state != V2StateReady) so this is purely a safety belt.
 func (t *V2Transport) Handshake() error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
+	t.recvMu.Lock()
+	defer t.recvMu.Unlock()
 
 	if t.initiator {
 		return t.initiatorHandshake()
@@ -384,9 +400,12 @@ func (t *V2Transport) readVersionPacket() error {
 }
 
 // ReadMessage reads an encrypted message from the v2 transport.
+//
+// Locks recvMu only; writes can proceed concurrently because the BIP-324
+// cipher uses independent send/recv FSChaCha20 instances.
 func (t *V2Transport) ReadMessage() (Message, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.recvMu.Lock()
+	defer t.recvMu.Unlock()
 
 	if t.state != V2StateReady {
 		return nil, errors.New("transport not ready")
@@ -449,9 +468,12 @@ func (t *V2Transport) ReadMessage() (Message, error) {
 }
 
 // WriteMessage writes an encrypted message to the v2 transport.
+//
+// Locks sendMu only; reads can proceed concurrently (independent cipher
+// state on each direction).
 func (t *V2Transport) WriteMessage(msg Message) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
 
 	if t.state != V2StateReady {
 		return errors.New("transport not ready")
@@ -481,9 +503,12 @@ func (t *V2Transport) WriteMessage(msg Message) error {
 }
 
 // SendDecoy sends a decoy message for traffic analysis resistance.
+//
+// Decoys go through the send cipher only, so we hold sendMu (matches
+// WriteMessage).  Reads concurrently are safe.
 func (t *V2Transport) SendDecoy(length int) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	t.sendMu.Lock()
+	defer t.sendMu.Unlock()
 
 	if t.state != V2StateReady {
 		return errors.New("transport not ready")
