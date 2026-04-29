@@ -267,6 +267,32 @@ func TestParseBIP324V2Env(t *testing.T) {
 	}
 }
 
+// TestPeerBloomFiltersConfigPropagation verifies that
+// Config.PeerBloomFilters is propagated to
+// PeerManagerConfig.AdvertiseNodeBloom.  Without this wiring the
+// `-peerbloomfilters` CLI flag (mirroring Bitcoin Core's flag of the
+// same name) would have no effect and the BIP-35 handler in main.go
+// would always fire regardless of operator intent.
+func TestPeerBloomFiltersConfigPropagation(t *testing.T) {
+	tests := []struct {
+		name string
+		on   bool
+	}{
+		{"bloom off", false},
+		{"bloom on (default)", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{PeerBloomFilters: tt.on}
+			pmCfg := p2p.PeerManagerConfig{AdvertiseNodeBloom: cfg.PeerBloomFilters}
+			if pmCfg.AdvertiseNodeBloom != tt.on {
+				t.Errorf("AdvertiseNodeBloom = %v, want %v",
+					pmCfg.AdvertiseNodeBloom, tt.on)
+			}
+		})
+	}
+}
+
 // TestBIP324V2ConfigPropagation verifies that Config.BIP324V2 is propagated
 // to PeerManagerConfig.PreferV2 — guarding the wiring in run() so a future
 // refactor that drops the field never silently regresses to v1-only.

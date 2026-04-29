@@ -132,3 +132,44 @@ func TestPeerDispatchesMempool(t *testing.T) {
 		t.Fatal("OnMempool listener was not invoked by handleMessage")
 	}
 }
+
+// TestPeerManagerAdvertisesNodeBloom verifies that PeerManager.makePeerConfig
+// advertises NODE_BLOOM in the version handshake's service bits when (and
+// only when) `AdvertiseNodeBloom` is true.  This is the on-the-wire half of
+// the BIP-35 / BIP-111 fix — Bitcoin Core gates the MEMPOOL handler on
+// `peer.m_our_services & NODE_BLOOM` (net_processing.cpp:4855) and OR's
+// NODE_BLOOM in only when `-peerbloomfilters` is true (init.cpp:1104).
+func TestPeerManagerAdvertisesNodeBloom(t *testing.T) {
+	tests := []struct {
+		name      string
+		advertise bool
+		wantBit   bool
+	}{
+		{"peerbloomfilters off — no NODE_BLOOM", false, false},
+		{"peerbloomfilters on — NODE_BLOOM advertised", true, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pm := NewPeerManager(PeerManagerConfig{
+				Network:            0xD9B4BEF9,
+				MaxOutbound:        8,
+				MaxInbound:         117,
+				UserAgent:          "/blockbrew:test/",
+				AdvertiseNodeBloom: tt.advertise,
+			})
+			cfg := pm.makePeerConfig()
+			has := cfg.Services&ServiceNodeBloom != 0
+			if has != tt.wantBit {
+				t.Errorf("Services & NODE_BLOOM = %v (Services=0x%x), want %v",
+					has, cfg.Services, tt.wantBit)
+			}
+			// Always advertise the baseline bits regardless of bloom flag.
+			if cfg.Services&ServiceNodeNetwork == 0 {
+				t.Error("NODE_NETWORK bit missing from advertised services")
+			}
+			if cfg.Services&ServiceNodeWitness == 0 {
+				t.Error("NODE_WITNESS bit missing from advertised services")
+			}
+		})
+	}
+}

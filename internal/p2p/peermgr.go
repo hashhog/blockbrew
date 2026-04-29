@@ -118,6 +118,14 @@ type PeerManagerConfig struct {
 	// peeks 64 bytes; v1 peers fall through to legacy plaintext via the
 	// prefixed-conn shim in transport.go.
 	PreferV2 bool
+
+	// AdvertiseNodeBloom controls whether NODE_BLOOM (BIP-111) is OR'd
+	// into our advertised service bits in the version handshake.  This is
+	// the gate Bitcoin Core uses for honoring BIP-35 "mempool" requests
+	// (net_processing.cpp:4855 — `peer.m_our_services & NODE_BLOOM`).
+	// Wired from the top-level `-peerbloomfilters` flag.  Default false
+	// in this struct's zero value; main.go always sets it explicitly.
+	AdvertiseNodeBloom bool
 }
 
 // BanInfo contains information about a banned peer.
@@ -1235,10 +1243,24 @@ func (pm *PeerManager) makePeerConfig() PeerConfig {
 	// Wrap the OnAddr listener to add addresses to our book
 	listeners := pm.wrapListeners()
 
+	// Advertised service bits.  NODE_BLOOM (BIP-111) is OR'd in only when
+	// `-peerbloomfilters` is on (default), mirroring Core's init.cpp:1104:
+	//
+	//     if (args.GetBoolArg("-peerbloomfilters", DEFAULT_PEERBLOOMFILTERS))
+	//         g_local_services = ServiceFlags(g_local_services | NODE_BLOOM);
+	//
+	// Advertising NODE_BLOOM tells peers we will honor BIP-35 "mempool"
+	// requests; main.go's OnMempool gate uses the same flag so the
+	// advertisement and the handler stay in sync.
+	services := uint64(ServiceNodeNetwork | ServiceNodeWitness)
+	if pm.config.AdvertiseNodeBloom {
+		services |= ServiceNodeBloom
+	}
+
 	return PeerConfig{
 		Network:         pm.config.Network,
 		ProtocolVersion: ProtocolVersion,
-		Services:        ServiceNodeNetwork | ServiceNodeWitness,
+		Services:        services,
 		UserAgent:       pm.config.UserAgent,
 		BestHeight:      bestHeight,
 		DisableRelayTx:  false,

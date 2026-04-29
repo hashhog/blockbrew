@@ -80,6 +80,17 @@ type Config struct {
 	// `BLOCKBREW_BIP324_V2` env var (`0` / `false` to opt out, `1` /
 	// `true` to opt in).  CLI flag takes precedence when both are set.
 	BIP324V2 bool
+
+	// PeerBloomFilters controls advertisement of the BIP-111 NODE_BLOOM
+	// service bit and is the gate for serving BIP-35 "mempool" requests.
+	// Mirrors Bitcoin Core's `-peerbloomfilters` flag (see init.cpp:1104):
+	// when true, NODE_BLOOM is OR'd into our advertised services in the
+	// version handshake, and incoming "mempool" messages are honored.
+	// When false, peers see no NODE_BLOOM bit and "mempool" requests are
+	// silently ignored (Core disconnects; we simply drop, matching the
+	// rest of blockbrew's permissive eviction policy).  Default true,
+	// matching Core's DEFAULT_PEERBLOOMFILTERS.
+	PeerBloomFilters bool
 }
 
 // parseBIP324V2Env interprets the BLOCKBREW_BIP324_V2 env-var value as a
@@ -209,6 +220,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
+	flag.BoolVar(&cfg.PeerBloomFilters, "peerbloomfilters", true, "Advertise NODE_BLOOM (BIP-111) and honor BIP-35 \"mempool\" requests. Default ON, matching Bitcoin Core's DEFAULT_PEERBLOOMFILTERS. Pass `-peerbloomfilters=false` to opt out.")
 	flag.Parse()
 
 	// Env-var fallback: BLOCKBREW_BIP324_V2=0/1 overrides the compiled-in
@@ -414,7 +426,8 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			_, h := chainMgr.BestBlock()
 			return h
 		},
-		PreferV2: cfg.BIP324V2,
+		PreferV2:           cfg.BIP324V2,
+		AdvertiseNodeBloom: cfg.PeerBloomFilters,
 	})
 
 	// 8. Initialize wallet early so sync callbacks can reference it
@@ -470,18 +483,27 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	// BIP35 "mempool" handler: peer requests our mempool contents → respond
 	// with one or more inv messages enumerating mempool txids.  Mirrors
-	// Bitcoin Core's net_processing.cpp NetMsgType::MEMPOOL handler.
+	// Bitcoin Core's net_processing.cpp NetMsgType::MEMPOOL handler:
 	//
-	// Gating: blockbrew does not advertise BIP111 NODE_BLOOM and has no
-	// per-peer permission system (no equivalent of Core's
-	// NetPermissionFlags::Mempool), so the only filter applied is the
-	// peer's WantsTxRelay() flag — peers that disabled tx relay in their
-	// version message are skipped.  This is more permissive than modern
-	// Core but no less safe: we never serve transactions we wouldn't
-	// otherwise relay, and the response is bounded by the local mempool
-	// size (see DefaultConfig in internal/mempool).
+	//     if (!(peer.m_our_services & NODE_BLOOM) &&
+	//         !pfrom.HasPermission(NetPermissionFlags::Mempool))
+	//         return;
+	//
+	// Gate: BIP-35 is gated on whether *we* advertise NODE_BLOOM (BIP-111),
+	// not on the peer's fRelay bit (which is BIP-37 and controls only
+	// whether we relay txs to that peer absent a bloom filter).  Core's
+	// MEMPOOL handler does not check fRelay before sending the inv —
+	// queueing a `m_send_mempool` flag that the next inv flush honors —
+	// so we don't either.  blockbrew has no per-peer permission system
+	// (no equivalent of Core's NetPermissionFlags::Mempool), so the only
+	// gate is the local NODE_BLOOM advertisement controlled by
+	// `-peerbloomfilters` (default true).  When the flag is off we
+	// silently drop the request rather than disconnecting; Core
+	// disconnects, but blockbrew's permissive eviction policy applies
+	// elsewhere too.
+	bloomEnabled := cfg.PeerBloomFilters
 	syncListeners.OnMempool = func(peer *p2p.Peer, _ *p2p.MsgMempool) {
-		if !peer.WantsTxRelay() {
+		if !bloomEnabled {
 			return
 		}
 		invs := p2p.HandleMempoolRequest(peer, mp)
@@ -508,7 +530,8 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		OnPeerDisconnected: func(p *p2p.Peer) {
 			syncMgr.HandlePeerDisconnected(p)
 		},
-		PreferV2: cfg.BIP324V2,
+		PreferV2:           cfg.BIP324V2,
+		AdvertiseNodeBloom: cfg.PeerBloomFilters,
 	})
 
 	// Wire the peer manager back into the sync manager (breaks circular dependency)

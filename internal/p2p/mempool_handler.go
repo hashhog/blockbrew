@@ -24,9 +24,12 @@ type MempoolTxidProvider interface {
 // RelayTransaction announcement convention (see peermgr.go).
 //
 // Gating: this function does NOT enforce the BIP111 NODE_BLOOM /
-// permission policy that Bitcoin Core's handler does — blockbrew does not
-// advertise NODE_BLOOM and has no per-peer permission system, so the
-// caller is responsible for any policy checks (e.g. WantsTxRelay).
+// permission policy that Bitcoin Core's handler does.  The caller is
+// responsible for the policy check — main.go gates invocation on
+// `cfg.PeerBloomFilters` (the same flag that controls whether
+// NODE_BLOOM is OR'd into the advertised service bits in peermgr.go),
+// matching Core's `peer.m_our_services & NODE_BLOOM` test in
+// net_processing.cpp:4855.
 //
 // If provider is nil, returns nil and the caller should silently ignore
 // the request (avoids a nil-deref while keeping the dispatcher trivial).
