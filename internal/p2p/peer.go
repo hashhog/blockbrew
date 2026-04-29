@@ -243,6 +243,12 @@ func NewOutboundPeer(addr string, config PeerConfig) (*Peer, error) {
 		} else {
 			p.transport = transport
 			p.v2Transport = transport.IsEncrypted()
+			if p.v2Transport {
+				// Positive v2-success log so the cross-impl BIP-324 interop
+				// matrix harness can classify blockbrew-as-dialer pairs as
+				// v2 instead of "unknown" (Phase D parity fix).
+				log.Printf("BIP-324 v2 outbound connected (encrypted) peer=%s", p.addr)
+			}
 		}
 	} else {
 		p.transport = NewV1Transport(conn, config.Network)
@@ -384,6 +390,10 @@ func (p *Peer) negotiateInboundTransport() error {
 		p.mu.Lock()
 		p.v2Transport = true
 		p.mu.Unlock()
+		// Positive v2-success log so the cross-impl BIP-324 interop matrix
+		// harness can classify blockbrew-as-listener pairs as v2 instead of
+		// "unknown" (Phase D parity fix).
+		log.Printf("BIP-324 v2 inbound connected (encrypted) peer=%s", p.addr)
 	}
 	return nil
 }
