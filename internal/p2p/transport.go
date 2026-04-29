@@ -167,55 +167,92 @@ func (t *V2Transport) Handshake() error {
 }
 
 // initiatorHandshake performs the initiator's side of the v2 handshake.
+//
+// The wire-level interleaving is delicate because both sides start by sending
+// pubkey+garbage and then need each other's pubkey to derive the cipher
+// keys.  We use one goroutine for all sends (which can include arbitrarily
+// large garbage) so reads on the main goroutine cannot deadlock on pipe
+// back-pressure.  This matches the event-driven approach in
+// bitcoin-core/src/net.cpp::V2Transport (clearbit/peer.zig:performV2Handshake
+// uses the same pattern).
+//
+// Wire shape:
+//
+//	->  pubkey || garbage
+//	<-  pubkey || garbage || garbage_terminator || version_packet
+//	->  garbage_terminator || version_packet
 func (t *V2Transport) initiatorHandshake() error {
-	// Step 1: Send our ElligatorSwift public key + garbage
 	ourPubKey := t.cipher.GetOurPubKey()
-	sendData := make([]byte, EllSwiftPubKeySize+len(t.ourGarbage))
-	copy(sendData[0:EllSwiftPubKeySize], ourPubKey[:])
-	copy(sendData[EllSwiftPubKeySize:], t.ourGarbage)
 
-	if _, err := t.conn.Write(sendData); err != nil {
-		return fmt.Errorf("send pubkey: %w", err)
+	// Drive our outbound bytes from a goroutine.  The first chunk
+	// (pubkey + garbage) is queued before we know the peer's pubkey;
+	// the second chunk (terminator + version_packet) is computed only
+	// after we receive the peer's pubkey, then signaled via a channel.
+	type sendStage struct {
+		data []byte
 	}
+	stage := make(chan sendStage, 2)
+	sendErrCh := make(chan error, 1)
 
-	// Step 2: Read their ElligatorSwift public key
+	go func() {
+		for chunk := range stage {
+			if _, err := t.conn.Write(chunk.data); err != nil {
+				sendErrCh <- err
+				return
+			}
+		}
+		sendErrCh <- nil
+	}()
+
+	// Step 1: queue pubkey + garbage immediately.
+	first := make([]byte, EllSwiftPubKeySize+len(t.ourGarbage))
+	copy(first[0:EllSwiftPubKeySize], ourPubKey[:])
+	copy(first[EllSwiftPubKeySize:], t.ourGarbage)
+	stage <- sendStage{first}
+
+	// Step 2: read their pubkey (64 bytes).
 	theirPubKeyBytes := make([]byte, EllSwiftPubKeySize)
 	if _, err := io.ReadFull(t.conn, theirPubKeyBytes); err != nil {
+		close(stage)
 		return fmt.Errorf("read pubkey: %w", err)
 	}
-
 	var theirPubKey crypto.EllSwiftPubKey
 	copy(theirPubKey[:], theirPubKeyBytes)
 
-	// Step 3: Initialize cipher
+	// Step 3: derive cipher state.
 	if err := t.cipher.InitializeWithMagic(theirPubKey, true, t.magic); err != nil {
+		close(stage)
 		return fmt.Errorf("init cipher: %w", err)
 	}
 
-	// Step 4: Read their garbage + garbage terminator
+	// Step 4: queue our terminator + version_packet now that the cipher is
+	// ready.  Per BIP-324 the version packet's AAD is our sent garbage.
+	versionPacket, err := t.cipher.Encrypt(nil, t.ourGarbage, false)
+	if err != nil {
+		close(stage)
+		return fmt.Errorf("encrypt version: %w", err)
+	}
+	ourGarbageTerminator := t.cipher.GetSendGarbageTerminator()
+	second := make([]byte, GarbageTerminatorLen+len(versionPacket))
+	copy(second[0:GarbageTerminatorLen], ourGarbageTerminator[:])
+	copy(second[GarbageTerminatorLen:], versionPacket)
+	stage <- sendStage{second}
+	close(stage)
+
+	// Step 5: scan for their garbage terminator.
 	theirGarbageTerminator := t.cipher.GetRecvGarbageTerminator()
 	if err := t.readGarbageAndTerminator(theirGarbageTerminator[:]); err != nil {
 		return fmt.Errorf("read garbage: %w", err)
 	}
 
-	// Step 5: Read and decrypt their version packet
+	// Step 6: read & decrypt their version packet (AAD = their garbage).
 	if err := t.readVersionPacket(); err != nil {
 		return fmt.Errorf("read version packet: %w", err)
 	}
 
-	// Step 6: Send our garbage terminator + version packet
-	ourGarbageTerminator := t.cipher.GetSendGarbageTerminator()
-	if _, err := t.conn.Write(ourGarbageTerminator[:]); err != nil {
-		return fmt.Errorf("send garbage terminator: %w", err)
-	}
-
-	// Send version packet (empty content, our garbage as AAD)
-	versionPacket, err := t.cipher.Encrypt(nil, t.ourGarbage, false)
-	if err != nil {
-		return fmt.Errorf("encrypt version: %w", err)
-	}
-	if _, err := t.conn.Write(versionPacket); err != nil {
-		return fmt.Errorf("send version: %w", err)
+	// Make sure all of our writes flushed before we declare success.
+	if err := <-sendErrCh; err != nil {
+		return fmt.Errorf("send: %w", err)
 	}
 
 	t.state = V2StateReady
@@ -282,30 +319,38 @@ func (t *V2Transport) responderHandshake() error {
 	return nil
 }
 
-// readGarbageAndTerminator reads garbage data until the garbage terminator is found.
+// readGarbageAndTerminator reads garbage data until the garbage terminator
+// is found, scanning the trailing 16-byte window after each new byte.
+//
+// We must read at least 16 bytes before checking — peers MAY send 0-byte
+// garbage, in which case the terminator arrives in the first 16 bytes.
+// Reading byte-by-byte after the initial bulk read keeps us aligned with
+// the wire shape Bitcoin Core / ouroboros / clearbit use.
 func (t *V2Transport) readGarbageAndTerminator(terminator []byte) error {
-	// Read up to MaxGarbageLen + GarbageTerminatorLen bytes, looking for terminator
 	maxRead := MaxGarbageLen + GarbageTerminatorLen
-	buffer := make([]byte, 0, maxRead)
 
-	for len(buffer) < maxRead {
-		// Read one byte at a time (could be optimized)
+	// Bulk-read the first GarbageTerminatorLen (16) bytes; the smallest
+	// case (zero-length garbage) puts the terminator entirely inside this
+	// initial window.
+	buffer := make([]byte, GarbageTerminatorLen, maxRead)
+	if _, err := io.ReadFull(t.conn, buffer); err != nil {
+		return err
+	}
+
+	for {
+		if bytes.Equal(buffer[len(buffer)-GarbageTerminatorLen:], terminator) {
+			t.theirGarbage = buffer[:len(buffer)-GarbageTerminatorLen]
+			return nil
+		}
+		if len(buffer) >= maxRead {
+			return errors.New("garbage terminator not found within MaxGarbageLen window")
+		}
 		var b [1]byte
 		if _, err := io.ReadFull(t.conn, b[:]); err != nil {
 			return err
 		}
 		buffer = append(buffer, b[0])
-
-		// Check if buffer ends with terminator
-		if len(buffer) >= GarbageTerminatorLen {
-			if bytes.Equal(buffer[len(buffer)-GarbageTerminatorLen:], terminator) {
-				t.theirGarbage = buffer[:len(buffer)-GarbageTerminatorLen]
-				return nil
-			}
-		}
 	}
-
-	return errors.New("garbage terminator not found")
 }
 
 // readVersionPacket reads and decrypts the version packet.
@@ -483,9 +528,24 @@ func (t *V2Transport) SetWriteDeadline(deadline time.Time) error {
 	return t.conn.SetWriteDeadline(deadline)
 }
 
-// NegotiateTransport attempts to establish a v2 connection, falling back to v1 if needed.
-// For outbound connections, this tries v2 first.
-// For inbound connections, this detects v1 vs v2 based on the first bytes.
+// NegotiateTransport attempts to establish a v2 connection, falling back to
+// v1 if needed.
+//
+// For outbound connections this drives the v2 initiator handshake.  For
+// inbound connections it peeks the first 64 bytes to classify v1 vs v2:
+//
+//   - v1: bytes 0..15 match `magic || "version\0\0\0\0\0"`.  The peeked
+//     bytes are preserved on a `prefixedConn` and a V1Transport is
+//     returned, so the caller can continue reading the v1 frame normally.
+//   - v2: those 64 bytes are treated as the peer's ElligatorSwift public
+//     key; we initialise the responder cipher and drive the rest of the
+//     BIP-324 handshake.
+//
+// The responder send/receive path uses a goroutine for the outbound bytes
+// because both sides queue up to ~4 KB of garbage during the handshake and
+// net.Pipe / kernel pipe buffers can stall a synchronous Write/Read order.
+// This mirrors the event-driven I/O Bitcoin Core uses in V2Transport
+// (src/net.cpp).
 func NegotiateTransport(conn net.Conn, magic uint32, initiator, preferV2 bool) (Transport, error) {
 	if !preferV2 {
 		return NewV1Transport(conn, magic), nil
@@ -506,17 +566,16 @@ func NegotiateTransport(conn net.Conn, magic uint32, initiator, preferV2 bool) (
 		return v2, nil
 	}
 
-	// For inbound, peek at first bytes to detect v1 vs v2
-	// Read first 64 bytes (ElligatorSwift pubkey size)
+	// Inbound: peek the first 64 bytes (ElligatorSwift pubkey size) and
+	// classify v1 vs v2.
 	firstBytes := make([]byte, EllSwiftPubKeySize)
 	if _, err := io.ReadFull(conn, firstBytes); err != nil {
 		return nil, fmt.Errorf("read first bytes: %w", err)
 	}
 
-	// Check for v1 magic
+	// v1 fast path: prefix the already-read bytes back onto the conn so
+	// the v1 reader sees an intact frame.
 	if CheckV1Magic(firstBytes, magic) {
-		// This is a v1 connection, need to process the rest of the header
-		// Create a prefixed reader
 		prefixedConn := &prefixedConn{
 			prefix: firstBytes,
 			conn:   conn,
@@ -524,13 +583,16 @@ func NegotiateTransport(conn net.Conn, magic uint32, initiator, preferV2 bool) (
 		return NewV1Transport(prefixedConn, magic), nil
 	}
 
-	// This appears to be v2, create transport and continue handshake
+	// v2 path: those 64 bytes are the peer's pubkey.  Drive the responder
+	// handshake, with all sends going through a goroutine so we don't
+	// deadlock on synchronous pipe back-pressure (the peer can't send its
+	// terminator until it sees our pubkey, but our pubkey send may need
+	// kernel buffer space its garbage hasn't yet vacated).
 	v2, err := NewV2Transport(conn, magic, false)
 	if err != nil {
 		return nil, err
 	}
 
-	// Feed the already-read pubkey into the cipher initialization
 	var theirPubKey crypto.EllSwiftPubKey
 	copy(theirPubKey[:], firstBytes)
 
@@ -538,16 +600,9 @@ func NegotiateTransport(conn net.Conn, magic uint32, initiator, preferV2 bool) (
 		return nil, fmt.Errorf("init cipher: %w", err)
 	}
 
-	// Continue with garbage terminator reading
-	theirGarbageTerminator := v2.cipher.GetRecvGarbageTerminator()
-	if err := v2.readGarbageAndTerminator(theirGarbageTerminator[:]); err != nil {
-		return nil, fmt.Errorf("read garbage: %w", err)
-	}
-
-	// Send our response
+	// Build the full responder reply: pubkey || garbage || terminator || version_packet.
 	ourPubKey := v2.cipher.GetOurPubKey()
 	ourGarbageTerminator := v2.cipher.GetSendGarbageTerminator()
-
 	versionPacket, err := v2.cipher.Encrypt(nil, v2.ourGarbage, false)
 	if err != nil {
 		return nil, fmt.Errorf("encrypt version: %w", err)
@@ -563,13 +618,34 @@ func NegotiateTransport(conn net.Conn, magic uint32, initiator, preferV2 bool) (
 	offset += GarbageTerminatorLen
 	copy(sendData[offset:], versionPacket)
 
-	if _, err := conn.Write(sendData); err != nil {
-		return nil, fmt.Errorf("send response: %w", err)
+	// Drive the write from a goroutine so the upcoming
+	// readGarbageAndTerminator (which scans byte-by-byte through the
+	// peer's garbage) isn't blocked behind our Write completing.
+	sendErrCh := make(chan error, 1)
+	go func() {
+		_, werr := conn.Write(sendData)
+		sendErrCh <- werr
+	}()
+
+	// Now read the peer's garbage + terminator.  This consumes from the
+	// initiator's first send (pubkey+garbage); the initiator queues
+	// terminator+version_packet only AFTER it observes our pubkey, which
+	// reaches the wire above.
+	theirGarbageTerminator := v2.cipher.GetRecvGarbageTerminator()
+	if err := v2.readGarbageAndTerminator(theirGarbageTerminator[:]); err != nil {
+		return nil, fmt.Errorf("read garbage: %w", err)
 	}
 
-	// Read their version packet
+	// Read their version packet (AAD = their garbage).
 	if err := v2.readVersionPacket(); err != nil {
 		return nil, fmt.Errorf("read version packet: %w", err)
+	}
+
+	// Make sure our send goroutine flushed everything before we report
+	// success — otherwise application messages could race in front of
+	// the version packet on the wire.
+	if werr := <-sendErrCh; werr != nil {
+		return nil, fmt.Errorf("send response: %w", werr)
 	}
 
 	v2.state = V2StateReady

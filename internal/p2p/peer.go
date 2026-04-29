@@ -252,6 +252,12 @@ func NewOutboundPeer(addr string, config PeerConfig) (*Peer, error) {
 }
 
 // NewInboundPeer wraps an already-accepted TCP connection as an inbound peer.
+//
+// The transport is provisioned with a temporary V1Transport so any code path
+// that touches `p.transport` before Start() (deadlines, Disconnect, tests)
+// has a non-nil value to work with.  The real transport — v1 or v2,
+// classified by peeking 64 bytes from the connection — is established by
+// Start() before the read/write goroutines launch.  See peer.go:negotiateInboundTransport.
 func NewInboundPeer(conn net.Conn, config PeerConfig) *Peer {
 	// Generate our local nonce for self-connection detection
 	localNonce, _ := randomUint64()
@@ -271,9 +277,9 @@ func NewInboundPeer(conn net.Conn, config PeerConfig) *Peer {
 
 	p.setupConn()
 
-	// For inbound, we'll negotiate transport during Start() since we need to
-	// detect whether the peer is using v1 or v2 based on first bytes.
-	// For now, default to v1 - the actual negotiation happens in Start().
+	// Placeholder; replaced by negotiateInboundTransport during Start() when
+	// PreferV2 is set.  Required so accidental early p.transport access
+	// (e.g. from a misuse in tests or a racy Disconnect()) doesn't NPE.
 	p.transport = NewV1Transport(conn, config.Network)
 
 	return p
@@ -291,10 +297,26 @@ func (p *Peer) setupConn() {
 }
 
 // Start begins the peer's read/write goroutines and initiates the handshake.
+//
+// For inbound connections that opted into BIP-324 v2 (config.PreferV2 set on
+// the listener side), Start() drives the v1-vs-v2 classification and v2
+// responder handshake BEFORE launching the read/write goroutines, so the
+// goroutines never observe the placeholder V1Transport when the peer is
+// actually speaking v2.
 func (p *Peer) Start() error {
 	p.mu.Lock()
 	p.state = PeerStateHandshaking
 	p.mu.Unlock()
+
+	// Inbound v2 negotiation must happen here (not in NewInboundPeer) because
+	// it does blocking I/O on the conn — we don't want to stall the accept
+	// loop while peeking.
+	if p.inbound && p.config.PreferV2 {
+		if err := p.negotiateInboundTransport(); err != nil {
+			p.Disconnect()
+			return fmt.Errorf("inbound v2 negotiation: %w", err)
+		}
+	}
 
 	// Start goroutines
 	p.wg.Add(2)
@@ -320,6 +342,50 @@ func (p *Peer) Start() error {
 	case <-p.quit:
 		return ErrPeerDisconnected
 	}
+}
+
+// negotiateInboundTransport peeks the first 64 bytes of an inbound connection
+// to classify it as v1 (legacy plaintext) or v2 (BIP-324) and installs the
+// appropriate Transport on p.transport.
+//
+// Wire algorithm (mirrors NegotiateTransport's responder branch and matches
+// clearbit/peer.zig:633-700 + ouroboros/peer.py:_negotiate_v2):
+//
+//   - Read 64 bytes (size of an EllSwift public key).
+//   - If first 16 bytes look like a v1 frame (network magic + "version\0\0\0\0\0"),
+//     wrap the conn with the prefix already consumed and serve as v1.
+//   - Otherwise treat those 64 bytes as the peer's EllSwift public key,
+//     initialise the cipher with magic, and complete the responder
+//     handshake (read garbage+terminator, send our pubkey+garbage+terminator+
+//     version packet, read their version packet).
+//
+// On any error the connection is closed by the caller (Start()).
+func (p *Peer) negotiateInboundTransport() error {
+	// Bound the handshake — defends against a peer that opens TCP and then
+	// stalls.  60s is the existing peer-wide HandshakeTimeout; we use the
+	// same so the outer Start() select doesn't fire before we do.
+	deadline := time.Now().Add(HandshakeTimeout)
+	if err := p.conn.SetReadDeadline(deadline); err != nil {
+		return fmt.Errorf("set read deadline: %w", err)
+	}
+	if err := p.conn.SetWriteDeadline(deadline); err != nil {
+		return fmt.Errorf("set write deadline: %w", err)
+	}
+	defer p.conn.SetReadDeadline(time.Time{})
+	defer p.conn.SetWriteDeadline(time.Time{})
+
+	transport, err := NegotiateTransport(p.conn, p.config.Network, false /* responder */, true /* preferV2 */)
+	if err != nil {
+		return err
+	}
+
+	p.transport = transport
+	if transport.IsEncrypted() {
+		p.mu.Lock()
+		p.v2Transport = true
+		p.mu.Unlock()
+	}
+	return nil
 }
 
 // sendVersionMessage constructs and queues our version message.
@@ -404,16 +470,23 @@ func (p *Peer) readHandler() {
 }
 
 // writeHandler reads from the sendQueue channel and writes to TCP.
+//
+// All writes go through p.transport.WriteMessage so v2-negotiated peers
+// see encrypted BIP-324 packets — the previous direct WriteMessage call
+// silently bypassed the v2 transport and emitted plaintext v1 frames over
+// the encrypted channel, which (combined with the FSChaCha20 cipher bug)
+// is why outbound v2 was effectively dead pre-fix.
 func (p *Peer) writeHandler() {
 	defer p.wg.Done()
 	defer p.signalDisconnect()
 	for {
 		select {
 		case msg := <-p.sendQueue:
-			// Set write deadline
-			p.conn.SetWriteDeadline(time.Now().Add(30 * time.Second))
+			// Set write deadline via the transport so v2's wrapping
+			// conn (if any) gets the deadline too.
+			p.transport.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
-			err := WriteMessage(p.conn, p.config.Network, msg)
+			err := p.transport.WriteMessage(msg)
 			if err != nil {
 				return
 			}
