@@ -113,6 +113,11 @@ type PeerManagerConfig struct {
 	Listeners         *PeerListeners  // Callbacks for received messages
 	OnPeerConnected    func(p *Peer)  // Called when a peer completes handshake
 	OnPeerDisconnected func(p *Peer)  // Called when a peer disconnects
+	// PreferV2 enables BIP-324 v2 transport negotiation on both new outbound
+	// connections AND incoming inbound connections.  Inbound classification
+	// peeks 64 bytes; v1 peers fall through to legacy plaintext via the
+	// prefixed-conn shim in transport.go.
+	PreferV2 bool
 }
 
 // BanInfo contains information about a banned peer.
@@ -1238,6 +1243,7 @@ func (pm *PeerManager) makePeerConfig() PeerConfig {
 		BestHeight:      bestHeight,
 		DisableRelayTx:  false,
 		Listeners:       listeners,
+		PreferV2:        pm.config.PreferV2,
 	}
 }
 
