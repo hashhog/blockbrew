@@ -228,28 +228,40 @@ func TestMinRelayFeeConversion(t *testing.T) {
 
 // TestParseBIP324V2Env covers the env-var fallback path used when the
 // `-bip324v2` CLI flag was not explicitly set. The CLI flag itself takes
-// precedence; this test only exercises the env-var helper.
+// precedence; this test only exercises the env-var helper.  The helper
+// is a tristate: explicit on (1/true) → true, explicit off (0/false) →
+// false, anything else (including empty) → defaultOn.
 func TestParseBIP324V2Env(t *testing.T) {
 	tests := []struct {
-		name string
-		env  string
-		want bool
+		name      string
+		env       string
+		defaultOn bool
+		want      bool
 	}{
-		{"empty disables", "", false},
-		{"explicit zero disables", "0", false},
-		{"one enables", "1", true},
-		{"true enables", "true", true},
-		{"True enables (case-insensitive)", "True", true},
-		{"TRUE enables (case-insensitive)", "TRUE", true},
-		{"false stays off", "false", false},
-		{"yes stays off (only 1/true accepted)", "yes", false},
-		{"random string stays off", "garbage", false},
+		// Default-ON cases (the production default).
+		{"empty falls through to default-on", "", true, true},
+		{"explicit one enables (default-on)", "1", true, true},
+		{"true enables (default-on)", "true", true, true},
+		{"True enables (case-insensitive, default-on)", "True", true, true},
+		{"TRUE enables (case-insensitive, default-on)", "TRUE", true, true},
+		{"explicit zero disables (default-on)", "0", true, false},
+		{"false disables (default-on)", "false", true, false},
+		{"False disables (case-insensitive, default-on)", "False", true, false},
+		{"FALSE disables (case-insensitive, default-on)", "FALSE", true, false},
+		{"yes falls through to default-on", "yes", true, true},
+		{"random string falls through to default-on", "garbage", true, true},
+		// Default-OFF cases (still useful for tests / forward compat).
+		{"empty falls through to default-off", "", false, false},
+		{"explicit one enables (default-off)", "1", false, true},
+		{"explicit zero disables (default-off)", "0", false, false},
+		{"random string falls through to default-off", "garbage", false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := parseBIP324V2Env(tt.env)
+			got := parseBIP324V2Env(tt.env, tt.defaultOn)
 			if got != tt.want {
-				t.Errorf("parseBIP324V2Env(%q) = %v, want %v", tt.env, got, tt.want)
+				t.Errorf("parseBIP324V2Env(%q, defaultOn=%v) = %v, want %v",
+					tt.env, tt.defaultOn, got, tt.want)
 			}
 		})
 	}
