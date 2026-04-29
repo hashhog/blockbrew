@@ -67,6 +67,32 @@ type Config struct {
 	// dominated by `first_avg` (UTXO read), so reducing UTXO cache misses
 	// has more leverage than enlarging the LSM block cache.
 	DBCache int
+
+	// BIP-324 v2 transport opt-in. When true, both new outbound dials and
+	// inbound classification negotiate the v2 (encrypted) transport with a
+	// fall-through to v1 plaintext. Default OFF until the cross-impl interop
+	// matrix confirms parity with every other hashhog node — the in-process
+	// round-trip tests pass (peer_test, transport_test) but cross-impl
+	// behavior across the 10 node fleet has not yet been live-verified end
+	// to end. See `tools/bip324-interop-matrix.sh`.
+	//
+	// Settable via `-bip324v2` CLI flag or `BLOCKBREW_BIP324_V2=1` env var.
+	// CLI flag takes precedence when both are set.
+	BIP324V2 bool
+}
+
+// parseBIP324V2Env returns true iff the BLOCKBREW_BIP324_V2 env-var value
+// represents an "on" toggle. Accepts "1", "true" (case-insensitive). Anything
+// else (including empty) returns false. Kept separate from parseFlags() so
+// the propagation can be unit-tested without touching flag.Parse() globals.
+func parseBIP324V2Env(v string) bool {
+	if v == "" {
+		return false
+	}
+	if v == "1" {
+		return true
+	}
+	return strings.EqualFold(v, "true")
 }
 
 // computeCacheSplit returns (utxoCacheBytes, pebbleBlockCacheBytes) for a
@@ -117,6 +143,9 @@ func main() {
 	log.Printf("blockbrew v%s starting...", version)
 	log.Printf("Network: %s", cfg.Network)
 	log.Printf("Data directory: %s", cfg.DataDir)
+	if cfg.BIP324V2 {
+		log.Printf("BIP-324 v2 transport: ENABLED (outbound + inbound; v1 fall-through)")
+	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		log.Fatalf("Failed to create data directory: %v", err)
@@ -173,7 +202,22 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.ParallelScripts, "parallelscripts", true, "Enable parallel script validation")
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
+	flag.BoolVar(&cfg.BIP324V2, "bip324v2", false, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Also settable via BLOCKBREW_BIP324_V2=1.")
 	flag.Parse()
+
+	// Env-var fallback: BLOCKBREW_BIP324_V2=1 enables v2 if the CLI flag
+	// wasn't explicitly set. CLI flag wins when both are present (the env
+	// var is checked only if the user didn't pass -bip324v2 on the command
+	// line — flag.Visit walks only flags that were actually set).
+	cliBIP324V2Set := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "bip324v2" {
+			cliBIP324V2Set = true
+		}
+	})
+	if !cliBIP324V2Set {
+		cfg.BIP324V2 = parseBIP324V2Env(os.Getenv("BLOCKBREW_BIP324_V2"))
+	}
 
 	if cfg.ListenP2P == "" {
 		cfg.ListenP2P = fmt.Sprintf(":%d", chainPortForNetwork(cfg.Network))
@@ -363,6 +407,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			_, h := chainMgr.BestBlock()
 			return h
 		},
+		PreferV2: cfg.BIP324V2,
 	})
 
 	// 8. Initialize wallet early so sync callbacks can reference it
@@ -456,6 +501,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		OnPeerDisconnected: func(p *p2p.Peer) {
 			syncMgr.HandlePeerDisconnected(p)
 		},
+		PreferV2: cfg.BIP324V2,
 	})
 
 	// Wire the peer manager back into the sync manager (breaks circular dependency)
@@ -1174,6 +1220,8 @@ func printHelp() {
 	fmt.Println("  --version       Print version and exit")
 	fmt.Println("  --pprof         pprof HTTP server address (e.g., localhost:6060)")
 	fmt.Println("  --parallelscripts  Enable parallel script validation (default: true)")
+	fmt.Println("  --bip324v2      Enable BIP-324 v2 encrypted transport (default: false)")
+	fmt.Println("                  Also settable via env: BLOCKBREW_BIP324_V2=1")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  blockbrew                                           Start node on mainnet")
