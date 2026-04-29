@@ -278,8 +278,8 @@ func TestPeerBloomFiltersConfigPropagation(t *testing.T) {
 		name string
 		on   bool
 	}{
-		{"bloom off", false},
-		{"bloom on (default)", true},
+		{"bloom off (default)", false},
+		{"bloom on", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
