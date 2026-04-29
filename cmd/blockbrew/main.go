@@ -88,8 +88,8 @@ type Config struct {
 	// version handshake, and incoming "mempool" messages are honored.
 	// When false, peers see no NODE_BLOOM bit and "mempool" requests are
 	// silently ignored (Core disconnects; we simply drop, matching the
-	// rest of blockbrew's permissive eviction policy).  Default true,
-	// matching Core's DEFAULT_PEERBLOOMFILTERS.
+	// rest of blockbrew's permissive eviction policy).  Default false,
+	// matching Core's DEFAULT_PEERBLOOMFILTERS=false (net_processing.h:44).
 	PeerBloomFilters bool
 }
 
@@ -220,7 +220,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
-	flag.BoolVar(&cfg.PeerBloomFilters, "peerbloomfilters", true, "Advertise NODE_BLOOM (BIP-111) and honor BIP-35 \"mempool\" requests. Default ON, matching Bitcoin Core's DEFAULT_PEERBLOOMFILTERS. Pass `-peerbloomfilters=false` to opt out.")
+	flag.BoolVar(&cfg.PeerBloomFilters, "peerbloomfilters", false, "Advertise NODE_BLOOM (BIP-111) and honor BIP-35 \"mempool\" requests. Default OFF, matching Bitcoin Core's DEFAULT_PEERBLOOMFILTERS=false. Pass `-peerbloomfilters=true` to opt in.")
 	flag.Parse()
 
 	// Env-var fallback: BLOCKBREW_BIP324_V2=0/1 overrides the compiled-in
