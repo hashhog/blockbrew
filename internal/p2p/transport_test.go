@@ -82,15 +82,9 @@ func TestNegotiateTransportInboundClassifiesV1(t *testing.T) {
 //   - Both transports classify themselves as encrypted
 //   - An app-layer message round-trips after the handshake.
 //
-// CURRENTLY SKIPPED: the underlying EllSwift codec in
-// internal/crypto/ellswift.go is non-functional (see
-// TestEllSwiftRoundTripSanity).  Two parties cannot derive a common ECDH
-// secret, so the BIP-324 handshake wedges at the garbage-terminator scan
-// with mismatched terminators on the two sides.  Once the codec is
-// rewritten, drop the Skip and this becomes the v2 wire-correctness gate
-// for the cipher fix shipped in this commit.
+// This is the v2 wire-correctness gate.  Unblocked by the libsecp256k1
+// EllSwift cgo rewrite of internal/crypto/ellswift.go.
 func TestNegotiateTransportV2HandshakeRoundTrip(t *testing.T) {
-	t.Skip("BLOCKED on broken EllSwift codec — see TestEllSwiftRoundTripSanity")
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
@@ -164,13 +158,9 @@ func TestNegotiateTransportV2HandshakeRoundTrip(t *testing.T) {
 // would arrive as undecryptable bytes (length prefix decrypts to a wildly
 // wrong size, then the AEAD fails on the payload).
 //
-// CURRENTLY SKIPPED: EllSwift codec blocks reaching the cipher.  The unit
-// test in internal/crypto/chacha20poly1305_test.go::TestFSChaCha20Vectors
-// already covers the FSChaCha20 fix against Bitcoin Core's published
-// vectors, so cipher correctness IS verified — just not via the wire path.
+// Unblocked by the libsecp256k1 EllSwift cgo rewrite of
+// internal/crypto/ellswift.go; now exercises the full wire path.
 func TestNegotiateTransportV2MultiplePackets(t *testing.T) {
-	t.Skip("BLOCKED on broken EllSwift codec — cipher fix is covered " +
-		"directly in internal/crypto/chacha20poly1305_test.go")
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
@@ -228,14 +218,9 @@ func TestNegotiateTransportV2MultiplePackets(t *testing.T) {
 // handshake before the read/write goroutines launch, and the resulting
 // transport is encrypted.
 //
-// CURRENTLY SKIPPED: depends on a working ECDH (see
-// TestEllSwiftRoundTripSanity).  The wiring fix in this commit (Start()
-// dispatching to negotiateInboundTransport, peer.go::NewInboundPeer no
-// longer hard-coding NewV1Transport) is exercised statically by the v1
-// classification test above; the dynamic v2 path becomes test-runnable
-// the moment EllSwift is fixed.
+// Unblocked by the libsecp256k1 EllSwift cgo rewrite of
+// internal/crypto/ellswift.go; exercises the full Start() v2 wiring.
 func TestPeerInboundV2NegotiationDriven(t *testing.T) {
-	t.Skip("BLOCKED on broken EllSwift codec — see TestEllSwiftRoundTripSanity")
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
