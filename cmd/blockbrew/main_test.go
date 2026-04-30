@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -387,6 +388,72 @@ func TestParsePruneFlagAcceptsValid(t *testing.T) {
 				t.Errorf("expected success, got err=%v output=%s", err, out)
 			}
 		})
+	}
+}
+
+// TestReindexRefusesToStart guards the honest-defer behaviour: -reindex
+// is documented in -help and parsed, but until the chainstate-rebuild
+// path is implemented we exit non-zero with a clear message rather than
+// silently accept the flag and do nothing. If a future commit lands a
+// real reindex implementation, this test must be updated alongside it.
+func TestReindexRefusesToStart(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess reindex test in -short mode")
+	}
+	binary, err := buildTestBinary(t)
+	if err != nil {
+		t.Fatalf("build test binary: %v", err)
+	}
+	defer os.Remove(binary)
+	cmd := exec.Command(binary, "-reindex", "-datadir=/tmp/blockbrew-reindex-test")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("expected non-zero exit for -reindex, got success: %s", out)
+	}
+	if !strings.Contains(string(out), "reindex") {
+		t.Errorf("expected error message to mention reindex, got: %s", out)
+	}
+	if !strings.Contains(string(out), "not yet implemented") {
+		t.Errorf("expected message to acknowledge unimplemented status, got: %s", out)
+	}
+}
+
+// TestDebugFlagAccumulates verifies that -debug is repeatable and
+// comma-aware via the debugFlag flag.Value adapter.
+func TestDebugFlagAccumulates(t *testing.T) {
+	var d debugFlag
+	if err := d.Set("net,mempool"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if err := d.Set("rpc"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if len(d) != 2 {
+		t.Errorf("expected 2 entries (one per Set), got %d: %v", len(d), d)
+	}
+	if d.String() != "net,mempool,rpc" {
+		t.Errorf("String() = %q, want %q", d.String(), "net,mempool,rpc")
+	}
+}
+
+// TestStdFlagSetterRoundtrip makes sure the FlagSetter shim correctly
+// reports registration and rejects unknown keys.
+func TestStdFlagSetterRoundtrip(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	var rpcuser string
+	fs.StringVar(&rpcuser, "rpcuser", "", "")
+	s := stdFlagSetter{fs: fs}
+	if !s.IsRegistered("rpcuser") {
+		t.Error("rpcuser should be registered")
+	}
+	if s.IsRegistered("nope") {
+		t.Error("nope should not be registered")
+	}
+	if err := s.Set("rpcuser", "alice"); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if rpcuser != "alice" {
+		t.Errorf("rpcuser = %q, want alice", rpcuser)
 	}
 }
 
