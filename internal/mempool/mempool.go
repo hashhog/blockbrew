@@ -871,6 +871,25 @@ func (mp *Mempool) HasTransaction(txHash wire.Hash256) bool {
 	return ok
 }
 
+// GetTxByWTxid returns the mempool transaction with the given witness txid,
+// or nil if no such transaction is in the mempool. Used by BIP-331 package
+// relay to satisfy "getpkgtxns" requests.
+//
+// Implementation note: the mempool indexes by txid, not wtxid, so this is a
+// linear scan. BIP-331 caps a single getpkgtxns at 25 wtxids, so the worst
+// case is 25 * |mempool| comparisons, which is acceptable for the package
+// relay use case (peer-driven, rate-limited).
+func (mp *Mempool) GetTxByWTxid(wtxid wire.Hash256) *wire.MsgTx {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	for _, entry := range mp.pool {
+		if entry.Tx.WTxHash() == wtxid {
+			return entry.Tx
+		}
+	}
+	return nil
+}
+
 // Count returns the number of transactions in the mempool.
 func (mp *Mempool) Count() int {
 	mp.mu.RLock()

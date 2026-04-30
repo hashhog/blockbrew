@@ -607,6 +607,49 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		}
 	}
 
+	// BIP-331 package-relay handlers.
+	//
+	// OnSendPackages: peer.go already records the bitfield on the Peer struct
+	// (see Peer.PackageVersions). Nothing extra to do here.
+	//
+	// OnGetPkgTxns: peer wants the full transactions for a list of wtxids.
+	// Look each up in the mempool and reply with a single pkgtxns. Missing
+	// entries are silently skipped — the peer will treat the gap as a
+	// partial response (BIP-331 §"pkgtxns").
+	syncListeners.OnGetPkgTxns = func(peer *p2p.Peer, msg *p2p.MsgGetPkgTxns) {
+		reply := &p2p.MsgPkgTxns{}
+		for _, w := range msg.WTxIDs {
+			if tx := mp.GetTxByWTxid(w); tx != nil {
+				reply.Txs = append(reply.Txs, tx)
+			}
+		}
+		// Even an empty reply is meaningful (peer learns we have none of them).
+		peer.SendMessage(reply)
+	}
+
+	// OnPkgTxns: peer pushed a package. Feed it through AcceptPackage and let
+	// the existing relay logic take over for any tx that was newly accepted.
+	syncListeners.OnPkgTxns = func(peer *p2p.Peer, msg *p2p.MsgPkgTxns) {
+		if len(msg.Txs) == 0 {
+			return
+		}
+		result, err := mp.AcceptPackage(msg.Txs)
+		if err != nil {
+			log.Printf("[mempool] Rejected pkgtxns from %s: %v", peer.Address(), err)
+			return
+		}
+		// Relay each tx that was newly accepted (skip already-in / failed).
+		if result == nil {
+			return
+		}
+		for _, txr := range result.TxResults {
+			if !txr.Accepted || txr.AlreadyInMempool {
+				continue
+			}
+			peerMgr.RelayTransaction(txr.TxID, txr.Fee, txr.VSize, peer.Address())
+		}
+	}
+
 	peerMgr = p2p.NewPeerManager(p2p.PeerManagerConfig{
 		Network:     networkMagic(chainParams),
 		ChainParams: chainParams,
