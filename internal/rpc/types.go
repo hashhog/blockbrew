@@ -9,6 +9,9 @@ const (
 	RPCErrMethodNotFound     = -32601 // The method does not exist
 	RPCErrInvalidParams      = -32602 // Invalid method parameter(s)
 	RPCErrInternal           = -32603 // Internal JSON-RPC error
+	RPCErrTypeError            = -3   // Unexpected type was passed as parameter
+	RPCErrInvalidAddressOrKey  = -5   // Invalid address or key
+	RPCErrInvalidParameter     = -8   // Invalid, missing or duplicate parameter
 	RPCErrBlockNotFound      = -5     // Block not found
 	RPCErrTxNotFound         = -5     // Transaction not found
 	RPCErrWalletError        = -4     // Unspecified wallet error
