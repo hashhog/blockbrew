@@ -46,6 +46,7 @@ type Server struct {
 	walletMgr    *wallet.Manager        // multi-wallet manager
 	indexManager *storage.IndexManager
 	pruner       *storage.Pruner        // BIP-?? auto-prune state; nil = archive
+	dataDir      string                 // Filesystem root for mempool.dat etc.
 	httpServer   *http.Server
 
 	cookiePassword string // hex-encoded cookie secret (empty if unused)
@@ -156,6 +157,14 @@ func WithPruner(p *storage.Pruner) ServerOption {
 func WithCookiePassword(password string) ServerOption {
 	return func(s *Server) {
 		s.cookiePassword = password
+	}
+}
+
+// WithDataDir sets the data directory used by RPCs that read or write files
+// (e.g. dumpmempool / loadmempool).
+func WithDataDir(dir string) ServerOption {
+	return func(s *Server) {
+		s.dataDir = dir
 	}
 }
 
@@ -470,6 +479,10 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetMempoolAncestors(params)
 	case "getmempooldescendants":
 		return s.handleGetMempoolDescendants(params)
+	case "savemempool", "dumpmempool":
+		return s.handleDumpMempool(params)
+	case "loadmempool":
+		return s.handleLoadMempool(params)
 
 	// Network RPCs
 	case "getpeerinfo":

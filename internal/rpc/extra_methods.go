@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
@@ -268,6 +269,48 @@ func (s *Server) handleGetMempoolDescendants(params json.RawMessage) (interface{
 	return result, nil
 }
 
+// handleDumpMempool implements both `dumpmempool` (Core legacy) and the
+// modern `savemempool`. Writes <datadir>/mempool.dat in Core MEMPOOL_DUMP_VERSION=2
+// byte-compatible format. Returns true on success.
+func (s *Server) handleDumpMempool(_ json.RawMessage) (interface{}, *RPCError) {
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
+	}
+	if s.dataDir == "" {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Data dir not configured"}
+	}
+	if err := s.mempool.Dump(s.dataDir); err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("dumpmempool: %v", err)}
+	}
+	return true, nil
+}
+
+// handleLoadMempool reloads <datadir>/mempool.dat. Honours Core
+// DEFAULT_MEMPOOL_EXPIRY = 336 hours when filtering by age. Returns a result
+// summary (read/accepted/failed/expired counts) so callers can audit.
+func (s *Server) handleLoadMempool(_ json.RawMessage) (interface{}, *RPCError) {
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
+	}
+	if s.dataDir == "" {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Data dir not configured"}
+	}
+	res, err := s.mempool.Load(s.dataDir, mempool.LoadOptions{MaxAge: 14 * 24 * time.Hour})
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("loadmempool: %v", err)}
+	}
+	if res == nil {
+		// File didn't exist — return zero counts instead of an error.
+		res = &mempool.LoadResult{}
+	}
+	return map[string]interface{}{
+		"read":     res.Read,
+		"accepted": res.Accepted,
+		"failed":   res.Failed,
+		"expired":  res.Expired,
+	}, nil
+}
+
 // ============================================================================
 // Script RPCs
 // ============================================================================
@@ -494,8 +537,11 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"submitblock \"hexdata\"",
 		"",
 		"== Mempool ==",
+		"dumpmempool",
 		"getmempoolinfo",
 		"getrawmempool ( verbose )",
+		"loadmempool",
+		"savemempool",
 		"",
 		"== Network ==",
 		"addnode \"node\" \"command\"",
