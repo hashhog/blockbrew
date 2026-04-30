@@ -91,6 +91,20 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		softforks = buildDeploymentMap(tipNode, s.chainParams)
 	}
 
+	// Pruning fields. Core's rpc/blockchain.cpp emits `pruned` always,
+	// `pruneheight` and `automatic_pruning` only when pruning is on, and
+	// `prune_target_size` only when automatic_pruning is on. We follow
+	// the same shape (omitempty in BlockchainInfo). When the operator
+	// passed `-prune=N` but no pass has yet freed any files,
+	// pruneheight is still reported as 0 — Core does the same.
+	pruned := s.pruner.IsEnabled()
+	pruneHeight := int32(0)
+	pruneTarget := uint64(0)
+	if pruned {
+		pruneHeight = s.pruner.PruneHeight()
+		pruneTarget = s.pruner.TargetBytes()
+	}
+
 	return &BlockchainInfo{
 		Chain:                s.rpcChainName(),
 		Blocks:               tipHeight,
@@ -100,7 +114,10 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		MedianTime:           medianTime,
 		VerificationProgress: verificationProgress,
 		InitialBlockDownload: ibd,
-		Pruned:               false,
+		Pruned:               pruned,
+		PruneHeight:          pruneHeight,
+		AutomaticPruning:     pruned, // we don't expose Core's -prune=1 manual-only mode
+		PruneTargetSize:      pruneTarget,
 		Softforks:            softforks,
 	}, nil
 }
@@ -213,8 +230,26 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
 	}
 
+	// Headers known but body absent? Distinguish "never had it" from
+	// "had it, pruned now" so callers see Core's pruned-data error
+	// (RPC_MISC_ERROR / "Block not available (pruned data)") instead of
+	// a generic -5 not-found that operators can't tell from a typo'd hash.
+	// We report pruned only when the operator actually enabled pruning
+	// AND the header is known on the active chain — the same conditions
+	// Core checks (rpc/blockchain.cpp:677).
 	block, err := s.chainDB.GetBlock(hash)
 	if err != nil {
+		// Header in index + on main chain + prune enabled implies pruned.
+		if s.pruner.IsEnabled() && s.headerIndex != nil {
+			if hdrNode := s.headerIndex.GetNode(hash); hdrNode != nil {
+				if s.chainMgr != nil && s.chainMgr.IsInMainChain(hash) {
+					return nil, &RPCError{
+						Code:    RPCErrMisc,
+						Message: "Block not available (pruned data)",
+					}
+				}
+			}
+		}
 		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
 	}
 

@@ -80,6 +80,20 @@ type BlockchainInfo struct {
 	VerificationProgress float64                    `json:"verificationprogress"`
 	InitialBlockDownload bool                       `json:"initialblockdownload"`
 	Pruned               bool                       `json:"pruned"`
+	// PruneHeight is the lowest-height block whose body is still on disk.
+	// Only emitted when pruned=true; matches Bitcoin Core's
+	// rpc/blockchain.cpp getblockchaininfo behavior. omitempty so archive
+	// nodes don't include the key, also matching Core.
+	PruneHeight int32 `json:"pruneheight,omitempty"`
+	// AutomaticPruning is true when the node will automatically delete
+	// old block files to stay under -prune target. Always true when
+	// pruned=true in our implementation (we don't expose `-prune=1`
+	// manual-only mode).
+	AutomaticPruning bool `json:"automatic_pruning,omitempty"`
+	// PruneTargetSize is the configured -prune target in bytes (NOT
+	// MiB — Core converts MiB to bytes here). Only emitted when
+	// automatic_pruning=true. omitempty otherwise.
+	PruneTargetSize uint64 `json:"prune_target_size,omitempty"`
 	// Softforks mirrors getdeploymentinfo.deployments: both RPCs read from the
 	// same buildDeploymentMap helper so their data is always consistent.
 	Softforks            map[string]DeploymentEntry `json:"softforks"`

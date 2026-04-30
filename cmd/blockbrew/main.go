@@ -91,6 +91,20 @@ type Config struct {
 	// rest of blockbrew's permissive eviction policy).  Default false,
 	// matching Core's DEFAULT_PEERBLOOMFILTERS=false (net_processing.h:44).
 	PeerBloomFilters bool
+
+	// Prune sets the auto-prune target in MiB for the blk*.dat / rev*.dat
+	// directory. 0 (the default) disables pruning entirely (archive node).
+	// Values 1..549 are rejected at flag-validation time: Bitcoin Core's
+	// MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 MiB is the floor below which
+	// pruning would routinely drop data the node still needs to serve
+	// over P2P inside the next compact-block window. Values >= 550 enable
+	// automatic pruning: oldest blk/rev pairs whose contents are entirely
+	// at heights tip - MIN_BLOCKS_TO_KEEP (288) or below are deleted to
+	// keep the on-disk footprint near this target. Headers, the UTXO
+	// set, and recent blocks are never pruned.
+	//
+	// Mirrors Bitcoin Core's `-prune=N` flag (init.cpp).
+	Prune int64
 }
 
 // parseBIP324V2Env interprets the BLOCKBREW_BIP324_V2 env-var value as a
@@ -221,7 +235,23 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
 	flag.BoolVar(&cfg.PeerBloomFilters, "peerbloomfilters", false, "Advertise NODE_BLOOM (BIP-111) and honor BIP-35 \"mempool\" requests. Default OFF, matching Bitcoin Core's DEFAULT_PEERBLOOMFILTERS=false. Pass `-peerbloomfilters=true` to opt in.")
+	flag.Int64Var(&cfg.Prune, "prune", 0, "Auto-prune target in MiB for the blk*.dat directory. 0 = archive (no pruning, default). Must be >= 550 if non-zero (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES). Headers, UTXO set, and the last 288 blocks are never pruned.")
 	flag.Parse()
+
+	// Validate -prune. Bitcoin Core treats `-prune=1` as "manual via RPC
+	// only" — we don't implement the manual-RPC path yet, so reject it
+	// alongside any other sub-MIN_DISK_SPACE value rather than silently
+	// promoting to 550. 0 is the archive default.
+	if cfg.Prune < 0 {
+		fmt.Fprintln(os.Stderr, "Error: -prune must be >= 0")
+		os.Exit(1)
+	}
+	if cfg.Prune > 0 && cfg.Prune < int64(storage.MinPruneTargetMiB) {
+		fmt.Fprintf(os.Stderr,
+			"Error: -prune target %d MiB is below the %d MiB floor (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES). Pass 0 to disable pruning, or >= %d to enable.\n",
+			cfg.Prune, storage.MinPruneTargetMiB, storage.MinPruneTargetMiB)
+		os.Exit(1)
+	}
 
 	// Env-var fallback: BLOCKBREW_BIP324_V2=0/1 overrides the compiled-in
 	// default if the CLI flag wasn't explicitly set. CLI flag wins when
@@ -354,6 +384,24 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	log.Printf("Flat-file block store opened at %s (current file=blk%05d.dat)",
 		blocksDir, blockStore.CurrentFile())
 
+	// 1c. Initialize the auto-pruner. Disabled by default (cfg.Prune=0
+	// → archive mode); enabled when the operator passes -prune=N for
+	// N >= 550 MiB. The pruner does not start a background goroutine —
+	// MaybePrune is invoked from the per-block OnBlockConnected hook so
+	// pruning happens at most once per connected block (cheap when
+	// usage is below target, since CalculateCurrentUsage is O(numFiles)).
+	pruneCfg := storage.PruneConfig{
+		TargetBytes: uint64(cfg.Prune) * 1024 * 1024,
+	}
+	pruner := storage.NewPruner(pruneCfg, blockStore, chainDB)
+	if pruner.IsEnabled() {
+		log.Printf("Pruning enabled: target=%d MiB (~%.1f GiB); MIN_BLOCKS_TO_KEEP=%d",
+			cfg.Prune,
+			float64(cfg.Prune)/1024.0,
+			storage.MinBlocksToKeep,
+		)
+	}
+
 	// 2. Initialize the header index
 	headerIndex := consensus.NewHeaderIndex(chainParams)
 	log.Printf("Header index initialized with genesis: %s", chainParams.GenesisHash.String()[:16])
@@ -442,6 +490,16 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			w.ScanBlock(block, height)
 		}
 		mp.BlockConnected(block)
+		// Auto-prune: cheap no-op when -prune=0 (the default). When
+		// enabled, this fires per-block but only does work once usage
+		// crosses the configured target. Errors are logged and not
+		// propagated — a transient failure (e.g. EBUSY on rev?????.dat)
+		// must not stall block connection.
+		if pruner.IsEnabled() {
+			if _, err := pruner.MaybePrune(height); err != nil {
+				log.Printf("prune: %v", err)
+			}
+		}
 	}
 	syncMgr = p2p.NewSyncManager(p2p.SyncManagerConfig{
 		ChainParams:  chainParams,
@@ -590,6 +648,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		rpc.WithSyncManager(syncMgr),
 		rpc.WithTemplateGenerator(templateGen),
 		rpc.WithWallet(w),
+		rpc.WithPruner(pruner),
 	)
 
 	// 12. Start all services
@@ -1253,6 +1312,9 @@ func printHelp() {
 	fmt.Println("  --bip324v2      Enable BIP-324 v2 encrypted transport (default: true)")
 	fmt.Println("                  Pass -bip324v2=false to opt out. Also via env:")
 	fmt.Println("                  BLOCKBREW_BIP324_V2=0 (off) or =1 (on; default)")
+	fmt.Println("  --prune=N       Auto-prune target in MiB (default: 0 = archive)")
+	fmt.Println("                  N must be 0 or >= 550 (Bitcoin Core MIN_DISK_SPACE)")
+	fmt.Println("                  Headers, UTXO set, and last 288 blocks never pruned")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  blockbrew                                           Start node on mainnet")
