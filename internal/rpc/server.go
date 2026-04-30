@@ -523,6 +523,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	// Fee estimation RPCs
 	case "estimatesmartfee":
 		return s.handleEstimateSmartFee(params)
+	case "estimaterawfee":
+		return s.handleEstimateRawFee(params)
 
 	// Wallet management RPCs (don't require a specific wallet)
 	case "createwallet":
@@ -595,6 +597,10 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleHelp(params)
 	case "verifymessage":
 		return s.handleVerifyMessage(params)
+	case "signmessage":
+		return s.handleSignMessage(params, walletName)
+	case "signmessagewithprivkey":
+		return s.handleSignMessageWithPrivKey(params)
 
 	// Descriptor RPCs
 	case "getdescriptorinfo":
