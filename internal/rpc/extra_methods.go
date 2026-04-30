@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -8,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
+	bbcrypto "github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/mempool"
 	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/storage"
@@ -554,9 +557,12 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"decodescript \"hexstring\"",
 		"getrawtransaction \"txid\" ( verbose )",
 		"sendrawtransaction \"hexstring\"",
+		"signmessage \"address\" \"message\"",
+		"signmessagewithprivkey \"privkey\" \"message\"",
 		"verifymessage \"address\" \"signature\" \"message\"",
 		"",
 		"== Fee Estimation ==",
+		"estimaterawfee conf_target ( threshold )",
 		"estimatesmartfee conf_target ( \"estimate_mode\" )",
 		"",
 		"== Wallet ==",
@@ -579,9 +585,252 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 	return strings.Join(methods, "\n"), nil
 }
 
+// handleVerifyMessage implements the `verifymessage` RPC.
+// Reference: bitcoin-core/src/rpc/signmessage.cpp::verifymessage and
+// src/common/signmessage.cpp::MessageVerify. Only legacy P2PKH addresses are
+// supported, matching Core's behavior — segwit addresses do not commit to the
+// pubkey hash in a way that lets a base64 compact-recoverable ECDSA signature
+// alone identify the signer.
 func (s *Server) handleVerifyMessage(params json.RawMessage) (interface{}, *RPCError) {
-	// Placeholder - message verification requires specific address-based signing
-	return nil, &RPCError{Code: RPCErrInternal, Message: "verifymessage not yet implemented"}
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 3 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "verifymessage requires address, signature, message"}
+	}
+	addrStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "address must be a string"}
+	}
+	sigB64, ok := args[1].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "signature must be a string"}
+	}
+	message, ok := args[2].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "message must be a string"}
+	}
+
+	addr, err := address.DecodeAddress(addrStr, s.getNetwork())
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid address"}
+	}
+	if addr.Type != address.P2PKH {
+		return nil, &RPCError{Code: RPCErrTypeError, Message: "Address does not refer to key"}
+	}
+
+	sigBytes, err := base64.StdEncoding.DecodeString(sigB64)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrTypeError, Message: "Malformed base64 encoding"}
+	}
+
+	hash := bbcrypto.MessageHash(message)
+	pub, compressed, err := bbcrypto.RecoverPubKeyFromCompact(sigBytes, hash)
+	if err != nil {
+		return false, nil
+	}
+
+	// The recovery byte already encodes whether the signer used a compressed
+	// pubkey; honor that when computing Hash160 so we hash exactly the bytes
+	// the signer committed to.
+	var pkBytes []byte
+	if compressed {
+		pkBytes = pub.SerializeCompressed()
+	} else {
+		pkBytes = pub.SerializeUncompressed()
+	}
+	gotHash := bbcrypto.Hash160(pkBytes)
+	if len(addr.Hash) != 20 {
+		return false, nil
+	}
+	for i := 0; i < 20; i++ {
+		if gotHash[i] != addr.Hash[i] {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// handleSignMessage implements the `signmessage` RPC.
+// Reference: bitcoin-core/src/wallet/rpc/signmessage.cpp. Signs `message` using
+// the private key tied to `address` in the loaded wallet, returning a base64
+// compact-recoverable ECDSA signature. The address must be P2PKH.
+func (s *Server) handleSignMessage(params json.RawMessage, walletName string) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "signmessage requires address and message"}
+	}
+	addrStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "address must be a string"}
+	}
+	message, ok := args[1].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "message must be a string"}
+	}
+
+	w, rpcErr := s.getWalletForRPC(walletName)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+
+	addr, err := address.DecodeAddress(addrStr, s.getNetwork())
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid address"}
+	}
+	if addr.Type != address.P2PKH {
+		return nil, &RPCError{Code: RPCErrTypeError, Message: "Address does not refer to key"}
+	}
+
+	privKey, err := w.GetKeyForAddress(addrStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: err.Error()}
+	}
+
+	hash := bbcrypto.MessageHash(message)
+	// Wallet-derived keys are always compressed (BIP32 produces compressed
+	// pubkeys), and the owning P2PKH address was hashed from the compressed
+	// pubkey, so we must sign with isCompressedKey=true.
+	sig := bbcrypto.SignMessageCompact(privKey, hash, true)
+	return base64.StdEncoding.EncodeToString(sig), nil
+}
+
+// handleSignMessageWithPrivKey implements the `signmessagewithprivkey` RPC.
+// Reference: bitcoin-core/src/rpc/signmessage.cpp::signmessagewithprivkey.
+// This is wallet-less: the caller passes a WIF private key directly.
+func (s *Server) handleSignMessageWithPrivKey(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "signmessagewithprivkey requires privkey and message"}
+	}
+	wif, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "privkey must be a string"}
+	}
+	message, ok := args[1].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "message must be a string"}
+	}
+
+	priv, compressed, err := decodeWIFForRPC(wif, s.getNetwork())
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid private key"}
+	}
+	hash := bbcrypto.MessageHash(message)
+	sig := bbcrypto.SignMessageCompact(priv, hash, compressed)
+	return base64.StdEncoding.EncodeToString(sig), nil
+}
+
+// decodeWIFForRPC decodes a WIF-encoded private key and reports whether the
+// associated public key should be compressed (33-byte SEC) or not. Mirrors the
+// wallet package's unexported decodeWIF but is local to the RPC layer to avoid
+// adding a public wallet API solely for `signmessagewithprivkey`.
+func decodeWIFForRPC(wif string, net address.Network) (*bbcrypto.PrivateKey, bool, error) {
+	version, payload, err := address.Base58CheckDecode(wif)
+	if err != nil {
+		return nil, false, err
+	}
+	var expectedVersion byte
+	switch net {
+	case address.Mainnet:
+		expectedVersion = 0x80
+	default:
+		expectedVersion = 0xef
+	}
+	if version != expectedVersion {
+		return nil, false, fmt.Errorf("wrong network version")
+	}
+	switch {
+	case len(payload) == 33 && payload[32] == 0x01:
+		return bbcrypto.PrivateKeyFromBytes(payload[:32]), true, nil
+	case len(payload) == 32:
+		return bbcrypto.PrivateKeyFromBytes(payload), false, nil
+	default:
+		return nil, false, fmt.Errorf("invalid WIF payload length")
+	}
+}
+
+// handleEstimateRawFee implements the `estimaterawfee` RPC.
+// Reference: bitcoin-core/src/rpc/fees.cpp::estimaterawfee. The result is
+// keyed by horizon (`short`/`medium`/`long`); blockbrew tracks a single
+// horizon, so we report it under `medium` only — Core treats omitted
+// horizons as "not tracked" for this confirmation target, which is exactly
+// our semantics. Output values mirror Core's per-horizon shape so that
+// consensus-diff tooling and scripted callers see no schema surprises.
+func (s *Server) handleEstimateRawFee(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "estimaterawfee requires conf_target"}
+	}
+	confTargetF, ok := args[0].(float64)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "conf_target must be a number"}
+	}
+	confTarget := int(confTargetF)
+	threshold := 0.95
+	if len(args) >= 2 {
+		t, ok := args[1].(float64)
+		if !ok {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "threshold must be a number"}
+		}
+		threshold = t
+	}
+	if threshold < 0 || threshold > 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid threshold"}
+	}
+
+	out := map[string]interface{}{}
+	if s.feeEstimator == nil {
+		// No estimator configured — return an empty object, matching Core's
+		// behavior when no horizons track the requested target.
+		return out, nil
+	}
+
+	maxTarget := s.feeEstimator.HighestTargetTracked()
+	if confTarget < 1 || confTarget > maxTarget {
+		// Out of range for the only horizon we track; emit empty object so
+		// callers can detect "no data" without parsing an error.
+		return out, nil
+	}
+
+	res := s.feeEstimator.EstimateRawFee(confTarget, threshold)
+	horizon := map[string]interface{}{
+		"decay": res.Decay,
+		"scale": res.Scale,
+	}
+	bucketObj := func(b mempool.EstimationBucketStats) map[string]interface{} {
+		return map[string]interface{}{
+			"startrange":     b.StartRange,
+			"endrange":       b.EndRange,
+			"withintarget":   b.WithinTarget,
+			"totalconfirmed": b.TotalConfirmed,
+			"inmempool":      b.InMempool,
+			"leftmempool":    b.LeftMempool,
+		}
+	}
+	if res.FeeRate > 0 {
+		// sat/vB → BTC/kvB to match estimatesmartfee.
+		horizon["feerate"] = res.FeeRate / satoshiPerBitcoin * 1000
+		horizon["pass"] = bucketObj(res.Pass)
+		if res.Fail.StartRange != -1 {
+			horizon["fail"] = bucketObj(res.Fail)
+		}
+	} else {
+		horizon["fail"] = bucketObj(res.Fail)
+		horizon["errors"] = []string{"Insufficient data or no feerate found which meets threshold"}
+	}
+	out["medium"] = horizon
+	return out, nil
 }
 
 // ============================================================================

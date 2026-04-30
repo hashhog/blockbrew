@@ -265,6 +265,132 @@ func (fe *FeeEstimator) EstimateSmartFee(targetBlocks int) (float64, int) {
 	return -1, 0
 }
 
+// EstimationBucketStats summarizes a contiguous fee-rate range used by the
+// raw-fee scan. It mirrors the per-bucket data emitted by Bitcoin Core's
+// `estimaterawfee` RPC (`pass` and `fail` objects):
+//
+//	StartRange / EndRange — fee rate boundaries (sat/vB)
+//	WithinTarget          — txs confirmed within the requested target
+//	TotalConfirmed        — txs confirmed at any block height
+//	InMempool             — txs currently in mempool in this range
+//	LeftMempool           — txs that left mempool unconfirmed within target
+type EstimationBucketStats struct {
+	StartRange     float64
+	EndRange       float64
+	WithinTarget   float64
+	TotalConfirmed float64
+	InMempool      float64
+	LeftMempool    float64
+}
+
+// EstimationResult is the Core-shaped raw-fee scan result. FeeRate is
+// expressed in sat/vB; convert to BTC/kvB at the RPC boundary. FeeRate is -1
+// when the threshold could not be met (i.e. no usable bucket).
+type EstimationResult struct {
+	FeeRate float64
+	Decay   float64
+	Scale   float64
+	Pass    EstimationBucketStats
+	Fail    EstimationBucketStats
+}
+
+// EstimateRawFee scans the buckets just like `EstimateFee` but exposes the
+// pass/fail bucket boundaries that Bitcoin Core's `estimaterawfee` RPC
+// returns. `threshold` is the minimum success rate (e.g. 0.95 for 95%).
+//
+// Returned bucket boundaries are clamped to the lowest/highest fee rate bucket
+// that the scan inspected. If every bucket fails, FeeRate is -1 and the Fail
+// bucket reports the highest fee-rate range that was tried; Pass.StartRange is
+// then -1 to indicate "no passing bucket".
+func (fe *FeeEstimator) EstimateRawFee(targetBlocks int, threshold float64) EstimationResult {
+	fe.mu.RLock()
+	defer fe.mu.RUnlock()
+
+	if targetBlocks < 1 {
+		targetBlocks = 1
+	}
+	if targetBlocks > fe.maxTargetBlocks {
+		targetBlocks = fe.maxTargetBlocks
+	}
+	if threshold <= 0 || threshold > 1 {
+		threshold = 0.95
+	}
+
+	const minDataPoints = 2.0
+
+	// Walk buckets from highest fee rate down, tracking the last passing
+	// bucket and the first failing bucket beneath it. This matches the
+	// semantics of Core's TxConfirmStats::EstimateMedianVal(): the "pass"
+	// bucket is the lowest one that still met the threshold, and "fail" is
+	// the next one down that broke it.
+	bestBucket := -1
+	failBucket := -1
+	for i := len(fe.buckets) - 1; i >= 0; i-- {
+		bucket := fe.buckets[i]
+		var confirmed float64
+		for t := 0; t < targetBlocks && t < len(bucket.ConfirmedAt); t++ {
+			confirmed += bucket.ConfirmedAt[t].TxCount
+		}
+		total := confirmed + bucket.InMempool
+		if total < minDataPoints {
+			continue
+		}
+		successRate := confirmed / total
+		if successRate >= threshold {
+			bestBucket = i
+		} else {
+			failBucket = i
+			break
+		}
+	}
+
+	result := EstimationResult{
+		FeeRate: -1,
+		Decay:   fe.decay,
+		Scale:   1, // single-block scale — blockbrew tracks per-block, not per-window
+	}
+
+	bucketToStats := func(idx, target int) EstimationBucketStats {
+		b := fe.buckets[idx]
+		var withinTarget, total float64
+		for t := 0; t < target && t < len(b.ConfirmedAt); t++ {
+			withinTarget += b.ConfirmedAt[t].TxCount
+		}
+		for t := 0; t < len(b.ConfirmedAt); t++ {
+			total += b.ConfirmedAt[t].TxCount
+		}
+		return EstimationBucketStats{
+			StartRange:     b.FeeRateStart,
+			EndRange:       b.FeeRateEnd,
+			WithinTarget:   withinTarget,
+			TotalConfirmed: total,
+			InMempool:      b.InMempool,
+			LeftMempool:    0, // blockbrew does not track timeouts separately
+		}
+	}
+
+	if bestBucket >= 0 {
+		result.FeeRate = fe.buckets[bestBucket].FeeRateStart
+		result.Pass = bucketToStats(bestBucket, targetBlocks)
+	} else {
+		result.Pass = EstimationBucketStats{StartRange: -1, EndRange: -1}
+	}
+	if failBucket >= 0 {
+		result.Fail = bucketToStats(failBucket, targetBlocks)
+	} else {
+		result.Fail = EstimationBucketStats{StartRange: -1, EndRange: -1}
+	}
+	return result
+}
+
+// HighestTargetTracked returns the maximum confirmation target (in blocks)
+// supported by the estimator, mirroring CBlockPolicyEstimator's accessor.
+func (fe *FeeEstimator) HighestTargetTracked() int {
+	fe.mu.RLock()
+	defer fe.mu.RUnlock()
+	return fe.maxTargetBlocks
+}
+
 // BestHeight returns the current best height known to the estimator.
 func (fe *FeeEstimator) BestHeight() int32 {
 	fe.mu.RLock()
