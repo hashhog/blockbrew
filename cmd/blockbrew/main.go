@@ -351,6 +351,42 @@ func networkToAddressNetwork(params *consensus.ChainParams) address.Network {
 	}
 }
 
+// chainStateAdapter implements mempool.ChainState on top of consensus.ChainManager.
+// Lives in main to avoid an import cycle (mempool already depends on consensus,
+// but we don't want consensus to depend on mempool).
+type chainStateAdapter struct {
+	cm *consensus.ChainManager
+}
+
+func newChainStateAdapter(cm *consensus.ChainManager) *chainStateAdapter {
+	return &chainStateAdapter{cm: cm}
+}
+
+func (a *chainStateAdapter) TipHeight() int32 {
+	_, h := a.cm.BestBlock()
+	return h
+}
+
+func (a *chainStateAdapter) TipMTP() int64 {
+	tip := a.cm.BestBlockNode()
+	if tip == nil {
+		return 0
+	}
+	return tip.GetMedianTimePast()
+}
+
+func (a *chainStateAdapter) MTPAtHeight(height int32) int64 {
+	tip := a.cm.BestBlockNode()
+	if tip == nil {
+		return 0
+	}
+	anc := tip.GetAncestor(height)
+	if anc == nil {
+		return 0
+	}
+	return anc.GetMedianTimePast()
+}
+
 func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// 0. Start pprof server if enabled
 	if cfg.PprofAddr != "" {
@@ -446,6 +482,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		MinRelayFeeRate: minRelayFeeRate,
 		MaxOrphanTxs:    100,
 		ChainParams:     chainParams,
+		ChainState:      newChainStateAdapter(chainMgr),
 	}, utxoSet)
 	log.Printf("Mempool initialized (max %d MB)", cfg.MaxMempool)
 

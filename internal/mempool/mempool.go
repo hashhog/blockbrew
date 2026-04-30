@@ -34,6 +34,13 @@ var (
 	ErrRBFInsufficientFee = errors.New("replacement fee too low")
 	ErrRBFTooManyConflicts = errors.New("replacement would evict too many transactions")
 
+	// BIP-68 sequence-lock failure (mempool accept).
+	ErrSequenceLockNotMet = errors.New("non-final transaction (BIP-68 sequence locks not met)")
+
+	// Ancestor/descendant chain limits (Core DEFAULT_ANCESTOR_LIMIT/DEFAULT_DESCENDANT_LIMIT).
+	ErrTooManyAncestors   = errors.New("too many unconfirmed ancestors")
+	ErrTooManyDescendants = errors.New("too many descendants for an unconfirmed parent")
+
 	// Package validation errors.
 	ErrPackageEmpty            = errors.New("package is empty")
 	ErrPackageTooManyTxs       = errors.New("package exceeds maximum transaction count")
@@ -65,6 +72,38 @@ const (
 	MaxPackageWeight = 404_000
 )
 
+// Ancestor/descendant chain limits matching Bitcoin Core
+// (src/policy/policy.h DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT).
+const (
+	// DefaultAncestorLimit is the maximum number of in-mempool ancestors a tx
+	// may have (including itself).
+	DefaultAncestorLimit = 25
+
+	// DefaultDescendantLimit is the maximum number of in-mempool descendants
+	// a tx may have (including itself).
+	DefaultDescendantLimit = 25
+)
+
+// ChainState is the read-only view of the active chain that the mempool needs
+// for context-sensitive checks (BIP-68 sequence-locks, lock-time evaluation).
+//
+// All methods must be safe for concurrent callers. The implementation in
+// production is the chain manager; tests provide fakes.
+type ChainState interface {
+	// TipHeight returns the current best chain tip height.
+	TipHeight() int32
+
+	// TipMTP returns the median time past at the chain tip (the timestamp used
+	// to evaluate BIP-68 time-based sequence locks for transactions that would
+	// be included in the next block).
+	TipMTP() int64
+
+	// MTPAtHeight returns the median time past of the block at the given
+	// height in the active chain. Returns 0 when the height is unknown
+	// (caller treats this as "no time-based lock satisfied").
+	MTPAtHeight(height int32) int64
+}
+
 // Config configures the mempool.
 type Config struct {
 	MaxSize             int64 // Maximum mempool size in bytes (default: 300 MB)
@@ -72,6 +111,11 @@ type Config struct {
 	IncrementalRelayFee int64 // Incremental relay fee in sat/kvB (default: 1000)
 	MaxOrphanTxs        int   // Maximum orphan transactions (default: 100)
 	ChainParams         *consensus.ChainParams
+
+	// ChainState is optional. When provided, mempool accept enforces BIP-68
+	// sequence-locks against the chain tip's MTP. When nil (legacy/test
+	// callers), the BIP-68 check is skipped.
+	ChainState ChainState
 }
 
 // DefaultConfig returns a mempool config with sensible defaults.
@@ -343,6 +387,21 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		return fmt.Errorf("%w: %v", ErrScriptValidation, err)
 	}
 
+	// 10b. BIP-68 sequence-lock check (Bitcoin Core
+	//      validation.cpp::CheckSequenceLocksAtTip in PreChecks).
+	//      Locks are evaluated against the *next* block (tip height + 1)
+	//      and the chain tip's MTP. Skipped when no ChainState is wired.
+	if err := mp.checkSequenceLocksLocked(tx); err != nil {
+		return err
+	}
+
+	// 10c. Ancestor/descendant count limits (Core DEFAULT_ANCESTOR_LIMIT /
+	//      DEFAULT_DESCENDANT_LIMIT, both = 25). Reject before mutating
+	//      cluster/pool state so a rejection is side-effect free.
+	if err := mp.checkChainLimitsLocked(tx); err != nil {
+		return err
+	}
+
 	// 11. Create entry and add to mempool
 	entry := &TxEntry{
 		Tx:             tx,
@@ -584,6 +643,115 @@ func (mp *Mempool) collectDescendantsLocked(txHash wire.Hash256, visited map[wir
 		result = append(result, mp.collectDescendantsLocked(childHash, visited)...)
 	}
 	return result
+}
+
+// checkSequenceLocksLocked enforces BIP-68 (sequence locks) at mempool accept.
+//
+// Mirrors src/validation.cpp::CheckSequenceLocksAtTip: the lock is evaluated
+// against the *next* block (tip height + 1) and the chain tip's MTP — i.e.,
+// the values the transaction would see if mined into the next block. The
+// per-input height is the height of the block that confirmed the spent UTXO
+// (mempool parents are conservatively treated as confirming at tip+1, which
+// matches Core's "use the next block height for not-yet-confirmed inputs").
+//
+// Skipped when no ChainState is wired (legacy and test callers).
+// Must be called with mu held.
+func (mp *Mempool) checkSequenceLocksLocked(tx *wire.MsgTx) error {
+	if mp.config.ChainState == nil {
+		return nil
+	}
+	// BIP-68 only applies to v2+ transactions; spare the work otherwise.
+	if tx.Version < 2 {
+		return nil
+	}
+	cs := mp.config.ChainState
+	tipHeight := cs.TipHeight()
+	if mp.config.ChainParams != nil && tipHeight < mp.config.ChainParams.CSVHeight {
+		// CSV not yet active.
+		return nil
+	}
+	nextHeight := tipHeight + 1
+
+	prevHeights := make([]int32, len(tx.TxIn))
+	for i, in := range tx.TxIn {
+		// Mempool parent: would be in the same block as this tx, so use
+		// nextHeight (Core uses tip+1 for unconfirmed parents).
+		if _, ok := mp.pool[in.PreviousOutPoint.Hash]; ok {
+			prevHeights[i] = nextHeight
+			continue
+		}
+		utxo := mp.lookupOutputLocked(in.PreviousOutPoint)
+		if utxo == nil {
+			// Caller already checked missing inputs; treat as "not yet
+			// confirmed" so we don't crash.
+			prevHeights[i] = nextHeight
+			continue
+		}
+		prevHeights[i] = utxo.Height
+	}
+
+	getMTP := func(h int32) int64 {
+		if h < 0 {
+			return 0
+		}
+		return cs.MTPAtHeight(h)
+	}
+	lock := consensus.CalculateSequenceLocks(tx, prevHeights, getMTP)
+	if !consensus.EvaluateSequenceLocks(lock, nextHeight, cs.TipMTP()) {
+		return ErrSequenceLockNotMet
+	}
+	return nil
+}
+
+// checkChainLimitsLocked enforces ancestor/descendant count limits when
+// adding a new transaction. Mirrors Bitcoin Core's CalculateMemPoolAncestors
+// failure path (DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT, both 25).
+//
+// Counts include the transaction itself (Core's
+// "ancestor count = 1 + parent count" / "descendant count = 1 + child count"
+// semantics). Must be called with mu held.
+func (mp *Mempool) checkChainLimitsLocked(tx *wire.MsgTx) error {
+	// Ancestor limit: candidate + union of ancestor-sets of its mempool parents.
+	// Build the union by visiting each parent, then expanding via Depends.
+	ancestorSet := make(map[wire.Hash256]bool)
+	var addAncestors func(hash wire.Hash256)
+	addAncestors = func(hash wire.Hash256) {
+		if ancestorSet[hash] {
+			return
+		}
+		entry, ok := mp.pool[hash]
+		if !ok {
+			return
+		}
+		ancestorSet[hash] = true
+		for _, parent := range entry.Depends {
+			addAncestors(parent)
+		}
+	}
+	for _, in := range tx.TxIn {
+		addAncestors(in.PreviousOutPoint.Hash)
+	}
+	// |ancestorSet| is the number of distinct in-mempool ancestors. +1 for self.
+	if len(ancestorSet)+1 > DefaultAncestorLimit {
+		return fmt.Errorf("%w: %d > %d", ErrTooManyAncestors,
+			len(ancestorSet)+1, DefaultAncestorLimit)
+	}
+
+	// Descendant limit: for each in-mempool ancestor of the candidate, adding
+	// the candidate would push that ancestor's descendant-set by one. Core
+	// counts descendants-including-self; the candidate is a new descendant.
+	for ancHash := range ancestorSet {
+		descVisited := make(map[wire.Hash256]bool)
+		descs := mp.collectDescendantsLocked(ancHash, descVisited)
+		// descs excludes ancHash itself. After adding candidate, the count
+		// including self becomes len(descs) + 1 (self) + 1 (new candidate).
+		if len(descs)+2 > DefaultDescendantLimit {
+			return fmt.Errorf("%w: ancestor %s would have %d descendants > %d",
+				ErrTooManyDescendants, ancHash, len(descs)+2,
+				DefaultDescendantLimit)
+		}
+	}
+	return nil
 }
 
 // RemoveTransaction removes a transaction and all its descendants from the mempool.
@@ -1685,6 +1853,16 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 	flags := mp.getStandardScriptFlags()
 	if err := mp.validateScriptsLocked(tx, flags); err != nil {
 		return 0, 0, fmt.Errorf("%w: %v", ErrScriptValidation, err)
+	}
+
+	// BIP-68 sequence-lock check (mirrors AddTransaction).
+	if err := mp.checkSequenceLocksLocked(tx); err != nil {
+		return 0, 0, err
+	}
+
+	// Ancestor/descendant chain limits.
+	if err := mp.checkChainLimitsLocked(tx); err != nil {
+		return 0, 0, err
 	}
 
 	return fee, vsize, nil
