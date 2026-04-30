@@ -2,10 +2,13 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/p2p"
+	"github.com/hashhog/blockbrew/internal/storage"
 )
 
 func TestParseFlagsDefaults(t *testing.T) {
@@ -318,6 +321,95 @@ func TestBIP324V2ConfigPropagation(t *testing.T) {
 		})
 	}
 }
+
+// TestPruneFloorConstant guards the -prune floor enforced by
+// parseFlags against silent drift away from Bitcoin Core's
+// MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 MiB. If Core changes this
+// constant in a future major release, this test will need to be
+// re-evaluated alongside it.
+func TestPruneFloorConstant(t *testing.T) {
+	if storage.MinPruneTargetMiB != 550 {
+		t.Errorf("MinPruneTargetMiB = %d, want 550 (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES)",
+			storage.MinPruneTargetMiB)
+	}
+	if storage.MinBlocksToKeep != 288 {
+		t.Errorf("MinBlocksToKeep = %d, want 288 (Bitcoin Core MIN_BLOCKS_TO_KEEP)",
+			storage.MinBlocksToKeep)
+	}
+}
+
+// TestParsePruneFlagAcceptsValid spot-checks that valid -prune values
+// (0 and any value >= 550) are accepted by the in-process binary. We
+// cannot directly call parseFlags() — it uses flag.Parse() with global
+// state and os.Exit on failure — so we shell out to the test binary in
+// a subprocess and check that it accepts the flag without immediately
+// exiting.
+//
+// Skipped under -short to keep `go test ./...` fast.
+func TestParsePruneFlagAcceptsValid(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping subprocess flag-validation test in -short mode")
+	}
+	binary, err := buildTestBinary(t)
+	if err != nil {
+		t.Fatalf("build test binary: %v", err)
+	}
+	defer os.Remove(binary)
+
+	// Pass --version so the binary exits cleanly after flag parse.
+	tests := []struct {
+		name    string
+		args    []string
+		wantErr bool
+	}{
+		{"prune zero (archive)", []string{"-prune=0", "--version"}, false},
+		{"prune at floor", []string{"-prune=550", "--version"}, false},
+		{"prune above floor", []string{"-prune=2048", "--version"}, false},
+		{"prune below floor", []string{"-prune=100"}, true},
+		{"prune one MiB", []string{"-prune=1"}, true},
+		{"prune negative", []string{"-prune=-5"}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := exec.Command(binary, tt.args...)
+			out, err := cmd.CombinedOutput()
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected non-zero exit, got success: %s", out)
+					return
+				}
+				if !strings.Contains(string(out), "prune") {
+					t.Errorf("error output did not mention prune: %s", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("expected success, got err=%v output=%s", err, out)
+			}
+		})
+	}
+}
+
+// buildTestBinary compiles the blockbrew binary into a tempfile and
+// returns the path. Callers must os.Remove(path) when done.
+func buildTestBinary(t *testing.T) (string, error) {
+	t.Helper()
+	tmp := t.TempDir()
+	out := filepath.Join(tmp, "blockbrew-test")
+	cmd := exec.Command("go", "build", "-o", out, ".")
+	combined, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", &buildErr{out: string(combined), err: err}
+	}
+	return out, nil
+}
+
+type buildErr struct {
+	out string
+	err error
+}
+
+func (e *buildErr) Error() string { return e.err.Error() + ": " + e.out }
 
 func TestNetworkMagicValues(t *testing.T) {
 	// Import consensus to check values match

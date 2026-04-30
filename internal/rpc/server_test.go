@@ -213,6 +213,85 @@ func TestGetBlockchainInfo(t *testing.T) {
 	if result.Chain != "main" {
 		t.Errorf("expected chain 'main', got %s", result.Chain)
 	}
+	// Default (no pruner attached) must report archive mode.
+	if result.Pruned {
+		t.Errorf("default getblockchaininfo reported pruned=true (want archive)")
+	}
+	if result.AutomaticPruning {
+		t.Errorf("default getblockchaininfo reported automatic_pruning=true")
+	}
+	if result.PruneTargetSize != 0 {
+		t.Errorf("default getblockchaininfo prune_target_size=%d, want 0", result.PruneTargetSize)
+	}
+}
+
+// TestGetBlockchainInfoPrunedReports: with a pruner attached and
+// configured (TargetBytes >= floor), getblockchaininfo must return
+// pruned=true, automatic_pruning=true, and prune_target_size=bytes.
+// pruneheight stays 0 until at least one pass actually frees a file
+// (matching Bitcoin Core).
+func TestGetBlockchainInfoPrunedReports(t *testing.T) {
+	params := consensus.MainnetParams()
+	idx := consensus.NewHeaderIndex(params)
+	cmConfig := consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		UTXOSet:     consensus.NewInMemoryUTXOView(),
+	}
+	chainMgr := consensus.NewChainManager(cmConfig)
+
+	// Construct a Pruner with a non-zero target. We don't need to
+	// drive any actual prune work for this test — getblockchaininfo
+	// reads target/state directly off the Pruner.
+	tmpDir := t.TempDir()
+	db := storage.NewMemDB()
+	defer db.Close()
+	bs, err := storage.NewBlockStore(tmpDir, 0xD9B4BEF9, db)
+	if err != nil {
+		t.Fatalf("NewBlockStore: %v", err)
+	}
+	defer bs.Close()
+	cdb := storage.NewChainDB(db)
+	cdb.SetBlockStore(bs)
+	pruner := storage.NewPruner(storage.PruneConfig{TargetBytes: storage.MinPruneTargetBytes}, bs, cdb)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithHeaderIndex(idx),
+		WithChainManager(chainMgr),
+		WithChainDB(cdb),
+		WithPruner(pruner),
+	)
+
+	resp := testRPCRequest(t, server.handleRPC, "getblockchaininfo", []interface{}{}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	// The response goes through JSON encode/decode in testRPCRequest, so
+	// the typed result is map[string]interface{}, not *BlockchainInfo.
+	m, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("unexpected result type: %T", resp.Result)
+	}
+	if pruned, _ := m["pruned"].(bool); !pruned {
+		t.Errorf("pruned=%v, want true (pruner attached, target=floor)", m["pruned"])
+	}
+	if auto, _ := m["automatic_pruning"].(bool); !auto {
+		t.Errorf("automatic_pruning=%v, want true", m["automatic_pruning"])
+	}
+	// JSON numbers come back as float64 from json.Unmarshal-into-interface{}.
+	gotTarget, _ := m["prune_target_size"].(float64)
+	if uint64(gotTarget) != storage.MinPruneTargetBytes {
+		t.Errorf("prune_target_size = %v, want %d",
+			m["prune_target_size"], storage.MinPruneTargetBytes)
+	}
+	// pruneheight is omitempty when zero, so the key may be absent.
+	if v, present := m["pruneheight"]; present {
+		if h, _ := v.(float64); int32(h) != 0 {
+			t.Errorf("pruneheight = %v, want 0 (no pass run yet)", v)
+		}
+	}
 }
 
 func TestGetBlockCount(t *testing.T) {
