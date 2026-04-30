@@ -494,6 +494,15 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		log.Printf("Loaded fee estimates from disk (height %d)", feeEstimator.BestHeight())
 	}
 
+	// 6c. Reload persisted mempool. Match Bitcoin Core's
+	//     DEFAULT_MEMPOOL_EXPIRY = 336 hours (2 weeks).
+	if res, err := mp.Load(cfg.DataDir, mempool.LoadOptions{MaxAge: 14 * 24 * time.Hour}); err != nil {
+		log.Printf("Warning: mempool.dat reload failed: %v", err)
+	} else if res != nil {
+		log.Printf("Reloaded mempool.dat: %d read, %d accepted, %d failed, %d expired",
+			res.Read, res.Accepted, res.Failed, res.Expired)
+	}
+
 	// 7. Initialize peer manager
 	listenAddr := cfg.ListenP2P
 	if cfg.NoListen {
@@ -729,6 +738,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		rpc.WithTemplateGenerator(templateGen),
 		rpc.WithWallet(w),
 		rpc.WithPruner(pruner),
+		rpc.WithDataDir(cfg.DataDir),
 	)
 
 	// 12. Start all services
@@ -854,6 +864,11 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("Warning: fee estimates save failed: %v", err)
 		} else {
 			log.Printf("Fee estimates saved")
+		}
+		if err := mp.Dump(cfg.DataDir); err != nil {
+			log.Printf("Warning: mempool.dat dump failed: %v", err)
+		} else {
+			log.Printf("mempool.dat saved (%d txs)", mp.Count())
 		}
 		if w != nil {
 			if err := w.SaveToFile(""); err != nil {
