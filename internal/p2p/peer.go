@@ -101,6 +101,10 @@ type PeerListeners struct {
 	OnCFHeaders    func(p *Peer, msg *MsgCFHeaders)
 	OnGetCFCheckpt func(p *Peer, msg *MsgGetCFCheckpt)
 	OnCFCheckpt    func(p *Peer, msg *MsgCFCheckpt)
+	// BIP331 package-relay callbacks
+	OnSendPackages func(p *Peer, msg *MsgSendPackages)
+	OnGetPkgTxns   func(p *Peer, msg *MsgGetPkgTxns)
+	OnPkgTxns      func(p *Peer, msg *MsgPkgTxns)
 }
 
 // PeerState represents the connection state.
@@ -179,6 +183,10 @@ type Peer struct {
 	wtxidRelaySupported  bool // Peer supports wtxid-based relay (BIP339)
 	v2Transport          bool // Whether using BIP324 v2 transport
 	wantsAddrv2          bool // Peer supports BIP155 ADDRv2 messages
+
+	// BIP331 package relay: bitfield received in sendpackages.
+	// 0 means peer did not advertise. Bit 0 = ancestor packages.
+	packageVersions uint64
 
 	// BIP152 compact block state
 	compactBlockState *CompactBlockState
@@ -543,9 +551,10 @@ func (p *Peer) pingHandler() {
 
 // handleMessage dispatches received messages to the appropriate handler.
 func (p *Peer) handleMessage(msg Message) {
-	// Check for messages sent before handshake (except version/verack/wtxidrelay/sendcmpct/sendaddrv2/sendtxrcncl)
+	// Check for messages sent before handshake (except version/verack/wtxidrelay/sendcmpct/sendaddrv2/sendtxrcncl/sendpackages)
 	switch msg.(type) {
-	case *MsgVersion, *MsgVerAck, *MsgWTxidRelay, *MsgSendCmpct, *MsgSendAddrv2, *MsgSendTxRcncl:
+	case *MsgVersion, *MsgVerAck, *MsgWTxidRelay, *MsgSendCmpct, *MsgSendAddrv2, *MsgSendTxRcncl,
+		*MsgSendPackages:
 		// These are allowed before handshake
 	default:
 		p.mu.RLock()
@@ -712,6 +721,24 @@ func (p *Peer) handleMessage(msg Message) {
 		if p.config.Listeners != nil && p.config.Listeners.OnCFCheckpt != nil {
 			p.config.Listeners.OnCFCheckpt(p, m)
 		}
+	// BIP331 package-relay messages
+	case *MsgSendPackages:
+		// Per BIP-331, sendpackages MAY be sent multiple times (each with a
+		// different versions field). Combine them by OR-ing the bitfields.
+		p.mu.Lock()
+		p.packageVersions |= m.Versions
+		p.mu.Unlock()
+		if p.config.Listeners != nil && p.config.Listeners.OnSendPackages != nil {
+			p.config.Listeners.OnSendPackages(p, m)
+		}
+	case *MsgGetPkgTxns:
+		if p.config.Listeners != nil && p.config.Listeners.OnGetPkgTxns != nil {
+			p.config.Listeners.OnGetPkgTxns(p, m)
+		}
+	case *MsgPkgTxns:
+		if p.config.Listeners != nil && p.config.Listeners.OnPkgTxns != nil {
+			p.config.Listeners.OnPkgTxns(p, m)
+		}
 	}
 }
 
@@ -749,6 +776,9 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 		p.SendMessage(&MsgWTxidRelay{})
 		// BIP155: Signal ADDRv2 support
 		p.SendMessage(&MsgSendAddrv2{})
+		// BIP-331: advertise ancestor-package support so peers may push
+		// "pkgtxns" / request "getpkgtxns" against us. Bit 0 = ancestor.
+		p.SendMessage(&MsgSendPackages{Versions: PackageRelayVersionAncestor})
 	}
 
 	// Send verack
@@ -1197,6 +1227,21 @@ func (p *Peer) SupportsErlay() bool {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.erlaySupported
+}
+
+// PackageVersions returns the bitfield of BIP-331 package-relay versions the
+// peer announced via "sendpackages". 0 means the peer did not advertise
+// package-relay support. Bit 0 = ancestor packages.
+func (p *Peer) PackageVersions() uint64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.packageVersions
+}
+
+// SupportsPackageRelay returns true if the peer announced any BIP-331
+// package-relay variant.
+func (p *Peer) SupportsPackageRelay() bool {
+	return p.PackageVersions() != 0
 }
 
 // ErlaySalt returns the peer's Erlay salt from sendtxrcncl.

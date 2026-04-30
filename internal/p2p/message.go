@@ -250,7 +250,8 @@ func isNonCriticalMessage(cmd string) bool {
 		"filterload", "filteradd", "filterclear", "merkleblock",
 		"cmpctblock", "getblocktxn", "blocktxn",
 		"getcfilters", "cfilter", "getcfheaders", "cfheaders",
-		"getcfcheckpt", "cfcheckpt":
+		"getcfcheckpt", "cfcheckpt",
+		"sendpackages", "getpkgtxns", "pkgtxns":
 		return true
 	default:
 		return false
@@ -339,6 +340,13 @@ func makeMessage(command string) (Message, error) {
 		return &MsgGetCFCheckpt{}, nil
 	case "cfcheckpt":
 		return &MsgCFCheckpt{}, nil
+	// BIP331 package-relay messages
+	case "sendpackages":
+		return &MsgSendPackages{}, nil
+	case "getpkgtxns":
+		return &MsgGetPkgTxns{}, nil
+	case "pkgtxns":
+		return &MsgPkgTxns{}, nil
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnknownCommand, command)
 	}
