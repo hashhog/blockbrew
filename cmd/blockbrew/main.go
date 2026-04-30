@@ -105,7 +105,80 @@ type Config struct {
 	//
 	// Mirrors Bitcoin Core's `-prune=N` flag (init.cpp).
 	Prune int64
+
+	// Operational-parity flags. Each mirrors a Bitcoin Core CLI flag:
+	//   -daemon          Run in the background after init (re-exec pattern).
+	//   -pid=<file>      Write the daemon pid to <file> (default <datadir>/blockbrew.pid).
+	//   -conf=<file>     Read additional options from a config file.
+	//   -debug=<cat>     Enable verbose logging for the named category.
+	//                    Repeatable / comma-separated. Categories follow Core
+	//                    (`bitcoin-core/src/logging.cpp:LOG_CATEGORIES_BY_STR`).
+	//   -printtoconsole  Force log output to stderr even when -logfile= is set.
+	//   -logfile=<path>  Write log output to a file (SIGHUP reopens it).
+	//   -reindex         Wipe chainstate and rebuild from blk*.dat. Currently
+	//                    a *deferred* implementation: blockbrew honestly
+	//                    refuses to start so the operator knows the support
+	//                    is coming, instead of accepting the flag silently.
+	//   -zmqpub*         ZMQ PUB endpoints, mirroring Core's `-zmqpub<topic>`.
+	//   -rpcready-notify When run under systemd, send READY=1 once the RPC
+	//                    server is bound. Defaults to ON so containerised
+	//                    deployments work; set false to skip the syscall on
+	//                    non-systemd hosts.
+	//   -healthport=<n>  Bind a tiny HTTP /healthz endpoint for k8s-style
+	//                    liveness/readiness probes. 0 disables.
+	Daemon          bool
+	PidFile         string
+	ConfFile        string
+	Debug           debugFlag // accumulator (repeatable, comma-OK)
+	PrintToConsole  bool
+	LogFile         string
+	Reindex         bool
+	ZMQPubHashBlock string
+	ZMQPubHashTx    string
+	ZMQPubRawBlock  string
+	ZMQPubRawTx     string
+	ZMQPubSequence  string
+	RPCReadyNotify  bool
+	HealthPort      int
 }
+
+// debugFlag implements flag.Value so `-debug=` may be repeated and/or
+// comma-separated, both forms supported by Bitcoin Core.
+type debugFlag []string
+
+func (d *debugFlag) String() string {
+	if d == nil {
+		return ""
+	}
+	return strings.Join(*d, ",")
+}
+
+func (d *debugFlag) Set(v string) error {
+	*d = append(*d, v)
+	return nil
+}
+
+// stdFlagSetter adapts a *flag.FlagSet to the FlagSetter interface used
+// by applyConfigFlags. We need this thin shim so config-file tests can
+// run without depending on the global flag.CommandLine state.
+type stdFlagSetter struct{ fs *flag.FlagSet }
+
+func (s stdFlagSetter) Set(name, value string) error {
+	return s.fs.Set(name, value)
+}
+
+func (s stdFlagSetter) IsRegistered(name string) bool {
+	return s.fs.Lookup(name) != nil
+}
+
+// Process-scoped handles for resources owned by main(). Stored as
+// package-level vars so run() can wire them into shutdown without
+// threading them through the function signature (which is already
+// unwieldy). Initialised in main, consumed in run.
+var (
+	processPidFile *pidFileManager
+	processLogFile *logFileHandle
+)
 
 // parseBIP324V2Env interprets the BLOCKBREW_BIP324_V2 env-var value as a
 // tristate: "1"/"true" → enable, "0"/"false" → disable, anything else
@@ -168,6 +241,57 @@ func main() {
 		os.Exit(0)
 	}
 
+	// -reindex: HONEST DEFER. We currently track the work item in
+	// CLAUDE.md and W?? notes; until the implementation lands, refusing
+	// to start with a clear message is preferable to silently accepting
+	// the flag and doing nothing (which would lie to the operator).
+	// Match Bitcoin Core's user expectation: -reindex must rebuild the
+	// chain from blk*.dat. Until we do that, exit non-zero.
+	if cfg.Reindex {
+		fmt.Fprintln(os.Stderr, "Error: -reindex is not yet implemented in blockbrew.")
+		fmt.Fprintln(os.Stderr, "       The flat-file blk*.dat → Pebble chainstate rebuild path is in design.")
+		fmt.Fprintln(os.Stderr, "       To force a full rebuild today, stop the node and remove the chaindata/ directory.")
+		fmt.Fprintln(os.Stderr, "       Tracking: see meta-repo CLAUDE.md (W?? `-reindex implementation`).")
+		os.Exit(1)
+	}
+
+	// -daemon: detach from the controlling terminal before initialising
+	// the rest of the node. Done very early so the parent exits quickly
+	// (start_mainnet.sh is still nohup'd for backward compat). The child
+	// returns from daemonize() with daemonEnvFlag set; the parent exits.
+	if cfg.Daemon {
+		// Resolve pid path now so the parent can poll for it.
+		pidPath := cfg.PidFile
+		if pidPath == "" {
+			pidPath = filepath.Join(cfg.DataDir, "blockbrew.pid")
+		}
+		daemonize(pidPath, pidWaitTimeoutDefault)
+		// Only the child reaches here.
+	}
+
+	// Apply -debug categories (after potential daemon fork so the child
+	// inherits the parsed list via its own flag.Parse — they're stored
+	// on cfg.Debug already).
+	accepted, warnings := applyDebugCategories(cfg.Debug)
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "blockbrew: %s\n", w)
+	}
+
+	// Set up log destination. Default: stderr (matches existing behavior).
+	// -logfile=<path>: writes go to file; SIGHUP reopens (rotation).
+	// -printtoconsole: keep stderr ON even when -logfile is set (tee).
+	logHandle, err := newLogFileHandle(cfg.LogFile)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: open log file %s: %v\n", cfg.LogFile, err)
+		os.Exit(1)
+	}
+	if cfg.LogFile != "" {
+		if cfg.PrintToConsole {
+			log.SetOutput(io.MultiWriter(logHandle, os.Stderr))
+		} else {
+			log.SetOutput(logHandle)
+		}
+	}
 	log.SetPrefix("[blockbrew] ")
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 
@@ -177,9 +301,51 @@ func main() {
 	if cfg.BIP324V2 {
 		log.Printf("BIP-324 v2 transport: ENABLED (outbound + inbound; v1 fall-through)")
 	}
+	if len(accepted) > 0 {
+		cats, all := debugCategoriesSnapshot()
+		if all {
+			log.Printf("Debug logging: ALL categories enabled")
+		} else {
+			log.Printf("Debug logging: enabled categories: %v", cats)
+		}
+	}
+	if cfg.LogFile != "" {
+		log.Printf("Log file: %s (SIGHUP reopens)", cfg.LogFile)
+	}
 
 	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
 		log.Fatalf("Failed to create data directory: %v", err)
+	}
+
+	// Write PID file. Even when -daemon was not used, exposing the pid
+	// makes external tooling (start_mainnet.sh, systemd PIDFile=) work.
+	pidMgr := newPidFileManager(cfg.PidFile, cfg.DataDir)
+	if path, err := pidMgr.Write(); err != nil {
+		log.Printf("WARNING: pid file write failed: %v", err)
+	} else {
+		log.Printf("PID file: %s (pid=%d)", path, os.Getpid())
+	}
+
+	// Stash for run()'s shutdown path.
+	processPidFile = pidMgr
+	processLogFile = logHandle
+
+	// SIGHUP handler: reopen log file (if configured). Independent of
+	// the SIGINT/SIGTERM shutdown handler installed in run() so log-rotation
+	// signals never look like a shutdown request.
+	if logHandle != nil && cfg.LogFile != "" {
+		hupCh := make(chan os.Signal, 1)
+		signal.Notify(hupCh, syscall.SIGHUP)
+		go func() {
+			for range hupCh {
+				log.Printf("SIGHUP received; reopening log file %s", cfg.LogFile)
+				if err := logHandle.Reopen(); err != nil {
+					log.Printf("logfile reopen error: %v", err)
+				} else {
+					log.Printf("log file reopened")
+				}
+			}
+		}()
 	}
 
 	var chainParams *consensus.ChainParams
@@ -236,7 +402,55 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
 	flag.BoolVar(&cfg.PeerBloomFilters, "peerbloomfilters", false, "Advertise NODE_BLOOM (BIP-111) and honor BIP-35 \"mempool\" requests. Default OFF, matching Bitcoin Core's DEFAULT_PEERBLOOMFILTERS=false. Pass `-peerbloomfilters=true` to opt in.")
 	flag.Int64Var(&cfg.Prune, "prune", 0, "Auto-prune target in MiB for the blk*.dat directory. 0 = archive (no pruning, default). Must be >= 550 if non-zero (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES). Headers, UTXO set, and the last 288 blocks are never pruned.")
+	// Operational-parity flags. Mirror Bitcoin Core init.cpp argspec.
+	flag.BoolVar(&cfg.Daemon, "daemon", false, "Run in the background as a daemon (default: false). When true, blockbrew double-forks and detaches before init.")
+	flag.StringVar(&cfg.PidFile, "pid", "", "Write the daemon pid to <file> (default: <datadir>/blockbrew.pid).")
+	flag.StringVar(&cfg.ConfFile, "conf", "", "Path to a key=value config file. Defaults: <datadir>/blockbrew.conf, ~/.blockbrew/blockbrew.conf. CLI flags override config file.")
+	flag.Var(&cfg.Debug, "debug", "Output debugging information for the named category. Repeatable / comma-separated. Categories: net, mempool, validation, rpc, ... (see Bitcoin Core LOG_CATEGORIES_BY_STR). Pass `-debug=all` for everything; `-debug=none` to clear; prefix with `-` to negate (e.g. `-debug=-net`).")
+	flag.BoolVar(&cfg.PrintToConsole, "printtoconsole", false, "Send trace/debug info to console even when -logfile= is set (default: false). When -logfile is empty, output always goes to stderr regardless.")
+	flag.StringVar(&cfg.LogFile, "logfile", "", "Specify the path of the log file. Empty = stderr. SIGHUP reopens the file (rotation-friendly).")
+	flag.BoolVar(&cfg.Reindex, "reindex", false, "Wipe chainstate and rebuild from blk*.dat. NOT YET IMPLEMENTED — blockbrew refuses to start when this flag is set so silent no-ops never put the chainstate in a confused state.")
+	flag.StringVar(&cfg.ZMQPubHashBlock, "zmqpubhashblock", "", "ZMQ endpoint to publish 32-byte block hashes on (e.g. tcp://127.0.0.1:28332).")
+	flag.StringVar(&cfg.ZMQPubHashTx, "zmqpubhashtx", "", "ZMQ endpoint to publish 32-byte tx hashes on.")
+	flag.StringVar(&cfg.ZMQPubRawBlock, "zmqpubrawblock", "", "ZMQ endpoint to publish raw serialised blocks on.")
+	flag.StringVar(&cfg.ZMQPubRawTx, "zmqpubrawtx", "", "ZMQ endpoint to publish raw serialised txs on.")
+	flag.StringVar(&cfg.ZMQPubSequence, "zmqpubsequence", "", "ZMQ endpoint for sequence notifications (block connect/disconnect, tx accept/remove).")
+	flag.BoolVar(&cfg.RPCReadyNotify, "rpcready-notify", true, "On systemd hosts, send READY=1 to NOTIFY_SOCKET once RPC is bound. No-op when NOTIFY_SOCKET is unset.")
+	flag.IntVar(&cfg.HealthPort, "healthport", 0, "If non-zero, bind a /healthz HTTP endpoint on 127.0.0.1:<port> for liveness/readiness probes. 0 disables.")
 	flag.Parse()
+
+	// Apply config file (CLI > config > default). Build the set of flags
+	// the user provided on the command line so we don't overwrite them.
+	cliSet := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) { cliSet[f.Name] = true })
+
+	// We need to pre-resolve the datadir to find the default config-file
+	// path. The CLI value may already be set; the network suffix is
+	// applied below after config merge so the datadir we search is the
+	// raw user-supplied root (Core does the same).
+	confDataDir := cfg.DataDir
+	if confDataDir == "" {
+		confDataDir = defaultDataDir
+	}
+	confPath, confExplicit := resolveConfigPath(cfg.ConfFile, confDataDir)
+	if confPath != "" {
+		entries, err := loadConfigFile(confPath, cfg.Network)
+		if err != nil {
+			if confExplicit {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			// Defaults search: file existed but failed to parse → warn
+			// instead of fatal so a malformed default conf doesn't
+			// brick the daemon.
+			fmt.Fprintf(os.Stderr, "Warning: %v (continuing with CLI defaults)\n", err)
+		} else {
+			applyConfigFlags(stdFlagSetter{flag.CommandLine}, entries, cliSet,
+				func(format string, args ...any) {
+					fmt.Fprintf(os.Stderr, "blockbrew: "+format+"\n", args...)
+				})
+		}
+	}
 
 	// Validate -prune. Bitcoin Core treats `-prune=1` as "manual via RPC
 	// only" — we don't implement the manual-RPC path yet, so reject it
@@ -503,6 +717,23 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			res.Read, res.Accepted, res.Failed, res.Expired)
 	}
 
+	// 6d. ZMQ publisher (optional, off by default).  Mirrors Bitcoin
+	// Core's `-zmqpub<topic>` flags.  Failures here are downgraded to
+	// warnings: a misconfigured ZMQ socket must not stop the node from
+	// validating consensus.
+	zmqPub := newZMQPublisher(zmqPublisherConfig{
+		HashBlock: cfg.ZMQPubHashBlock,
+		HashTx:    cfg.ZMQPubHashTx,
+		RawBlock:  cfg.ZMQPubRawBlock,
+		RawTx:     cfg.ZMQPubRawTx,
+		Sequence:  cfg.ZMQPubSequence,
+	})
+	if err := zmqPub.Start(); err != nil {
+		log.Printf("WARNING: zmq publisher start failed: %v (continuing without ZMQ)", err)
+		zmqPub.Stop()
+		zmqPub = newZMQPublisher(zmqPublisherConfig{}) // disabled instance
+	}
+
 	// 7. Initialize peer manager
 	listenAddr := cfg.ListenP2P
 	if cfg.NoListen {
@@ -536,6 +767,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			w.ScanBlock(block, height)
 		}
 		mp.BlockConnected(block)
+		// ZMQ fan-out: hashblock / rawblock / sequence(C). Cheap no-op
+		// when no -zmqpub* endpoint is configured.
+		zmqPub.PublishBlockConnected(block, height)
 		// Auto-prune: cheap no-op when -prune=0 (the default). When
 		// enabled, this fires per-block but only does work once usage
 		// crosses the configured target. Errors are logged and not
@@ -581,6 +815,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		if entry != nil {
 			peerMgr.RelayTransaction(txHash, entry.Fee, entry.Size, peer.Address())
 		}
+		// ZMQ fan-out: hashtx / rawtx / sequence(A). Cheap no-op
+		// when no -zmqpub* endpoint is configured.
+		zmqPub.PublishTxAccepted(msg.Tx)
 		log.Printf("[mempool] Accepted tx %s from %s (fee: %d, size: %d)",
 			txHash, peer.Address(), entry.Fee, entry.Size)
 	}
@@ -790,6 +1027,59 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		}()
 	}
 
+	// Health endpoint (k8s-style liveness/readiness probes). Bound on
+	// 127.0.0.1 to avoid exposing internal state externally without an
+	// auth layer. Disabled when -healthport=0.
+	if cfg.HealthPort > 0 {
+		healthAddr := fmt.Sprintf("127.0.0.1:%d", cfg.HealthPort)
+		healthMux := http.NewServeMux()
+		healthMux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			// Liveness: if we can answer, we're alive. Readiness is gated
+			// on chain initialization being far enough along to answer
+			// RPCs — equivalent to Core's `getblockchaininfo` returning.
+			_, height := chainMgr.BestBlock()
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintf(w, "ok height=%d\n", height)
+		})
+		healthMux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+			outbound, inbound := peerMgr.PeerCount()
+			if outbound+inbound == 0 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				fmt.Fprintln(w, "not ready: no peers connected yet")
+				return
+			}
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			fmt.Fprintln(w, "ready")
+		})
+		go func() {
+			log.Printf("Health endpoint listening on %s (/healthz, /readyz)", healthAddr)
+			if err := http.ListenAndServe(healthAddr, healthMux); err != nil {
+				log.Printf("Health server error: %v", err)
+			}
+		}()
+	}
+
+	// systemd notify-ready (Type=notify integration). Cheap no-op when
+	// NOTIFY_SOCKET is unset (i.e. not run under systemd).  We send
+	// READY=1 *after* the RPC server is bound so external tooling
+	// (start_mainnet.sh, deployment health checks) can rely on the
+	// notification meaning "RPC will accept calls now".
+	if cfg.RPCReadyNotify {
+		notifyReady(fmt.Sprintf("blockbrew v%s ready, RPC on %s", version, cfg.ListenRPC))
+	}
+
+	// systemd watchdog: ping at half the configured interval. Disabled
+	// when WATCHDOG_USEC is unset.
+	if interval := watchdogInterval(); interval > 0 {
+		log.Printf("systemd watchdog: pinging every %s", interval)
+		ticker := time.NewTicker(interval)
+		go func() {
+			for range ticker.C {
+				notifyWatchdog()
+			}
+		}()
+	}
+
 	log.Printf("blockbrew v%s started successfully", version)
 
 	// 13. Wait for shutdown signal. Catches both SIGINT (Ctrl-C) and SIGTERM
@@ -806,6 +1096,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	} else {
 		log.Printf("received SIGINT, beginning graceful shutdown")
 	}
+
+	// systemd: report STOPPING=1 so TimeoutStopSec doesn't tick down
+	// against a node mid-flush.
+	notifyStopping()
 
 	// 14. Hard 30-second deadline watchdog. If graceful shutdown has not
 	// completed by then we best-effort close the DB and os.Exit(1). This
@@ -913,6 +1207,22 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("Warning: database close failed: %v", err)
 		}
 		log.Printf("Database closed")
+
+		// Stop ZMQ publisher (drains pending sends, closes sockets).
+		zmqPub.Stop()
+		log.Printf("ZMQ publisher stopped")
+
+		// Remove pid file last so external monitors can still observe
+		// the file during the shutdown window.
+		if processPidFile != nil {
+			if err := processPidFile.Remove(); err != nil {
+				log.Printf("Warning: pid file remove failed: %v", err)
+			}
+		}
+		// Close log file last so any post-shutdown log lines still land.
+		if processLogFile != nil {
+			_ = processLogFile.Close()
+		}
 	}()
 
 	<-shutdownDone
@@ -1410,6 +1720,26 @@ func printHelp() {
 	fmt.Println("  --prune=N       Auto-prune target in MiB (default: 0 = archive)")
 	fmt.Println("                  N must be 0 or >= 550 (Bitcoin Core MIN_DISK_SPACE)")
 	fmt.Println("                  Headers, UTXO set, and last 288 blocks never pruned")
+	fmt.Println()
+	fmt.Println("Operational flags (Bitcoin Core compat):")
+	fmt.Println("  --daemon            Detach into background after init")
+	fmt.Println("  --pid=<file>        PID file path (default: <datadir>/blockbrew.pid)")
+	fmt.Println("  --conf=<file>       Read additional options from a key=value config file")
+	fmt.Println("                      Default search: <datadir>/blockbrew.conf,")
+	fmt.Println("                      ~/.blockbrew/blockbrew.conf. CLI > conf > defaults.")
+	fmt.Println("  --debug=<cat>       Enable debug logging (repeatable / comma-separated)")
+	fmt.Println("                      Categories: net, mempool, validation, rpc, ...")
+	fmt.Println("                      `all` enables every category; `none` clears.")
+	fmt.Println("  --printtoconsole    Tee log file to stderr even when -logfile is set")
+	fmt.Println("  --logfile=<path>    Write logs to file (SIGHUP reopens for log rotation)")
+	fmt.Println("  --reindex           NOT YET IMPLEMENTED (refuses to start; tracking)")
+	fmt.Println("  --zmqpubhashblock   ZMQ PUB endpoint for 32-byte block hashes")
+	fmt.Println("  --zmqpubhashtx      ZMQ PUB endpoint for 32-byte tx hashes")
+	fmt.Println("  --zmqpubrawblock    ZMQ PUB endpoint for serialised blocks")
+	fmt.Println("  --zmqpubrawtx       ZMQ PUB endpoint for serialised txs")
+	fmt.Println("  --zmqpubsequence    ZMQ PUB endpoint for sequence notifications")
+	fmt.Println("  --rpcready-notify   systemd READY=1 once RPC is bound (default: true)")
+	fmt.Println("  --healthport=N      Bind /healthz on 127.0.0.1:N (k8s probes; 0 disables)")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  blockbrew                                           Start node on mainnet")
