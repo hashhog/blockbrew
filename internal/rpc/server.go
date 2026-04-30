@@ -45,6 +45,7 @@ type Server struct {
 	wallet       *wallet.Wallet         // single wallet (legacy support)
 	walletMgr    *wallet.Manager        // multi-wallet manager
 	indexManager *storage.IndexManager
+	pruner       *storage.Pruner        // BIP-?? auto-prune state; nil = archive
 	httpServer   *http.Server
 
 	cookiePassword string // hex-encoded cookie secret (empty if unused)
@@ -138,6 +139,15 @@ func WithWalletManager(wm *wallet.Manager) ServerOption {
 func WithIndexManager(im *storage.IndexManager) ServerOption {
 	return func(s *Server) {
 		s.indexManager = im
+	}
+}
+
+// WithPruner attaches the auto-prune state so getblockchaininfo can
+// report `pruned`, `pruneheight`, and `automatic_pruning` accurately.
+// nil pruner = archive node (the default).
+func WithPruner(p *storage.Pruner) ServerOption {
+	return func(s *Server) {
+		s.pruner = p
 	}
 }
 
