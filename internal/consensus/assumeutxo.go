@@ -337,26 +337,17 @@ func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networ
 	return stats, nil
 }
 
-// writeCoin writes a single coin in the snapshot format.
+// writeCoin writes a single coin in the Bitcoin Core snapshot format.
+//
+// Layout (bytes-identical to Core's Coin::Serialize + TxOutCompression):
+//   VARINT(code = (height<<1) | coinbase)
+//   VARINT(CompressAmount(amount))
+//   ScriptCompression: either special-tag (1+20 or 1+32 bytes) or
+//                      VARINT(size+6) followed by raw script bytes.
+//
+// Reference: bitcoin-core/src/coins.h, src/compressor.{h,cpp}.
 func writeCoin(w io.Writer, entry *UTXOEntry) error {
-	// Height and coinbase flag: (height << 1) | coinbase
-	code := uint64(entry.Height) << 1
-	if entry.IsCoinbase {
-		code |= 1
-	}
-	var buf bytes.Buffer
-	writeVaruint(&buf, code)
-
-	// Amount
-	writeVaruint(&buf, uint64(entry.Amount))
-
-	// Script (compressed)
-	compressed := CompressScript(entry.PkScript)
-	writeVaruint(&buf, uint64(len(compressed)))
-	buf.Write(compressed)
-
-	_, err := w.Write(buf.Bytes())
-	return err
+	return CoreSerializeCoin(w, entry)
 }
 
 // SnapshotStats contains statistics about a snapshot operation.
@@ -466,80 +457,10 @@ func LoadSnapshot(r io.Reader, db *storage.ChainDB, expectedNetworkMagic [4]byte
 	return utxoSet, stats, nil
 }
 
-// readCoin reads a single coin from the snapshot.
+// readCoin reads a single coin from a Bitcoin Core-format snapshot.
+// See writeCoin for the encoding.
 func readCoin(r io.Reader) (*UTXOEntry, error) {
-	// Read height and coinbase flag
-	code, err := readVaruintReader(r)
-	if err != nil {
-		return nil, err
-	}
-	height := int32(code >> 1)
-	isCoinbase := (code & 1) == 1
-
-	// Read amount
-	amount, err := readVaruintReader(r)
-	if err != nil {
-		return nil, err
-	}
-	if amount > uint64(MaxMoney) {
-		return nil, fmt.Errorf("invalid coin amount: %d", amount)
-	}
-
-	// Read script
-	scriptLen, err := readVaruintReader(r)
-	if err != nil {
-		return nil, err
-	}
-	// Use a generous limit for UTXO script deserialization. The consensus
-	// MAX_SCRIPT_SIZE only applies during script evaluation, not serialization.
-	// Valid blocks can contain outputs with scripts larger than 10KB.
-	if scriptLen > 4*1024*1024 {
-		return nil, fmt.Errorf("script too large: %d", scriptLen)
-	}
-	compressed := make([]byte, scriptLen)
-	if _, err := io.ReadFull(r, compressed); err != nil {
-		return nil, err
-	}
-	pkScript := DecompressScript(compressed)
-
-	return &UTXOEntry{
-		Amount:     int64(amount),
-		PkScript:   pkScript,
-		Height:     height,
-		IsCoinbase: isCoinbase,
-	}, nil
-}
-
-// readVaruintReader reads a varint from an io.Reader.
-func readVaruintReader(r io.Reader) (uint64, error) {
-	var first [1]byte
-	if _, err := io.ReadFull(r, first[:]); err != nil {
-		return 0, err
-	}
-
-	switch first[0] {
-	case 0xFD:
-		var buf [2]byte
-		if _, err := io.ReadFull(r, buf[:]); err != nil {
-			return 0, err
-		}
-		return uint64(buf[0]) | uint64(buf[1])<<8, nil
-	case 0xFE:
-		var buf [4]byte
-		if _, err := io.ReadFull(r, buf[:]); err != nil {
-			return 0, err
-		}
-		return uint64(buf[0]) | uint64(buf[1])<<8 | uint64(buf[2])<<16 | uint64(buf[3])<<24, nil
-	case 0xFF:
-		var buf [8]byte
-		if _, err := io.ReadFull(r, buf[:]); err != nil {
-			return 0, err
-		}
-		return uint64(buf[0]) | uint64(buf[1])<<8 | uint64(buf[2])<<16 | uint64(buf[3])<<24 |
-			uint64(buf[4])<<32 | uint64(buf[5])<<40 | uint64(buf[6])<<48 | uint64(buf[7])<<56, nil
-	default:
-		return uint64(first[0]), nil
-	}
+	return CoreDeserializeCoin(r)
 }
 
 // SnapshotLoadStats contains statistics about a snapshot load operation.
