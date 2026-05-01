@@ -2010,44 +2010,90 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 	}
 	defer f.Close()
 
-	// Load snapshot
-	networkMagic := s.chainParams.NetworkMagic
-	utxoSet, stats, err := consensus.LoadSnapshot(f, s.chainDB, networkMagic)
+	// Read snapshot metadata FIRST so we can refuse early on a height
+	// not in m_assumeutxo_data, matching Bitcoin Core's behavior in
+	// validation.cpp:5775-5780. Loading the coins into a chainstate
+	// before the whitelist check would defeat the purpose of the check.
+	sr, err := consensus.NewSnapshotReader(f)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to read snapshot metadata: %v", err)}
+	}
+	meta := sr.Metadata()
+
+	// Verify network magic before consulting assumeutxo params.
+	if meta.NetworkMagic != s.chainParams.NetworkMagic {
+		return nil, &RPCError{
+			Code:    RPCErrVerify,
+			Message: "Snapshot network magic does not match node network",
+		}
+	}
+
+	// Strict whitelist: refuse to load any snapshot whose base_blockhash
+	// (and therefore height) is not in m_assumeutxo_data for this network.
+	// Core spec: bitcoin-core/src/validation.cpp:5775-5780.
+	if s.chainParams.AssumeUTXO == nil || len(s.chainParams.AssumeUTXO.Data) == 0 {
+		// No whitelist configured for this network at all => refuse.
+		// (Core's AssumeutxoForHeight returns nullopt for any height on
+		// such a network, and the caller errors out the same way.)
+		baseHeight := int32(-1)
+		if s.headerIndex != nil {
+			if node := s.headerIndex.GetNode(meta.BlockHash); node != nil {
+				baseHeight = node.Height
+			}
+		}
+		return nil, &RPCError{
+			Code: RPCErrVerify,
+			Message: fmt.Sprintf("Assumeutxo height in snapshot metadata not recognized "+
+				"(%d) - refusing to load snapshot", baseHeight),
+		}
+	}
+
+	auData := s.chainParams.AssumeUTXO.ForBlockHash(meta.BlockHash)
+	if auData == nil {
+		// Look up height in the header index for the error message; if
+		// unknown, fall back to -1 to match the "we don't know it" intent.
+		baseHeight := int32(-1)
+		if s.headerIndex != nil {
+			if node := s.headerIndex.GetNode(meta.BlockHash); node != nil {
+				baseHeight = node.Height
+			}
+		}
+		return nil, &RPCError{
+			Code: RPCErrVerify,
+			Message: fmt.Sprintf("Assumeutxo height in snapshot metadata not recognized "+
+				"(%d) - refusing to load snapshot", baseHeight),
+		}
+	}
+
+	// Whitelisted: now actually load the coins. We re-open the file and
+	// hand it to LoadSnapshot, which re-reads the metadata. (Cheap: 51 bytes.)
+	if _, seekErr := f.Seek(0, 0); seekErr != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to rewind snapshot file: %v", seekErr)}
+	}
+
+	utxoSet, stats, err := consensus.LoadSnapshot(f, s.chainDB, s.chainParams.NetworkMagic)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to load snapshot: %v", err)}
 	}
 
-	// Verify the snapshot hash matches assumeutxo params if available
-	if s.chainParams.AssumeUTXO != nil {
-		auData := s.chainParams.AssumeUTXO.ForBlockHash(stats.BlockHash)
-		if auData == nil {
-			return nil, &RPCError{
-				Code:    RPCErrVerify,
-				Message: fmt.Sprintf("Snapshot block hash %s not recognized in assumeutxo params", stats.BlockHash.String()),
-			}
-		}
+	// TODO(snapshot-strict-hash): also reject snapshots whose hash_serialized
+	// does not match the whitelisted value, per Core validation.cpp:5912-5914:
+	//
+	//   if (AssumeutxoHash{maybe_stats->hashSerialized} != au_data.hash_serialized)
+	//
+	// Core uses MuHash3072 over the (outpoint, coin) set; the fleet does not
+	// yet have a MuHash3072 implementation (snapshot wave TODO), so we cannot
+	// produce a comparable digest here. ComputeUTXOHash() is a plain SHA-256
+	// over the cache and will not match Core's hashSerialized. Once MuHash
+	// lands, replace this comment with the real check using the same error
+	// wording as Core: "Bad snapshot content hash: expected %s, got %s".
 
-		// Compute hash of loaded UTXO set
-		computedHash, _, err := consensus.ComputeUTXOHash(utxoSet)
-		if err != nil {
-			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to compute UTXO hash: %v", err)}
-		}
+	stats.Height = auData.Height
 
-		if computedHash != auData.HashSerialized {
-			return nil, &RPCError{
-				Code:    RPCErrVerify,
-				Message: fmt.Sprintf("Snapshot UTXO hash mismatch: expected %s, got %s",
-					auData.HashSerialized.String(), computedHash.String()),
-			}
-		}
-
-		stats.Height = auData.Height
-	}
-
-	// Look up the snapshot block in header index to get height
+	// If the header index knows the block, prefer that height (matches Core
+	// which uses snapshot_start_block->nHeight). Should agree with auData.Height.
 	if s.headerIndex != nil {
-		node := s.headerIndex.GetNode(stats.BlockHash)
-		if node != nil {
+		if node := s.headerIndex.GetNode(stats.BlockHash); node != nil {
 			stats.Height = node.Height
 		}
 	}
