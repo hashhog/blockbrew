@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/big"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/address"
@@ -1917,8 +1918,31 @@ func (s *Server) getNetwork() address.Network {
 // AssumeUTXO RPCs
 // ============================================================================
 
+// handleDumpTxOutSet implements the dumptxoutset RPC. Mirrors Bitcoin Core
+// (rpc/blockchain.cpp:dumptxoutset) including the optional rollback path.
+//
+// Accepted parameter shapes (positional, JSON array):
+//
+//	[path]                              -> "latest" (existing behavior)
+//	[path, "latest"]                    -> equivalent to above
+//	[path, "rollback"]                  -> rollback to the highest assumeutxo
+//	                                        height <= current tip
+//	[path, "rollback", {"rollback": h}] -> rollback to a specific height/hash
+//	[path, "",         {"rollback": h}] -> same; "type" omitted
+//
+// Behavior on rollback:
+//  1. Resolve target node via header index (height or block-hash string).
+//  2. Use ChainManager.ReorgTo(target) to disconnect the active tip back to
+//     the target. Because target is on the active chain, FindFork(tip,target)
+//     == target and ReorgTo just disconnects without reconnecting anything.
+//  3. Write the snapshot at the rolled-back tip.
+//  4. Re-apply blocks back to the original tip via ReorgTo(originalTip).
+//
+// If step (4) fails (block data missing on disk, etc.) the chain is left
+// at the lower height and the error is returned to the caller. The dump
+// itself has already been written.
 func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCError) {
-	// Parse parameters: [path]
+	// Parse parameters: [path, type?, options?]
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
@@ -1933,33 +1957,284 @@ func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid path"}
 	}
 
+	snapshotType := ""
+	if len(args) >= 2 {
+		if args[1] != nil {
+			st, stOK := args[1].(string)
+			if !stOK {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid type parameter (must be string)"}
+			}
+			snapshotType = st
+		}
+	}
+
+	var rollbackOpt interface{}
+	rollbackSpecified := false
+	if len(args) >= 3 && args[2] != nil {
+		opts, optsOK := args[2].(map[string]interface{})
+		if !optsOK {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid options parameter (must be object)"}
+		}
+		if v, present := opts["rollback"]; present {
+			rollbackOpt = v
+			rollbackSpecified = true
+		}
+	}
+
+	// Reject contradictory inputs (Core: rpc/blockchain.cpp:3117).
+	if rollbackSpecified && snapshotType != "" && snapshotType != "rollback" {
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParams,
+			Message: fmt.Sprintf("Invalid snapshot type %q specified with rollback option", snapshotType),
+		}
+	}
+
 	if s.chainMgr == nil {
 		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Chain manager not available"}
 	}
 
-	// Get current tip
-	tipHash, tipHeight := s.chainMgr.BestBlock()
+	// Snapshot the current ("real") tip up front.
+	originalTipHash, originalTipHeight := s.chainMgr.BestBlock()
+	originalTipNode := s.chainMgr.BestBlockNode()
 
-	// Get UTXO set - need to access it through chain manager
+	// Resolve target node.
+	var targetNode *consensus.BlockNode
+	switch {
+	case rollbackSpecified:
+		var rerr *RPCError
+		targetNode, rerr = s.resolveRollbackTarget(rollbackOpt)
+		if rerr != nil {
+			return nil, rerr
+		}
+	case snapshotType == "rollback":
+		// Default: highest assumeutxo height <= current tip.
+		if s.chainParams == nil || s.chainParams.AssumeUTXO == nil ||
+			len(s.chainParams.AssumeUTXO.Data) == 0 {
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParams,
+				Message: "No assumeutxo snapshot heights available for this network",
+			}
+		}
+		var bestHeight int32 = -1
+		var bestData *consensus.AssumeUTXOData
+		for i := range s.chainParams.AssumeUTXO.Data {
+			d := &s.chainParams.AssumeUTXO.Data[i]
+			if d.Height <= originalTipHeight && d.Height > bestHeight {
+				bestHeight = d.Height
+				bestData = d
+			}
+		}
+		if bestData == nil {
+			return nil, &RPCError{
+				Code: RPCErrInvalidParams,
+				Message: fmt.Sprintf(
+					"No assumeutxo snapshot height <= current tip height %d", originalTipHeight),
+			}
+		}
+		// Prefer header-index lookup by hash (definitive); fall back to height.
+		if s.headerIndex != nil {
+			if n := s.headerIndex.GetNode(bestData.BlockHash); n != nil {
+				targetNode = n
+			}
+		}
+		if targetNode == nil && originalTipNode != nil {
+			targetNode = originalTipNode.GetAncestor(bestData.Height)
+		}
+		if targetNode == nil {
+			return nil, &RPCError{
+				Code: RPCErrInternal,
+				Message: fmt.Sprintf(
+					"Could not locate assumeutxo target block at height %d", bestData.Height),
+			}
+		}
+	case snapshotType == "" || snapshotType == "latest":
+		// Stay at the current tip — no rollback.
+		targetNode = originalTipNode
+	default:
+		return nil, &RPCError{
+			Code: RPCErrInvalidParams,
+			Message: fmt.Sprintf(
+				"Invalid snapshot type %q specified. Please specify \"rollback\" or \"latest\"",
+				snapshotType),
+		}
+	}
+
+	// Bail out cleanly if we're being asked to roll back but have no path.
+	if targetNode == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Could not resolve target block"}
+	}
+
+	// If the target is above the active tip, that's a forward jump we can't do.
+	if targetNode.Height > originalTipHeight {
+		return nil, &RPCError{
+			Code: RPCErrInvalidParams,
+			Message: fmt.Sprintf(
+				"Target height %d is above current tip %d", targetNode.Height, originalTipHeight),
+		}
+	}
+
+	// Verify target is on the active chain (otherwise rollback is undefined).
+	if originalTipNode != nil && targetNode.Height < originalTipHeight {
+		ancestor := originalTipNode.GetAncestor(targetNode.Height)
+		if ancestor == nil || ancestor.Hash != targetNode.Hash {
+			return nil, &RPCError{
+				Code: RPCErrInvalidParams,
+				Message: fmt.Sprintf(
+					"Target block %s is not on the active chain", targetNode.Hash.String()),
+			}
+		}
+	}
+
+	// Validate that we have the needed UTXO set type before we touch the chain.
 	utxoSet := s.chainMgr.UTXOSet()
 	if utxoSet == nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set not available"}
 	}
-
-	// Cast to *UTXOSet for snapshot operations
 	us, ok := utxoSet.(*consensus.UTXOSet)
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set type not supported for snapshots"}
 	}
 
-	// Open file for writing
+	// Roll back if needed. ReorgTo(target) where target is an ancestor of the
+	// current tip just disconnects down to target (FindFork == target, no
+	// connect loop iterations).
+	rolledBack := targetNode.Hash != originalTipHash
+	if rolledBack {
+		log.Printf("rpc: dumptxoutset rolling back from height %d to %d (%s)",
+			originalTipHeight, targetNode.Height, targetNode.Hash.String()[:16])
+		if err := s.chainMgr.ReorgTo(targetNode); err != nil {
+			return nil, &RPCError{
+				Code:    RPCErrInternal,
+				Message: fmt.Sprintf("Failed to roll back to target height %d: %v", targetNode.Height, err),
+			}
+		}
+		// Defensive: confirm the chain actually moved to where we asked.
+		gotHash, gotHeight := s.chainMgr.BestBlock()
+		if gotHash != targetNode.Hash || gotHeight != targetNode.Height {
+			log.Printf("rpc: dumptxoutset rolled back to %d/%s but expected %d/%s",
+				gotHeight, gotHash.String()[:16],
+				targetNode.Height, targetNode.Hash.String()[:16])
+			// Best-effort: try to restore original tip and bail.
+			if originalTipNode != nil {
+				_ = s.chainMgr.ReorgTo(originalTipNode)
+			}
+			return nil, &RPCError{Code: RPCErrInternal, Message: "Rollback target was not reached"}
+		}
+	}
+
+	// Now snapshot the UTXO set at the (possibly rolled-back) tip.
+	dumpTipHash, dumpTipHeight := s.chainMgr.BestBlock()
+
+	dumpResult, dumpErr := s.writeUtxoSnapshotFile(path, us, dumpTipHash, dumpTipHeight)
+
+	// Re-apply blocks back to the original tip if we rolled back.
+	if rolledBack && originalTipNode != nil {
+		if err := s.chainMgr.ReorgTo(originalTipNode); err != nil {
+			// We've already written the snapshot if dumpErr == nil. Surface
+			// this as a hard error so the operator notices the chain is
+			// stuck below the original tip.
+			log.Printf("rpc: dumptxoutset failed to roll forward to original tip %s (height %d): %v",
+				originalTipHash.String()[:16], originalTipHeight, err)
+			return nil, &RPCError{
+				Code: RPCErrInternal,
+				Message: fmt.Sprintf(
+					"Snapshot dumped at height %d but failed to restore tip to height %d: %v",
+					dumpTipHeight, originalTipHeight, err),
+			}
+		}
+	}
+
+	if dumpErr != nil {
+		return nil, dumpErr
+	}
+	return dumpResult, nil
+}
+
+// resolveRollbackTarget parses the `rollback` named-option value, which Core
+// accepts as either a number (height) or a hex string (block hash). We accept
+// JSON numbers, JSON strings of decimal digits, and 64-hex-character block
+// hashes. Returns the corresponding BlockNode on the active chain, or an
+// RPC error.
+func (s *Server) resolveRollbackTarget(v interface{}) (*consensus.BlockNode, *RPCError) {
+	if s.headerIndex == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Header index not available"}
+	}
+
+	var asHeight int32 = -1
+	var asHashStr string
+
+	switch t := v.(type) {
+	case float64:
+		// JSON numbers always come back as float64 from encoding/json. Reject
+		// anything that isn't an integer in int32 range.
+		if t < 0 || t > float64(int32(0x7fffffff)) || t != float64(int32(t)) {
+			return nil, &RPCError{
+				Code: RPCErrInvalidParams,
+				Message: fmt.Sprintf("Invalid rollback height %v", t),
+			}
+		}
+		asHeight = int32(t)
+	case string:
+		if len(t) == 64 {
+			asHashStr = t
+		} else if h, err := strconv.ParseInt(t, 10, 32); err == nil && h >= 0 {
+			asHeight = int32(h)
+		} else {
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParams,
+				Message: fmt.Sprintf("Invalid rollback target %q (expected height or 64-char block hash)", t),
+			}
+		}
+	default:
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParams,
+			Message: "Invalid rollback option (expected number or string)",
+		}
+	}
+
+	if asHashStr != "" {
+		hash, err := wire.NewHash256FromHex(asHashStr)
+		if err != nil {
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParams,
+				Message: fmt.Sprintf("Invalid block hash %q: %v", asHashStr, err),
+			}
+		}
+		node := s.headerIndex.GetNode(hash)
+		if node == nil {
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParams,
+				Message: fmt.Sprintf("Block %s not found", asHashStr),
+			}
+		}
+		return node, nil
+	}
+
+	node := s.headerIndex.GetHeaderByHeight(asHeight)
+	if node == nil {
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParams,
+			Message: fmt.Sprintf("Block at height %d not found", asHeight),
+		}
+	}
+	return node, nil
+}
+
+// writeUtxoSnapshotFile writes the UTXO set to the given path and returns the
+// dumptxoutset result. Factored out so the rollback path can run it after the
+// chain is rewound.
+func (s *Server) writeUtxoSnapshotFile(
+	path string,
+	us *consensus.UTXOSet,
+	tipHash wire.Hash256,
+	tipHeight int32,
+) (*DumpTxOutSetResult, *RPCError) {
 	f, err := createSnapshotFile(path)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to create file: %v", err)}
 	}
 	defer f.Close()
 
-	// Write snapshot
 	networkMagic := s.chainParams.NetworkMagic
 	stats, err := consensus.WriteSnapshot(f, us, tipHash, networkMagic)
 	if err != nil {
