@@ -140,6 +140,14 @@ type Config struct {
 	ZMQPubSequence  string
 	RPCReadyNotify  bool
 	HealthPort      int
+
+	// LoadSnapshot is the path to a Bitcoin Core-format UTXO snapshot
+	// (`utxo\xff` magic, VARINT-coded coins).  When non-empty and the
+	// chainstate is fresh (height==0), blockbrew loads the snapshot
+	// before starting the rest of the node.  Mirrors Core's
+	// `-loadsnapshot=<path>`.  See bitcoin-core/src/node/utxo_snapshot.h
+	// + src/rpc/blockchain.cpp loadtxoutset.
+	LoadSnapshot string
 }
 
 // debugFlag implements flag.Value so `-debug=` may be repeated and/or
@@ -417,6 +425,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.ZMQPubSequence, "zmqpubsequence", "", "ZMQ endpoint for sequence notifications (block connect/disconnect, tx accept/remove).")
 	flag.BoolVar(&cfg.RPCReadyNotify, "rpcready-notify", true, "On systemd hosts, send READY=1 to NOTIFY_SOCKET once RPC is bound. No-op when NOTIFY_SOCKET is unset.")
 	flag.IntVar(&cfg.HealthPort, "healthport", 0, "If non-zero, bind a /healthz HTTP endpoint on 127.0.0.1:<port> for liveness/readiness probes. 0 disables.")
+	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", "Load a Bitcoin Core-format UTXO snapshot (utxo\\xff magic) from <path> before starting the node. Only acted on when the chainstate is fresh (height==0); otherwise an error is logged and the snapshot is skipped. Mirrors Bitcoin Core's `-loadsnapshot=<path>`.")
 	flag.Parse()
 
 	// Apply config file (CLI > config > default). Build the set of flags
@@ -658,8 +667,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	// 3. Load persisted chain state
 	chainState, err := chainDB.GetChainState()
+	freshChainstate := false
 	if err != nil {
 		log.Printf("No existing chain state found, starting fresh")
+		freshChainstate = true
 		genesisHash := chainParams.GenesisBlock.Header.BlockHash()
 		if err := chainDB.StoreBlock(genesisHash, chainParams.GenesisBlock); err != nil {
 			log.Printf("Warning: failed to store genesis block: %v", err)
@@ -672,11 +683,34 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		}
 	} else {
 		log.Printf("Loaded chain state: height=%d hash=%s", chainState.BestHeight, chainState.BestHash.String())
+		if chainState.BestHeight == 0 {
+			freshChainstate = true
+		}
 	}
 
 	// 4. Initialize UTXO set with the configured cache budget.
 	utxoSet := consensus.NewUTXOSetWithMaxCache(chainDB, utxoCacheBytes)
 	log.Printf("UTXO set initialized (cache_max=%d MiB)", utxoCacheBytes>>20)
+
+	// 4b. -load-snapshot: import a Bitcoin Core-format UTXO snapshot
+	// (utxo\xff magic) before the chain manager comes up.  Only acted
+	// on when the chainstate is fresh — refusing in the general case
+	// avoids accidentally clobbering an in-progress IBD.  Mirrors
+	// Core's loadtxoutset RPC + -loadsnapshot CLI behaviour: the
+	// snapshot file's blockhash MUST appear in the chain params'
+	// AssumeUTXO table, and the loaded UTXO set's hash MUST match
+	// the expected value before we accept it.
+	if cfg.LoadSnapshot != "" {
+		if !freshChainstate {
+			log.Printf("WARNING: -load-snapshot=%q ignored: chainstate is not fresh (height>0). "+
+				"To force a snapshot import, stop the node and remove %s.",
+				cfg.LoadSnapshot, dbPath)
+		} else {
+			if err := loadSnapshotFromFile(cfg.LoadSnapshot, chainDB, utxoSet, chainParams); err != nil {
+				return fmt.Errorf("load-snapshot %q: %w", cfg.LoadSnapshot, err)
+			}
+		}
+	}
 
 	// 5. Initialize chain manager
 	chainMgr := consensus.NewChainManager(consensus.ChainManagerConfig{
@@ -1253,9 +1287,6 @@ func handleSubcommands(args []string) bool {
 	case "import-blocks":
 		handleImportBlocks(args[1:])
 		return true
-	case "import-utxo":
-		handleImportUTXO(args[1:])
-		return true
 	case "help":
 		printHelp()
 		return true
@@ -1489,199 +1520,78 @@ func handleImportBlocks(args []string) {
 		imported, skipped, elapsed, rate)
 }
 
-// handleImportUTXO loads a UTXO snapshot from an HDOG file into the chainstate database.
-// HDOG format:
-//
-//	Header (52 bytes): Magic "HDOG" (4) + Version uint32 LE (4) + BlockHash (32 LE) + Height uint32 LE (4) + UTXOCount uint64 LE (8)
-//	Per UTXO: TxID (32 LE) + Vout uint32 LE (4) + Amount int64 LE (8) + HeightCB uint32 LE (4) + ScriptLen uint16 LE (2) + Script (N)
-func handleImportUTXO(args []string) {
-	log.SetPrefix("[blockbrew] ")
-	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
+// loadSnapshotFromFile imports a Bitcoin Core-format UTXO snapshot
+// (`utxo\xff` magic, VARINT-coded coins) into the active chainstate
+// database.  Mirrors Bitcoin Core's loadtxoutset RPC + -loadsnapshot
+// CLI behaviour: the snapshot's base blockhash must appear in the
+// network's AssumeUTXO table, and the recomputed UTXO hash must match
+// the expected value before we promote the snapshot to the active
+// chainstate.  Reference: bitcoin-core/src/rpc/blockchain.cpp.
+func loadSnapshotFromFile(path string, chainDB *storage.ChainDB, utxoSet *consensus.UTXOSet, params *consensus.ChainParams) error {
+	log.Printf("[snapshot] loading Core-format UTXO snapshot from %s", path)
 
-	fs := flag.NewFlagSet("import-utxo", flag.ExitOnError)
-	homeDir, _ := os.UserHomeDir()
-	defaultDataDir := filepath.Join(homeDir, defaultDir)
-
-	dataDir := fs.String("datadir", defaultDataDir, "Data directory")
-	network := fs.String("network", "mainnet", "Network (mainnet, testnet, regtest, signet, testnet4)")
-	filePath := fs.String("file", "", "Path to HDOG snapshot file (required)")
-	batchSize := fs.Int("batchsize", 100000, "Number of UTXOs per write batch")
-	fs.Parse(args)
-
-	if *filePath == "" {
-		fmt.Fprintln(os.Stderr, "Error: -file is required")
-		fmt.Fprintln(os.Stderr, "Usage: blockbrew import-utxo -file <path> [-datadir <dir>] [-network <net>]")
-		os.Exit(1)
-	}
-
-	// Resolve data directory
-	actualDataDir := *dataDir
-	if *network != "mainnet" {
-		actualDataDir = filepath.Join(*dataDir, *network)
-	}
-	if err := os.MkdirAll(actualDataDir, 0700); err != nil {
-		log.Fatalf("Failed to create data directory: %v", err)
-	}
-
-	log.Printf("import-utxo: network=%s datadir=%s file=%s", *network, actualDataDir, *filePath)
-
-	// Open snapshot file
-	f, err := os.Open(*filePath)
+	f, err := os.Open(path)
 	if err != nil {
-		log.Fatalf("Failed to open snapshot file: %v", err)
+		return fmt.Errorf("open snapshot: %w", err)
 	}
 	defer f.Close()
 
-	reader := bufio.NewReaderSize(f, 8*1024*1024) // 8MB read buffer
+	reader := bufio.NewReaderSize(f, 8*1024*1024)
 
-	// --- Parse HDOG header (52 bytes) ---
-	var magic [4]byte
-	if _, err := io.ReadFull(reader, magic[:]); err != nil {
-		log.Fatalf("Failed to read magic: %v", err)
-	}
-	if string(magic[:]) != "HDOG" {
-		log.Fatalf("Invalid magic: %q (expected \"HDOG\")", magic)
-	}
-
-	var hdrVersion uint32
-	if err := binary.Read(reader, binary.LittleEndian, &hdrVersion); err != nil {
-		log.Fatalf("Failed to read version: %v", err)
-	}
-	if hdrVersion != 1 {
-		log.Fatalf("Unsupported HDOG version: %d (expected 1)", hdrVersion)
-	}
-
-	var blockHash wire.Hash256
-	if _, err := io.ReadFull(reader, blockHash[:]); err != nil {
-		log.Fatalf("Failed to read block hash: %v", err)
-	}
-
-	var blockHeight uint32
-	if err := binary.Read(reader, binary.LittleEndian, &blockHeight); err != nil {
-		log.Fatalf("Failed to read block height: %v", err)
-	}
-
-	var utxoCount uint64
-	if err := binary.Read(reader, binary.LittleEndian, &utxoCount); err != nil {
-		log.Fatalf("Failed to read UTXO count: %v", err)
-	}
-
-	log.Printf("HDOG header: version=%d height=%d utxos=%d block=%s",
-		hdrVersion, blockHeight, utxoCount, blockHash.String())
-
-	// --- Open database (delete and recreate for clean import) ---
-	dbPath := filepath.Join(actualDataDir, "chaindata")
-	if _, statErr := os.Stat(dbPath); statErr == nil {
-		log.Printf("Removing existing chaindata directory for clean import...")
-		if err := os.RemoveAll(dbPath); err != nil {
-			log.Fatalf("Failed to remove existing chaindata: %v", err)
-		}
-		log.Printf("Existing chaindata removed")
-	}
-	db, err := storage.NewPebbleDB(dbPath)
+	// Use the existing LoadSnapshot path so dump/load symmetry is
+	// preserved end-to-end.  It validates the magic, version, network
+	// magic, reads coins via CoreDeserializeCoin, and flushes the UTXO
+	// set into the underlying ChainDB.
+	loaded, stats, err := consensus.LoadSnapshot(reader, chainDB, params.NetworkMagic)
 	if err != nil {
-		log.Fatalf("Failed to open database: %v", err)
-	}
-	defer db.Close()
-
-	// --- Stream UTXOs into database ---
-	batch := db.NewBatch()
-	startTime := time.Now()
-	lastLogTime := startTime
-
-	// Pre-allocate read buffer for fixed-size UTXO fields:
-	// TxID(32) + Vout(4) + Amount(8) + HeightCB(4) + ScriptLen(2) = 50 bytes
-	fixedBuf := make([]byte, 50)
-
-	for i := uint64(0); i < utxoCount; i++ {
-		// Read fixed-size fields in one call
-		if _, err := io.ReadFull(reader, fixedBuf); err != nil {
-			log.Fatalf("Failed to read UTXO %d: %v", i, err)
-		}
-
-		// Parse fields from buffer (all little-endian)
-		// txid: fixedBuf[0:32]
-		vout := binary.LittleEndian.Uint32(fixedBuf[32:36])
-		amount := int64(binary.LittleEndian.Uint64(fixedBuf[36:44]))
-		heightCB := binary.LittleEndian.Uint32(fixedBuf[44:48])
-		scriptLen := binary.LittleEndian.Uint16(fixedBuf[48:50])
-
-		// Read Script
-		script := make([]byte, scriptLen)
-		if scriptLen > 0 {
-			if _, err := io.ReadFull(reader, script); err != nil {
-				log.Fatalf("Failed to read script at UTXO %d: %v", i, err)
-			}
-		}
-
-		// Construct DB key: "U" + txid (32 bytes) + vout (4 bytes BE)
-		keyCopy := make([]byte, 1+32+4)
-		keyCopy[0] = 'U'
-		copy(keyCopy[1:33], fixedBuf[0:32])
-		binary.BigEndian.PutUint32(keyCopy[33:], vout)
-
-		// Construct DB value using the same serialization as consensus.SerializeUTXOEntry:
-		//   varint(height << 1 | coinbase) + varint(amount) + varint(compressed_script_len) + compressed_script
-		height := int32(heightCB >> 1)
-		isCoinbase := (heightCB & 1) == 1
-
-		entry := &consensus.UTXOEntry{
-			Amount:     amount,
-			PkScript:   script,
-			Height:     height,
-			IsCoinbase: isCoinbase,
-		}
-		value := consensus.SerializeUTXOEntry(entry)
-
-		batch.Put(keyCopy, value)
-
-		// Flush batch every batchSize entries
-		if (i+1)%uint64(*batchSize) == 0 {
-			if err := batch.Write(); err != nil {
-				log.Fatalf("Batch write failed at UTXO %d: %v", i, err)
-			}
-			batch.Reset()
-		}
-
-		// Log progress every 1M UTXOs
-		if (i+1)%1_000_000 == 0 {
-			now := time.Now()
-			elapsed := now.Sub(startTime).Seconds()
-			rate := float64(i+1) / elapsed
-			pct := float64(i+1) * 100 / float64(utxoCount)
-			sinceLog := now.Sub(lastLogTime).Seconds()
-			log.Printf("import-utxo: %d / %d (%.2f%%) %.0f utxo/s [%.1fs since last log, %.1fs total]",
-				i+1, utxoCount, pct, rate, sinceLog, elapsed)
-			lastLogTime = now
-		}
+		return fmt.Errorf("LoadSnapshot: %w", err)
 	}
 
-	// Flush remaining batch
-	if batch.Len() > 0 {
-		if err := batch.Write(); err != nil {
-			log.Fatalf("Final batch write failed: %v", err)
-		}
+	// Verify the snapshot blockhash is recognised in the chain params'
+	// AssumeUTXO table.  Without this we would happily import any
+	// arbitrary file claiming to be a snapshot.
+	if params.AssumeUTXO == nil {
+		return fmt.Errorf("network %q has no AssumeUTXO params; snapshot loading not supported", params.Name)
+	}
+	expected := params.AssumeUTXO.ForBlockHash(stats.BlockHash)
+	if expected == nil {
+		return fmt.Errorf("snapshot block hash %s not recognised in AssumeUTXO params", stats.BlockHash.String())
 	}
 
-	// --- Set chain state ---
-	chainDB := storage.NewChainDB(db)
-	chainState := &storage.ChainState{
-		BestHash:   blockHash,
-		BestHeight: int32(blockHeight),
+	// Recompute the UTXO hash and compare.  Catches truncated/tampered
+	// snapshot files before we trust them as the active chainstate.
+	computed, _, err := consensus.ComputeUTXOHash(loaded)
+	if err != nil {
+		return fmt.Errorf("ComputeUTXOHash: %w", err)
 	}
-	if err := chainDB.SetChainState(chainState); err != nil {
-		log.Fatalf("Failed to set chain state: %v", err)
-	}
-
-	// Also set the height -> hash mapping for the snapshot block
-	if err := chainDB.SetBlockHeight(int32(blockHeight), blockHash); err != nil {
-		log.Fatalf("Failed to set block height mapping: %v", err)
+	if computed != expected.HashSerialized {
+		return fmt.Errorf("snapshot UTXO hash mismatch: expected %s, got %s",
+			expected.HashSerialized.String(), computed.String())
 	}
 
-	elapsed := time.Since(startTime).Seconds()
-	rate := float64(utxoCount) / elapsed
-	log.Printf("import-utxo complete: %d UTXOs imported in %.1fs (%.0f utxo/s)", utxoCount, elapsed, rate)
-	log.Printf("Chain tip set to height=%d hash=%s", blockHeight, blockHash.String())
+	// Promote the snapshot to the active chainstate by recording the
+	// base block as the chain tip + height mapping.  Subsequent IBD
+	// will continue from this point.
+	if err := chainDB.SetChainState(&storage.ChainState{
+		BestHash:   stats.BlockHash,
+		BestHeight: expected.Height,
+	}); err != nil {
+		return fmt.Errorf("SetChainState: %w", err)
+	}
+	if err := chainDB.SetBlockHeight(expected.Height, stats.BlockHash); err != nil {
+		return fmt.Errorf("SetBlockHeight: %w", err)
+	}
+
+	// Replace the in-memory utxoSet caller's contents by re-reading
+	// from the database.  We don't have a direct "swap" API; instead,
+	// the LoadSnapshot path already flushed the loaded coins to
+	// chainDB, and the existing utxoSet shares the same backing DB,
+	// so subsequent reads will hit the newly-stored coins.
+	_ = utxoSet // placeholder: shared chainDB, no extra wiring needed
+
+	log.Printf("[snapshot] loaded %d coins; tip=%s height=%d hash_serialized=%s",
+		stats.CoinsLoaded, stats.BlockHash.String(), expected.Height, computed.String())
+	return nil
 }
 
 func printHelp() {
@@ -1692,7 +1602,6 @@ func printHelp() {
 	fmt.Println("  version          Print version and exit")
 	fmt.Println("  wallet           Wallet management commands")
 	fmt.Println("  import-blocks    Import blocks from stdin (framed format)")
-	fmt.Println("  import-utxo      Import UTXO snapshot from HDOG file")
 	fmt.Println("  help             Print this help message")
 	fmt.Println()
 	fmt.Println("Options:")
@@ -1740,12 +1649,15 @@ func printHelp() {
 	fmt.Println("  --zmqpubsequence    ZMQ PUB endpoint for sequence notifications")
 	fmt.Println("  --rpcready-notify   systemd READY=1 once RPC is bound (default: true)")
 	fmt.Println("  --healthport=N      Bind /healthz on 127.0.0.1:N (k8s probes; 0 disables)")
+	fmt.Println("  --load-snapshot=<path>  Bitcoin Core-format UTXO snapshot to load at boot")
+	fmt.Println("                          (utxo\\xff magic). Mirrors Core's -loadsnapshot.")
+	fmt.Println("                          Only acted on when chainstate is fresh (height==0).")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  blockbrew                                           Start node on mainnet")
 	fmt.Println("  blockbrew --network regtest                         Start node on regtest")
 	fmt.Println("  blockbrew wallet create                             Generate new wallet")
 	fmt.Println("  blockbrew import-blocks --network mainnet < blocks  Import blocks from stdin")
-	fmt.Println("  blockbrew import-utxo -file snapshot.hdog           Import UTXO snapshot")
+	fmt.Println("  blockbrew --load-snapshot=utxo.dat                  Load Core-format UTXO snapshot at boot")
 	fmt.Println("  blockbrew --version                                 Print version")
 }
