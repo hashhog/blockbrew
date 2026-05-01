@@ -1967,8 +1967,11 @@ func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 	}
 	stats.Height = tipHeight
 
-	// Compute hash of the UTXO set for verification
-	utxoHash, coinsCount, err := consensus.ComputeUTXOHash(us)
+	// Compute Core-compatible HASH_SERIALIZED over the UTXO set. This is the
+	// value compared against `assumeutxo` whitelist entries on the load side
+	// (validation.cpp:5912-5914) and the same one Core's `dumptxoutset`
+	// reports as `txoutset_hash`.
+	utxoHash, coinsCount, err := consensus.ComputeHashSerialized(us)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to compute UTXO hash: %v", err)}
 	}
@@ -2076,17 +2079,25 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to load snapshot: %v", err)}
 	}
 
-	// TODO(snapshot-strict-hash): also reject snapshots whose hash_serialized
-	// does not match the whitelisted value, per Core validation.cpp:5912-5914:
-	//
-	//   if (AssumeutxoHash{maybe_stats->hashSerialized} != au_data.hash_serialized)
-	//
-	// Core uses MuHash3072 over the (outpoint, coin) set; the fleet does not
-	// yet have a MuHash3072 implementation (snapshot wave TODO), so we cannot
-	// produce a comparable digest here. ComputeUTXOHash() is a plain SHA-256
-	// over the cache and will not match Core's hashSerialized. Once MuHash
-	// lands, replace this comment with the real check using the same error
-	// wording as Core: "Bad snapshot content hash: expected %s, got %s".
+	// Strict content-hash check: refuse to activate the snapshot if the
+	// HASH_SERIALIZED digest of the loaded coins does not match the
+	// whitelisted assumeutxo value. Mirrors Core validation.cpp:5912-5914
+	// down to the error wording ("Bad snapshot content hash: expected %s,
+	// got %s") so behaviour is identical from an operator's perspective.
+	gotHash, _, hashErr := consensus.ComputeHashSerialized(utxoSet)
+	if hashErr != nil {
+		return nil, &RPCError{
+			Code:    RPCErrInternal,
+			Message: fmt.Sprintf("Failed to compute snapshot content hash: %v", hashErr),
+		}
+	}
+	if gotHash != auData.HashSerialized {
+		return nil, &RPCError{
+			Code: RPCErrVerify,
+			Message: fmt.Sprintf("Bad snapshot content hash: expected %s, got %s",
+				auData.HashSerialized.String(), gotHash.String()),
+		}
+	}
 
 	stats.Height = auData.Height
 
