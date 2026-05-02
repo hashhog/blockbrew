@@ -448,12 +448,20 @@ func LoadSnapshot(r io.Reader, db *storage.ChainDB, expectedNetworkMagic [4]byte
 	// Verify we consumed all coins
 	stats.CoinsLoaded = coinsLoaded
 
-	// Flush to database
-	if err := utxoSet.Flush(); err != nil {
-		return nil, nil, fmt.Errorf("failed to flush UTXO set: %w", err)
-	}
-
-	log.Printf("[snapshot] loaded %d coins from snapshot", coinsLoaded)
+	// IMPORTANT: do NOT call utxoSet.Flush() here. Flush() invokes the
+	// post-flush eviction (utxoset.go:299) which trims the cache to
+	// maxCacheBytes/4 once cacheBytes exceeds maxCacheBytes/2. For a
+	// real-world snapshot (165M coins ≈ 30 GiB cache) the eviction
+	// throws away ~95% of the freshly-loaded coins, after which the
+	// caller's HASH_SERIALIZED computation walks the (mostly empty)
+	// cache and produces a digest that doesn't match the snapshot —
+	// so the assumeutxo whitelist check rejects every real load.
+	//
+	// The caller is now responsible for: (1) computing the content
+	// hash against the in-memory cache, and (2) calling Flush() once
+	// the hash check passes (and accepting the cache trim that
+	// follows). See loadSnapshotFromFile in cmd/blockbrew/main.go.
+	log.Printf("[snapshot] loaded %d coins from snapshot (deferred flush)", coinsLoaded)
 	return utxoSet, stats, nil
 }
 

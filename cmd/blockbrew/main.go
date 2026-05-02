@@ -1597,13 +1597,35 @@ func loadSnapshotFromFile(path string, chainDB *storage.ChainDB, utxoSet *consen
 
 	// Recompute the UTXO hash and compare.  Catches truncated/tampered
 	// snapshot files before we trust them as the active chainstate.
-	computed, _, err := consensus.ComputeUTXOHash(loaded)
+	//
+	// Use ComputeHashSerialized (HashWriter::GetHash = SHA256d over
+	// uncompressed TxOutSer records, validation.cpp:5912-5914) — same
+	// flavour Bitcoin Core's `loadtxoutset` RPC validates against, and
+	// the same flavour produced by `dumptxoutset`'s txoutset_hash field
+	// + tools/compute-snapshot-hash.py + every other hashhog impl
+	// (lunarblock src/utxo.lua, hotbuns src/consensus/utxoHash.ts, etc).
+	// The earlier ComputeUTXOHash here was Core-compressed + single
+	// SHA256 — neither byte layout nor digest matched any other path,
+	// silently rejecting every real-world snapshot.
+	computed, _, err := consensus.ComputeHashSerialized(loaded)
 	if err != nil {
-		return fmt.Errorf("ComputeUTXOHash: %w", err)
+		return fmt.Errorf("ComputeHashSerialized: %w", err)
 	}
 	if computed != expected.HashSerialized {
 		return fmt.Errorf("snapshot UTXO hash mismatch: expected %s, got %s",
 			expected.HashSerialized.String(), computed.String())
+	}
+
+	// Hash check passed — now flush the loaded coins to chainDB.
+	// LoadSnapshot deliberately defers the flush so that the
+	// post-flush cache eviction (utxoset.go:299) doesn't run before
+	// ComputeHashSerialized has had a chance to walk the in-memory
+	// cache.  Calling Flush here accepts the eviction that follows;
+	// we no longer need the cache populated since the coins are now
+	// durable in chainDB and the active utxoSet (which shares the
+	// same chainDB) will read them on demand.
+	if err := loaded.Flush(); err != nil {
+		return fmt.Errorf("flush snapshot UTXOs: %w", err)
 	}
 
 	// Promote the snapshot to the active chainstate by recording the
@@ -1621,9 +1643,9 @@ func loadSnapshotFromFile(path string, chainDB *storage.ChainDB, utxoSet *consen
 
 	// Replace the in-memory utxoSet caller's contents by re-reading
 	// from the database.  We don't have a direct "swap" API; instead,
-	// the LoadSnapshot path already flushed the loaded coins to
-	// chainDB, and the existing utxoSet shares the same backing DB,
-	// so subsequent reads will hit the newly-stored coins.
+	// the snapshot's UTXOSet (`loaded`) now shares the same backing
+	// chainDB as the active utxoSet, so subsequent GetUTXO calls on
+	// utxoSet will hit the newly-persisted coins via the database.
 	_ = utxoSet // placeholder: shared chainDB, no extra wiring needed
 
 	log.Printf("[snapshot] loaded %d coins; tip=%s height=%d hash_serialized=%s",
