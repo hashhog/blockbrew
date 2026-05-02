@@ -684,6 +684,25 @@ var MainnetAssumeUTXOParams = AssumeUTXOParams{
 			ChainTxCount: 1305397408,
 			BlockHash:    mustParseHash("0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"),
 		},
+		// hashhog-local snapshot at h=944183 (utxo-snapshot-raw.dat from
+		// /data/nvme1/hashhog-mainnet/), used to recover blockbrew + lunarblock
+		// + hotbuns mainnet nodes after chainstate corruption (chainstate-
+		// corruption banner; sister bug to CAMLCOIN-EBADF-LEAK). NOT a Bitcoin
+		// Core chainparams entry — the four 840k/880k/910k/935k entries above
+		// ARE. Hash computed locally over the on-disk snapshot file
+		// (165,095,935 coins) by tools/compute-snapshot-hash.py:
+		//   raw HASH_SERIALIZED  = a888bcbc200384747c0813c8e7f4650d9bc0847b5147791c3ca869567271af2e
+		//   display (uint256)    = 2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8
+		// HashSerialized below is in display order to match the convention
+		// used by the four Core entries above (mustParseHash reverses to
+		// internal/raw order, which is what ComputeHashSerialized produces
+		// from sha256.Sum256 — see internal/consensus/utxohash.go:139-142).
+		{
+			Height:         944183,
+			HashSerialized: mustParseHash("2eaf71725669a83c1c7947517b84c09b0d65f4e7c813087c74840320bcbc88a8"),
+			ChainTxCount:   1334000000,
+			BlockHash:      mustParseHash("0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"),
+		},
 	},
 }
 
