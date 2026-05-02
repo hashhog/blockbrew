@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+
+	"github.com/hashhog/blockbrew/internal/wallet"
 )
 
 // ============================================================================
@@ -141,6 +144,50 @@ func (s *Server) handleSendToAddress(params json.RawMessage) (interface{}, *RPCE
 	return tx.TxHash().String(), nil
 }
 
+// handleEncryptWallet implements `encryptwallet "passphrase"`.
+//
+// Encrypts the master HD key under the supplied passphrase and locks the
+// wallet. Reference: bitcoin-core/src/wallet/rpc/encrypt.cpp::encryptwallet.
+//
+// Errors:
+//   -15 RPCErrWalletWrongEncState     when the wallet is already encrypted
+//   -8  RPCErrInvalidParameter        when passphrase is empty
+//   -16 RPCErrWalletEncryptionFailed  when encryption fails internally
+func (s *Server) handleEncryptWallet(params json.RawMessage) (interface{}, *RPCError) {
+	if s.wallet == nil {
+		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
+	}
+
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing passphrase"}
+	}
+	passphrase, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid passphrase"}
+	}
+	if passphrase == "" {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "passphrase cannot be empty"}
+	}
+
+	if err := s.wallet.EncryptWallet(passphrase); err != nil {
+		return nil, mapEncryptionError(err)
+	}
+
+	return "wallet encrypted; the keypool has been flushed. The wallet is now locked; use walletpassphrase to unlock.", nil
+}
+
+// handleWalletPassphrase implements `walletpassphrase "passphrase" timeout`.
+//
+// Decrypts the master key for `timeout` seconds, then auto-relocks via a
+// time.AfterFunc callback. If the wallet is not yet encrypted (i.e. created
+// without EncryptWallet), falls back to the legacy mnemonic-unlock for
+// backward compatibility with pre-encryption blockbrew callers.
+//
+// Reference: bitcoin-core/src/wallet/rpc/encrypt.cpp::walletpassphrase.
 func (s *Server) handleWalletPassphrase(params json.RawMessage) (interface{}, *RPCError) {
 	if s.wallet == nil {
 		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
@@ -159,24 +206,92 @@ func (s *Server) handleWalletPassphrase(params json.RawMessage) (interface{}, *R
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid passphrase"}
 	}
+	if passphrase == "" {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "passphrase cannot be empty"}
+	}
 
-	// In Bitcoin Core, walletpassphrase takes the encryption passphrase.
-	// In blockbrew, we use the mnemonic to unlock. For RPC compatibility,
-	// we treat the passphrase as the mnemonic.
+	// Bitcoin Core behavior: timeout in seconds, second positional arg.
+	// If absent, fall back to a 60s default for ergonomic CLI use.
+	var timeout int64 = 60
+	if len(args) >= 2 {
+		switch t := args[1].(type) {
+		case float64:
+			timeout = int64(t)
+		case int64:
+			timeout = t
+		default:
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid timeout"}
+		}
+	}
+	if timeout < 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Timeout cannot be negative."}
+	}
+
+	if s.wallet.IsEncrypted() {
+		if err := s.wallet.UnlockWithPassphrase(passphrase, timeout); err != nil {
+			return nil, mapEncryptionError(err)
+		}
+		return nil, nil
+	}
+
+	// Backward-compatible path: pre-encryption wallets use the mnemonic.
 	if err := s.wallet.Unlock(passphrase, ""); err != nil {
 		return nil, &RPCError{Code: RPCErrWalletError, Message: fmt.Sprintf("Failed to unlock wallet: %v", err)}
 	}
-
 	return nil, nil
 }
 
+// handleWalletLock implements `walletlock`. Zeroes the in-memory master key
+// and clears any pending auto-relock timer. Reference:
+// bitcoin-core/src/wallet/rpc/encrypt.cpp::walletlock.
 func (s *Server) handleWalletLock() (interface{}, *RPCError) {
 	if s.wallet == nil {
 		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
 	}
 
+	if !s.wallet.IsEncrypted() {
+		return nil, &RPCError{
+			Code:    RPCErrWalletWrongEncState,
+			Message: "Error: running with an unencrypted wallet, but walletlock was called.",
+		}
+	}
+
 	s.wallet.Lock()
 	return nil, nil
+}
+
+// mapEncryptionError converts wallet-package errors into the canonical
+// JSON-RPC error codes from bitcoin-core/src/rpc/protocol.h.
+func mapEncryptionError(err error) *RPCError {
+	switch {
+	case errors.Is(err, wallet.ErrWalletAlreadyEncrypted):
+		return &RPCError{
+			Code:    RPCErrWalletWrongEncState,
+			Message: "Error: running with an encrypted wallet, but encryptwallet was called.",
+		}
+	case errors.Is(err, wallet.ErrWalletNotEncrypted):
+		return &RPCError{
+			Code:    RPCErrWalletWrongEncState,
+			Message: "Error: running with an unencrypted wallet, but walletpassphrase was called.",
+		}
+	case errors.Is(err, wallet.ErrPassphraseIncorrect):
+		return &RPCError{
+			Code:    RPCErrWalletPassphraseIncorrect,
+			Message: "Error: The wallet passphrase entered was incorrect.",
+		}
+	case errors.Is(err, wallet.ErrEmptyPassphrase):
+		return &RPCError{
+			Code:    RPCErrInvalidParameter,
+			Message: "passphrase cannot be empty",
+		}
+	case errors.Is(err, wallet.ErrNoMasterKey):
+		return &RPCError{
+			Code:    RPCErrWalletEncryptionFailed,
+			Message: "Error: wallet does not contain private keys, nothing to encrypt.",
+		}
+	default:
+		return &RPCError{Code: RPCErrWalletEncryptionFailed, Message: err.Error()}
+	}
 }
 
 func (s *Server) handleListTransactions(params json.RawMessage) (interface{}, *RPCError) {
