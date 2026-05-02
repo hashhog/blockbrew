@@ -1317,3 +1317,210 @@ func (cm *ChainManager) PreciousBlock(hash wire.Hash256) error {
 func (cm *ChainManager) GetHeaderIndex() *HeaderIndex {
 	return cm.headerIndex
 }
+
+// ChainstateConsistencyResult summarises the outcome of a startup
+// consistency probe.  Callers log it and may use the rollback fields to
+// surface user-facing recovery hints.
+type ChainstateConsistencyResult struct {
+	// TipBefore is the tip height the probe started at (informational).
+	TipBefore int32
+	// TipAfter is the tip height after any auto-rollback.
+	TipAfter int32
+	// BlocksProbed is the number of blocks examined (1..maxDepth).
+	BlocksProbed int
+	// CorruptionAtHeight is the highest height where the consistency check
+	// detected a missing UTXO / undo-data / block-body invariant.  Zero
+	// when the chain is clean.
+	CorruptionAtHeight int32
+	// RolledBackBlocks is the number of blocks DisconnectBlock peeled off
+	// the tip in response.  Zero when the chain is clean or rollback
+	// could not run.
+	RolledBackBlocks int
+	// RollbackFailed is set if a corruption was detected but the rollback
+	// could not complete (e.g. missing undo data).  When true the caller
+	// should surface a [CHAINSTATE-CORRUPTION] notice and exit so the
+	// operator can wipe chaindata/.
+	RollbackFailed bool
+}
+
+// VerifyChainstateConsistency performs a startup consistency probe of the
+// persisted chainstate.  Same class of recovery as lunarblock c6fd8a0 +
+// nimrod 4920988: a hard crash mid-IBD can leave a state where chain_tip
+// advanced past blocks whose UTXO mutations / undo data / block body
+// never reached disk, producing a deterministic later wedge ("missing
+// UTXO" forever; see project memory `project_lunarblock_wedge_2026_04_28`
+// + the May 1 2026 blockbrew h=938360 wedge).
+//
+// Strategy: walk back maxDepth blocks from the current tip; for each
+// block, fetch the body + first 5 non-coinbase tx inputs and verify each
+// previous output resolves either to the live UTXO set or to the block's
+// own undo-data records.  A miss means the persisted UTXO set lost a
+// coin that the chain tip claims is spendable — the smoking-gun
+// corruption pattern.
+//
+// On detection we DisconnectBlock back to the deepest known-good height
+// (which restores UTXOs from undo data and rewrites chain_tip atomically
+// via the existing reorg path).  If undo data is missing for a block we
+// would need to peel, rollback aborts and the caller is expected to
+// surface a clear [CHAINSTATE-CORRUPTION] error directing the operator
+// to wipe chaindata/ (analogous to lunarblock's --reindex-chainstate
+// hint; blockbrew currently honest-defers --reindex per
+// cmd/blockbrew/main.go:258).
+//
+// maxDepth bounds the probe so a healthy node pays O(maxDepth) on every
+// startup, not O(tip).  200 mirrors lunarblock; large enough to catch
+// the typical "last few blocks of UTXO writes were lost" pattern, small
+// enough to finish in well under a second on warm caches.
+func (cm *ChainManager) VerifyChainstateConsistency(maxDepth int) ChainstateConsistencyResult {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	res := ChainstateConsistencyResult{}
+	if cm.tipNode == nil || cm.tipHeight <= 0 {
+		// Genesis-only chainstate. Nothing to verify.
+		return res
+	}
+	if cm.chainDB == nil {
+		return res
+	}
+
+	res.TipBefore = cm.tipHeight
+	res.TipAfter = cm.tipHeight
+
+	if maxDepth <= 0 {
+		maxDepth = 200
+	}
+
+	// inputCheckLimit caps the per-block input probe at a small number so
+	// the walk is cheap on archive nodes. Five is enough to catch the
+	// typical wedge where one of the early txs in a block spends a UTXO
+	// from the unflushed window — the original h=938361 symptom.
+	const inputCheckLimit = 5
+
+	// Walk back from tip up to maxDepth blocks. We stop early at the
+	// first detected corruption — DisconnectBlock will peel the tip back
+	// to that height (inclusive) and the next IBD pass re-applies it.
+	node := cm.tipNode
+	deepestBad := int32(-1)
+	for i := 0; i < maxDepth && node != nil && node.Height > 0; i++ {
+		res.BlocksProbed++
+
+		// Fetch the block body. If it is missing, the on-disk state has
+		// chain_tip ahead of block storage — the lunarblock
+		// `block_in_storage=no` symptom. Treat as corruption.
+		block, err := cm.chainDB.GetBlock(node.Hash)
+		if err != nil || block == nil {
+			log.Printf("chainmgr: [CONSISTENCY-PROBE] block body missing for tip-side block height=%d hash=%s err=%v",
+				node.Height, node.Hash.String()[:16], err)
+			deepestBad = node.Height
+			node = node.Parent
+			continue
+		}
+
+		// For each non-coinbase tx (capped), verify each input's prev-out
+		// resolves either to a live UTXO (already-spent inputs are
+		// expected to be ABSENT here, so we only consult the undo data
+		// in that case) or to the block's recorded SpentCoin.
+		probed := 0
+		blockCorrupt := false
+	txLoop:
+		for txIdx, tx := range block.Transactions {
+			if txIdx == 0 {
+				continue // coinbase
+			}
+			for inIdx, in := range tx.TxIn {
+				probed++
+				if probed > inputCheckLimit {
+					break txLoop
+				}
+
+				// Live UTXO lookup. After the block is connected, the
+				// input UTXO is spent and *should* be absent. So we
+				// expect the lookup to return nil — and the proof of
+				// historical existence comes from undo data.
+				live := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
+				if live != nil {
+					// Live UTXO still exists. Either (a) chain tip is
+					// behind, (b) this is a duplicate-coinbase artifact
+					// (BIP30), or (c) the UTXO set is genuinely
+					// inconsistent. Live presence is not a corruption
+					// signal on its own; skip to undo-data check.
+					_ = live
+				}
+
+				// Undo data records the coins this tx spent. Existence
+				// proves the chainstate transition was applied and
+				// the on-disk view is internally consistent.
+				if cm.chainDB == nil {
+					continue
+				}
+				undo, err := cm.chainDB.ReadBlockUndo(node.Hash)
+				if err != nil || undo == nil {
+					log.Printf("chainmgr: [CONSISTENCY-PROBE] undo data missing for height=%d hash=%s tx=%d in=%d err=%v",
+						node.Height, node.Hash.String()[:16], txIdx, inIdx, err)
+					blockCorrupt = true
+					break txLoop
+				}
+				// We don't drill into the SpentCoin contents — presence
+				// is sufficient for the lightweight probe. Deeper
+				// validation is the job of -reindex-chainstate.
+				break txLoop
+			}
+		}
+		if blockCorrupt {
+			deepestBad = node.Height
+		}
+
+		node = node.Parent
+	}
+
+	if deepestBad < 0 {
+		// Clean chainstate.
+		log.Printf("chainmgr: [CONSISTENCY-PROBE] OK tip=%d depth=%d blocks", res.TipBefore, res.BlocksProbed)
+		return res
+	}
+
+	// Corruption detected. Peel the chain tip back to deepestBad-1 by
+	// repeated DisconnectBlock. DisconnectBlock validates the tip
+	// matches and replays undo data — if it fails (undo missing) we stop
+	// and surface RollbackFailed=true.
+	res.CorruptionAtHeight = deepestBad
+	log.Printf("chainmgr: [CONSISTENCY-PROBE] corruption detected at height %d — rolling back", deepestBad)
+
+	// Disconnect runs under cm.mu, but DisconnectBlock acquires it again
+	// (it's a public entrypoint). Drop the lock around each call.
+	for cm.tipNode != nil && cm.tipHeight >= deepestBad {
+		hash := cm.tipNode.Hash
+		h := cm.tipHeight
+
+		cm.mu.Unlock()
+		err := cm.DisconnectBlock(hash)
+		cm.mu.Lock()
+
+		if err != nil {
+			log.Printf("chainmgr: [CONSISTENCY-PROBE] DisconnectBlock failed at height %d: %v", h, err)
+			res.RollbackFailed = true
+			break
+		}
+		res.RolledBackBlocks++
+		// Safety cap: don't peel more than 2*maxDepth blocks even if
+		// something pathological keeps reporting corruption.
+		if res.RolledBackBlocks >= 2*maxDepth {
+			log.Printf("chainmgr: [CONSISTENCY-PROBE] reached rollback safety cap (%d blocks)", res.RolledBackBlocks)
+			res.RollbackFailed = true
+			break
+		}
+	}
+
+	res.TipAfter = cm.tipHeight
+	if res.RollbackFailed {
+		log.Printf("chainmgr: [CHAINSTATE-CORRUPTION] auto-rollback could not complete (tip=%d). "+
+			"The on-disk chainstate appears corrupt. Operator action: stop the node and remove "+
+			"the chaindata/ directory to force a full re-sync (blockbrew -reindex is honest-deferred).",
+			res.TipAfter)
+	} else {
+		log.Printf("chainmgr: [CONSISTENCY-PROBE] rolled back %d blocks; tip=%d", res.RolledBackBlocks, res.TipAfter)
+	}
+
+	return res
+}

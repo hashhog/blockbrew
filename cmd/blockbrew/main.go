@@ -829,6 +829,27 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			// higher tip. This call restores the correct tip so that
 			// StartBlockDownload resumes from where we left off.
 			chainMgr.ReloadChainState()
+
+			// Startup chainstate consistency probe (BUG-REPORT.md fix #3).
+			// After ReloadChainState restored the tip, walk back up to
+			// 200 blocks and verify each block's UTXO/undo invariants.
+			// On corruption (UTXO writes lost in a crash window),
+			// auto-rollback the tip to the last known-good height; the
+			// next IBD pass re-applies the peeled blocks. Runs once per
+			// startup so a healthy node pays a fixed-time probe.
+			res := chainMgr.VerifyChainstateConsistency(200)
+			if res.RolledBackBlocks > 0 {
+				log.Printf("[CHAINSTATE-RECOVERY] auto-rolled back %d blocks (tip %d -> %d) after consistency probe; "+
+					"will re-fetch + re-apply on the next IBD pass",
+					res.RolledBackBlocks, res.TipBefore, res.TipAfter)
+			}
+			if res.RollbackFailed {
+				log.Printf("[CHAINSTATE-CORRUPTION] startup consistency probe detected unrecoverable state at "+
+					"height %d. Operator action required: stop the node and remove %s/chaindata/ "+
+					"to force a full re-sync. (-reindex is honest-deferred; see main.go:258.)",
+					res.CorruptionAtHeight, cfg.DataDir)
+			}
+
 			syncMgr.StartBlockDownload()
 		},
 		OnBlockConnected: onBlockConnected,
@@ -1206,24 +1227,31 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			}
 		}
 
-		// Flush chainstate: UTXO set, then chain tip pointer. Order matters
-		// for crash consistency — tip must reference an already-flushed UTXO.
-		log.Printf("flushing chainstate")
-		if err := utxoSet.Flush(); err != nil {
-			log.Printf("Warning: UTXO flush failed: %v", err)
-		}
-		log.Printf("UTXO set flushed")
-
+		// Flush chainstate atomically: UTXO set + chain-tip pointer in a
+		// single Pebble batch with Sync. Pre-2026-05-02 these were two
+		// separate writes (utxoSet.Flush() then chainDB.SetChainState()),
+		// which left a SIGKILL-during-shutdown window where the persisted
+		// UTXO cache could land *ahead* of the persisted chain tip — the
+		// exact corruption pattern observed in the May 1 blockbrew
+		// h=938360 wedge (and lunarblock's Apr 28 h=938344 wedge).  After
+		// this fix there is no on-disk state where UTXOs reflect height
+		// N+M but chain_tip still says height N.
 		bestHash, bestHeight := chainMgr.BestBlock()
+		log.Printf("flushing chainstate atomically at height %d", bestHeight)
+		shutBatch := chainDB.NewBatch()
+		if err := utxoSet.FlushBatch(shutBatch); err != nil {
+			log.Printf("Warning: UTXO flush-batch failed: %v", err)
+		}
 		if bestHeight > 0 {
-			if err := chainDB.SetChainState(&storage.ChainState{
+			chainDB.SetChainStateBatch(shutBatch, &storage.ChainState{
 				BestHash:   bestHash,
 				BestHeight: bestHeight,
-			}); err != nil {
-				log.Printf("Warning: chain state save failed: %v", err)
-			} else {
-				log.Printf("Chain state saved at height %d", bestHeight)
-			}
+			})
+		}
+		if err := shutBatch.Write(); err != nil {
+			log.Printf("Warning: atomic chainstate-flush batch failed: %v", err)
+		} else {
+			log.Printf("Chainstate flushed atomically (UTXO + tip) at height %d", bestHeight)
 		}
 
 		// Flush + close the flat-file block store BEFORE the Pebble DB.

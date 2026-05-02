@@ -1355,6 +1355,108 @@ func TestEvictDistantPendingNoop(t *testing.T) {
 	}
 }
 
+// failingChainConnector returns a configurable error from ConnectBlock.
+// Used to verify the halt-on-validation-failure branch.
+type failingChainConnector struct {
+	mockChainConnector
+	err     error
+	calls   atomic.Int32
+}
+
+func (f *failingChainConnector) ConnectBlock(_ *wire.MsgBlock) error {
+	f.calls.Add(1)
+	return f.err
+}
+
+// TestConnectPendingBlocksHaltsOnValidationFailure verifies the
+// BUG-REPORT.md fix #4 / W82-CHAINSTATE behaviour: when ConnectBlock
+// returns a genuine validation error during IBD, the connect loop must
+// latch the chainstateCorrupted flag and stop calling ConnectBlock so
+// the operator gets a single [CHAINSTATE-CORRUPTION] notice instead of
+// the 50k/min retry storm that produced the 14M-line May 1 wedge log.
+//
+// Pre-fix behaviour: nextHeight was advanced past the failed block but
+// the chain tip stayed put, so the next block always failed
+// "block does not connect to tip" and the gap-detection path
+// re-queued the same block forever.
+func TestConnectPendingBlocksHaltsOnValidationFailure(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	mock := &failingChainConnector{
+		mockChainConnector: mockChainConnector{tipHeight: 0, tipTimestamp: 1},
+	}
+	// Same shape as the real h=938361 wedge: a tx-input validation
+	// error that the pre-fix code mis-classified as "skip me".
+	wireErr := "tx 1 input validation failed: transaction input references missing UTXO: " +
+		"c07011e99e20497fe3a43f089aa74bdada1973092011e2901fb8623786141013:1"
+	mock.err = &simpleErr{msg: wireErr}
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:  params,
+		HeaderIndex:  idx,
+		ChainManager: mock,
+	})
+	sm.nextHeight = 1
+
+	// Build a single pending block at height 1.
+	hdr := createTestBlockHeader(wire.Hash256{}, 100, 1)
+	bwr := &blockWithRequest{
+		block: &wire.MsgBlock{
+			Header: hdr,
+			Transactions: []*wire.MsgTx{
+				{
+					Version: 1,
+					TxIn: []*wire.TxIn{{
+						PreviousOutPoint: wire.OutPoint{Index: 0xFFFFFFFF},
+						SignatureScript:  []byte{0x01, 0x01},
+						Sequence:         0xFFFFFFFF,
+					}},
+					TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x51}}},
+				},
+			},
+		},
+		req: &blockRequest{
+			Hash:   hdr.BlockHash(),
+			Height: 1,
+			State:  BlockDownloadReceived,
+		},
+	}
+	pending := map[int32]*blockWithRequest{1: bwr}
+
+	// First call: ConnectBlock fires once, fails with a "genuine"
+	// validation error, the corruption flag latches, pending is
+	// drained, and nextHeight does NOT advance (vs the pre-fix path
+	// which incorrectly bumped nextHeight past the bad block).
+	sm.connectPendingBlocks(pending)
+	if !sm.chainstateCorrupted.Load() {
+		t.Fatal("chainstateCorrupted should be latched after first validation failure")
+	}
+	if got := mock.calls.Load(); got != 1 {
+		t.Errorf("ConnectBlock calls=%d, want 1 on first attempt", got)
+	}
+	if _, still := pending[1]; still {
+		t.Error("pending[1] should be drained after halt")
+	}
+	if sm.nextHeight != 1 {
+		t.Errorf("nextHeight=%d, want 1 (must NOT advance past corrupt block)", sm.nextHeight)
+	}
+
+	// Second call: re-seed pending and verify ConnectBlock is NOT
+	// called again (the loop early-exits on the latched flag).
+	pending[1] = bwr
+	sm.connectPendingBlocks(pending)
+	if got := mock.calls.Load(); got != 1 {
+		t.Errorf("ConnectBlock calls=%d after second connectPendingBlocks; "+
+			"halt loop must not re-invoke ConnectBlock once latched", got)
+	}
+}
+
+// simpleErr is a test-only error type so we don't pull in fmt for one line.
+type simpleErr struct{ msg string }
+
+func (e *simpleErr) Error() string { return e.msg }
+
 // TestRequestJitterSpread guards the W69b request-jitter contract: 100
 // consecutive requestJitter() draws must span at least 100 ms of
 // wall-clock. Without the jitter, 144 getdata stamps fall in the same

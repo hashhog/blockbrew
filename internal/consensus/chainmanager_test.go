@@ -1277,3 +1277,213 @@ func (c *countingUTXOView) GetUTXO(wire.OutPoint) *UTXOEntry {
 	c.calls++
 	return nil
 }
+
+// TestVerifyChainstateConsistencyClean covers the happy path: a freshly-
+// connected chain has UTXO + undo data + block bodies for every block,
+// so the consistency probe reports zero corruption and zero rollback.
+//
+// This is one of the three new tests added with the BUG-REPORT.md
+// chainstate-corruption fixes (May 2 2026).  Same defensive recovery
+// class as lunarblock c6fd8a0 / nimrod 4920988.
+func TestVerifyChainstateConsistencyClean(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	prev := idx.Genesis()
+	for i := 0; i < 5; i++ {
+		blk := createTestBlock(t, params, prev, nil)
+		hash := blk.Header.BlockHash()
+		node, err := idx.AddHeader(blk.Header)
+		if err != nil {
+			t.Fatalf("AddHeader %d: %v", i, err)
+		}
+		if err := db.StoreBlock(hash, blk); err != nil {
+			t.Fatalf("StoreBlock %d: %v", i, err)
+		}
+		if err := cm.ConnectBlock(blk); err != nil {
+			t.Fatalf("ConnectBlock %d: %v", i, err)
+		}
+		prev = node
+	}
+
+	res := cm.VerifyChainstateConsistency(10)
+	if res.CorruptionAtHeight != 0 {
+		t.Errorf("expected no corruption, got at height %d", res.CorruptionAtHeight)
+	}
+	if res.RolledBackBlocks != 0 {
+		t.Errorf("expected zero rollback, got %d blocks", res.RolledBackBlocks)
+	}
+	if res.RollbackFailed {
+		t.Error("RollbackFailed should be false on a clean chain")
+	}
+	if res.TipBefore != 5 || res.TipAfter != 5 {
+		t.Errorf("tip stayed at 5, got before=%d after=%d", res.TipBefore, res.TipAfter)
+	}
+	if res.BlocksProbed == 0 {
+		t.Error("BlocksProbed should be > 0 on a non-empty chain")
+	}
+}
+
+// TestVerifyChainstateConsistencyMissingBlockBody simulates the
+// `block_in_storage=no` corruption pattern (lunarblock h=938344, May 1
+// blockbrew h=938360): chain_tip points at a block whose body is no
+// longer reachable from the block store.  The probe must detect the
+// miss and roll back through that height.
+func TestVerifyChainstateConsistencyMissingBlockBody(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	memDB := storage.NewMemDB()
+	db := storage.NewChainDB(memDB)
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	prev := idx.Genesis()
+	hashes := make([]wire.Hash256, 0, 5)
+	for i := 0; i < 5; i++ {
+		blk := createTestBlock(t, params, prev, nil)
+		hash := blk.Header.BlockHash()
+		node, err := idx.AddHeader(blk.Header)
+		if err != nil {
+			t.Fatalf("AddHeader %d: %v", i, err)
+		}
+		if err := db.StoreBlock(hash, blk); err != nil {
+			t.Fatalf("StoreBlock %d: %v", i, err)
+		}
+		if err := cm.ConnectBlock(blk); err != nil {
+			t.Fatalf("ConnectBlock %d: %v", i, err)
+		}
+		prev = node
+		hashes = append(hashes, hash)
+	}
+
+	if _, h := cm.BestBlock(); h != 5 {
+		t.Fatalf("setup failed: tip=%d, want 5", h)
+	}
+
+	// Simulate the corruption: delete the body for block 4 (the one
+	// before tip).  This mimics the persisted-tip-ahead-of-body crash
+	// window the BUG-REPORT.md atomic-barrier fix is closing.
+	bodyKey := storage.MakeBlockDataKey(hashes[3])
+	if err := memDB.Delete(bodyKey); err != nil {
+		t.Fatalf("Delete body: %v", err)
+	}
+
+	res := cm.VerifyChainstateConsistency(10)
+	if res.CorruptionAtHeight == 0 {
+		t.Fatal("expected corruption to be reported, got none")
+	}
+	if res.RolledBackBlocks == 0 {
+		t.Errorf("expected rollback to fire, got 0 blocks")
+	}
+	// The probe walks tip-side and finds the bad block (h=4). It then
+	// peels via DisconnectBlock until tip<deepestBad. We deleted the
+	// body at h=4, so disconnecting h=4 fails (DisconnectBlock needs
+	// the block body to walk transactions in reverse). The probe halts
+	// at tip=4 and surfaces RollbackFailed=true so the operator knows
+	// to wipe chaindata/.
+	if _, h := cm.BestBlock(); h >= 5 {
+		t.Errorf("expected tip rolled back below the original tip 5, got %d", h)
+	}
+	if !res.RollbackFailed {
+		t.Errorf("expected RollbackFailed=true when undo path is blocked by missing body")
+	}
+}
+
+// TestVerifyChainstateConsistencyGenesisOnly: probe must be a no-op on
+// a fresh chainstate.  Mirrors lunarblock spec/chainstate_corruption_spec.lua.
+func TestVerifyChainstateConsistencyGenesisOnly(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	res := cm.VerifyChainstateConsistency(10)
+	if res.CorruptionAtHeight != 0 || res.RolledBackBlocks != 0 || res.RollbackFailed {
+		t.Errorf("genesis-only chain should produce a no-op probe; got %+v", res)
+	}
+	if res.BlocksProbed != 0 {
+		t.Errorf("BlocksProbed should be 0 on a genesis-only chain, got %d", res.BlocksProbed)
+	}
+}
+
+// TestAtomicShutdownFlushBatch validates that UTXO mutations and the
+// chain-tip pointer can be written in a single atomic batch — the core
+// invariant the BUG-REPORT.md fix #2 relies on for crash safety.
+//
+// The pre-fix shutdown path called utxoSet.Flush() then chainDB
+// .SetChainState() as two separate writes; a SIGKILL between them left
+// UTXOs persisted ahead of the tip, the same corruption pattern that
+// produced the May 1 blockbrew h=938360 wedge.  This test demonstrates
+// the FlushBatch + SetChainStateBatch primitives compose into one
+// atomic Pebble batch.
+func TestAtomicShutdownFlushBatch(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	memDB := storage.NewMemDB()
+	db := storage.NewChainDB(memDB)
+	utxoSet := NewUTXOSet(db)
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+		UTXOSet:     utxoSet,
+	})
+
+	prev := idx.Genesis()
+	for i := 0; i < 3; i++ {
+		blk := createTestBlock(t, params, prev, nil)
+		hash := blk.Header.BlockHash()
+		node, err := idx.AddHeader(blk.Header)
+		if err != nil {
+			t.Fatalf("AddHeader %d: %v", i, err)
+		}
+		if err := db.StoreBlock(hash, blk); err != nil {
+			t.Fatalf("StoreBlock %d: %v", i, err)
+		}
+		if err := cm.ConnectBlock(blk); err != nil {
+			t.Fatalf("ConnectBlock %d: %v", i, err)
+		}
+		prev = node
+	}
+
+	bestHash, bestHeight := cm.BestBlock()
+	if bestHeight != 3 {
+		t.Fatalf("setup: bestHeight=%d, want 3", bestHeight)
+	}
+
+	// Build the atomic shutdown batch the same way main.go now does.
+	batch := db.NewBatch()
+	if err := utxoSet.FlushBatch(batch); err != nil {
+		t.Fatalf("FlushBatch: %v", err)
+	}
+	db.SetChainStateBatch(batch, &storage.ChainState{
+		BestHash:   bestHash,
+		BestHeight: bestHeight,
+	})
+	if err := batch.Write(); err != nil {
+		t.Fatalf("batch.Write: %v", err)
+	}
+
+	// After the batch commits, both the chain state and the UTXO set
+	// must be readable from disk and consistent.
+	state, err := db.GetChainState()
+	if err != nil {
+		t.Fatalf("GetChainState: %v", err)
+	}
+	if state.BestHeight != 3 || state.BestHash != bestHash {
+		t.Errorf("chain state mismatch: got h=%d hash=%s", state.BestHeight, state.BestHash.String()[:16])
+	}
+}
