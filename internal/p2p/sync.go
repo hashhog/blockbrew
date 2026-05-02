@@ -216,6 +216,15 @@ type SyncManager struct {
 	connStatsMaxNs    int64         // max ConnectBlock latency in window (ns)
 	connStatsTotalTxs int64         // summed tx count across window
 	connStatsLifetime int64         // cumulative count since process start
+
+	// chainstateCorrupted latches when connectPendingBlocks hits a
+	// genuine validation failure during IBD (presumed chainstate
+	// corruption per BUG-REPORT.md).  Once set, the connect loop early-
+	// exits without re-running ConnectBlock, so the corruption notice is
+	// printed at most once per retry tick (not 50k times/min like the
+	// pre-fix skip-and-loop path).  Cleared only by process restart.
+	chainstateCorrupted   atomic.Bool
+	lastCorruptionWarning atomic.Int64 // unix nanos
 }
 
 // ChainConnector is the interface for connecting blocks to the chain.
@@ -1793,6 +1802,14 @@ func (sm *SyncManager) connectionWorker() {
 	var lastPendingWarn time.Time // rate-limit "pending map too large" warnings
 
 	connectPending := func() {
+		// Halted: skip the whole connect loop.  Once the corruption
+		// flag is latched (BUG-REPORT.md fix #4), connectPendingBlocks
+		// is a no-op until the operator restarts. Prevents the 50k/min
+		// retry storm we saw on May 1 (h=938361 wedge log).
+		if sm.chainstateCorrupted.Load() {
+			return
+		}
+
 		// Evict blocks that are behind nextHeight (already connected or skipped)
 		sm.mu.RLock()
 		nh := sm.nextHeight
@@ -1864,6 +1881,15 @@ func (sm *SyncManager) connectionWorker() {
 
 // connectPendingBlocks connects any blocks that are ready in order.
 func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest) {
+	// Halt-on-corruption fast path (BUG-REPORT.md fix #4). Once
+	// chainstateCorrupted is latched by an earlier ConnectBlock failure,
+	// every subsequent call here is a no-op until the operator restarts
+	// the node. Without this guard the retry ticker would re-enter the
+	// connect loop every 5s and re-print the corruption banner.
+	if sm.chainstateCorrupted.Load() {
+		return
+	}
+
 	sm.mu.Lock()
 	nextHeight := sm.nextHeight
 	sm.mu.Unlock()
@@ -2017,25 +2043,68 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 					}
 				}
 
-				// Genuine validation error: mark as invalid and skip
-				log.Printf("sync: GENUINE validation failure at height %d, skipping block: %v",
-					nextHeight, connectErr)
-				node := sm.headerIndex.GetNode(bwr.req.Hash)
-				if node != nil {
-					node.Status |= consensus.StatusInvalid
+				// Genuine validation error.  Pre-2026-05-02 the handler
+				// here marked the header invalid + advanced nextHeight
+				// past the failed block, but left chain_tip at the
+				// previous block — meaning the *next* block would
+				// always fail "block does not connect to tip" + the
+				// gap-detection path would re-queue the same block,
+				// re-fail validation, ad infinitum (the May 1 blockbrew
+				// h=938361 wedge: 14M log lines, ~50k retries/min).
+				//
+				// Genuine validation failures during IBD are almost
+				// always a symptom of chainstate corruption — same root
+				// cause as lunarblock c6fd8a0 / project memory
+				// `project_lunarblock_wedge_2026_04_28`: a hard crash
+				// mid-IBD lost an unflushed UTXO write window, so a
+				// later block's tx now references a coin that is no
+				// longer in the persisted UTXO set.  Silently skipping
+				// it would either (a) wedge as above, or (b) advance
+				// the chain on a known-bad state — both are worse than
+				// halting.
+				//
+				// Halt the connection loop and surface a loud
+				// [CHAINSTATE-CORRUPTION] line.  The startup
+				// VerifyChainstateConsistency probe (chainmanager.go)
+				// will auto-rollback on the next restart; if that
+				// recovery path also fails, the operator is told to
+				// wipe chaindata/.  The block is NOT marked invalid in
+				// the header index, so a recovered restart can validate
+				// it cleanly.
+				// Latch the flag + rate-limit the warning. First print is
+				// always emitted; subsequent retries print at most once
+				// per minute. Both lines fire on the first hit so the
+				// operator sees both the symptom and the recovery hint.
+				firstHit := sm.chainstateCorrupted.CompareAndSwap(false, true)
+				now := time.Now().UnixNano()
+				last := sm.lastCorruptionWarning.Load()
+				if firstHit || now-last >= int64(time.Minute) {
+					sm.lastCorruptionWarning.Store(now)
+					log.Printf("[CHAINSTATE-CORRUPTION] sync: GENUINE validation failure at height %d hash=%s: %v",
+						nextHeight, bwr.req.Hash.String()[:16], connectErr)
+					if firstHit {
+						log.Printf("[CHAINSTATE-CORRUPTION] this is almost certainly a chainstate-corruption " +
+							"wedge (UTXO writes lost in a prior crash window). The broken \"skip-and-advance\" " +
+							"loop has been removed; halting block connection here. Restart the node to run " +
+							"the startup consistency probe, which auto-rolls-back the tip to the last known-good " +
+							"height. If the wedge recurs after restart, stop the node and remove the chaindata/ " +
+							"directory to force a full re-sync (-reindex is honest-deferred).")
+					}
 				}
+
+				// Drop the block from the in-memory pending map so we
+				// don't busy-loop on it.  Crucially we do NOT advance
+				// nextHeight and do NOT mark the header invalid — the
+				// next restart's consistency probe will peel chain_tip
+				// back so this block becomes connectable again.
 				delete(pending, nextHeight)
 
-				// Remove from queue and advance past the failed block
-				nextHeight++
-				sm.mu.Lock()
-				sm.removeFromQueue(bwr.req.Hash)
-				sm.nextHeight = nextHeight
-				sm.mu.Unlock()
-
-				// Stop connecting further blocks: the chain tip is now behind
-				// nextHeight, so subsequent blocks will also fail because their
-				// PrevBlock won't match the tip.
+				// Stop connecting further blocks. The retry ticker will
+				// re-enter this loop and re-print the corruption
+				// message at most once per tick (10s in the default
+				// config) so operators see the wedge but the log
+				// volume is bounded — vs the 50k/min loop the old
+				// skip-and-advance produced.
 				break
 			}
 
