@@ -2384,9 +2384,24 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 		}
 	}
 
+	// Flush the loaded coins to chainDB. LoadSnapshot deliberately defers
+	// this so the post-flush cache eviction doesn't run before
+	// ComputeHashSerialized has walked the in-memory cache. After this
+	// flush, the snapshot's coins are durable in the shared chainDB and
+	// the cache may be trimmed.
+	if flushErr := utxoSet.Flush(); flushErr != nil {
+		return nil, &RPCError{
+			Code:    RPCErrInternal,
+			Message: fmt.Sprintf("Failed to flush snapshot UTXOs: %v", flushErr),
+		}
+	}
+
 	// Store reference to the loaded UTXO set
 	// In a full implementation, this would activate a snapshot chainstate
-	// For now, we just return success with the stats
+	// For now, we just return success with the stats. The coins are
+	// already in chainDB via the Flush above; promotion to active
+	// chainstate (SetChainState/SetBlockHeight) is handled by the
+	// CLI -load-snapshot path in cmd/blockbrew/main.go::loadSnapshotFromFile.
 	_ = utxoSet // Would be used to create a snapshot chainstate
 
 	return &LoadTxOutSetResult{
