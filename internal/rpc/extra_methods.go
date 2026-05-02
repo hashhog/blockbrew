@@ -572,6 +572,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"listtransactions ( \"label\" count )",
 		"listunspent",
 		"sendtoaddress \"address\" amount",
+		"encryptwallet \"passphrase\"",
 		"walletlock",
 		"walletpassphrase \"passphrase\" timeout",
 		"",

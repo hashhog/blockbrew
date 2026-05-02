@@ -390,6 +390,36 @@ func (s *Server) handleSendToAddressWithWallet(params json.RawMessage, walletNam
 	return tx.TxHash().String(), nil
 }
 
+// handleEncryptWalletWithWallet implements `encryptwallet "passphrase"` for
+// the multi-wallet routing path. See handleEncryptWallet for semantics.
+func (s *Server) handleEncryptWalletWithWallet(params json.RawMessage, walletName string) (interface{}, *RPCError) {
+	w, rpcErr := s.getWalletForRPC(walletName)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing passphrase"}
+	}
+	passphrase, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid passphrase"}
+	}
+	if passphrase == "" {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "passphrase cannot be empty"}
+	}
+
+	if err := w.EncryptWallet(passphrase); err != nil {
+		return nil, mapEncryptionError(err)
+	}
+
+	return "wallet encrypted; the keypool has been flushed. The wallet is now locked; use walletpassphrase to unlock.", nil
+}
+
 func (s *Server) handleWalletPassphraseWithWallet(params json.RawMessage, walletName string) (interface{}, *RPCError) {
 	w, rpcErr := s.getWalletForRPC(walletName)
 	if rpcErr != nil {
@@ -409,11 +439,36 @@ func (s *Server) handleWalletPassphraseWithWallet(params json.RawMessage, wallet
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid passphrase"}
 	}
+	if passphrase == "" {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "passphrase cannot be empty"}
+	}
 
+	var timeout int64 = 60
+	if len(args) >= 2 {
+		switch t := args[1].(type) {
+		case float64:
+			timeout = int64(t)
+		case int64:
+			timeout = t
+		default:
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid timeout"}
+		}
+	}
+	if timeout < 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Timeout cannot be negative."}
+	}
+
+	if w.IsEncrypted() {
+		if err := w.UnlockWithPassphrase(passphrase, timeout); err != nil {
+			return nil, mapEncryptionError(err)
+		}
+		return nil, nil
+	}
+
+	// Backward-compatible path for pre-encryption wallets.
 	if err := w.Unlock(passphrase, ""); err != nil {
 		return nil, &RPCError{Code: RPCErrWalletError, Message: fmt.Sprintf("Failed to unlock wallet: %v", err)}
 	}
-
 	return nil, nil
 }
 
@@ -421,6 +476,13 @@ func (s *Server) handleWalletLockWithWallet(walletName string) (interface{}, *RP
 	w, rpcErr := s.getWalletForRPC(walletName)
 	if rpcErr != nil {
 		return nil, rpcErr
+	}
+
+	if !w.IsEncrypted() {
+		return nil, &RPCError{
+			Code:    RPCErrWalletWrongEncState,
+			Message: "Error: running with an unencrypted wallet, but walletlock was called.",
+		}
 	}
 
 	w.Lock()
