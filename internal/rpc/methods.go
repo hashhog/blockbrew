@@ -1362,7 +1362,8 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Template generation failed: %v", err)}
 	}
 
-	// Build transaction list
+	// Build transaction list. Per-tx sigops cost comes from the template's
+	// TxSigOpsCost slice (parallel to non-coinbase txs); see mining.selectTransactions.
 	txs := make([]BlockTemplateTx, 0, len(template.Block.Transactions)-1)
 	for i, tx := range template.Block.Transactions {
 		if i == 0 {
@@ -1372,13 +1373,18 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 		var buf bytes.Buffer
 		tx.Serialize(&buf)
 
+		var sigOps int64
+		if idx := i - 1; idx >= 0 && idx < len(template.TxSigOpsCost) {
+			sigOps = template.TxSigOpsCost[idx]
+		}
+
 		txs = append(txs, BlockTemplateTx{
 			Data:    hex.EncodeToString(buf.Bytes()),
 			TxID:    tx.TxHash().String(),
 			Hash:    tx.WTxHash().String(),
 			Depends: []int{}, // Simplified
 			Fee:     0,       // Would need fee tracking per tx
-			SigOps:  0,       // Would need sigop counting
+			SigOps:  sigOps,
 			Weight:  int64(consensus.CalcTxWeight(tx)),
 		})
 	}

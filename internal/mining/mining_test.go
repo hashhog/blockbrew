@@ -387,10 +387,13 @@ func TestGenerateTemplate(t *testing.T) {
 func TestSelectTransactions(t *testing.T) {
 	t.Run("empty mempool", func(t *testing.T) {
 		mp := &mockMempool{entries: nil}
-		txs, fees, sigops := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0)
+		txs, perTxSigOps, fees, sigops := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
 
 		if len(txs) != 0 {
 			t.Errorf("expected 0 transactions, got %d", len(txs))
+		}
+		if len(perTxSigOps) != 0 {
+			t.Errorf("expected 0 per-tx sigops entries, got %d", len(perTxSigOps))
 		}
 		if fees != 0 {
 			t.Errorf("expected 0 fees, got %d", fees)
@@ -424,7 +427,7 @@ func TestSelectTransactions(t *testing.T) {
 			entries: []*mempool.TxEntry{entry2, entry1},
 		}
 
-		txs, fees, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0)
+		txs, _, fees, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
 
 		if len(txs) != 2 {
 			t.Fatalf("expected 2 transactions, got %d", len(txs))
@@ -451,7 +454,7 @@ func TestSelectTransactions(t *testing.T) {
 		}
 
 		// Set weight limit below transaction weight
-		txs, _, _ := selectTransactions(mp, txWeight-1, consensus.MaxBlockSigOpsCost, 0)
+		txs, _, _, _ := selectTransactions(mp, txWeight-1, consensus.MaxBlockSigOpsCost, 0, nil)
 
 		if len(txs) != 0 {
 			t.Error("transaction should have been excluded due to weight limit")
@@ -473,7 +476,7 @@ func TestSelectTransactions(t *testing.T) {
 			entries: []*mempool.TxEntry{entry},
 		}
 
-		txs, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 5.0) // min 5 sat/vB
+		txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 5.0, nil) // min 5 sat/vB
 
 		if len(txs) != 0 {
 			t.Error("transaction should have been excluded due to low fee rate")
@@ -509,7 +512,7 @@ func TestSelectTransactions(t *testing.T) {
 			entries: []*mempool.TxEntry{childEntry, parentEntry},
 		}
 
-		txs, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0)
+		txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
 
 		// Parent should be included (comes later in sorted order)
 		// Child should be skipped because parent isn't included yet when we check child
@@ -1020,4 +1023,164 @@ func TestUpdateCoinbaseWitnessCommitment(t *testing.T) {
 	if !bytes.Equal(updatedCommit, newCommitment) {
 		t.Error("updated commitment mismatch")
 	}
+}
+
+// makeHighSigOpTx constructs a synthetic transaction whose scriptPubKey
+// contains `nChecksigs` bare OP_CHECKSIG opcodes. Each OP_CHECKSIG is one
+// legacy sigop, so the BIP141 cost is `nChecksigs * WITNESS_SCALE_FACTOR (4)`.
+// The previous-outpoint hash is non-zero so the tx is not a coinbase.
+func makeHighSigOpTx(seed byte, nChecksigs int) *wire.MsgTx {
+	pkScript := make([]byte, nChecksigs)
+	for i := range pkScript {
+		pkScript[i] = 0xac // OP_CHECKSIG
+	}
+	return &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{
+				Hash:  wire.Hash256{seed, seed, seed},
+				Index: 0,
+			},
+			SignatureScript: []byte{0x00},
+			Sequence:        0xFFFFFFFF,
+		}},
+		TxOut: []*wire.TxOut{{
+			Value:    100000,
+			PkScript: pkScript,
+		}},
+		LockTime: 0,
+	}
+}
+
+// TestSelectTransactionsSigOpsBudget is a regression test for the per-tx
+// sigops bug fixed in W103: getblocktemplate previously hardcoded SigOps to 0
+// and the selection loop did not bound running totals against
+// MAX_BLOCK_SIGOPS_COST. This test asserts:
+//
+//  1. selectTransactions returns a non-zero per-tx sigops count for txs
+//     containing CHECKSIG opcodes.
+//  2. The running-total budget is enforced: a candidate tx whose sigops cost
+//     would push the running total above MAX_BLOCK_SIGOPS_COST is skipped.
+//  3. GenerateTemplate populates BlockTemplate.TxSigOpsCost in lockstep with
+//     the selected txs (drives the per-tx `sigops` field in getblocktemplate).
+func TestSelectTransactionsSigOpsBudget(t *testing.T) {
+	t.Run("per-tx sigops are non-zero", func(t *testing.T) {
+		tx := makeHighSigOpTx(1, 5) // 5 CHECKSIG opcodes => 5 * 4 = 20 cost
+		entry := &mempool.TxEntry{
+			Tx:      tx,
+			TxHash:  tx.TxHash(),
+			Fee:     1000,
+			Size:    100,
+			FeeRate: 10.0,
+		}
+		mp := &mockMempool{entries: []*mempool.TxEntry{entry}}
+
+		txs, perTxSigOps, _, total := selectTransactions(
+			mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
+
+		if len(txs) != 1 {
+			t.Fatalf("expected 1 selected tx, got %d", len(txs))
+		}
+		if len(perTxSigOps) != 1 {
+			t.Fatalf("expected 1 per-tx sigops entry, got %d", len(perTxSigOps))
+		}
+		const expected = int64(5 * consensus.WitnessScaleFactor)
+		if perTxSigOps[0] != expected {
+			t.Errorf("per-tx sigops = %d, want %d", perTxSigOps[0], expected)
+		}
+		if total != expected {
+			t.Errorf("total sigops = %d, want %d", total, expected)
+		}
+	})
+
+	t.Run("selection respects MAX_BLOCK_SIGOPS_COST", func(t *testing.T) {
+		// Each tx has 6_000 CHECKSIGs => 24_000 sigops cost. Three of them
+		// (72_000) fit under 80_000; a fourth (96_000) would not, so the
+		// selector must skip it.
+		const checksigsPerTx = 6_000
+		const costPerTx = int64(checksigsPerTx * consensus.WitnessScaleFactor)
+		entries := make([]*mempool.TxEntry, 0, 5)
+		for i := 0; i < 5; i++ {
+			tx := makeHighSigOpTx(byte(i+1), checksigsPerTx)
+			entries = append(entries, &mempool.TxEntry{
+				Tx:      tx,
+				TxHash:  tx.TxHash(),
+				Fee:     1000,
+				Size:    100,
+				FeeRate: 10.0,
+			})
+		}
+		mp := &mockMempool{entries: entries}
+
+		txs, perTxSigOps, _, total := selectTransactions(
+			mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
+
+		// Bound: total must never exceed MAX_BLOCK_SIGOPS_COST (80_000).
+		if total > int64(consensus.MaxBlockSigOpsCost) {
+			t.Fatalf("total sigops %d exceeds MAX_BLOCK_SIGOPS_COST=%d",
+				total, consensus.MaxBlockSigOpsCost)
+		}
+		// At 24_000 cost per tx, exactly 3 should fit (72_000 <= 80_000),
+		// and a fourth (96_000) must be rejected.
+		if len(txs) != 3 {
+			t.Errorf("expected 3 txs to fit budget, got %d", len(txs))
+		}
+		if total != 3*costPerTx {
+			t.Errorf("total sigops = %d, want %d", total, 3*costPerTx)
+		}
+		if len(perTxSigOps) != len(txs) {
+			t.Errorf("per-tx sigops length %d != selected length %d",
+				len(perTxSigOps), len(txs))
+		}
+		for i, c := range perTxSigOps {
+			if c != costPerTx {
+				t.Errorf("perTxSigOps[%d] = %d, want %d", i, c, costPerTx)
+			}
+		}
+	})
+
+	t.Run("GenerateTemplate populates TxSigOpsCost", func(t *testing.T) {
+		params := consensus.RegtestParams()
+		genesisHash := params.GenesisHash
+		tipNode := &consensus.BlockNode{
+			Hash:   genesisHash,
+			Header: params.GenesisBlock.Header,
+			Height: 0,
+		}
+		chainState := &mockChainState{tipHash: genesisHash, tipHeight: 0, tipNode: tipNode}
+		headerIndex := &mockHeaderIndex{
+			nodes: map[wire.Hash256]*consensus.BlockNode{genesisHash: tipNode},
+		}
+
+		tx := makeHighSigOpTx(7, 3) // 3 CHECKSIGs => 12 cost
+		entry := &mempool.TxEntry{
+			Tx:      tx,
+			TxHash:  tx.TxHash(),
+			Fee:     5000,
+			Size:    100,
+			FeeRate: 50.0,
+		}
+		mp := &mockMempool{entries: []*mempool.TxEntry{entry}}
+		tg := NewTemplateGenerator(params, chainState, mp, headerIndex)
+
+		template, err := tg.GenerateTemplate(TemplateConfig{MinerAddress: []byte{0x51}})
+		if err != nil {
+			t.Fatalf("GenerateTemplate failed: %v", err)
+		}
+
+		// One non-coinbase tx selected, so TxSigOpsCost must have exactly 1 entry.
+		if len(template.Block.Transactions) != 2 {
+			t.Fatalf("expected 2 txs (coinbase + 1), got %d", len(template.Block.Transactions))
+		}
+		if len(template.TxSigOpsCost) != 1 {
+			t.Fatalf("expected 1 TxSigOpsCost entry, got %d", len(template.TxSigOpsCost))
+		}
+		const expected = int64(3 * consensus.WitnessScaleFactor)
+		if template.TxSigOpsCost[0] != expected {
+			t.Errorf("TxSigOpsCost[0] = %d, want %d", template.TxSigOpsCost[0], expected)
+		}
+		if template.SigOpsCost != expected {
+			t.Errorf("template.SigOpsCost = %d, want %d", template.SigOpsCost, expected)
+		}
+	})
 }

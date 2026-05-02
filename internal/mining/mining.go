@@ -19,6 +19,11 @@ type BlockTemplate struct {
 	SigOpsCost        int64  // Total sigops cost
 	CoinbaseValue     int64  // Subsidy + fees
 	WitnessCommitment []byte // Witness commitment hash
+	// TxSigOpsCost is the per-tx sigops cost for each non-coinbase transaction,
+	// in the same order as Block.Transactions[1:]. Mirrors Bitcoin Core's
+	// CBlockTemplate::vTxSigOpsCost (see node/miner.cpp). Used by getblocktemplate
+	// to populate the per-tx `sigops` field.
+	TxSigOpsCost []int64
 }
 
 // TemplateConfig configures block template generation.
@@ -36,6 +41,7 @@ type TemplateGenerator struct {
 	chainMgr    ChainStateProvider
 	mp          MempoolProvider
 	headerIndex HeaderIndexProvider
+	utxoSrc     UTXOViewProvider // Optional; nil falls back to output-only sigops estimate.
 }
 
 // ChainStateProvider provides chain state for template generation.
@@ -55,6 +61,13 @@ type HeaderIndexProvider interface {
 	AddHeader(header wire.BlockHeader) (*consensus.BlockNode, error)
 }
 
+// UTXOViewProvider returns the current UTXO view. Used by the template
+// generator so per-tx sigops accounting can include P2SH redeem-script and
+// witness sigops (which require resolving the prevout's scriptPubKey).
+type UTXOViewProvider interface {
+	UTXOSet() consensus.UpdatableUTXOView
+}
+
 // NewTemplateGenerator creates a new block template generator.
 func NewTemplateGenerator(
 	params *consensus.ChainParams,
@@ -62,12 +75,25 @@ func NewTemplateGenerator(
 	mp MempoolProvider,
 	idx HeaderIndexProvider,
 ) *TemplateGenerator {
-	return &TemplateGenerator{
+	tg := &TemplateGenerator{
 		chainParams: params,
 		chainMgr:    cm,
 		mp:          mp,
 		headerIndex: idx,
 	}
+	// If the chain-state provider also exposes a UTXO view (the production
+	// ChainManager does), wire it up automatically so callers don't have to
+	// thread it separately.
+	if up, ok := cm.(UTXOViewProvider); ok {
+		tg.utxoSrc = up
+	}
+	return tg
+}
+
+// SetUTXOSource overrides the UTXO source used for per-tx sigops accounting.
+// Primarily used by tests; production code wires it up via NewTemplateGenerator.
+func (tg *TemplateGenerator) SetUTXOSource(p UTXOViewProvider) {
+	tg.utxoSrc = p
 }
 
 // GenerateTemplate creates a new block template.
@@ -122,8 +148,17 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 	coinbaseReserve := int64(4000)
 	availableWeight := maxWeight - coinbaseReserve
 
-	selectedTxs, totalFees, totalSigOps := selectTransactions(
-		tg.mp, availableWeight, maxSigOps, config.MinTxFeeRate)
+	// Resolve a UTXO view if the chain state exposes one. This lets us count
+	// P2SH redeem-script and segwit/taproot witness sigops accurately, matching
+	// Bitcoin Core's GetTransactionSigOpCost. If no view is available we fall
+	// back to a conservative output-script-only estimate.
+	var utxoView consensus.UTXOView
+	if tg.utxoSrc != nil {
+		utxoView = tg.utxoSrc.UTXOSet()
+	}
+
+	selectedTxs, txSigOpsCost, totalFees, totalSigOps := selectTransactions(
+		tg.mp, availableWeight, maxSigOps, config.MinTxFeeRate, utxoView)
 
 	// 5. Calculate the subsidy
 	subsidy := consensus.CalcBlockSubsidy(newHeight)
@@ -168,15 +203,26 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 		SigOpsCost:        totalSigOps,
 		CoinbaseValue:     coinbaseValue,
 		WitnessCommitment: witnessCommitment,
+		TxSigOpsCost:      txSigOpsCost,
 	}, nil
 }
 
 // selectTransactions selects transactions from the mempool using the
-// ancestor fee rate algorithm (CPFP-aware).
-func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, minFeeRate float64) ([]*wire.MsgTx, int64, int64) {
+// ancestor fee rate algorithm (CPFP-aware). Returns the selected txs, a
+// parallel slice of per-tx sigops cost (sigops cost units, already scaled),
+// total fees, and total sigops cost.
+//
+// If utxoView is non-nil, sigops counting matches Bitcoin Core's
+// GetTransactionSigOpCost: legacy (vin+vout) scaled by 4 + P2SH redeem-script
+// sigops scaled by 4 + witness sigops (unscaled). If utxoView is nil, falls
+// back to the conservative output-script estimate so callers without a UTXO
+// view (e.g. early-init regtest tests) still get budget enforcement and
+// non-zero per-tx reporting.
+func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, minFeeRate float64, utxoView consensus.UTXOView) ([]*wire.MsgTx, []int64, int64, int64) {
 	entries := mp.GetSortedByAncestorFeeRate()
 
 	var selected []*wire.MsgTx
+	var sigOpsCosts []int64
 	var totalFees int64
 	var totalSigOps int64
 	var totalWeight int64
@@ -194,14 +240,9 @@ func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, minFeeRa
 			continue // Try next (smaller) transaction
 		}
 
-		// Estimate sigops cost for this transaction
-		// We count sigops in outputs (scaled by 4)
-		txSigOps := int64(0)
-		for _, out := range entry.Tx.TxOut {
-			txSigOps += int64(consensus.CountSigOps(out.PkScript)) * consensus.WitnessScaleFactor
-		}
+		txSigOps := computeTxSigOpsCost(entry.Tx, utxoView)
 
-		// Check sigops limit
+		// Check sigops limit (MAX_BLOCK_SIGOPS_COST = 80_000)
 		if totalSigOps+txSigOps > maxSigOps {
 			continue
 		}
@@ -219,13 +260,48 @@ func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, minFeeRa
 		}
 
 		selected = append(selected, entry.Tx)
+		sigOpsCosts = append(sigOpsCosts, txSigOps)
 		included[entry.TxHash] = true
 		totalFees += entry.Fee
 		totalWeight += txWeight
 		totalSigOps += txSigOps
 	}
 
-	return selected, totalFees, totalSigOps
+	return selected, sigOpsCosts, totalFees, totalSigOps
+}
+
+// computeTxSigOpsCost returns the BIP141 sigops cost for a transaction.
+// Mirrors Bitcoin Core's GetTransactionSigOpCost (consensus/tx_verify.cpp):
+// legacy (scriptSig + scriptPubKey) scaled by WITNESS_SCALE_FACTOR, plus P2SH
+// redeem-script sigops (also scaled), plus witness sigops (unscaled).
+//
+// When utxoView is nil, only legacy sigops are counted (P2SH and witness
+// sigops require resolving the prevout's scriptPubKey). This is a conservative
+// over- or under-estimate depending on script type, but it keeps behavior
+// sensible in tests / pre-UTXO-init paths.
+func computeTxSigOpsCost(tx *wire.MsgTx, utxoView consensus.UTXOView) int64 {
+	if consensus.IsCoinbaseTx(tx) {
+		return 0
+	}
+
+	// Legacy sigops: count CHECKSIG/CHECKMULTISIG opcodes in scriptSig of every
+	// input AND scriptPubKey of every output, then scale by 4. Matches
+	// GetLegacySigOpCount in Core.
+	legacy := 0
+	for _, in := range tx.TxIn {
+		legacy += consensus.CountSigOps(in.SignatureScript)
+	}
+	for _, out := range tx.TxOut {
+		legacy += consensus.CountSigOps(out.PkScript)
+	}
+	cost := int64(legacy) * int64(consensus.WitnessScaleFactor)
+
+	if utxoView != nil {
+		cost += int64(consensus.CountP2SHSigOps(tx, utxoView)) // already scaled
+		cost += int64(consensus.CountWitnessSigOps(tx, utxoView))
+	}
+
+	return cost
 }
 
 // CreateCoinbaseTx creates the coinbase transaction for a block.
