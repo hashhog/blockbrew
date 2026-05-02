@@ -258,12 +258,40 @@ func (u *UTXOSet) Flush() error {
 }
 
 // flushLocked performs flush while holding the lock.
+//
+// Pebble enforces a hard 4 GiB cap on a single batch (open.go:47,
+// batch.go:1413, ErrBatchTooLarge). A normal block-connect produces dozens
+// of dirty entries — well under the cap — but a -load-snapshot import
+// hands flushLocked all 165M coins in one shot, easily 8+ GiB serialized,
+// which used to panic mid-import. We now split the writes into chunks
+// well below the cap so loadSnapshotFromFile can durably commit a Core-
+// format UTXO snapshot in one go without a Pebble panic.
 func (u *UTXOSet) flushLocked() error {
 	if u.db == nil {
 		return nil
 	}
 
+	// Cap each batch around 2 GiB to leave plenty of slack under Pebble's
+	// 4 GiB ErrBatchTooLarge limit. With typical ~50-100 byte serialized
+	// entries that's tens of millions of entries per batch — fast for
+	// normal IBD flushes (small batches still fit in one chunk) and
+	// chunked-but-bounded for snapshot imports.
+	const maxBatchBytes = 2 * 1024 * 1024 * 1024 // 2 GiB
+
 	batch := u.db.DB().NewBatch()
+	chunks := 0
+	flushChunk := func() error {
+		if batch.Len() == 0 {
+			return nil
+		}
+		if err := batch.Write(); err != nil {
+			return err
+		}
+		chunks++
+		batch = u.db.DB().NewBatch()
+		return nil
+	}
+	approxBatchBytes := 0
 
 	// Write all dirty entries
 	for outpoint := range u.dirty {
@@ -272,6 +300,16 @@ func (u *UTXOSet) flushLocked() error {
 			key := storage.MakeUTXOKey(outpoint)
 			data := SerializeUTXOEntry(entry)
 			batch.Put(key, data)
+			// Pebble's batch encoding adds a few bytes of header per
+			// entry on top of len(key)+len(value). Over-estimate
+			// slightly to stay well below the 4 GiB hard cap.
+			approxBatchBytes += len(key) + len(data) + 16
+			if approxBatchBytes >= maxBatchBytes {
+				if err := flushChunk(); err != nil {
+					return err
+				}
+				approxBatchBytes = 0
+			}
 		}
 	}
 
@@ -279,9 +317,17 @@ func (u *UTXOSet) flushLocked() error {
 	for outpoint := range u.deleted {
 		key := storage.MakeUTXOKey(outpoint)
 		batch.Delete(key)
+		approxBatchBytes += len(key) + 16
+		if approxBatchBytes >= maxBatchBytes {
+			if err := flushChunk(); err != nil {
+				return err
+			}
+			approxBatchBytes = 0
+		}
 	}
 
-	if err := batch.Write(); err != nil {
+	// Final partial chunk.
+	if err := flushChunk(); err != nil {
 		return err
 	}
 
