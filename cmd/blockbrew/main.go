@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -611,6 +612,12 @@ func (a *chainStateAdapter) MTPAtHeight(height int32) int64 {
 }
 
 func run(cfg *Config, chainParams *consensus.ChainParams) error {
+	// Startup consistency probe runs at most once per process (see
+	// BUG-REPORT.md fix #3). OnSyncComplete fires on every header-sync
+	// edge but the probe + DisconnectBlock loop is destructive and must
+	// not be re-entered after the initial peel.
+	var consistencyProbeOnce sync.Once
+
 	// 0. Start pprof server if enabled
 	if cfg.PprofAddr != "" {
 		consensus.StartProfileServer(cfg.PprofAddr)
@@ -831,24 +838,26 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			chainMgr.ReloadChainState()
 
 			// Startup chainstate consistency probe (BUG-REPORT.md fix #3).
-			// After ReloadChainState restored the tip, walk back up to
-			// 200 blocks and verify each block's UTXO/undo invariants.
-			// On corruption (UTXO writes lost in a crash window),
-			// auto-rollback the tip to the last known-good height; the
-			// next IBD pass re-applies the peeled blocks. Runs once per
-			// startup so a healthy node pays a fixed-time probe.
-			res := chainMgr.VerifyChainstateConsistency(200)
-			if res.RolledBackBlocks > 0 {
-				log.Printf("[CHAINSTATE-RECOVERY] auto-rolled back %d blocks (tip %d -> %d) after consistency probe; "+
-					"will re-fetch + re-apply on the next IBD pass",
-					res.RolledBackBlocks, res.TipBefore, res.TipAfter)
-			}
-			if res.RollbackFailed {
-				log.Printf("[CHAINSTATE-CORRUPTION] startup consistency probe detected unrecoverable state at "+
-					"height %d. Operator action required: stop the node and remove %s/chaindata/ "+
-					"to force a full re-sync. (-reindex is honest-deferred; see main.go:258.)",
-					res.CorruptionAtHeight, cfg.DataDir)
-			}
+			// MUST run at most once per process: OnSyncComplete fires on
+			// every header-sync edge (peer reconnect, late-arriving
+			// header batches), and DisconnectBlock deletes undo data on
+			// every peel — so a re-probe after rollback would re-detect
+			// the freshly-deleted undo as "corruption" and peel the
+			// chain back unboundedly. The sync.Once gate prevents that.
+			consistencyProbeOnce.Do(func() {
+				res := chainMgr.VerifyChainstateConsistency(200)
+				if res.RolledBackBlocks > 0 {
+					log.Printf("[CHAINSTATE-RECOVERY] auto-rolled back %d blocks (tip %d -> %d) after consistency probe; "+
+						"will re-fetch + re-apply on the next IBD pass",
+						res.RolledBackBlocks, res.TipBefore, res.TipAfter)
+				}
+				if res.RollbackFailed {
+					log.Printf("[CHAINSTATE-CORRUPTION] startup consistency probe detected unrecoverable state at "+
+						"height %d. Operator action required: stop the node and remove %s/chaindata/ "+
+						"to force a full re-sync. (-reindex is honest-deferred; see main.go:258.)",
+						res.CorruptionAtHeight, cfg.DataDir)
+				}
+			})
 
 			syncMgr.StartBlockDownload()
 		},
