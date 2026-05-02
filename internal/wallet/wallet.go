@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 	"github.com/hashhog/blockbrew/internal/address"
@@ -55,6 +56,17 @@ type Wallet struct {
 	addrLabels  map[string]string            // maps address to label
 	// Per-type address indices
 	nextIdx map[WalletAddressType]*addressIndices
+
+	// Encryption state (Bitcoin Core "crypter" semantics).
+	//
+	// encrypted is set once EncryptWallet has been called. While encrypted,
+	// the master HD key is held only as ciphertext (encryptedMaster); when
+	// the wallet is locked, masterKey is nil and signing is impossible.
+	// walletpassphrase decrypts encryptedMaster back into masterKey for
+	// `relockTimeout` and schedules an auto-relock via relockTimer.
+	encrypted        bool
+	encryptedMaster  []byte      // salt||nonce||ciphertext (output of encryptMasterKey)
+	relockTimer      *time.Timer // auto-relock for walletpassphrase timeout
 }
 
 // WalletUTXO is a UTXO owned by the wallet.
@@ -100,6 +112,10 @@ var (
 	ErrInvalidAddress    = errors.New("invalid address")
 	ErrDuplicateAddress  = errors.New("address already exists")
 )
+
+// MaxRelockSleepSeconds matches Bitcoin Core's MAX_SLEEP_TIME and caps
+// walletpassphrase timeouts to ~3 years. See bitcoin-core/src/wallet/rpc/encrypt.cpp.
+const MaxRelockSleepSeconds int64 = 100000000
 
 // DefaultGapLimit is the default number of unused addresses to maintain.
 const DefaultGapLimit = 20
@@ -254,11 +270,14 @@ func (w *Wallet) NewP2TRAddress() (string, error) {
 // newAddressOfTypeLocked generates a new address (caller must hold lock).
 // isChange indicates whether this is a change address (internal) or receiving (external).
 func (w *Wallet) newAddressOfTypeLocked(addrType WalletAddressType, isChange bool) (string, error) {
-	if w.masterKey == nil {
-		return "", ErrNoMasterKey
-	}
+	// Order matters: a locked, encrypted wallet has masterKey == nil because
+	// the cleartext key is wiped on Lock(). Surface the user-facing reason
+	// (locked) rather than the implementation detail (no master key).
 	if w.locked {
 		return "", ErrWalletLocked
+	}
+	if w.masterKey == nil {
+		return "", ErrNoMasterKey
 	}
 
 	coinType := w.coinType()
@@ -1356,14 +1375,35 @@ func (w *Wallet) scriptToAddress(pkScript []byte) string {
 	return ""
 }
 
-// Lock locks the wallet, preventing signing operations.
+// Lock locks the wallet, preventing signing operations. When the wallet is
+// encrypted, this also zeroes and discards the in-memory master key — only
+// the ciphertext (encryptedMaster) is retained.
 func (w *Wallet) Lock() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.locked = true
+	w.lockLocked()
 }
 
-// Unlock unlocks the wallet.
+// lockLocked locks the wallet; caller must hold w.mu (write lock).
+func (w *Wallet) lockLocked() {
+	w.locked = true
+	if w.relockTimer != nil {
+		w.relockTimer.Stop()
+		w.relockTimer = nil
+	}
+	if w.encrypted && w.masterKey != nil {
+		// Best-effort scrubbing of secret material. Go's GC and slice headers
+		// mean we can only zero the buffers we hold pointers to; this is the
+		// same caveat Bitcoin Core's SecureString carries on most platforms.
+		zeroBytes(w.masterKey.Key)
+		zeroBytes(w.masterKey.ChainCode)
+		w.masterKey = nil
+	}
+}
+
+// Unlock unlocks the wallet by mnemonic. This is blockbrew's pre-encryption
+// unlock path and is preserved for backward compatibility with callers that
+// hold the mnemonic. Passphrase-encrypted wallets must use UnlockWithPassphrase.
 func (w *Wallet) Unlock(mnemonic, passphrase string) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -1397,6 +1437,135 @@ func (w *Wallet) IsLocked() bool {
 	defer w.mu.RUnlock()
 	return w.locked
 }
+
+// IsEncrypted returns whether the wallet has had EncryptWallet applied.
+// Mirrors CWallet::HasEncryptionKeys().
+func (w *Wallet) IsEncrypted() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.encrypted
+}
+
+// EncryptWallet encrypts the wallet's master HD key under the supplied
+// passphrase using AES-256-GCM with scrypt key derivation, and locks the
+// wallet. Returns ErrWalletAlreadyEncrypted if already encrypted, ErrNoMasterKey
+// if there is nothing to encrypt, or ErrEmptyPassphrase if passphrase is empty.
+//
+// After this call returns nil, callers must use UnlockWithPassphrase to
+// resume signing. The plaintext master key is wiped from memory before return.
+func (w *Wallet) EncryptWallet(passphrase string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.encrypted {
+		return ErrWalletAlreadyEncrypted
+	}
+	if w.masterKey == nil {
+		return ErrNoMasterKey
+	}
+	if len(passphrase) == 0 {
+		return ErrEmptyPassphrase
+	}
+
+	// Serialize as Key||ChainCode (64 bytes) — same layout used by SaveToFile.
+	plaintext := make([]byte, 0, len(w.masterKey.Key)+len(w.masterKey.ChainCode))
+	plaintext = append(plaintext, w.masterKey.Key...)
+	plaintext = append(plaintext, w.masterKey.ChainCode...)
+	defer zeroBytes(plaintext)
+
+	envelope, err := encryptMasterKey(plaintext, passphrase)
+	if err != nil {
+		return err
+	}
+
+	w.encryptedMaster = envelope
+	w.encrypted = true
+
+	// Wipe in-memory master key and lock.
+	zeroBytes(w.masterKey.Key)
+	zeroBytes(w.masterKey.ChainCode)
+	w.masterKey = nil
+	w.locked = true
+	if w.relockTimer != nil {
+		w.relockTimer.Stop()
+		w.relockTimer = nil
+	}
+
+	return nil
+}
+
+// UnlockWithPassphrase decrypts the encrypted master key with the supplied
+// passphrase, retains the cleartext key in memory for `timeout` seconds, and
+// schedules an auto-relock callback. timeout values are clamped to
+// [0, MaxRelockSleepSeconds]; a timeout of 0 unlocks the wallet without
+// scheduling any auto-relock (matching the documented behavior of negative-
+// rejected, zero-allowed sleep in Core's walletpassphrase clamp).
+//
+// Calling this on an unencrypted wallet returns ErrWalletNotEncrypted.
+// Re-calling while already unlocked simply resets the auto-relock timer
+// (matching CWallet::Unlock behavior of "set a new unlock time that overrides
+// the old one").
+func (w *Wallet) UnlockWithPassphrase(passphrase string, timeout int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if !w.encrypted {
+		return ErrWalletNotEncrypted
+	}
+	if len(passphrase) == 0 {
+		return ErrEmptyPassphrase
+	}
+	if timeout < 0 {
+		return errors.New("timeout cannot be negative")
+	}
+	if timeout > MaxRelockSleepSeconds {
+		timeout = MaxRelockSleepSeconds
+	}
+
+	plaintext, err := decryptMasterKey(w.encryptedMaster, passphrase)
+	if err != nil {
+		return err
+	}
+	defer zeroBytes(plaintext)
+
+	if len(plaintext) != 64 {
+		return ErrPassphraseIncorrect
+	}
+
+	// Reconstruct the master key from key||chaincode.
+	keyBuf := make([]byte, 32)
+	chainBuf := make([]byte, 32)
+	copy(keyBuf, plaintext[:32])
+	copy(chainBuf, plaintext[32:])
+	if !isValidSecretKey(keyBuf) {
+		zeroBytes(keyBuf)
+		zeroBytes(chainBuf)
+		return ErrPassphraseIncorrect
+	}
+	w.masterKey = &HDKey{
+		Key:       keyBuf,
+		ChainCode: chainBuf,
+		Depth:     0,
+		ParentFP:  [4]byte{},
+		Index:     0,
+		IsPrivate: true,
+	}
+	w.locked = false
+
+	// Schedule auto-relock. A new call cancels any prior timer.
+	if w.relockTimer != nil {
+		w.relockTimer.Stop()
+		w.relockTimer = nil
+	}
+	if timeout > 0 {
+		w.relockTimer = time.AfterFunc(time.Duration(timeout)*time.Second, func() {
+			w.Lock()
+		})
+	}
+
+	return nil
+}
+
 
 // GetMasterFingerprint returns the fingerprint of the master key.
 func (w *Wallet) GetMasterFingerprint() ([4]byte, error) {

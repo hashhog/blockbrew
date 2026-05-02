@@ -25,6 +25,11 @@ const (
 	RPCErrClientP2PDisabled      = -9   // P2P networking is disabled
 	RPCErrWallet               = -4     // Wallet error (general)
 	RPCErrMisc                 = -1     // Miscellaneous error
+
+	// Wallet encryption-state error codes (Bitcoin Core protocol.h).
+	RPCErrWalletPassphraseIncorrect = -14 // Passphrase entered was incorrect
+	RPCErrWalletWrongEncState       = -15 // Wrong wallet encryption state
+	RPCErrWalletEncryptionFailed    = -16 // Failed to encrypt the wallet
 )
 
 // RPCRequest is a JSON-RPC request.
