@@ -549,6 +549,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleListUnspentWithWallet(walletName)
 	case "sendtoaddress":
 		return s.handleSendToAddressWithWallet(params, walletName)
+	case "encryptwallet":
+		return s.handleEncryptWalletWithWallet(params, walletName)
 	case "walletpassphrase":
 		return s.handleWalletPassphraseWithWallet(params, walletName)
 	case "walletlock":
