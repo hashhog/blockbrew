@@ -3,36 +3,9 @@ package consensus
 import (
 	"testing"
 
-	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
-
-// encodeBIP34Height encodes a block height for BIP34 coinbase scriptSig.
-func encodeBIP34Height(height int32) []byte {
-	if height == 0 {
-		return []byte{0x00} // OP_0
-	}
-	if height >= 1 && height <= 16 {
-		return []byte{byte(script.OP_1 + height - 1)}
-	}
-	// Encode as minimally-encoded little-endian with push opcode
-	// Need to handle negative (shouldn't happen for heights)
-	var data []byte
-	if height < 128 {
-		data = []byte{byte(height)}
-	} else if height < 32768 {
-		data = []byte{byte(height), byte(height >> 8)}
-	} else {
-		data = []byte{byte(height), byte(height >> 8), byte(height >> 16)}
-		// If high bit of last byte is set, need sign byte
-		if data[len(data)-1]&0x80 != 0 {
-			data = append(data, 0x00)
-		}
-	}
-	// Prepend push length
-	return append([]byte{byte(len(data))}, data...)
-}
 
 // createTestBlock creates a valid test block that spends the previous coinbase.
 func createTestBlock(t *testing.T, params *ChainParams, prevNode *BlockNode, txs []*wire.MsgTx) *wire.MsgBlock {

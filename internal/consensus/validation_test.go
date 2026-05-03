@@ -551,6 +551,7 @@ func TestCalcBlockSubsidyHalvings(t *testing.T) {
 }
 
 // TestCheckBIP34Height tests BIP34 height encoding in coinbase.
+// Reference: Bitcoin Core validation.cpp:4151-4159, script.h:433-448.
 func TestCheckBIP34Height(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -558,6 +559,7 @@ func TestCheckBIP34Height(t *testing.T) {
 		height     int32
 		shouldPass bool
 	}{
+		// --- Canonical forms (must pass) ---
 		{
 			name:       "height 0 (OP_0)",
 			scriptSig:  []byte{0x00},
@@ -565,15 +567,21 @@ func TestCheckBIP34Height(t *testing.T) {
 			shouldPass: true,
 		},
 		{
-			name:       "height 1 (OP_1)",
+			name:       "height 1 (OP_1 = 0x51)",
 			scriptSig:  []byte{0x51},
 			height:     1,
 			shouldPass: true,
 		},
 		{
-			name:       "height 16 (OP_16)",
+			name:       "height 16 (OP_16 = 0x60)",
 			scriptSig:  []byte{0x60},
 			height:     16,
+			shouldPass: true,
+		},
+		{
+			name:       "height 17 (length-prefixed, no sign pad)",
+			scriptSig:  []byte{0x01, 0x11},
+			height:     17,
 			shouldPass: true,
 		},
 		{
@@ -583,15 +591,82 @@ func TestCheckBIP34Height(t *testing.T) {
 			shouldPass: true,
 		},
 		{
-			name:       "height 500000 (3 byte push)",
-			scriptSig:  []byte{0x03, 0x20, 0xa1, 0x07}, // Little-endian 500000
+			name:       "height 127 (0x7f, no sign pad)",
+			scriptSig:  []byte{0x01, 0x7f},
+			height:     127,
+			shouldPass: true,
+		},
+		{
+			name:       "height 128 (0x80 needs sign-pad: 0x02 0x80 0x00)",
+			scriptSig:  []byte{0x02, 0x80, 0x00},
+			height:     128,
+			shouldPass: true,
+		},
+		{
+			name:       "height 32768 (0x8000 needs sign-pad: 0x03 0x00 0x80 0x00)",
+			scriptSig:  []byte{0x03, 0x00, 0x80, 0x00},
+			height:     32768,
+			shouldPass: true,
+		},
+		{
+			name:       "height 500000 (3 byte push, 0x07A120 LE)",
+			scriptSig:  []byte{0x03, 0x20, 0xa1, 0x07},
 			height:     500000,
 			shouldPass: true,
 		},
 		{
-			name:       "wrong height",
-			scriptSig:  []byte{0x01, 0x64}, // height 100
-			height:     200,                // expected 200
+			name:       "height 227931 (mainnet BIP34 activation, 0x37A5B LE)",
+			scriptSig:  []byte{0x03, 0x5b, 0x7a, 0x03},
+			height:     227931,
+			shouldPass: true,
+		},
+		{
+			name:       "scriptSig has extra bytes after canonical prefix (prefix match)",
+			scriptSig:  []byte{0x01, 0x64, 0xde, 0xad},
+			height:     100,
+			shouldPass: true,
+		},
+		// --- Non-canonical / rejected forms ---
+		{
+			name:       "reject: wrong height",
+			scriptSig:  []byte{0x01, 0x64},
+			height:     200,
+			shouldPass: false,
+		},
+		{
+			name:       "reject: length-prefixed 0x01 0x01 for height 1 (must be OP_1)",
+			scriptSig:  []byte{0x01, 0x01},
+			height:     1,
+			shouldPass: false,
+		},
+		{
+			name:       "reject: length-prefixed 0x01 0x10 for height 16 (must be OP_16)",
+			scriptSig:  []byte{0x01, 0x10},
+			height:     16,
+			shouldPass: false,
+		},
+		{
+			name:       "reject: zero-padded height 100 (0x02 0x64 0x00)",
+			scriptSig:  []byte{0x02, 0x64, 0x00},
+			height:     100,
+			shouldPass: false,
+		},
+		{
+			name:       "reject: OP_PUSHDATA1 prefix for height 1",
+			scriptSig:  []byte{0x4c, 0x01, 0x01},
+			height:     1,
+			shouldPass: false,
+		},
+		{
+			name:       "reject: redundant sign byte at height 100 (0x02 0x64 0x00 not needed)",
+			scriptSig:  []byte{0x02, 0x64, 0x00},
+			height:     100,
+			shouldPass: false,
+		},
+		{
+			name:       "reject: too short scriptSig",
+			scriptSig:  []byte{},
+			height:     100,
 			shouldPass: false,
 		},
 	}
@@ -611,6 +686,30 @@ func TestCheckBIP34Height(t *testing.T) {
 				t.Errorf("checkBIP34Height() expected error, got nil")
 			}
 		})
+	}
+}
+
+// TestEncodeBIP34Height tests the canonical BIP-34 height encoder.
+func TestEncodeBIP34Height(t *testing.T) {
+	tests := []struct {
+		height   int32
+		expected []byte
+	}{
+		{0, []byte{0x00}},                         // OP_0
+		{1, []byte{0x51}},                         // OP_1
+		{16, []byte{0x60}},                        // OP_16
+		{17, []byte{0x01, 0x11}},                  // 1-byte push
+		{127, []byte{0x01, 0x7f}},                 // no sign pad
+		{128, []byte{0x02, 0x80, 0x00}},           // sign pad at 0x80
+		{32768, []byte{0x03, 0x00, 0x80, 0x00}},   // sign pad at 0x8000
+		{500000, []byte{0x03, 0x20, 0xa1, 0x07}},  // 3-byte push
+		{227931, []byte{0x03, 0x5b, 0x7a, 0x03}},  // mainnet BIP34 (0x37A5B LE)
+	}
+	for _, tt := range tests {
+		got := encodeBIP34Height(tt.height)
+		if !bytes.Equal(got, tt.expected) {
+			t.Errorf("encodeBIP34Height(%d) = %x, want %x", tt.height, got, tt.expected)
+		}
 	}
 }
 
