@@ -671,6 +671,18 @@ func (e *Engine) executeScript(script []byte) error {
 			return ErrDisabledOpcode
 		}
 
+		// CONST_SCRIPTCODE: OP_CODESEPARATOR in BASE (legacy non-segwit)
+		// scripts is rejected even in unexecuted branches when the flag is
+		// set.  Mirrors Core interpreter.cpp:474-476, which fires BEFORE
+		// the fExec gate.  Core checks `sigversion == SigVersion::BASE` —
+		// not witness v0 — because OP_CODESEPARATOR is valid in witness
+		// scripts; the flag is a standardness rule for legacy relay only.
+		if op == OP_CODESEPARATOR &&
+			e.sigVersion == SigVersionBase &&
+			e.flags&ScriptVerifyConstScriptCode != 0 {
+			return errors.New("OP_CODESEPARATOR in legacy script with CONST_SCRIPTCODE")
+		}
+
 		// Determine if we're in an executing branch
 		executing := e.isExecuting()
 
@@ -1062,14 +1074,15 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int, opcodePos uint32)
 		return e.opHash256()
 
 	case OP_CODESEPARATOR:
-		// In witness v0, OP_CODESEPARATOR is forbidden if CONST_SCRIPTCODE is set
-		if e.sigVersion == SigVersionWitnessV0 && e.flags&ScriptVerifyConstScriptCode != 0 {
-			return errors.New("OP_CODESEPARATOR in witness v0 script")
-		}
-		// For tapscript, update codesep_pos (opcode index)
+		// CONST_SCRIPTCODE check was moved above the fExec gate in the main
+		// eval loop (Core interpreter.cpp:474-476 parity).  Here we just
+		// record the opcode index (already correct — `opcodePos` is a real
+		// opcode counter, not a byte position) for the tapscript sigmsg
+		// (BIP-341 interpreter.cpp:1055, 1565).
 		e.codesepPos = opcodePos
-		// For legacy scripts, track byte position after this opcode
-		// pc is already positioned after the OP_CODESEPARATOR opcode
+		// For legacy/witness-v0 scripts, track byte position after this opcode
+		// so scriptCode can be sliced starting after the OP_CODESEPARATOR.
+		// pc is already positioned after the OP_CODESEPARATOR opcode byte.
 		e.lastCodeSepIdx = pc
 		return nil
 
