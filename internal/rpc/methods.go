@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/big"
@@ -1426,6 +1427,56 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 	}, nil
 }
 
+// bip22ResultString maps a submitblock rejection error to the canonical short
+// ASCII string defined in BIP-22 and Bitcoin Core BIP22ValidationResult()
+// (src/rpc/mining.cpp).  Returns "rejected" for unrecognised errors so callers
+// never leak verbose internal messages to mining pools.
+func bip22ResultString(err error) string {
+	if err == nil {
+		return "" // caller should return null (success)
+	}
+	switch {
+	// Proof-of-work failure (hash above target)
+	case errors.Is(err, consensus.ErrDifficultyTooLow),
+		errors.Is(err, consensus.ErrNegativeTarget),
+		errors.Is(err, consensus.ErrTargetTooHigh):
+		return "high-hash"
+	// nBits field doesn't match required difficulty
+	case errors.Is(err, consensus.ErrBadDifficultyBits),
+		errors.Is(err, consensus.ErrBadDifficulty):
+		return "bad-diffbits"
+	// Merkle root
+	case errors.Is(err, consensus.ErrBadMerkleRoot):
+		return "bad-txnmrklroot"
+	// Witness commitment (BIP-141)
+	case errors.Is(err, consensus.ErrBadWitnessCommitment),
+		errors.Is(err, consensus.ErrMissingWitnessCommitment):
+		return "bad-witness-merkle-match"
+	// Coinbase value / subsidy
+	case errors.Is(err, consensus.ErrBadCoinbaseValue):
+		return "bad-cb-amount"
+	// Sigops budget
+	case errors.Is(err, consensus.ErrSigOpsCostTooHigh):
+		return "bad-blk-sigops"
+	// Duplicate tx within block (BIP-30)
+	case errors.Is(err, consensus.ErrDuplicateTx),
+		errors.Is(err, consensus.ErrDuplicateCoinbase):
+		return "bad-txns-duplicate"
+	// BIP-34 coinbase height encoding
+	case errors.Is(err, consensus.ErrBadBIP34Height):
+		return "bad-cb-height"
+	// Time checks
+	case errors.Is(err, consensus.ErrTimestampBeforeMTP),
+		errors.Is(err, consensus.ErrTimestampTooEarly):
+		return "time-too-old"
+	case errors.Is(err, consensus.ErrTimestampTooFar):
+		return "time-too-new"
+	// Catch-all — covers connection errors, missing prev block, script fails, etc.
+	default:
+		return "rejected"
+	}
+}
+
 func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, rpcErr *RPCError) {
 	// Recover from any panic during block deserialization or processing to
 	// prevent a malformed submitblock from crashing the node (DoS vector).
@@ -1484,17 +1535,20 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		return nil, &RPCError{Code: RPCErrInternal, Message: "Chain params not configured"}
 	}
 
+	// CheckBlockSanity covers PoW, merkle root, weight, sigops, etc.
+	// Failures are mapped to BIP-22 result strings (not RPC errors) per spec.
 	if err := consensus.CheckBlockSanity(block, s.chainParams.PowLimit); err != nil {
-		return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Block sanity check failed: %v", err)}
+		return bip22ResultString(err), nil
 	}
 
 	// Add header to index
 	hash := block.Header.BlockHash()
 	if _, err := s.headerIndex.AddHeader(block.Header); err != nil {
-		// If duplicate, that's OK
-		if err != consensus.ErrDuplicateHeader {
-			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Header validation failed: %v", err)}
+		// If duplicate, that's OK — return "duplicate" per BIP-22
+		if errors.Is(err, consensus.ErrDuplicateHeader) {
+			return "duplicate", nil
 		}
+		return bip22ResultString(err), nil
 	}
 
 	// Store block
@@ -1507,11 +1561,12 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	// Add header to index before connecting (ignore duplicate — headers may
 	// already be present from P2P header sync).
 	if s.chainMgr != nil {
-		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil && err != consensus.ErrDuplicateHeader {
-			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to add header to index: %v", err)}
+		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil && !errors.Is(err, consensus.ErrDuplicateHeader) {
+			return bip22ResultString(err), nil
 		}
 		if err := s.chainMgr.ConnectBlock(block); err != nil {
-			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Block connection failed: %v", err)}
+			// Map connection failures to BIP-22 result strings.
+			return bip22ResultString(err), nil
 		}
 	}
 
@@ -1520,7 +1575,7 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		// TODO: Broadcast block inv to peers
 	}
 
-	return nil, nil // Success returns null
+	return nil, nil // null = success per BIP-22
 }
 
 // handleSubmitBlockBatch processes multiple blocks in a single RPC call.
