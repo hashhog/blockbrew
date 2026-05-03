@@ -201,10 +201,24 @@ func CountWitnessSigOps(tx *wire.MsgTx, utxoView UTXOView) int {
 	return totalSigOps
 }
 
-// countWitnessSigOpsForInput counts sigops for a single witness input.
+// countWitnessSigOpsForInput counts sigops for a single witness input,
+// for the purpose of the block-level MaxBlockSigOpsCost (80,000) budget.
+//
+// This MUST mirror Bitcoin Core's WitnessSigOps (interpreter.cpp:2123-2137):
+// only segwit v0 contributes to the block sigop budget. Taproot (v1) and
+// any future witness version return 0 here. Per BIP-342, Taproot enforces
+// its own per-input validation-weight budget
+// (VALIDATION_WEIGHT_PER_SIGOP_PASSED), which is checked inside the script
+// interpreter — NOT against MaxBlockSigOpsCost. Counting tapscript
+// CHECKSIG/CHECKSIGADD ops toward the block budget would reject blocks
+// that Core accepts (e.g. ordinals/inscription blocks with high-opcount
+// tapscripts).
+//
+// CountTaprootSigOps is preserved for callers that need a tapscript-only
+// estimate (e.g. mempool policy heuristics), but it must NOT be summed
+// into CountBlockSigOpsCost.
 func countWitnessSigOpsForInput(version int, program []byte, witness [][]byte, inputIdx int) int {
-	switch version {
-	case 0:
+	if version == 0 {
 		// Segwit v0
 		if len(program) == 20 {
 			// P2WPKH: exactly 1 signature operation
@@ -218,32 +232,10 @@ func countWitnessSigOpsForInput(version int, program []byte, witness [][]byte, i
 			witnessScript := witness[len(witness)-1]
 			return CountWitnessSigOpsV0(witnessScript)
 		}
-	case 1:
-		// Taproot (v1)
-		if len(program) != 32 {
-			return 0
-		}
-		if len(witness) == 0 {
-			return 0
-		}
-
-		// Check for annex (starts with 0x50)
-		stack := witness
-		if len(stack) >= 2 && len(stack[len(stack)-1]) > 0 && stack[len(stack)-1][0] == 0x50 {
-			stack = stack[:len(stack)-1]
-		}
-
-		if len(stack) == 1 {
-			// Key path: 1 sigop
-			return 1
-		}
-		// Script path: count OP_CHECKSIG/OP_CHECKSIGVERIFY in the tapscript
-		if len(stack) >= 2 {
-			tapscript := stack[len(stack)-2]
-			return CountTaprootSigOps(tapscript)
-		}
 	}
 
+	// Future flags may be implemented here. Taproot (v1) and beyond
+	// contribute 0 to the block sigop budget. (Core: interpreter.cpp:2135-2136.)
 	return 0
 }
 
