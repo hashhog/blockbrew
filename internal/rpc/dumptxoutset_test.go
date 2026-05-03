@@ -311,6 +311,71 @@ func TestDumpTxOutSetInvalidType(t *testing.T) {
 	}
 }
 
+// TestDumpTxOutSetAtomicWrite asserts the canonical Core .incomplete + rename
+// flow: a successful dump leaves <path> on disk and NO <path>.incomplete
+// orphan. Refusing to overwrite an existing destination is also covered.
+//
+// Mirrors `bitcoin-core/src/rpc/blockchain.cpp::dumptxoutset` which writes to
+// `temppath = path + ".incomplete"`, fsyncs, and renames before returning.
+func TestDumpTxOutSetAtomicWrite(t *testing.T) {
+	rig := newDumpTxOutSetTestRig(t, 3)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "utxo-atomic.dat")
+
+	if _, rpcErr := rig.callDumpTxOutSet(t, []interface{}{path}); rpcErr != nil {
+		t.Fatalf("dumptxoutset(latest): %+v", rpcErr)
+	}
+
+	// <path> exists.
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("snapshot path missing after successful dump: %v", err)
+	}
+
+	// <path>.incomplete must NOT exist after a successful dump.
+	if _, err := os.Stat(snapshotTempPath(path)); err == nil {
+		t.Fatalf("temp file %s still present after successful dump (expected to be renamed away)", snapshotTempPath(path))
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected stat error for temp path: %v", err)
+	}
+
+	// Calling dumptxoutset against the same path must refuse — Core's
+	// "<path> already exists" guard.
+	_, rpcErr := rig.callDumpTxOutSet(t, []interface{}{path})
+	if rpcErr == nil {
+		t.Fatalf("expected error when dumping to an existing path")
+	}
+	if rpcErr.Code != RPCErrInvalidParams {
+		t.Errorf("expected RPCErrInvalidParams for clobber attempt, got %d", rpcErr.Code)
+	}
+}
+
+// TestDumpTxOutSetCleansTempOnError forces the snapshot writer down a failure
+// path (a path under a non-existent directory) and asserts that no
+// .incomplete file is left behind on the filesystem.
+func TestDumpTxOutSetCleansTempOnError(t *testing.T) {
+	rig := newDumpTxOutSetTestRig(t, 2)
+
+	dir := t.TempDir()
+	// Path under a directory that doesn't exist — os.Create fails so no
+	// temp file is ever created. We assert the cleanup path doesn't leave
+	// orphans even when the temp file was never created.
+	bad := filepath.Join(dir, "no-such-subdir", "utxo-fail.dat")
+
+	_, rpcErr := rig.callDumpTxOutSet(t, []interface{}{bad})
+	if rpcErr == nil {
+		t.Fatalf("expected RPC error for unwritable path")
+	}
+
+	// Neither path should exist.
+	if _, err := os.Stat(bad); err == nil {
+		t.Fatalf("final path %s exists after a failed dump", bad)
+	}
+	if _, err := os.Stat(snapshotTempPath(bad)); err == nil {
+		t.Fatalf("temp path %s exists after a failed dump", snapshotTempPath(bad))
+	}
+}
+
 // verifySnapshotMetadata re-reads the snapshot file written by the RPC and
 // asserts the magic + network magic + base block hash match expectations.
 func verifySnapshotMetadata(t *testing.T, path string, wantMagic [4]byte, wantHash wire.Hash256) {
