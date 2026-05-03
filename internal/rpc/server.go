@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -54,6 +55,31 @@ type Server struct {
 	mu        sync.RWMutex
 	startTime time.Time
 	shutdown  chan struct{}
+
+	// blockSubmissionPaused gates inbound block acceptance during the
+	// `dumptxoutset rollback` rewind→dump→replay dance. Mirrors Bitcoin
+	// Core's NetworkDisable RAII wrapper around TemporaryRollback in
+	// rpc/blockchain.cpp::dumptxoutset. Peers stay connected; only block
+	// acceptance is gated. Atomic so the P2P HandleBlock path can read
+	// without lock contention.
+	blockSubmissionPaused atomic.Bool
+}
+
+// networkDisable is the NetworkDisable equivalent: returns a closure
+// that MUST be called (defer-style) to restore acceptance. Mirrors
+// Core's NetworkDisable around TemporaryRollback in
+// rpc/blockchain.cpp::dumptxoutset.
+func (s *Server) networkDisable() func() {
+	s.blockSubmissionPaused.Store(true)
+	return func() {
+		s.blockSubmissionPaused.Store(false)
+	}
+}
+
+// IsBlockSubmissionPaused reports whether inbound block acceptance is
+// currently gated by an active dumptxoutset rollback. Hot-path read.
+func (s *Server) IsBlockSubmissionPaused() bool {
+	return s.blockSubmissionPaused.Load()
 }
 
 // ServerOption is a functional option for configuring the server.
