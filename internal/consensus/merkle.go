@@ -6,16 +6,53 @@ import (
 
 // CalcMerkleRoot computes the Merkle root of a list of transaction hashes.
 // Bitcoin's Merkle tree duplicates the last element if the count is odd.
+//
+// Note: This wrapper does NOT detect CVE-2012-2459 (merkle-tree malleability
+// from duplicate adjacent hashes). For block validation, use
+// CalcMerkleRootMutation, which returns a `mutated` flag so the caller can
+// distinguish a malicious mutation (transient — must NOT mark the block
+// permanently invalid) from a real merkle-root mismatch (real — mark
+// permanently invalid). See Bitcoin Core consensus/merkle.cpp:46-63 +
+// validation.cpp:3837-3862.
 func CalcMerkleRoot(hashes []wire.Hash256) wire.Hash256 {
+	root, _ := CalcMerkleRootMutation(hashes)
+	return root
+}
+
+// CalcMerkleRootMutation computes the Merkle root and reports whether any
+// adjacent pair of hashes at any level is identical, the signature of
+// CVE-2012-2459: an attacker can construct a "mutated" transaction list
+// (e.g. [1,2,3,4,5,6,5,6]) that produces the same merkle root as the
+// legitimate list ([1,2,3,4,5,6]) but has a different transaction count.
+//
+// Treat `mutated == true` as a transient block error: the block must be
+// rejected, but it must NOT be permanently marked invalid, because the
+// legitimate (un-mutated) form has the same block hash and is still valid.
+//
+// Mirrors Bitcoin Core's `ComputeMerkleRoot(std::vector<uint256> hashes,
+// bool* mutated)` (consensus/merkle.cpp:46-63).
+func CalcMerkleRootMutation(hashes []wire.Hash256) (wire.Hash256, bool) {
 	if len(hashes) == 0 {
-		return wire.Hash256{}
+		return wire.Hash256{}, false
 	}
 
 	// Make a copy to avoid modifying the input
 	level := make([]wire.Hash256, len(hashes))
 	copy(level, hashes)
 
+	mutated := false
+
 	for len(level) > 1 {
+		// Detect CVE-2012-2459: if any two adjacent hashes (before the odd-
+		// duplicate step) are equal, mark the tree as mutated. This catches
+		// both naturally duplicated adjacent leaves and the attacker's
+		// trailing duplication. Core checks ALL levels, not just leaves.
+		for pos := 0; pos+1 < len(level); pos += 2 {
+			if level[pos] == level[pos+1] {
+				mutated = true
+			}
+		}
+
 		// If odd number of elements, duplicate the last one
 		if len(level)%2 != 0 {
 			level = append(level, level[len(level)-1])
@@ -29,7 +66,7 @@ func CalcMerkleRoot(hashes []wire.Hash256) wire.Hash256 {
 		level = nextLevel
 	}
 
-	return level[0]
+	return level[0], mutated
 }
 
 // hashPair computes DoubleSHA256(left || right).

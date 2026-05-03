@@ -20,6 +20,14 @@ var (
 	ErrFirstTxNotCoinbase      = errors.New("first transaction is not coinbase")
 	ErrMultipleCoinbase        = errors.New("block has multiple coinbase transactions")
 	ErrBadMerkleRoot           = errors.New("merkle root mismatch")
+	// ErrBlockMutated signals CVE-2012-2459: the merkle tree contains a
+	// duplicated adjacent pair, so a different transaction list could
+	// produce the same merkle root. Treat as TRANSIENT — the block must
+	// be rejected but MUST NOT be permanently marked invalid, because
+	// the legitimate (un-mutated) form has the same block hash and is
+	// still potentially valid. Bitcoin Core uses BLOCK_MUTATED for this
+	// (validation.cpp:3850-3858, "bad-txns-duplicate").
+	ErrBlockMutated            = errors.New("block merkle tree mutated (CVE-2012-2459)")
 	ErrBlockWeightTooHigh      = errors.New("block weight exceeds maximum")
 	ErrTimestampTooFar         = errors.New("block timestamp too far in the future")
 	ErrBlockVersionTooLow      = errors.New("block version too low for height")
@@ -78,15 +86,26 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int) error {
 		}
 	}
 
-	// 6. Merkle root matches computed Merkle root from transaction IDs
+	// 6. Merkle root matches computed Merkle root from transaction IDs.
+	// The mutation flag detects CVE-2012-2459: if the tree contains a
+	// duplicated adjacent pair, the matching merkle root could have come
+	// from a different transaction list. Returning ErrBlockMutated
+	// (instead of ErrBadMerkleRoot) lets the caller treat this as
+	// transient — the block is rejected but the block hash must NOT be
+	// permanently marked invalid, otherwise an attacker can DoS the node
+	// by sending the mutated form before the legitimate form arrives.
+	// Mirrors Core CheckMerkleRoot (validation.cpp:3837-3862).
 	txHashes := make([]wire.Hash256, len(block.Transactions))
 	for i, tx := range block.Transactions {
 		txHashes[i] = tx.TxHash()
 	}
-	calculatedMerkle := CalcMerkleRoot(txHashes)
+	calculatedMerkle, mutated := CalcMerkleRootMutation(txHashes)
 	if calculatedMerkle != block.Header.MerkleRoot {
 		return fmt.Errorf("%w: expected %s, got %s",
 			ErrBadMerkleRoot, calculatedMerkle.String(), block.Header.MerkleRoot.String())
+	}
+	if mutated {
+		return ErrBlockMutated
 	}
 
 	// 7. Block weight must not exceed MaxBlockWeight
