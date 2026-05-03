@@ -1437,6 +1437,13 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		}
 	}()
 
+	// NetworkDisable gate: refuse submissions while a `dumptxoutset
+	// rollback` dance is in progress. Mirrors Core's NetworkDisable RAII
+	// around TemporaryRollback in rpc/blockchain.cpp::dumptxoutset.
+	if s.IsBlockSubmissionPaused() {
+		return "rejected: block submission paused (dumptxoutset rollback in progress)", nil
+	}
+
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
@@ -2108,11 +2115,27 @@ func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set type not supported for snapshots"}
 	}
 
+	// Pruned-mode pre-check (Core: rpc/blockchain.cpp:dumptxoutset, the
+	// `IsPruneMode() && target_index->nHeight < GetFirstBlock()->nHeight`
+	// guard). Blockbrew does not implement block pruning today (Cat C audit
+	// `project_storage_parity_category_c` — Pruning MISSING in blockbrew).
+	// Every block from genesis is on disk, so any rollback target is reachable
+	// and the check is a no-op. Documented gap: revisit once `-prune` lands.
+
 	// Roll back if needed. ReorgTo(target) where target is an ancestor of the
 	// current tip just disconnects down to target (FindFork == target, no
 	// connect loop iterations).
 	rolledBack := targetNode.Hash != originalTipHash
 	if rolledBack {
+		// NetworkDisable RAII: pause inbound block acceptance for the
+		// duration of the rewind→dump→replay dance. Mirrors Core's
+		// NetworkDisable wrapper around TemporaryRollback in
+		// rpc/blockchain.cpp::dumptxoutset. The deferred restore fires
+		// on every return path (success, error) so peers can resume
+		// submitting once the original tip is back.
+		restore := s.networkDisable()
+		defer restore()
+
 		log.Printf("rpc: dumptxoutset rolling back from height %d to %d (%s)",
 			originalTipHeight, targetNode.Height, targetNode.Hash.String()[:16])
 		if err := s.chainMgr.ReorgTo(targetNode); err != nil {
