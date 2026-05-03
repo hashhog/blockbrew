@@ -30,6 +30,13 @@ func openSnapshotFile(path string) (*os.File, error) {
 	return os.Open(path)
 }
 
+// snapshotTempPath returns the canonical "<path>.incomplete" suffix used by
+// the atomic dumptxoutset write pattern. Mirrors Bitcoin Core's
+// `temppath = path + ".incomplete"` (rpc/blockchain.cpp::dumptxoutset).
+func snapshotTempPath(path string) string {
+	return path + ".incomplete"
+}
+
 // Satoshis per Bitcoin for conversion.
 const satoshiPerBitcoin = 100_000_000
 
@@ -2229,24 +2236,65 @@ func (s *Server) resolveRollbackTarget(v interface{}) (*consensus.BlockNode, *RP
 // writeUtxoSnapshotFile writes the UTXO set to the given path and returns the
 // dumptxoutset result. Factored out so the rollback path can run it after the
 // chain is rewound.
+//
+// Atomic write protocol: writes to "<path>.incomplete", fsyncs via
+// File.Sync(), then renames to <path>. Mirrors Bitcoin Core's
+// `temppath = path + ".incomplete"` flow (rpc/blockchain.cpp::dumptxoutset)
+// so that operators copying mid-dump never see a torn file, and a SIGKILL
+// during dump leaves only the .incomplete artifact behind for cleanup. The
+// caller is also expected to refuse if <path> already exists.
 func (s *Server) writeUtxoSnapshotFile(
 	path string,
 	us *consensus.UTXOSet,
 	tipHash wire.Hash256,
 	tipHeight int32,
 ) (*DumpTxOutSetResult, *RPCError) {
-	f, err := createSnapshotFile(path)
+	// Refuse to overwrite an existing destination — matches Core's
+	// behaviour. The .incomplete temp is fine to overwrite (a previous
+	// crashed dump's leftover).
+	if _, statErr := os.Stat(path); statErr == nil {
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParams,
+			Message: fmt.Sprintf("%s already exists. If you are sure this is what you want, move it out of the way first.", path),
+		}
+	} else if !os.IsNotExist(statErr) {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to stat %s: %v", path, statErr)}
+	}
+
+	tempPath := snapshotTempPath(path)
+	// Best-effort cleanup helper for any error-path return.
+	cleanupTemp := func() {
+		if rmErr := os.Remove(tempPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("rpc: dumptxoutset failed to remove temp file %s: %v", tempPath, rmErr)
+		}
+	}
+
+	f, err := createSnapshotFile(tempPath)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to create file: %v", err)}
 	}
-	defer f.Close()
 
 	networkMagic := s.chainParams.NetworkMagic
 	stats, err := consensus.WriteSnapshot(f, us, tipHash, networkMagic)
 	if err != nil {
+		_ = f.Close()
+		cleanupTemp()
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to write snapshot: %v", err)}
 	}
 	stats.Height = tipHeight
+
+	// fsync so durability is guaranteed before the atomic rename. Without
+	// this, a power loss between rename and the OS flushing dirty pages
+	// could leave <path> visible but with zero-length / torn contents.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanupTemp()
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to fsync snapshot: %v", err)}
+	}
+	if err := f.Close(); err != nil {
+		cleanupTemp()
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to close snapshot: %v", err)}
+	}
 
 	// Compute Core-compatible HASH_SERIALIZED over the UTXO set. This is the
 	// value compared against `assumeutxo` whitelist entries on the load side
@@ -2254,7 +2302,13 @@ func (s *Server) writeUtxoSnapshotFile(
 	// reports as `txoutset_hash`.
 	utxoHash, coinsCount, err := consensus.ComputeHashSerialized(us)
 	if err != nil {
+		cleanupTemp()
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to compute UTXO hash: %v", err)}
+	}
+
+	if err := os.Rename(tempPath, path); err != nil {
+		cleanupTemp()
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to rename snapshot to final path: %v", err)}
 	}
 
 	return &DumpTxOutSetResult{
