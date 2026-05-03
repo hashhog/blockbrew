@@ -1625,3 +1625,52 @@ func TestGetSyncStateW70(t *testing.T) {
 		t.Errorf("chain = %v, want \"main\"", got["chain"])
 	}
 }
+
+// TestBIP22ResultString verifies that bip22ResultString maps each blockbrew
+// consensus error to the canonical BIP-22 short string defined in BIP-22 and
+// Bitcoin Core BIP22ValidationResult() (src/rpc/mining.cpp).
+func TestBIP22ResultString(t *testing.T) {
+	tests := []struct {
+		err  error
+		want string
+	}{
+		// Proof-of-work failures
+		{consensus.ErrDifficultyTooLow, "high-hash"},
+		{consensus.ErrNegativeTarget, "high-hash"},
+		{consensus.ErrTargetTooHigh, "high-hash"},
+		// nBits mismatch
+		{consensus.ErrBadDifficultyBits, "bad-diffbits"},
+		{consensus.ErrBadDifficulty, "bad-diffbits"},
+		// Merkle root
+		{consensus.ErrBadMerkleRoot, "bad-txnmrklroot"},
+		// Witness commitment
+		{consensus.ErrBadWitnessCommitment, "bad-witness-merkle-match"},
+		{consensus.ErrMissingWitnessCommitment, "bad-witness-merkle-match"},
+		// Coinbase value
+		{consensus.ErrBadCoinbaseValue, "bad-cb-amount"},
+		// Sigops
+		{consensus.ErrSigOpsCostTooHigh, "bad-blk-sigops"},
+		// Duplicate transactions (BIP-30)
+		{consensus.ErrDuplicateTx, "bad-txns-duplicate"},
+		{consensus.ErrDuplicateCoinbase, "bad-txns-duplicate"},
+		// BIP-34 height
+		{consensus.ErrBadBIP34Height, "bad-cb-height"},
+		// Timestamp
+		{consensus.ErrTimestampBeforeMTP, "time-too-old"},
+		{consensus.ErrTimestampTooEarly, "time-too-old"},
+		{consensus.ErrTimestampTooFar, "time-too-new"},
+		// Catch-all
+		{consensus.ErrNoTransactions, "rejected"},
+		{consensus.ErrFirstTxNotCoinbase, "rejected"},
+		{consensus.ErrSequenceLockNotMet, "rejected"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.err.Error(), func(t *testing.T) {
+			got := bip22ResultString(tc.err)
+			if got != tc.want {
+				t.Errorf("bip22ResultString(%v) = %q, want %q", tc.err, got, tc.want)
+			}
+		})
+	}
+}
