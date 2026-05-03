@@ -361,13 +361,16 @@ func ValidateBlockWithOptions(block *wire.MsgBlock, prevHeader *wire.BlockHeader
 	}
 
 	// BIP30: Check for duplicate transaction outputs in the UTXO set.
-	// Two historical blocks (91722 and 91812) on mainnet have duplicate coinbase
-	// txids and are exempted. After BIP34 activation, the height encoded in the
-	// coinbase makes duplicate txids impossible, so the check can be skipped.
-	// However, after height 1,983,702 the check must resume because BIP34 does
-	// not fully guarantee uniqueness beyond that point.
+	// Two historical mainnet blocks (91842 and 91880) intentionally have duplicate
+	// coinbase txids and are exempted from this check — they predate BIP-30.
+	// After BIP34 activation (h≥227931), the height-in-coinbase rule makes
+	// duplicate txids practically impossible. However, at h≥1,983,702 the check
+	// must resume because BIP34 modular arithmetic begins to repeat pre-BIP34
+	// coinbase heights, potentially re-enabling collisions.
+	// Reference: Bitcoin Core validation.cpp ConnectBlock (around line 2467-2476)
+	// and IsBIP30Repeat() logic.
 	const bip34ImpliesBIP30Limit int32 = 1_983_702
-	enforceBIP30 := height != 91722 && height != 91812
+	enforceBIP30 := height != 91842 && height != 91880
 	// Skip BIP30 after BIP34 activation (unique coinbase guarantees unique txids)
 	if enforceBIP30 && height >= params.BIP34Height {
 		enforceBIP30 = false
