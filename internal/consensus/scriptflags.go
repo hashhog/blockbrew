@@ -29,10 +29,10 @@ func GetBlockScriptFlags(height int32, params *ChainParams, blockHash wire.Hash2
 	// have it active from genesis or very early)
 	flags |= script.ScriptVerifyP2SH
 
-	// BIP66: Strict DER signatures (activated at BIP66Height)
+	// BIP66: Strict DER signatures (activated at BIP66Height).
+	// ScriptVerifyStrictEncoding is policy-only (STANDARD_SCRIPT_VERIFY_FLAGS).
 	if height >= params.BIP66Height {
 		flags |= script.ScriptVerifyDERSig
-		flags |= script.ScriptVerifyStrictEncoding
 	}
 
 	// BIP65: CHECKLOCKTIMEVERIFY (activated at BIP65Height)
@@ -45,19 +45,39 @@ func GetBlockScriptFlags(height int32, params *ChainParams, blockHash wire.Hash2
 		flags |= script.ScriptVerifyCSV
 	}
 
-	// BIP141/BIP143/BIP147: Segregated Witness (activated at SegwitHeight)
-	// BIP146: NULLFAIL is also activated with segwit
-	// BIP141: WITNESS_PUBKEYTYPE requires compressed pubkeys in witness v0
+	// BIP141/BIP143/BIP147: Segregated Witness (activated at SegwitHeight).
+	// WITNESS + NULLDUMMY are consensus rules.
+	// ScriptVerifyNullFail and ScriptVerifyWitnessPubKeyType are policy-only
+	// (STANDARD_SCRIPT_VERIFY_FLAGS per Bitcoin Core policy/policy.h:125,128).
 	if height >= params.SegwitHeight {
 		flags |= script.ScriptVerifyWitness
 		flags |= script.ScriptVerifyNullDummy
-		flags |= script.ScriptVerifyNullFail
-		flags |= script.ScriptVerifyWitnessPubKeyType
 	}
 
 	// BIP341/BIP342: Taproot (activated at TaprootHeight)
 	if height >= params.TaprootHeight {
 		flags |= script.ScriptVerifyTaproot
+	}
+
+	return flags
+}
+
+// GetStandardScriptFlags returns mempool/relay script verification flags for a
+// given height.  This composes the consensus flags from GetBlockScriptFlags and
+// adds the policy-only STANDARD_SCRIPT_VERIFY_FLAGS additions that Bitcoin Core
+// uses in mempool acceptance (policy/policy.h:119-132).
+//
+// Do NOT use this for block validation — use GetBlockScriptFlags instead.
+func GetStandardScriptFlags(height int32, params *ChainParams, blockHash wire.Hash256) script.ScriptFlags {
+	flags := GetBlockScriptFlags(height, params, blockHash)
+
+	// Add policy-only flags for mempool standardness enforcement
+	if height >= params.BIP66Height {
+		flags |= script.ScriptVerifyStrictEncoding
+	}
+	if height >= params.SegwitHeight {
+		flags |= script.ScriptVerifyNullFail
+		flags |= script.ScriptVerifyWitnessPubKeyType
 	}
 
 	return flags
