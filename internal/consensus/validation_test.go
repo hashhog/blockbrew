@@ -3,7 +3,9 @@ package consensus
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -1431,5 +1433,229 @@ func TestBIP68EdgeCasePrevHeightZero(t *testing.T) {
 
 	if !calledHeights[0] {
 		t.Errorf("For prevHeight=0, MTP should be fetched at height 0")
+	}
+}
+
+// TestCalcMerkleRootMutationCVE20122459 tests the CVE-2012-2459 defense.
+//
+// CVE-2012-2459 describes how Bitcoin's merkle tree, which duplicates the
+// last hash when the level has odd length, lets an attacker construct a
+// "mutated" transaction list that produces the same merkle root as the
+// honest list. For example: leaves [1,2,3,4,5,6] and [1,2,3,4,5,6,5,6]
+// produce the same root because at the second level, [H(1,2), H(3,4),
+// H(5,6)] becomes [D, E, F, F] (after odd-duplication) — exactly the
+// same as [D, E, F, F] from [1,2,3,4,5,6,5,6] without odd-duplication.
+//
+// The defense: if any adjacent pair of hashes at any tree level is equal,
+// flag the tree as "mutated". The block must be rejected, but it must NOT
+// be permanently marked invalid, because the honest form has the same
+// block hash and is still potentially valid.
+func TestCalcMerkleRootMutationCVE20122459(t *testing.T) {
+	hash := func(b byte) wire.Hash256 {
+		var h wire.Hash256
+		h[0] = b
+		return h
+	}
+
+	t.Run("no mutation (4 distinct leaves)", func(t *testing.T) {
+		hashes := []wire.Hash256{hash(1), hash(2), hash(3), hash(4)}
+		_, mutated := CalcMerkleRootMutation(hashes)
+		if mutated {
+			t.Errorf("expected no mutation flag for 4 distinct leaves")
+		}
+	})
+
+	t.Run("no mutation (single leaf)", func(t *testing.T) {
+		hashes := []wire.Hash256{hash(1)}
+		_, mutated := CalcMerkleRootMutation(hashes)
+		if mutated {
+			t.Errorf("expected no mutation flag for 1 leaf")
+		}
+	})
+
+	t.Run("no mutation (odd count, 3 distinct leaves)", func(t *testing.T) {
+		// 3 leaves: odd-duplication of leaf-3 happens but adjacent pair
+		// (leaf-1, leaf-2) is fine. The duplicated (leaf-3, leaf-3) IS
+		// adjacent equal — but Core does this check BEFORE the odd
+		// duplication step, so naturally-odd lists must not be flagged.
+		hashes := []wire.Hash256{hash(1), hash(2), hash(3)}
+		_, mutated := CalcMerkleRootMutation(hashes)
+		if mutated {
+			t.Errorf("expected no mutation flag for natural odd-list (3 leaves)")
+		}
+	})
+
+	t.Run("CVE-2012-2459 mutation (adjacent dup at leaf level)", func(t *testing.T) {
+		// [1, 2, 3, 4, 5, 6] vs [1, 2, 3, 4, 5, 6, 5, 6] — the canonical
+		// CVE example. The mutated form has adjacent duplicates at the
+		// SECOND level (level pairs are [D, E, F, F]), so the leaf-level
+		// 8-leaf list is the attack signature.
+		honest := []wire.Hash256{hash(1), hash(2), hash(3), hash(4), hash(5), hash(6)}
+		mutated := []wire.Hash256{hash(1), hash(2), hash(3), hash(4), hash(5), hash(6), hash(5), hash(6)}
+
+		honestRoot, honestMut := CalcMerkleRootMutation(honest)
+		mutatedRoot, mutatedMut := CalcMerkleRootMutation(mutated)
+
+		if honestMut {
+			t.Errorf("honest 6-leaf list must NOT be flagged as mutated")
+		}
+		if !mutatedMut {
+			t.Errorf("8-leaf mutated list MUST be flagged as mutated (CVE-2012-2459)")
+		}
+		if honestRoot != mutatedRoot {
+			t.Errorf("CVE-2012-2459 invariant: honest and mutated roots must match\n  honest=%s\n  mutated=%s",
+				honestRoot.String(), mutatedRoot.String())
+		}
+	})
+
+	t.Run("adjacent duplicate at leaf level", func(t *testing.T) {
+		// Simplest attack: [A, B, C, C] — adjacent C, C at the leaf level.
+		// Equivalent (un-mutated) form would be [A, B, C] with odd-
+		// duplication, but [A, B, C, C] looks like a 4-leaf list.
+		hashes := []wire.Hash256{hash(1), hash(2), hash(3), hash(3)}
+		_, mutated := CalcMerkleRootMutation(hashes)
+		if !mutated {
+			t.Errorf("expected mutation flag for adjacent-duplicate leaves")
+		}
+	})
+
+	t.Run("CalcMerkleRoot wrapper preserves backward compat", func(t *testing.T) {
+		// The non-mutation-aware wrapper must still return the correct
+		// root (the mutation flag is just discarded).
+		hashes := []wire.Hash256{hash(1), hash(2), hash(3), hash(3)}
+		rootViaWrapper := CalcMerkleRoot(hashes)
+		rootViaMutation, _ := CalcMerkleRootMutation(hashes)
+		if rootViaWrapper != rootViaMutation {
+			t.Errorf("CalcMerkleRoot must equal CalcMerkleRootMutation root\n  wrapper=%s\n  mutation=%s",
+				rootViaWrapper.String(), rootViaMutation.String())
+		}
+	})
+}
+
+// TestCheckBlockSanityCVE20122459 verifies that CheckBlockSanity returns
+// ErrBlockMutated (transient — must NOT mark block permanently invalid)
+// instead of ErrBadMerkleRoot (real — mark permanently invalid) when the
+// transaction list contains a CVE-2012-2459 mutation.
+//
+// This is the regression for blockbrew P0-1: any peer can otherwise
+// permanently dead-end a node by sending the mutated form before the
+// legitimate form arrives — the block hash gets marked StatusInvalid in
+// the header index and the legitimate block can never be accepted.
+func TestCheckBlockSanityCVE20122459(t *testing.T) {
+	params := RegtestParams()
+
+	// Build a 6-tx block (1 coinbase + 5 padding non-coinbase txs) and a
+	// duplicated form (1 coinbase + 5 padding + 4 of the padding repeated
+	// to form an 8-tx mutated list with the same merkle root).
+	//
+	// We can't reuse the coinbase as a non-coinbase tx, so we use 6 txs at
+	// the leaf level: [coinbase, B, C, D, E, F] honest vs
+	// [coinbase, B, C, D, E, F, E, F] mutated. By Core's diagram both
+	// produce the same merkle root.
+	makeCoinbase := func() *wire.MsgTx {
+		return &wire.MsgTx{
+			Version: 1,
+			TxIn: []*wire.TxIn{{
+				PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xffffffff},
+				SignatureScript:  []byte{0x03, 0x01, 0x00, 0x00},
+				Sequence:         0xffffffff,
+			}},
+			TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x76, 0xa9}}},
+		}
+	}
+	makeTx := func(salt byte) *wire.MsgTx {
+		return &wire.MsgTx{
+			Version: 1,
+			TxIn: []*wire.TxIn{{
+				PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{salt}, Index: 0},
+				SignatureScript:  []byte{0x00},
+				Sequence:         0xffffffff,
+			}},
+			TxOut: []*wire.TxOut{{Value: 50000, PkScript: []byte{0x76, 0xa9}}},
+		}
+	}
+
+	cb := makeCoinbase()
+	b := makeTx(0xb1)
+	c := makeTx(0xc1)
+	d := makeTx(0xd1)
+	e := makeTx(0xe1)
+	f := makeTx(0xf1)
+
+	honestTxs := []*wire.MsgTx{cb, b, c, d, e, f}
+	// Mutated: append e, f again. [cb, B, C, D, E, F, E, F].
+	mutatedTxs := []*wire.MsgTx{cb, b, c, d, e, f, e, f}
+
+	// Compute merkle root for the honest form (which equals the mutated
+	// form's root by the CVE invariant).
+	honestHashes := make([]wire.Hash256, len(honestTxs))
+	for i, tx := range honestTxs {
+		honestHashes[i] = tx.TxHash()
+	}
+	mutatedHashes := make([]wire.Hash256, len(mutatedTxs))
+	for i, tx := range mutatedTxs {
+		mutatedHashes[i] = tx.TxHash()
+	}
+	honestRoot, _ := CalcMerkleRootMutation(honestHashes)
+	mutatedRoot, mutatedFlag := CalcMerkleRootMutation(mutatedHashes)
+	if honestRoot != mutatedRoot {
+		t.Fatalf("test setup invariant: honest root %s != mutated root %s",
+			honestRoot.String(), mutatedRoot.String())
+	}
+	if !mutatedFlag {
+		t.Fatalf("test setup invariant: mutated form must be flagged")
+	}
+
+	// Build the block header. We need it to pass PoW on regtest, which is
+	// trivial (target = 7fff...).
+	header := wire.BlockHeader{
+		Version:    0x20000000,
+		PrevBlock:  params.GenesisHash,
+		MerkleRoot: mutatedRoot, // Same as honestRoot
+		Timestamp:  uint32(time.Now().Unix()),
+		Bits:       params.PowLimitBits,
+		Nonce:      0,
+	}
+	// Mine to find a nonce satisfying regtest PoW.
+	for nonce := uint32(0); nonce < 0xffffffff; nonce++ {
+		header.Nonce = nonce
+		if CheckProofOfWork(header.BlockHash(), header.Bits, params.PowLimit) == nil {
+			break
+		}
+	}
+
+	// Send the MUTATED block: same hash as the honest block would have,
+	// but a different transaction list. This is the attack.
+	mutatedBlock := &wire.MsgBlock{
+		Header:       header,
+		Transactions: mutatedTxs,
+	}
+
+	err := CheckBlockSanity(mutatedBlock, params.PowLimit)
+	if err == nil {
+		t.Fatalf("expected mutated block to be rejected, got nil")
+	}
+	if !errors.Is(err, ErrBlockMutated) {
+		t.Fatalf("expected ErrBlockMutated (transient) for CVE-2012-2459, got: %v", err)
+	}
+	if errors.Is(err, ErrBadMerkleRoot) {
+		t.Errorf("must NOT return ErrBadMerkleRoot for mutated block: a real " +
+			"merkle mismatch would mark the block permanently invalid, " +
+			"creating the CVE-2012-2459 dead-end DoS")
+	}
+
+	// Sanity check: the honest block must still pass merkle validation
+	// (it may fail other checks like duplicate inputs in the dummy txs,
+	// but it must NOT trip ErrBlockMutated or ErrBadMerkleRoot).
+	honestBlock := &wire.MsgBlock{
+		Header:       header,
+		Transactions: honestTxs,
+	}
+	err = CheckBlockSanity(honestBlock, params.PowLimit)
+	if errors.Is(err, ErrBlockMutated) {
+		t.Errorf("honest block must NOT be flagged as mutated, got: %v", err)
+	}
+	if errors.Is(err, ErrBadMerkleRoot) {
+		t.Errorf("honest block must NOT have merkle mismatch, got: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math/rand/v2"
@@ -1613,14 +1614,34 @@ func (sm *SyncManager) validationWorker() {
 				if err != nil {
 					log.Printf("sync: block %s (height %d) failed sanity check: %v",
 						bwr.req.Hash.String()[:16], bwr.req.Height, err)
-					// Mark as invalid in header index
-					node := sm.headerIndex.GetNode(bwr.req.Hash)
-					if node != nil {
-						node.Status |= consensus.StatusInvalid
+					// CVE-2012-2459 defense: ErrBlockMutated means the merkle
+					// tree had a duplicated adjacent pair, so the same block
+					// hash could legitimately arrive later from an honest peer.
+					// Treat as TRANSIENT — drop this copy and ban the sender
+					// (they shipped a mutated form), but do NOT mark the block
+					// hash permanently invalid. Mirrors Bitcoin Core
+					// validation.cpp:3850-3858 which uses BLOCK_MUTATED
+					// (transient) instead of BLOCK_CONSENSUS for this case.
+					transientMutation := errors.Is(err, consensus.ErrBlockMutated)
+					if !transientMutation {
+						// Mark as invalid in header index
+						node := sm.headerIndex.GetNode(bwr.req.Hash)
+						if node != nil {
+							node.Status |= consensus.StatusInvalid
+						}
 					}
-					// Penalize the peer that sent the invalid block
+					// Penalize the peer that sent the invalid block (the peer
+					// is bad regardless: they shipped either an invalid block
+					// or a mutated one).
 					if bwr.req.Peer != nil {
 						bwr.req.Peer.Misbehaving(100, fmt.Sprintf("invalid block: %v", err))
+					}
+					// On transient mutation, requeue for re-download from a
+					// different peer instead of routing to the connection
+					// pipeline (which would skip the height entirely).
+					if transientMutation {
+						sm.requeueForRedownload(bwr)
+						return
 					}
 					// Still send to connection pipeline so it can skip this height
 					// and continue with subsequent blocks. Mark it as failed so
