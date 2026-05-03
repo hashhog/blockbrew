@@ -225,60 +225,62 @@ func checkWitnessCommitment(block *wire.MsgBlock) error {
 	return nil
 }
 
-// checkBIP34Height validates that the coinbase contains the block height.
-// BIP34 requires the first item in the coinbase scriptSig to be a push of
-// the block height as a minimally-encoded script number.
+// checkBIP34Height validates that the coinbase scriptSig starts with the
+// byte-exact canonical encoding of expectedHeight, matching Bitcoin Core's
+// ContextualCheckBlock (validation.cpp:4151-4159):
+//
+//	CScript expect = CScript() << nHeight;
+//	sig.size() >= expect.size() && equal(expect, sig[:expect.size()])
+//
+// The canonical encoding mirrors Core's CScript::push_int64 (script.h:433-448):
+//   - height == 0  → OP_0 (0x00), single byte
+//   - 1..16        → OP_1..OP_16 (0x51..0x60), single byte
+//   - otherwise    → length-prefixed CScriptNum (sign-magnitude little-endian)
+//
+// Non-canonical forms (OP_PUSHDATA1 prefix, zero-padded mantissa, redundant
+// sign byte, wrong OP_N for low heights) are rejected.
 func checkBIP34Height(coinbase *wire.MsgTx, expectedHeight int32) error {
 	if len(coinbase.TxIn) == 0 {
 		return ErrBadBIP34Height
 	}
-
 	scriptSig := coinbase.TxIn[0].SignatureScript
-	if len(scriptSig) == 0 {
-		return ErrBadBIP34Height
+	expect := encodeBIP34Height(expectedHeight)
+	if len(scriptSig) < len(expect) || !bytes.Equal(scriptSig[:len(expect)], expect) {
+		return fmt.Errorf("%w: expected prefix %x in scriptSig %x",
+			ErrBadBIP34Height, expect, scriptSig)
 	}
-
-	// The first byte tells us how many bytes follow for the height push
-	firstByte := scriptSig[0]
-
-	var pushedHeight int64
-	var pushLen int
-
-	if firstByte == 0 {
-		// OP_0 = height 0
-		pushedHeight = 0
-		pushLen = 1
-	} else if firstByte >= 1 && firstByte <= 75 {
-		// Direct push of 1-75 bytes
-		pushLen = int(firstByte)
-		if len(scriptSig) < 1+pushLen {
-			return ErrBadBIP34Height
-		}
-		data := scriptSig[1 : 1+pushLen]
-		pushedHeight = decodeScriptNum(data)
-	} else if firstByte == script.OP_PUSHDATA1 {
-		if len(scriptSig) < 2 {
-			return ErrBadBIP34Height
-		}
-		pushLen = int(scriptSig[1])
-		if len(scriptSig) < 2+pushLen {
-			return ErrBadBIP34Height
-		}
-		data := scriptSig[2 : 2+pushLen]
-		pushedHeight = decodeScriptNum(data)
-	} else if firstByte >= script.OP_1 && firstByte <= script.OP_16 {
-		// OP_1 through OP_16 = heights 1-16
-		pushedHeight = int64(firstByte - script.OP_1 + 1)
-		pushLen = 1
-	} else {
-		return ErrBadBIP34Height
-	}
-
-	if pushedHeight != int64(expectedHeight) {
-		return fmt.Errorf("%w: expected %d, got %d", ErrBadBIP34Height, expectedHeight, pushedHeight)
-	}
-
 	return nil
+}
+
+// encodeBIP34Height returns the canonical BIP-34 byte encoding of height,
+// matching Bitcoin Core's CScript() << nHeight (script.h:433-448).
+func encodeBIP34Height(height int32) []byte {
+	if height == 0 {
+		// OP_0 — single byte 0x00
+		return []byte{0x00}
+	}
+	if height >= 1 && height <= 16 {
+		// OP_1..OP_16 — single byte 0x51..0x60
+		return []byte{byte(0x50 + height)}
+	}
+	// CScriptNum: minimal sign-magnitude little-endian, prefixed by byte count.
+	h := uint32(height)
+	var le [4]byte
+	n := 0
+	for h > 0 {
+		le[n] = byte(h & 0xff)
+		h >>= 8
+		n++
+	}
+	// If the high bit of the last byte is set, append a zero sign byte.
+	if le[n-1]&0x80 != 0 {
+		le[n] = 0x00
+		n++
+	}
+	out := make([]byte, 1+n)
+	out[0] = byte(n)
+	copy(out[1:], le[:n])
+	return out
 }
 
 // decodeScriptNum decodes a minimally-encoded script number (little-endian with sign bit).
