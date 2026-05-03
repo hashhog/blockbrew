@@ -820,8 +820,8 @@ func TestGetBlockScriptFlags(t *testing.T) {
 			expectBIP65:         true,
 			expectCSV:           true,
 			expectSegwit:        true,
-			expectNullFail:      true, // BIP146 NULLFAIL activates with segwit
-			expectWitnessPubKey: true, // BIP141 WITNESS_PUBKEYTYPE activates with segwit
+			expectNullFail:      false, // NULLFAIL is policy-only (not consensus)
+			expectWitnessPubKey: false, // WITNESS_PUBKEYTYPE is policy-only (not consensus)
 		},
 		{
 			height:              params.SegwitHeight - 1,
@@ -830,8 +830,8 @@ func TestGetBlockScriptFlags(t *testing.T) {
 			expectBIP65:         true,
 			expectCSV:           true,
 			expectSegwit:        false,
-			expectNullFail:      false, // NULLFAIL not active before segwit
-			expectWitnessPubKey: false, // WITNESS_PUBKEYTYPE not active before segwit
+			expectNullFail:      false, // NULLFAIL not active (policy-only regardless)
+			expectWitnessPubKey: false, // WITNESS_PUBKEYTYPE not active (policy-only regardless)
 		},
 	}
 
