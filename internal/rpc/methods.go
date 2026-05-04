@@ -12,11 +12,14 @@ import (
 	"strconv"
 	"time"
 
+	"strings"
+
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
 	"github.com/hashhog/blockbrew/internal/mining"
 	"github.com/hashhog/blockbrew/internal/p2p"
+	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -1486,8 +1489,24 @@ func bip22ResultString(err error) string {
 		return "time-too-old"
 	case errors.Is(err, consensus.ErrTimestampTooFar):
 		return "time-too-new"
-	// Catch-all — covers connection errors, missing prev block, script fails, etc.
+	// Script / signature verification failures (connect-block stage).
+	// Core validation.cpp:2122: "block-script-verify-flag-failed (%s)".
+	// Covers ErrDisabledOpcode (OP_CAT + 14 peers), ErrScriptFailed,
+	// ErrScriptTooLong, ErrScriptNotClean, and any other script engine error
+	// that bubbles up as a wrapped "script failed" string.
+	case errors.Is(err, script.ErrDisabledOpcode),
+		errors.Is(err, script.ErrScriptFailed),
+		errors.Is(err, script.ErrScriptTooLong),
+		errors.Is(err, script.ErrScriptNotClean):
+		return "block-script-verify-flag-failed"
+	// Catch-all string match for errors wrapped with fmt.Errorf("tx %d script: ...").
+	// The errors.Is chain above covers sentinel errors; this catches the
+	// format-wrapped variants that lose the sentinel through multiple wraps.
 	default:
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "script") || strings.Contains(msg, "disabled opcode") {
+			return "block-script-verify-flag-failed"
+		}
 		return "rejected"
 	}
 }
