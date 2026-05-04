@@ -1452,6 +1452,9 @@ func bip22ResultString(err error) string {
 	case errors.Is(err, consensus.ErrBadWitnessCommitment),
 		errors.Is(err, consensus.ErrMissingWitnessCommitment):
 		return "bad-witness-merkle-match"
+	// Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
+	case errors.Is(err, consensus.ErrNegativeOutput):
+		return "bad-txns-vout-negative"
 	// Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..100 bytes)
 	case errors.Is(err, consensus.ErrCoinbaseScriptSize):
 		return "bad-cb-length"
