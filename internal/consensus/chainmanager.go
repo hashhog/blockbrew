@@ -668,8 +668,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	}
 	if coinbaseValue > subsidy+totalFees {
 		rollbackUTXOs()
-		return fmt.Errorf("coinbase value %d exceeds allowed %d (subsidy %d + fees %d)",
-			coinbaseValue, subsidy+totalFees, subsidy, totalFees)
+		return fmt.Errorf("%w: %d > %d (subsidy %d + fees %d)",
+			ErrBadCoinbaseValue, coinbaseValue, subsidy+totalFees, subsidy, totalFees)
 	}
 
 	// Update chain state
