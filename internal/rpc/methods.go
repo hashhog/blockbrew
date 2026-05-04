@@ -1480,8 +1480,11 @@ func bip22ResultString(err error) string {
 	// BIP-34 coinbase height encoding
 	case errors.Is(err, consensus.ErrBadBIP34Height):
 		return "bad-cb-height"
-	// Non-final transaction (IsFinalTx check)
-	case errors.Is(err, consensus.ErrNonFinalTx):
+	// Non-final transaction (IsFinalTx / nLockTime check) and BIP-68
+	// SequenceLocks failure (relative locktime not met).
+	// Core validation.cpp:2558 maps both to "bad-txns-nonfinal".
+	case errors.Is(err, consensus.ErrNonFinalTx),
+		errors.Is(err, consensus.ErrSequenceLockNotMet):
 		return "bad-txns-nonfinal"
 	// Time checks
 	case errors.Is(err, consensus.ErrTimestampBeforeMTP),
