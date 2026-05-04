@@ -459,33 +459,11 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	}
 
 	// BIP-30: Reject any block whose transactions would overwrite existing
-	// (unspent) UTXOs. Two historical mainnet blocks are exempted (91842 and
-	// 91880). After BIP-34 activation the unique-height-in-coinbase rule makes
-	// duplicate txids structurally impossible, so skip the check in the
-	// bip34_height..1_983_702 window. At or above 1_983_702 the BIP-34
-	// modular-arithmetic space wraps and we must re-enforce.
+	// (unspent) UTXOs.  Logic lives in CheckBIP30 (blockvalidation.go) so
+	// tests can exercise it without a full ChainManager.
 	// Mirrors Bitcoin Core validation.cpp ConnectBlock ~line 2467-2476.
-	{
-		const bip34ImpliesBIP30Limit int32 = 1_983_702
-		enforceBIP30 := node.Height != 91842 && node.Height != 91880
-		if enforceBIP30 && node.Height >= cm.params.BIP34Height {
-			enforceBIP30 = false
-		}
-		if !enforceBIP30 && node.Height >= bip34ImpliesBIP30Limit {
-			enforceBIP30 = true
-		}
-		if enforceBIP30 {
-			for _, tx := range block.Transactions {
-				txHash := tx.TxHash()
-				for i := range tx.TxOut {
-					outpoint := wire.OutPoint{Hash: txHash, Index: uint32(i)}
-					if cm.utxoSet.GetUTXO(outpoint) != nil {
-						return fmt.Errorf("%w: output %s:%d already exists in UTXO set",
-							ErrDuplicateTx, txHash.String()[:16], i)
-					}
-				}
-			}
-		}
+	if err := CheckBIP30(block, node.Height, cm.params, cm.utxoSet); err != nil {
+		return err
 	}
 
 	// Cache prevouts for script validation BEFORE spending them.

@@ -1667,6 +1667,9 @@ func TestCheckBlockSanityCVE20122459(t *testing.T) {
 // Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
 // The two mainnet blocks at h=91842 and h=91880 intentionally duplicate earlier
 // coinbase txids and must be exempted; all other heights must be enforced.
+//
+// This test calls CheckBIP30 directly — the same helper invoked by
+// ChainManager.ConnectBlock — so it exercises the live production code path.
 func TestBIP30ExceptionHeights(t *testing.T) {
 	// Use regtest params (maximal PoW limit) so any block hash passes PoW.
 	// Override activation heights so BIP-context checks don't interfere with
@@ -1697,82 +1700,45 @@ func TestBIP30ExceptionHeights(t *testing.T) {
 	}
 	coinbaseTxid := coinbaseTx.TxHash()
 
-	// Build a block containing just the coinbase.
-	// Use Bits = 0x207fffff so any hash satisfies regtest PoW.
-	// Compute the correct merkle root from the single coinbase txid.
-	merkleRoot := CalcMerkleRoot([]wire.Hash256{coinbaseTxid})
-	blockHeader := wire.BlockHeader{
-		Version:    1,
-		PrevBlock:  wire.Hash256{}, // genesis parent
-		MerkleRoot: merkleRoot,
-		Timestamp:  1231006506,
-		Bits:       0x207fffff,
-		Nonce:      0,
-	}
 	block := &wire.MsgBlock{
-		Header:       blockHeader,
+		Header: wire.BlockHeader{
+			Version:    1,
+			PrevBlock:  wire.Hash256{},
+			MerkleRoot: CalcMerkleRoot([]wire.Hash256{coinbaseTxid}),
+			Timestamp:  1231006506,
+			Bits:       0x207fffff,
+		},
 		Transactions: []*wire.MsgTx{coinbaseTx},
 	}
 
-	// prevHeader: minimal block header (genesis-like)
-	prevHeader := &wire.BlockHeader{
-		Version:   1,
-		Timestamp: 1231006505,
-		Bits:      0x207fffff,
-	}
-
-	// Pre-populate the UTXO view with the same coinbase txid at output index 0.
-	// This simulates the "existing UTXO" that BIP-30 would detect as a duplicate.
-	utxoView := NewInMemoryUTXOView()
-	utxoView.AddUTXO(
-		wire.OutPoint{Hash: coinbaseTxid, Index: 0},
-		&UTXOEntry{Amount: 100, PkScript: []byte{0x51}, Height: 1000, IsCoinbase: true},
-	)
-
-	opts := DefaultValidateBlockOptions()
-	opts.SkipScripts = true // skip script execution; we only care about BIP-30
-
-	// Test 1: height=91842 — EXEMPT. The duplicate coinbase UTXO exists but
-	// BIP-30 must NOT be enforced at this height, so validation must succeed
-	// (or fail for a reason other than ErrDuplicateTx).
-	err := ValidateBlockWithOptions(block, prevHeader, 91842, &params, utxoView, opts)
-	if errors.Is(err, ErrDuplicateTx) {
-		t.Errorf("height 91842: BIP-30 exception must NOT reject duplicate coinbase, got ErrDuplicateTx")
-	}
-
-	// Test 2: height=91843 — NOT exempt. Same duplicate UTXO → must reject with ErrDuplicateTx.
-	// Reset the view: ValidateBlock may have spent/added UTXOs; rebuild it.
-	utxoView2 := NewInMemoryUTXOView()
-	utxoView2.AddUTXO(
-		wire.OutPoint{Hash: coinbaseTxid, Index: 0},
-		&UTXOEntry{Amount: 100, PkScript: []byte{0x51}, Height: 1000, IsCoinbase: true},
-	)
-	err2 := ValidateBlockWithOptions(block, prevHeader, 91843, &params, utxoView2, opts)
-	if !errors.Is(err2, ErrDuplicateTx) {
-		t.Errorf("height 91843: BIP-30 must reject duplicate coinbase, got: %v", err2)
-	}
-
-	// Test 3: height=91880 — also exempt (second exception block). Must not reject.
-	utxoView3 := NewInMemoryUTXOView()
-	utxoView3.AddUTXO(
-		wire.OutPoint{Hash: coinbaseTxid, Index: 0},
-		&UTXOEntry{Amount: 100, PkScript: []byte{0x51}, Height: 1000, IsCoinbase: true},
-	)
-	err3 := ValidateBlockWithOptions(block, prevHeader, 91880, &params, utxoView3, opts)
-	if errors.Is(err3, ErrDuplicateTx) {
-		t.Errorf("height 91880: BIP-30 exception must NOT reject duplicate coinbase, got ErrDuplicateTx")
-	}
-
-	// Verify old wrong heights (91722 and 91812) are NOT exempt — they must be rejected.
-	for _, wrongHeight := range []int32{91722, 91812} {
-		utxoViewW := NewInMemoryUTXOView()
-		utxoViewW.AddUTXO(
+	newView := func() *InMemoryUTXOView {
+		v := NewInMemoryUTXOView()
+		v.AddUTXO(
 			wire.OutPoint{Hash: coinbaseTxid, Index: 0},
 			&UTXOEntry{Amount: 100, PkScript: []byte{0x51}, Height: 1000, IsCoinbase: true},
 		)
-		errW := ValidateBlockWithOptions(block, prevHeader, wrongHeight, &params, utxoViewW, opts)
-		if !errors.Is(errW, ErrDuplicateTx) {
-			t.Errorf("height %d: must NOT be BIP-30 exempt (wrong old height), got: %v", wrongHeight, errW)
+		return v
+	}
+
+	// Test 1: height=91842 — EXEMPT.
+	if err := CheckBIP30(block, 91842, &params, newView()); errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("height 91842: BIP-30 exception must NOT reject duplicate coinbase, got ErrDuplicateTx")
+	}
+
+	// Test 2: height=91843 — NOT exempt.
+	if err := CheckBIP30(block, 91843, &params, newView()); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("height 91843: BIP-30 must reject duplicate coinbase, got: %v", err)
+	}
+
+	// Test 3: height=91880 — EXEMPT.
+	if err := CheckBIP30(block, 91880, &params, newView()); errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("height 91880: BIP-30 exception must NOT reject duplicate coinbase, got ErrDuplicateTx")
+	}
+
+	// Verify old wrong heights (91722 and 91812) are NOT exempt.
+	for _, wrongHeight := range []int32{91722, 91812} {
+		if err := CheckBIP30(block, wrongHeight, &params, newView()); !errors.Is(err, ErrDuplicateTx) {
+			t.Errorf("height %d: must NOT be BIP-30 exempt (wrong old height), got: %v", wrongHeight, err)
 		}
 	}
 }
