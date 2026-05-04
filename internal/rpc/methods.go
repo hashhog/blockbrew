@@ -1455,6 +1455,9 @@ func bip22ResultString(err error) string {
 	// Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
 	case errors.Is(err, consensus.ErrNegativeOutput):
 		return "bad-txns-vout-negative"
+	// Output value > MAX_MONEY (consensus/tx_check.cpp::CheckTransaction — Core parity)
+	case errors.Is(err, consensus.ErrOutputTooLarge):
+		return "bad-txns-vout-toolarge"
 	// Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..100 bytes)
 	case errors.Is(err, consensus.ErrCoinbaseScriptSize):
 		return "bad-cb-length"
