@@ -324,163 +324,42 @@ func decodeScriptNum(data []byte) int64 {
 	return result
 }
 
-// ValidateBlockOptions configures block validation behavior.
-type ValidateBlockOptions struct {
-	// SkipScripts skips script validation (used for assume-valid during IBD)
-	SkipScripts bool
-	// ParallelScripts enables parallel script validation
-	ParallelScripts bool
-}
-
-// DefaultValidateBlockOptions returns the default validation options.
-func DefaultValidateBlockOptions() ValidateBlockOptions {
-	return ValidateBlockOptions{
-		SkipScripts:     false,
-		ParallelScripts: true, // Enable parallel validation by default
-	}
-}
-
-// ValidateBlock performs full validation of a block including all transactions.
-// This function handles intra-block UTXO spending by updating the UTXO view
-// as it processes each transaction.
+// CheckBIP30 reports whether a block at the given height must enforce the
+// BIP-30 duplicate-UTXO rule and, if so, whether any of its transactions
+// would overwrite an existing UTXO entry in utxoView.
 //
-// DEAD CODE WARNING (wave-30 audit 2026-05-04): ValidateBlock and
-// ValidateBlockWithOptions have zero non-test callers in internal/. The live
-// block-acceptance path is ChainManager.ConnectBlock (chainmanager.go). Any
-// consensus fix that lands here has NO effect on production behaviour. If you
-// are fixing a consensus bug, make the change in ChainManager.ConnectBlock.
-// These functions are preserved only for their test coverage; a future cleanup
-// wave should either delete them or wire them into ConnectBlock.
-func ValidateBlock(block *wire.MsgBlock, prevHeader *wire.BlockHeader, height int32, params *ChainParams, utxoView UpdatableUTXOView) error {
-	return ValidateBlockWithOptions(block, prevHeader, height, params, utxoView, DefaultValidateBlockOptions())
-}
-
-// ValidateBlockWithOptions performs full validation with configurable options.
-// Use this for IBD with assume-valid optimization or for performance tuning.
+// BIP-30 is the live path for duplicate-UTXO detection; see
+// ChainManager.ConnectBlock in chainmanager.go for production usage.
+// This helper exists so the rule can also be unit-tested without a full
+// ChainManager.
 //
-// DEAD CODE WARNING: see ValidateBlock comment above.
-func ValidateBlockWithOptions(block *wire.MsgBlock, prevHeader *wire.BlockHeader, height int32, params *ChainParams, utxoView UpdatableUTXOView, opts ValidateBlockOptions) error {
-	// Perform sanity checks
-	if err := CheckBlockSanity(block, params.PowLimit); err != nil {
-		return err
-	}
-
-	// Perform context-dependent checks
-	if err := CheckBlockContext(block, prevHeader, height, params); err != nil {
-		return err
-	}
-
-	// BIP30: Check for duplicate transaction outputs in the UTXO set.
-	// Two historical mainnet blocks (91842 and 91880) intentionally have duplicate
-	// coinbase txids and are exempted from this check — they predate BIP-30.
-	// After BIP34 activation (h≥227931), the height-in-coinbase rule makes
-	// duplicate txids practically impossible. However, at h≥1,983,702 the check
-	// must resume because BIP34 modular arithmetic begins to repeat pre-BIP34
-	// coinbase heights, potentially re-enabling collisions.
-	// Reference: Bitcoin Core validation.cpp ConnectBlock (around line 2467-2476)
-	// and IsBIP30Repeat() logic.
+// Exemptions (mirrors Bitcoin Core ConnectBlock / IsBIP30Repeat()):
+//   - Heights 91842 and 91880: historical mainnet blocks that pre-date BIP-30.
+//   - BIP34 active window (BIP34Height … 1,983,701): unique-height coinbase
+//     makes duplicate txids structurally impossible.
+//   - At h ≥ 1,983,702 BIP34 modular arithmetic wraps; re-enforce.
+func CheckBIP30(block *wire.MsgBlock, height int32, params *ChainParams, utxoView UTXOView) error {
 	const bip34ImpliesBIP30Limit int32 = 1_983_702
-	enforceBIP30 := height != 91842 && height != 91880
-	// Skip BIP30 after BIP34 activation (unique coinbase guarantees unique txids)
-	if enforceBIP30 && height >= params.BIP34Height {
-		enforceBIP30 = false
+	enforce := height != 91842 && height != 91880
+	if enforce && height >= params.BIP34Height {
+		enforce = false
 	}
-	// Re-enable BIP30 at or above the BIP34-implies-BIP30 limit
-	if !enforceBIP30 && height >= bip34ImpliesBIP30Limit {
-		enforceBIP30 = true
+	if !enforce && height >= bip34ImpliesBIP30Limit {
+		enforce = true
 	}
-	if enforceBIP30 {
-		for _, tx := range block.Transactions {
-			txHash := tx.TxHash()
-			for i := range tx.TxOut {
-				outpoint := wire.OutPoint{Hash: txHash, Index: uint32(i)}
-				if utxoView.GetUTXO(outpoint) != nil {
-					return fmt.Errorf("%w: output %s:%d already exists",
-						ErrDuplicateTx, txHash.String()[:16], i)
-				}
+	if !enforce {
+		return nil
+	}
+	for _, tx := range block.Transactions {
+		txHash := tx.TxHash()
+		for i := range tx.TxOut {
+			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(i)}
+			if utxoView.GetUTXO(outpoint) != nil {
+				return fmt.Errorf("%w: output %s:%d already exists",
+					ErrDuplicateTx, txHash.String()[:16], i)
 			}
 		}
 	}
-
-	// Get script flags for this block (hash checked against exception map)
-	blockHash := block.Header.BlockHash()
-	scriptFlags := GetBlockScriptFlags(height, params, blockHash)
-
-	// Calculate expected subsidy
-	subsidy := CalcBlockSubsidy(height)
-
-	// Track total fees
-	var totalFees int64
-
-	// First pass: validate transaction structure and inputs (not scripts)
-	for i, tx := range block.Transactions {
-		// Check transaction sanity (already done in CheckBlockSanity, but we do it again
-		// to ensure consistency)
-		if err := CheckTransactionSanity(tx); err != nil {
-			return fmt.Errorf("tx %d: %w", i, err)
-		}
-
-		if i == 0 {
-			// Coinbase transaction - add outputs to UTXO view
-			utxoView.AddTxOutputs(tx, height)
-			continue
-		}
-
-		// Check transaction inputs (this includes coinbase maturity checks)
-		fee, err := CheckTransactionInputs(tx, height, utxoView)
-		if err != nil {
-			return fmt.Errorf("tx %d: %w", i, err)
-		}
-		totalFees += fee
-		if totalFees > MaxMoney {
-			return fmt.Errorf("accumulated fee in the block out of range: %d > %d", totalFees, MaxMoney)
-		}
-
-		// Update UTXO view: spend inputs and add outputs
-		// IMPORTANT: This handles intra-block spending - txs can spend outputs
-		// from earlier txs in the same block
-		utxoView.SpendTxInputs(tx)
-		utxoView.AddTxOutputs(tx, height)
-	}
-
-	// Second pass: validate scripts (can be parallelized)
-	// Skip script validation if assume-valid optimization is active
-	if !opts.SkipScripts {
-		if opts.ParallelScripts {
-			// Use parallel validation for better performance
-			if err := ParallelScriptValidation(block, utxoView, scriptFlags); err != nil {
-				return err
-			}
-		} else {
-			// Sequential validation
-			for i, tx := range block.Transactions {
-				if i == 0 {
-					continue // Skip coinbase
-				}
-				if err := ValidateTransactionScripts(tx, utxoView, scriptFlags); err != nil {
-					return fmt.Errorf("tx %d script: %w", i, err)
-				}
-			}
-		}
-	}
-
-	// Verify coinbase value doesn't exceed subsidy + fees
-	coinbase := block.Transactions[0]
-	var coinbaseValue int64
-	for _, out := range coinbase.TxOut {
-		coinbaseValue += out.Value
-	}
-	if coinbaseValue > subsidy+totalFees {
-		return fmt.Errorf("%w: %d > %d (subsidy) + %d (fees)",
-			ErrBadCoinbaseValue, coinbaseValue, subsidy, totalFees)
-	}
-
-	// Check sigops cost
-	sigOpsCost := CountBlockSigOpsCost(block, utxoView)
-	if sigOpsCost > MaxBlockSigOpsCost {
-		return fmt.Errorf("%w: %d > %d", ErrSigOpsCostTooHigh, sigOpsCost, MaxBlockSigOpsCost)
-	}
-
 	return nil
 }
 
@@ -519,20 +398,6 @@ func CheckBlockTimestamp(blockTimestamp uint32, medianTimePast uint32) error {
 	return nil
 }
 
-// ContextualCheckBlock performs all contextual block checks including MTP validation.
-// This is a convenience function that combines CheckBlockContext with MTP check.
-func ContextualCheckBlock(block *wire.MsgBlock, prevHeader *wire.BlockHeader, height int32, params *ChainParams, prevTimestamps []uint32) error {
-	// Check MTP
-	if len(prevTimestamps) > 0 {
-		mtp := CalcMedianTimePast(prevTimestamps)
-		if err := CheckBlockTimestamp(block.Header.Timestamp, mtp); err != nil {
-			return err
-		}
-	}
-
-	// Perform other context checks
-	return CheckBlockContext(block, prevHeader, height, params)
-}
 
 // AddTxOutputs adds all outputs from a transaction to the UTXO view.
 // This is implemented on InMemoryUTXOView, defined here as a method on the interface
@@ -674,24 +539,6 @@ func ParallelScriptValidation(block *wire.MsgBlock, utxoView UTXOView, flags scr
 	return nil
 }
 
-// ValidateBlockScripts validates all scripts in a block, optionally in parallel.
-// If parallel is true, uses ParallelScriptValidation for better performance.
-func ValidateBlockScripts(block *wire.MsgBlock, utxoView UTXOView, flags script.ScriptFlags, parallel bool) error {
-	if parallel {
-		return ParallelScriptValidation(block, utxoView, flags)
-	}
-
-	// Sequential validation
-	for txIdx, tx := range block.Transactions {
-		if txIdx == 0 {
-			continue // Skip coinbase
-		}
-		if err := ValidateTransactionScripts(tx, utxoView, flags); err != nil {
-			return fmt.Errorf("tx %d: %w", txIdx, err)
-		}
-	}
-	return nil
-}
 
 // ParallelScriptValidationCached validates scripts with signature cache support.
 // Cached entries are looked up before expensive script verification, and successful
