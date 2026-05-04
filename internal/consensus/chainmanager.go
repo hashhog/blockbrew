@@ -458,6 +458,36 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		return nil
 	}
 
+	// BIP-30: Reject any block whose transactions would overwrite existing
+	// (unspent) UTXOs. Two historical mainnet blocks are exempted (91842 and
+	// 91880). After BIP-34 activation the unique-height-in-coinbase rule makes
+	// duplicate txids structurally impossible, so skip the check in the
+	// bip34_height..1_983_702 window. At or above 1_983_702 the BIP-34
+	// modular-arithmetic space wraps and we must re-enforce.
+	// Mirrors Bitcoin Core validation.cpp ConnectBlock ~line 2467-2476.
+	{
+		const bip34ImpliesBIP30Limit int32 = 1_983_702
+		enforceBIP30 := node.Height != 91842 && node.Height != 91880
+		if enforceBIP30 && node.Height >= cm.params.BIP34Height {
+			enforceBIP30 = false
+		}
+		if !enforceBIP30 && node.Height >= bip34ImpliesBIP30Limit {
+			enforceBIP30 = true
+		}
+		if enforceBIP30 {
+			for _, tx := range block.Transactions {
+				txHash := tx.TxHash()
+				for i := range tx.TxOut {
+					outpoint := wire.OutPoint{Hash: txHash, Index: uint32(i)}
+					if cm.utxoSet.GetUTXO(outpoint) != nil {
+						return fmt.Errorf("%w: output %s:%d already exists in UTXO set",
+							ErrDuplicateTx, txHash.String()[:16], i)
+					}
+				}
+			}
+		}
+	}
+
 	// Cache prevouts for script validation BEFORE spending them.
 	// The first pass spends UTXOs, so the second pass (script validation)
 	// needs a cached view of the original UTXOs.
@@ -465,6 +495,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		cache:    make(map[wire.OutPoint]*UTXOEntry),
 		fallback: cm.utxoSet,
 	}
+
+	// Accumulate block-wide sigop cost (BIP-141 §Block size limit).
+	// Counted per-tx inside the first-pass loop while prevouts are still
+	// available in cachedView (before SpendTxInputs evicts them).
+	// Reject with bad-blk-sigops if total exceeds MaxBlockSigOpsCost (80,000).
+	// Mirrors Bitcoin Core validation.cpp ConnectBlock nSigOpsCost logic (~line 2568).
+	var nSigOpsCost int
 
 	// Track UTXO modifications so we can roll back if validation fails.
 	// Each entry records a tx index and the outputs it added / inputs it spent.
@@ -521,6 +558,14 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				addedOuts = append(addedOuts, wire.OutPoint{Hash: txHash, Index: uint32(idx)})
 			}
 			utxoMods = append(utxoMods, utxoModification{txIdx: i, addedOuts: addedOuts})
+			// Count coinbase sigops (legacy only; CountP2SHSigOps + CountWitnessSigOps
+			// both short-circuit to 0 for coinbase txs).
+			for _, txIn := range tx.TxIn {
+				nSigOpsCost += CountSigOps(txIn.SignatureScript) * WitnessScaleFactor
+			}
+			for _, txOut := range tx.TxOut {
+				nSigOpsCost += CountSigOps(txOut.PkScript) * WitnessScaleFactor
+			}
 			continue
 		}
 
@@ -579,6 +624,23 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				rollbackUTXOs()
 				return fmt.Errorf("tx %d: %w", i, ErrSequenceLockNotMet)
 			}
+		}
+
+		// Block-wide sigop COST cap (BIP-141 §Block size limit, MAX_BLOCK_SIGOPS_COST=80000).
+		// Count BEFORE spending inputs so cachedView still holds the prevout data
+		// needed by CountP2SHSigOps and CountWitnessSigOps.
+		// Mirrors Core's per-tx nSigOpsCost accumulation (validation.cpp ~line 2568).
+		for _, txIn := range tx.TxIn {
+			nSigOpsCost += CountSigOps(txIn.SignatureScript) * WitnessScaleFactor
+		}
+		for _, txOut := range tx.TxOut {
+			nSigOpsCost += CountSigOps(txOut.PkScript) * WitnessScaleFactor
+		}
+		nSigOpsCost += CountP2SHSigOps(tx, cachedView)
+		nSigOpsCost += CountWitnessSigOps(tx, cachedView)
+		if nSigOpsCost > MaxBlockSigOpsCost {
+			rollbackUTXOs()
+			return fmt.Errorf("%w: %d > %d", ErrSigOpsCostTooHigh, nSigOpsCost, MaxBlockSigOpsCost)
 		}
 
 		// Always record spent UTXOs for in-memory rollback. Without this,
