@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -1655,6 +1656,10 @@ func TestBIP22ResultString(t *testing.T) {
 		{consensus.ErrDuplicateCoinbase, "bad-txns-duplicate"},
 		// BIP-34 height
 		{consensus.ErrBadBIP34Height, "bad-cb-height"},
+		// Non-final transaction (IsFinalTx)
+		{consensus.ErrNonFinalTx, "bad-txns-nonfinal"},
+		// Wrapped non-final (as produced by CheckBlockContext → ConnectBlock)
+		{fmt.Errorf("block context check failed: %w", fmt.Errorf("tx 1: %w", consensus.ErrNonFinalTx)), "bad-txns-nonfinal"},
 		// Timestamp
 		{consensus.ErrTimestampBeforeMTP, "time-too-old"},
 		{consensus.ErrTimestampTooEarly, "time-too-old"},
