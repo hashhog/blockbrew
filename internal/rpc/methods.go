@@ -1452,6 +1452,9 @@ func bip22ResultString(err error) string {
 	case errors.Is(err, consensus.ErrBadWitnessCommitment),
 		errors.Is(err, consensus.ErrMissingWitnessCommitment):
 		return "bad-witness-merkle-match"
+	// Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..100 bytes)
+	case errors.Is(err, consensus.ErrCoinbaseScriptSize):
+		return "bad-cb-length"
 	// Coinbase value / subsidy
 	case errors.Is(err, consensus.ErrBadCoinbaseValue):
 		return "bad-cb-amount"
