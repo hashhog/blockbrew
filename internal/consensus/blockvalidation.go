@@ -343,12 +343,22 @@ func DefaultValidateBlockOptions() ValidateBlockOptions {
 // ValidateBlock performs full validation of a block including all transactions.
 // This function handles intra-block UTXO spending by updating the UTXO view
 // as it processes each transaction.
+//
+// DEAD CODE WARNING (wave-30 audit 2026-05-04): ValidateBlock and
+// ValidateBlockWithOptions have zero non-test callers in internal/. The live
+// block-acceptance path is ChainManager.ConnectBlock (chainmanager.go). Any
+// consensus fix that lands here has NO effect on production behaviour. If you
+// are fixing a consensus bug, make the change in ChainManager.ConnectBlock.
+// These functions are preserved only for their test coverage; a future cleanup
+// wave should either delete them or wire them into ConnectBlock.
 func ValidateBlock(block *wire.MsgBlock, prevHeader *wire.BlockHeader, height int32, params *ChainParams, utxoView UpdatableUTXOView) error {
 	return ValidateBlockWithOptions(block, prevHeader, height, params, utxoView, DefaultValidateBlockOptions())
 }
 
 // ValidateBlockWithOptions performs full validation with configurable options.
 // Use this for IBD with assume-valid optimization or for performance tuning.
+//
+// DEAD CODE WARNING: see ValidateBlock comment above.
 func ValidateBlockWithOptions(block *wire.MsgBlock, prevHeader *wire.BlockHeader, height int32, params *ChainParams, utxoView UpdatableUTXOView, opts ValidateBlockOptions) error {
 	// Perform sanity checks
 	if err := CheckBlockSanity(block, params.PowLimit); err != nil {
