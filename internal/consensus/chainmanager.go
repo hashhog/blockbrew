@@ -609,8 +609,19 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			blockUndo.TxUndos = append(blockUndo.TxUndos, txUndo)
 		}
 
-		// Update UTXO view: spend inputs and add outputs
+		// Update UTXO view: spend inputs and add outputs.
+		// CVE-2012-2459 / dup-txid fix: after spending inputs, evict them from
+		// cachedView.cache so a later duplicate tx cannot find a stale "unspent"
+		// entry there.  Without this, a block containing [coinbase, tx, tx] (same
+		// non-coinbase tx twice) would be incorrectly accepted: the second copy's
+		// inputs were still in cachedView.cache from the first copy's fetch loop,
+		// so CheckTransactionInputs found them even though cm.utxoSet had already
+		// marked them spent.  Core rejects via bad-txns-inputs-missingorspent in
+		// ConnectBlock (validation.cpp) when the second tx finds its prevout absent.
 		cm.utxoSet.SpendTxInputs(tx)
+		for _, in := range tx.TxIn {
+			delete(cachedView.cache, in.PreviousOutPoint)
+		}
 		cm.utxoSet.AddTxOutputs(tx, node.Height)
 
 		// Track modifications for rollback
