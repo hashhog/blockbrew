@@ -1461,6 +1461,9 @@ func bip22ResultString(err error) string {
 	// Sigops budget
 	case errors.Is(err, consensus.ErrSigOpsCostTooHigh):
 		return "bad-blk-sigops"
+	// Missing or already-spent prevout (ConnectBlock input check, CVE-2012-2459 path)
+	case errors.Is(err, consensus.ErrMissingInput):
+		return "bad-txns-inputs-missingorspent"
 	// Duplicate tx within block (BIP-30)
 	case errors.Is(err, consensus.ErrDuplicateTx),
 		errors.Is(err, consensus.ErrDuplicateCoinbase):
