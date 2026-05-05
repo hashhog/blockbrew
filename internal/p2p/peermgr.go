@@ -126,6 +126,15 @@ type PeerManagerConfig struct {
 	// Wired from the top-level `-peerbloomfilters` flag.  Default false
 	// in this struct's zero value; main.go always sets it explicitly.
 	AdvertiseNodeBloom bool
+
+	// AdvertiseNodeNetworkLimited controls whether NODE_NETWORK_LIMITED
+	// (BIP-159, 1<<10) is OR'd into our advertised service bits in the
+	// version handshake.  Set when prune mode is enabled (-prune > 0).
+	// Mirrors Core's init.cpp: `nLocalServices |= NODE_NETWORK_LIMITED`
+	// when `IsPruneMode()` is true.  Peers seeing this bit know we serve
+	// only the most recent NODE_NETWORK_LIMITED_MIN_BLOCKS (288) blocks
+	// and must not request older blocks via getdata.
+	AdvertiseNodeNetworkLimited bool
 }
 
 // BanInfo contains information about a banned peer.
@@ -1255,6 +1264,13 @@ func (pm *PeerManager) makePeerConfig() PeerConfig {
 	services := uint64(ServiceNodeNetwork | ServiceNodeWitness)
 	if pm.config.AdvertiseNodeBloom {
 		services |= ServiceNodeBloom
+	}
+	// BIP-159: signal limited-archive serving when prune mode is enabled.
+	// Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in the
+	// auto-prune case (the node still has the recent-288 archive), so we
+	// keep NODE_NETWORK set as well.
+	if pm.config.AdvertiseNodeNetworkLimited {
+		services |= ServiceNodeNetworkLimited
 	}
 
 	return PeerConfig{
