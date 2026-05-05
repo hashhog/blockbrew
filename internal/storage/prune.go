@@ -56,11 +56,28 @@ type PruneConfig struct {
 	// a buffer, the oldest pruneable files are unlinked. 0 = pruning
 	// disabled (archive mode, the default).
 	TargetBytes uint64
+
+	// Manual marks the impl as being in `-prune=1` manual-only mode.
+	// When true, the node is in prune mode (NODE_NETWORK_LIMITED is
+	// advertised, getblockchaininfo.pruned is true) but the automatic
+	// per-block prune trigger short-circuits — only the
+	// pruneblockchain RPC may delete data. Mirrors Bitcoin Core's
+	// PRUNE_TARGET_MANUAL sentinel (init.cpp / blockmanager_args.cpp,
+	// node/blockstorage.h:408).
+	Manual bool
 }
 
-// IsEnabled reports whether auto-pruning is configured.
+// IsEnabled reports whether the node is in prune mode at all (either
+// automatic with TargetBytes > 0, or manual). Used by NODE_NETWORK_LIMITED
+// advertisement and getblockchaininfo.pruned.
 func (c PruneConfig) IsEnabled() bool {
-	return c.TargetBytes > 0
+	return c.TargetBytes > 0 || c.Manual
+}
+
+// IsAutomatic reports whether the auto-prune loop should run. Manual
+// mode disables auto-prune entirely (Core parity: -prune=1).
+func (c PruneConfig) IsAutomatic() bool {
+	return c.TargetBytes > 0 && !c.Manual
 }
 
 // Pruner coordinates auto-prune passes for a BlockStore. It is safe to
@@ -225,6 +242,17 @@ func (bs *BlockStore) UnlinkPrunedFile(fileNum int32) (uint64, error) {
 func (p *Pruner) MaybePrune(tipHeight int32) (PruneStats, error) {
 	var stats PruneStats
 	if !p.IsEnabled() || p.chainDB == nil {
+		return stats, nil
+	}
+	// `-prune=1` (manual mode): do not run the automatic prune pass.
+	// Core parity (node/blockstorage.cpp:336-342 / blockmanager_args.cpp:27):
+	// in manual mode prune_target is the unreachable PRUNE_TARGET_MANUAL
+	// sentinel, so FindFilesToPrune's usage check never trips. Only the
+	// pruneblockchain RPC may delete data in this mode.
+	if p.cfg.Manual {
+		stats.PruneHeight = p.pruneHeight.Load()
+		stats.LastSafeHeight = lastSafeHeight(tipHeight)
+		stats.CurrentUsage = p.bs.CalculateCurrentUsage()
 		return stats, nil
 	}
 	p.mu.Lock()

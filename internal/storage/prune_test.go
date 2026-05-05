@@ -22,6 +22,7 @@ func TestPruneConfigEnabled(t *testing.T) {
 		{"zero disables (archive)", PruneConfig{TargetBytes: 0}, false},
 		{"non-zero enables", PruneConfig{TargetBytes: 1024}, true},
 		{"min target enables", PruneConfig{TargetBytes: MinPruneTargetBytes}, true},
+		{"manual mode enables", PruneConfig{Manual: true}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -29,6 +30,64 @@ func TestPruneConfigEnabled(t *testing.T) {
 				t.Errorf("IsEnabled = %v, want %v", tt.cfg.IsEnabled(), tt.want)
 			}
 		})
+	}
+}
+
+// TestPruneConfigAutomatic covers the auto-vs-manual split. Mirrors
+// Bitcoin Core's `automatic_pruning` field on getblockchaininfo
+// (rpc/blockchain.cpp:1452): true when the auto-prune trigger is live,
+// false when the operator is in `-prune=1` manual-only mode.
+func TestPruneConfigAutomatic(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  PruneConfig
+		want bool
+	}{
+		{"archive (off) is not automatic", PruneConfig{}, false},
+		{"manual mode is not automatic", PruneConfig{Manual: true}, false},
+		{"non-zero target is automatic", PruneConfig{TargetBytes: MinPruneTargetBytes}, true},
+		{"manual + target → manual wins", PruneConfig{TargetBytes: 1024, Manual: true}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.IsAutomatic(); got != tt.want {
+				t.Errorf("IsAutomatic = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestPrunerManualModeNoAutoPrune: a pruner in `-prune=1` manual mode
+// reports IsEnabled() = true (NODE_NETWORK_LIMITED, getblockchaininfo.pruned
+// both want this) but MaybePrune returns immediately without doing work.
+// Mirrors Core's PRUNE_TARGET_MANUAL sentinel (init.cpp:524, blockmanager_args.cpp:27).
+func TestPrunerManualModeNoAutoPrune(t *testing.T) {
+	tmpDir := t.TempDir()
+	db := NewMemDB()
+	defer db.Close()
+	bs, err := NewBlockStore(tmpDir, testMagic, db)
+	if err != nil {
+		t.Fatalf("NewBlockStore: %v", err)
+	}
+	defer bs.Close()
+	chainDB := NewChainDB(db)
+
+	p := NewPruner(PruneConfig{Manual: true}, bs, chainDB)
+	if !p.IsEnabled() {
+		t.Fatal("manual-mode pruner reported IsEnabled=false")
+	}
+	if p.cfg.IsAutomatic() {
+		t.Fatal("manual-mode pruner reported IsAutomatic=true")
+	}
+	if tb := p.TargetBytes(); tb != 0 {
+		t.Errorf("manual-mode TargetBytes = %d, want 0 (Core PRUNE_TARGET_MANUAL maps to no auto target)", tb)
+	}
+	stats, err := p.MaybePrune(1_000_000)
+	if err != nil {
+		t.Fatalf("MaybePrune on manual: %v", err)
+	}
+	if stats.FilesPruned != 0 || stats.BytesPruned != 0 {
+		t.Errorf("manual-mode pruner did automatic work: %+v", stats)
 	}
 }
 
