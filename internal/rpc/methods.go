@@ -1492,6 +1492,10 @@ func bip22ResultString(err error) string {
 		return "time-too-old"
 	case errors.Is(err, consensus.ErrTimestampTooFar):
 		return "time-too-new"
+	// Coinbase maturity violation (consensus/tx_verify.cpp::CheckTxInputs).
+	// Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase")
+	case errors.Is(err, consensus.ErrImmatureCoinbase):
+		return "bad-txns-premature-spend-of-coinbase"
 	// Script / signature verification failures (connect-block stage).
 	// Core validation.cpp:2122: "block-script-verify-flag-failed (%s)".
 	// Covers ErrDisabledOpcode (OP_CAT + 14 peers), ErrScriptFailed,
