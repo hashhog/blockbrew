@@ -462,17 +462,19 @@ func parseFlags() *Config {
 		}
 	}
 
-	// Validate -prune. Bitcoin Core treats `-prune=1` as "manual via RPC
-	// only" — we don't implement the manual-RPC path yet, so reject it
-	// alongside any other sub-MIN_DISK_SPACE value rather than silently
-	// promoting to 550. 0 is the archive default.
+	// Validate -prune (Bitcoin Core init.cpp:524 / blockmanager_args.cpp:22):
+	//   0      → off (archive, default)
+	//   1      → manual mode: in prune mode but auto-prune does not fire;
+	//            only the pruneblockchain RPC triggers a sweep.
+	//   2..549 → rejected (below MIN_DISK_SPACE_FOR_BLOCK_FILES = 550 MiB)
+	//   ≥550   → automatic prune target in MiB
 	if cfg.Prune < 0 {
 		fmt.Fprintln(os.Stderr, "Error: -prune must be >= 0")
 		os.Exit(1)
 	}
-	if cfg.Prune > 0 && cfg.Prune < int64(storage.MinPruneTargetMiB) {
+	if cfg.Prune > 1 && cfg.Prune < int64(storage.MinPruneTargetMiB) {
 		fmt.Fprintf(os.Stderr,
-			"Error: -prune target %d MiB is below the %d MiB floor (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES). Pass 0 to disable pruning, or >= %d to enable.\n",
+			"Error: -prune target %d MiB is below the %d MiB floor (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES). Pass 0 to disable pruning, 1 for manual mode, or >= %d for automatic.\n",
 			cfg.Prune, storage.MinPruneTargetMiB, storage.MinPruneTargetMiB)
 		os.Exit(1)
 	}
@@ -656,16 +658,23 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// MaybePrune is invoked from the per-block OnBlockConnected hook so
 	// pruning happens at most once per connected block (cheap when
 	// usage is below target, since CalculateCurrentUsage is O(numFiles)).
-	pruneCfg := storage.PruneConfig{
-		TargetBytes: uint64(cfg.Prune) * 1024 * 1024,
+	pruneCfg := storage.PruneConfig{}
+	if cfg.Prune == 1 {
+		pruneCfg.Manual = true
+	} else if cfg.Prune > 1 {
+		pruneCfg.TargetBytes = uint64(cfg.Prune) * 1024 * 1024
 	}
 	pruner := storage.NewPruner(pruneCfg, blockStore, chainDB)
 	if pruner.IsEnabled() {
-		log.Printf("Pruning enabled: target=%d MiB (~%.1f GiB); MIN_BLOCKS_TO_KEEP=%d",
-			cfg.Prune,
-			float64(cfg.Prune)/1024.0,
-			storage.MinBlocksToKeep,
-		)
+		if pruneCfg.Manual {
+			log.Printf("Pruning enabled: manual mode (-prune=1); auto-prune off, pruneblockchain RPC required")
+		} else {
+			log.Printf("Pruning enabled: target=%d MiB (~%.1f GiB); MIN_BLOCKS_TO_KEEP=%d",
+				cfg.Prune,
+				float64(cfg.Prune)/1024.0,
+				storage.MinBlocksToKeep,
+			)
+		}
 	}
 
 	// 2. Initialize the header index
