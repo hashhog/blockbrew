@@ -644,6 +644,18 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	case "getchainstates":
 		return s.handleGetChainStates()
 
+	// Wave-47b P2 RPCs
+	case "gettxoutsetinfo":
+		return s.handleGetTxOutSetInfo(params)
+	case "getnetworkhashps":
+		return s.handleGetNetworkHashPS(params)
+	case "gettxoutproof":
+		return s.handleGetTxOutProof(params)
+	case "verifytxoutproof":
+		return s.handleVerifyTxOutProof(params)
+	case "getrpcinfo":
+		return s.handleGetRPCInfo(params)
+
 	default:
 		return nil, &RPCError{Code: RPCErrMethodNotFound, Message: fmt.Sprintf("Method not found: %s", method)}
 	}
