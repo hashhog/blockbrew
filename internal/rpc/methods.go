@@ -1496,6 +1496,11 @@ func bip22ResultString(err error) string {
 	// Core: state.Invalid(TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase")
 	case errors.Is(err, consensus.ErrImmatureCoinbase):
 		return "bad-txns-premature-spend-of-coinbase"
+	// Non-coinbase tx where sum(inputs) < sum(outputs).
+	// Core consensus/tx_verify.cpp::CheckTxInputs:
+	//   state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-in-belowout", ...)
+	case errors.Is(err, consensus.ErrInsufficientFunds):
+		return "bad-txns-in-belowout"
 	// Script / signature verification failures (connect-block stage).
 	// Core validation.cpp:2122: "block-script-verify-flag-failed (%s)".
 	// Covers ErrDisabledOpcode (OP_CAT + 14 peers), ErrScriptFailed,
