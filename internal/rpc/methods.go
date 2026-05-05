@@ -2517,155 +2517,61 @@ func (s *Server) writeUtxoSnapshotFile(
 	}, nil
 }
 
+// handleLoadTxOutSet refuses the loadtxoutset RPC and directs the operator
+// at the CLI flag instead.
+//
+// Background (cross-impl audit 2026-05-05,
+// CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md): the
+// previous implementation called consensus.LoadSnapshot + utxoSet.Flush
+// and reported the resulting stats as success, but it did NOT call:
+//
+//   - chainDB.SetChainState({BestHash, BestHeight, ...})
+//   - chainDB.SetBlockHeight(stats.Height, stats.BlockHash)
+//
+// Both of those are made by the CLI path
+// (cmd/blockbrew/main.go::loadSnapshotFromFile, lines 1567-1654) AFTER
+// LoadSnapshot returns. Without them the snapshot UTXOs live in chainDB
+// while the persisted chain-tip pointer still points at genesis, so
+// subsequent IBD silently re-downloads the entire chain from genesis
+// and overwrites the snapshot UTXOs. Restart does not self-heal — the
+// persisted tip pointer is wrong.
+//
+// Wiring the missing SetChainState/SetBlockHeight calls in-handler is
+// also not enough: the running daemon's header sync / block downloader /
+// chain manager were initialised at boot from the pre-load chainstate
+// and have no in-handler refresh path. The CLI is the only entry point
+// that runs BEFORE those components start.
+//
+// Fix is option (B) from rustoshi 1d0a325 / hotbuns e355cd7: refuse the
+// RPC at the gate, leave the datadir untouched, point the operator at
+// the CLI flag. Same JSON-RPC error code Bitcoin Core uses in
+// bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset when
+// ActivateSnapshot cannot proceed.
+//
+// The gate fires before any file I/O so a refused call leaves the
+// datadir untouched.
 func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCError) {
-	// Parse parameters: [path]
+	// Parse parameters for shape only; never open the snapshot file.
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
 	}
-
 	if len(args) < 1 {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing path parameter"}
 	}
-
-	path, ok := args[0].(string)
-	if !ok || path == "" {
+	if path, ok := args[0].(string); !ok || path == "" {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid path"}
 	}
 
-	if s.chainParams == nil {
-		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Chain params not available"}
+	return nil, &RPCError{
+		Code: RPCErrInternal,
+		Message: "loadtxoutset RPC is disabled in this build because the live " +
+			"daemon cannot atomically activate a UTXO snapshot once the " +
+			"header-sync and block-download components have started. Use " +
+			"the CLI flag -load-snapshot=<path> at startup instead — that " +
+			"path imports the snapshot, pins the chain tip, and writes the " +
+			"block index before any P2P/sync components are constructed.",
 	}
-
-	// Open file for reading
-	f, err := openSnapshotFile(path)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to open file: %v", err)}
-	}
-	defer f.Close()
-
-	// Read snapshot metadata FIRST so we can refuse early on a height
-	// not in m_assumeutxo_data, matching Bitcoin Core's behavior in
-	// validation.cpp:5775-5780. Loading the coins into a chainstate
-	// before the whitelist check would defeat the purpose of the check.
-	sr, err := consensus.NewSnapshotReader(f)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to read snapshot metadata: %v", err)}
-	}
-	meta := sr.Metadata()
-
-	// Verify network magic before consulting assumeutxo params.
-	if meta.NetworkMagic != s.chainParams.NetworkMagic {
-		return nil, &RPCError{
-			Code:    RPCErrVerify,
-			Message: "Snapshot network magic does not match node network",
-		}
-	}
-
-	// Strict whitelist: refuse to load any snapshot whose base_blockhash
-	// (and therefore height) is not in m_assumeutxo_data for this network.
-	// Core spec: bitcoin-core/src/validation.cpp:5775-5780.
-	if s.chainParams.AssumeUTXO == nil || len(s.chainParams.AssumeUTXO.Data) == 0 {
-		// No whitelist configured for this network at all => refuse.
-		// (Core's AssumeutxoForHeight returns nullopt for any height on
-		// such a network, and the caller errors out the same way.)
-		baseHeight := int32(-1)
-		if s.headerIndex != nil {
-			if node := s.headerIndex.GetNode(meta.BlockHash); node != nil {
-				baseHeight = node.Height
-			}
-		}
-		return nil, &RPCError{
-			Code: RPCErrVerify,
-			Message: fmt.Sprintf("Assumeutxo height in snapshot metadata not recognized "+
-				"(%d) - refusing to load snapshot", baseHeight),
-		}
-	}
-
-	auData := s.chainParams.AssumeUTXO.ForBlockHash(meta.BlockHash)
-	if auData == nil {
-		// Look up height in the header index for the error message; if
-		// unknown, fall back to -1 to match the "we don't know it" intent.
-		baseHeight := int32(-1)
-		if s.headerIndex != nil {
-			if node := s.headerIndex.GetNode(meta.BlockHash); node != nil {
-				baseHeight = node.Height
-			}
-		}
-		return nil, &RPCError{
-			Code: RPCErrVerify,
-			Message: fmt.Sprintf("Assumeutxo height in snapshot metadata not recognized "+
-				"(%d) - refusing to load snapshot", baseHeight),
-		}
-	}
-
-	// Whitelisted: now actually load the coins. We re-open the file and
-	// hand it to LoadSnapshot, which re-reads the metadata. (Cheap: 51 bytes.)
-	if _, seekErr := f.Seek(0, 0); seekErr != nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to rewind snapshot file: %v", seekErr)}
-	}
-
-	utxoSet, stats, err := consensus.LoadSnapshot(f, s.chainDB, s.chainParams.NetworkMagic)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to load snapshot: %v", err)}
-	}
-
-	// Strict content-hash check: refuse to activate the snapshot if the
-	// HASH_SERIALIZED digest of the loaded coins does not match the
-	// whitelisted assumeutxo value. Mirrors Core validation.cpp:5912-5914
-	// down to the error wording ("Bad snapshot content hash: expected %s,
-	// got %s") so behaviour is identical from an operator's perspective.
-	gotHash, _, hashErr := consensus.ComputeHashSerialized(utxoSet)
-	if hashErr != nil {
-		return nil, &RPCError{
-			Code:    RPCErrInternal,
-			Message: fmt.Sprintf("Failed to compute snapshot content hash: %v", hashErr),
-		}
-	}
-	if gotHash != auData.HashSerialized {
-		return nil, &RPCError{
-			Code: RPCErrVerify,
-			Message: fmt.Sprintf("Bad snapshot content hash: expected %s, got %s",
-				auData.HashSerialized.String(), gotHash.String()),
-		}
-	}
-
-	stats.Height = auData.Height
-
-	// If the header index knows the block, prefer that height (matches Core
-	// which uses snapshot_start_block->nHeight). Should agree with auData.Height.
-	if s.headerIndex != nil {
-		if node := s.headerIndex.GetNode(stats.BlockHash); node != nil {
-			stats.Height = node.Height
-		}
-	}
-
-	// Flush the loaded coins to chainDB. LoadSnapshot deliberately defers
-	// this so the post-flush cache eviction doesn't run before
-	// ComputeHashSerialized has walked the in-memory cache. After this
-	// flush, the snapshot's coins are durable in the shared chainDB and
-	// the cache may be trimmed.
-	if flushErr := utxoSet.Flush(); flushErr != nil {
-		return nil, &RPCError{
-			Code:    RPCErrInternal,
-			Message: fmt.Sprintf("Failed to flush snapshot UTXOs: %v", flushErr),
-		}
-	}
-
-	// Store reference to the loaded UTXO set
-	// In a full implementation, this would activate a snapshot chainstate
-	// For now, we just return success with the stats. The coins are
-	// already in chainDB via the Flush above; promotion to active
-	// chainstate (SetChainState/SetBlockHeight) is handled by the
-	// CLI -load-snapshot path in cmd/blockbrew/main.go::loadSnapshotFromFile.
-	_ = utxoSet // Would be used to create a snapshot chainstate
-
-	return &LoadTxOutSetResult{
-		CoinsLoaded: stats.CoinsLoaded,
-		TipHash:     stats.BlockHash.String(),
-		BaseHeight:  stats.Height,
-		Path:        path,
-	}, nil
 }
 
 func (s *Server) handleGetChainStates() (interface{}, *RPCError) {
