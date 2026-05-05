@@ -226,6 +226,11 @@ type SyncManager struct {
 	// pre-fix skip-and-loop path).  Cleared only by process restart.
 	chainstateCorrupted   atomic.Bool
 	lastCorruptionWarning atomic.Int64 // unix nanos
+
+	// pruner, when non-nil and configured with a target, is used by
+	// HandleGetData to reject pre-prune-horizon block requests with a
+	// `notfound` reply (BIP-159 peer-served-blocks gate).
+	pruner *storage.Pruner
 }
 
 // ChainConnector is the interface for connecting blocks to the chain.
@@ -267,6 +272,11 @@ type SyncManagerConfig struct {
 	OnSyncComplete   func()
 	OnBlockConnected func(block *wire.MsgBlock, height int32) // Called after a block is connected
 	DownloadWindow   int                                      // Max concurrent block downloads (default: 1024)
+	// Pruner is the auto-prune subsystem.  When non-nil and the configured
+	// target is non-zero, BIP-159 NODE_NETWORK_LIMITED is advertised and
+	// HandleGetData rejects requests below the recent-288 keep window with
+	// a `notfound` reply (Core net_processing.cpp behaviour).
+	Pruner *storage.Pruner
 }
 
 // NewSyncManager creates a new sync manager.
@@ -302,6 +312,7 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		chainMgr:          config.ChainManager,
 		lastTipUpdate:     now,
 		nextStaleTipCheck: now.Add(StaleTipCheckInterval),
+		pruner:            config.Pruner,
 	}
 	// IBD starts true from the moment the sync manager is created; it is
 	// only latched to false by updateIBDStatus() once the chain tip is
@@ -1003,15 +1014,48 @@ func (sm *SyncManager) HandleNotFound(peer *Peer, msg *MsgNotFound) {
 }
 
 // HandleGetData responds to getdata requests by sending requested blocks and transactions.
+//
+// BIP-159 peer-served-blocks gate: when prune mode is on, refuse to serve
+// blocks below the prune horizon (tip - MIN_BLOCKS_TO_KEEP).  Mirrors Core's
+// net_processing.cpp `ProcessGetBlockData` which short-circuits and emits a
+// `notfound` for any historical block the pruned node no longer has.  Without
+// this gate a pruned node would attempt a disk read for a deleted block and
+// either return a stale error to the peer or hang the request.
 func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
+	// Determine the prune horizon once for the whole batch.
+	pruneHorizon := int32(-1) // -1 = no gate
+	if sm.pruner != nil && sm.pruner.TargetBytes() > 0 && sm.chainMgr != nil {
+		_, tipHeight := sm.chainMgr.BestBlock()
+		if tipHeight > int32(storage.MinBlocksToKeep) {
+			pruneHorizon = tipHeight - int32(storage.MinBlocksToKeep)
+		}
+	}
+
+	var notFound []*InvVect
 	for _, inv := range msg.InvList {
 		// Strip witness flag to get base type
 		baseType := inv.Type &^ InvWitnessFlag
 		switch baseType {
 		case InvTypeBlock:
+			// Prune-mode gate: if we're a NODE_NETWORK_LIMITED node and the
+			// requested block is below tip-288, decline with notfound.
+			if pruneHorizon >= 0 && sm.headerIndex != nil {
+				if node := sm.headerIndex.GetNode(inv.Hash); node != nil &&
+					node.Height < pruneHorizon {
+					notFound = append(notFound, inv)
+					continue
+				}
+			}
 			block, err := sm.chainDB.GetBlock(inv.Hash)
 			if err != nil {
-				log.Printf("sync: getdata block %x not found: %v", inv.Hash[:4], err)
+				// On any read error in prune mode, send a notfound so the
+				// peer can re-request from a NODE_NETWORK peer instead of
+				// hanging.  Outside prune mode we keep the legacy log+skip.
+				if pruneHorizon >= 0 {
+					notFound = append(notFound, inv)
+				} else {
+					log.Printf("sync: getdata block %x not found: %v", inv.Hash[:4], err)
+				}
 				continue
 			}
 			log.Printf("sync: serving block at %x to peer %s", inv.Hash[:4], peer.Address())
@@ -1019,6 +1063,9 @@ func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
 		case InvTypeTx:
 			// TODO: look up transaction from mempool
 		}
+	}
+	if len(notFound) > 0 {
+		peer.SendMessage(&MsgNotFound{InvList: notFound})
 	}
 }
 

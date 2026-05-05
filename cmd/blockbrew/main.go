@@ -792,8 +792,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			_, h := chainMgr.BestBlock()
 			return h
 		},
-		PreferV2:           cfg.BIP324V2,
-		AdvertiseNodeBloom: cfg.PeerBloomFilters,
+		PreferV2:                    cfg.BIP324V2,
+		AdvertiseNodeBloom:          cfg.PeerBloomFilters,
+		AdvertiseNodeNetworkLimited: cfg.Prune > 0,
 	})
 
 	// 8. Initialize wallet early so sync callbacks can reference it
@@ -828,6 +829,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		ChainDB:      chainDB,
 		PeerManager:  nil, // Will be set below after peerMgr is created
 		ChainManager: chainMgr,
+		Pruner:       pruner,
 		OnSyncComplete: func() {
 			log.Printf("Header synchronization complete, starting block download")
 			// Re-resolve the chain tip now that headers are available.
@@ -978,8 +980,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		OnPeerDisconnected: func(p *p2p.Peer) {
 			syncMgr.HandlePeerDisconnected(p)
 		},
-		PreferV2:           cfg.BIP324V2,
-		AdvertiseNodeBloom: cfg.PeerBloomFilters,
+		PreferV2:                    cfg.BIP324V2,
+		AdvertiseNodeBloom:          cfg.PeerBloomFilters,
+		AdvertiseNodeNetworkLimited: cfg.Prune > 0,
 	})
 
 	// Wire the peer manager back into the sync manager (breaks circular dependency)
