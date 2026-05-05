@@ -379,6 +379,7 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 	node := s.chainMgr.BestBlockNode()
 
 	var difficulty float64
+	var tipBitsHex, tipTargetHex string
 	if node != nil {
 		genesisTarget := consensus.CompactToBig(0x1d00ffff)
 		currentTarget := consensus.CompactToBig(node.Header.Bits)
@@ -387,6 +388,11 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 			diff.Quo(diff, new(big.Float).SetInt(currentTarget))
 			difficulty, _ = diff.Float64()
 		}
+		tipBitsHex = fmt.Sprintf("%08x", node.Header.Bits)
+		tipTargetHex = fmt.Sprintf("%064x", consensus.CompactToBig(node.Header.Bits))
+	} else {
+		tipBitsHex = "1d00ffff"
+		tipTargetHex = fmt.Sprintf("%064x", consensus.CompactToBig(0x1d00ffff))
 	}
 
 	pooledTx := 0
@@ -394,11 +400,24 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 		pooledTx = s.mempool.Count()
 	}
 
-	return &MiningInfo{
-		Blocks:     tipHeight,
+	// "next" block: approximate with current bits.
+	next := MiningInfoNext{
+		Height:     tipHeight + 1,
+		Bits:       tipBitsHex,
 		Difficulty: difficulty,
-		PooledTx:   pooledTx,
-		Chain:      s.rpcChainName(),
+		Target:     tipTargetHex,
+	}
+
+	return &MiningInfo{
+		Blocks:        tipHeight,
+		Bits:          tipBitsHex,
+		Difficulty:    difficulty,
+		Target:        tipTargetHex,
+		PooledTx:      pooledTx,
+		BlockMinTxFee: 0.00001,
+		Chain:         s.rpcChainName(),
+		Next:          next,
+		Warnings:      "",
 	}, nil
 }
 
