@@ -128,9 +128,13 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 	pruned := s.pruner.IsEnabled()
 	pruneHeight := int32(0)
 	pruneTarget := uint64(0)
+	automaticPruning := false
 	if pruned {
 		pruneHeight = s.pruner.PruneHeight()
 		pruneTarget = s.pruner.TargetBytes()
+		// Core parity (rpc/blockchain.cpp:1452): automatic_pruning is
+		// false when -prune=1 (manual mode); true otherwise.
+		automaticPruning = pruneTarget > 0
 	}
 
 	return &BlockchainInfo{
@@ -148,7 +152,7 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		ChainWork:            chainWorkHex,
 		Pruned:               pruned,
 		PruneHeight:          pruneHeight,
-		AutomaticPruning:     pruned, // we don't expose Core's -prune=1 manual-only mode
+		AutomaticPruning:     automaticPruning,
 		PruneTargetSize:      pruneTarget,
 		Softforks:            softforks,
 		Warnings:             "",
