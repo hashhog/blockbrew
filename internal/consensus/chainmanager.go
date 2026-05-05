@@ -473,6 +473,15 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		cache:    make(map[wire.OutPoint]*UTXOEntry),
 		fallback: cm.utxoSet,
 	}
+	// scriptView is a separate snapshot used exclusively by the second-pass
+	// script validation.  Unlike cachedView, entries are NEVER evicted from
+	// scriptView: the CVE-2012-2459 eviction that removes spent inputs from
+	// cachedView.cache (so that a later duplicate tx cannot find a stale
+	// "unspent" entry) would otherwise leave the second pass unable to look up
+	// inputs that the first pass already spent.  scriptView is populated
+	// alongside cachedView in the UTXO-fetch loop below and then used
+	// (read-only) in ParallelScriptValidationCached / ValidateTransactionScripts.
+	scriptView := make(map[wire.OutPoint]*UTXOEntry)
 
 	// Accumulate block-wide sigop cost (BIP-141 §Block size limit).
 	// Counted per-tx inside the first-pass loop while prevouts are still
@@ -561,6 +570,10 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
 			if utxo != nil {
 				cachedView.cache[in.PreviousOutPoint] = utxo
+				// Also snapshot into scriptView for the second-pass script
+				// validation; scriptView is never evicted so the second pass
+				// can always find inputs that the first pass spent.
+				scriptView[in.PreviousOutPoint] = utxo
 			}
 		}
 		_firstUtxoNs += time.Since(_utxoStart).Nanoseconds()
@@ -681,9 +694,18 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 
 	// Second pass: validate scripts (can be skipped for assume-valid or parallelized)
 	if !skipScripts {
-		// Use the cached UTXO view so script validation can find spent UTXOs
+		// Build a read-only view that the second pass uses to look up prevouts.
+		// We use scriptView (populated in the first-pass UTXO-fetch loop) rather
+		// than cachedView because cachedView has spent inputs evicted for
+		// CVE-2012-2459 protection.  scriptView is never modified, so outputs
+		// created within this block (same-block spends) are found via the
+		// cm.utxoSet fallback (they were added with AddTxOutputs in the first pass).
+		scriptUTXOView := &cachedUTXOView{
+			cache:    scriptView,
+			fallback: cm.utxoSet,
+		}
 		if cm.parallelScripts {
-			if err := ParallelScriptValidationCached(block, cachedView, flags, cm.sigCache); err != nil {
+			if err := ParallelScriptValidationCached(block, scriptUTXOView, flags, cm.sigCache); err != nil {
 				rollbackUTXOs()
 				return fmt.Errorf("script validation failed: %w", err)
 			}
@@ -692,7 +714,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				if i == 0 {
 					continue // Skip coinbase
 				}
-				if err := ValidateTransactionScripts(tx, cachedView, flags); err != nil {
+				if err := ValidateTransactionScripts(tx, scriptUTXOView, flags); err != nil {
 					rollbackUTXOs()
 					return fmt.Errorf("tx %d script validation failed: %w", i, err)
 				}
