@@ -766,10 +766,38 @@ func (s *Server) buildRESTBlockResult(block *wire.MsgBlock, hash wire.Hash256, i
 		}
 	}
 
+	// Compute stripped size for REST response
+	restStrippedSize := 80
+	for _, tx := range block.Transactions {
+		var noWitBuf bytes.Buffer
+		tx.SerializeNoWitness(&noWitBuf)
+		restStrippedSize += noWitBuf.Len()
+	}
+
+	// Build coinbase_tx metadata (Core 27+) for REST response.
+	var restCoinbaseTx interface{}
+	if len(block.Transactions) > 0 {
+		cb := block.Transactions[0]
+		if len(cb.TxIn) > 0 {
+			vin0 := cb.TxIn[0]
+			cbMap := map[string]interface{}{
+				"version":  cb.Version,
+				"locktime": cb.LockTime,
+				"sequence": vin0.Sequence,
+				"coinbase": hex.EncodeToString(vin0.SignatureScript),
+			}
+			if len(vin0.Witness) > 0 {
+				cbMap["witness"] = hex.EncodeToString(vin0.Witness[0])
+			}
+			restCoinbaseTx = cbMap
+		}
+	}
+
 	return &BlockResult{
 		Hash:          hash.String(),
 		Confirmations: confirmations,
 		Size:          size,
+		StrippedSize:  restStrippedSize,
 		Weight:        weight,
 		Height:        height,
 		Version:       block.Header.Version,
@@ -779,11 +807,13 @@ func (s *Server) buildRESTBlockResult(block *wire.MsgBlock, hash wire.Hash256, i
 		Time:          block.Header.Timestamp,
 		Nonce:         block.Header.Nonce,
 		Bits:          fmt.Sprintf("%08x", block.Header.Bits),
+		Target:        fmt.Sprintf("%064x", consensus.CompactToBig(block.Header.Bits)),
 		Difficulty:    difficulty,
 		ChainWork:     chainWork,
 		NTx:           len(block.Transactions),
 		PreviousHash:  prevHash,
 		NextHash:      nextHash,
+		CoinbaseTx:    restCoinbaseTx,
 	}
 }
 

@@ -82,10 +82,26 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		}
 	}
 
-	// Get median time past
+	// Get median time past, tip bits/target/time, chainwork
 	var medianTime int64
+	var tipBits, tipTarget, chainWorkHex string
+	var tipTime uint32
 	if tipNode != nil {
 		medianTime = tipNode.GetMedianTimePast()
+		tipBits = fmt.Sprintf("%08x", tipNode.Header.Bits)
+		tipTime = tipNode.Header.Timestamp
+		// Full-precision target: zero-pad big.Int hex to 64 chars.
+		targetBig := consensus.CompactToBig(tipNode.Header.Bits)
+		tipTarget = fmt.Sprintf("%064x", targetBig)
+		if tipNode.TotalWork != nil {
+			chainWorkHex = fmt.Sprintf("%064x", tipNode.TotalWork)
+		} else {
+			chainWorkHex = fmt.Sprintf("%064x", 0)
+		}
+	} else {
+		tipBits = "1d00ffff"
+		tipTarget = fmt.Sprintf("%064x", consensus.CompactToBig(0x1d00ffff))
+		chainWorkHex = fmt.Sprintf("%064x", 0)
 	}
 
 	// Check if IBD is active
@@ -122,15 +138,20 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		Blocks:               tipHeight,
 		Headers:              headersHeight,
 		BestBlockHash:        tipHash.String(),
+		Bits:                 tipBits,
+		Target:               tipTarget,
 		Difficulty:           difficulty,
+		Time:                 tipTime,
 		MedianTime:           medianTime,
 		VerificationProgress: verificationProgress,
 		InitialBlockDownload: ibd,
+		ChainWork:            chainWorkHex,
 		Pruned:               pruned,
 		PruneHeight:          pruneHeight,
 		AutomaticPruning:     pruned, // we don't expose Core's -prune=1 manual-only mode
 		PruneTargetSize:      pruneTarget,
 		Softforks:            softforks,
+		Warnings:             "",
 	}, nil
 }
 
@@ -293,6 +314,14 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 	size := buf.Len()
 	weight := calcBlockWeight(block)
 
+	// Compute stripped size (no-witness serialization).
+	strippedSize := 80 // header
+	for _, tx := range block.Transactions {
+		var noWitBuf bytes.Buffer
+		tx.SerializeNoWitness(&noWitBuf)
+		strippedSize += noWitBuf.Len()
+	}
+
 	// Calculate difficulty
 	genesisTarget := consensus.CompactToBig(0x1d00ffff)
 	currentTarget := consensus.CompactToBig(block.Header.Bits)
@@ -320,6 +349,26 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 		}
 	}
 
+	// Build coinbase_tx metadata (Core 27+ field).
+	// Reference: bitcoin-core/src/rpc/blockchain.cpp coinbaseTxToJSON()
+	var coinbaseTx interface{}
+	if len(block.Transactions) > 0 {
+		cb := block.Transactions[0]
+		if len(cb.TxIn) > 0 {
+			vin0 := cb.TxIn[0]
+			cbMap := map[string]interface{}{
+				"version":  cb.Version,
+				"locktime": cb.LockTime,
+				"sequence": vin0.Sequence,
+				"coinbase": hex.EncodeToString(vin0.SignatureScript),
+			}
+			if len(vin0.Witness) > 0 {
+				cbMap["witness"] = hex.EncodeToString(vin0.Witness[0])
+			}
+			coinbaseTx = cbMap
+		}
+	}
+
 	// Get previous and next block hashes
 	var prevHash, nextHash string
 	if node.Parent != nil {
@@ -336,10 +385,17 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 		}
 	}
 
+	// Chainwork from node.TotalWork
+	chainWorkHex := "0000000000000000000000000000000000000000000000000000000000000000"
+	if node.TotalWork != nil {
+		chainWorkHex = fmt.Sprintf("%064x", node.TotalWork)
+	}
+
 	return &BlockResult{
 		Hash:          hash.String(),
 		Confirmations: confirmations,
 		Size:          size,
+		StrippedSize:  strippedSize,
 		Weight:        weight,
 		Height:        node.Height,
 		Version:       block.Header.Version,
@@ -350,10 +406,13 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 		MedianTime:    node.GetMedianTimePast(),
 		Nonce:         block.Header.Nonce,
 		Bits:          fmt.Sprintf("%08x", block.Header.Bits),
+		Target:        fmt.Sprintf("%064x", consensus.CompactToBig(block.Header.Bits)),
 		Difficulty:    difficulty,
+		ChainWork:     chainWorkHex,
 		NTx:           len(block.Transactions),
 		PreviousHash:  prevHash,
 		NextHash:      nextHash,
+		CoinbaseTx:    coinbaseTx,
 	}, nil
 }
 
@@ -1148,29 +1207,42 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 			connType = "inbound"
 		}
 		result = append(result, PeerInfo{
-			ID:             i,
-			Addr:           p.Address(),
-			Network:        "ipv4",
-			Services:       fmt.Sprintf("%016x", services),
-			ServicesNames:  decodeServiceNames(services),
-			RelayTxes:      p.RelayTxes(),
-			LastSend:       p.LastSend().Unix(),
-			LastRecv:       p.LastRecv().Unix(),
-			BytesSent:      p.BytesSent(),
-			BytesRecv:      p.BytesRecvd(),
-			ConnTime:       time.Now().Add(-p.ConnTime()).Unix(),
-			TimeOffset:     p.TimeOffset(),
-			PingTime:       p.PingLatency().Seconds(),
-			Version:        p.ProtocolVersion(),
-			SubVer:         p.UserAgent(),
-			Inbound:        p.Inbound(),
-			BIP152HBTo:     false,
-			BIP152HBFrom:   false,
-			StartHeight:    p.StartHeight(),
-			SyncedHeaders:  -1,
-			SyncedBlocks:   -1,
-			Inflight:       []int{},
-			ConnectionType: connType,
+			ID:                    i,
+			Addr:                  p.Address(),
+			Network:               "ipv4",
+			Services:              fmt.Sprintf("%016x", services),
+			ServicesNames:         decodeServiceNames(services),
+			RelayTxes:             p.RelayTxes(),
+			LastSend:              p.LastSend().Unix(),
+			LastRecv:              p.LastRecv().Unix(),
+			LastTransaction:       0,
+			LastBlock:             0,
+			BytesSent:             p.BytesSent(),
+			BytesRecv:             p.BytesRecvd(),
+			ConnTime:              time.Now().Add(-p.ConnTime()).Unix(),
+			TimeOffset:            p.TimeOffset(),
+			PingTime:              p.PingLatency().Seconds(),
+			MinPing:               p.PingLatency().Seconds(),
+			Version:               p.ProtocolVersion(),
+			SubVer:                p.UserAgent(),
+			Inbound:               p.Inbound(),
+			BIP152HBTo:            false,
+			BIP152HBFrom:          false,
+			StartHeight:           p.StartHeight(),
+			PreSyncedHeaders:      -1,
+			SyncedHeaders:         -1,
+			SyncedBlocks:          -1,
+			Inflight:              []int{},
+			AddrRelayEnabled:      true,
+			AddrProcessed:         0,
+			AddrRateLimited:       0,
+			Permissions:           []string{},
+			MinFeeFilter:          0.0,
+			BytesSentPerMsg:       map[string]int64{},
+			BytesRecvPerMsg:       map[string]int64{},
+			ConnectionType:        connType,
+			TransportProtocolType: "v1",
+			SessionID:             "",
 		})
 	}
 

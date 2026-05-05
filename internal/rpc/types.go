@@ -83,10 +83,15 @@ type BlockchainInfo struct {
 	Blocks               int32                      `json:"blocks"`
 	Headers              int32                      `json:"headers"`
 	BestBlockHash        string                     `json:"bestblockhash"`
+	Bits                 string                     `json:"bits"`
+	Target               string                     `json:"target"`
 	Difficulty           float64                    `json:"difficulty"`
+	Time                 uint32                     `json:"time"`
 	MedianTime           int64                      `json:"mediantime"`
 	VerificationProgress float64                    `json:"verificationprogress"`
 	InitialBlockDownload bool                       `json:"initialblockdownload"`
+	ChainWork            string                     `json:"chainwork"`
+	SizeOnDisk           int64                      `json:"size_on_disk"`
 	Pruned               bool                       `json:"pruned"`
 	// PruneHeight is the lowest-height block whose body is still on disk.
 	// Only emitted when pruned=true; matches Bitcoin Core's
@@ -105,6 +110,7 @@ type BlockchainInfo struct {
 	// Softforks mirrors getdeploymentinfo.deployments: both RPCs read from the
 	// same buildDeploymentMap helper so their data is always consistent.
 	Softforks            map[string]DeploymentEntry `json:"softforks"`
+	Warnings             string                     `json:"warnings"`
 }
 
 // BlockResult represents a block in RPC responses.
@@ -112,6 +118,7 @@ type BlockResult struct {
 	Hash          string        `json:"hash"`
 	Confirmations int32         `json:"confirmations"`
 	Size          int           `json:"size"`
+	StrippedSize  int           `json:"strippedsize"`
 	Weight        int           `json:"weight"`
 	Height        int32         `json:"height"`
 	Version       int32         `json:"version"`
@@ -122,11 +129,13 @@ type BlockResult struct {
 	MedianTime    int64         `json:"mediantime"`
 	Nonce         uint32        `json:"nonce"`
 	Bits          string        `json:"bits"`
+	Target        string        `json:"target"`
 	Difficulty    float64       `json:"difficulty"`
-	ChainWork     string        `json:"chainwork,omitempty"`
+	ChainWork     string        `json:"chainwork"`
 	NTx           int           `json:"nTx"`
 	PreviousHash  string        `json:"previousblockhash,omitempty"`
 	NextHash      string        `json:"nextblockhash,omitempty"`
+	CoinbaseTx    interface{}   `json:"coinbase_tx,omitempty"`
 }
 
 // BlockHeaderResult represents a block header in RPC responses.
@@ -234,29 +243,42 @@ type MempoolEntry struct {
 
 // PeerInfo represents peer information in RPC responses.
 type PeerInfo struct {
-	ID             int      `json:"id"`
-	Addr           string   `json:"addr"`
-	Network        string   `json:"network"`
-	Services       string   `json:"services"`
-	ServicesNames  []string `json:"servicesnames"`
-	RelayTxes      bool     `json:"relaytxes"`
-	LastSend       int64    `json:"lastsend"`
-	LastRecv       int64    `json:"lastrecv"`
-	BytesSent      uint64   `json:"bytessent"`
-	BytesRecv      uint64   `json:"bytesrecv"`
-	ConnTime       int64    `json:"conntime"`
-	TimeOffset     int64    `json:"timeoffset"`
-	PingTime       float64  `json:"pingtime"`
-	Version        int32    `json:"version"`
-	SubVer         string   `json:"subver"`
-	Inbound        bool     `json:"inbound"`
-	BIP152HBTo     bool     `json:"bip152_hb_to"`
-	BIP152HBFrom   bool     `json:"bip152_hb_from"`
-	StartHeight    int32    `json:"startingheight"`
-	SyncedHeaders  int32    `json:"synced_headers"`
-	SyncedBlocks   int32    `json:"synced_blocks"`
-	Inflight       []int    `json:"inflight"`
-	ConnectionType string   `json:"connection_type"`
+	ID                    int                    `json:"id"`
+	Addr                  string                 `json:"addr"`
+	Network               string                 `json:"network"`
+	Services              string                 `json:"services"`
+	ServicesNames         []string               `json:"servicesnames"`
+	RelayTxes             bool                   `json:"relaytxes"`
+	LastSend              int64                  `json:"lastsend"`
+	LastRecv              int64                  `json:"lastrecv"`
+	LastTransaction       int64                  `json:"last_transaction"`
+	LastBlock             int64                  `json:"last_block"`
+	BytesSent             uint64                 `json:"bytessent"`
+	BytesRecv             uint64                 `json:"bytesrecv"`
+	ConnTime              int64                  `json:"conntime"`
+	TimeOffset            int64                  `json:"timeoffset"`
+	PingTime              float64                `json:"pingtime"`
+	MinPing               float64                `json:"minping"`
+	Version               int32                  `json:"version"`
+	SubVer                string                 `json:"subver"`
+	Inbound               bool                   `json:"inbound"`
+	BIP152HBTo            bool                   `json:"bip152_hb_to"`
+	BIP152HBFrom          bool                   `json:"bip152_hb_from"`
+	StartHeight           int32                  `json:"startingheight"`
+	PreSyncedHeaders      int32                  `json:"presynced_headers"`
+	SyncedHeaders         int32                  `json:"synced_headers"`
+	SyncedBlocks          int32                  `json:"synced_blocks"`
+	Inflight              []int                  `json:"inflight"`
+	AddrRelayEnabled      bool                   `json:"addr_relay_enabled"`
+	AddrProcessed         int64                  `json:"addr_processed"`
+	AddrRateLimited       int64                  `json:"addr_rate_limited"`
+	Permissions           []string               `json:"permissions"`
+	MinFeeFilter          float64                `json:"minfeefilter"`
+	BytesSentPerMsg       map[string]int64       `json:"bytessent_per_msg"`
+	BytesRecvPerMsg       map[string]int64       `json:"bytesrecv_per_msg"`
+	ConnectionType        string                 `json:"connection_type"`
+	TransportProtocolType string                 `json:"transport_protocol_type"`
+	SessionID             string                 `json:"session_id"`
 }
 
 // NetworkInfo represents the result of getnetworkinfo.
@@ -359,12 +381,25 @@ type TxOutResult struct {
 }
 
 // MiningInfo represents the result of getmininginfo.
+// MiningInfoNext is the "next" sub-object in getmininginfo (Core 31.99).
+type MiningInfoNext struct {
+	Height     int32   `json:"height"`
+	Bits       string  `json:"bits"`
+	Difficulty float64 `json:"difficulty"`
+	Target     string  `json:"target"`
+}
+
 type MiningInfo struct {
-	Blocks       int32   `json:"blocks"`
-	Difficulty   float64 `json:"difficulty"`
-	NetworkHash  float64 `json:"networkhashps"`
-	PooledTx     int     `json:"pooledtx"`
-	Chain        string  `json:"chain"`
+	Blocks         int32          `json:"blocks"`
+	Bits           string         `json:"bits"`
+	Difficulty     float64        `json:"difficulty"`
+	Target         string         `json:"target"`
+	NetworkHash    float64        `json:"networkhashps"`
+	PooledTx       int            `json:"pooledtx"`
+	BlockMinTxFee  float64        `json:"blockmintxfee"`
+	Chain          string         `json:"chain"`
+	Next           MiningInfoNext `json:"next"`
+	Warnings       string         `json:"warnings"`
 }
 
 // DecodeScriptResult represents the result of decodescript.
