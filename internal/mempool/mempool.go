@@ -37,6 +37,13 @@ var (
 	// BIP-68 sequence-lock failure (mempool accept).
 	ErrSequenceLockNotMet = errors.New("non-final transaction (BIP-68 sequence locks not met)")
 
+	// IsFinalTx failure (BIP-113 nLockTime gate, mempool accept).
+	ErrNonFinalTx = errors.New("non-final transaction (nLockTime not satisfied at tip+1)")
+
+	// Coinbase maturity failure (mempool accept).
+	ErrImmatureCoinbaseSpend = errors.New("immature coinbase spend: output does not have enough confirmations")
+
+
 	// Ancestor/descendant chain limits (Core DEFAULT_ANCESTOR_LIMIT/DEFAULT_DESCENDANT_LIMIT).
 	ErrTooManyAncestors   = errors.New("too many unconfirmed ancestors")
 	ErrTooManyDescendants = errors.New("too many descendants for an unconfirmed parent")
@@ -313,6 +320,20 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	// 5. Calculate virtual size
 	vsize := (weight + 3) / 4 // Round up
 
+	// 5b. IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
+	// Mempool holds txs for the *next* block, so check against tipHeight+1
+	// and the current chain MTP (MEDIAN_TIME_PAST of the last 11 blocks).
+	// Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip
+	// (validation.cpp:819).
+	if mp.config.ChainState != nil {
+		cs := mp.config.ChainState
+		nextHeight := cs.TipHeight() + 1
+		mtp := uint32(cs.TipMTP())
+		if !consensus.IsFinalTx(tx, nextHeight, mtp) {
+			return ErrNonFinalTx
+		}
+	}
+
 	// 6. Check for double spends (with RBF support) and gather input values
 	var totalInputValue int64
 	var missingInputs []wire.OutPoint
@@ -332,6 +353,19 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		if utxo == nil {
 			missingInputs = append(missingInputs, in.PreviousOutPoint)
 		} else {
+			// Coinbase maturity (Gap B3): a confirmed coinbase output must
+			// have at least CoinbaseMaturity (100) confirmations before it
+			// can be spent in the mempool.
+			// Mirrors Bitcoin Core MemPoolAccept::PreChecks / CheckTxInputs
+			// (consensus/tx_verify.cpp).
+			if utxo.IsCoinbase && mp.config.ChainState != nil {
+				tipHeight := mp.config.ChainState.TipHeight()
+				age := tipHeight - utxo.Height
+				if age < consensus.CoinbaseMaturity {
+					return fmt.Errorf("%w: age %d < %d required",
+						ErrImmatureCoinbaseSpend, age, consensus.CoinbaseMaturity)
+				}
+			}
 			totalInputValue += utxo.Amount
 		}
 	}
