@@ -1,7 +1,9 @@
 package consensus
 
 import (
+	"bytes"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/storage"
@@ -2350,5 +2352,403 @@ func TestProcessSubmittedBlock_FiresOnBlockConnectedOnHappyPath(t *testing.T) {
 	}
 	if lastHeight != 1 {
 		t.Errorf("submitblock fire height = %d, want 1", lastHeight)
+	}
+}
+
+// ============================================================================
+// Pattern D closure (2026-05-05) — multi-block reorg atomicity.
+//
+// Pre-fix: ReorgTo executed N DisconnectBlock calls and M ConnectBlock calls
+// each as its own Pebble commit. A crash midway through a reorg could leave
+// the on-disk chainstate at any intermediate tip, with undo data half-deleted
+// and UTXO mutations partially flushed — recovery on next boot would replay
+// from a corrupt mid-reorg state.
+//
+// Post-fix: ReorgTo opens ONE pebble.Batch on entry, installs it on
+// cm.reorgBatch under cm.mu, and every per-block Connect/Disconnect inside
+// the reorg appends its persistence writes to the shared batch instead of
+// committing per-block. After the last connect, the in-memory UTXO set is
+// drained into the same batch via FlushBatch, and one batch.Write() commits
+// the whole reorg atomically. A crash before that commit leaves on-disk
+// state at the pre-reorg tip; success leaves it at the post-reorg tip.
+//
+// Memory cap: MaxReorgDepth=100 (Bitcoin Core default). Reorgs of greater
+// span return ErrReorgTooDeep rather than splitting the work across multiple
+// commits (which would defeat the atomicity guarantee).
+//
+// Cross-impl reference: bitcoin-core validation.cpp::ActivateBestChain holds
+// a single CDBBatch across all DisconnectTip / ConnectTip calls.
+// ============================================================================
+
+// countingDB wraps a storage.DB and intercepts NewBatch so tests can count
+// how many distinct Pebble batches were opened during a unit of work. Used
+// by the single-batch property test to assert that ReorgTo opens exactly
+// ONE batch for the whole multi-block reorg, not one per per-block helper.
+//
+// We also intercept direct Put/Delete to ensure the reorg path does NOT
+// take the non-batched fallback (which would silently break atomicity).
+type countingDB struct {
+	inner       storage.DB
+	mu          sync.Mutex
+	batchOpens  int
+	batchWrites int
+	directPuts  int
+	directDels  int
+	// failNextWrite, when true, makes the NEXT Batch.Write() return an
+	// error (used by the crash-pre-commit test to simulate a process
+	// crash mid-reorg without actually killing the test binary).
+	failNextWrite bool
+}
+
+func newCountingDB(inner storage.DB) *countingDB {
+	return &countingDB{inner: inner}
+}
+
+func (c *countingDB) Get(key []byte) ([]byte, error) { return c.inner.Get(key) }
+func (c *countingDB) Has(key []byte) (bool, error)   { return c.inner.Has(key) }
+func (c *countingDB) Put(key, value []byte) error {
+	c.mu.Lock()
+	c.directPuts++
+	c.mu.Unlock()
+	return c.inner.Put(key, value)
+}
+func (c *countingDB) Delete(key []byte) error {
+	c.mu.Lock()
+	c.directDels++
+	c.mu.Unlock()
+	return c.inner.Delete(key)
+}
+func (c *countingDB) NewIterator(prefix []byte) storage.Iterator {
+	return c.inner.NewIterator(prefix)
+}
+func (c *countingDB) Close() error { return c.inner.Close() }
+func (c *countingDB) NewBatch() storage.Batch {
+	c.mu.Lock()
+	c.batchOpens++
+	failNext := c.failNextWrite
+	c.failNextWrite = false
+	c.mu.Unlock()
+	return &countingBatch{
+		owner:    c,
+		inner:    c.inner.NewBatch(),
+		failNext: failNext,
+	}
+}
+
+type countingBatch struct {
+	owner    *countingDB
+	inner    storage.Batch
+	failNext bool
+}
+
+func (b *countingBatch) Put(key, value []byte) { b.inner.Put(key, value) }
+func (b *countingBatch) Delete(key []byte)     { b.inner.Delete(key) }
+func (b *countingBatch) Reset()                { b.inner.Reset() }
+func (b *countingBatch) Len() int              { return b.inner.Len() }
+func (b *countingBatch) Write() error {
+	b.owner.mu.Lock()
+	b.owner.batchWrites++
+	b.owner.mu.Unlock()
+	if b.failNext {
+		return errors.New("countingDB: simulated crash on batch commit")
+	}
+	return b.inner.Write()
+}
+
+// snapshotData copies every key/value out of a MemDB so a test can compare
+// before- and after-reorg state byte-for-byte.
+func snapshotData(t *testing.T, db *storage.MemDB) map[string][]byte {
+	t.Helper()
+	out := make(map[string][]byte)
+	it := db.NewIterator(nil)
+	defer it.Release()
+	for it.Next() {
+		k := append([]byte(nil), it.Key()...)
+		v := append([]byte(nil), it.Value()...)
+		out[string(k)] = v
+	}
+	return out
+}
+
+// buildPatternDFork builds a 4-deep A-chain on the manager and sets up an
+// equivalent-or-heavier-work B-fork from the genesis. Returns the connect
+// path of the B-fork (in connect order) so the caller can drive ReorgTo
+// directly. Helper isolated so all three Pattern D tests share fixture
+// construction.
+func buildPatternDFork(
+	t *testing.T,
+	cm *ChainManager,
+	idx *HeaderIndex,
+	db *storage.ChainDB,
+	params *ChainParams,
+	aLen int,
+	bLen int,
+) (aTip *BlockNode, bTip *BlockNode, bPath []*BlockNode) {
+	t.Helper()
+	genesis := idx.Genesis()
+
+	// A-chain.
+	prev := genesis
+	for i := 0; i < aLen; i++ {
+		blk := createSiblingBlock(t, params, prev, byte(0xA0+i))
+		if _, err := idx.AddHeader(blk.Header); err != nil {
+			t.Fatalf("A%d AddHeader: %v", i+1, err)
+		}
+		if err := db.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
+			t.Fatalf("A%d StoreBlock: %v", i+1, err)
+		}
+		if err := cm.ConnectBlock(blk); err != nil {
+			t.Fatalf("A%d ConnectBlock: %v", i+1, err)
+		}
+		prev = idx.GetNode(blk.Header.BlockHash())
+	}
+	aTip = prev
+
+	// B-chain — same fork point (genesis), distinct extra-nonce so block
+	// hashes diverge.
+	bPrev := genesis
+	bPath = make([]*BlockNode, 0, bLen)
+	for i := 0; i < bLen; i++ {
+		blk := createSiblingBlock(t, params, bPrev, byte(0xB0+i))
+		node, err := idx.AddHeader(blk.Header)
+		if err != nil {
+			t.Fatalf("B%d AddHeader: %v", i+1, err)
+		}
+		if err := db.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
+			t.Fatalf("B%d StoreBlock: %v", i+1, err)
+		}
+		bPath = append(bPath, node)
+		bPrev = node
+	}
+	bTip = bPrev
+	return aTip, bTip, bPath
+}
+
+// TestReorgTo_SingleBatchProperty asserts that a multi-block reorg
+// (disconnect 3, connect 4) opens EXACTLY ONE Pebble batch and commits it
+// EXACTLY ONCE — no per-block batch.Write() inside the reorg span. Pre-
+// Pattern D this would have been disconnect_count + connect_count = 7
+// separate batches plus 3 direct Put/Delete pairs from DisconnectBlock.
+func TestReorgTo_SingleBatchProperty(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	memdb := storage.NewMemDB()
+	counter := newCountingDB(memdb)
+	chainDB := storage.NewChainDB(counter)
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     chainDB,
+	})
+
+	_, _, bPath := buildPatternDFork(t, cm, idx, chainDB, params, 3, 4)
+	bTip := bPath[len(bPath)-1]
+
+	// Reset counters: only the reorg span should be measured.
+	counter.mu.Lock()
+	counter.batchOpens = 0
+	counter.batchWrites = 0
+	counter.directPuts = 0
+	counter.directDels = 0
+	counter.mu.Unlock()
+
+	if err := cm.ReorgTo(bTip); err != nil {
+		t.Fatalf("ReorgTo failed: %v", err)
+	}
+
+	counter.mu.Lock()
+	opens := counter.batchOpens
+	writes := counter.batchWrites
+	puts := counter.directPuts
+	dels := counter.directDels
+	counter.mu.Unlock()
+
+	if opens != 1 {
+		t.Errorf("multi-block reorg opened %d batches, want exactly 1 (Pattern D atomicity)", opens)
+	}
+	if writes != 1 {
+		t.Errorf("multi-block reorg wrote %d batches, want exactly 1 (Pattern D atomicity)", writes)
+	}
+	if puts != 0 {
+		t.Errorf("multi-block reorg issued %d direct Puts; reorg path must batch all writes", puts)
+	}
+	if dels != 0 {
+		t.Errorf("multi-block reorg issued %d direct Deletes; reorg path must batch all writes", dels)
+	}
+
+	// Tip must have advanced to bTip post-commit.
+	if got, h := cm.BestBlock(); got != bTip.Hash || h != bTip.Height {
+		t.Errorf("after reorg: tip = %s height=%d, want %s height=%d",
+			got.String()[:16], h, bTip.Hash.String()[:16], bTip.Height)
+	}
+}
+
+// TestReorgTo_CrashPreCommitPreservesPreReorgState asserts that a simulated
+// crash during the final batch.Write() leaves on-disk state at the pre-
+// reorg tip. We do NOT assert anything about in-memory state (a real crash
+// would lose it on restart anyway); the contract is "either pre OR post
+// state is on disk, never partial".
+func TestReorgTo_CrashPreCommitPreservesPreReorgState(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	memdb := storage.NewMemDB()
+	counter := newCountingDB(memdb)
+	chainDB := storage.NewChainDB(counter)
+
+	// FlushInterval=1 so every per-block ConnectBlock during the A-chain
+	// fixture phase writes chainstate to disk. With the default IBD
+	// behavior (no chainstate writes between flushes) the pre-reorg disk
+	// snapshot would be missing the chainstate key entirely and the
+	// "tip rolled back to A" assertion would have no anchor.
+	cm := NewChainManager(ChainManagerConfig{
+		Params:        params,
+		HeaderIndex:   idx,
+		ChainDB:       chainDB,
+		FlushInterval: 1,
+	})
+
+	aTip, _, bPath := buildPatternDFork(t, cm, idx, chainDB, params, 3, 4)
+	bTip := bPath[len(bPath)-1]
+
+	// Snapshot disk state at the pre-reorg A-tip. This is the state we
+	// expect to see if the crash-pre-commit really did roll the on-disk
+	// world back to before the reorg.
+	preDisk := snapshotData(t, memdb)
+
+	// Arm the next batch to fail on commit. ReorgTo opens one batch for
+	// the whole multi-block reorg, so this fires exactly when ReorgTo is
+	// about to swing the chainstate to bTip.
+	counter.mu.Lock()
+	counter.failNextWrite = true
+	counter.mu.Unlock()
+
+	err := cm.ReorgTo(bTip)
+	if err == nil {
+		t.Fatal("expected ReorgTo to return an error after simulated crash; got nil")
+	}
+
+	// On-disk state must be byte-identical to the pre-reorg snapshot. If
+	// any per-block write had bypassed the union batch (e.g. an
+	// un-refactored DisconnectBlock direct Delete), this map would diverge.
+	postDisk := snapshotData(t, memdb)
+	if len(preDisk) != len(postDisk) {
+		t.Errorf("on-disk key count diverged after simulated crash: pre=%d post=%d (Pattern D requires byte-identical pre-reorg state)",
+			len(preDisk), len(postDisk))
+	}
+	for k, v := range preDisk {
+		got, ok := postDisk[k]
+		if !ok {
+			t.Errorf("post-crash disk missing key %x (had value %x in pre-reorg snapshot)", []byte(k), v)
+			continue
+		}
+		if !bytes.Equal(v, got) {
+			t.Errorf("post-crash disk key %x value diverged: pre=%x post=%x", []byte(k), v, got)
+		}
+	}
+	for k := range postDisk {
+		if _, ok := preDisk[k]; !ok {
+			t.Errorf("post-crash disk has extra key %x not present in pre-reorg snapshot", []byte(k))
+		}
+	}
+
+	// The persisted ChainState must still point at the A-tip.
+	state, gerr := chainDB.GetChainState()
+	if gerr != nil {
+		t.Fatalf("GetChainState after crash: %v", gerr)
+	}
+	if state.BestHash != aTip.Hash {
+		t.Errorf("post-crash on-disk tip = %s, want pre-reorg A-tip %s",
+			state.BestHash.String()[:16], aTip.Hash.String()[:16])
+	}
+	if state.BestHeight != aTip.Height {
+		t.Errorf("post-crash on-disk height = %d, want pre-reorg A-tip height %d",
+			state.BestHeight, aTip.Height)
+	}
+}
+
+// TestReorgTo_MaxReorgDepthCap asserts that a reorg whose disconnect+connect
+// span exceeds MaxReorgDepth is refused with ErrReorgTooDeep instead of
+// silently splitting the work across multiple Pebble commits (which would
+// forfeit the atomicity guarantee).
+//
+// We exercise this with a chain length that crosses the boundary: A-chain
+// of MaxReorgDepth+1 blocks vs B-chain of one heavier block from genesis
+// would force a disconnect of MaxReorgDepth+1 plus a connect of 1 — span
+// MaxReorgDepth+2 — well over the cap.
+func TestReorgTo_MaxReorgDepthCap(t *testing.T) {
+	if MaxReorgDepth < 4 {
+		t.Skipf("MaxReorgDepth=%d too small for this test", MaxReorgDepth)
+	}
+
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	memdb := storage.NewMemDB()
+	chainDB := storage.NewChainDB(memdb)
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     chainDB,
+	})
+
+	// Build A-chain of MaxReorgDepth+1 blocks (each with distinct extra
+	// nonce so headers are unique). Done by hand here rather than via
+	// buildPatternDFork because we want a B-fork that has MORE work
+	// (depth+1) so the reorg actually attempts to fire.
+	genesis := idx.Genesis()
+	prev := genesis
+	for i := 0; i < MaxReorgDepth+1; i++ {
+		blk := createSiblingBlock(t, params, prev, byte(0x40+(i%160)))
+		if _, err := idx.AddHeader(blk.Header); err != nil {
+			t.Fatalf("A%d AddHeader: %v", i+1, err)
+		}
+		if err := chainDB.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
+			t.Fatalf("A%d StoreBlock: %v", i+1, err)
+		}
+		if err := cm.ConnectBlock(blk); err != nil {
+			t.Fatalf("A%d ConnectBlock: %v", i+1, err)
+		}
+		prev = idx.GetNode(blk.Header.BlockHash())
+	}
+
+	// B-chain: MaxReorgDepth+2 blocks rooted at genesis (strictly more
+	// work). We deliberately make B exactly one block longer than A so
+	// the disconnect span (MaxReorgDepth+1) plus connect span
+	// (MaxReorgDepth+2) = 2*MaxReorgDepth+3, which is > MaxReorgDepth.
+	bPrev := genesis
+	for i := 0; i < MaxReorgDepth+2; i++ {
+		blk := createSiblingBlock(t, params, bPrev, byte(0xC0+(i%64)))
+		node, err := idx.AddHeader(blk.Header)
+		if err != nil {
+			t.Fatalf("B%d AddHeader: %v", i+1, err)
+		}
+		if err := chainDB.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
+			t.Fatalf("B%d StoreBlock: %v", i+1, err)
+		}
+		bPrev = node
+	}
+
+	preTipHash, preTipHeight := cm.BestBlock()
+
+	err := cm.ReorgTo(bPrev)
+	if err == nil {
+		t.Fatalf("expected ErrReorgTooDeep, got nil (reorg of span > %d should be refused)", MaxReorgDepth)
+	}
+	if !errors.Is(err, ErrReorgTooDeep) {
+		t.Errorf("expected ErrReorgTooDeep, got %v", err)
+	}
+
+	// Tip must not have moved.
+	postTipHash, postTipHeight := cm.BestBlock()
+	if postTipHash != preTipHash {
+		t.Errorf("tip moved despite ErrReorgTooDeep: pre=%s post=%s",
+			preTipHash.String()[:16], postTipHash.String()[:16])
+	}
+	if postTipHeight != preTipHeight {
+		t.Errorf("tip height moved despite ErrReorgTooDeep: pre=%d post=%d",
+			preTipHeight, postTipHeight)
 	}
 }
