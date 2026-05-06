@@ -593,6 +593,14 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetAddressesByLabelWithWallet(params, walletName)
 	case "getaddressinfo":
 		return s.handleGetAddressInfoWithWallet(params, walletName)
+	case "getbalances":
+		return s.handleGetBalances(walletName)
+	case "lockunspent":
+		return s.handleLockUnspent(params, walletName)
+	case "listlockunspent":
+		return s.handleListLockUnspent(walletName)
+	case "walletcreatefundedpsbt":
+		return s.handleWalletCreateFundedPSBT(params, walletName)
 
 	// PSBT RPCs
 	case "createpsbt":
