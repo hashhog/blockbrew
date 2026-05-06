@@ -480,7 +480,13 @@ func TestSyncManagerHandlesInvalidHeader(t *testing.T) {
 	sm.syncPeer = peer
 	sm.mu.Unlock()
 
-	// Create an invalid header (orphan - unknown parent)
+	// Create an invalid header (orphan - unknown parent).  Since the
+	// 2026-05-06 fix, a single orphan header is no longer treated as a
+	// banning offense — Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
+	// counter must be exhausted first.  See
+	// CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+	// (Pattern B).  Here we deliver 11 successive orphans to drive the
+	// counter past threshold and verify the disconnect path still fires.
 	invalidHeader := createTestBlockHeader(
 		wire.Hash256{0x12, 0x34}, // Unknown parent
 		params.GenesisBlock.Header.Timestamp+600,
@@ -489,12 +495,19 @@ func TestSyncManagerHandlesInvalidHeader(t *testing.T) {
 
 	msg := &MsgHeaders{Headers: []wire.BlockHeader{invalidHeader}}
 
-	// Handle the invalid headers - this should clear the sync peer
-	sm.HandleHeaders(peer, msg)
+	// Under the threshold: peer should NOT be cleared.
+	for i := 0; i < MaxNumUnconnectingHeadersMsgs; i++ {
+		sm.HandleHeaders(peer, msg)
+		if sm.SyncPeer() != peer {
+			t.Fatalf("sync peer cleared at orphan #%d (Core MAX=%d should tolerate)",
+				i+1, MaxNumUnconnectingHeadersMsgs)
+		}
+	}
 
-	// Sync peer should be cleared after receiving bad header
+	// 11th orphan exceeds threshold → sync peer cleared, peer banned.
+	sm.HandleHeaders(peer, msg)
 	if sm.SyncPeer() != nil {
-		t.Error("sync peer should be nil after bad header")
+		t.Error("sync peer should be nil after exceeding MAX_NUM_UNCONNECTING_HEADERS_MSGS")
 	}
 }
 
@@ -1489,5 +1502,130 @@ func TestRequestJitterSpread(t *testing.T) {
 			"without enough spread, 144 getdata timeouts fire as a "+
 			"thundering herd instead of a trickle",
 			draws, spread, minSpreadMs)
+	}
+}
+
+// TestSyncManagerUnconnectingHeadersCounter verifies that 9 successive
+// unconnecting-headers messages do NOT trigger a misbehavior penalty or
+// disconnect, but the 11th one does.  Mirrors Bitcoin Core's
+// MAX_NUM_UNCONNECTING_HEADERS_MSGS=10 behavior in
+// net_processing.cpp::ProcessHeadersMessage.  Pre-fix, blockbrew tripped
+// peer.Misbehaving(20) on the very first orphan header, producing a
+// score-100 ban after 5 honest unconnecting batches (Pattern B in
+// CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md).
+func TestSyncManagerUnconnectingHeadersCounter(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	pm := &PeerManager{peers: make(map[string]*PeerInfo)}
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+		PeerManager: pm,
+	})
+
+	peer := createMockPeer("1.2.3.4:8333", 100)
+	sm.mu.Lock()
+	sm.syncPeer = peer
+	sm.mu.Unlock()
+
+	// Build a header that does NOT connect to genesis: prev_block is a
+	// random hash the peer has never sent us.
+	orphanPrev := wire.Hash256{0xde, 0xad, 0xbe, 0xef}
+	orphanHeader := createTestBlockHeader(orphanPrev,
+		params.GenesisBlock.Header.Timestamp+600, 1)
+	orphanMsg := &MsgHeaders{Headers: []wire.BlockHeader{orphanHeader}}
+
+	// Send 10 successive orphan messages — under the threshold, should NOT
+	// disconnect or accumulate a banning misbehavior score.
+	for i := 1; i <= MaxNumUnconnectingHeadersMsgs; i++ {
+		sm.HandleHeaders(peer, orphanMsg)
+		if peer.ShouldBan() {
+			t.Fatalf("peer flagged for ban after %d unconnecting messages "+
+				"(Core MAX=%d should tolerate)", i, MaxNumUnconnectingHeadersMsgs)
+		}
+		if peer.MisbehaviorScore() != 0 {
+			t.Fatalf("peer misbehavior score = %d after %d unconnecting messages, "+
+				"want 0 (Core: under-threshold = no penalty)",
+				peer.MisbehaviorScore(), i)
+		}
+		sm.mu.RLock()
+		count := sm.unconnectingHeaders[peer.Address()]
+		sm.mu.RUnlock()
+		if count != i {
+			t.Fatalf("unconnecting counter = %d after %d messages, want %d",
+				count, i, i)
+		}
+	}
+
+	// 11th message — exceeds threshold, must Misbehaving + Disconnect.
+	sm.HandleHeaders(peer, orphanMsg)
+	if peer.MisbehaviorScore() != ScoreHeadersDontConnect {
+		t.Errorf("peer misbehavior score after 11th orphan = %d, want %d",
+			peer.MisbehaviorScore(), ScoreHeadersDontConnect)
+	}
+	// After disconnect, the per-peer counter should be cleared.
+	sm.mu.RLock()
+	finalCount := sm.unconnectingHeaders[peer.Address()]
+	sm.mu.RUnlock()
+	if finalCount != 0 {
+		t.Errorf("unconnecting counter should clear after disconnect, got %d", finalCount)
+	}
+}
+
+// TestSyncManagerUnconnectingCounterResetsOnConnect verifies that a
+// successful connecting batch zeroes the unconnecting counter (Core:
+// nUnconnectingHeaders = 0 in the success path of ProcessHeadersMessage).
+func TestSyncManagerUnconnectingCounterResetsOnConnect(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	pm := &PeerManager{peers: make(map[string]*PeerInfo)}
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+		PeerManager: pm,
+	})
+
+	peer := createMockPeer("1.2.3.4:8333", 100)
+	sm.mu.Lock()
+	sm.syncPeer = peer
+	sm.mu.Unlock()
+
+	// Send 5 orphan messages.
+	orphanPrev := wire.Hash256{0xfe, 0xed, 0xfa, 0xce}
+	orphanHeader := createTestBlockHeader(orphanPrev,
+		params.GenesisBlock.Header.Timestamp+600, 1)
+	orphanMsg := &MsgHeaders{Headers: []wire.BlockHeader{orphanHeader}}
+	for i := 0; i < 5; i++ {
+		sm.HandleHeaders(peer, orphanMsg)
+	}
+	sm.mu.RLock()
+	if sm.unconnectingHeaders[peer.Address()] != 5 {
+		t.Fatalf("expected counter=5 after 5 orphans, got %d",
+			sm.unconnectingHeaders[peer.Address()])
+	}
+	sm.mu.RUnlock()
+
+	// Now send a properly-connecting batch (extends from genesis).
+	good := make([]wire.BlockHeader, 3)
+	prevHash := params.GenesisHash
+	prevTs := params.GenesisBlock.Header.Timestamp
+	for i := 0; i < 3; i++ {
+		good[i] = createTestBlockHeader(prevHash, prevTs+600, uint32(100+i))
+		prevHash = good[i].BlockHash()
+		prevTs = good[i].Timestamp
+	}
+	sm.HandleHeaders(peer, &MsgHeaders{Headers: good})
+
+	sm.mu.RLock()
+	count := sm.unconnectingHeaders[peer.Address()]
+	sm.mu.RUnlock()
+	if count != 0 {
+		t.Errorf("unconnecting counter after successful connect = %d, want 0", count)
+	}
+	if peer.ShouldBan() || peer.MisbehaviorScore() != 0 {
+		t.Errorf("peer should not be flagged after successful connect (score=%d ban=%v)",
+			peer.MisbehaviorScore(), peer.ShouldBan())
 	}
 }
