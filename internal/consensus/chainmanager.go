@@ -122,6 +122,29 @@ type ChainManager struct {
 	// embedded mempool re-validation against the new tip's UTXO view sees
 	// a coherent state.
 	onBlockDisconnected func(block *wire.MsgBlock, height int32)
+
+	// onBlockConnected, if set, is invoked once per block whose ConnectBlock
+	// successfully extends the active tip — including each replay inside
+	// ReorgTo. Wired from main.go to chainDB.WriteTxIndex so the txindex
+	// (tx_id → block_hash mapping) is populated even on the submitblock /
+	// reorg paths, not just the IBD-via-SyncManager path. Mirrors Bitcoin
+	// Core's BaseIndex::BlockConnected fan-out (index/base.cpp), which is
+	// invoked from validation.cpp::ConnectTip → MempoolNotifyEnter →
+	// CValidationInterface::BlockConnected.
+	//
+	// Pattern C0 closure for blockbrew (CORE-PARITY-AUDIT
+	// _txindex-revert-on-reorg-fleet-result-2026-05-05.md). The pre-fix
+	// state had WriteTxIndex defined at internal/storage/chaindb.go:332
+	// with zero non-test callers, so getrawtransaction(<txid>) returned
+	// "no such tx" even for confirmed transactions on the active chain.
+	// Stacks on top of today's submitblock-side-branch (4e51e8b) and
+	// Pattern B disconnect (72c23be) work — both of which already exercise
+	// the connect-replay path that this hook now hangs txindex writes off.
+	//
+	// Invoked OUTSIDE cm.mu (same locking discipline as onBlockDisconnected
+	// above) so the hook can take its own locks (chainDB's RocksDB batch
+	// commit) without lock-order risk against cm.mu.
+	onBlockConnected func(block *wire.MsgBlock, height int32)
 }
 
 // ChainManagerConfig configures the chain manager.
@@ -150,6 +173,17 @@ type ChainManagerConfig struct {
 	// lib/sync.ml:2354-2363 which iterates !disconnected_txs and calls
 	// Mempool.add_transaction per non-coinbase tx.
 	OnBlockDisconnected func(block *wire.MsgBlock, height int32)
+
+	// OnBlockConnected, if set, is invoked once per block successfully
+	// connected to the active tip via ConnectBlock — including each replay
+	// inside ReorgTo. Wired from main.go to chainDB.WriteTxIndex (gated by
+	// -txindex) so submitblock + reorg paths write txindex entries, not
+	// just the IBD-via-SyncManager path. Mirrors Bitcoin Core's
+	// BaseIndex::BlockConnected fan-out.
+	//
+	// Pattern C0 closure (2026-05-05). Cross-impl reference: bitcoin-core
+	// src/index/txindex.cpp::TxIndex::CustomAppend.
+	OnBlockConnected func(block *wire.MsgBlock, height int32)
 }
 
 // NewChainManager creates a new chain manager.
@@ -177,6 +211,7 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 		isIBD:               true, // Start in IBD mode
 		sigCache:            sigCache,
 		onBlockDisconnected: config.OnBlockDisconnected,
+		onBlockConnected:    config.OnBlockConnected,
 	}
 
 	// Default to parallel script validation
@@ -381,6 +416,30 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		log.Printf("chainmgr: ConnectBlock height=%d hash=%s txCount=%d tipHeight=%d",
 			node.Height, hash.String()[:16], len(block.Transactions), cm.tipHeight)
 	}
+
+	// connectedBlock + connectedHeight are captured under cm.mu only on the
+	// successful-return path below (just before the lock is released by the
+	// `defer cm.mu.Unlock()` immediately following). The deferred dispatcher
+	// below fires the OnBlockConnected callback OUTSIDE cm.mu so the hook
+	// (e.g. txindex batch commit on RocksDB) cannot deadlock against cm.mu
+	// held by a contending ConnectBlock / DisconnectBlock. Mirrors the
+	// post-unlock discipline used by DisconnectBlock for the symmetric
+	// onBlockDisconnected hook (Pattern B closure 72c23be).
+	//
+	// Pattern C0 closure for blockbrew (CORE-PARITY-AUDIT
+	// _txindex-revert-on-reorg-fleet-result-2026-05-05.md). For ReorgTo,
+	// ConnectBlock is called recursively per replay, so each replay fires
+	// its own onBlockConnected naturally.
+	var (
+		connectedBlock  *wire.MsgBlock
+		connectedHeight int32
+		connectedCB     func(*wire.MsgBlock, int32)
+	)
+	defer func() {
+		if connectedCB != nil && connectedBlock != nil {
+			connectedCB(connectedBlock, connectedHeight)
+		}
+	}()
 
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
@@ -931,6 +990,18 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		cm.phaseStatsMaxFirstValNs = 0
 	}
 
+	// Pattern C0 closure (2026-05-05): hand the just-connected block to the
+	// onBlockConnected callback for txindex writes. Captured here, fired
+	// post-unlock by the deferred dispatcher at the top of this function so
+	// the hook can take its own locks (chainDB batch commit) without
+	// lock-order risk against cm.mu.
+	// Cross-impl reference: bitcoin-core/src/index/txindex.cpp.
+	if cm.onBlockConnected != nil {
+		connectedBlock = block
+		connectedHeight = node.Height
+		connectedCB = cm.onBlockConnected
+	}
+
 	return nil
 }
 
@@ -1066,6 +1137,21 @@ func (cm *ChainManager) collectPrevTimestamps(node *BlockNode, count int) []uint
 func (cm *ChainManager) SetOnBlockDisconnected(cb func(block *wire.MsgBlock, height int32)) {
 	cm.mu.Lock()
 	cm.onBlockDisconnected = cb
+	cm.mu.Unlock()
+}
+
+// SetOnBlockConnected installs (or replaces) the block-connected callback
+// after construction. The callback fires once per block successfully
+// connected to the active tip in ConnectBlock, including each replay inside
+// ReorgTo. Used by main.go to wire chain manager → txindex writes
+// (Pattern C0 closure for blockbrew).
+//
+// Reference: bitcoin-core/src/index/txindex.cpp + index/base.cpp.
+// Cross-impl: stacks on top of SetOnBlockDisconnected (Pattern B, 72c23be)
+// using the identical post-unlock dispatch discipline.
+func (cm *ChainManager) SetOnBlockConnected(cb func(block *wire.MsgBlock, height int32)) {
+	cm.mu.Lock()
+	cm.onBlockConnected = cb
 	cm.mu.Unlock()
 }
 
