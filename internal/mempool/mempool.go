@@ -48,6 +48,16 @@ var (
 	ErrTooManyAncestors   = errors.New("too many unconfirmed ancestors")
 	ErrTooManyDescendants = errors.New("too many descendants for an unconfirmed parent")
 
+	// Ancestor/descendant size limits in kvB
+	// (Core DEFAULT_ANCESTOR_SIZE_LIMIT_KVB / DEFAULT_DESCENDANT_SIZE_LIMIT_KVB, both 101).
+	ErrAncestorSizeTooLarge   = errors.New("exceeds ancestor size limit")
+	ErrDescendantSizeTooLarge = errors.New("exceeds descendant size limit")
+
+	// BIP-125 Rule 2 (MempoolFullRBF disabled): replacement must not introduce
+	// new unconfirmed inputs that were not already in the original conflicting
+	// transactions or their in-mempool ancestors.
+	ErrRBFNewUnconfirmedInput = errors.New("replacement adds new unconfirmed input not in conflicts' ancestor set")
+
 	// Package validation errors.
 	ErrPackageEmpty            = errors.New("package is empty")
 	ErrPackageTooManyTxs       = errors.New("package exceeds maximum transaction count")
@@ -67,6 +77,18 @@ const (
 
 	// SequenceFinal is the maximum sequence number (disables RBF signaling).
 	SequenceFinal = 0xFFFFFFFF
+
+	// MaxBIP125RBFSequence is the largest nSequence value that opts a
+	// transaction in to BIP-125 replaceability. Mirrors Bitcoin Core's
+	// `MAX_BIP125_RBF_SEQUENCE = 0xfffffffd` (`src/util/rbf.h:12`,
+	// SEQUENCE_FINAL−2). A tx signals RBF iff at least one input has
+	// nSequence <= MaxBIP125RBFSequence.
+	//
+	// Note: this is intentionally tighter than the historical "any
+	// nSequence < SEQUENCE_FINAL signals" reading. Wallets that set
+	// nSequence = 0xfffffffe (anti-fee-snipe locktime, no RBF intent)
+	// must NOT be marked replaceable.
+	MaxBIP125RBFSequence uint32 = 0xFFFFFFFD
 )
 
 // Package relay constants (BIP331 / Bitcoin Core policy).
@@ -80,7 +102,8 @@ const (
 )
 
 // Ancestor/descendant chain limits matching Bitcoin Core
-// (src/policy/policy.h DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT).
+// (src/kernel/mempool_limits.h DEFAULT_ANCESTOR_LIMIT /
+// DEFAULT_DESCENDANT_LIMIT and DEFAULT_{ANCESTOR,DESCENDANT}_SIZE_LIMIT_KVB).
 const (
 	// DefaultAncestorLimit is the maximum number of in-mempool ancestors a tx
 	// may have (including itself).
@@ -89,6 +112,21 @@ const (
 	// DefaultDescendantLimit is the maximum number of in-mempool descendants
 	// a tx may have (including itself).
 	DefaultDescendantLimit = 25
+
+	// DefaultAncestorSizeLimitKvB caps the total virtual size (kvB) of a
+	// transaction's in-mempool ancestor set, including itself. Matches
+	// Core's `DEFAULT_ANCESTOR_SIZE_LIMIT_KVB = 101`. A short chain of
+	// large transactions may respect the count cap and still violate this.
+	DefaultAncestorSizeLimitKvB = 101
+
+	// DefaultDescendantSizeLimitKvB caps the total virtual size (kvB) of
+	// any in-mempool ancestor's descendant set, including itself. Matches
+	// Core's `DEFAULT_DESCENDANT_SIZE_LIMIT_KVB = 101`.
+	DefaultDescendantSizeLimitKvB = 101
+
+	// vbytesPerKvB is the byte/vbyte conversion factor used by the kvB-
+	// denominated mempool limits. 1 kvB = 1000 vB.
+	vbytesPerKvB = 1000
 )
 
 // ChainState is the read-only view of the active chain that the mempool needs
@@ -429,10 +467,12 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		return err
 	}
 
-	// 10c. Ancestor/descendant count limits (Core DEFAULT_ANCESTOR_LIMIT /
-	//      DEFAULT_DESCENDANT_LIMIT, both = 25). Reject before mutating
-	//      cluster/pool state so a rejection is side-effect free.
-	if err := mp.checkChainLimitsLocked(tx); err != nil {
+	// 10c. Ancestor/descendant count + size limits (Core
+	//      DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT = 25 and
+	//      DEFAULT_{ANCESTOR,DESCENDANT}_SIZE_LIMIT_KVB = 101). Reject
+	//      before mutating cluster/pool state so a rejection is
+	//      side-effect free.
+	if err := mp.checkChainLimitsWithSizeLocked(tx, vsize); err != nil {
 		return err
 	}
 
@@ -739,14 +779,24 @@ func (mp *Mempool) checkSequenceLocksLocked(tx *wire.MsgTx) error {
 	return nil
 }
 
-// checkChainLimitsLocked enforces ancestor/descendant count limits when
-// adding a new transaction. Mirrors Bitcoin Core's CalculateMemPoolAncestors
-// failure path (DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT, both 25).
+// checkChainLimitsLocked enforces ancestor/descendant count + size limits
+// when adding a new transaction. Mirrors Bitcoin Core's
+// CalculateMemPoolAncestors failure path
+// (DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT, both 25;
+// DEFAULT_ANCESTOR_SIZE_LIMIT_KVB / DEFAULT_DESCENDANT_SIZE_LIMIT_KVB,
+// both 101 kvB = 101_000 vB).
 //
-// Counts include the transaction itself (Core's
+// Counts and sizes include the transaction itself (Core's
 // "ancestor count = 1 + parent count" / "descendant count = 1 + child count"
-// semantics). Must be called with mu held.
+// semantics). The candidate's vsize is supplied via candidateVSize; when
+// the caller does not yet know it (legacy callers) it may pass 0 and the
+// size cap will be evaluated against ancestors only — count caps still
+// apply. Must be called with mu held.
 func (mp *Mempool) checkChainLimitsLocked(tx *wire.MsgTx) error {
+	return mp.checkChainLimitsWithSizeLocked(tx, 0)
+}
+
+func (mp *Mempool) checkChainLimitsWithSizeLocked(tx *wire.MsgTx, candidateVSize int64) error {
 	// Ancestor limit: candidate + union of ancestor-sets of its mempool parents.
 	// Build the union by visiting each parent, then expanding via Depends.
 	ancestorSet := make(map[wire.Hash256]bool)
@@ -773,9 +823,25 @@ func (mp *Mempool) checkChainLimitsLocked(tx *wire.MsgTx) error {
 			len(ancestorSet)+1, DefaultAncestorLimit)
 	}
 
+	// Ancestor SIZE limit (Core DEFAULT_ANCESTOR_SIZE_LIMIT_KVB, 101 kvB):
+	// sum of vsizes of all ancestors plus the candidate.
+	maxAncestorBytes := int64(DefaultAncestorSizeLimitKvB) * vbytesPerKvB
+	var ancestorBytes int64
+	for ancHash := range ancestorSet {
+		if entry, ok := mp.pool[ancHash]; ok {
+			ancestorBytes += entry.Size
+		}
+	}
+	totalAncestorBytes := ancestorBytes + candidateVSize
+	if totalAncestorBytes > maxAncestorBytes {
+		return fmt.Errorf("%w: %d vB > %d vB",
+			ErrAncestorSizeTooLarge, totalAncestorBytes, maxAncestorBytes)
+	}
+
 	// Descendant limit: for each in-mempool ancestor of the candidate, adding
 	// the candidate would push that ancestor's descendant-set by one. Core
 	// counts descendants-including-self; the candidate is a new descendant.
+	maxDescendantBytes := int64(DefaultDescendantSizeLimitKvB) * vbytesPerKvB
 	for ancHash := range ancestorSet {
 		descVisited := make(map[wire.Hash256]bool)
 		descs := mp.collectDescendantsLocked(ancHash, descVisited)
@@ -785,6 +851,22 @@ func (mp *Mempool) checkChainLimitsLocked(tx *wire.MsgTx) error {
 			return fmt.Errorf("%w: ancestor %s would have %d descendants > %d",
 				ErrTooManyDescendants, ancHash, len(descs)+2,
 				DefaultDescendantLimit)
+		}
+
+		// Descendant SIZE limit: ancestor.Size + sum(descendant vsizes) + candidate.
+		var descBytes int64
+		if anc, ok := mp.pool[ancHash]; ok {
+			descBytes = anc.Size
+		}
+		for _, dHash := range descs {
+			if d, ok := mp.pool[dHash]; ok {
+				descBytes += d.Size
+			}
+		}
+		descBytes += candidateVSize
+		if descBytes > maxDescendantBytes {
+			return fmt.Errorf("%w: ancestor %s would have descendant size %d vB > %d vB",
+				ErrDescendantSizeTooLarge, ancHash, descBytes, maxDescendantBytes)
 		}
 	}
 	return nil
@@ -1396,8 +1478,24 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 		}
 	}
 
-	// BIP125 Rule 2: The replacement must not contain any new unconfirmed inputs
-	// that weren't already in the original transactions. (Relaxed in practice.)
+	// BIP125 Rule 2: the replacement must not introduce any new unconfirmed
+	// inputs that were not already known when the conflicts entered the
+	// mempool. Concretely, every mempool-resident parent of the replacement
+	// must either be one of the directly-conflicting txs, or itself a
+	// mempool ancestor of one of those conflicts. This prevents an attacker
+	// from forcing extra mempool work / state churn by pulling in fresh
+	// unconfirmed dependencies that the original conflicts never depended on
+	// (DoS surface called out in BIP-125 and Core's
+	// `policy/rbf.cpp::EntriesAndTxidsDisjoint` companion check).
+	//
+	// Reference: `bitcoin-core/src/policy/rbf.cpp` and
+	// `bitcoin-core/src/util/rbf.h`. (Core master folded the explicit
+	// `HasNoNewUnconfirmed` check into the cluster mempool's
+	// EntriesAndTxidsDisjoint + change-set logic; for blockbrew's
+	// BIP-125-style enforcement we keep the classic check.)
+	if err := mp.checkRBFNoNewUnconfirmedInputsLocked(newTx, conflicting); err != nil {
+		return err
+	}
 
 	// BIP125 Rule 3: The replacement must pay an absolute fee higher than
 	// the total fees of all conflicting transactions.
@@ -1460,13 +1558,58 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 }
 
 // signalsRBF returns true if the transaction signals BIP125 replaceability.
+//
+// A transaction opts in to RBF iff at least one input has
+// nSequence <= MAX_BIP125_RBF_SEQUENCE (0xfffffffd, SEQUENCE_FINAL−2).
+// Mirrors `bitcoin-core/src/util/rbf.cpp::SignalsOptInRBF`.
+//
+// Crucially this is NOT `< SEQUENCE_FINAL`: nSequence == 0xfffffffe
+// (the anti-fee-snipe value used by many wallets that have no RBF
+// intent) must be treated as non-signaling.
 func signalsRBF(tx *wire.MsgTx) bool {
 	for _, in := range tx.TxIn {
-		if in.Sequence < SequenceFinal {
+		if in.Sequence <= MaxBIP125RBFSequence {
 			return true
 		}
 	}
 	return false
+}
+
+// checkRBFNoNewUnconfirmedInputsLocked enforces BIP-125 Rule 2: every
+// mempool-resident parent of the replacement transaction must either be
+// one of the directly-conflicting txs, or a mempool ancestor of one of
+// those conflicts. Confirmed (UTXO-set) inputs are always allowed. Must
+// be called with mu held.
+func (mp *Mempool) checkRBFNoNewUnconfirmedInputsLocked(
+	newTx *wire.MsgTx,
+	conflicting map[wire.Hash256]bool,
+) error {
+	// Build the closure: { conflict txids } ∪ { ancestors of each conflict }.
+	allowed := make(map[wire.Hash256]bool, len(conflicting)*4)
+	for cHash := range conflicting {
+		allowed[cHash] = true
+		visited := make(map[wire.Hash256]bool)
+		for _, anc := range mp.collectAncestorsLocked(cHash, visited) {
+			allowed[anc] = true
+		}
+	}
+
+	// Any input whose previous-output hash is in the mempool but NOT in
+	// the allowed closure is a "new unconfirmed input". Inputs that
+	// reference confirmed UTXOs (i.e., outpoints not in mp.pool) are fine.
+	for _, in := range newTx.TxIn {
+		parentHash := in.PreviousOutPoint.Hash
+		if _, inMempool := mp.pool[parentHash]; !inMempool {
+			continue
+		}
+		if !allowed[parentHash] {
+			return fmt.Errorf("%w: input %s:%d references unconfirmed parent %s "+
+				"that is not a conflict or conflict-ancestor",
+				ErrRBFNewUnconfirmedInput,
+				parentHash, in.PreviousOutPoint.Index, parentHash)
+		}
+	}
+	return nil
 }
 
 // Ensure Mempool implements consensus.UTXOView
@@ -1915,8 +2058,8 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 		return 0, 0, err
 	}
 
-	// Ancestor/descendant chain limits.
-	if err := mp.checkChainLimitsLocked(tx); err != nil {
+	// Ancestor/descendant chain limits (count + size).
+	if err := mp.checkChainLimitsWithSizeLocked(tx, vsize); err != nil {
 		return 0, 0, err
 	}
 
