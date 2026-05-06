@@ -1740,3 +1740,297 @@ func TestProcessSubmittedBlock_ReorgsToHeavierBranch(t *testing.T) {
 		t.Errorf("displaced A2 not in header index")
 	}
 }
+
+// ============================================================================
+// Pattern B closure (2026-05-05) — mempool refill on disconnect.
+//
+// Cross-impl reference: camlcoin lib/sync.ml:2354-2363 (the canonical shape).
+// Stacks on Pattern Y closure 4e51e8b. Corpus entry:
+// tools/diff-test-corpus/regression/mempool-refill-on-reorg.
+//
+// Pre-fix: ChainManager.DisconnectBlock had no callback; the existing
+// mempool helper at internal/mempool/mempool.go::BlockDisconnected (line
+// 1251) was unwired. On a reorg, valid txs from the disconnected chain
+// silently disappeared.
+//
+// Post-fix: NewChainManager accepts an OnBlockDisconnected callback (also
+// settable post-construction via SetOnBlockDisconnected). DisconnectBlock
+// fires the callback after the lock is released, once per popped block.
+// main.go wires it to mp.BlockDisconnected so non-coinbase txs from each
+// disconnected block get re-fed into the mempool — matching Bitcoin Core's
+// MaybeUpdateMempoolForReorg in validation.cpp::DisconnectTip.
+// ============================================================================
+
+// TestDisconnectBlock_FiresOnBlockDisconnectedCallback exercises the
+// per-disconnect callback wiring. Build a chain genesis -> A1 (no spend
+// tx, just coinbase), call DisconnectBlock(A1.hash), assert the callback
+// fired exactly once with the popped block + its pre-disconnect height.
+func TestDisconnectBlock_FiresOnBlockDisconnectedCallback(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	type fired struct {
+		blockHash wire.Hash256
+		height    int32
+		txCount   int
+	}
+	var observed []fired
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+		OnBlockDisconnected: func(block *wire.MsgBlock, height int32) {
+			observed = append(observed, fired{
+				blockHash: block.Header.BlockHash(),
+				height:    height,
+				txCount:   len(block.Transactions),
+			})
+		},
+	})
+
+	genesis := idx.Genesis()
+	a1 := createTestBlock(t, params, genesis, nil)
+	a1Hash := a1.Header.BlockHash()
+	if _, err := idx.AddHeader(a1.Header); err != nil {
+		t.Fatalf("add A1 header: %v", err)
+	}
+	if err := db.StoreBlock(a1Hash, a1); err != nil {
+		t.Fatalf("store A1: %v", err)
+	}
+	if err := cm.ConnectBlock(a1); err != nil {
+		t.Fatalf("connect A1: %v", err)
+	}
+
+	if _, h := cm.BestBlock(); h != 1 {
+		t.Fatalf("post-connect tip height = %d, want 1", h)
+	}
+
+	if err := cm.DisconnectBlock(a1Hash); err != nil {
+		t.Fatalf("disconnect A1: %v", err)
+	}
+
+	if len(observed) != 1 {
+		t.Fatalf("OnBlockDisconnected fired %d times, want 1; observed=%+v", len(observed), observed)
+	}
+	if observed[0].blockHash != a1Hash {
+		t.Errorf("callback block hash = %s, want %s",
+			observed[0].blockHash.String()[:16], a1Hash.String()[:16])
+	}
+	if observed[0].height != 1 {
+		t.Errorf("callback height = %d, want 1 (pre-disconnect tip height)",
+			observed[0].height)
+	}
+	if observed[0].txCount != 1 {
+		t.Errorf("callback block tx count = %d, want 1 (coinbase only)",
+			observed[0].txCount)
+	}
+}
+
+// TestSetOnBlockDisconnected_PostConstruction verifies the post-construction
+// setter also works. This is the wiring pattern main.go uses (mempool is
+// constructed AFTER the chain manager, so SetOnBlockDisconnected is the
+// natural seam).
+func TestSetOnBlockDisconnected_PostConstruction(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	var fireCount int
+	cm.SetOnBlockDisconnected(func(block *wire.MsgBlock, height int32) {
+		fireCount++
+	})
+
+	genesis := idx.Genesis()
+	a1 := createTestBlock(t, params, genesis, nil)
+	if _, err := idx.AddHeader(a1.Header); err != nil {
+		t.Fatalf("add A1 header: %v", err)
+	}
+	if err := db.StoreBlock(a1.Header.BlockHash(), a1); err != nil {
+		t.Fatalf("store A1: %v", err)
+	}
+	if err := cm.ConnectBlock(a1); err != nil {
+		t.Fatalf("connect A1: %v", err)
+	}
+	if err := cm.DisconnectBlock(a1.Header.BlockHash()); err != nil {
+		t.Fatalf("disconnect A1: %v", err)
+	}
+
+	if fireCount != 1 {
+		t.Errorf("post-construction callback fired %d times, want 1", fireCount)
+	}
+}
+
+// TestReorgTo_FiresOnBlockDisconnectedPerPeel exercises the multi-block
+// peel inside ReorgTo. Build chain A (A1, A2) and a heavier chain B (B1,
+// B2, B3). After ReorgTo(B3), the callback must have fired EXACTLY twice
+// — once for A2 (peeled first), once for A1 (peeled second). Order matters
+// (Core peels tip-down).
+func TestReorgTo_FiresOnBlockDisconnectedPerPeel(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	type fired struct {
+		hash   wire.Hash256
+		height int32
+	}
+	var peeled []fired
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+		OnBlockDisconnected: func(block *wire.MsgBlock, height int32) {
+			peeled = append(peeled, fired{block.Header.BlockHash(), height})
+		},
+	})
+
+	genesis := idx.Genesis()
+
+	// Chain A: A1, A2 (becomes initial tip).
+	a1 := createTestBlock(t, params, genesis, nil)
+	nodeA1, err := idx.AddHeader(a1.Header)
+	if err != nil {
+		t.Fatalf("A1 header: %v", err)
+	}
+	if err := db.StoreBlock(a1.Header.BlockHash(), a1); err != nil {
+		t.Fatalf("A1 store: %v", err)
+	}
+	if err := cm.ConnectBlock(a1); err != nil {
+		t.Fatalf("A1 connect: %v", err)
+	}
+
+	a2 := createTestBlock(t, params, nodeA1, nil)
+	if _, err := idx.AddHeader(a2.Header); err != nil {
+		t.Fatalf("A2 header: %v", err)
+	}
+	if err := db.StoreBlock(a2.Header.BlockHash(), a2); err != nil {
+		t.Fatalf("A2 store: %v", err)
+	}
+	if err := cm.ConnectBlock(a2); err != nil {
+		t.Fatalf("A2 connect: %v", err)
+	}
+
+	// Chain B: B1, B2, B3 (heavier). Use createSiblingBlock for distinct hashes.
+	b1 := createSiblingBlock(t, params, genesis, 0xB1)
+	nodeB1, err := idx.AddHeader(b1.Header)
+	if err != nil {
+		t.Fatalf("B1 header: %v", err)
+	}
+	if err := db.StoreBlock(b1.Header.BlockHash(), b1); err != nil {
+		t.Fatalf("B1 store: %v", err)
+	}
+
+	b2 := createSiblingBlock(t, params, nodeB1, 0xB2)
+	nodeB2, err := idx.AddHeader(b2.Header)
+	if err != nil {
+		t.Fatalf("B2 header: %v", err)
+	}
+	if err := db.StoreBlock(b2.Header.BlockHash(), b2); err != nil {
+		t.Fatalf("B2 store: %v", err)
+	}
+
+	b3 := createSiblingBlock(t, params, nodeB2, 0xB3)
+	nodeB3, err := idx.AddHeader(b3.Header)
+	if err != nil {
+		t.Fatalf("B3 header: %v", err)
+	}
+	if err := db.StoreBlock(b3.Header.BlockHash(), b3); err != nil {
+		t.Fatalf("B3 store: %v", err)
+	}
+
+	// Trigger the reorg — A2 then A1 must be peeled, B1 B2 B3 connected.
+	if err := cm.ReorgTo(nodeB3); err != nil {
+		t.Fatalf("ReorgTo(B3): %v", err)
+	}
+
+	if len(peeled) != 2 {
+		t.Fatalf("OnBlockDisconnected fired %d times during reorg, want 2; observed=%+v",
+			len(peeled), peeled)
+	}
+	// Tip-down peel order: A2 first (height 2), then A1 (height 1).
+	if peeled[0].hash != a2.Header.BlockHash() || peeled[0].height != 2 {
+		t.Errorf("first peel = (%s, h=%d), want (A2, h=2)",
+			peeled[0].hash.String()[:16], peeled[0].height)
+	}
+	if peeled[1].hash != a1.Header.BlockHash() || peeled[1].height != 1 {
+		t.Errorf("second peel = (%s, h=%d), want (A1, h=1)",
+			peeled[1].hash.String()[:16], peeled[1].height)
+	}
+}
+
+// TestReorgViaProcessSubmittedBlock_FiresDisconnectedCallback ties the
+// Pattern B closure to the Pattern Y dispatcher: when a submitblock-driven
+// reorg fires (ProcessSubmittedBlock → ReorgTo), the disconnect callback
+// must fire for every peeled block. This is the closure path the corpus
+// entry mempool-refill-on-reorg exercises end-to-end (post-Pattern-Y, every
+// fleet entity now hits ReorgTo for B3; Pattern B is the downstream gap).
+func TestReorgViaProcessSubmittedBlock_FiresDisconnectedCallback(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	var peelCount int
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+		OnBlockDisconnected: func(block *wire.MsgBlock, height int32) {
+			peelCount++
+		},
+	})
+
+	genesis := idx.Genesis()
+
+	// A-chain: 2 blocks (becomes initial active tip).
+	a1 := createSiblingBlock(t, params, genesis, 0xA1)
+	if err := submitBlockToManager(t, cm, idx, db, a1); err != nil {
+		t.Fatalf("A1: %v", err)
+	}
+	a1Node := idx.GetNode(a1.Header.BlockHash())
+
+	a2 := createSiblingBlock(t, params, a1Node, 0xA2)
+	if err := submitBlockToManager(t, cm, idx, db, a2); err != nil {
+		t.Fatalf("A2: %v", err)
+	}
+
+	// B-chain: 3 blocks (heavier). B1+B2 stored as side-branch, B3 triggers reorg.
+	b1 := createSiblingBlock(t, params, genesis, 0xB1)
+	if err := submitBlockToManager(t, cm, idx, db, b1); !errors.Is(err, ErrSideBranchAccepted) {
+		t.Fatalf("B1: want ErrSideBranchAccepted, got %v", err)
+	}
+	b1Node := idx.GetNode(b1.Header.BlockHash())
+
+	b2 := createSiblingBlock(t, params, b1Node, 0xB2)
+	if err := submitBlockToManager(t, cm, idx, db, b2); !errors.Is(err, ErrSideBranchAccepted) {
+		t.Fatalf("B2: want ErrSideBranchAccepted, got %v", err)
+	}
+	b2Node := idx.GetNode(b2.Header.BlockHash())
+
+	// Up to here: tip is still A2; no disconnects have fired yet.
+	if peelCount != 0 {
+		t.Fatalf("pre-reorg peel count = %d, want 0", peelCount)
+	}
+
+	// B3: heavier-tip → ProcessSubmittedBlock → ReorgTo → A2,A1 peeled.
+	b3 := createSiblingBlock(t, params, b2Node, 0xB3)
+	if err := submitBlockToManager(t, cm, idx, db, b3); err != nil {
+		t.Fatalf("B3 (reorg): %v", err)
+	}
+
+	// Both A1 and A2 must have been peeled exactly once each.
+	if peelCount != 2 {
+		t.Errorf("submitblock-driven reorg peel count = %d, want 2 (A2 + A1)", peelCount)
+	}
+	if got, h := cm.BestBlock(); got != b3.Header.BlockHash() || h != 3 {
+		t.Errorf("post-reorg tip = (%s, h=%d), want (B3, h=3)", got.String()[:16], h)
+	}
+}
