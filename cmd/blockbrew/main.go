@@ -55,6 +55,21 @@ type Config struct {
 	MinRelayFee  float64
 	PrintVersion bool
 
+	// Rest enables Bitcoin Core's REST HTTP surface
+	// (`/rest/block/...`, `/rest/tx/...`, `/rest/chaininfo.json`, etc.) on
+	// the same socket as the JSON-RPC server. Default false, matching
+	// Bitcoin Core's `-rest=0` default (init.cpp). When true, the handlers
+	// implemented in `internal/rpc/rest.go::RegisterRESTHandlers` are
+	// mounted on the RPC mux at startup and serve unauthenticated GETs
+	// under `/rest/`. JSON-RPC POST routes are unaffected and still
+	// require auth. Mirrors Core: see `bitcoin-core/src/rest.cpp`
+	// `uri_prefixes` and `init.cpp`'s `-rest` argspec.
+	//
+	// Pre-fix the `RPCConfig.RESTEnabled` field existed but no CLI flag
+	// fed it, so the implemented REST handlers were unreachable in
+	// production binaries (audit `_rest-api-cross-impl-audit-2026-05-06-part1.md`).
+	Rest bool
+
 	// Performance profiling
 	PprofAddr       string
 	ParallelScripts bool
@@ -401,6 +416,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.WalletFile, "wallet", "wallet.dat", "Wallet file name")
 	flag.StringVar(&cfg.LogLevel, "loglevel", "info", "Log level (debug, info, warn, error)")
 	flag.BoolVar(&cfg.TxIndex, "txindex", false, "Enable transaction index")
+	flag.BoolVar(&cfg.Rest, "rest", false, "Accept public REST requests on the JSON-RPC socket (Core parity: default off). When true, handlers under `/rest/` (block, tx, headers, blockhashbyheight, chaininfo, mempool/{info,contents}, getutxos) are mounted unauthenticated; JSON-RPC POST endpoints still require auth. Mirrors Bitcoin Core's `-rest=1`.")
 	flag.Int64Var(&cfg.MaxMempool, "maxmempool", 300, "Maximum mempool size in MB")
 	flag.Float64Var(&cfg.MinRelayFee, "minrelayfee", 0.00001, "Minimum relay fee (BTC/kvB)")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "Print version and exit")
@@ -1109,6 +1125,11 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			// flag was passed on the command line. See chainMgr.SetOnBlockConnected
 			// wiring above (the storage-side counterpart).
 			TxIndex: cfg.TxIndex,
+			// REST surface (`/rest/...`). Off by default (Core parity).
+			// See `internal/rpc/rest.go` for the handler set; the audit
+			// at `_rest-api-cross-impl-audit-2026-05-06-part1.md` flagged
+			// the missing CLI plumbing as RED-2 (P1 dead code).
+			RESTEnabled: cfg.Rest,
 		},
 		rpc.WithCookiePassword(cookiePassword),
 		rpc.WithChainParams(chainParams),
