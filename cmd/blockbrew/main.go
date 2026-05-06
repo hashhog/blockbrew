@@ -760,9 +760,59 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// Stacks on top of Pattern Y closure 4e51e8b which made
 	// submitblock-driven reorgs flow through ReorgTo at all.
 	// See CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
+	//
+	// Pattern C0 closure (2026-05-05) — when -txindex is enabled, also fan
+	// the disconnect into chainDB.DeleteTxIndex per tx (including coinbase)
+	// so the stored tx_id → block_hash mapping is reverted when its block
+	// leaves the active chain. Mirrors Bitcoin Core's
+	// BaseIndex::BlockDisconnected → CustomRemove fan-out for the txindex
+	// (index/txindex.cpp). Symmetric with the SetOnBlockConnected handler
+	// below: every tx written on connect is deleted on disconnect.
 	chainMgr.SetOnBlockDisconnected(func(block *wire.MsgBlock, height int32) {
 		mp.BlockDisconnected(block)
+		if cfg.TxIndex && chainDB != nil {
+			for _, tx := range block.Transactions {
+				txid := tx.TxHash()
+				if err := chainDB.DeleteTxIndex(txid); err != nil {
+					log.Printf("txindex: delete %s on disconnect height=%d failed: %v",
+						txid.String()[:16], height, err)
+				}
+			}
+		}
 	})
+
+	// Pattern C0 closure (2026-05-05) — wire chain → txindex on connect.
+	// ChainManager's ConnectBlock fires this for every block successfully
+	// connected to the active tip (including each replay inside ReorgTo).
+	// Pre-fix, chainDB.WriteTxIndex was defined at
+	// internal/storage/chaindb.go:332 with zero non-test callers, so
+	// `getrawtransaction(<txid>)` returned "no such tx" even for confirmed
+	// transactions on the active chain. Mirrors Bitcoin Core's
+	// BaseIndex::BlockConnected → CustomAppend fan-out
+	// (index/base.cpp + index/txindex.cpp).
+	//
+	// Stacks on top of:
+	//   - 4e51e8b (Pattern Y): submitblock side-branch acceptance — the
+	//     ProcessSubmittedBlock path that exercises this hook.
+	//   - 72c23be (Pattern B): symmetric onBlockDisconnected hook used for
+	//     the matching txindex revert on disconnect (above).
+	//
+	// Genesis is exempt — ConnectBlock returns early for height 0 and the
+	// onBlockConnected fire is skipped (genesis coinbase is unspendable).
+	// All non-genesis coinbases ARE indexed to match Core (`-txindex` in
+	// Core covers every confirmed tx including coinbases).
+	if cfg.TxIndex && chainDB != nil {
+		chainMgr.SetOnBlockConnected(func(block *wire.MsgBlock, height int32) {
+			blockHash := block.Header.BlockHash()
+			for _, tx := range block.Transactions {
+				txid := tx.TxHash()
+				if err := chainDB.WriteTxIndex(txid, blockHash); err != nil {
+					log.Printf("txindex: write %s @ height=%d failed: %v",
+						txid.String()[:16], height, err)
+				}
+			}
+		})
+	}
 
 	// 6b. Initialize fee estimator
 	feeEstimator := mempool.NewFeeEstimator()
@@ -1052,6 +1102,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			ListenAddr: cfg.ListenRPC,
 			Username:   cfg.RPCUser,
 			Password:   cfg.RPCPassword,
+			// Pattern C0 closure (2026-05-05): plumb -txindex through to the
+			// RPC server so getrawtransaction's txindex lookup branch is
+			// reachable. Pre-fix this field defaulted to false and the
+			// handler short-circuited with "Use -txindex" even when the
+			// flag was passed on the command line. See chainMgr.SetOnBlockConnected
+			// wiring above (the storage-side counterpart).
+			TxIndex: cfg.TxIndex,
 		},
 		rpc.WithCookiePassword(cookiePassword),
 		rpc.WithChainParams(chainParams),
