@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/storage"
@@ -1458,5 +1459,284 @@ func TestAtomicShutdownFlushBatch(t *testing.T) {
 	}
 	if state.BestHeight != 3 || state.BestHash != bestHash {
 		t.Errorf("chain state mismatch: got h=%d hash=%s", state.BestHeight, state.BestHash.String()[:16])
+	}
+}
+
+// ============================================================================
+// Pattern Y closure (2026-05-05) — submitblock side-branch acceptance.
+//
+// Cross-impl reference fix: rustoshi 68a422b. Corpus entry:
+// tools/diff-test-corpus/regression/reorg-via-submitblock.
+//
+// Pre-fix: handleSubmitBlock unconditionally called ConnectBlock, which
+// rejected any block whose parent was not the active tip with a generic
+// "rejected" string — even though the parent was already in the header
+// index. The reorg dispatcher could never fire for a competing fork because
+// the first competing-branch block was dropped on arrival.
+//
+// Post-fix: ProcessSubmittedBlock decouples block storage (header index +
+// chainDB.StoreBlock) from active-chain extension. Mirrors Bitcoin Core's
+// AcceptBlock + ActivateBestChain split (validation.cpp).
+// ============================================================================
+
+// createSiblingBlock creates a block at the same height as a previously-mined
+// sibling but with different content (extranonce in the coinbase scriptSig)
+// so the resulting block hash differs. Used to exercise side-branch
+// acceptance and reorg-via-submitblock paths.
+func createSiblingBlock(t *testing.T, params *ChainParams, prevNode *BlockNode, extraNonce byte) *wire.MsgBlock {
+	t.Helper()
+
+	blockHeight := prevNode.Height + 1
+	heightScript := encodeBIP34Height(blockHeight)
+	// Append extraNonce so two siblings of the same parent produce distinct
+	// coinbase scripts → distinct merkle roots → distinct block hashes.
+	heightScript = append(heightScript, 0x00, extraNonce)
+
+	coinbase := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{
+					Hash:  wire.Hash256{},
+					Index: 0xFFFFFFFF,
+				},
+				SignatureScript: heightScript,
+				Sequence:        0xFFFFFFFF,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    CalcBlockSubsidy(blockHeight),
+				PkScript: []byte{0x51}, // OP_TRUE
+			},
+		},
+		LockTime: 0,
+	}
+
+	allTxs := []*wire.MsgTx{coinbase}
+	txHashes := []wire.Hash256{coinbase.TxHash()}
+	merkleRoot := CalcMerkleRoot(txHashes)
+
+	header := wire.BlockHeader{
+		Version:    4,
+		PrevBlock:  prevNode.Hash,
+		MerkleRoot: merkleRoot,
+		Timestamp:  prevNode.Header.Timestamp + 600,
+		Bits:       params.PowLimitBits,
+		Nonce:      0,
+	}
+
+	target := CompactToBig(header.Bits)
+	for i := uint32(0); i < 10000000; i++ {
+		header.Nonce = i
+		hash := header.BlockHash()
+		if HashToBig(hash).Cmp(target) <= 0 {
+			break
+		}
+	}
+
+	return &wire.MsgBlock{
+		Header:       header,
+		Transactions: allTxs,
+	}
+}
+
+// submitBlockToManager mimics what handleSubmitBlock in internal/rpc/methods.go
+// does: AddHeader + StoreBlock + ProcessSubmittedBlock. Returns the result of
+// ProcessSubmittedBlock so tests can assert on the three outcomes (nil /
+// ErrSideBranchAccepted / other-error).
+func submitBlockToManager(t *testing.T, cm *ChainManager, idx *HeaderIndex, db *storage.ChainDB, block *wire.MsgBlock) error {
+	t.Helper()
+	if _, err := idx.AddHeader(block.Header); err != nil {
+		return err
+	}
+	if err := db.StoreBlock(block.Header.BlockHash(), block); err != nil {
+		return err
+	}
+	return cm.ProcessSubmittedBlock(block)
+}
+
+// TestProcessSubmittedBlock_HappyPathExtendsActiveTip exercises the
+// extend-tip path: a single block whose parent is the current active tip.
+// ProcessSubmittedBlock must call ConnectBlock and return nil. The tip must
+// advance.
+func TestProcessSubmittedBlock_HappyPathExtendsActiveTip(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+	block := createTestBlock(t, params, genesis, nil)
+	hash := block.Header.BlockHash()
+
+	if err := submitBlockToManager(t, cm, idx, db, block); err != nil {
+		t.Fatalf("submit happy-path block: unexpected err=%v", err)
+	}
+
+	gotHash, gotHeight := cm.BestBlock()
+	if gotHeight != 1 {
+		t.Errorf("tip height = %d, want 1", gotHeight)
+	}
+	if gotHash != hash {
+		t.Errorf("tip hash = %s, want %s", gotHash.String()[:16], hash.String()[:16])
+	}
+}
+
+// TestProcessSubmittedBlock_SideBranchAcceptanceAtSameHeight exercises the
+// Pattern Y bug: submit A1 (becomes tip), then submit B1 (sibling of A1,
+// same parent = genesis, equal work). B1 must be stored, header indexed, and
+// return ErrSideBranchAccepted. Tip must NOT flip.
+//
+// Pre-fix this test would fail at submit_b1: ConnectBlock rejected with a
+// "block does not connect to tip during IBD" error.
+func TestProcessSubmittedBlock_SideBranchAcceptanceAtSameHeight(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// A1 — becomes tip via happy path.
+	a1 := createSiblingBlock(t, params, genesis, 0xA1)
+	a1Hash := a1.Header.BlockHash()
+	if err := submitBlockToManager(t, cm, idx, db, a1); err != nil {
+		t.Fatalf("A1: unexpected err=%v", err)
+	}
+	if got, _ := cm.BestBlock(); got != a1Hash {
+		t.Fatalf("after A1: tip = %s, want %s", got.String()[:16], a1Hash.String()[:16])
+	}
+
+	// B1 — sibling of A1. Same parent (genesis), distinct content. Must be
+	// stored as side-branch with equal work; tip stays at A1.
+	b1 := createSiblingBlock(t, params, genesis, 0xB1)
+	b1Hash := b1.Header.BlockHash()
+	if a1Hash == b1Hash {
+		t.Fatal("createSiblingBlock did not produce distinct hashes")
+	}
+
+	err := submitBlockToManager(t, cm, idx, db, b1)
+	if !errors.Is(err, ErrSideBranchAccepted) {
+		t.Fatalf("B1: want ErrSideBranchAccepted, got err=%v", err)
+	}
+
+	// Tip MUST remain at A1 (equal work; tie-break to first-arrived).
+	if got, h := cm.BestBlock(); got != a1Hash || h != 1 {
+		t.Errorf("after B1 side-branch: tip = %s height = %d, want %s height=1",
+			got.String()[:16], h, a1Hash.String()[:16])
+	}
+
+	// B1 must be in the header index (sibling under genesis).
+	if idx.GetNode(b1Hash) == nil {
+		t.Errorf("B1 not in header index after side-branch acceptance")
+	}
+	// B1's body must be persisted.
+	if !db.HasBlock(b1Hash) {
+		t.Errorf("B1 body not persisted after side-branch acceptance")
+	}
+}
+
+// TestProcessSubmittedBlock_ReorgsToHeavierBranch exercises the full
+// reorg-via-submitblock scenario from the corpus entry: submit A1, A2 (chain
+// A becomes tip at height 2), then submit B1, B2 (stored as side-branch),
+// then B3 (the heavier-tip block; triggers reorg from A2 to B3).
+//
+// Pre-fix this test would fail at submit_b1: ConnectBlock rejected with
+// "rejected" because B1's parent (genesis) was not the active tip (A1).
+//
+// Post-fix: B1, B2 are stored as side-branch (ErrSideBranchAccepted); B3 is
+// the heavier-work tip → ReorgTo fires → A1+A2 disconnected, B1+B2+B3
+// connected, tip = B3 at height 3.
+func TestProcessSubmittedBlock_ReorgsToHeavierBranch(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// Chain A: A1 → A2.
+	a1 := createSiblingBlock(t, params, genesis, 0xA1)
+	if err := submitBlockToManager(t, cm, idx, db, a1); err != nil {
+		t.Fatalf("A1: unexpected err=%v", err)
+	}
+	a1Node := idx.GetNode(a1.Header.BlockHash())
+	a2 := createSiblingBlock(t, params, a1Node, 0xA2)
+	a2Hash := a2.Header.BlockHash()
+	if err := submitBlockToManager(t, cm, idx, db, a2); err != nil {
+		t.Fatalf("A2: unexpected err=%v", err)
+	}
+	if got, h := cm.BestBlock(); got != a2Hash || h != 2 {
+		t.Fatalf("after A1+A2: tip = %s height = %d, want %s height=2",
+			got.String()[:16], h, a2Hash.String()[:16])
+	}
+
+	// Chain B: B1 → B2 → B3, all sharing genesis as fork point.
+	b1 := createSiblingBlock(t, params, genesis, 0xB1)
+	b1Hash := b1.Header.BlockHash()
+	if err := submitBlockToManager(t, cm, idx, db, b1); !errors.Is(err, ErrSideBranchAccepted) {
+		t.Fatalf("B1: want ErrSideBranchAccepted, got err=%v", err)
+	}
+	b1Node := idx.GetNode(b1Hash)
+	if b1Node == nil {
+		t.Fatal("B1 not in header index")
+	}
+	if got, _ := cm.BestBlock(); got != a2Hash {
+		t.Errorf("after B1: tip moved unexpectedly to %s", got.String()[:16])
+	}
+
+	b2 := createSiblingBlock(t, params, b1Node, 0xB2)
+	b2Hash := b2.Header.BlockHash()
+	if err := submitBlockToManager(t, cm, idx, db, b2); !errors.Is(err, ErrSideBranchAccepted) {
+		t.Fatalf("B2: want ErrSideBranchAccepted, got err=%v", err)
+	}
+	b2Node := idx.GetNode(b2Hash)
+	if b2Node == nil {
+		t.Fatal("B2 not in header index")
+	}
+	// At this point B-chain has equal work to A-chain (both height 2). Tip
+	// stays at A2 (tie-break to first-arrived).
+	if got, _ := cm.BestBlock(); got != a2Hash {
+		t.Errorf("after B2 (equal work): tip = %s, want %s (tie-break)",
+			got.String()[:16], a2Hash.String()[:16])
+	}
+
+	// B3 — height 3 → strictly heavier than A-chain → triggers reorg.
+	b3 := createSiblingBlock(t, params, b2Node, 0xB3)
+	b3Hash := b3.Header.BlockHash()
+	if err := submitBlockToManager(t, cm, idx, db, b3); err != nil {
+		t.Fatalf("B3: want nil (reorg accept), got err=%v", err)
+	}
+
+	// Tip flipped to B3 at height 3.
+	if got, h := cm.BestBlock(); got != b3Hash || h != 3 {
+		t.Errorf("after B3 reorg: tip = %s height = %d, want %s height=3",
+			got.String()[:16], h, b3Hash.String()[:16])
+	}
+
+	// Both fork branches must remain in the header index — Core retains
+	// the displaced A-chain blocks (BLOCK_HAVE_DATA) for potential future
+	// reactivation via reconsiderblock or another reorg.
+	if idx.GetNode(a1.Header.BlockHash()) == nil {
+		t.Errorf("displaced A1 not in header index")
+	}
+	if idx.GetNode(a2Hash) == nil {
+		t.Errorf("displaced A2 not in header index")
 	}
 }
