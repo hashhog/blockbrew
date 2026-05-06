@@ -467,6 +467,39 @@ func (pm *PeerManager) BroadcastMessage(msg Message) {
 	}
 }
 
+// AnnounceBlock announces a newly accepted block to all connected peers,
+// honoring BIP-130 (sendheaders).  Peers that previously sent us a
+// `sendheaders` message receive a `headers` message containing the block
+// header directly; others receive an `inv` for the block hash.
+//
+// This avoids the extra `inv -> getheaders -> headers -> getdata` round-trip
+// for header-preferring peers and is what Bitcoin Core's net_processing.cpp
+// `MaybeSendInventory` does for new tip announcements.  Reference:
+// camlcoin `lib/peer_manager.ml::announce_block`.
+func (pm *PeerManager) AnnounceBlock(header wire.BlockHeader, hash wire.Hash256) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	headersMsg := &MsgHeaders{Headers: []wire.BlockHeader{header}}
+	invMsg := &MsgInv{
+		InvList: []*InvVect{
+			{Type: InvTypeBlock, Hash: hash},
+		},
+	}
+
+	for _, info := range pm.peers {
+		peer := info.peer
+		if !peer.IsConnected() {
+			continue
+		}
+		if peer.SendsHeaders() {
+			peer.SendMessage(headersMsg)
+		} else {
+			peer.SendMessage(invMsg)
+		}
+	}
+}
+
 // RelayTransaction sends an inv message for a transaction to all peers that want tx relay.
 // This is called when a transaction is added to the mempool (e.g., via sendrawtransaction RPC).
 // The fromPeer parameter is the address of the peer that sent us this transaction; we skip

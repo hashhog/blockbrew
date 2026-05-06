@@ -6,6 +6,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -16,10 +17,16 @@ var (
 	ErrDuplicateHeader      = errors.New("header already exists")
 	ErrInvalidPoW           = errors.New("header has invalid proof of work")
 	ErrTimestampTooEarly    = errors.New("header timestamp is before median time past")
+	ErrTimestampTooFarFuture = errors.New("header timestamp is more than 2 hours in the future")
 	ErrBadDifficulty        = errors.New("header has incorrect difficulty bits")
 	ErrCheckpointMismatch   = errors.New("header does not match checkpoint")
 	ErrForkBeforeCheckpoint = errors.New("fork before last checkpoint is not allowed")
 )
+
+// headerNowUnix returns the current wall-clock time in seconds since epoch.
+// It is a package variable so tests can substitute a deterministic clock when
+// exercising the future-time gate in AddHeader.
+var headerNowUnix = func() int64 { return time.Now().Unix() }
 
 // BlockStatus tracks the validation state of a block.
 type BlockStatus uint32
@@ -386,6 +393,16 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 	mtp := parent.GetMedianTimePast()
 	if int64(header.Timestamp) <= mtp {
 		return nil, ErrTimestampTooEarly
+	}
+
+	// Future-time check at header acceptance (Bitcoin Core's
+	// ContextualCheckBlockHeader: validation.cpp).  Reject headers whose
+	// timestamp is more than MaxTimeAdjustment (7200s) ahead of current
+	// wall-clock time.  Without this gate, an adversarial peer can grow the
+	// in-memory header index with far-future headers that only fail when the
+	// full block arrives — wasting memory and CPU on PoW checks.
+	if int64(header.Timestamp) > headerNowUnix()+MaxTimeAdjustment {
+		return nil, ErrTimestampTooFarFuture
 	}
 
 	// Validate difficulty at adjustment boundaries

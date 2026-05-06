@@ -2747,13 +2747,19 @@ func (s *Server) handleGenerateToAddress(params json.RawMessage) (interface{}, *
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Block generation failed: %v", err)}
 	}
 
-	// Broadcast inv(MSG_BLOCK) to all connected peers for each new block
+	// Announce each new block to connected peers, honoring BIP-130 (sendheaders).
+	// Peers that opted in via `sendheaders` get the header directly; others get an inv.
 	if s.peerMgr != nil {
 		for _, h := range hashes {
-			inv := &p2p.MsgInv{}
-			inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: h})
-			s.peerMgr.BroadcastMessage(inv)
-			log.Printf("rpc: broadcast block inv %x to peers", h[:4])
+			if node := s.headerIndex.GetNode(h); node != nil {
+				s.peerMgr.AnnounceBlock(node.Header, h)
+			} else {
+				// Fallback: header not yet indexed — announce via inv only.
+				inv := &p2p.MsgInv{}
+				inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: h})
+				s.peerMgr.BroadcastMessage(inv)
+			}
+			log.Printf("rpc: announced block %x to peers", h[:4])
 		}
 	}
 
@@ -2826,12 +2832,16 @@ func (s *Server) handleGenerateToDescriptor(params json.RawMessage) (interface{}
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Block generation failed: %v", err)}
 	}
 
-	// Broadcast inv(MSG_BLOCK) to all connected peers for each new block
+	// Announce each new block to connected peers, honoring BIP-130 (sendheaders).
 	if s.peerMgr != nil {
 		for _, h := range hashes {
-			inv := &p2p.MsgInv{}
-			inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: h})
-			s.peerMgr.BroadcastMessage(inv)
+			if node := s.headerIndex.GetNode(h); node != nil {
+				s.peerMgr.AnnounceBlock(node.Header, h)
+			} else {
+				inv := &p2p.MsgInv{}
+				inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: h})
+				s.peerMgr.BroadcastMessage(inv)
+			}
 		}
 	}
 
@@ -3017,11 +3027,15 @@ func (s *Server) handleGenerateBlock(params json.RawMessage) (interface{}, *RPCE
 		}
 	}
 
-	// Broadcast inv(MSG_BLOCK) to all connected peers
+	// Announce the new block to peers, honoring BIP-130 (sendheaders).
 	if s.peerMgr != nil {
-		inv := &p2p.MsgInv{}
-		inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: blockHash})
-		s.peerMgr.BroadcastMessage(inv)
+		if node := s.headerIndex.GetNode(blockHash); node != nil {
+			s.peerMgr.AnnounceBlock(node.Header, blockHash)
+		} else {
+			inv := &p2p.MsgInv{}
+			inv.AddInvVect(&p2p.InvVect{Type: p2p.InvTypeBlock, Hash: blockHash})
+			s.peerMgr.BroadcastMessage(inv)
+		}
 	}
 
 	return result, nil
