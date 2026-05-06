@@ -19,6 +19,18 @@ const (
 	// MaxHeadersPerRequest is the maximum headers we can receive per request.
 	MaxHeadersPerRequest = 2000
 
+	// MaxNumUnconnectingHeadersMsgs caps how many *successive* unconnecting-
+	// headers messages a peer may send before we disconnect (and ban via
+	// the existing misbehavior pipeline).  Mirrors Bitcoin Core's
+	// MAX_NUM_UNCONNECTING_HEADERS_MSGS in net_processing.cpp.
+	//
+	// Per the 2026-05-06 header-sync DoS audit (Pattern B), blockbrew used
+	// to bake misbehavior(20) + Disconnect() into the very first
+	// ErrOrphanHeader message — five honest unconnecting batches in a
+	// row hit the +100 ban threshold and dropped the peer.  Core tolerates
+	// up to 10 (>1 reorg attempt) before disconnecting.
+	MaxNumUnconnectingHeadersMsgs = 10
+
 	// HeaderSyncTimeout is the timeout for receiving headers from a peer.
 	HeaderSyncTimeout = 2 * time.Minute
 
@@ -231,6 +243,14 @@ type SyncManager struct {
 	// HandleGetData to reject pre-prune-horizon block requests with a
 	// `notfound` reply (BIP-159 peer-served-blocks gate).
 	pruner *storage.Pruner
+
+	// unconnectingHeaders tracks per-peer counters of consecutive
+	// unconnecting-headers messages.  Protected by `mu`.  Mirrors
+	// Bitcoin Core's nUnconnectingHeaders state machine.  The counter
+	// is incremented on every ErrOrphanHeader from the first header
+	// in a batch, reset on the first connecting batch, and triggers
+	// disconnect once it would exceed MaxNumUnconnectingHeadersMsgs.
+	unconnectingHeaders map[string]int
 }
 
 // ChainConnector is the interface for connecting blocks to the chain.
@@ -313,6 +333,7 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		lastTipUpdate:     now,
 		nextStaleTipCheck: now.Add(StaleTipCheckInterval),
 		pruner:            config.Pruner,
+		unconnectingHeaders: make(map[string]int),
 	}
 	// IBD starts true from the moment the sync manager is created; it is
 	// only latched to false by updateIBDStatus() once the chain tip is
@@ -536,7 +557,51 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 				continue
 			}
 
-			// Score depends on error type: orphan/disconnected = 20, invalid PoW = 100.
+			// Special case: ErrOrphanHeader on the FIRST header of a batch
+			// is the Core "headers don't connect" path.  Bitcoin Core
+			// tolerates up to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
+			// successive unconnecting messages from a peer before
+			// disconnecting (net_processing.cpp::ProcessHeadersMessage).
+			// Pre-fix, blockbrew immediately Misbehaving(20)+Disconnect on
+			// the first orphan, which is stricter than Core and drops
+			// honest peers caught in a transient reorg.  See
+			// CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
+			// (Pattern B).
+			if err == consensus.ErrOrphanHeader && i == 0 {
+				addr := peer.Address()
+				sm.unconnectingHeaders[addr]++
+				count := sm.unconnectingHeaders[addr]
+				// Flush any earlier-good headers before bailing.
+				if sm.chainDB != nil && len(pendingHeaders) > 0 {
+					if ferr := sm.chainDB.StoreBlockHeadersBatch(pendingHeaders); ferr != nil {
+						log.Printf("sync: failed to flush %d pending headers: %v",
+							len(pendingHeaders), ferr)
+					}
+				}
+				if count > MaxNumUnconnectingHeadersMsgs {
+					log.Printf("sync: peer %s exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS=%d, disconnecting",
+						addr, MaxNumUnconnectingHeadersMsgs)
+					peer.Misbehaving(ScoreHeadersDontConnect,
+						fmt.Sprintf("too many unconnecting headers (count=%d)", count))
+					peer.Disconnect()
+					delete(sm.unconnectingHeaders, addr)
+					sm.syncPeer = nil
+					go sm.startHeaderSync()
+					return
+				}
+				// Under threshold: do NOT misbehave / disconnect.  Re-issue
+				// getheaders so the peer can find a common ancestor (Core's
+				// FindForkInGlobalIndex behavior).
+				log.Printf("sync: orphan header from %s (unconnecting #%d/%d), re-requesting headers",
+					addr, count, MaxNumUnconnectingHeadersMsgs)
+				locator := sm.headerIndex.BestTip().BuildLocator()
+				sm.sendGetHeaders(peer, locator)
+				return
+			}
+
+			// Genuinely bad header (PoW, fork-before-checkpoint, mid-batch
+			// orphan, etc.).  Score depends on error type: most invalid =
+			// 100 (instant ban); fork-before-checkpoint = 20 (IBD soft).
 			// W15 root-cause fix (ref: wave14-2026-04-14/BLOCKBREW-DURABILITY.md):
 			// during IBD catch-up we intentionally cap non-PoW header errors at a
 			// small score so a transient chain-ambiguity burst from a single peer
@@ -547,6 +612,9 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 			score := ScoreInvalidBlock
 			switch err {
 			case consensus.ErrOrphanHeader:
+				// Mid-batch orphan: keep the legacy +20 (this should be
+				// rare; the peer announced a chain that breaks part-way
+				// through, which is closer to inconsistent than missing).
 				score = ScoreHeadersDontConnect
 			case consensus.ErrForkBeforeCheckpoint:
 				// Reduced during IBD to avoid banning honest peers whose batches
@@ -595,6 +663,11 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	newHeight := sm.headerIndex.BestHeight()
 	if headersAdded > 0 {
 		log.Printf("sync: added %d headers (%d -> %d)", headersAdded, startHeight, newHeight)
+		// Core parity: reset the unconnecting-headers counter on any
+		// successfully-connecting batch from this peer.  Mirrors
+		// nUnconnectingHeaders = 0 in the success path of
+		// net_processing.cpp::ProcessHeadersMessage.
+		delete(sm.unconnectingHeaders, peer.Address())
 	}
 
 	// W17 chainmgr-startup recovery: if the chain manager is still holding
