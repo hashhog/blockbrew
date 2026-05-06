@@ -40,20 +40,26 @@ type WalletConfig struct {
 
 // Wallet manages keys, addresses, and balances.
 type Wallet struct {
-	mu          sync.RWMutex
-	name        string // wallet name (empty for default wallet)
-	config      WalletConfig
-	masterKey   *HDKey
-	accounts    []*Account
-	utxos       map[wire.OutPoint]*WalletUTXO
-	txHistory   []*WalletTx
-	nextExtIdx  uint32
-	nextIntIdx  uint32
-	gapLimit    int
-	locked      bool
-	addrToPath  map[string]string            // maps address to derivation path
-	addrToType  map[string]WalletAddressType // maps address to address type
-	addrLabels  map[string]string            // maps address to label
+	mu         sync.RWMutex
+	name       string // wallet name (empty for default wallet)
+	config     WalletConfig
+	masterKey  *HDKey
+	accounts   []*Account
+	utxos      map[wire.OutPoint]*WalletUTXO
+	txHistory  []*WalletTx
+	nextExtIdx uint32
+	nextIntIdx uint32
+	gapLimit   int
+	locked     bool
+	addrToPath map[string]string            // maps address to derivation path
+	addrToType map[string]WalletAddressType // maps address to address type
+	addrLabels map[string]string            // maps address to label
+	// lockedCoins is the in-memory set of UTXOs that the user has marked
+	// unspendable via `lockunspent`. Mirrors CWallet::setLockedCoins. The
+	// value distinguishes a persistent (true) from in-memory-only (false)
+	// lock, matching Core's bool-flag in LockCoin/setLockedCoinsPersistent.
+	// Reference: bitcoin-core/src/wallet/wallet.cpp::LockCoin/UnlockCoin.
+	lockedCoins map[wire.OutPoint]bool
 	// Per-type address indices
 	nextIdx map[WalletAddressType]*addressIndices
 
@@ -64,9 +70,9 @@ type Wallet struct {
 	// the wallet is locked, masterKey is nil and signing is impossible.
 	// walletpassphrase decrypts encryptedMaster back into masterKey for
 	// `relockTimeout` and schedules an auto-relock via relockTimer.
-	encrypted        bool
-	encryptedMaster  []byte      // salt||nonce||ciphertext (output of encryptMasterKey)
-	relockTimer      *time.Timer // auto-relock for walletpassphrase timeout
+	encrypted       bool
+	encryptedMaster []byte      // salt||nonce||ciphertext (output of encryptMasterKey)
+	relockTimer     *time.Timer // auto-relock for walletpassphrase timeout
 }
 
 // WalletUTXO is a UTXO owned by the wallet.
@@ -123,14 +129,15 @@ const DefaultGapLimit = 20
 // NewWallet creates a new empty wallet.
 func NewWallet(config WalletConfig) *Wallet {
 	return &Wallet{
-		config:     config,
-		utxos:      make(map[wire.OutPoint]*WalletUTXO),
-		txHistory:  make([]*WalletTx, 0),
-		gapLimit:   DefaultGapLimit,
-		locked:     true,
-		addrToPath: make(map[string]string),
-		addrToType: make(map[string]WalletAddressType),
-		addrLabels: make(map[string]string),
+		config:      config,
+		utxos:       make(map[wire.OutPoint]*WalletUTXO),
+		txHistory:   make([]*WalletTx, 0),
+		gapLimit:    DefaultGapLimit,
+		locked:      true,
+		addrToPath:  make(map[string]string),
+		addrToType:  make(map[string]WalletAddressType),
+		addrLabels:  make(map[string]string),
+		lockedCoins: make(map[wire.OutPoint]bool),
 		nextIdx: map[WalletAddressType]*addressIndices{
 			AddressTypeP2WPKH:      {External: 0, Internal: 0},
 			AddressTypeP2PKH:       {External: 0, Internal: 0},
@@ -507,6 +514,14 @@ func (w *Wallet) Name() string {
 	return w.name
 }
 
+// Network returns the address network (mainnet/testnet/regtest/signet) the
+// wallet was configured with. RPC handlers that need to decode user-supplied
+// addresses (e.g. walletcreatefundedpsbt) read this so they don't depend on
+// the server's chainParams resolution.
+func (w *Wallet) Network() address.Network {
+	return w.config.Network
+}
+
 // GetBalance returns the wallet balance.
 func (w *Wallet) GetBalance() (confirmed, unconfirmed int64) {
 	w.mu.RLock()
@@ -520,6 +535,45 @@ func (w *Wallet) GetBalance() (confirmed, unconfirmed int64) {
 		}
 	}
 	return
+}
+
+// Balances mirrors Bitcoin Core's CWalletBalances/`GetBalance` (wallet.cpp).
+// Trusted: confirmed UTXOs that are not coinbase-immature.
+// UntrustedPending: unconfirmed UTXOs (mempool / 0-conf).
+// Immature: coinbase UTXOs below CoinbaseMaturity confirmations.
+// All amounts are satoshis. tipHeight is the current chain tip height.
+//
+// Reference: bitcoin-core/src/wallet/wallet.cpp::GetBalance and
+// bitcoin-core/src/wallet/rpc/coins.cpp::getbalances.
+type Balances struct {
+	Trusted          int64
+	UntrustedPending int64
+	Immature         int64
+}
+
+// GetBalances returns a multi-state balance breakdown analogous to Core's
+// CWalletBalances. tipHeight is the current chain tip height; if zero or
+// unknown, callers can pass 1<<30 to make all coinbase coins look mature.
+func (w *Wallet) GetBalances(tipHeight int32) Balances {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	var b Balances
+	for _, utxo := range w.utxos {
+		if !utxo.Confirmed {
+			b.UntrustedPending += utxo.Amount
+			continue
+		}
+		if utxo.IsCoinbase {
+			confirmations := tipHeight - utxo.Height + 1
+			if confirmations < consensus.CoinbaseMaturity {
+				b.Immature += utxo.Amount
+				continue
+			}
+		}
+		b.Trusted += utxo.Amount
+	}
+	return b
 }
 
 // GetSpendableBalance returns the balance excluding immature coinbase outputs.
@@ -602,6 +656,75 @@ func (w *Wallet) RemoveUTXO(outpoint wire.OutPoint) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.utxos, outpoint)
+}
+
+// LockCoin marks a UTXO as temporarily unspendable. `persistent` mirrors
+// Core's persistent flag (bitcoin-core/src/wallet/wallet.cpp::LockCoin):
+// when true the lock survives wallet save/load; when false it is in-memory
+// only and cleared on shutdown. Returns true if the lock was applied (the
+// UTXO must exist in the wallet, must not already be spent, and must not
+// already be locked unless `persistent` is upgrading an in-memory lock).
+//
+// HasUTXO must be true for the lock to apply (matching Core's
+// `mapWallet.find(outpt.hash)` check), but absent UTXO is signalled
+// out-of-band via HasOwnUTXO so the RPC layer can return the precise
+// `RPC_INVALID_PARAMETER` codes Core does.
+func (w *Wallet) LockCoin(outpoint wire.OutPoint, persistent bool) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.lockedCoins[outpoint] = persistent
+	return true
+}
+
+// UnlockCoin removes a UTXO from the locked set. Returns true if it was
+// present and removed, false otherwise.
+func (w *Wallet) UnlockCoin(outpoint wire.OutPoint) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, ok := w.lockedCoins[outpoint]; !ok {
+		return false
+	}
+	delete(w.lockedCoins, outpoint)
+	return true
+}
+
+// UnlockAllCoins clears the locked-coin set. Called by `lockunspent true`
+// with no outputs (Core: CWallet::UnlockAllCoins).
+func (w *Wallet) UnlockAllCoins() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.lockedCoins = make(map[wire.OutPoint]bool)
+	return true
+}
+
+// IsLockedCoin reports whether the given outpoint is currently locked.
+func (w *Wallet) IsLockedCoin(outpoint wire.OutPoint) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	_, ok := w.lockedCoins[outpoint]
+	return ok
+}
+
+// ListLockedCoins returns a copy of the currently-locked outpoints. The
+// order is not stable (mirrors Core's std::set ordering only by accident).
+func (w *Wallet) ListLockedCoins() []wire.OutPoint {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	out := make([]wire.OutPoint, 0, len(w.lockedCoins))
+	for op := range w.lockedCoins {
+		out = append(out, op)
+	}
+	return out
+}
+
+// HasOwnUTXO reports whether the wallet currently tracks the given outpoint
+// as an unspent UTXO. Used by lockunspent to mirror Core's
+// `mapWallet.find(outpt.hash)` lookup before locking.
+func (w *Wallet) HasOwnUTXO(outpoint wire.OutPoint) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	_, ok := w.utxos[outpoint]
+	return ok
 }
 
 // IsOwnAddress checks if an address belongs to this wallet.
@@ -1565,7 +1688,6 @@ func (w *Wallet) UnlockWithPassphrase(passphrase string, timeout int64) error {
 
 	return nil
 }
-
 
 // GetMasterFingerprint returns the fingerprint of the master key.
 func (w *Wallet) GetMasterFingerprint() ([4]byte, error) {
