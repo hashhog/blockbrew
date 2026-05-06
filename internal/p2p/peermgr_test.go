@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 func TestNewPeerManager(t *testing.T) {
@@ -191,6 +192,112 @@ func TestPeerManagerBroadcastMessage(t *testing.T) {
 
 	// BroadcastMessage with no peers should not panic
 	pm.BroadcastMessage(&MsgPing{Nonce: 12345})
+}
+
+// makeFakeConnectedPeer returns a *Peer with state=Connected and an empty
+// outbound queue, suitable for unit-testing the peer-manager broadcast
+// helpers.  Avoids the full handshake machinery in `peer.Start()`.
+func makeFakeConnectedPeer(addr string, sendsHeaders bool) *Peer {
+	p := &Peer{
+		addr:          addr,
+		state:         PeerStateConnected,
+		sendQueue:     make(chan Message, SendQueueSize),
+		quit:          make(chan struct{}),
+		handshakeDone: make(chan struct{}),
+		startTime:     time.Now(),
+	}
+	close(p.handshakeDone)
+	if sendsHeaders {
+		p.sendHeadersPreferred = true
+	}
+	return p
+}
+
+// TestPeerManagerAnnounceBlock verifies BIP-130 sendheaders honoring on the
+// outbound block-announce path: peers that previously sent us a `sendheaders`
+// message receive a `headers` message; other peers receive an `inv`.
+//
+// Reference: Bitcoin Core net_processing.cpp `MaybeSendInventory` (the
+// fHeaderAnnounce branch); camlcoin `lib/peer_manager.ml::announce_block`.
+func TestPeerManagerAnnounceBlock(t *testing.T) {
+	config := PeerManagerConfig{
+		Network:     MainnetMagic,
+		ChainParams: consensus.RegtestParams(),
+	}
+	pm := NewPeerManager(config)
+
+	hdrPeer := makeFakeConnectedPeer("10.0.0.1:8333", true)
+	invPeer := makeFakeConnectedPeer("10.0.0.2:8333", false)
+
+	pm.mu.Lock()
+	pm.peers[hdrPeer.addr] = &PeerInfo{peer: hdrPeer, connType: ConnInbound, connectedAt: time.Now()}
+	pm.peers[invPeer.addr] = &PeerInfo{peer: invPeer, connType: ConnInbound, connectedAt: time.Now()}
+	pm.mu.Unlock()
+
+	// Synthesize a block header + hash.
+	header := wire.BlockHeader{
+		Version:    1,
+		PrevBlock:  wire.Hash256{},
+		MerkleRoot: wire.Hash256{0xab, 0xcd},
+		Timestamp:  1296688602,
+		Bits:       0x207fffff,
+		Nonce:      42,
+	}
+	hash := header.BlockHash()
+
+	pm.AnnounceBlock(header, hash)
+
+	// hdrPeer should have received exactly one MsgHeaders containing only this header.
+	select {
+	case msg := <-hdrPeer.sendQueue:
+		hmsg, ok := msg.(*MsgHeaders)
+		if !ok {
+			t.Fatalf("hdrPeer queue: got %T, want *MsgHeaders", msg)
+		}
+		if len(hmsg.Headers) != 1 {
+			t.Fatalf("hdrPeer headers len = %d, want 1", len(hmsg.Headers))
+		}
+		if hmsg.Headers[0].BlockHash() != hash {
+			t.Fatalf("hdrPeer header hash = %s, want %s",
+				hmsg.Headers[0].BlockHash().String(), hash.String())
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("hdrPeer did not receive any message")
+	}
+
+	// invPeer should have received exactly one MsgInv with InvTypeBlock.
+	select {
+	case msg := <-invPeer.sendQueue:
+		imsg, ok := msg.(*MsgInv)
+		if !ok {
+			t.Fatalf("invPeer queue: got %T, want *MsgInv", msg)
+		}
+		if len(imsg.InvList) != 1 {
+			t.Fatalf("invPeer InvList len = %d, want 1", len(imsg.InvList))
+		}
+		if imsg.InvList[0].Type != InvTypeBlock {
+			t.Fatalf("invPeer inv type = %v, want InvTypeBlock", imsg.InvList[0].Type)
+		}
+		if imsg.InvList[0].Hash != hash {
+			t.Fatalf("invPeer inv hash = %s, want %s",
+				imsg.InvList[0].Hash.String(), hash.String())
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("invPeer did not receive any message")
+	}
+
+	// Each peer received exactly one message — make sure the inverse channel
+	// did not also get the wrong type.
+	select {
+	case extra := <-hdrPeer.sendQueue:
+		t.Fatalf("hdrPeer received an extra message: %T", extra)
+	default:
+	}
+	select {
+	case extra := <-invPeer.sendQueue:
+		t.Fatalf("invPeer received an extra message: %T", extra)
+	default:
+	}
 }
 
 func TestPeerManagerForEachPeer(t *testing.T) {

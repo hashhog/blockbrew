@@ -718,3 +718,70 @@ func TestBestHeightCache(t *testing.T) {
 		t.Errorf("BestHeight(%d) != BestTip.Height(%d)", bestHeight, bestTip.Height)
 	}
 }
+
+// TestAddHeaderRejectsFarFutureTimestamp verifies the BIP-130/Core
+// `ContextualCheckBlockHeader` future-time check at the header-acceptance
+// gate.  Without this check an adversarial peer can grow the in-memory
+// header index with far-future headers that only fail at block validation.
+//
+// We pin the wall-clock to a value above the regtest genesis timestamp,
+// then attempt to add a header timestamped MaxTimeAdjustment+1 seconds in
+// the future.  AddHeader must return ErrTimestampTooFarFuture and must NOT
+// add the node to the index.
+func TestAddHeaderRejectsFarFutureTimestamp(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	// Pin "now" to a deterministic value clearly past the regtest genesis
+	// (1296688602) so the future-window math is unambiguous.
+	pinnedNow := int64(2_000_000_000) // 2033-05-18 UTC, well after regtest genesis
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	// Header timestamp 7201 seconds ahead of pinnedNow == one second past the
+	// 2-hour future-time window.  Must be rejected.
+	farFutureTS := uint32(pinnedNow + MaxTimeAdjustment + 1)
+	header := createTestHeader(params.GenesisHash, farFutureTS, 1)
+
+	_, err := idx.AddHeader(header)
+	if err != ErrTimestampTooFarFuture {
+		t.Fatalf("AddHeader(far-future) err = %v, want ErrTimestampTooFarFuture", err)
+	}
+
+	// Header must not have been admitted to the index.
+	if idx.NodeCount() != 1 {
+		t.Errorf("NodeCount = %d after rejected far-future header, want 1 (genesis only)",
+			idx.NodeCount())
+	}
+	if idx.BestHeight() != 0 {
+		t.Errorf("BestHeight = %d after rejected far-future header, want 0", idx.BestHeight())
+	}
+}
+
+// TestAddHeaderAcceptsTimestampAtFutureBoundary verifies the future-time
+// check is inclusive of `now + MaxTimeAdjustment` (matching Core's
+// `nTime <= nAdjustedTime + MAX_FUTURE_BLOCK_TIME`) and admits headers at
+// the exact boundary.  This guards against an off-by-one that would reject
+// honest peers whose clock is ~7200s ahead.
+func TestAddHeaderAcceptsTimestampAtFutureBoundary(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	// Boundary timestamp: pinnedNow + MaxTimeAdjustment exactly.
+	boundaryTS := uint32(pinnedNow + MaxTimeAdjustment)
+	header := createTestHeader(params.GenesisHash, boundaryTS, 1)
+
+	node, err := idx.AddHeader(header)
+	if err != nil {
+		t.Fatalf("AddHeader(boundary) err = %v, want nil", err)
+	}
+	if node == nil || node.Height != 1 {
+		t.Fatalf("AddHeader(boundary) node = %+v, want height 1", node)
+	}
+}

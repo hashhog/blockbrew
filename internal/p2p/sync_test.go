@@ -217,13 +217,18 @@ func TestSyncManagerContinuesOnFullBatch(t *testing.T) {
 	sm.syncPeer = peer
 	sm.mu.Unlock()
 
-	// Create exactly 2000 headers (should trigger another request)
+	// Create exactly 2000 headers (should trigger another request).
+	// Each header advances the timestamp by 600s past its parent, keeping
+	// the chain in the past relative to wall-clock time and well within the
+	// MaxTimeAdjustment future-time window enforced by HeaderIndex.AddHeader.
+	// (The original loop used `prevTimestamp + (i+1)*600`, which compounded
+	// to ~2049 by header 2000 and tripped the future-time gate.)
 	headers := make([]wire.BlockHeader, MaxHeadersPerRequest)
 	prevHash := params.GenesisHash
 	prevTimestamp := params.GenesisBlock.Header.Timestamp
 
 	for i := 0; i < MaxHeadersPerRequest; i++ {
-		headers[i] = createTestBlockHeader(prevHash, prevTimestamp+uint32(i+1)*600, uint32(i+1))
+		headers[i] = createTestBlockHeader(prevHash, prevTimestamp+600, uint32(i+1))
 		prevHash = headers[i].BlockHash()
 		prevTimestamp = headers[i].Timestamp
 	}
