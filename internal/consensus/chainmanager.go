@@ -902,6 +902,84 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	return nil
 }
 
+// ErrSideBranchAccepted is a sentinel returned by ProcessSubmittedBlock when
+// a block has been validated and stored as a side-branch (heavier ancestor
+// chain has not yet overtaken the active tip). Callers should map this to
+// BIP-22's "inconclusive" result string per Bitcoin Core's
+// rpc/mining.cpp::submitblock convention.
+//
+// This is the Pattern Y closure for blockbrew — see
+// CORE-PARITY-AUDIT/_reorg-via-submitblock-fleet-result-2026-05-05.md and
+// rustoshi 68a422b for the cross-impl reference fix. Pre-fix, blockbrew
+// rejected any block whose parent was not on the active chain with a
+// generic "rejected" string, even if the parent was already in the header
+// index. Post-fix, side-branch blocks are stored + indexed (HAVE_DATA in
+// Core's CBlockIndex parlance) and a reorg fires later if a heavier branch
+// arrives — mirroring `BlockManager::AcceptBlock` in validation.cpp where
+// storage and best-chain selection are decoupled.
+var ErrSideBranchAccepted = fmt.Errorf("block accepted as side-branch")
+
+// ProcessSubmittedBlock handles an externally-submitted block (RPC submitblock
+// path). Unlike ConnectBlock which only extends the active tip, this method
+// also accepts side-branch blocks (parent in header index but not on active
+// chain) and triggers a reorg when the new branch becomes heaviest.
+//
+// Caller contract:
+//   - The block has already passed CheckBlockSanity.
+//   - The header has already been added to the header index (so we can look
+//     up its node and TotalWork).
+//   - The full block body has already been persisted via chainDB.StoreBlock.
+//
+// Return values (mirrors Bitcoin Core's submitblock return convention):
+//   - nil                       → block accepted, became part of active chain.
+//   - ErrSideBranchAccepted     → block stored on a non-active branch
+//                                 (caller should return BIP-22 "inconclusive").
+//   - other error               → validation/connection failure; caller maps
+//                                 via bip22ResultString.
+//
+// Reference: bitcoin-core/src/validation.cpp::AcceptBlock + ActivateBestChain.
+// Storage and best-chain selection are decoupled in Core; this method
+// brings blockbrew's submitblock path into parity.
+func (cm *ChainManager) ProcessSubmittedBlock(block *wire.MsgBlock) error {
+	hash := block.Header.BlockHash()
+	newNode := cm.headerIndex.GetNode(hash)
+	if newNode == nil {
+		return fmt.Errorf("block %s not found in header index", hash.String())
+	}
+
+	// Snapshot current tip under read lock — both decision branches release
+	// before re-acquiring under their own locking discipline.
+	cm.mu.RLock()
+	tipNode := cm.tipNode
+	tipWork := cm.tipNode.TotalWork
+	cm.mu.RUnlock()
+
+	// Happy path: block extends current active tip → connect inline.
+	if newNode.Parent == tipNode {
+		return cm.ConnectBlock(block)
+	}
+
+	// Side-branch: parent is in the header index but not the active tip.
+	// Two sub-cases per Core's ActivateBestChain logic:
+	//
+	//   (a) New branch has STRICTLY MORE work than active tip → reorg.
+	//   (b) New branch has equal or less work → store as side-branch and
+	//       return "inconclusive" per BIP-22; the block already has a node
+	//       in the header index (with TotalWork) and its body persisted on
+	//       disk, so a later submission that extends this branch and tips
+	//       the work balance can trigger a reorg via this same method.
+	if newNode.TotalWork.Cmp(tipWork) > 0 {
+		log.Printf("chainmgr: submitblock-triggered reorg target=%s height=%d work=%s tip_work=%s",
+			hash.String()[:16], newNode.Height, newNode.TotalWork.String(), tipWork.String())
+		return cm.ReorgTo(newNode)
+	}
+
+	// Side-branch stored, no reorg.
+	log.Printf("chainmgr: submitblock side-branch stored hash=%s height=%d (tip stays at %s height=%d)",
+		hash.String()[:16], newNode.Height, tipNode.Hash.String()[:16], tipNode.Height)
+	return ErrSideBranchAccepted
+}
+
 // IsIBD returns whether the node is in Initial Block Download mode.
 func (cm *ChainManager) IsIBD() bool {
 	cm.mu.RLock()

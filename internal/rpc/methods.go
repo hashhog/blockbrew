@@ -1686,8 +1686,29 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil && !errors.Is(err, consensus.ErrDuplicateHeader) {
 			return bip22ResultString(err), nil
 		}
-		if err := s.chainMgr.ConnectBlock(block); err != nil {
-			// Map connection failures to BIP-22 result strings.
+
+		// ProcessSubmittedBlock decouples block storage from active-chain
+		// extension (Pattern Y closure 2026-05-05; cross-impl reference
+		// rustoshi 68a422b). Three outcomes:
+		//
+		//   nil                       → block extended active chain or
+		//                                triggered a reorg → BIP-22 null
+		//                                ("accept").
+		//   ErrSideBranchAccepted     → block stored on a non-active
+		//                                branch with insufficient work to
+		//                                overtake tip → BIP-22 "inconclusive"
+		//                                (Core convention, rpc/mining.cpp
+		//                                ::submitblock).
+		//   other error               → connection / validation failure,
+		//                                map via bip22ResultString.
+		//
+		// This mirrors Bitcoin Core's split between AcceptBlock (storage +
+		// header index entry) and ActivateBestChain (tip selection) in
+		// validation.cpp.
+		if err := s.chainMgr.ProcessSubmittedBlock(block); err != nil {
+			if errors.Is(err, consensus.ErrSideBranchAccepted) {
+				return "inconclusive", nil
+			}
 			return bip22ResultString(err), nil
 		}
 	}
