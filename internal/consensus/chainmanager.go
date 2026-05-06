@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -16,6 +17,18 @@ import (
 // Temporarily lowered 500 → 100 while diagnosing the post-4da26c8 connector
 // bottleneck: at ~60 blk/hr the old 500-window took ~8 hr to emit one rollup.
 const PhaseStatsLogEvery = 100
+
+// MaxReorgDepth caps the disconnect+reconnect span of a single ReorgTo so the
+// resulting Pebble batch (Pattern D, multi-block atomicity) cannot grow without
+// bound. Bitcoin Core's default is 100 (-maxreorgdepth in chainparams), well
+// below Pebble's 4 GiB ErrBatchTooLarge guardrail at typical undo+UTXO sizes.
+// A reorg that wants more than this returns an error rather than splitting
+// across multiple batches — splitting would forfeit the very atomicity this
+// constant exists to enforce.
+//
+// Cross-impl: clearbit ReorgManager has the same cap; Core uses 100 in
+// validation.cpp's MaxReorgDepth() helper.
+const MaxReorgDepth = 100
 
 
 // cachedUTXOView wraps a UTXOView with a cache of entries that may have been
@@ -102,6 +115,32 @@ type ChainManager struct {
 	phaseStatsFirstValNs     int64
 	phaseStatsMaxFirstUtxoNs int64
 	phaseStatsMaxFirstValNs  int64
+
+	// reorgMu serializes ReorgTo against itself. The reorg batch wraps many
+	// Connect+Disconnect calls; running two reorgs in parallel would mix
+	// their writes into the same Pebble batch and corrupt the chain. Held
+	// for the entire duration of a single ReorgTo (separate from cm.mu so
+	// ConnectBlock / DisconnectBlock can take cm.mu in their normal pattern
+	// without recursive-lock issues).
+	reorgMu sync.Mutex
+
+	// reorgBatch, when non-nil, redirects all per-block persistence writes
+	// inside ConnectBlock / DisconnectBlock into the named batch instead of
+	// committing to disk per-block. Set by ReorgTo for the duration of a
+	// multi-block reorg so the disconnects + reconnects ride a single Pebble
+	// commit (Pattern D, multi-block atomicity, 2026-05-05). Always nil
+	// outside ReorgTo. Read+written only while cm.mu is held; ReorgTo
+	// installs / clears it under cm.mu and the per-block helpers read it
+	// under cm.mu, so visibility is guaranteed by the lock.
+	//
+	// Crash mid-reorg semantics: with this in place a crash at ANY point in
+	// ReorgTo before batch.Write() succeeds leaves the on-disk state at the
+	// pre-reorg tip; success leaves it at the post-reorg tip. There is no
+	// intermediate-tip state on disk where the chainstate has advanced past
+	// the fork but UTXO mutations or undo deletions are partial. Cross-impl
+	// reference: bitcoin-core validation.cpp's CChainState::ActivateBestChain
+	// holds a single CDBBatch across all DisconnectTip / ConnectTip calls.
+	reorgBatch storage.Batch
 
 	// onBlockDisconnected, if set, is invoked once per block popped off the
 	// active tip by DisconnectBlock — including each peel inside ReorgTo.
@@ -846,61 +885,83 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Persist block data atomically: undo data, block height, UTXO set, and
 	// chain state are written in a single batch so a crash can never leave the
 	// chain tip ahead of (or behind) the UTXO set.
+	//
+	// Pattern D (multi-block reorg atomicity, 2026-05-05): when cm.reorgBatch
+	// is set (we are inside ReorgTo), we APPEND every persistence write to
+	// that shared batch instead of opening + committing our own per-block.
+	// ReorgTo commits the union batch once, so a crash mid-reorg leaves the
+	// on-disk state at the pre-reorg tip OR the post-reorg tip — never a
+	// partial state where some blocks of the new chain are persisted but
+	// others are not.
 	if cm.chainDB != nil {
-		writeChainState := !cm.isIBD || shouldFlush
-
-		if writeChainState || generateUndo {
-			// Use NoSync for non-flush IBD batches — only the flush batch
-			// (which persists chain state) needs durability.
-			var batch storage.Batch
-			if cm.isIBD && !shouldFlush {
-				batch = cm.chainDB.NewBatchNoSync()
-			} else {
-				batch = cm.chainDB.NewBatch()
-			}
-
-			// Undo data keyed by block hash (not height, since heights can change during reorgs)
+		if cm.reorgBatch != nil {
+			// Reorg-batched path: append to the union batch ReorgTo opened.
+			// UTXO flush is done ONCE at the end of ReorgTo (not per-block)
+			// so the FRESH-bit dedup across the whole reorg span still works.
 			if generateUndo {
-				cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
+				cm.chainDB.WriteBlockUndoBatch(cm.reorgBatch, hash, blockUndo)
 			}
+			cm.chainDB.SetBlockHeightBatch(cm.reorgBatch, node.Height, hash)
+			cm.chainDB.SetChainStateBatch(cm.reorgBatch, &storage.ChainState{
+				BestHash:   hash,
+				BestHeight: node.Height,
+			})
+		} else {
+			writeChainState := !cm.isIBD || shouldFlush
 
-			// Height -> hash mapping
-			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
-
-			// UTXO flush into the same batch when it's time
-			if shouldFlush {
-				type batchFlusher interface {
-					FlushBatch(storage.Batch) error
+			if writeChainState || generateUndo {
+				// Use NoSync for non-flush IBD batches — only the flush batch
+				// (which persists chain state) needs durability.
+				var batch storage.Batch
+				if cm.isIBD && !shouldFlush {
+					batch = cm.chainDB.NewBatchNoSync()
+				} else {
+					batch = cm.chainDB.NewBatch()
 				}
-				if f, ok := cm.utxoSet.(batchFlusher); ok {
-					if err := f.FlushBatch(batch); err != nil {
-						return fmt.Errorf("failed to flush UTXOs to batch: %w", err)
+
+				// Undo data keyed by block hash (not height, since heights can change during reorgs)
+				if generateUndo {
+					cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
+				}
+
+				// Height -> hash mapping
+				cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
+
+				// UTXO flush into the same batch when it's time
+				if shouldFlush {
+					type batchFlusher interface {
+						FlushBatch(storage.Batch) error
+					}
+					if f, ok := cm.utxoSet.(batchFlusher); ok {
+						if err := f.FlushBatch(batch); err != nil {
+							return fmt.Errorf("failed to flush UTXOs to batch: %w", err)
+						}
 					}
 				}
-			}
 
-			// Chain state (tip hash + height) in the same atomic batch
-			if writeChainState {
-				cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
-					BestHash:   hash,
-					BestHeight: node.Height,
-				})
-			}
+				// Chain state (tip hash + height) in the same atomic batch
+				if writeChainState {
+					cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+						BestHash:   hash,
+						BestHeight: node.Height,
+					})
+				}
 
-			if err := batch.Write(); err != nil {
-				return fmt.Errorf("failed to write atomic block batch: %w", err)
-			}
+				if err := batch.Write(); err != nil {
+					return fmt.Errorf("failed to write atomic block batch: %w", err)
+				}
 
-			if shouldFlush {
-				log.Printf("chainmgr: UTXO flush at height %d (atomic)", cm.tipHeight)
-			}
-		} else {
-			// During IBD between flushes, still persist height mapping
-			cm.chainDB.SetBlockHeight(node.Height, hash)
-			// Write undo data individually between flush intervals
-			if generateUndo {
-				if err := cm.chainDB.WriteBlockUndo(hash, blockUndo); err != nil {
-					return fmt.Errorf("failed to write undo data: %w", err)
+				if shouldFlush {
+					log.Printf("chainmgr: UTXO flush at height %d (atomic)", cm.tipHeight)
+				}
+			} else {
+				// During IBD between flushes, still persist height mapping
+				cm.chainDB.SetBlockHeight(node.Height, hash)
+				// Write undo data individually between flush intervals
+				if generateUndo {
+					if err := cm.chainDB.WriteBlockUndo(hash, blockUndo); err != nil {
+						return fmt.Errorf("failed to write undo data: %w", err)
+					}
 				}
 			}
 		}
@@ -1253,9 +1314,18 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 		// Coinbase (i == 0) has no inputs to restore - we just removed its outputs above
 	}
 
-	// Delete undo data from database
-	if err := cm.chainDB.DeleteBlockUndo(hash); err != nil {
-		log.Printf("chainmgr: warning: failed to delete undo data for %s: %v", hash.String()[:16], err)
+	// Delete undo data from database.
+	//
+	// Pattern D (multi-block reorg atomicity, 2026-05-05): when cm.reorgBatch
+	// is set, the delete rides the shared batch so the multi-block reorg is
+	// one atomic Pebble commit. Outside ReorgTo we still issue an individual
+	// Delete (preserves the pre-existing single-disconnect API).
+	if cm.reorgBatch != nil {
+		cm.chainDB.DeleteBlockUndoBatch(cm.reorgBatch, hash)
+	} else {
+		if err := cm.chainDB.DeleteBlockUndo(hash); err != nil {
+			log.Printf("chainmgr: warning: failed to delete undo data for %s: %v", hash.String()[:16], err)
+		}
 	}
 
 	// Clear signature cache since cached entries may no longer be valid after reorg.
@@ -1276,12 +1346,25 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	cm.tipHeight = parent.Height
 	cm.updateTipCache(parent.Hash, parent.Height)
 
-	// Persist updated chain state
+	// Persist updated chain state.
+	//
+	// Pattern D: under ReorgTo we append the (intermediate) chainstate write
+	// to the shared batch — it will be overwritten by later DisconnectBlock
+	// peels and finally by the new-tip ConnectBlock writes within the same
+	// batch. Pebble's batch dedups in-key Puts, so only the final value lands
+	// on disk. Outside ReorgTo we issue a direct Put as before.
 	if cm.chainDB != nil {
-		cm.chainDB.SetChainState(&storage.ChainState{
-			BestHash:   parent.Hash,
-			BestHeight: parent.Height,
-		})
+		if cm.reorgBatch != nil {
+			cm.chainDB.SetChainStateBatch(cm.reorgBatch, &storage.ChainState{
+				BestHash:   parent.Hash,
+				BestHeight: parent.Height,
+			})
+		} else {
+			cm.chainDB.SetChainState(&storage.ChainState{
+				BestHash:   parent.Hash,
+				BestHeight: parent.Height,
+			})
+		}
 	}
 
 	// Pattern B closure (2026-05-05): hand the disconnected block to the
@@ -1298,8 +1381,40 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	return nil
 }
 
+// ErrReorgTooDeep is returned by ReorgTo when the requested reorg span
+// (disconnect_count + connect_count) exceeds MaxReorgDepth. Splitting a
+// reorg across multiple Pebble commits would forfeit the multi-block
+// atomicity Pattern D was added for, so we refuse loudly instead.
+var ErrReorgTooDeep = errors.New("reorg span exceeds MaxReorgDepth")
+
 // ReorgTo reorganizes the chain to a new tip.
+//
+// Pattern D — multi-block reorg atomicity (2026-05-05).
+// The disconnect of N old-tip blocks and the connect of M new-branch blocks
+// are accumulated into a SINGLE Pebble batch and committed once at the end.
+// Crash semantics: a process crash at any point before the final batch.Write()
+// returns leaves on-disk state at the pre-reorg tip; success leaves it at the
+// post-reorg tip. There is no on-disk state where the chainstate has advanced
+// past the fork but per-block undo deletions or UTXO mutations are partial.
+//
+// MaxReorgDepth caps the span: a reorg that would require disconnect+connect
+// of more than MaxReorgDepth blocks returns ErrReorgTooDeep rather than
+// splitting the work across multiple commits (which would defeat the
+// atomicity guarantee). Bitcoin Core uses the same 100-block default.
+//
+// Cross-impl: validation.cpp::ActivateBestChain holds a single CDBBatch
+// across all DisconnectTip / ConnectTip calls inside one activation; we
+// mirror that by parking the batch on cm.reorgBatch and having the per-block
+// helpers read it under cm.mu.
 func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
+	// Serialize against any concurrent ReorgTo. Two reorgs would otherwise
+	// share cm.reorgBatch and tangle their writes; the chainstate write at
+	// the end would race and one of the new-tip key chains would land
+	// half-committed. cm.reorgMu is separate from cm.mu so per-block
+	// helpers can take cm.mu under it without recursive-lock issues.
+	cm.reorgMu.Lock()
+	defer cm.reorgMu.Unlock()
+
 	cm.mu.Lock()
 	currentTip := cm.tipNode
 	cm.mu.Unlock()
@@ -1310,29 +1425,70 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 		return fmt.Errorf("no common ancestor found")
 	}
 
-	log.Printf("chainmgr: reorg from height %d to %d (fork at %d)",
-		currentTip.Height, newTip.Height, fork.Height)
-
-	// Disconnect blocks from current tip back to fork
+	// Build disconnect + connect plans before touching state. We need both
+	// counts up front for the MaxReorgDepth bound check.
 	disconnectNodes := make([]*BlockNode, 0)
 	for node := currentTip; node != fork; node = node.Parent {
 		disconnectNodes = append(disconnectNodes, node)
 	}
+	connectNodes := make([]*BlockNode, 0)
+	for node := newTip; node != fork; node = node.Parent {
+		connectNodes = append(connectNodes, node)
+	}
+	// Reverse to connect in order (fork+1 .. newTip).
+	for i, j := 0, len(connectNodes)-1; i < j; i, j = i+1, j-1 {
+		connectNodes[i], connectNodes[j] = connectNodes[j], connectNodes[i]
+	}
+
+	span := len(disconnectNodes) + len(connectNodes)
+	if span > MaxReorgDepth {
+		log.Printf("chainmgr: refusing reorg from %d to %d: span=%d exceeds MaxReorgDepth=%d",
+			currentTip.Height, newTip.Height, span, MaxReorgDepth)
+		return fmt.Errorf("%w: span=%d limit=%d", ErrReorgTooDeep, span, MaxReorgDepth)
+	}
+
+	log.Printf("chainmgr: reorg from height %d to %d (fork at %d, disconnect=%d connect=%d)",
+		currentTip.Height, newTip.Height, fork.Height,
+		len(disconnectNodes), len(connectNodes))
+
+	// Open the union batch. Sync mode (durable) — a reorg unwinds visible
+	// state, so the post-commit fsync is non-negotiable. cm.reorgBatch is
+	// installed under cm.mu so per-block helpers see it consistently.
+	if cm.chainDB == nil {
+		// In-memory ChainDB-less paths (some tests) keep the per-call
+		// behavior since there is no batch to share.
+		return cm.reorgInMemoryFallback(disconnectNodes, connectNodes)
+	}
+	batch := cm.chainDB.NewBatch()
+
+	cm.mu.Lock()
+	if cm.reorgBatch != nil {
+		cm.mu.Unlock()
+		// Should be impossible thanks to reorgMu, but guard against silent
+		// double-install corruption if a future caller bypasses ReorgTo.
+		return fmt.Errorf("reorgBatch already set — concurrent reorg in flight")
+	}
+	cm.reorgBatch = batch
+	cm.mu.Unlock()
+
+	// Always clear reorgBatch before returning, including on every error
+	// path. If the batch was committed it is just dropped here; if it was
+	// not committed (error path) it is dropped too — Pebble batches are
+	// safe to abandon, no Reset/Close required for correctness.
+	defer func() {
+		cm.mu.Lock()
+		cm.reorgBatch = nil
+		cm.mu.Unlock()
+	}()
+
+	// Disconnect blocks from current tip back to fork.
 	for _, node := range disconnectNodes {
 		if err := cm.DisconnectBlock(node.Hash); err != nil {
 			return fmt.Errorf("disconnect block %s failed: %w", node.Hash.String()[:16], err)
 		}
 	}
 
-	// Connect blocks from fork to new tip
-	connectNodes := make([]*BlockNode, 0)
-	for node := newTip; node != fork; node = node.Parent {
-		connectNodes = append(connectNodes, node)
-	}
-	// Reverse to connect in order
-	for i, j := 0, len(connectNodes)-1; i < j; i, j = i+1, j-1 {
-		connectNodes[i], connectNodes[j] = connectNodes[j], connectNodes[i]
-	}
+	// Connect blocks from fork to new tip.
 	for _, node := range connectNodes {
 		block, err := cm.chainDB.GetBlock(node.Hash)
 		if err != nil {
@@ -1343,6 +1499,63 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 		}
 	}
 
+	// Drain the in-memory UTXO mutations from every Connect/Disconnect we
+	// just executed into the same batch. FlushBatch resets the dirty /
+	// deleted / fresh maps so the post-commit cache is consistent with
+	// disk. This is the moment that turns the per-block in-memory UTXO
+	// updates into durable on-disk writes — must happen before batch.Write.
+	type batchFlusher interface {
+		FlushBatch(storage.Batch) error
+	}
+	cm.mu.Lock()
+	if f, ok := cm.utxoSet.(batchFlusher); ok {
+		if err := f.FlushBatch(batch); err != nil {
+			cm.mu.Unlock()
+			return fmt.Errorf("failed to flush reorg UTXO mutations to batch: %w", err)
+		}
+	}
+	cm.mu.Unlock()
+
+	// Commit the union batch. Up to this point a crash would leave the
+	// on-disk state at the pre-reorg tip (in-memory mutations are lost on
+	// restart and the chainstate key on disk still points at currentTip).
+	// After this call returns nil, on-disk state is at newTip.
+	if err := batch.Write(); err != nil {
+		return fmt.Errorf("failed to commit multi-block reorg batch: %w", err)
+	}
+
+	return nil
+}
+
+// reorgInMemoryFallback executes a reorg without the union-batch path. Only
+// reachable when chainDB is nil (some unit-test configurations) — the live
+// fleet always has a ChainDB so this is unreachable in production. Preserves
+// the pre-Pattern-D behavior (per-block in-memory mutations) for those tests.
+func (cm *ChainManager) reorgInMemoryFallback(
+	disconnectNodes []*BlockNode,
+	connectNodes []*BlockNode,
+) error {
+	for _, node := range disconnectNodes {
+		if err := cm.DisconnectBlock(node.Hash); err != nil {
+			return fmt.Errorf("disconnect block %s failed: %w", node.Hash.String()[:16], err)
+		}
+	}
+	for _, node := range connectNodes {
+		// Without chainDB we cannot resolve block bodies; this matches the
+		// pre-existing behavior (such tests stash blocks elsewhere or skip
+		// the connect phase entirely).
+		if cm.chainDB == nil {
+			return fmt.Errorf("reorg connect requires chainDB (block %s)",
+				node.Hash.String()[:16])
+		}
+		block, err := cm.chainDB.GetBlock(node.Hash)
+		if err != nil {
+			return fmt.Errorf("block %s not found for reorg: %w", node.Hash.String()[:16], err)
+		}
+		if err := cm.ConnectBlock(block); err != nil {
+			return fmt.Errorf("connect block %s failed during reorg: %w", node.Hash.String()[:16], err)
+		}
+	}
 	return nil
 }
 

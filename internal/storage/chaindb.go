@@ -271,6 +271,17 @@ func (c *ChainDB) WriteBlockUndoBatch(batch Batch, hash wire.Hash256, undo *Bloc
 	batch.Put(key, undo.Serialize())
 }
 
+// DeleteBlockUndoBatch adds an undo-data deletion to an existing batch.
+//
+// Pattern D (multi-block reorg atomicity, 2026-05-05): used by ReorgTo so the
+// disconnects + reconnects of a multi-block reorg ride a single Pebble batch.
+// Without this, DisconnectBlock would have to issue an individual Delete per
+// peeled block — half-committing them under crash on the way to the new tip.
+func (c *ChainDB) DeleteBlockUndoBatch(batch Batch, hash wire.Hash256) {
+	key := MakeUndoBlockKey(hash)
+	batch.Delete(key)
+}
+
 // NewBatch creates a new write batch from the underlying database.
 func (c *ChainDB) NewBatch() Batch {
 	return c.db.NewBatch()
