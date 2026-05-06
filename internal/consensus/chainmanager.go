@@ -102,6 +102,26 @@ type ChainManager struct {
 	phaseStatsFirstValNs     int64
 	phaseStatsMaxFirstUtxoNs int64
 	phaseStatsMaxFirstValNs  int64
+
+	// onBlockDisconnected, if set, is invoked once per block popped off the
+	// active tip by DisconnectBlock — including each peel inside ReorgTo.
+	// Wired from main.go to mp.BlockDisconnected so transactions from the
+	// just-disconnected block (other than coinbase) get re-fed into the
+	// mempool, mirroring Bitcoin Core's MaybeUpdateMempoolForReorg flow
+	// (validation.cpp::DisconnectTip → MaybeUpdateMempoolForReorg).
+	//
+	// Pattern B closure for blockbrew (CORE-PARITY-AUDIT
+	// _mempool-refill-on-reorg-fleet-result-2026-05-05.md). Stacks on top
+	// of the Pattern Y closure 4e51e8b which made submitblock-driven
+	// reorgs flow through ReorgTo at all; without B, every such reorg was
+	// dropping its disconnected-tip txs on the floor.
+	//
+	// Invoked OUTSIDE cm.mu so the hook can take its own locks (mempool's
+	// mu) without risking lock-order issues. The callback runs after the
+	// chain state has been updated and the tip pointer advanced, so an
+	// embedded mempool re-validation against the new tip's UTXO view sees
+	// a coherent state.
+	onBlockDisconnected func(block *wire.MsgBlock, height int32)
 }
 
 // ChainManagerConfig configures the chain manager.
@@ -119,6 +139,17 @@ type ChainManagerConfig struct {
 	// SigCacheSize is the maximum number of entries in the signature cache.
 	// Default: 50,000 entries. Set to 0 to disable caching.
 	SigCacheSize int
+
+	// OnBlockDisconnected, if set, is invoked once per block popped off the
+	// active tip by DisconnectBlock (and transitively by every peel inside
+	// ReorgTo). Wired from main.go to mp.BlockDisconnected so non-coinbase
+	// txs from the disconnected block get re-fed into the mempool. Mirrors
+	// Bitcoin Core's MaybeUpdateMempoolForReorg.
+	//
+	// Pattern B closure (2026-05-05). Cross-impl reference: camlcoin
+	// lib/sync.ml:2354-2363 which iterates !disconnected_txs and calls
+	// Mempool.add_transaction per non-coinbase tx.
+	OnBlockDisconnected func(block *wire.MsgBlock, height int32)
 }
 
 // NewChainManager creates a new chain manager.
@@ -136,15 +167,16 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 	}
 
 	cm := &ChainManager{
-		params:          config.Params,
-		headerIndex:     config.HeaderIndex,
-		chainDB:         config.ChainDB,
-		utxoSet:         config.UTXOSet,
-		flushInterval:   flushInterval,
-		assumeValidHash: config.AssumeValidHash,
-		parallelScripts: config.ParallelScripts,
-		isIBD:           true, // Start in IBD mode
-		sigCache:        sigCache,
+		params:              config.Params,
+		headerIndex:         config.HeaderIndex,
+		chainDB:             config.ChainDB,
+		utxoSet:             config.UTXOSet,
+		flushInterval:       flushInterval,
+		assumeValidHash:     config.AssumeValidHash,
+		parallelScripts:     config.ParallelScripts,
+		isIBD:               true, // Start in IBD mode
+		sigCache:            sigCache,
+		onBlockDisconnected: config.OnBlockDisconnected,
 	}
 
 	// Default to parallel script validation
@@ -1027,10 +1059,44 @@ func (cm *ChainManager) collectPrevTimestamps(node *BlockNode, count int) []uint
 	return timestamps
 }
 
+// SetOnBlockDisconnected installs (or replaces) the block-disconnected
+// callback after construction. The callback fires once per block popped off
+// the active tip in DisconnectBlock, including each peel inside ReorgTo.
+// Used by main.go to wire chain manager → mempool refill (Pattern B closure).
+func (cm *ChainManager) SetOnBlockDisconnected(cb func(block *wire.MsgBlock, height int32)) {
+	cm.mu.Lock()
+	cm.onBlockDisconnected = cb
+	cm.mu.Unlock()
+}
+
 // DisconnectBlock undoes the effects of a block (for reorgs).
 // It removes outputs created by the block and restores spent UTXOs from undo data.
 // Transactions must be disconnected in reverse order to correctly restore the UTXO set.
+//
+// On a successful disconnect, fires the OnBlockDisconnected callback (if
+// configured) with the just-popped block and its pre-disconnect height. The
+// callback is invoked OUTSIDE cm.mu — primary current consumer is the
+// mempool refill helper (mp.BlockDisconnected) which takes its own lock and
+// must not contend with cm.mu. See Pattern B closure (CORE-PARITY-AUDIT
+// _mempool-refill-on-reorg-fleet-result-2026-05-05.md) and Bitcoin Core's
+// MaybeUpdateMempoolForReorg in validation.cpp.
 func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
+	// disconnectedBlock and disconnectedHeight are captured under the lock
+	// and used to fire the OnBlockDisconnected callback after the lock is
+	// released. Zero values mean "no callback fire" (early-return path).
+	var (
+		disconnectedBlock  *wire.MsgBlock
+		disconnectedHeight int32
+		disconnectedCB     func(*wire.MsgBlock, int32)
+	)
+	defer func() {
+		// Fire post-unlock so the callback (e.g. mempool refill) can take
+		// its own locks freely without lock-order risk against cm.mu.
+		if disconnectedCB != nil && disconnectedBlock != nil {
+			disconnectedCB(disconnectedBlock, disconnectedHeight)
+		}
+	}()
+
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -1119,6 +1185,7 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 		return fmt.Errorf("cannot disconnect genesis block")
 	}
 
+	prevHeight := cm.tipNode.Height
 	cm.tipNode = parent
 	cm.tipHeight = parent.Height
 	cm.updateTipCache(parent.Hash, parent.Height)
@@ -1129,6 +1196,17 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 			BestHash:   parent.Hash,
 			BestHeight: parent.Height,
 		})
+	}
+
+	// Pattern B closure (2026-05-05): hand the disconnected block to the
+	// mempool-refill callback. Captured here, fired post-unlock by the
+	// deferred dispatcher at the top of this function so the hook can
+	// take its own locks (mp.mu) without lock-order risk against cm.mu.
+	// Cross-impl reference: camlcoin lib/sync.ml:2354-2363.
+	if cm.onBlockDisconnected != nil {
+		disconnectedBlock = block
+		disconnectedHeight = prevHeight
+		disconnectedCB = cm.onBlockDisconnected
 	}
 
 	return nil

@@ -750,6 +750,20 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	}, utxoSet)
 	log.Printf("Mempool initialized (max %d MB)", cfg.MaxMempool)
 
+	// Pattern B closure (2026-05-05) — wire chain → mempool refill on
+	// disconnect. ChainManager's DisconnectBlock fires this for every block
+	// popped off the active tip (including each peel inside ReorgTo). The
+	// helper at internal/mempool/mempool.go::BlockDisconnected re-adds
+	// non-coinbase txs from the disconnected block via AddTransaction (which
+	// runs the same checks as a freshly received tx, so policy-correct
+	// against the new tip — matching Core's MaybeUpdateMempoolForReorg).
+	// Stacks on top of Pattern Y closure 4e51e8b which made
+	// submitblock-driven reorgs flow through ReorgTo at all.
+	// See CORE-PARITY-AUDIT/_mempool-refill-on-reorg-fleet-result-2026-05-05.md.
+	chainMgr.SetOnBlockDisconnected(func(block *wire.MsgBlock, height int32) {
+		mp.BlockDisconnected(block)
+	})
+
 	// 6b. Initialize fee estimator
 	feeEstimator := mempool.NewFeeEstimator()
 	if err := feeEstimator.Load(cfg.DataDir); err != nil {
