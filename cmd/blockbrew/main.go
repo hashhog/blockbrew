@@ -164,6 +164,20 @@ type Config struct {
 	// `-loadsnapshot=<path>`.  See bitcoin-core/src/node/utxo_snapshot.h
 	// + src/rpc/blockchain.cpp loadtxoutset.
 	LoadSnapshot string
+
+	// BlockFilterIndex enables the BIP-157/158 compact-block-filter index.
+	// When true, blockbrew builds and persists a basic-type GCS filter for
+	// every connected block and rewinds the index on disconnect (BIP-157
+	// Phase 1 + Phase 2). When false (the default — matches Bitcoin Core's
+	// `-blockfilterindex=0`), the index is not registered, the
+	// /rest/blockfilter and /rest/blockfilterheaders REST endpoints return
+	// "Index is not enabled for filtertype basic", and getblockfilter
+	// returns the same error.
+	//
+	// Mirrors Bitcoin Core's `-blockfilterindex=basic|0|1` flag (init.cpp).
+	// We accept boolean only; "basic" is the only filter type defined and
+	// the only one Core implements server-side.
+	BlockFilterIndex bool
 }
 
 // debugFlag implements flag.Value so `-debug=` may be repeated and/or
@@ -443,6 +457,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.RPCReadyNotify, "rpcready-notify", true, "On systemd hosts, send READY=1 to NOTIFY_SOCKET once RPC is bound. No-op when NOTIFY_SOCKET is unset.")
 	flag.IntVar(&cfg.HealthPort, "healthport", 0, "If non-zero, bind a /healthz HTTP endpoint on 127.0.0.1:<port> for liveness/readiness probes. 0 disables.")
 	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", "Load a Bitcoin Core-format UTXO snapshot (utxo\\xff magic) from <path> before starting the node. Only acted on when the chainstate is fresh (height==0); otherwise an error is logged and the snapshot is skipped. Mirrors Bitcoin Core's `-loadsnapshot=<path>`.")
+	flag.BoolVar(&cfg.BlockFilterIndex, "blockfilterindex", false, "Maintain the BIP-157/158 basic compact-block-filter index. Default OFF (matches Bitcoin Core's `-blockfilterindex=0`). When ON, blockbrew populates the index on every connected block, rewinds it on disconnect (Phase 2 reorg-aware), and exposes the resulting filters via /rest/blockfilter, /rest/blockfilterheaders, and the getblockfilter RPC.")
 	flag.Parse()
 
 	// Apply config file (CLI > config > default). Build the set of flags
@@ -766,6 +781,27 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	}, utxoSet)
 	log.Printf("Mempool initialized (max %d MB)", cfg.MaxMempool)
 
+	// 6a. Optional secondary indexes. Constructed before the chain → index
+	// hooks below so the OnBlockConnected / OnBlockDisconnected fan-out can
+	// reference them. Currently registers:
+	//
+	//   - blockfilterindex (BIP-157/158 basic) when -blockfilterindex is set.
+	//
+	// Mirrors Bitcoin Core's `-blockfilterindex=<basic>` flag. Default OFF
+	// (`-blockfilterindex=0` in init.cpp). When OFF, the IndexManager is
+	// still constructed (so RPC handlers see a non-nil but empty manager
+	// and can return Core's "Index is not enabled" error string verbatim
+	// instead of a generic "internal error").
+	indexManager := storage.NewIndexManager(chainDB)
+	var blockFilterIndex *storage.BlockFilterIndex
+	if cfg.BlockFilterIndex {
+		blockFilterIndex = storage.NewBlockFilterIndex(chainDB.DB())
+		if err := indexManager.RegisterIndex(blockFilterIndex); err != nil {
+			return fmt.Errorf("blockfilterindex: register: %w", err)
+		}
+		log.Printf("BIP-157/158 blockfilterindex enabled (best_height=%d)", blockFilterIndex.BestHeight())
+	}
+
 	// Pattern B closure (2026-05-05) — wire chain → mempool refill on
 	// disconnect. ChainManager's DisconnectBlock fires this for every block
 	// popped off the active tip (including each peel inside ReorgTo). The
@@ -784,6 +820,17 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// BaseIndex::BlockDisconnected → CustomRemove fan-out for the txindex
 	// (index/txindex.cpp). Symmetric with the SetOnBlockConnected handler
 	// below: every tx written on connect is deleted on disconnect.
+	//
+	// BIP-157 Phase 2 (2026-05-06) — when -blockfilterindex is enabled,
+	// also fan the disconnect into the BlockFilterIndex's batch-aware
+	// rewind helper. When the disconnect is part of a ReorgTo, we ride
+	// chainMgr.CurrentReorgBatch() so the filter-row deletion + state-row
+	// rewind commit atomically with the consensus state. When the
+	// disconnect is a standalone single-block tip-pop (rare; primarily
+	// invalidateblock RPC), we open a private batch and commit it
+	// immediately. Mirrors Bitcoin Core's
+	// BaseIndex::BlockDisconnected → CustomRemove fan-out — Core also
+	// composes the deletion + state-row write into a single CDBBatch.
 	chainMgr.SetOnBlockDisconnected(func(block *wire.MsgBlock, height int32) {
 		mp.BlockDisconnected(block)
 		if cfg.TxIndex && chainDB != nil {
@@ -792,6 +839,40 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 				if err := chainDB.DeleteTxIndex(txid); err != nil {
 					log.Printf("txindex: delete %s on disconnect height=%d failed: %v",
 						txid.String()[:16], height, err)
+				}
+			}
+		}
+		if blockFilterIndex != nil {
+			blockHash := block.Header.BlockHash()
+			if reorgBatch := chainMgr.CurrentReorgBatch(); reorgBatch != nil {
+				// Mid-reorg: queue the filter rewind into the shared
+				// pebble batch. ReorgTo's batch.Write() commits it
+				// atomically with the consensus rewind. The post-Write
+				// in-memory state mutation is deferred to ReorgTo's
+				// own deferred dispatcher via CommitRevertState below;
+				// however the simplest correct approach here is to
+				// also publish the in-memory mutation now — if the
+				// batch-Write fails later, the chain manager's error
+				// path leaves the on-disk index pointing at the
+				// pre-reorg tip, and the next process restart re-Init's
+				// the index from disk. This window is consistent with
+				// the consensus chain: cm.tipNode is also moved
+				// in-memory before batch.Write commits, and the same
+				// re-Init-from-disk semantics rescue both.
+				prevHeight, prevHash, prevFilterHeader, err :=
+					blockFilterIndex.RevertBlockBatch(reorgBatch, block, height, blockHash, nil)
+				if err != nil {
+					log.Printf("blockfilterindex: revert (batched) %s @ height=%d failed: %v",
+						blockHash.String()[:16], height, err)
+					return
+				}
+				blockFilterIndex.CommitRevertState(prevHeight, prevHash, prevFilterHeader)
+			} else {
+				// Outside reorg: open a private batch + commit
+				// immediately (RevertBlock encapsulates this).
+				if err := blockFilterIndex.RevertBlock(block, height, blockHash, nil); err != nil {
+					log.Printf("blockfilterindex: revert %s @ height=%d failed: %v",
+						blockHash.String()[:16], height, err)
 				}
 			}
 		}
@@ -817,14 +898,38 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// onBlockConnected fire is skipped (genesis coinbase is unspendable).
 	// All non-genesis coinbases ARE indexed to match Core (`-txindex` in
 	// Core covers every confirmed tx including coinbases).
-	if cfg.TxIndex && chainDB != nil {
+	//
+	// BIP-157 Phase 1 (Phase 2 lands here too via the same hook) — when
+	// -blockfilterindex is enabled, fan the connect into the
+	// BlockFilterIndex's batch-aware filter writer. Inside ReorgTo this
+	// rides cm.reorgBatch so the post-fork-replay filters land
+	// atomically with the consensus rewrite; outside reorg it commits a
+	// private batch.
+	if cfg.TxIndex || blockFilterIndex != nil {
 		chainMgr.SetOnBlockConnected(func(block *wire.MsgBlock, height int32) {
 			blockHash := block.Header.BlockHash()
-			for _, tx := range block.Transactions {
-				txid := tx.TxHash()
-				if err := chainDB.WriteTxIndex(txid, blockHash); err != nil {
-					log.Printf("txindex: write %s @ height=%d failed: %v",
-						txid.String()[:16], height, err)
+			if cfg.TxIndex && chainDB != nil {
+				for _, tx := range block.Transactions {
+					txid := tx.TxHash()
+					if err := chainDB.WriteTxIndex(txid, blockHash); err != nil {
+						log.Printf("txindex: write %s @ height=%d failed: %v",
+							txid.String()[:16], height, err)
+					}
+				}
+			}
+			if blockFilterIndex != nil {
+				if reorgBatch := chainMgr.CurrentReorgBatch(); reorgBatch != nil {
+					if err := blockFilterIndex.WriteBlockBatch(reorgBatch, block, height, blockHash, nil); err != nil {
+						log.Printf("blockfilterindex: write (batched) %s @ height=%d failed: %v",
+							blockHash.String()[:16], height, err)
+						return
+					}
+					blockFilterIndex.CommitWriteState(height, blockHash)
+				} else {
+					if err := blockFilterIndex.WriteBlock(block, height, blockHash, nil); err != nil {
+						log.Printf("blockfilterindex: write %s @ height=%d failed: %v",
+							blockHash.String()[:16], height, err)
+					}
 				}
 			}
 		})
@@ -1144,6 +1249,11 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		rpc.WithWallet(w),
 		rpc.WithPruner(pruner),
 		rpc.WithDataDir(cfg.DataDir),
+		// IndexManager carries optional secondary indexes (BIP-157
+		// blockfilterindex when -blockfilterindex=1, etc.). Always
+		// passed; RPC handlers gate on whether the requested index is
+		// registered. See section 6a above.
+		rpc.WithIndexManager(indexManager),
 	)
 
 	// 12. Start all services

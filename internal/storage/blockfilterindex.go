@@ -113,8 +113,48 @@ func (idx *BlockFilterIndex) Init() error {
 	return nil
 }
 
-// WriteBlock builds and stores a compact block filter for a newly connected block.
+// WriteBlock builds and stores a compact block filter for a newly connected
+// block. Opens its own write batch and commits it before returning.
+//
+// Used outside reorgs (the IBD / single-block-extend happy path). Inside a
+// reorg, callers should prefer WriteBlockBatch + the chain manager's shared
+// reorg batch so the multi-block disconnect+reconnect commits atomically
+// (BIP-157 Phase 2 — see CORE-PARITY-AUDIT and ChainManager.CurrentReorgBatch).
 func (idx *BlockFilterIndex) WriteBlock(block *wire.MsgBlock, height int32, blockHash wire.Hash256, undo *BlockUndo) error {
+	batch := idx.db.NewBatch()
+	if err := idx.WriteBlockBatch(batch, block, height, blockHash, undo); err != nil {
+		return err
+	}
+	if err := batch.Write(); err != nil {
+		return err
+	}
+	idx.commitWriteState(height, blockHash)
+	return nil
+}
+
+// WriteBlockBatch is the batch-aware variant of WriteBlock.
+//
+// It computes the BIP-158 basic filter + filter-header chain entry for the
+// given block and APPENDS the filter Put + state Put into the caller-owned
+// batch. It does NOT commit the batch and does NOT mutate the index's
+// in-memory best-height / prev-filter-header until commitWriteState is called.
+//
+// The intended call sequence inside a reorg is:
+//
+//	batch := chainMgr.CurrentReorgBatch() // shared with cm.reorgBatch
+//	if err := idx.WriteBlockBatch(batch, blk, h, hash, undo); err != nil { ... }
+//	// ... ReorgTo's commit eventually calls batch.Write()
+//	idx.CommitWriteState(h, hash)         // POST-Write only
+//
+// Outside of a reorg (single-block extend) WriteBlock is the right entry
+// point — it does open + delegate + commit + commitWriteState in one call.
+//
+// Cross-impl reference: bitcoin-core/src/index/blockfilterindex.cpp::CustomAppend.
+func (idx *BlockFilterIndex) WriteBlockBatch(batch Batch, block *wire.MsgBlock, height int32, blockHash wire.Hash256, undo *BlockUndo) error {
+	if batch == nil {
+		return errors.New("blockfilterindex: WriteBlockBatch called with nil batch")
+	}
+
 	// Build the GCS filter
 	filter := idx.buildBasicFilter(block, undo, blockHash)
 
@@ -122,24 +162,22 @@ func (idx *BlockFilterIndex) WriteBlock(block *wire.MsgBlock, height int32, bloc
 	filterHash := wire.DoubleHashB(filter)
 
 	// Compute filter header: SHA256d(filterHash || prevFilterHeader)
+	prev := idx.PrevFilterHeader()
 	headerData := make([]byte, 64)
 	copy(headerData[:32], filterHash[:])
-	copy(headerData[32:], idx.prevFilterHeader[:])
+	copy(headerData[32:], prev[:])
 	filterHeader := wire.DoubleHashB(headerData)
 
-	// Store filter data
+	// Filter-data entry keyed by height.
 	filterData := &BlockFilterData{
 		BlockHash:    blockHash,
 		FilterHash:   filterHash,
 		FilterHeader: filterHeader,
 		Filter:       filter,
 	}
+	batch.Put(MakeBlockFilterKey(height), filterData.Serialize())
 
-	batch := idx.db.NewBatch()
-	key := MakeBlockFilterKey(height)
-	batch.Put(key, filterData.Serialize())
-
-	// Save state
+	// State entry pointing at the new tip.
 	state := &BlockFilterState{
 		BestHeight:       height,
 		BestHash:         blockHash,
@@ -147,21 +185,106 @@ func (idx *BlockFilterIndex) WriteBlock(block *wire.MsgBlock, height int32, bloc
 	}
 	batch.Put(BlockFilterStateKey, state.Serialize())
 
-	if err := batch.Write(); err != nil {
-		return err
-	}
+	// Stash the freshly-computed filter-header on the index so the *next*
+	// WriteBlockBatch call inside the same reorg can chain off it without
+	// having to read the not-yet-committed batch back. The reorg batch
+	// commits all entries atomically; if the caller never commits the batch
+	// (e.g. ReorgTo errors before batch.Write()), the in-memory mutation
+	// here is reverted by the chain manager's defer-rollback path that
+	// re-Init's the index, OR — in the ChainManager.reorgBatch flow —
+	// simply abandoning the batch leaves the on-disk state at the
+	// pre-reorg tip while the index re-loads from disk on next Init.
+	//
+	// We deliberately do NOT call UpdateBest here: bestHeight / bestHash
+	// changes only land via commitWriteState on the post-batch-Write path
+	// so a crash between Put and Write doesn't leave the index in-memory
+	// pointing at a tip that disk doesn't agree with.
+	idx.setPrevFilterHeader(filterHeader)
 
-	idx.prevFilterHeader = filterHeader
-	idx.UpdateBest(height, blockHash)
 	return nil
 }
 
-// RevertBlock removes a block filter from the index.
-func (idx *BlockFilterIndex) RevertBlock(block *wire.MsgBlock, height int32, blockHash wire.Hash256, _ *BlockUndo) error {
+// commitWriteState publishes the post-Write best-height/best-hash on the
+// in-memory index. Must be called only after the batch containing the
+// WriteBlockBatch entries has been committed to disk.
+func (idx *BlockFilterIndex) commitWriteState(height int32, blockHash wire.Hash256) {
+	idx.UpdateBest(height, blockHash)
+}
+
+// CommitWriteState is the exported alias for callers driving the batch
+// life-cycle from outside the package (e.g. the chain-manager hook which
+// hands the shared reorg batch + commits via ReorgTo's batch.Write). The
+// hook signals "the batch I gave you just landed on disk" by calling this.
+//
+// Symmetric pair: CommitRevertState for the disconnect path.
+func (idx *BlockFilterIndex) CommitWriteState(height int32, blockHash wire.Hash256) {
+	idx.commitWriteState(height, blockHash)
+}
+
+// RevertBlock removes a block filter from the index. Opens its own write
+// batch and commits it before returning.
+//
+// Used outside reorgs (the rare single-tip-disconnect operator path). Inside
+// a reorg, callers should prefer RevertBlockBatch + the chain manager's
+// shared reorg batch so the multi-block disconnect+reconnect commits
+// atomically (BIP-157 Phase 2). The batch helper is the cross-impl analog
+// of bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove which builds
+// a CDBBatch, queues the deletion + state-row write, and commits.
+func (idx *BlockFilterIndex) RevertBlock(block *wire.MsgBlock, height int32, blockHash wire.Hash256, undo *BlockUndo) error {
+	batch := idx.db.NewBatch()
+	prevHeight, prevHash, prevFilterHeader, err := idx.RevertBlockBatch(batch, block, height, blockHash, undo)
+	if err != nil {
+		return err
+	}
+	if err := batch.Write(); err != nil {
+		return err
+	}
+	idx.commitRevertState(prevHeight, prevHash, prevFilterHeader)
+	return nil
+}
+
+// RevertBlockBatch is the batch-aware variant of RevertBlock.
+//
+// It APPENDS the filter-row deletion + state-row write that mark the index
+// as having peeled `height` off into the caller-owned batch and returns
+// (prevHeight, prevHash, prevFilterHeader) so the caller can finish the
+// post-Write state mutation by calling CommitRevertState once the batch has
+// landed on disk.
+//
+// BIP-157 Phase 2 — reorg-aware filter chain (2026-05-06).
+// The chain-manager hook for OnBlockDisconnected uses this when
+// cm.CurrentReorgBatch() is non-nil so the filter rewind rides the same
+// Pebble batch as the UTXO + chainstate + undo-data rewind. A crash before
+// ReorgTo's final batch.Write() leaves the on-disk filter index at the
+// pre-reorg tip; success leaves it at the post-reorg tip — there is no
+// intermediate state where the consensus chain has reorged but the filter
+// index still references the abandoned branch.
+//
+// Cross-impl reference: bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove
+// — Core also batches the deletion + state-row in a single CDBBatch, then
+// commits via BaseIndex::Rewind. This helper is the blockbrew analog and
+// composes with cm.reorgBatch the same way Core's CustomRemove composes
+// with the surrounding ActivateBestChain CDBBatch.
+//
+// Returns (prevHeight, prevHash, prevFilterHeader, error). Even on error,
+// no in-memory state on the index is mutated (the caller's batch may also
+// be partially populated, and the Pebble batch semantics guarantee an
+// abandoned batch is safely droppable).
+func (idx *BlockFilterIndex) RevertBlockBatch(batch Batch, block *wire.MsgBlock, height int32, blockHash wire.Hash256, _ *BlockUndo) (int32, wire.Hash256, wire.Hash256, error) {
+	if batch == nil {
+		return 0, wire.Hash256{}, wire.Hash256{}, errors.New("blockfilterindex: RevertBlockBatch called with nil batch")
+	}
+
 	prevHash := block.Header.PrevBlock
 	prevHeight := height - 1
 
-	// Load previous filter header
+	// Load previous filter header from the on-disk index. During a multi-
+	// block disconnect, the prev-height filter row is still on disk because
+	// we peel from tip backward and only the just-peeled block's row is
+	// queued for deletion in the current batch. Successive peels read each
+	// time from disk — this is the same read-from-disk pattern Bitcoin
+	// Core's CustomRemove uses (it calls ReadFilterHeader directly off the
+	// CDBWrapper, not via the in-flight batch).
 	var prevFilterHeader wire.Hash256
 	if prevHeight >= 0 {
 		prevData, err := idx.GetFilter(prevHeight)
@@ -170,13 +293,12 @@ func (idx *BlockFilterIndex) RevertBlock(block *wire.MsgBlock, height int32, blo
 		}
 	}
 
-	batch := idx.db.NewBatch()
+	// Queue the deletion of the filter row at this height into the caller's
+	// batch.
+	batch.Delete(MakeBlockFilterKey(height))
 
-	// Delete filter at this height
-	key := MakeBlockFilterKey(height)
-	batch.Delete(key)
-
-	// Update state
+	// Queue the state-row write so post-commit the index points at the
+	// pre-disconnect parent.
 	state := &BlockFilterState{
 		BestHeight:       prevHeight,
 		BestHash:         prevHash,
@@ -184,13 +306,40 @@ func (idx *BlockFilterIndex) RevertBlock(block *wire.MsgBlock, height int32, blo
 	}
 	batch.Put(BlockFilterStateKey, state.Serialize())
 
-	if err := batch.Write(); err != nil {
-		return err
-	}
+	return prevHeight, prevHash, prevFilterHeader, nil
+}
 
-	idx.prevFilterHeader = prevFilterHeader
+// commitRevertState publishes the post-Write tip + prev-filter-header on
+// the in-memory index. Must be called only after the batch containing the
+// RevertBlockBatch entries has been committed to disk.
+func (idx *BlockFilterIndex) commitRevertState(prevHeight int32, prevHash wire.Hash256, prevFilterHeader wire.Hash256) {
+	idx.setPrevFilterHeader(prevFilterHeader)
 	idx.UpdateBest(prevHeight, prevHash)
-	return nil
+}
+
+// CommitRevertState is the exported alias used by the chain-manager hook to
+// signal "the batch I gave you just landed on disk".
+//
+// Symmetric pair: CommitWriteState for the connect path.
+func (idx *BlockFilterIndex) CommitRevertState(prevHeight int32, prevHash wire.Hash256, prevFilterHeader wire.Hash256) {
+	idx.commitRevertState(prevHeight, prevHash, prevFilterHeader)
+}
+
+// PrevFilterHeader returns the in-memory cached previous-filter-header used
+// to chain the next block's filter header. Read under the BaseIndex lock so
+// concurrent WriteBlockBatch + GetFilter calls see a consistent snapshot.
+func (idx *BlockFilterIndex) PrevFilterHeader() wire.Hash256 {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.prevFilterHeader
+}
+
+// setPrevFilterHeader updates the in-memory cached previous-filter-header.
+// Held under the BaseIndex lock to be consistent with the public reader.
+func (idx *BlockFilterIndex) setPrevFilterHeader(h wire.Hash256) {
+	idx.mu.Lock()
+	idx.prevFilterHeader = h
+	idx.mu.Unlock()
 }
 
 // GetFilter returns the filter data for a given height.
@@ -564,7 +713,7 @@ func matchGCS(filter []byte, blockHash wire.Hash256, scripts [][]byte) (bool, er
 
 // bitStreamReader reads bits from a byte stream.
 type bitStreamReader struct {
-	r        *bytes.Reader
+	r         *bytes.Reader
 	accumBits uint64
 	numBits   uint
 }
