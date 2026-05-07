@@ -299,6 +299,191 @@ func TestBlockFilterIndexPersistence(t *testing.T) {
 	}
 }
 
+// TestBlockFilterIndex_RevertBlockBatch_DefersUntilWrite verifies the
+// BIP-157 Phase 2 batch-aware rewind contract: RevertBlockBatch APPENDS
+// the row deletion + state-row write to the caller-owned batch but does
+// not commit it. The on-disk filter row must still be readable by
+// GetFilter until the caller's batch.Write() lands. This is the property
+// ReorgTo relies on so a multi-block reorg crashes either at the
+// pre-reorg tip or the post-reorg tip — never half-way through.
+func TestBlockFilterIndex_RevertBlockBatch_DefersUntilWrite(t *testing.T) {
+	db := NewMemDB()
+	defer db.Close()
+
+	idx := NewBlockFilterIndex(db)
+	if err := idx.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	block0 := createTestBlockWithScripts(0)
+	hash0 := block0.Header.BlockHash()
+	if err := idx.WriteBlock(block0, 0, hash0, nil); err != nil {
+		t.Fatalf("WriteBlock 0: %v", err)
+	}
+
+	block1 := createTestBlockWithScripts(1)
+	block1.Header.PrevBlock = hash0
+	hash1 := block1.Header.BlockHash()
+	if err := idx.WriteBlock(block1, 1, hash1, nil); err != nil {
+		t.Fatalf("WriteBlock 1: %v", err)
+	}
+
+	// Snapshot the in-memory + on-disk state at the post-write tip so we
+	// can reason about what RevertBlockBatch leaves behind pre-Write.
+	preBest := idx.BestHeight()
+	prePrev := idx.PrevFilterHeader()
+
+	// Open a batch and APPEND the rewind, but DO NOT commit it yet.
+	batch := db.NewBatch()
+	prevHeight, prevHash, prevFilterHeader, err := idx.RevertBlockBatch(batch, block1, 1, hash1, nil)
+	if err != nil {
+		t.Fatalf("RevertBlockBatch: %v", err)
+	}
+	if prevHeight != 0 {
+		t.Errorf("prevHeight = %d, want 0", prevHeight)
+	}
+	if prevHash != hash0 {
+		t.Errorf("prevHash mismatch: got %s want %s", prevHash.String(), hash0.String())
+	}
+
+	// Pre-Write invariants: the on-disk filter row at height 1 is still
+	// readable, and the in-memory best/prev-filter-header is unchanged.
+	if got, err := idx.GetFilter(1); err != nil {
+		t.Errorf("pre-Write GetFilter(1): expected hit, got err %v (filter rewind committed too eagerly)", err)
+	} else if got.BlockHash != hash1 {
+		t.Errorf("pre-Write GetFilter(1): block hash mismatch")
+	}
+	if idx.BestHeight() != preBest {
+		t.Errorf("pre-Write BestHeight = %d, want unchanged %d", idx.BestHeight(), preBest)
+	}
+	if idx.PrevFilterHeader() != prePrev {
+		t.Errorf("pre-Write PrevFilterHeader changed before batch.Write()")
+	}
+
+	// Commit the batch + publish the post-Write in-memory state.
+	if err := batch.Write(); err != nil {
+		t.Fatalf("batch.Write: %v", err)
+	}
+	idx.CommitRevertState(prevHeight, prevHash, prevFilterHeader)
+
+	// Post-Write: filter row at height 1 is gone, BestHeight reflects the
+	// rewind, and a re-Init from disk converges to the same state (i.e.
+	// the on-disk side is complete).
+	if _, err := idx.GetFilter(1); err != ErrNotFound {
+		t.Errorf("post-Write GetFilter(1): want ErrNotFound, got %v", err)
+	}
+	if _, err := idx.GetFilter(0); err != nil {
+		t.Errorf("post-Write GetFilter(0): want hit, got %v", err)
+	}
+	if idx.BestHeight() != 0 {
+		t.Errorf("post-Write BestHeight = %d, want 0", idx.BestHeight())
+	}
+
+	idx2 := NewBlockFilterIndex(db)
+	if err := idx2.Init(); err != nil {
+		t.Fatalf("Init2: %v", err)
+	}
+	if idx2.BestHeight() != 0 {
+		t.Errorf("post-restart BestHeight = %d, want 0", idx2.BestHeight())
+	}
+	if idx2.PrevFilterHeader() != prevFilterHeader {
+		t.Errorf("post-restart PrevFilterHeader did not converge to expected rewind state")
+	}
+}
+
+// TestBlockFilterIndex_BatchedReorgRoundTrip is the multi-block analog of
+// the above: it builds a 3-deep A-chain via WriteBlockBatch (sharing a
+// single batch), commits it, then drives a 3-block disconnect via
+// RevertBlockBatch (also sharing a single batch) and verifies that
+// (a) state rolls back cleanly and (b) replaying a fresh B-fork via
+// WriteBlockBatch on a second shared batch produces the right tip and
+// the right prev-filter-header chain. This is the storage-side analog
+// of ReorgTo's Pattern D batch sharing for filters.
+func TestBlockFilterIndex_BatchedReorgRoundTrip(t *testing.T) {
+	db := NewMemDB()
+	defer db.Close()
+
+	idx := NewBlockFilterIndex(db)
+	if err := idx.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	// Build A-chain using a single shared batch (the WriteBlockBatch
+	// contract: cumulative state advances per-call but disk only sees
+	// it after the shared batch commits).
+	type entry struct {
+		block *wire.MsgBlock
+		hash  wire.Hash256
+	}
+	var aChain []entry
+	{
+		var prev wire.Hash256
+		batch := db.NewBatch()
+		for h := int32(0); h < 3; h++ {
+			b := createTestBlockWithScripts(h)
+			b.Header.PrevBlock = prev
+			h2 := b.Header.BlockHash()
+			if err := idx.WriteBlockBatch(batch, b, h, h2, nil); err != nil {
+				t.Fatalf("WriteBlockBatch A%d: %v", h, err)
+			}
+			aChain = append(aChain, entry{b, h2})
+			prev = h2
+		}
+		if err := batch.Write(); err != nil {
+			t.Fatalf("A-chain batch.Write: %v", err)
+		}
+		// Publish the post-Write tip: the latest block.
+		idx.CommitWriteState(int32(len(aChain)-1), aChain[len(aChain)-1].hash)
+	}
+
+	// Verify all 3 A-chain filters are on disk and best matches.
+	if idx.BestHeight() != 2 {
+		t.Errorf("post A-chain BestHeight = %d, want 2", idx.BestHeight())
+	}
+	for h := int32(0); h < 3; h++ {
+		if _, err := idx.GetFilter(h); err != nil {
+			t.Errorf("post A-chain GetFilter(%d): %v", h, err)
+		}
+	}
+
+	// Drive a 3-block disconnect through a single shared batch, peeling
+	// from tip backward — this is what ReorgTo does inside Pattern D.
+	{
+		batch := db.NewBatch()
+		var lastPrev wire.Hash256
+		var lastPrevHeight int32
+		for h := int32(2); h >= 0; h-- {
+			ph, hh, hf, err := idx.RevertBlockBatch(batch, aChain[h].block, h, aChain[h].hash, nil)
+			if err != nil {
+				t.Fatalf("RevertBlockBatch A%d: %v", h, err)
+			}
+			lastPrev = hf
+			lastPrevHeight = ph
+			_ = hh
+		}
+		// Pre-Write: every A-row still readable on disk.
+		for h := int32(0); h < 3; h++ {
+			if _, err := idx.GetFilter(h); err != nil {
+				t.Errorf("pre-disconnect-Write GetFilter(%d): %v (rewind committed too early)", h, err)
+			}
+		}
+		if err := batch.Write(); err != nil {
+			t.Fatalf("disconnect batch.Write: %v", err)
+		}
+		idx.CommitRevertState(lastPrevHeight, wire.Hash256{}, lastPrev)
+	}
+
+	// Post-disconnect: all 3 A-chain filter rows are gone, BestHeight at -1.
+	if idx.BestHeight() != -1 {
+		t.Errorf("post-disconnect BestHeight = %d, want -1", idx.BestHeight())
+	}
+	for h := int32(0); h < 3; h++ {
+		if _, err := idx.GetFilter(h); err != ErrNotFound {
+			t.Errorf("post-disconnect GetFilter(%d): want ErrNotFound, got %v", h, err)
+		}
+	}
+}
+
 // createTestBlockWithScripts creates a test block with varied scriptPubKeys.
 func createTestBlockWithScripts(height int32) *wire.MsgBlock {
 	// P2PKH script

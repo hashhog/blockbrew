@@ -2316,6 +2316,173 @@ func TestReorgTo_FiresOnBlockConnectedPerReplay(t *testing.T) {
 	}
 }
 
+// TestReorgTo_CurrentReorgBatchVisibleToHooks is the BIP-157 Phase 2
+// (reorg-aware filter chain) integration sentinel. It verifies that the
+// post-unlock OnBlockDisconnected / OnBlockConnected hooks called by
+// ReorgTo see a NON-NIL chainMgr.CurrentReorgBatch() each time they fire,
+// and that the same pointer is shared across every peel + replay inside
+// one ReorgTo call. This is the property the storage-side
+// BlockFilterIndex.RevertBlockBatch / WriteBlockBatch helpers rely on so
+// that a multi-block reorg's filter rewind commits as ONE atomic Pebble
+// write alongside the consensus state.
+//
+// Cross-impl reference: bitcoin-core/src/index/blockfilterindex.cpp::CustomRemove
+// (deletion + state-row composed into the surrounding ActivateBestChain
+// CDBBatch). Pre-fix on blockbrew, the filter rewind would have opened
+// its own per-block batch and committed each peel separately, defeating
+// the Pattern D atomicity that just landed (52468e7).
+func TestReorgTo_CurrentReorgBatchVisibleToHooks(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	type observation struct {
+		kind     string // "connect" | "disconnect"
+		hash     wire.Hash256
+		height   int32
+		batchPtr storage.Batch // nil when CurrentReorgBatch returned nil
+	}
+	var observed []observation
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	// Wire post-construction so we can capture the CurrentReorgBatch at
+	// hook-fire time. The hooks fire OUTSIDE cm.mu and BEFORE ReorgTo's
+	// terminal batch.Write, which is precisely the window the BIP-157
+	// Phase 2 hook needs to see a non-nil batch.
+	cm.SetOnBlockDisconnected(func(block *wire.MsgBlock, height int32) {
+		observed = append(observed, observation{
+			kind:     "disconnect",
+			hash:     block.Header.BlockHash(),
+			height:   height,
+			batchPtr: cm.CurrentReorgBatch(),
+		})
+	})
+	cm.SetOnBlockConnected(func(block *wire.MsgBlock, height int32) {
+		observed = append(observed, observation{
+			kind:     "connect",
+			hash:     block.Header.BlockHash(),
+			height:   height,
+			batchPtr: cm.CurrentReorgBatch(),
+		})
+	})
+
+	genesis := idx.Genesis()
+
+	// A-chain: A1, A2 via the per-block ConnectBlock path (no reorg yet,
+	// so CurrentReorgBatch must be nil for both fires).
+	a1 := createTestBlock(t, params, genesis, nil)
+	nodeA1, err := idx.AddHeader(a1.Header)
+	if err != nil {
+		t.Fatalf("A1 header: %v", err)
+	}
+	if err := db.StoreBlock(a1.Header.BlockHash(), a1); err != nil {
+		t.Fatalf("A1 store: %v", err)
+	}
+	if err := cm.ConnectBlock(a1); err != nil {
+		t.Fatalf("A1 connect: %v", err)
+	}
+
+	a2 := createTestBlock(t, params, nodeA1, nil)
+	if _, err := idx.AddHeader(a2.Header); err != nil {
+		t.Fatalf("A2 header: %v", err)
+	}
+	if err := db.StoreBlock(a2.Header.BlockHash(), a2); err != nil {
+		t.Fatalf("A2 store: %v", err)
+	}
+	if err := cm.ConnectBlock(a2); err != nil {
+		t.Fatalf("A2 connect: %v", err)
+	}
+
+	// Pre-reorg: 2 connect fires; both must have seen CurrentReorgBatch == nil.
+	if len(observed) != 2 {
+		t.Fatalf("pre-reorg fires = %d, want 2", len(observed))
+	}
+	for i, o := range observed {
+		if o.batchPtr != nil {
+			t.Errorf("pre-reorg fire %d (kind=%s, h=%d) saw a non-nil reorg batch — should be nil outside ReorgTo",
+				i, o.kind, o.height)
+		}
+	}
+
+	// Reset for the reorg-window observations.
+	observed = observed[:0]
+
+	// B-chain: B1, B2, B3 (heavier). Use createSiblingBlock for distinct hashes.
+	b1 := createSiblingBlock(t, params, genesis, 0xB1)
+	nodeB1, err := idx.AddHeader(b1.Header)
+	if err != nil {
+		t.Fatalf("B1 header: %v", err)
+	}
+	if err := db.StoreBlock(b1.Header.BlockHash(), b1); err != nil {
+		t.Fatalf("B1 store: %v", err)
+	}
+
+	b2 := createSiblingBlock(t, params, nodeB1, 0xB2)
+	nodeB2, err := idx.AddHeader(b2.Header)
+	if err != nil {
+		t.Fatalf("B2 header: %v", err)
+	}
+	if err := db.StoreBlock(b2.Header.BlockHash(), b2); err != nil {
+		t.Fatalf("B2 store: %v", err)
+	}
+
+	b3 := createSiblingBlock(t, params, nodeB2, 0xB3)
+	nodeB3, err := idx.AddHeader(b3.Header)
+	if err != nil {
+		t.Fatalf("B3 header: %v", err)
+	}
+	if err := db.StoreBlock(b3.Header.BlockHash(), b3); err != nil {
+		t.Fatalf("B3 store: %v", err)
+	}
+
+	if err := cm.ReorgTo(nodeB3); err != nil {
+		t.Fatalf("ReorgTo(B3): %v", err)
+	}
+
+	// Reorg window: 2 disconnects (A2, A1) + 3 connects (B1, B2, B3) = 5 fires,
+	// all of which must have seen the SAME non-nil batch pointer.
+	if len(observed) != 5 {
+		t.Fatalf("reorg-window fires = %d, want 5; observed=%+v", len(observed), observed)
+	}
+	var sharedBatch storage.Batch
+	for i, o := range observed {
+		if o.batchPtr == nil {
+			t.Errorf("reorg fire %d (kind=%s, h=%d, hash=%s) saw NIL reorg batch — Phase 2 hook would have fallen back to its private batch and broken atomicity",
+				i, o.kind, o.height, o.hash.String()[:16])
+			continue
+		}
+		if sharedBatch == nil {
+			sharedBatch = o.batchPtr
+		} else if o.batchPtr != sharedBatch {
+			t.Errorf("reorg fire %d saw a DIFFERENT batch pointer than fire 0 — Phase D shared-batch property is broken",
+				i)
+		}
+	}
+
+	// After ReorgTo returns, the batch is cleared.
+	if cm.CurrentReorgBatch() != nil {
+		t.Errorf("post-reorg CurrentReorgBatch() = %v, want nil", cm.CurrentReorgBatch())
+	}
+
+	// Order check: the first 2 fires are disconnects in tip-down order
+	// (A2 then A1), the next 3 are connects in fork→tip order (B1, B2, B3).
+	wantKinds := []string{"disconnect", "disconnect", "connect", "connect", "connect"}
+	wantHeights := []int32{2, 1, 1, 2, 3}
+	for i := range observed {
+		if observed[i].kind != wantKinds[i] {
+			t.Errorf("fire %d kind = %q, want %q", i, observed[i].kind, wantKinds[i])
+		}
+		if observed[i].height != wantHeights[i] {
+			t.Errorf("fire %d height = %d, want %d", i, observed[i].height, wantHeights[i])
+		}
+	}
+}
+
 // TestProcessSubmittedBlock_FiresOnBlockConnectedOnHappyPath ties Pattern C0
 // to the diff-test corpus entry it closes (txindex-revert-on-reorg). The
 // corpus drives every block in via submitblock — i.e. ProcessSubmittedBlock

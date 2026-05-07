@@ -30,7 +30,6 @@ const PhaseStatsLogEvery = 100
 // validation.cpp's MaxReorgDepth() helper.
 const MaxReorgDepth = 100
 
-
 // cachedUTXOView wraps a UTXOView with a cache of entries that may have been
 // spent from the underlying view. This is used during block connection so that
 // script validation (second pass) can still access UTXOs that were spent in the
@@ -624,8 +623,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Each entry records a tx index and the outputs it added / inputs it spent.
 	type utxoModification struct {
 		txIdx       int
-		addedOuts   []wire.OutPoint    // outputs added to UTXO set
-		spentInputs []wire.OutPoint    // inputs spent from UTXO set
+		addedOuts   []wire.OutPoint     // outputs added to UTXO set
+		spentInputs []wire.OutPoint     // inputs spent from UTXO set
 		spentCoins  []storage.SpentCoin // original UTXOs for rollback
 	}
 	var utxoMods []utxoModification
@@ -1097,9 +1096,9 @@ var ErrSideBranchAccepted = fmt.Errorf("block accepted as side-branch")
 // Return values (mirrors Bitcoin Core's submitblock return convention):
 //   - nil                       → block accepted, became part of active chain.
 //   - ErrSideBranchAccepted     → block stored on a non-active branch
-//                                 (caller should return BIP-22 "inconclusive").
+//     (caller should return BIP-22 "inconclusive").
 //   - other error               → validation/connection failure; caller maps
-//                                 via bip22ResultString.
+//     via bip22ResultString.
 //
 // Reference: bitcoin-core/src/validation.cpp::AcceptBlock + ActivateBestChain.
 // Storage and best-chain selection are decoupled in Core; this method
@@ -1214,6 +1213,35 @@ func (cm *ChainManager) SetOnBlockConnected(cb func(block *wire.MsgBlock, height
 	cm.mu.Lock()
 	cm.onBlockConnected = cb
 	cm.mu.Unlock()
+}
+
+// CurrentReorgBatch returns the per-reorg shared persistence batch when the
+// chain manager is mid-reorg, or nil otherwise. Used by external secondary
+// indexes (BIP-157 blockfilterindex Phase 2, future BIP-158 follow-ups)
+// whose connect/disconnect hooks need to ride the same Pebble batch as the
+// UTXO + chainstate + undo-data rewind so a multi-block reorg commits
+// atomically.
+//
+// Locking discipline: the OnBlockConnected / OnBlockDisconnected hooks fire
+// AFTER cm.mu is released by the dispatcher in ConnectBlock /
+// DisconnectBlock, but BEFORE ReorgTo's batch.Write() lands. Read here
+// under cm.mu so the hook sees a coherent (nil OR live-shared) batch
+// pointer; once the hook captures the pointer, it is safe to use until
+// ReorgTo's deferred dispatcher clears cm.reorgBatch (which only happens
+// after the synchronous batch.Write in the success path, or after the
+// error path returns to the caller).
+//
+// Returns nil when called outside of a ReorgTo. The hook is responsible for
+// falling back to its own per-block batch in that case.
+//
+// Cross-impl reference: bitcoin-core/src/validation.cpp::ActivateBestChain
+// holds a single CDBBatch across DisconnectTip / ConnectTip and the
+// secondary-index fan-out via CValidationInterface composes into the same
+// batch by Reading cm.reorgBatch's analog through the ChainstateManager.
+func (cm *ChainManager) CurrentReorgBatch() storage.Batch {
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+	return cm.reorgBatch
 }
 
 // DisconnectBlock undoes the effects of a block (for reorgs).
