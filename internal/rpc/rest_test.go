@@ -678,6 +678,272 @@ func TestBitmapFromString(t *testing.T) {
 	}
 }
 
+// makeBlockFilterServer wires a Server with a registered BlockFilterIndex
+// holding a filter for the genesis block. Used by TestRESTBlockFilter and
+// TestRESTBlockFilterHeaders to exercise the BIP-157 REST endpoints.
+func makeBlockFilterServer(t *testing.T) (*Server, wire.Hash256, *storage.BlockFilterIndex) {
+	t.Helper()
+	params := consensus.MainnetParams()
+	idx := consensus.NewHeaderIndex(params)
+	cmConfig := consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		UTXOSet:     consensus.NewInMemoryUTXOView(),
+	}
+	chainMgr := consensus.NewChainManager(cmConfig)
+
+	memDB := storage.NewMemDB()
+	chainDB := storage.NewChainDB(memDB)
+	indexMgr := storage.NewIndexManager(chainDB)
+
+	// Use a separate DB instance for the filter index so its keyspace
+	// doesn't collide with chainDB's.
+	bfi := storage.NewBlockFilterIndex(storage.NewMemDB())
+	if err := indexMgr.RegisterIndex(bfi); err != nil {
+		t.Fatalf("RegisterIndex: %v", err)
+	}
+
+	// Write a filter for the genesis block so GetFilter(0) succeeds.
+	genesisHash := params.GenesisHash
+	if err := bfi.WriteBlock(params.GenesisBlock, 0, genesisHash, nil); err != nil {
+		t.Fatalf("WriteBlock genesis: %v", err)
+	}
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0", RESTEnabled: true},
+		WithChainParams(params),
+		WithHeaderIndex(idx),
+		WithChainManager(chainMgr),
+		WithChainDB(chainDB),
+		WithIndexManager(indexMgr),
+	)
+
+	return server, genesisHash, bfi
+}
+
+func TestRESTBlockFilter(t *testing.T) {
+	server, genesisHash, bfi := makeBlockFilterServer(t)
+	hashStr := genesisHash.String()
+
+	// JSON: { "filter": "<hex>" }
+	rr := testRESTRequest(t, server.handleRESTBlockFilter, http.MethodGet,
+		"/rest/blockfilter/basic/"+hashStr+".json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var jres map[string]string
+	if err := json.NewDecoder(rr.Body).Decode(&jres); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	gotFilter, err := hex.DecodeString(jres["filter"])
+	if err != nil {
+		t.Fatalf("decode filter hex: %v", err)
+	}
+	wantFilter, err := bfi.GetFilter(0)
+	if err != nil {
+		t.Fatalf("GetFilter: %v", err)
+	}
+	if !bytes.Equal(gotFilter, wantFilter.Filter) {
+		t.Errorf("JSON filter mismatch: got %x, want %x", gotFilter, wantFilter.Filter)
+	}
+
+	// Hex: filter_type(1) || block_hash(32) || varbytes(filter), hex-encoded.
+	rr = testRESTRequest(t, server.handleRESTBlockFilter, http.MethodGet,
+		"/rest/blockfilter/basic/"+hashStr+".hex")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	hexBody := rr.Body.String()
+	hexBody = hexBody[:len(hexBody)-1] // trim newline
+	rawHex, err := hex.DecodeString(hexBody)
+	if err != nil {
+		t.Fatalf("decode hex body: %v", err)
+	}
+	if rawHex[0] != 0 {
+		t.Errorf("expected filter_type byte 0, got %d", rawHex[0])
+	}
+	if !bytes.Equal(rawHex[1:33], genesisHash[:]) {
+		t.Errorf("hex hash mismatch: got %x, want %x", rawHex[1:33], genesisHash[:])
+	}
+
+	// Bin: same payload as hex but raw bytes.
+	rr = testRESTRequest(t, server.handleRESTBlockFilter, http.MethodGet,
+		"/rest/blockfilter/basic/"+hashStr+".bin")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if ct := rr.Header().Get("Content-Type"); ct != "application/octet-stream" {
+		t.Errorf("expected octet-stream, got %s", ct)
+	}
+	bin := rr.Body.Bytes()
+	if len(bin) < 33 {
+		t.Fatalf("bin payload too short: %d bytes", len(bin))
+	}
+	if bin[0] != 0 {
+		t.Errorf("expected filter_type byte 0, got %d", bin[0])
+	}
+	if !bytes.Equal(bin, rawHex) {
+		t.Errorf("bin and hex payloads disagree")
+	}
+
+	// Unknown filtertype.
+	rr = testRESTRequest(t, server.handleRESTBlockFilter, http.MethodGet,
+		"/rest/blockfilter/extended/"+hashStr+".json")
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for unknown filtertype, got %d", rr.Code)
+	}
+
+	// Bad URI shape (missing hash).
+	rr = testRESTRequest(t, server.handleRESTBlockFilter, http.MethodGet,
+		"/rest/blockfilter/basic/")
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for bad URI, got %d", rr.Code)
+	}
+
+	// Unknown block hash.
+	rr = testRESTRequest(t, server.handleRESTBlockFilter, http.MethodGet,
+		"/rest/blockfilter/basic/0000000000000000000000000000000000000000000000000000000000000001.json")
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown block, got %d", rr.Code)
+	}
+
+	// Method not allowed.
+	rr = testRESTRequest(t, server.handleRESTBlockFilter, http.MethodPost,
+		"/rest/blockfilter/basic/"+hashStr+".json")
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("expected 405 for POST, got %d", rr.Code)
+	}
+}
+
+func TestRESTBlockFilterHeaders(t *testing.T) {
+	server, genesisHash, bfi := makeBlockFilterServer(t)
+	hashStr := genesisHash.String()
+
+	// JSON: array of one hex header.
+	rr := testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/basic/1/"+hashStr+".json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var jheaders []string
+	if err := json.NewDecoder(rr.Body).Decode(&jheaders); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	if len(jheaders) != 1 {
+		t.Fatalf("expected 1 header, got %d", len(jheaders))
+	}
+	wantData, err := bfi.GetFilter(0)
+	if err != nil {
+		t.Fatalf("GetFilter: %v", err)
+	}
+	if jheaders[0] != wantData.FilterHeader.String() {
+		t.Errorf("JSON header mismatch: got %s, want %s",
+			jheaders[0], wantData.FilterHeader.String())
+	}
+
+	// Bin: 32 bytes of raw filter header.
+	rr = testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/basic/1/"+hashStr+".bin")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	if rr.Body.Len() != 32 {
+		t.Errorf("expected 32 bytes, got %d", rr.Body.Len())
+	}
+	if !bytes.Equal(rr.Body.Bytes(), wantData.FilterHeader[:]) {
+		t.Errorf("bin header bytes mismatch")
+	}
+
+	// Hex: 64 hex chars + newline.
+	rr = testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/basic/1/"+hashStr+".hex")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	hexBody := rr.Body.String()
+	hexBody = hexBody[:len(hexBody)-1] // trim newline
+	if len(hexBody) != 64 {
+		t.Errorf("expected 64 hex chars, got %d", len(hexBody))
+	}
+
+	// Asking for more headers than exist clamps to what's available
+	// (Core returns the same shorter list silently).
+	rr = testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/basic/5/"+hashStr+".json")
+	if rr.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+	var jheaders2 []string
+	if err := json.NewDecoder(rr.Body).Decode(&jheaders2); err != nil {
+		t.Fatalf("decode JSON: %v", err)
+	}
+	if len(jheaders2) != 1 {
+		t.Errorf("expected 1 header (only genesis exists), got %d", len(jheaders2))
+	}
+
+	// Out-of-range count.
+	rr = testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/basic/0/"+hashStr+".json")
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for count=0, got %d", rr.Code)
+	}
+	rr = testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/basic/3000/"+hashStr+".json")
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for count out of range, got %d", rr.Code)
+	}
+
+	// Unknown filtertype.
+	rr = testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/extended/1/"+hashStr+".json")
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 for unknown filtertype, got %d", rr.Code)
+	}
+
+	// Unknown hash.
+	rr = testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/basic/1/0000000000000000000000000000000000000000000000000000000000000001.json")
+	if rr.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for unknown hash, got %d", rr.Code)
+	}
+}
+
+// TestRESTBlockFilterIndexDisabled confirms /rest/blockfilter and
+// /rest/blockfilterheaders both return 400 with a Core-compatible error
+// when -blockfilterindex is not enabled.
+func TestRESTBlockFilterIndexDisabled(t *testing.T) {
+	params := consensus.MainnetParams()
+	idx := consensus.NewHeaderIndex(params)
+	cmConfig := consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		UTXOSet:     consensus.NewInMemoryUTXOView(),
+	}
+	chainMgr := consensus.NewChainManager(cmConfig)
+
+	// Note: no IndexManager wired.
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0", RESTEnabled: true},
+		WithChainParams(params),
+		WithHeaderIndex(idx),
+		WithChainManager(chainMgr),
+	)
+
+	hashStr := params.GenesisHash.String()
+
+	rr := testRESTRequest(t, server.handleRESTBlockFilter, http.MethodGet,
+		"/rest/blockfilter/basic/"+hashStr+".json")
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("blockfilter without index: expected 400, got %d", rr.Code)
+	}
+
+	rr = testRESTRequest(t, server.handleRESTBlockFilterHeaders, http.MethodGet,
+		"/rest/blockfilterheaders/basic/1/"+hashStr+".json")
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("blockfilterheaders without index: expected 400, got %d", rr.Code)
+	}
+}
+
 func TestParseOutpoint(t *testing.T) {
 	tests := []struct {
 		input   string
