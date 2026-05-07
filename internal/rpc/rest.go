@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -104,6 +105,11 @@ func (s *Server) RegisterRESTHandlers(mux *http.ServeMux) {
 
 	// UTXO query endpoint
 	mux.HandleFunc("/rest/getutxos/", s.handleRESTGetUTXOs)
+
+	// BIP-157 compact block filter endpoints (mirror Core's
+	// rest.cpp::rest_block_filter and rest_filter_header).
+	mux.HandleFunc("/rest/blockfilter/", s.handleRESTBlockFilter)
+	mux.HandleFunc("/rest/blockfilterheaders/", s.handleRESTBlockFilterHeaders)
 }
 
 // handleRESTBlock handles GET /rest/block/<hash>.<format>
@@ -866,6 +872,266 @@ func (s *Server) buildBlockHeaderResult(header *wire.BlockHeader, height int32) 
 		ChainWork:     chainWork,
 		PreviousHash:  prevHash,
 		NextHash:      nextHash,
+	}
+}
+
+// ============================================================================
+// BIP-157 Compact Block Filter REST endpoints
+// ============================================================================
+
+// restBlockFilterJSON is the JSON-format response body for /rest/blockfilter.
+// Mirrors Bitcoin Core's rest.cpp::rest_block_filter JSON output:
+//   {"filter": "<hex of GCS-encoded filter>"}
+type restBlockFilterJSON struct {
+	Filter string `json:"filter"`
+}
+
+// getBlockFilterIndex returns the BIP-157/158 BlockFilterIndex if it is
+// registered with the IndexManager. Returns (nil, error-string) if absent.
+func (s *Server) getBlockFilterIndex() (*storage.BlockFilterIndex, string) {
+	if s.indexManager == nil {
+		return nil, "Index is not enabled for filtertype basic"
+	}
+	idx := s.indexManager.GetIndex("blockfilterindex")
+	if idx == nil {
+		return nil, "Index is not enabled for filtertype basic"
+	}
+	bfi, ok := idx.(*storage.BlockFilterIndex)
+	if !ok {
+		return nil, "Block filter index not properly initialized"
+	}
+	return bfi, ""
+}
+
+// parseRESTFilterType parses a Core-style filtertype name. Only "basic"
+// is supported (filter type 0); any other value is rejected with the
+// same error string Core emits.
+func parseRESTFilterType(name string) (uint8, bool) {
+	if name == "basic" {
+		return 0, true
+	}
+	return 0, false
+}
+
+// handleRESTBlockFilter handles GET /rest/blockfilter/<filtertype>/<hash>.<format>
+// per BIP-157 / Core rest.cpp::rest_block_filter. Returns the GCS-encoded
+// compact block filter for the requested block.
+//
+// Binary/hex output is the Core BlockFilter wire serialization:
+//   filter_type (1 byte) || block_hash (32 bytes LE) || varbytes(encoded_filter)
+//
+// JSON output is { "filter": "<hex of encoded_filter>" }.
+func (s *Server) handleRESTBlockFilter(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		restError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	// Path is /rest/blockfilter/<filtertype>/<hash>.<ext>
+	path := strings.TrimPrefix(r.URL.Path, "/rest/blockfilter/")
+	parts := strings.SplitN(path, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		restError(w, http.StatusBadRequest, "Invalid URI format. Expected /rest/blockfilter/<filtertype>/<blockhash>")
+		return
+	}
+
+	filterTypeName := parts[0]
+	hashStr, format, err := parseRESTFormat(parts[1])
+	if err != nil {
+		restError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if _, ok := parseRESTFilterType(filterTypeName); !ok {
+		restError(w, http.StatusBadRequest, "Unknown filtertype "+filterTypeName)
+		return
+	}
+
+	hash, err := wire.NewHash256FromHex(hashStr)
+	if err != nil {
+		restError(w, http.StatusBadRequest, "Invalid hash: "+hashStr)
+		return
+	}
+
+	bfi, errMsg := s.getBlockFilterIndex()
+	if bfi == nil {
+		restError(w, http.StatusBadRequest, errMsg)
+		return
+	}
+
+	if s.headerIndex == nil {
+		restError(w, http.StatusServiceUnavailable, "Node is warming up")
+		return
+	}
+
+	node := s.headerIndex.GetNode(hash)
+	if node == nil {
+		restError(w, http.StatusNotFound, hashStr+" not found")
+		return
+	}
+
+	// Core gates on "block was connected to active chain" — the closest
+	// blockbrew analog is IsInMainChain (filters are only written for
+	// connected blocks via IndexManager.BlockConnected).
+	if s.chainMgr != nil && !s.chainMgr.IsInMainChain(hash) {
+		restError(w, http.StatusNotFound, "Filter not found. Block was not connected to active chain.")
+		return
+	}
+
+	filterData, err := bfi.GetFilter(node.Height)
+	if err != nil {
+		restError(w, http.StatusNotFound, "Filter not found. Block filters are still in the process of being indexed.")
+		return
+	}
+
+	switch format {
+	case RESTFormatJSON:
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(restBlockFilterJSON{Filter: hex.EncodeToString(filterData.Filter)})
+		return
+	case RESTFormatBin, RESTFormatHex:
+		var buf bytes.Buffer
+		buf.WriteByte(0) // filter_type = basic
+		buf.Write(hash[:])
+		if err := wire.WriteVarBytes(&buf, filterData.Filter); err != nil {
+			restError(w, http.StatusInternalServerError, "failed to serialize filter")
+			return
+		}
+		if format == RESTFormatHex {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte(hex.EncodeToString(buf.Bytes())))
+			w.Write([]byte("\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(buf.Bytes())
+		return
+	}
+}
+
+// handleRESTBlockFilterHeaders handles
+// GET /rest/blockfilterheaders/<filtertype>/<count>/<hash>.<format>
+// per BIP-157 / Core rest.cpp::rest_filter_header. Returns up to <count>
+// compact block filter headers starting from <hash>, walking forward in
+// the active chain.
+//
+// Binary/hex output is the concatenation of 32-byte filter headers.
+// JSON output is a JSON array of hex-string filter headers.
+func (s *Server) handleRESTBlockFilterHeaders(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		restError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	path := strings.TrimPrefix(r.URL.Path, "/rest/blockfilterheaders/")
+	parts := strings.SplitN(path, "/", 3)
+	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
+		restError(w, http.StatusBadRequest, "Invalid URI format. Expected /rest/blockfilterheaders/<filtertype>/<count>/<blockhash>.<ext>")
+		return
+	}
+
+	filterTypeName := parts[0]
+	countStr := parts[1]
+	hashStr, format, err := parseRESTFormat(parts[2])
+	if err != nil {
+		restError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	if _, ok := parseRESTFilterType(filterTypeName); !ok {
+		restError(w, http.StatusBadRequest, "Unknown filtertype "+filterTypeName)
+		return
+	}
+
+	count, err := strconv.Atoi(countStr)
+	if err != nil || count < 1 || count > maxRESTHeadersResults {
+		restError(w, http.StatusBadRequest, fmt.Sprintf("Header count is invalid or out of acceptable range (1-%d): %s", maxRESTHeadersResults, countStr))
+		return
+	}
+
+	hash, err := wire.NewHash256FromHex(hashStr)
+	if err != nil {
+		restError(w, http.StatusBadRequest, "Invalid hash: "+hashStr)
+		return
+	}
+
+	bfi, errMsg := s.getBlockFilterIndex()
+	if bfi == nil {
+		restError(w, http.StatusBadRequest, errMsg)
+		return
+	}
+
+	if s.headerIndex == nil {
+		restError(w, http.StatusServiceUnavailable, "Node is warming up")
+		return
+	}
+
+	startNode := s.headerIndex.GetNode(hash)
+	if startNode == nil {
+		restError(w, http.StatusNotFound, hashStr+" not found")
+		return
+	}
+
+	// Walk forward in the active chain (Core: while pindex && active_chain.Contains(pindex)).
+	// We use BestBlockNode + GetAncestor to reach each height in the main
+	// chain — same approach Core uses via active_chain.Next().
+	if s.chainMgr == nil {
+		restError(w, http.StatusServiceUnavailable, "Chain manager not available")
+		return
+	}
+	tipNode := s.chainMgr.BestBlockNode()
+	if tipNode == nil {
+		restError(w, http.StatusServiceUnavailable, "Node is warming up")
+		return
+	}
+
+	// Confirm startNode is on the active chain.
+	if !s.chainMgr.IsInMainChain(hash) {
+		// Core returns the headers it could collect; if the very first
+		// hash isn't on the active chain it loops zero times and then
+		// fails inside the LookupFilterHeader pass. We mirror that by
+		// reporting "not found".
+		restError(w, http.StatusNotFound, hashStr+" not found")
+		return
+	}
+
+	headers := make([]wire.Hash256, 0, count)
+	for h := startNode.Height; h <= tipNode.Height && len(headers) < count; h++ {
+		anc := tipNode.GetAncestor(h)
+		if anc == nil {
+			break
+		}
+		filterData, err := bfi.GetFilter(anc.Height)
+		if err != nil {
+			restError(w, http.StatusNotFound, "Filter not found. Block filters are still in the process of being indexed.")
+			return
+		}
+		headers = append(headers, filterData.FilterHeader)
+	}
+
+	switch format {
+	case RESTFormatJSON:
+		w.Header().Set("Content-Type", "application/json")
+		hexes := make([]string, len(headers))
+		for i, h := range headers {
+			hexes[i] = h.String()
+		}
+		_ = json.NewEncoder(w).Encode(hexes)
+		return
+	case RESTFormatBin, RESTFormatHex:
+		var buf bytes.Buffer
+		for _, h := range headers {
+			buf.Write(h[:])
+		}
+		if format == RESTFormatHex {
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte(hex.EncodeToString(buf.Bytes())))
+			w.Write([]byte("\n"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Write(buf.Bytes())
+		return
 	}
 }
 
