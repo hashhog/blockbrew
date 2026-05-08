@@ -1253,6 +1253,227 @@ func (w *Wallet) signP2TR(tx *wire.MsgTx, idx int, prevOuts []*wire.TxOut, privK
 	return nil
 }
 
+// signP2WSH signs a P2WSH (native segwit script-hash) input. witnessScript
+// is what's hashed into the scriptPubKey; for CHECKMULTISIG it's
+// `OP_M <pubkey1> ... <pubkeyN> OP_N OP_CHECKMULTISIG`. signers is in
+// witness-script pubkey order; entries may be nil for keys the wallet
+// does not own (partial-sign).
+//
+// Witness layout per BIP-141 §"P2WSH" + the legacy CHECKMULTISIG
+// off-by-one bug-compat pad:
+//
+//	[<>, <sig1>, <sig2>, ..., <sigM>, <witnessScript>]
+//
+// The leading empty push is required iff the witness script ends in
+// OP_CHECKMULTISIG; for non-multisig P2WSH templates (single CHECKSIG)
+// the layout is `[<sig>, <witnessScript>]`.
+//
+// Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature (the
+// `witnessversion == 0 && type == WITNESS_V0_SCRIPTHASH` branch).
+func (w *Wallet) signP2WSH(tx *wire.MsgTx, idx int, amount int64, witnessScript []byte, signers []*bbcrypto.PrivateKey) error {
+	sighash, err := script.CalcWitnessSignatureHash(
+		witnessScript,
+		script.SigHashAll,
+		tx,
+		idx,
+		amount,
+	)
+	if err != nil {
+		return err
+	}
+
+	if isMultisigScript(witnessScript) {
+		m, _, err := parseMultisigScript(witnessScript)
+		if err != nil {
+			return err
+		}
+		// Witness: empty push, then up to M signatures in pubkey order.
+		witness := make([][]byte, 0, m+2)
+		witness = append(witness, []byte{}) // CHECKMULTISIG off-by-one pad
+		emitted := 0
+		for _, signer := range signers {
+			if signer == nil {
+				continue
+			}
+			if emitted >= m {
+				break
+			}
+			sig, err := bbcrypto.SignECDSA(signer, sighash)
+			if err != nil {
+				return err
+			}
+			sig = append(sig, byte(script.SigHashAll))
+			witness = append(witness, sig)
+			emitted++
+		}
+		if emitted < m {
+			return fmt.Errorf("partial-sign: only %d of %d required keys owned", emitted, m)
+		}
+		witness = append(witness, witnessScript)
+		tx.TxIn[idx].Witness = witness
+		return nil
+	}
+
+	// Non-multisig P2WSH: assume the script is a single-CHECKSIG-style
+	// template. Emit one signature, then the witness script.
+	if len(signers) != 1 || signers[0] == nil {
+		return errors.New("non-multisig P2WSH requires exactly one signer")
+	}
+	sig, err := bbcrypto.SignECDSA(signers[0], sighash)
+	if err != nil {
+		return err
+	}
+	sig = append(sig, byte(script.SigHashAll))
+	tx.TxIn[idx].Witness = [][]byte{sig, witnessScript}
+	return nil
+}
+
+// signP2SH_P2WSH signs a P2SH-wrapped P2WSH input: scriptSig is a single
+// push of redeemScript (which is itself the P2WSH `OP_0 <32-byte-hash>`),
+// and the witness is the same as bare P2WSH.
+//
+// Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature (P2SH
+// recursion + WITNESS_V0_SCRIPTHASH inner step).
+func (w *Wallet) signP2SH_P2WSH(tx *wire.MsgTx, idx int, amount int64, redeemScript, witnessScript []byte, signers []*bbcrypto.PrivateKey) error {
+	if err := w.signP2WSH(tx, idx, amount, witnessScript, signers); err != nil {
+		return err
+	}
+	// scriptSig: push the redeem script (mirrors psbt_ops.go::buildScriptSig).
+	tx.TxIn[idx].SignatureScript = buildScriptSig(redeemScript)
+	return nil
+}
+
+// signLegacyP2SH signs a bare P2SH input (not segwit-wrapped) using
+// legacy (non-BIP143) sighashing. The redeem script is the script that
+// is hashed into the scriptPubKey; for the common case of M-of-N
+// CHECKMULTISIG it is
+// `OP_M <pubkey1> ... <pubkeyN> OP_N OP_CHECKMULTISIG`.
+//
+// scriptSig layout per BIP-16 + the CHECKMULTISIG off-by-one pad:
+//
+//	OP_0 <sig1> ... <sigM> <redeemScript>
+//
+// Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature (P2SH +
+// SCRIPTHASH inner with SigVersion::BASE).
+func (w *Wallet) signLegacyP2SH(tx *wire.MsgTx, idx int, redeemScript []byte, signers []*bbcrypto.PrivateKey) error {
+	sighash, err := script.CalcSignatureHash(
+		redeemScript,
+		script.SigHashAll,
+		tx,
+		idx,
+	)
+	if err != nil {
+		return err
+	}
+
+	if isMultisigScript(redeemScript) {
+		m, _, err := parseMultisigScript(redeemScript)
+		if err != nil {
+			return err
+		}
+		parts := make([][]byte, 0, m+1)
+		parts = append(parts, []byte{}) // CHECKMULTISIG off-by-one pad
+		emitted := 0
+		for _, signer := range signers {
+			if signer == nil {
+				continue
+			}
+			if emitted >= m {
+				break
+			}
+			sig, err := bbcrypto.SignECDSA(signer, sighash)
+			if err != nil {
+				return err
+			}
+			sig = append(sig, byte(script.SigHashAll))
+			parts = append(parts, sig)
+			emitted++
+		}
+		if emitted < m {
+			return fmt.Errorf("partial-sign: only %d of %d required keys owned", emitted, m)
+		}
+		tx.TxIn[idx].SignatureScript = buildLegacyScriptSig(parts, redeemScript)
+		return nil
+	}
+
+	// Non-multisig: single key.
+	if len(signers) != 1 || signers[0] == nil {
+		return errors.New("non-multisig legacy P2SH requires exactly one signer")
+	}
+	sig, err := bbcrypto.SignECDSA(signers[0], sighash)
+	if err != nil {
+		return err
+	}
+	sig = append(sig, byte(script.SigHashAll))
+	pubKey := signers[0].PubKey().SerializeCompressed()
+	tx.TxIn[idx].SignatureScript = buildLegacyScriptSig([][]byte{sig, pubKey}, redeemScript)
+	return nil
+}
+
+// findKeyForPubKey searches addrToPath for any derivation that produces
+// the given compressed public key. Linear in the number of issued
+// addresses; acceptable since wallets in this codebase issue O(100s).
+func (w *Wallet) findKeyForPubKey(pubKey []byte) (*bbcrypto.PrivateKey, error) {
+	if w.masterKey == nil {
+		return nil, ErrNoMasterKey
+	}
+	for _, path := range w.addrToPath {
+		key, err := w.masterKey.DerivePath(path)
+		if err != nil {
+			continue
+		}
+		priv, err := key.ECPrivKey()
+		if err != nil {
+			continue
+		}
+		if subtleEqualBytes(priv.PubKey().SerializeCompressed(), pubKey) {
+			return priv, nil
+		}
+	}
+	return nil, fmt.Errorf("wallet does not own pubkey")
+}
+
+// collectSignersForScript walks a script (witness or redeem) for embedded
+// pubkeys and returns the wallet's private keys for each one we own. For
+// CHECKMULTISIG scripts the returned signers are in script-pubkey order
+// so the caller can preserve CHECKMULTISIG's stack-order requirement.
+//
+// Returns (nil, error) if the wallet owns zero keys for the script —
+// callers can choose to surface this as a per-input error in the RPC
+// response (mirroring Core's signrawtransactionwithwallet partial-sign
+// behaviour).
+func (w *Wallet) collectSignersForScript(s []byte) ([]*bbcrypto.PrivateKey, error) {
+	if isMultisigScript(s) {
+		_, pubKeys, err := parseMultisigScript(s)
+		if err != nil {
+			return nil, err
+		}
+		signers := make([]*bbcrypto.PrivateKey, len(pubKeys))
+		owned := 0
+		for i, pk := range pubKeys {
+			priv, err := w.findKeyForPubKey(pk)
+			if err == nil {
+				signers[i] = priv
+				owned++
+			}
+		}
+		if owned == 0 {
+			return nil, fmt.Errorf("wallet owns none of the multisig pubkeys")
+		}
+		return signers, nil
+	}
+
+	// Single-key witness/redeem (e.g. P2PK-style witness). Try to
+	// extract a single 33-byte compressed key push.
+	if len(s) >= 34 && s[0] == 0x21 {
+		priv, err := w.findKeyForPubKey(s[1:34])
+		if err == nil {
+			return []*bbcrypto.PrivateKey{priv}, nil
+		}
+	}
+	return nil, fmt.Errorf("unsupported script template (need multisig or single-key)")
+}
+
 // computeTweakedPrivKey computes the tweaked private key for taproot signing.
 func (w *Wallet) computeTweakedPrivKey(privKeyBytes []byte, tweakHash [32]byte, negate bool) ([]byte, error) {
 	var privScalar secp256k1.ModNScalar
@@ -1448,7 +1669,11 @@ func (w *Wallet) signInputWithScripts(tx *wire.MsgTx, idx int, utxo *WalletUTXO,
 		if info == nil || len(info.WitnessScript) == 0 {
 			return errors.New("missing witness script for P2WSH input")
 		}
-		return errors.New("P2WSH signing not implemented in this build (W27-D Phase 3 pending)")
+		signers, err := w.collectSignersForScript(info.WitnessScript)
+		if err != nil {
+			return err
+		}
+		return w.signP2WSH(tx, idx, utxo.Amount, info.WitnessScript, signers)
 	}
 
 	// P2SH must be classified by inspecting the redeem script the caller
@@ -1485,11 +1710,19 @@ func (w *Wallet) signInputWithScripts(tx *wire.MsgTx, idx int, utxo *WalletUTXO,
 			if info.WitnessScript == nil {
 				return errors.New("missing witness script for P2SH-P2WSH input")
 			}
-			return errors.New("P2SH-P2WSH signing not implemented in this build (W27-D Phase 3 pending)")
+			signers, err := w.collectSignersForScript(info.WitnessScript)
+			if err != nil {
+				return err
+			}
+			return w.signP2SH_P2WSH(tx, idx, utxo.Amount, info.RedeemScript, info.WitnessScript, signers)
 
 		default:
 			// Legacy P2SH (e.g. bare M-of-N CHECKMULTISIG).
-			return errors.New("legacy P2SH signing not implemented in this build (W27-D Phase 3 pending)")
+			signers, err := w.collectSignersForScript(info.RedeemScript)
+			if err != nil {
+				return err
+			}
+			return w.signLegacyP2SH(tx, idx, info.RedeemScript, signers)
 		}
 	}
 
