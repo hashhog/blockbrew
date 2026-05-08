@@ -97,6 +97,28 @@ var (
 	ErrPSBTTxMismatch         = errors.New("PSBT transactions do not match")
 	ErrPSBTNoUTXO             = errors.New("PSBT input missing UTXO information")
 	ErrPSBTInvalidSignature   = errors.New("invalid PSBT signature")
+
+	// ErrPSBTNonWitnessUTXOMismatch is returned when the txid of the
+	// PSBT_IN_NON_WITNESS_UTXO transaction does not match the prevout
+	// hash referenced by the unsigned transaction's input. Per BIP-174 +
+	// Bitcoin Core PSBTInput::IsSane, the wallet MUST refuse to sign
+	// against an unverified previous transaction — otherwise an attacker
+	// can swap in a forged prevTx to lie about its outputs (W41/W40-A).
+	ErrPSBTNonWitnessUTXOMismatch = errors.New("PSBT NON_WITNESS_UTXO txid does not match prevout")
+
+	// ErrPSBTUTXOIndexOutOfRange is returned when the unsigned tx's
+	// input references an output index beyond the NON_WITNESS_UTXO's
+	// TxOut slice. Caught here so the signer dispatch never indexes a
+	// short slice.
+	ErrPSBTUTXOIndexOutOfRange = errors.New("PSBT prevout index out of range for NON_WITNESS_UTXO")
+
+	// ErrWitnessUtxoMismatch is returned when both WITNESS_UTXO and
+	// NON_WITNESS_UTXO are present but their (value, scriptPubKey) at
+	// the prevout index disagree. Defends against CVE-2020-14199 — a
+	// malicious wallet can otherwise lie about the input amount through
+	// the WITNESS_UTXO oracle and trick the signer into oversigning.
+	// See Bitcoin Core PSBTInput::IsSane and W40-A audit.
+	ErrWitnessUtxoMismatch = errors.New("PSBT WITNESS_UTXO disagrees with NON_WITNESS_UTXO at prevout index")
 )
 
 // BIP32Derivation represents a BIP32 derivation path with fingerprint.
@@ -359,6 +381,14 @@ func DecodePSBTReader(r io.Reader) (*PSBT, error) {
 		err := psbt.readInput(r, &psbt.Inputs[i])
 		if err != nil {
 			return nil, fmt.Errorf("failed to read input %d: %w", i, err)
+		}
+
+		// W41: validate the input's UTXO oracles against the unsigned
+		// tx's prevout BEFORE handing the parsed PSBT to any signer.
+		// Mirrors Bitcoin Core PSBTInput::IsSane (src/psbt.cpp).
+		prevOutpoint := psbt.UnsignedTx.TxIn[i].PreviousOutPoint
+		if err := validatePSBTInput(&psbt.Inputs[i], prevOutpoint); err != nil {
+			return nil, fmt.Errorf("PSBT input %d failed sanity check: %w", i, err)
 		}
 	}
 
@@ -1222,4 +1252,59 @@ func serializeTapTree(leaves []TapTreeLeaf) []byte {
 	}
 
 	return buf.Bytes()
+}
+
+// validatePSBTInput is the IsSane analog from Bitcoin Core
+// (`src/psbt.cpp` PSBTInput::IsSane). It ensures the per-input UTXO
+// oracles agree with the unsigned transaction's prevout reference,
+// before any sighash is computed against them. Two checks:
+//
+//  1. If NON_WITNESS_UTXO is present, DoubleSHA256 of its serialized
+//     (no-witness) bytes MUST equal the prevout hash. Otherwise an
+//     attacker can swap in a forged prevTx whose TxOut[vout] lies
+//     about the value or scriptPubKey, and the signer will produce a
+//     valid signature over forged data (W40-A bug A1).
+//
+//  2. If both WITNESS_UTXO and NON_WITNESS_UTXO are present, the
+//     (value, scriptPubKey) at NON_WITNESS_UTXO.TxOut[vout] MUST
+//     match WITNESS_UTXO byte-for-byte. Otherwise the signer's amount
+//     oracle (WITNESS_UTXO) can be lied to while the txid check above
+//     still passes — CVE-2020-14199 / W40-A bug A2.
+//
+// Pure function over the input + its prevout. Called from the parser
+// (defense against malformed input on the wire) AND from the signer
+// dispatch (defense against PSBTs constructed in-process that bypass
+// the parser).
+func validatePSBTInput(input *PSBTInput, prevOutpoint wire.OutPoint) error {
+	if input == nil {
+		return nil
+	}
+
+	// A1: NON_WITNESS_UTXO txid check.
+	if input.NonWitnessUTXO != nil {
+		actualTxid := input.NonWitnessUTXO.TxHash()
+		if actualTxid != prevOutpoint.Hash {
+			return ErrPSBTNonWitnessUTXOMismatch
+		}
+		if int(prevOutpoint.Index) >= len(input.NonWitnessUTXO.TxOut) {
+			return ErrPSBTUTXOIndexOutOfRange
+		}
+	}
+
+	// A2: WITNESS_UTXO vs NON_WITNESS_UTXO cross-check (both present).
+	// CVE-2020-14199: WITNESS_UTXO is the amount oracle for BIP-143
+	// sighash; if it disagrees with the verified NON_WITNESS_UTXO the
+	// signer must refuse to commit.
+	if input.WitnessUTXO != nil && input.NonWitnessUTXO != nil {
+		// Index already bounds-checked above.
+		nwOut := input.NonWitnessUTXO.TxOut[prevOutpoint.Index]
+		if nwOut.Value != input.WitnessUTXO.Value {
+			return ErrWitnessUtxoMismatch
+		}
+		if !bytes.Equal(nwOut.PkScript, input.WitnessUTXO.PkScript) {
+			return ErrWitnessUtxoMismatch
+		}
+	}
+
+	return nil
 }
