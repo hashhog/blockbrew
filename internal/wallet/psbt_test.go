@@ -765,3 +765,372 @@ func TestExtractTransaction(t *testing.T) {
 		t.Errorf("Expected 2 witness items, got %d", len(extracted.TxIn[0].Witness))
 	}
 }
+
+// TestPSBTTapLeafScriptsRoundTrip exercises the per-input TAP_LEAF_SCRIPT
+// (PSBTInTapLeafScript = 0x15) write path at psbt.go:814 — the W33 audit
+// flagged that site as latent append-aliasing risk.
+//
+// We deliberately back leaf.Script with a slice that has SPARE CAPACITY
+// (the failure mode for the old `append(leaf.Script, leaf.LeafVersion)`
+// idiom) and assert (a) the encode does NOT mutate the caller's backing
+// array and (b) the round-trip recovers byte-identical Script + LeafVersion
+// + ControlBlock for each leaf. (W34-B.)
+func TestPSBTTapLeafScriptsRoundTrip(t *testing.T) {
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000abc")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    100000,
+				PkScript: []byte{0x51, 0x20, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20},
+			},
+		},
+		LockTime: 0,
+	}
+
+	psbt, err := NewPSBT(tx)
+	if err != nil {
+		t.Fatalf("NewPSBT: %v", err)
+	}
+
+	// Build TWO TapLeafScripts whose Script slice has spare capacity. If
+	// the encode path ever regresses to `append(leaf.Script, leaf.LeafVersion)`
+	// this scratch byte at [len(script)] would be silently overwritten.
+	leaf1Script := make([]byte, 4, 16)
+	copy(leaf1Script, []byte{0x51, 0x52, 0x53, 0x54}) // OP_1 OP_2 OP_3 OP_4
+	leaf1Script[len(leaf1Script):16][0] = 0xAA        // canary in spare cap
+
+	leaf2Script := make([]byte, 5, 32)
+	copy(leaf2Script, []byte{0x76, 0xa9, 0x14, 0x00, 0xff})
+	leaf2Script[len(leaf2Script):32][0] = 0xBB // canary in spare cap
+
+	// Snapshot canaries by extending into the spare capacity through a
+	// separate slice header (Script is unchanged, len stays 4 / 5).
+	leaf1Spare := leaf1Script[:cap(leaf1Script)]
+	leaf2Spare := leaf2Script[:cap(leaf2Script)]
+	leaf1CanaryBefore := leaf1Spare[len(leaf1Script)]
+	leaf2CanaryBefore := leaf2Spare[len(leaf2Script)]
+
+	// ControlBlock = 33-byte minimum (1 leaf-version + 32-byte internal key).
+	cb1 := make([]byte, 33)
+	cb1[0] = 0xc0
+	for i := 1; i < 33; i++ {
+		cb1[i] = byte(i)
+	}
+	cb2 := make([]byte, 33+32) // one merkle proof step
+	cb2[0] = 0xc1
+	for i := 1; i < len(cb2); i++ {
+		cb2[i] = byte(i ^ 0x55)
+	}
+
+	psbt.Inputs[0].TapLeafScripts = []TapLeaf{
+		{LeafVersion: 0xc0, Script: leaf1Script, ControlBlock: cb1},
+		{LeafVersion: 0xc1, Script: leaf2Script, ControlBlock: cb2},
+	}
+
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// (a) caller's backing arrays must not have been mutated by encode.
+	if leaf1Spare[len(leaf1Script)] != leaf1CanaryBefore {
+		t.Fatalf("psbt.go:814 append-aliasing regression: leaf1 spare capacity mutated (got 0x%02x want 0x%02x)",
+			leaf1Spare[len(leaf1Script)], leaf1CanaryBefore)
+	}
+	if leaf2Spare[len(leaf2Script)] != leaf2CanaryBefore {
+		t.Fatalf("psbt.go:814 append-aliasing regression: leaf2 spare capacity mutated (got 0x%02x want 0x%02x)",
+			leaf2Spare[len(leaf2Script)], leaf2CanaryBefore)
+	}
+
+	// (b) round-trip byte fidelity.
+	decoded, err := DecodePSBT(encoded)
+	if err != nil {
+		t.Fatalf("DecodePSBT: %v", err)
+	}
+	if got := len(decoded.Inputs); got != 1 {
+		t.Fatalf("expected 1 input, got %d", got)
+	}
+	gotLeaves := decoded.Inputs[0].TapLeafScripts
+	if len(gotLeaves) != 2 {
+		t.Fatalf("expected 2 tap leaf scripts, got %d", len(gotLeaves))
+	}
+
+	// Build a lookup keyed on ControlBlock — decode order should match
+	// encode order, but we lookup by control block to be robust.
+	wantByCB := map[string]TapLeaf{
+		string(cb1): {LeafVersion: 0xc0, Script: leaf1Script, ControlBlock: cb1},
+		string(cb2): {LeafVersion: 0xc1, Script: leaf2Script, ControlBlock: cb2},
+	}
+	for i, leaf := range gotLeaves {
+		want, ok := wantByCB[string(leaf.ControlBlock)]
+		if !ok {
+			t.Fatalf("decoded leaf %d has unrecognized control block %x", i, leaf.ControlBlock)
+		}
+		if leaf.LeafVersion != want.LeafVersion {
+			t.Errorf("leaf %d: LeafVersion got 0x%02x, want 0x%02x", i, leaf.LeafVersion, want.LeafVersion)
+		}
+		if !bytes.Equal(leaf.Script, want.Script) {
+			t.Errorf("leaf %d: Script got %x, want %x", i, leaf.Script, want.Script)
+		}
+		if !bytes.Equal(leaf.ControlBlock, want.ControlBlock) {
+			t.Errorf("leaf %d: ControlBlock got %x, want %x", i, leaf.ControlBlock, want.ControlBlock)
+		}
+	}
+
+	// (c) re-encode the decoded PSBT and assert byte-for-byte match —
+	// confirms write path is deterministic for this leaf set.
+	reEncoded, err := decoded.Encode()
+	if err != nil {
+		t.Fatalf("re-Encode: %v", err)
+	}
+	if !bytes.Equal(encoded, reEncoded) {
+		t.Errorf("PSBT TapLeafScripts round-trip not byte-identical (len %d vs %d)", len(encoded), len(reEncoded))
+	}
+}
+
+// TestPSBTTapTreeRoundTrip exercises the per-output PSBT_OUT_TAP_TREE
+// (0x06) write path. (W34-B.)
+func TestPSBTTapTreeRoundTrip(t *testing.T) {
+	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000001234")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    50000,
+				PkScript: []byte{0x51, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f, 0x40},
+			},
+		},
+		LockTime: 0,
+	}
+
+	psbt, err := NewPSBT(tx)
+	if err != nil {
+		t.Fatalf("NewPSBT: %v", err)
+	}
+
+	// Tree of 3 leaves at depths 1, 2, 2 (canonical 2-of-3 taptree shape).
+	// parseTapTree stores depth in ControlBlock[0], and serializeTapTree
+	// reads it back from there — match that convention.
+	psbt.Outputs[0].TapTree = []TapLeaf{
+		{LeafVersion: 0xc0, Script: []byte{0x51}, ControlBlock: []byte{1}},                   // depth=1, OP_1
+		{LeafVersion: 0xc0, Script: []byte{0x52, 0x53}, ControlBlock: []byte{2}},             // depth=2, OP_2 OP_3
+		{LeafVersion: 0xc0, Script: []byte{0x54, 0x55, 0x56}, ControlBlock: []byte{2}},       // depth=2
+	}
+
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	decoded, err := DecodePSBT(encoded)
+	if err != nil {
+		t.Fatalf("DecodePSBT: %v", err)
+	}
+	if len(decoded.Outputs) != 1 {
+		t.Fatalf("expected 1 output, got %d", len(decoded.Outputs))
+	}
+	got := decoded.Outputs[0].TapTree
+	if len(got) != 3 {
+		t.Fatalf("expected 3 tap-tree leaves, got %d", len(got))
+	}
+	want := psbt.Outputs[0].TapTree
+	for i := range want {
+		if got[i].LeafVersion != want[i].LeafVersion {
+			t.Errorf("tap-tree leaf %d LeafVersion: got 0x%02x want 0x%02x", i, got[i].LeafVersion, want[i].LeafVersion)
+		}
+		if !bytes.Equal(got[i].Script, want[i].Script) {
+			t.Errorf("tap-tree leaf %d Script: got %x want %x", i, got[i].Script, want[i].Script)
+		}
+		// ControlBlock[0] holds depth on round-trip.
+		if len(got[i].ControlBlock) == 0 || got[i].ControlBlock[0] != want[i].ControlBlock[0] {
+			t.Errorf("tap-tree leaf %d depth: got %x want %x", i, got[i].ControlBlock, want[i].ControlBlock)
+		}
+	}
+
+	// Re-encode and assert byte-for-byte match.
+	reEncoded, err := decoded.Encode()
+	if err != nil {
+		t.Fatalf("re-Encode: %v", err)
+	}
+	if !bytes.Equal(encoded, reEncoded) {
+		t.Errorf("PSBT TapTree round-trip not byte-identical (len %d vs %d)", len(encoded), len(reEncoded))
+	}
+}
+
+// TestPSBTMultiInputRoundTrip — 3-input PSBT round-trip, asserting that
+// per-input data stays bound to the correct index after encode+decode.
+// (W34-B.)
+func TestPSBTMultiInputRoundTrip(t *testing.T) {
+	prevHash0, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
+	prevHash1, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000002")
+	prevHash2, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000003")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: wire.OutPoint{Hash: prevHash0, Index: 0}, Sequence: 0xffffffff},
+			{PreviousOutPoint: wire.OutPoint{Hash: prevHash1, Index: 7}, Sequence: 0xffffffff},
+			{PreviousOutPoint: wire.OutPoint{Hash: prevHash2, Index: 42}, Sequence: 0xffffffff},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 30000, PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}},
+		},
+		LockTime: 0,
+	}
+
+	psbt, err := NewPSBT(tx)
+	if err != nil {
+		t.Fatalf("NewPSBT: %v", err)
+	}
+
+	// Tag each input differently so we can verify ordering.
+	psbt.Inputs[0].WitnessUTXO = &wire.TxOut{Value: 10000, PkScript: []byte{0xAA, 0x00}}
+	psbt.Inputs[0].SighashType = 0x01
+
+	psbt.Inputs[1].WitnessUTXO = &wire.TxOut{Value: 20000, PkScript: []byte{0xBB, 0x00}}
+	psbt.Inputs[1].SighashType = 0x02
+	psbt.Inputs[1].RedeemScript = []byte{0x21, 0xBB, 0xBB, 0xBB, 0xAC}
+
+	psbt.Inputs[2].WitnessUTXO = &wire.TxOut{Value: 30000, PkScript: []byte{0xCC, 0x00}}
+	psbt.Inputs[2].SighashType = 0x03
+	psbt.Inputs[2].WitnessScript = []byte{0x52, 0xCC, 0xCC, 0xCC, 0x52, 0xAE}
+
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	decoded, err := DecodePSBT(encoded)
+	if err != nil {
+		t.Fatalf("DecodePSBT: %v", err)
+	}
+	if len(decoded.Inputs) != 3 {
+		t.Fatalf("expected 3 inputs, got %d", len(decoded.Inputs))
+	}
+
+	// Per-index witness UTXO value uniquely identifies each input.
+	wantValues := []int64{10000, 20000, 30000}
+	for i, want := range wantValues {
+		if decoded.Inputs[i].WitnessUTXO == nil {
+			t.Fatalf("input %d: WitnessUTXO missing after decode", i)
+		}
+		if decoded.Inputs[i].WitnessUTXO.Value != want {
+			t.Errorf("input %d: WitnessUTXO.Value got %d want %d (input ordering broken)",
+				i, decoded.Inputs[i].WitnessUTXO.Value, want)
+		}
+	}
+
+	// PreviousOutPoint indices preserved 1:1.
+	wantOutpointIdx := []uint32{0, 7, 42}
+	for i, want := range wantOutpointIdx {
+		got := decoded.UnsignedTx.TxIn[i].PreviousOutPoint.Index
+		if got != want {
+			t.Errorf("input %d: PreviousOutPoint.Index got %d want %d", i, got, want)
+		}
+	}
+
+	// SighashType + RedeemScript + WitnessScript landed on the right input.
+	if decoded.Inputs[0].SighashType != 0x01 || decoded.Inputs[1].SighashType != 0x02 || decoded.Inputs[2].SighashType != 0x03 {
+		t.Errorf("SighashType ordering broken: got [%d %d %d]",
+			decoded.Inputs[0].SighashType, decoded.Inputs[1].SighashType, decoded.Inputs[2].SighashType)
+	}
+	if !bytes.Equal(decoded.Inputs[1].RedeemScript, []byte{0x21, 0xBB, 0xBB, 0xBB, 0xAC}) {
+		t.Errorf("input 1 RedeemScript not preserved: got %x", decoded.Inputs[1].RedeemScript)
+	}
+	if !bytes.Equal(decoded.Inputs[2].WitnessScript, []byte{0x52, 0xCC, 0xCC, 0xCC, 0x52, 0xAE}) {
+		t.Errorf("input 2 WitnessScript not preserved: got %x", decoded.Inputs[2].WitnessScript)
+	}
+	if len(decoded.Inputs[0].RedeemScript) != 0 {
+		t.Errorf("input 0 should not have RedeemScript, got %x", decoded.Inputs[0].RedeemScript)
+	}
+}
+
+// TestPSBTEncodedBytesNoSegwitMarker — BIP-174 invariant: the unsigned
+// transaction in PSBT_GLOBAL_UNSIGNED_TX MUST be serialized WITHOUT the
+// segwit marker+flag, even when the source tx carries witnesses (the
+// witnesses are illegal in the unsigned tx anyway, but this covers the
+// case where a caller supplies a tx whose witnesses were stripped at
+// the API boundary). We verify that the first two bytes after the
+// 4-byte version field are NOT 0x00 0x01. (W34-B.)
+func TestPSBTEncodedBytesNoSegwitMarker(t *testing.T) {
+	prevHash, _ := wire.NewHash256FromHex("00000000000000000000000000000000000000000000000000000000deadbeef")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+				// NB: NewPSBT rejects pre-populated witness, so leave empty.
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 100000, PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}},
+		},
+		LockTime: 0,
+	}
+
+	psbt, err := NewPSBT(tx)
+	if err != nil {
+		t.Fatalf("NewPSBT: %v", err)
+	}
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// Walk the encoded blob: 5-byte magic, then the first global key/value
+	// (which by BIP-174 MUST be PSBT_GLOBAL_UNSIGNED_TX, key 0x00).
+	if len(encoded) < 5 || !bytes.Equal(encoded[:5], psbtMagic) {
+		end := len(encoded)
+		if end > 5 {
+			end = 5
+		}
+		t.Fatalf("encoded PSBT does not start with magic: %x", encoded[:end])
+	}
+
+	r := bytes.NewReader(encoded[5:])
+	key, value, err := readKeyValue(r)
+	if err != nil {
+		t.Fatalf("readKeyValue (global): %v", err)
+	}
+	if len(key) != 1 || key[0] != PSBTGlobalUnsignedTx {
+		t.Fatalf("first global key must be PSBTGlobalUnsignedTx (0x00), got %x", key)
+	}
+
+	// value = serialized unsigned tx. Layout:
+	//   [0..4]  version (int32 LE)
+	//   [4..]   marker+flag if segwit, else input-count CompactSize
+	if len(value) < 6 {
+		t.Fatalf("unsigned tx blob too short: %d bytes", len(value))
+	}
+	if value[4] == 0x00 && value[5] == 0x01 {
+		t.Fatalf("BIP-174 violation: PSBT_GLOBAL_UNSIGNED_TX contains segwit marker+flag (0x00 0x01) at offset 4-5; got blob %x", value)
+	}
+
+	// Sanity: the blob must also deserialize back to a tx with identical
+	// inputs/outputs (and no witnesses, since SerializeNoWitness was used).
+	var rt wire.MsgTx
+	if err := rt.Deserialize(bytes.NewReader(value)); err != nil {
+		t.Fatalf("Deserialize unsigned tx: %v", err)
+	}
+	if rt.Version != 2 || len(rt.TxIn) != 1 || len(rt.TxOut) != 1 {
+		t.Fatalf("unsigned tx round-trip mismatch: version=%d in=%d out=%d", rt.Version, len(rt.TxIn), len(rt.TxOut))
+	}
+	for i, in := range rt.TxIn {
+		if len(in.Witness) != 0 {
+			t.Errorf("input %d: unsigned tx must have no witness, got %d items", i, len(in.Witness))
+		}
+	}
+}
+
