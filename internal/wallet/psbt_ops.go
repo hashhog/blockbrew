@@ -887,6 +887,11 @@ func finalizeMultisig(input *PSBTInput, isWitness bool) (bool, error) {
 	witness = append(witness, wsScript)
 
 	input.FinalScriptWitness = witness
+	// W43 / BIP-174: clear producer fields after finalize so encoder does
+	// not leak partial_sigs / redeem_script / witness_script / sighash /
+	// bip32_derivation into the serialized PSBT bytes. Mirrors lunarblock
+	// W41 finalize_input cleanup.
+	clearInputSigningData(input)
 	return true, nil
 }
 

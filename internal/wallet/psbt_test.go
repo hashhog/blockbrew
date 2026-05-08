@@ -1527,3 +1527,181 @@ func TestPSBTValidate_A2_WitnessScriptMismatch(t *testing.T) {
 	}
 }
 
+// TestFinalizeMultisig_W43_ClearsProducerFields verifies that finalizing a
+// P2WSH 2-of-2 multisig input clears all BIP-174 producer-only key types
+// (partial_sigs, redeem_script, witness_script, sighash_type,
+// bip32_derivation) so they are not leaked into the serialized PSBT.
+//
+// Pre-W43, finalizeMultisig set FinalScriptWitness and returned without
+// calling clearInputSigningData, causing T3 (finalizepsbt) byte-divergence
+// vs Bitcoin Core in tools/psbt-multi-input-test.sh.
+//
+// Mirrors lunarblock W41 commit 442301d (src/psbt.lua finalize_input).
+//
+// Asymmetric fixtures: two distinct compressed pubkeys, two distinct DER
+// signatures, asymmetric BIP32 derivation paths, non-zero sighash type.
+func TestFinalizeMultisig_W43_ClearsProducerFields(t *testing.T) {
+	prevHash, _ := wire.NewHash256FromHex("00000000000000000000000000000000000000000000000000000000abcdef01")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 7},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    98765,
+				PkScript: []byte{0x00, 0x14, 0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c},
+			},
+		},
+	}
+
+	// Two distinct compressed pubkeys (33 bytes, asymmetric — first byte
+	// differs, body bytes also differ).
+	pubKey1 := make([]byte, 33)
+	pubKey1[0] = 0x02
+	for i := 1; i < 33; i++ {
+		pubKey1[i] = byte(0x10 + i)
+	}
+	pubKey2 := make([]byte, 33)
+	pubKey2[0] = 0x03
+	for i := 1; i < 33; i++ {
+		pubKey2[i] = byte(0x80 - i)
+	}
+
+	// Two distinct DER signatures, sighash byte 0x01 (SIGHASH_ALL).
+	mkSig := func(seed byte) []byte {
+		sig := make([]byte, 71)
+		sig[0] = 0x30
+		sig[1] = 0x44
+		sig[2] = 0x02
+		sig[3] = 0x20
+		for i := 4; i < 36; i++ {
+			sig[i] = seed ^ byte(i)
+		}
+		sig[36] = 0x02
+		sig[37] = 0x20
+		for i := 38; i < 70; i++ {
+			sig[i] = seed ^ byte(0xa5-i)
+		}
+		sig[70] = 0x01
+		return sig
+	}
+	sig1 := mkSig(0x11)
+	sig2 := mkSig(0x42)
+
+	// Witness script: OP_2 <pubKey1> <pubKey2> OP_2 OP_CHECKMULTISIG.
+	witnessScript := []byte{0x52, 0x21}
+	witnessScript = append(witnessScript, pubKey1...)
+	witnessScript = append(witnessScript, 0x21)
+	witnessScript = append(witnessScript, pubKey2...)
+	witnessScript = append(witnessScript, 0x52, 0xae)
+
+	// P2WSH UTXO program: OP_0 <32-byte-hash>. The finalizer does not
+	// recompute SHA256(witnessScript) here, so any 32-byte placeholder
+	// works; we use an asymmetric one to avoid palindrome fixtures.
+	witnessProgram := make([]byte, 34)
+	witnessProgram[0] = 0x00
+	witnessProgram[1] = 0x20
+	for i := 2; i < 34; i++ {
+		witnessProgram[i] = byte(0xa0 + i)
+	}
+
+	psbt := &PSBT{
+		UnsignedTx: tx,
+		Inputs:     make([]PSBTInput, 1),
+		Outputs:    make([]PSBTOutput, 1),
+	}
+	in := &psbt.Inputs[0]
+	in.WitnessUTXO = &wire.TxOut{Value: 200_000, PkScript: witnessProgram}
+	in.WitnessScript = witnessScript
+	in.SighashType = 0x01
+	in.PartialSigs = map[string][]byte{
+		string(pubKey1): sig1,
+		string(pubKey2): sig2,
+	}
+	in.BIP32Derivation = map[string]*BIP32Derivation{
+		string(pubKey1): {
+			Fingerprint: [4]byte{0xde, 0xad, 0xbe, 0xef},
+			Path:        []uint32{0x80000000 | 84, 0x80000000, 0x80000000, 0, 5},
+		},
+		string(pubKey2): {
+			Fingerprint: [4]byte{0xca, 0xfe, 0xba, 0xbe},
+			Path:        []uint32{0x80000000 | 84, 0x80000000, 0x80000000, 1, 9},
+		},
+	}
+
+	complete, err := FinalizePSBT(psbt)
+	if err != nil {
+		t.Fatalf("FinalizePSBT: %v", err)
+	}
+	if !complete {
+		t.Fatal("expected multisig PSBT to be complete after finalization")
+	}
+
+	// Finalized fields MUST be set.
+	if len(in.FinalScriptWitness) == 0 {
+		t.Fatal("FinalScriptWitness empty after finalize")
+	}
+	// Witness shape: [OP_0, sig1, sig2, witnessScript].
+	if len(in.FinalScriptWitness) != 4 {
+		t.Fatalf("expected 4 witness items, got %d", len(in.FinalScriptWitness))
+	}
+	if !bytes.Equal(in.FinalScriptWitness[3], witnessScript) {
+		t.Errorf("witness[3] != witnessScript")
+	}
+
+	// W43 invariant: producer fields MUST be cleared.
+	if len(in.PartialSigs) != 0 {
+		t.Errorf("PartialSigs not cleared after finalize: got %d entries", len(in.PartialSigs))
+	}
+	if len(in.WitnessScript) != 0 {
+		t.Errorf("WitnessScript not cleared after finalize: got %x", in.WitnessScript)
+	}
+	if len(in.RedeemScript) != 0 {
+		t.Errorf("RedeemScript not cleared after finalize: got %x", in.RedeemScript)
+	}
+	if in.SighashType != 0 {
+		t.Errorf("SighashType not cleared after finalize: got 0x%x", in.SighashType)
+	}
+	if len(in.BIP32Derivation) != 0 {
+		t.Errorf("BIP32Derivation not cleared after finalize: got %d entries", len(in.BIP32Derivation))
+	}
+
+	// And the encoded PSBT must not contain the producer key types for
+	// this input. Since we only keep finalized data, an encode/decode
+	// round-trip on the finalized PSBT must yield empty producer fields.
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode (finalized): %v", err)
+	}
+	decoded, err := DecodePSBT(encoded)
+	if err != nil {
+		t.Fatalf("DecodePSBT (finalized): %v", err)
+	}
+	if len(decoded.Inputs) != 1 {
+		t.Fatalf("expected 1 input on decode, got %d", len(decoded.Inputs))
+	}
+	d := decoded.Inputs[0]
+	if len(d.PartialSigs) != 0 {
+		t.Errorf("decoded.PartialSigs leaked: %d entries", len(d.PartialSigs))
+	}
+	if len(d.WitnessScript) != 0 {
+		t.Errorf("decoded.WitnessScript leaked: %x", d.WitnessScript)
+	}
+	if len(d.RedeemScript) != 0 {
+		t.Errorf("decoded.RedeemScript leaked: %x", d.RedeemScript)
+	}
+	if d.SighashType != 0 {
+		t.Errorf("decoded.SighashType leaked: 0x%x", d.SighashType)
+	}
+	if len(d.BIP32Derivation) != 0 {
+		t.Errorf("decoded.BIP32Derivation leaked: %d entries", len(d.BIP32Derivation))
+	}
+	if len(d.FinalScriptWitness) != 4 {
+		t.Errorf("decoded FinalScriptWitness shape lost: got %d items", len(d.FinalScriptWitness))
+	}
+}
+
