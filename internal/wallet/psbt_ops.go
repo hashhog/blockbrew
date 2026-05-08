@@ -254,12 +254,21 @@ func (s *WalletPSBTSigner) SignPSBTInput(psbt *PSBT, idx int) (bool, error) {
 		return false, nil
 	}
 
+	// W41: defense-in-depth. The parser runs validatePSBTInput on
+	// DecodePSBT, but PSBTs constructed in-process (e.g. via NewPSBT
+	// + direct field assignment) bypass that path. Re-check here so
+	// no sighash is ever computed over an inconsistent input. See
+	// Bitcoin Core PSBTInput::IsSane (src/psbt.cpp).
+	prevOutpoint := psbt.UnsignedTx.TxIn[idx].PreviousOutPoint
+	if err := validatePSBTInput(input, prevOutpoint); err != nil {
+		return false, err
+	}
+
 	// Get the UTXO information
 	var utxo *wire.TxOut
 	if input.WitnessUTXO != nil {
 		utxo = input.WitnessUTXO
 	} else if input.NonWitnessUTXO != nil {
-		prevOutpoint := psbt.UnsignedTx.TxIn[idx].PreviousOutPoint
 		if int(prevOutpoint.Index) >= len(input.NonWitnessUTXO.TxOut) {
 			return false, ErrPSBTNoUTXO
 		}
@@ -482,25 +491,31 @@ func (s *WalletPSBTSigner) signInputWithKey(psbt *PSBT, idx int, input *PSBTInpu
 
 // signTaprootInput signs a taproot input.
 func (s *WalletPSBTSigner) signTaprootInput(psbt *PSBT, idx int, input *PSBTInput, utxo *wire.TxOut, privKey *bbcrypto.PrivateKey, xonlyPubKey []byte) error {
-	// Build prevOuts for taproot sighash
+	// Build prevOuts for taproot sighash. W41: validate every input's
+	// UTXO oracles before reading them — taproot sighash commits to
+	// ALL prevOuts, so a forged sibling input would silently corrupt
+	// the signature for `idx`.
 	prevOuts := make([]*wire.TxOut, len(psbt.UnsignedTx.TxIn))
 	for i, txIn := range psbt.UnsignedTx.TxIn {
 		if i == idx {
 			prevOuts[i] = utxo
-		} else {
-			// Need UTXO info for all inputs
-			inp := &psbt.Inputs[i]
-			if inp.WitnessUTXO != nil {
-				prevOuts[i] = inp.WitnessUTXO
-			} else if inp.NonWitnessUTXO != nil {
-				prevOut := txIn.PreviousOutPoint
-				if int(prevOut.Index) < len(inp.NonWitnessUTXO.TxOut) {
-					prevOuts[i] = inp.NonWitnessUTXO.TxOut[prevOut.Index]
-				}
+			continue
+		}
+		// Need UTXO info for all inputs
+		inp := &psbt.Inputs[i]
+		if err := validatePSBTInput(inp, txIn.PreviousOutPoint); err != nil {
+			return err
+		}
+		if inp.WitnessUTXO != nil {
+			prevOuts[i] = inp.WitnessUTXO
+		} else if inp.NonWitnessUTXO != nil {
+			prevOut := txIn.PreviousOutPoint
+			if int(prevOut.Index) < len(inp.NonWitnessUTXO.TxOut) {
+				prevOuts[i] = inp.NonWitnessUTXO.TxOut[prevOut.Index]
 			}
-			if prevOuts[i] == nil {
-				return errors.New("missing UTXO for taproot sighash")
-			}
+		}
+		if prevOuts[i] == nil {
+			return errors.New("missing UTXO for taproot sighash")
 		}
 	}
 
@@ -606,12 +621,20 @@ func FinalizeInput(psbt *PSBT, idx int) (bool, error) {
 		return true, nil
 	}
 
+	// W41: validate UTXO oracles before reading utxo.PkScript /
+	// utxo.Value. FinalizeInput is reachable from external callers
+	// without a prior signer pass, so the parser-side check is not
+	// sufficient here either.
+	prevOutpoint := psbt.UnsignedTx.TxIn[idx].PreviousOutPoint
+	if err := validatePSBTInput(input, prevOutpoint); err != nil {
+		return false, err
+	}
+
 	// Get the UTXO
 	var utxo *wire.TxOut
 	if input.WitnessUTXO != nil {
 		utxo = input.WitnessUTXO
 	} else if input.NonWitnessUTXO != nil {
-		prevOutpoint := psbt.UnsignedTx.TxIn[idx].PreviousOutPoint
 		if int(prevOutpoint.Index) >= len(input.NonWitnessUTXO.TxOut) {
 			return false, ErrPSBTNoUTXO
 		}
