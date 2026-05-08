@@ -2,6 +2,7 @@ package wallet
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -1277,6 +1278,252 @@ func TestPSBTEncodedBytesNoSegwitMarker(t *testing.T) {
 		if len(in.Witness) != 0 {
 			t.Errorf("input %d: unsigned tx must have no witness, got %d items", i, len(in.Witness))
 		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W41 — PSBT NON_WITNESS_UTXO consistency (Bitcoin Core PSBTInput::IsSane)
+// ---------------------------------------------------------------------------
+
+// buildPrevTx returns a 1-output transaction with the given (value,
+// pkScript). Asymmetric byte fixture (W32-B): value/pkScript are
+// non-palindromic so a byte-swap regression cannot accidentally pass.
+func buildPrevTxW41(value int64, pkScript []byte) *wire.MsgTx {
+	return &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				// Coinbase-style null input is fine for the fixture; we
+				// only care about the tx's serialized bytes -> txid.
+				PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xffffffff},
+				SignatureScript:  []byte{0x51, 0x52}, // OP_1 OP_2 — asymmetric
+				Sequence:         0xfffffffd,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: value, PkScript: append([]byte(nil), pkScript...)},
+		},
+		LockTime: 0,
+	}
+}
+
+// TestPSBTValidate_A1_NonWitnessTxidMismatch builds a PSBT whose
+// PSBT_IN_NON_WITNESS_UTXO serializes to a tx whose txid does NOT
+// match the unsigned tx's input prevout. The parser MUST reject.
+// W40-A bug A1: the signer would otherwise consume the forged
+// NonWitnessUTXO.TxOut[idx] directly (psbt_ops.go:266) and sign over
+// attacker-controlled values.
+func TestPSBTValidate_A1_NonWitnessTxidMismatch(t *testing.T) {
+	prevTx := buildPrevTxW41(123_456_789, []byte{
+		0x76, 0xa9, 0x14,
+		0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+		0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+		0x88, 0xac,
+	})
+	realTxid := prevTx.TxHash()
+
+	// Forge a different prevout hash by flipping one byte. Asymmetric
+	// modification — never collides with the real txid.
+	var forgedHash wire.Hash256
+	copy(forgedHash[:], realTxid[:])
+	forgedHash[0] ^= 0x5a
+
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: forgedHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 100_000, PkScript: []byte{0x6a, 0x01, 0x41}}, // OP_RETURN 'A'
+		},
+	}
+
+	psbt := &PSBT{
+		UnsignedTx: tx,
+		Inputs:     make([]PSBTInput, 1),
+		Outputs:    make([]PSBTOutput, 1),
+	}
+	psbt.Inputs[0].NonWitnessUTXO = prevTx
+
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode (test fixture build): %v", err)
+	}
+
+	_, err = DecodePSBT(encoded)
+	if err == nil {
+		t.Fatal("DecodePSBT accepted PSBT with mismatched NON_WITNESS_UTXO txid; want reject")
+	}
+	if !errors.Is(err, ErrPSBTNonWitnessUTXOMismatch) {
+		t.Fatalf("got error %v, want ErrPSBTNonWitnessUTXOMismatch", err)
+	}
+
+	// And direct in-process validator call (signer-dispatch code path).
+	if got := validatePSBTInput(&psbt.Inputs[0], tx.TxIn[0].PreviousOutPoint); !errors.Is(got, ErrPSBTNonWitnessUTXOMismatch) {
+		t.Fatalf("validatePSBTInput direct call: got %v, want ErrPSBTNonWitnessUTXOMismatch", got)
+	}
+
+	// Sanity: the same NonWitnessUTXO IS accepted when the prevout
+	// matches the real txid (proves the test fixture is well-formed
+	// and the rejection above is specifically about the txid check).
+	tx.TxIn[0].PreviousOutPoint.Hash = realTxid
+	psbt2 := &PSBT{
+		UnsignedTx: tx,
+		Inputs:     make([]PSBTInput, 1),
+		Outputs:    make([]PSBTOutput, 1),
+	}
+	psbt2.Inputs[0].NonWitnessUTXO = prevTx
+	encoded2, err := psbt2.Encode()
+	if err != nil {
+		t.Fatalf("Encode (positive-control fixture): %v", err)
+	}
+	if _, err := DecodePSBT(encoded2); err != nil {
+		t.Fatalf("DecodePSBT rejected the positive-control PSBT: %v", err)
+	}
+}
+
+// TestPSBTValidate_A2_WitnessAmountMismatch builds a PSBT where both
+// WITNESS_UTXO and NON_WITNESS_UTXO are present and refer to the same
+// (txid, vout) — but the WITNESS_UTXO lies about the amount. CVE-
+// 2020-14199: the BIP-143 sighash committed by the signer is over
+// `value` from WITNESS_UTXO; if the wallet trusts WITNESS_UTXO without
+// cross-checking, an attacker can trick the user into signing away
+// their full UTXO as fee.
+func TestPSBTValidate_A2_WitnessAmountMismatch(t *testing.T) {
+	pkScript := []byte{
+		0x00, 0x14,
+		0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa,
+		0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05,
+	}
+	const realValue int64 = 50_000_000   // 0.5 BTC
+	const liedValue int64 = 1_000        // attacker says it's only 1000 sat
+	prevTx := buildPrevTxW41(realValue, pkScript)
+	realTxid := prevTx.TxHash()
+
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: realTxid, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 900, PkScript: []byte{0x6a, 0x02, 0x41, 0x42}},
+		},
+	}
+
+	psbt := &PSBT{
+		UnsignedTx: tx,
+		Inputs:     make([]PSBTInput, 1),
+		Outputs:    make([]PSBTOutput, 1),
+	}
+	psbt.Inputs[0].NonWitnessUTXO = prevTx
+	psbt.Inputs[0].WitnessUTXO = &wire.TxOut{
+		Value:    liedValue,
+		PkScript: append([]byte(nil), pkScript...),
+	}
+
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode (test fixture build): %v", err)
+	}
+
+	_, err = DecodePSBT(encoded)
+	if err == nil {
+		t.Fatal("DecodePSBT accepted PSBT with WITNESS_UTXO amount lie; want reject (CVE-2020-14199)")
+	}
+	if !errors.Is(err, ErrWitnessUtxoMismatch) {
+		t.Fatalf("got error %v, want ErrWitnessUtxoMismatch", err)
+	}
+
+	// In-process validator must agree.
+	if got := validatePSBTInput(&psbt.Inputs[0], tx.TxIn[0].PreviousOutPoint); !errors.Is(got, ErrWitnessUtxoMismatch) {
+		t.Fatalf("validatePSBTInput direct call: got %v, want ErrWitnessUtxoMismatch", got)
+	}
+}
+
+// TestPSBTValidate_A2_WitnessScriptMismatch — same shape as the amount
+// test, but the WITNESS_UTXO's pkScript disagrees with the on-chain
+// pkScript at NON_WITNESS_UTXO.TxOut[vout]. Equally fatal: the signer's
+// script-type dispatch (P2WPKH vs P2WSH vs P2TR) hangs off
+// utxo.PkScript, so a forged witness-utxo can re-route the dispatcher
+// into the wrong sighash branch.
+func TestPSBTValidate_A2_WitnessScriptMismatch(t *testing.T) {
+	realPkScript := []byte{
+		0x00, 0x14,
+		0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x11, 0x22, 0x33,
+		0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xa1, 0xb2, 0xc3, 0xd4,
+	}
+	// Asymmetric forgery: same length P2WPKH-shaped script, totally
+	// different hash. (Different hash, different value would also
+	// trip the value branch — keep value EQUAL so we know this test
+	// fails specifically on the script check.)
+	forgedPkScript := []byte{
+		0x00, 0x14,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+		0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14,
+	}
+	if bytes.Equal(realPkScript, forgedPkScript) {
+		t.Fatal("test fixture invariant: realPkScript != forgedPkScript")
+	}
+
+	const sharedValue int64 = 7_777_777
+	prevTx := buildPrevTxW41(sharedValue, realPkScript)
+	realTxid := prevTx.TxHash()
+
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: realTxid, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 7_000_000, PkScript: []byte{0x6a, 0x03, 0x41, 0x42, 0x43}},
+		},
+	}
+
+	psbt := &PSBT{
+		UnsignedTx: tx,
+		Inputs:     make([]PSBTInput, 1),
+		Outputs:    make([]PSBTOutput, 1),
+	}
+	psbt.Inputs[0].NonWitnessUTXO = prevTx
+	psbt.Inputs[0].WitnessUTXO = &wire.TxOut{
+		Value:    sharedValue, // identical, isolates the script check
+		PkScript: append([]byte(nil), forgedPkScript...),
+	}
+
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode (test fixture build): %v", err)
+	}
+
+	_, err = DecodePSBT(encoded)
+	if err == nil {
+		t.Fatal("DecodePSBT accepted PSBT with WITNESS_UTXO scriptPubKey lie; want reject")
+	}
+	if !errors.Is(err, ErrWitnessUtxoMismatch) {
+		t.Fatalf("got error %v, want ErrWitnessUtxoMismatch", err)
+	}
+
+	if got := validatePSBTInput(&psbt.Inputs[0], tx.TxIn[0].PreviousOutPoint); !errors.Is(got, ErrWitnessUtxoMismatch) {
+		t.Fatalf("validatePSBTInput direct call: got %v, want ErrWitnessUtxoMismatch", got)
+	}
+
+	// Positive control: making both UTXO oracles agree must pass.
+	psbt.Inputs[0].WitnessUTXO.PkScript = append([]byte(nil), realPkScript...)
+	encoded2, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode (positive control): %v", err)
+	}
+	if _, err := DecodePSBT(encoded2); err != nil {
+		t.Fatalf("DecodePSBT rejected the positive-control PSBT: %v", err)
 	}
 }
 
