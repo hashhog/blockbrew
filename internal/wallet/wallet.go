@@ -112,11 +112,23 @@ type addressIndices struct {
 
 // Wallet errors
 var (
-	ErrWalletLocked      = errors.New("wallet is locked")
-	ErrInsufficientFunds = errors.New("insufficient funds")
-	ErrNoMasterKey       = errors.New("wallet has no master key")
-	ErrInvalidAddress    = errors.New("invalid address")
-	ErrDuplicateAddress  = errors.New("address already exists")
+	ErrWalletLocked          = errors.New("wallet is locked")
+	ErrInsufficientFunds     = errors.New("insufficient funds")
+	ErrNoMasterKey           = errors.New("wallet has no master key")
+	ErrInvalidAddress        = errors.New("invalid address")
+	ErrDuplicateAddress      = errors.New("address already exists")
+	// ErrRedeemScriptMismatch is returned when a caller-supplied P2SH
+	// redeemScript fails the BIP-16 commitment check
+	// (HASH160(redeemScript) != scriptPubKey[2:22]). Signing MUST abort
+	// before the BIP-143 sighash is computed, otherwise we would emit a
+	// signature on a forged input. Reference: bitcoin-core/src/script/
+	// interpreter.cpp::EvalScript (OP_HASH160 ... OP_EQUAL).
+	ErrRedeemScriptMismatch = errors.New("P2SH redeemScript hash does not match scriptPubKey commitment")
+	// ErrWitnessScriptMismatch is returned when a caller-supplied P2WSH
+	// witnessScript fails the BIP-141 commitment check
+	// (SHA256(witnessScript) != program[2:34], where program is the
+	// scriptPubKey for bare P2WSH or the redeemScript for P2SH-P2WSH).
+	ErrWitnessScriptMismatch = errors.New("P2WSH witnessScript hash does not match witness-program commitment")
 )
 
 // MaxRelockSleepSeconds matches Bitcoin Core's MAX_SLEEP_TIME and caps
@@ -1047,7 +1059,16 @@ func (w *Wallet) signInput(tx *wire.MsgTx, idx int, utxo *WalletUTXO, privKey *b
 		return w.signP2PKH(tx, idx, utxo.Amount, privKey, pubKey)
 
 	case isP2SH(pkScript):
-		// Assume P2SH-P2WPKH (nested segwit)
+		// Assume P2SH-P2WPKH (nested segwit). W31 defense-in-depth:
+		// verify HASH160(reconstructed redeem) == pkScript[2:22] before
+		// signing — even though signInput is only called when the wallet
+		// owns the key, an attacker-supplied pkScript pointing at a
+		// different P2SH would otherwise produce a valid sighash.
+		redeemScript := []byte{0x00, 0x14}
+		redeemScript = append(redeemScript, pubKeyHash[:]...)
+		if err := verifyP2SHCommitment(redeemScript, pkScript); err != nil {
+			return err
+		}
 		return w.signP2SH_P2WPKH(tx, idx, utxo.Amount, privKey, pubKey, pubKeyHash)
 
 	case isP2WPKH(pkScript):
@@ -1669,6 +1690,12 @@ func (w *Wallet) signInputWithScripts(tx *wire.MsgTx, idx int, utxo *WalletUTXO,
 		if info == nil || len(info.WitnessScript) == 0 {
 			return errors.New("missing witness script for P2WSH input")
 		}
+		// W31: verify SHA256(witnessScript) == pkScript[2:34] before
+		// signing. Without this check the wallet would sign an attacker-
+		// supplied script over the user's coins.
+		if err := verifyP2WSHCommitment(info.WitnessScript, pkScript); err != nil {
+			return err
+		}
 		signers, err := w.collectSignersForScript(info.WitnessScript)
 		if err != nil {
 			return err
@@ -1690,7 +1717,22 @@ func (w *Wallet) signInputWithScripts(tx *wire.MsgTx, idx int, utxo *WalletUTXO,
 			}
 			pubKey := privKey.PubKey()
 			pubKeyHash := bbcrypto.Hash160(pubKey.SerializeCompressed())
+			// W31: even when reconstructing the redeemScript from a wallet-
+			// owned key, verify the resulting commitment matches the
+			// scriptPubKey. Without the check we'd happily sign for any
+			// caller-supplied UTXO whose pkScript is some unrelated P2SH.
+			redeemScript := []byte{0x00, 0x14}
+			redeemScript = append(redeemScript, pubKeyHash[:]...)
+			if err := verifyP2SHCommitment(redeemScript, pkScript); err != nil {
+				return err
+			}
 			return w.signP2SH_P2WPKH(tx, idx, utxo.Amount, privKey, pubKey, pubKeyHash)
+		}
+
+		// W31: verify HASH160(redeemScript) == pkScript[2:22] for ALL
+		// P2SH dispatch branches before computing any sighash.
+		if err := verifyP2SHCommitment(info.RedeemScript, pkScript); err != nil {
+			return err
 		}
 
 		switch classifyRedeemScript(info.RedeemScript) {
@@ -1709,6 +1751,10 @@ func (w *Wallet) signInputWithScripts(tx *wire.MsgTx, idx int, utxo *WalletUTXO,
 		case redeemP2SH_P2WSH:
 			if info.WitnessScript == nil {
 				return errors.New("missing witness script for P2SH-P2WSH input")
+			}
+			// W31: verify SHA256(witnessScript) == redeemScript[2:34].
+			if err := verifyP2WSHCommitment(info.WitnessScript, info.RedeemScript); err != nil {
+				return err
 			}
 			signers, err := w.collectSignersForScript(info.WitnessScript)
 			if err != nil {
@@ -1759,6 +1805,48 @@ func classifyRedeemScript(redeem []byte) redeemKind {
 	default:
 		return redeemLegacyP2SH
 	}
+}
+
+// verifyP2SHCommitment checks that HASH160(redeemScript) matches the
+// 20-byte commitment embedded in a BIP-16 P2SH scriptPubKey
+// (`OP_HASH160 <0x14> <h160> OP_EQUAL`). Returns ErrRedeemScriptMismatch
+// on any mismatch, including a malformed pkScript.
+//
+// Every P2SH signing path MUST call this before computing a BIP-143
+// sighash, otherwise the wallet will emit a signature over a forged
+// input — the W31 fix. Reference impl: camlcoin lib/wallet.ml:1262
+// (`Crypto.hash160 redeem |> Cstruct.equal script_hash`).
+func verifyP2SHCommitment(redeemScript, pkScript []byte) error {
+	if !isP2SH(pkScript) {
+		return ErrRedeemScriptMismatch
+	}
+	if len(redeemScript) == 0 {
+		return ErrRedeemScriptMismatch
+	}
+	actual := bbcrypto.Hash160(redeemScript)
+	if !subtleEqualBytes(actual[:], pkScript[2:22]) {
+		return ErrRedeemScriptMismatch
+	}
+	return nil
+}
+
+// verifyP2WSHCommitment checks that SHA256(witnessScript) matches the
+// 32-byte commitment in a BIP-141 P2WSH witness program (`OP_0 <0x20>
+// <sha256>`). The program may be either a bare P2WSH scriptPubKey OR a
+// P2SH-wrapped P2WSH redeemScript. Returns ErrWitnessScriptMismatch on
+// any mismatch, including a malformed program.
+func verifyP2WSHCommitment(witnessScript, program []byte) error {
+	if !isP2WSH(program) {
+		return ErrWitnessScriptMismatch
+	}
+	if len(witnessScript) == 0 {
+		return ErrWitnessScriptMismatch
+	}
+	actual := bbcrypto.SHA256Hash(witnessScript)
+	if !subtleEqualBytes(actual[:], program[2:34]) {
+		return ErrWitnessScriptMismatch
+	}
+	return nil
 }
 
 // findKeyForPubKeyHash searches addrToPath for any key whose hash160

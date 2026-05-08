@@ -388,6 +388,11 @@ func (s *WalletPSBTSigner) signInputWithKey(psbt *PSBT, idx int, input *PSBTInpu
 		if len(input.WitnessScript) == 0 {
 			return errors.New("missing witness script for P2WSH")
 		}
+		// W31: verify SHA256(witnessScript) == pkScript[2:34] before
+		// signing. See verifyP2WSHCommitment in wallet.go.
+		if err := verifyP2WSHCommitment(input.WitnessScript, pkScript); err != nil {
+			return err
+		}
 		sighash, err := script.CalcWitnessSignatureHash(input.WitnessScript, hashType, psbt.UnsignedTx, idx, utxo.Value)
 		if err != nil {
 			return err
@@ -402,6 +407,12 @@ func (s *WalletPSBTSigner) signInputWithKey(psbt *PSBT, idx int, input *PSBTInpu
 		// P2SH - could be P2SH-P2WPKH or P2SH-P2WSH
 		if len(input.RedeemScript) == 0 {
 			return errors.New("missing redeem script for P2SH")
+		}
+
+		// W31: verify HASH160(redeemScript) == pkScript[2:22] for ALL
+		// P2SH branches before computing any sighash.
+		if err := verifyP2SHCommitment(input.RedeemScript, pkScript); err != nil {
+			return err
 		}
 
 		if isP2WPKH(input.RedeemScript) {
@@ -421,6 +432,10 @@ func (s *WalletPSBTSigner) signInputWithKey(psbt *PSBT, idx int, input *PSBTInpu
 			// P2SH-P2WSH
 			if len(input.WitnessScript) == 0 {
 				return errors.New("missing witness script for P2SH-P2WSH")
+			}
+			// W31: verify SHA256(witnessScript) == redeemScript[2:34].
+			if err := verifyP2WSHCommitment(input.WitnessScript, input.RedeemScript); err != nil {
+				return err
 			}
 			sighash, err := script.CalcWitnessSignatureHash(input.WitnessScript, hashType, psbt.UnsignedTx, idx, utxo.Value)
 			if err != nil {
