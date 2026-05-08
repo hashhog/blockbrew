@@ -535,22 +535,48 @@ func (s *Server) handleSignRawTransactionWithWallet(params json.RawMessage, wall
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Transaction decode failed: %v", err)}
 	}
 
-	// Build a map of prevtxs for quick lookup
+	// Build a map of prevtxs for quick lookup AND a slice of decoded
+	// PrevTxInfo entries for the wallet signer. The slice form is what
+	// SignTransactionWithPrevs consumes; mirrors Bitcoin Core's
+	// `signrawtransactionwithwallet --prevtxs` argument shape.
 	prevTxMap := make(map[wire.OutPoint]PrevTx)
+	walletPrevs := make([]wallet.PrevTxInfo, 0, len(prevTxs))
 	for _, ptx := range prevTxs {
 		hash, err := wire.NewHash256FromHex(ptx.TxID)
 		if err != nil {
 			continue
 		}
-		prevTxMap[wire.OutPoint{Hash: hash, Index: ptx.Vout}] = ptx
+		op := wire.OutPoint{Hash: hash, Index: ptx.Vout}
+		prevTxMap[op] = ptx
+
+		info := wallet.PrevTxInfo{OutPoint: op}
+		if ptx.ScriptPubKey != "" {
+			if b, err := hex.DecodeString(ptx.ScriptPubKey); err == nil {
+				info.ScriptPubKey = b
+			}
+		}
+		if ptx.RedeemScript != "" {
+			if b, err := hex.DecodeString(ptx.RedeemScript); err == nil {
+				info.RedeemScript = b
+			}
+		}
+		if ptx.WitnessScript != "" {
+			if b, err := hex.DecodeString(ptx.WitnessScript); err == nil {
+				info.WitnessScript = b
+			}
+		}
+		// Amount is in BTC in the RPC; convert to satoshis. The wallet
+		// signer needs satoshi-amounts for BIP-143 sighash.
+		info.Amount = int64(ptx.Amount * 1e8)
+		walletPrevs = append(walletPrevs, info)
 	}
 
-	// Try to sign with wallet
-	// Note: Current wallet.SignTransaction only handles P2WPKH
-	// We'll extend the result to track partial/failed signatures
+	// Sign with wallet via the new prevtxs-aware entry-point. The W27-D
+	// wave (Phases 1+2+3) closes the W19 P0 where this RPC's `prevtxs`
+	// arg was parsed but never threaded into the signer.
 	var signErrors []SignRawTransactionErr
 
-	err = w.SignTransaction(tx)
+	err = w.SignTransactionWithPrevs(tx, walletPrevs)
 	complete := err == nil
 
 	if err != nil {

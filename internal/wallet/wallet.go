@@ -1312,8 +1312,51 @@ func (w *Wallet) getKeyForPath(path string) (*bbcrypto.PrivateKey, error) {
 	return key.ECPrivKey()
 }
 
+// PrevTxInfo describes a previous output supplied to SignTransactionWithPrevs
+// for inputs whose UTXO data the wallet does not already track. It mirrors
+// the shape of the `prevtxs` array in `signrawtransactionwithwallet` (see
+// internal/rpc/rawtx_methods.go::PrevTx) but holds raw bytes instead of hex
+// strings so the wallet can consume it directly.
+//
+// For P2SH inputs RedeemScript is required; for P2WSH / P2SH-P2WSH inputs
+// WitnessScript is required; for P2SH-P2WPKH only RedeemScript is needed.
+// Both fields may be left nil for native P2WPKH / P2PKH / P2TR inputs.
+//
+// Reference: bitcoin-core/src/wallet/rpc/spend.cpp (signrawtransactionwithwallet)
+// and bitcoin-core/src/script/sign.cpp::ProduceSignature.
+type PrevTxInfo struct {
+	OutPoint      wire.OutPoint
+	ScriptPubKey  []byte
+	Amount        int64
+	RedeemScript  []byte // optional, for P2SH variants
+	WitnessScript []byte // optional, for P2WSH / P2SH-P2WSH
+}
+
 // SignTransaction signs all inputs of a transaction using wallet keys.
+//
+// Closes the W19 / R1 audit P0: this previously was a P2WPKH-only stub
+// that signed every input as if it were P2WPKH, silently producing wrong
+// witnesses for P2PKH / P2SH-P2WPKH / P2TR / P2WSH / P2SH-P2WSH inputs.
+// It now delegates to SignTransactionWithPrevs(tx, nil), which dispatches
+// by script template via signInput / signInputWithScripts.
+//
+// Inputs that need extra script material (redeemScript / witnessScript)
+// must be passed through SignTransactionWithPrevs.
+//
+// Reference: bitcoin-core/src/wallet/scriptpubkeyman.cpp::SignTransaction.
 func (w *Wallet) SignTransaction(tx *wire.MsgTx) error {
+	return w.SignTransactionWithPrevs(tx, nil)
+}
+
+// SignTransactionWithPrevs signs all inputs of a transaction, threading
+// caller-supplied previous-output info through the signer so that inputs
+// using non-bare P2SH / P2WSH / P2SH-P2WSH templates can be signed
+// correctly. prevs may be nil — in that case the wallet falls back to
+// its internal UTXO store, which is the historical behaviour.
+//
+// Inputs whose outpoint is in neither the wallet's UTXO store nor prevs
+// fail with a per-input error.
+func (w *Wallet) SignTransactionWithPrevs(tx *wire.MsgTx, prevs []PrevTxInfo) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -1324,60 +1367,98 @@ func (w *Wallet) SignTransaction(tx *wire.MsgTx) error {
 		return ErrNoMasterKey
 	}
 
-	// For each input, find the corresponding UTXO
+	// Build a lookup from prevs (keyed by outpoint).
+	prevMap := make(map[wire.OutPoint]*PrevTxInfo, len(prevs))
+	for i := range prevs {
+		p := &prevs[i]
+		prevMap[p.OutPoint] = p
+	}
+
+	// Build prevOuts for taproot sighash (it needs a TxOut for every input).
+	prevOuts := make([]*wire.TxOut, len(tx.TxIn))
+	utxos := make([]*WalletUTXO, len(tx.TxIn))
+	overrideScripts := make([]*PrevTxInfo, len(tx.TxIn))
+
 	for i, txIn := range tx.TxIn {
-		utxo, exists := w.utxos[txIn.PreviousOutPoint]
-		if !exists {
+		// Prefer caller-supplied prevs (they may carry redeem/witness scripts).
+		if pinfo, ok := prevMap[txIn.PreviousOutPoint]; ok {
+			overrideScripts[i] = pinfo
+			// Build a synthetic WalletUTXO so the rest of the dispatcher
+			// has a uniform type to work with. KeyPath is left blank — the
+			// wallet's keystore is searched by pubkey for these inputs.
+			utxos[i] = &WalletUTXO{
+				OutPoint: txIn.PreviousOutPoint,
+				Amount:   pinfo.Amount,
+				PkScript: pinfo.ScriptPubKey,
+			}
+			// Cross-fill from internal store if amount/script is missing.
+			if utxo, exists := w.utxos[txIn.PreviousOutPoint]; exists {
+				if utxos[i].Amount == 0 {
+					utxos[i].Amount = utxo.Amount
+				}
+				if len(utxos[i].PkScript) == 0 {
+					utxos[i].PkScript = utxo.PkScript
+				}
+				if utxos[i].KeyPath == "" {
+					utxos[i].KeyPath = utxo.KeyPath
+				}
+			}
+		} else if utxo, exists := w.utxos[txIn.PreviousOutPoint]; exists {
+			utxos[i] = utxo
+		} else {
 			return fmt.Errorf("UTXO not found for input %d", i)
 		}
 
-		// Get the private key for this UTXO
-		privKey, err := w.getKeyForPath(utxo.KeyPath)
-		if err != nil {
-			return err
+		prevOuts[i] = &wire.TxOut{
+			Value:    utxos[i].Amount,
+			PkScript: utxos[i].PkScript,
 		}
+	}
 
-		// Create P2WPKH script code
-		pubKey := privKey.PubKey()
-		pubKeyHash := bbcrypto.Hash160(pubKey.SerializeCompressed())
-
-		scriptCode := make([]byte, 25)
-		scriptCode[0] = 0x76 // OP_DUP
-		scriptCode[1] = 0xa9 // OP_HASH160
-		scriptCode[2] = 0x14 // Push 20 bytes
-		copy(scriptCode[3:23], pubKeyHash[:])
-		scriptCode[23] = 0x88 // OP_EQUALVERIFY
-		scriptCode[24] = 0xac // OP_CHECKSIG
-
-		// Calculate BIP143 sighash
-		sighash, err := script.CalcWitnessSignatureHash(
-			scriptCode,
-			script.SigHashAll,
-			tx,
-			i,
-			utxo.Amount,
-		)
-		if err != nil {
-			return err
-		}
-
-		// Sign with ECDSA
-		sig, err := bbcrypto.SignECDSA(privKey, sighash)
-		if err != nil {
-			return err
-		}
-
-		// Append sighash type byte
-		sig = append(sig, byte(script.SigHashAll))
-
-		// Set witness
-		tx.TxIn[i].Witness = [][]byte{
-			sig,
-			pubKey.SerializeCompressed(),
+	for i := range tx.TxIn {
+		if err := w.signInputWithScripts(tx, i, utxos[i], prevOuts, overrideScripts[i]); err != nil {
+			return fmt.Errorf("failed to sign input %d: %w", i, err)
 		}
 	}
 
 	return nil
+}
+
+// signInputWithScripts dispatches a single input through the script-type-
+// aware signer. Phase-1 (W27-D) version: this is a thin delegator to
+// signInput for inputs the wallet owns end-to-end; the redeemScript-
+// inspection switch and the new P2WSH / P2SH-P2WSH / legacy-P2SH signers
+// are added in Phase-2 / Phase-3 follow-up commits.
+func (w *Wallet) signInputWithScripts(tx *wire.MsgTx, idx int, utxo *WalletUTXO, prevOuts []*wire.TxOut, info *PrevTxInfo) error {
+	// Phase-1 stub: ignore info and fall through to signInput. P2WSH /
+	// P2SH-P2WSH / legacy-P2SH templates will be wired up in Phase-2 /
+	// Phase-3 of the W27-D plan.
+	_ = info
+	privKey, err := w.findKeyForUTXO(utxo)
+	if err != nil {
+		return err
+	}
+	return w.signInput(tx, idx, utxo, privKey, prevOuts)
+}
+
+// findKeyForUTXO returns the wallet's private key for a wallet-owned UTXO,
+// preferring the recorded KeyPath but falling back to scanning addrToPath
+// for the address derived from the UTXO's scriptPubKey. Used by
+// signInputWithScripts for inputs that arrived via prevtxs but whose
+// scriptPubKey is one the wallet still controls.
+func (w *Wallet) findKeyForUTXO(utxo *WalletUTXO) (*bbcrypto.PrivateKey, error) {
+	if utxo.KeyPath != "" {
+		return w.getKeyForPath(utxo.KeyPath)
+	}
+	addr := w.scriptToAddress(utxo.PkScript)
+	if addr == "" {
+		return nil, fmt.Errorf("wallet does not own scriptPubKey")
+	}
+	path, ok := w.addrToPath[addr]
+	if !ok {
+		return nil, fmt.Errorf("wallet does not own address %s", addr)
+	}
+	return w.getKeyForPath(path)
 }
 
 // ScanBlock checks a block for transactions relevant to the wallet.
