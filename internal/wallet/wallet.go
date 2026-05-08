@@ -1424,21 +1424,145 @@ func (w *Wallet) SignTransactionWithPrevs(tx *wire.MsgTx, prevs []PrevTxInfo) er
 	return nil
 }
 
-// signInputWithScripts dispatches a single input through the script-type-
-// aware signer. Phase-1 (W27-D) version: this is a thin delegator to
-// signInput for inputs the wallet owns end-to-end; the redeemScript-
-// inspection switch and the new P2WSH / P2SH-P2WSH / legacy-P2SH signers
-// are added in Phase-2 / Phase-3 follow-up commits.
+// signInputWithScripts is the script-template dispatcher used by
+// SignTransactionWithPrevs. It mirrors the canonical PSBT signer at
+// psbt_ops.go::signInputWithKey so the raw-tx and PSBT paths agree on
+// script-type semantics. info may be nil for inputs that the wallet
+// already owns end-to-end, in which case behaviour matches signInput.
+//
+// Phase-2 (W27-D) version: P2SH inputs are now classified by inspecting
+// the caller-supplied redeem script (mirroring Core ProduceSignature),
+// and bare P2WSH inputs are routed to a new signing path. The actual
+// P2WSH / P2SH-P2WSH / legacy-P2SH signers are added in Phase-3 of this
+// wave; Phase-2 returns "not yet implemented" for those branches so the
+// dispatch tree is in place and the wallet's existing single-sig paths
+// keep working.
+//
+// Reference: bitcoin-core/src/script/sign.cpp::ProduceSignature.
 func (w *Wallet) signInputWithScripts(tx *wire.MsgTx, idx int, utxo *WalletUTXO, prevOuts []*wire.TxOut, info *PrevTxInfo) error {
-	// Phase-1 stub: ignore info and fall through to signInput. P2WSH /
-	// P2SH-P2WSH / legacy-P2SH templates will be wired up in Phase-2 /
-	// Phase-3 of the W27-D plan.
-	_ = info
+	pkScript := utxo.PkScript
+
+	// Bare-segwit-v0 P2WSH must be dispatched before the P2WPKH/P2TR
+	// detectors; isP2WSH is defined in psbt_ops.go.
+	if isP2WSH(pkScript) {
+		if info == nil || len(info.WitnessScript) == 0 {
+			return errors.New("missing witness script for P2WSH input")
+		}
+		return errors.New("P2WSH signing not implemented in this build (W27-D Phase 3 pending)")
+	}
+
+	// P2SH must be classified by inspecting the redeem script the caller
+	// supplied (BIP16 + BIP141 P2SH-wrapped segwit). Falling back to
+	// "assume P2SH-P2WPKH" was the W19 P0 bug.
+	if isP2SH(pkScript) {
+		// If the wallet owns this address natively (its own P2SH-P2WPKH
+		// template), info may be nil; reconstruct the redeem script from
+		// the wallet's key and dispatch via the existing signer.
+		if info == nil || len(info.RedeemScript) == 0 {
+			privKey, err := w.findKeyForUTXO(utxo)
+			if err != nil {
+				return fmt.Errorf("missing redeem script and unknown wallet key for P2SH input: %w", err)
+			}
+			pubKey := privKey.PubKey()
+			pubKeyHash := bbcrypto.Hash160(pubKey.SerializeCompressed())
+			return w.signP2SH_P2WPKH(tx, idx, utxo.Amount, privKey, pubKey, pubKeyHash)
+		}
+
+		switch classifyRedeemScript(info.RedeemScript) {
+		case redeemP2SH_P2WPKH:
+			// P2SH-wrapped P2WPKH. The redeem script encodes the hash160
+			// we need for the script-code, so derive directly from it.
+			var pubKeyHash [20]byte
+			copy(pubKeyHash[:], info.RedeemScript[2:22])
+			privKey, err := w.findKeyForPubKeyHash(pubKeyHash[:])
+			if err != nil {
+				return err
+			}
+			pubKey := privKey.PubKey()
+			return w.signP2SH_P2WPKH(tx, idx, utxo.Amount, privKey, pubKey, pubKeyHash)
+
+		case redeemP2SH_P2WSH:
+			if info.WitnessScript == nil {
+				return errors.New("missing witness script for P2SH-P2WSH input")
+			}
+			return errors.New("P2SH-P2WSH signing not implemented in this build (W27-D Phase 3 pending)")
+
+		default:
+			// Legacy P2SH (e.g. bare M-of-N CHECKMULTISIG).
+			return errors.New("legacy P2SH signing not implemented in this build (W27-D Phase 3 pending)")
+		}
+	}
+
+	// All other templates: the wallet must own the key locally. Look it
+	// up by KeyPath if we have one, else by ScriptPubKey hash.
 	privKey, err := w.findKeyForUTXO(utxo)
 	if err != nil {
 		return err
 	}
 	return w.signInput(tx, idx, utxo, privKey, prevOuts)
+}
+
+// redeemKind classifies a P2SH redeem script for dispatch.
+type redeemKind int
+
+const (
+	redeemUnknown redeemKind = iota
+	redeemP2SH_P2WPKH
+	redeemP2SH_P2WSH
+	redeemLegacyP2SH
+)
+
+// classifyRedeemScript returns the type of P2SH-wrapped script. It mirrors
+// the dispatch tree at psbt_ops.go:401-446 and Bitcoin Core's
+// ProduceSignature recursion (script/sign.cpp:739-787).
+func classifyRedeemScript(redeem []byte) redeemKind {
+	switch {
+	case isP2WPKH(redeem):
+		return redeemP2SH_P2WPKH
+	case isP2WSH(redeem):
+		return redeemP2SH_P2WSH
+	case len(redeem) == 0:
+		return redeemUnknown
+	default:
+		return redeemLegacyP2SH
+	}
+}
+
+// findKeyForPubKeyHash searches addrToPath for any key whose hash160
+// matches; used for P2SH-P2WPKH redeem-script dispatch.
+func (w *Wallet) findKeyForPubKeyHash(hash160 []byte) (*bbcrypto.PrivateKey, error) {
+	if w.masterKey == nil {
+		return nil, ErrNoMasterKey
+	}
+	for _, path := range w.addrToPath {
+		key, err := w.masterKey.DerivePath(path)
+		if err != nil {
+			continue
+		}
+		priv, err := key.ECPrivKey()
+		if err != nil {
+			continue
+		}
+		h := bbcrypto.Hash160(priv.PubKey().SerializeCompressed())
+		if subtleEqualBytes(h[:], hash160) {
+			return priv, nil
+		}
+	}
+	return nil, fmt.Errorf("wallet does not own pubkey-hash")
+}
+
+// subtleEqualBytes is a constant-time byte-compare for equal-length
+// inputs. Crypto-conservatism only — these are public-key / hash160
+// comparisons, timing leaks aren't actually a concern here.
+func subtleEqualBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := range a {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
 }
 
 // findKeyForUTXO returns the wallet's private key for a wallet-owned UTXO,
