@@ -922,12 +922,12 @@ func TestPSBTTapTreeRoundTrip(t *testing.T) {
 	}
 
 	// Tree of 3 leaves at depths 1, 2, 2 (canonical 2-of-3 taptree shape).
-	// parseTapTree stores depth in ControlBlock[0], and serializeTapTree
-	// reads it back from there — match that convention.
-	psbt.Outputs[0].TapTree = []TapLeaf{
-		{LeafVersion: 0xc0, Script: []byte{0x51}, ControlBlock: []byte{1}},                   // depth=1, OP_1
-		{LeafVersion: 0xc0, Script: []byte{0x52, 0x53}, ControlBlock: []byte{2}},             // depth=2, OP_2 OP_3
-		{LeafVersion: 0xc0, Script: []byte{0x54, 0x55, 0x56}, ControlBlock: []byte{2}},       // depth=2
+	// W35-B: depth is now a first-class field on TapTreeLeaf, not stuffed
+	// into TapLeaf.ControlBlock[0].
+	psbt.Outputs[0].TapTree = []TapTreeLeaf{
+		{Depth: 1, LeafVersion: 0xc0, Script: []byte{0x51}},                   // depth=1, OP_1
+		{Depth: 2, LeafVersion: 0xc0, Script: []byte{0x52, 0x53}},             // depth=2, OP_2 OP_3
+		{Depth: 2, LeafVersion: 0xc0, Script: []byte{0x54, 0x55, 0x56}},       // depth=2
 	}
 
 	encoded, err := psbt.Encode()
@@ -954,9 +954,9 @@ func TestPSBTTapTreeRoundTrip(t *testing.T) {
 		if !bytes.Equal(got[i].Script, want[i].Script) {
 			t.Errorf("tap-tree leaf %d Script: got %x want %x", i, got[i].Script, want[i].Script)
 		}
-		// ControlBlock[0] holds depth on round-trip.
-		if len(got[i].ControlBlock) == 0 || got[i].ControlBlock[0] != want[i].ControlBlock[0] {
-			t.Errorf("tap-tree leaf %d depth: got %x want %x", i, got[i].ControlBlock, want[i].ControlBlock)
+		// W35-B: depth is now a first-class field, not ControlBlock[0].
+		if got[i].Depth != want[i].Depth {
+			t.Errorf("tap-tree leaf %d Depth: got %d want %d", i, got[i].Depth, want[i].Depth)
 		}
 	}
 
@@ -967,6 +967,152 @@ func TestPSBTTapTreeRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(encoded, reEncoded) {
 		t.Errorf("PSBT TapTree round-trip not byte-identical (len %d vs %d)", len(encoded), len(reEncoded))
+	}
+}
+
+// TestPSBTTapTreeAndTapLeafScriptsCoexist exercises the W35-B type split.
+// Before the refactor, both per-input PSBT_IN_TAP_LEAF_SCRIPT (0x15) and
+// per-output PSBT_OUT_TAP_TREE (0x06) were carried by []TapLeaf, with the
+// tap-tree path stuffing depth into ControlBlock[0]. If a caller ever
+// constructed both on the same PSBT, the same struct shape meant
+// ControlBlock[0] silently meant two different things in the two
+// contexts. After W35-B, Output.TapTree is []TapTreeLeaf with an
+// explicit Depth field, so the two cannot be confused at the call site.
+//
+// This test constructs an Input with TapLeafScripts AND an Output with
+// TapTree on the same PSBT and verifies both round-trip without
+// cross-contamination on the now-separated types.
+func TestPSBTTapTreeAndTapLeafScriptsCoexist(t *testing.T) {
+	prevHash, _ := wire.NewHash256FromHex("000000000000000000000000000000000000000000000000000000000000c0e1")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    75000,
+				PkScript: []byte{0x51, 0x20, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9, 0xaa, 0xab, 0xac, 0xad, 0xae, 0xaf, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xbb, 0xbc, 0xbd, 0xbe, 0xbf},
+			},
+		},
+		LockTime: 0,
+	}
+
+	psbt, err := NewPSBT(tx)
+	if err != nil {
+		t.Fatalf("NewPSBT: %v", err)
+	}
+
+	// Per-input TapLeafScripts: real BIP341 control blocks.
+	cbA := make([]byte, 33)
+	cbA[0] = 0xc0
+	for i := 1; i < 33; i++ {
+		cbA[i] = byte(i + 0x10)
+	}
+	cbB := make([]byte, 33+32)
+	cbB[0] = 0xc0
+	for i := 1; i < len(cbB); i++ {
+		cbB[i] = byte(i + 0x40)
+	}
+	psbt.Inputs[0].TapLeafScripts = []TapLeaf{
+		{LeafVersion: 0xc0, Script: []byte{0x51, 0x52}, ControlBlock: cbA},
+		{LeafVersion: 0xc0, Script: []byte{0x76, 0xa9, 0x14, 0xde, 0xad}, ControlBlock: cbB},
+	}
+
+	// Per-output TapTree: 3 leaves at depths 1, 2, 2. Crucially the
+	// scripts are DIFFERENT from the per-input ones, so any cross-
+	// contamination between the two field types would surface as a
+	// bytewise mismatch in the round-trip.
+	psbt.Outputs[0].TapTree = []TapTreeLeaf{
+		{Depth: 1, LeafVersion: 0xc0, Script: []byte{0x6a, 0x01, 0xff}},
+		{Depth: 2, LeafVersion: 0xc0, Script: []byte{0xa9, 0x14, 0x00, 0x11, 0x22}},
+		{Depth: 2, LeafVersion: 0xc0, Script: []byte{0x21, 0x03, 0xaa, 0xbb, 0xcc, 0xdd}},
+	}
+
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	decoded, err := DecodePSBT(encoded)
+	if err != nil {
+		t.Fatalf("DecodePSBT: %v", err)
+	}
+
+	// --- Per-input TapLeafScripts: verify control blocks are real
+	// 33 / 65-byte BIP341 control blocks, not a 1-byte depth stub.
+	gotInLeaves := decoded.Inputs[0].TapLeafScripts
+	if len(gotInLeaves) != 2 {
+		t.Fatalf("expected 2 input TapLeafScripts, got %d", len(gotInLeaves))
+	}
+	wantByCB := map[string]TapLeaf{
+		string(cbA): {LeafVersion: 0xc0, Script: []byte{0x51, 0x52}, ControlBlock: cbA},
+		string(cbB): {LeafVersion: 0xc0, Script: []byte{0x76, 0xa9, 0x14, 0xde, 0xad}, ControlBlock: cbB},
+	}
+	for i, leaf := range gotInLeaves {
+		want, ok := wantByCB[string(leaf.ControlBlock)]
+		if !ok {
+			t.Fatalf("input leaf %d unrecognized control block %x", i, leaf.ControlBlock)
+		}
+		if len(leaf.ControlBlock) != 33 && len(leaf.ControlBlock) != 65 {
+			t.Errorf("input leaf %d: control block length %d, want 33 or 65 (real BIP341)", i, len(leaf.ControlBlock))
+		}
+		if leaf.LeafVersion != want.LeafVersion {
+			t.Errorf("input leaf %d: LeafVersion got 0x%02x want 0x%02x", i, leaf.LeafVersion, want.LeafVersion)
+		}
+		if !bytes.Equal(leaf.Script, want.Script) {
+			t.Errorf("input leaf %d: Script got %x want %x", i, leaf.Script, want.Script)
+		}
+		if !bytes.Equal(leaf.ControlBlock, want.ControlBlock) {
+			t.Errorf("input leaf %d: ControlBlock got %x want %x", i, leaf.ControlBlock, want.ControlBlock)
+		}
+	}
+
+	// --- Per-output TapTree: verify Depth is recovered as a first-class
+	// field; the type is TapTreeLeaf, which has no ControlBlock at all.
+	gotOutLeaves := decoded.Outputs[0].TapTree
+	if len(gotOutLeaves) != 3 {
+		t.Fatalf("expected 3 output TapTree leaves, got %d", len(gotOutLeaves))
+	}
+	wantOut := psbt.Outputs[0].TapTree
+	for i := range wantOut {
+		if gotOutLeaves[i].Depth != wantOut[i].Depth {
+			t.Errorf("output leaf %d: Depth got %d want %d", i, gotOutLeaves[i].Depth, wantOut[i].Depth)
+		}
+		if gotOutLeaves[i].LeafVersion != wantOut[i].LeafVersion {
+			t.Errorf("output leaf %d: LeafVersion got 0x%02x want 0x%02x", i, gotOutLeaves[i].LeafVersion, wantOut[i].LeafVersion)
+		}
+		if !bytes.Equal(gotOutLeaves[i].Script, wantOut[i].Script) {
+			t.Errorf("output leaf %d: Script got %x want %x", i, gotOutLeaves[i].Script, wantOut[i].Script)
+		}
+	}
+
+	// --- Cross-contamination guard: ensure no input ControlBlock is
+	// 1 byte (i.e. nobody mistook a tap-tree depth for a control block),
+	// and ensure all output Depth values are small ints (≤ some sane
+	// taproot tree bound), not bytes that look like the leading byte of
+	// a control block (0xc0 / 0xc1).
+	for i, leaf := range gotInLeaves {
+		if len(leaf.ControlBlock) == 1 {
+			t.Errorf("input leaf %d: ControlBlock degenerated to 1-byte stub (length %d) — type cross-contamination", i, len(leaf.ControlBlock))
+		}
+	}
+	for i, leaf := range gotOutLeaves {
+		if leaf.Depth > 128 {
+			t.Errorf("output leaf %d: Depth=%d looks like a control-block tag byte (0xc0/0xc1) — type cross-contamination", i, leaf.Depth)
+		}
+	}
+
+	// Re-encode and assert byte-for-byte match.
+	reEncoded, err := decoded.Encode()
+	if err != nil {
+		t.Fatalf("re-Encode: %v", err)
+	}
+	if !bytes.Equal(encoded, reEncoded) {
+		t.Errorf("PSBT TapTree+TapLeafScripts coexist round-trip not byte-identical (len %d vs %d)", len(encoded), len(reEncoded))
 	}
 }
 

@@ -111,11 +111,25 @@ type TapScriptSigKey struct {
 	LeafHash    [32]byte
 }
 
-// TapLeaf represents a taproot script leaf.
+// TapLeaf represents a taproot script leaf as carried in a per-input
+// PSBT_IN_TAP_LEAF_SCRIPT (BIP371). ControlBlock is a real BIP341 control
+// block (33 + N*32 bytes).
 type TapLeaf struct {
 	LeafVersion byte
 	Script      []byte
 	ControlBlock []byte
+}
+
+// TapTreeLeaf represents a single leaf in a per-output PSBT_OUT_TAP_TREE
+// (BIP371). The wire format carries Depth + LeafVersion + Script with NO
+// control block — the control block is derived by the verifier from the
+// tree structure. Kept distinct from TapLeaf so the two BIP371 fields
+// can never be confused at the call site (the W34-B refactor previously
+// stashed Depth in TapLeaf.ControlBlock[0], a structural overload).
+type TapTreeLeaf struct {
+	Depth       uint8
+	LeafVersion uint8
+	Script      []byte
 }
 
 // TapBIP32Derivation represents taproot BIP32 derivation info.
@@ -177,7 +191,7 @@ type PSBTOutput struct {
 
 	// Taproot fields (BIP371)
 	TapInternalKey     []byte // 32 bytes
-	TapTree            []TapLeaf
+	TapTree            []TapTreeLeaf
 	TapBIP32Derivation map[string]*TapBIP32Derivation
 
 	// Unknown key-value pairs
@@ -1150,10 +1164,12 @@ func serializeWitnessStack(stack [][]byte) []byte {
 	return buf.Bytes()
 }
 
-// parseTapTree parses a tap tree from serialized form.
-func parseTapTree(data []byte) ([]TapLeaf, error) {
+// parseTapTree parses a tap tree (per-output PSBT_OUT_TAP_TREE, BIP371)
+// from serialized form. Each leaf is { depth:u8, leafVersion:u8,
+// compactSize(script), script }.
+func parseTapTree(data []byte) ([]TapTreeLeaf, error) {
 	r := bytes.NewReader(data)
-	var leaves []TapLeaf
+	var leaves []TapTreeLeaf
 
 	for r.Len() > 0 {
 		// Read depth (1 byte)
@@ -1178,28 +1194,24 @@ func parseTapTree(data []byte) ([]TapLeaf, error) {
 			return nil, err
 		}
 
-		// Store depth in control block (we'll reconstruct properly when needed)
-		leaves = append(leaves, TapLeaf{
-			LeafVersion:  leafVersion,
-			Script:       script,
-			ControlBlock: []byte{depth}, // Temporarily store depth
+		leaves = append(leaves, TapTreeLeaf{
+			Depth:       depth,
+			LeafVersion: leafVersion,
+			Script:      script,
 		})
 	}
 
 	return leaves, nil
 }
 
-// serializeTapTree serializes a tap tree.
-func serializeTapTree(leaves []TapLeaf) []byte {
+// serializeTapTree serializes a tap tree to its BIP371 PSBT_OUT_TAP_TREE
+// wire form. Inverse of parseTapTree.
+func serializeTapTree(leaves []TapTreeLeaf) []byte {
 	var buf bytes.Buffer
 
 	for _, leaf := range leaves {
-		// Write depth (stored in control block first byte)
-		depth := byte(0)
-		if len(leaf.ControlBlock) > 0 {
-			depth = leaf.ControlBlock[0]
-		}
-		wire.WriteUint8(&buf, depth)
+		// Write depth
+		wire.WriteUint8(&buf, leaf.Depth)
 
 		// Write leaf version
 		wire.WriteUint8(&buf, leaf.LeafVersion)
