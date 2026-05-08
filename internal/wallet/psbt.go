@@ -811,7 +811,13 @@ func (p *PSBT) writeInput(w io.Writer, input *PSBTInput) error {
 
 	for _, leaf := range input.TapLeafScripts {
 		key := append([]byte{PSBTInTapLeafScript}, leaf.ControlBlock...)
-		value := append(leaf.Script, leaf.LeafVersion)
+		// Defensive copy: leaf.Script is caller-owned; using append here
+		// would mutate the caller's backing array if it has spare capacity
+		// (e.g. produced by bytes.Buffer.Bytes()). Pre-size + copy makes
+		// the fresh allocation explicit. (W34-B / W33 audit.)
+		value := make([]byte, len(leaf.Script)+1)
+		copy(value, leaf.Script)
+		value[len(leaf.Script)] = leaf.LeafVersion
 		if err := writeKeyValue(w, key, value); err != nil {
 			return err
 		}
