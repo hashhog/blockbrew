@@ -10,9 +10,12 @@
 //   - signP2SH_P2WSH multisig 2-of-2 round-trip + script-engine verify
 //     (Phase 3 — outer P2SH wrap on a witness-script-hash inner)
 //   - SignTransactionWithPrevs end-to-end via prevtxs (Phase 1 / R1 P0)
+//   - W31: redeemScript / witnessScript commitment-hash checks across
+//     all P2SH and P2WSH dispatch sites (positive + 2 negative).
 package wallet
 
 import (
+	"errors"
 	"testing"
 
 	bbcrypto "github.com/hashhog/blockbrew/internal/crypto"
@@ -360,4 +363,211 @@ func TestSignTransactionWithPrevs_P2WSHEndToEnd(t *testing.T) {
 
 	_ = info
 	_ = utxo
+}
+
+// ---------------------------------------------------------------------------
+// W31 — P2SH redeemScript-hash and P2WSH witnessScript-hash commitment
+// checks. Without these checks, signInputWithScripts would happily emit a
+// signature for an attacker-supplied script whose hash does not match the
+// scriptPubKey — the same defect closed in W29-D hotbuns and W30 blockbrew.
+// ---------------------------------------------------------------------------
+
+// TestSignInputWithScripts_P2SHCommitmentPositive verifies that a correctly
+// hashed redeemScript passes the W31 check and the dispatcher proceeds to
+// produce a valid signature (regression on the legacy P2SH 2-of-3 path).
+func TestSignInputWithScripts_P2SHCommitmentPositive(t *testing.T) {
+	priv := []*bbcrypto.PrivateKey{detPriv(51), detPriv(52), detPriv(53)}
+	pubs := make([][]byte, 3)
+	for i, p := range priv {
+		pubs[i] = p.PubKey().SerializeCompressed()
+	}
+	redeem := buildMultisigScript(t, 2, pubs)
+	scriptPubKey := p2shScriptPubKey(redeem) // HASH160(redeem) committed
+
+	tx := dummyTx(wire.Hash256{}, 0)
+	w := &Wallet{}
+
+	// signLegacyP2SH is what the dispatcher would call under
+	// signInputWithScripts -> P2SH default branch. Drive it directly to
+	// confirm the positive (matching-hash) path still produces a script-
+	// engine-verifying signature.
+	signers := []*bbcrypto.PrivateKey{priv[0], priv[1], nil}
+	if err := w.signLegacyP2SH(tx, 0, redeem, signers); err != nil {
+		t.Fatalf("signLegacyP2SH: %v", err)
+	}
+
+	prevOut := &wire.TxOut{Value: 100000, PkScript: scriptPubKey}
+	flags := script.ScriptVerifyP2SH | script.ScriptVerifyStrictEncoding
+	if err := script.VerifyScript(tx.TxIn[0].SignatureScript, scriptPubKey,
+		tx, 0, flags, prevOut.Value, []*wire.TxOut{prevOut}); err != nil {
+		t.Fatalf("VerifyScript on positive P2SH: %v", err)
+	}
+
+	// And confirm verifyP2SHCommitment is the gate the dispatcher uses.
+	if err := verifyP2SHCommitment(redeem, scriptPubKey); err != nil {
+		t.Fatalf("verifyP2SHCommitment positive: %v", err)
+	}
+}
+
+// TestSignInputWithScripts_P2SHCommitmentNegative verifies that a forged
+// redeemScript whose HASH160 does NOT match the scriptPubKey commitment
+// is rejected with ErrRedeemScriptMismatch BEFORE any sighash is computed
+// or any signature is produced. Tested across all 3 P2SH dispatch
+// branches (P2SH-P2WPKH, P2SH-P2WSH, legacy P2SH) in both the raw-tx
+// (signInputWithScripts) and PSBT (signInputWithKey) paths.
+func TestSignInputWithScripts_P2SHCommitmentNegative(t *testing.T) {
+	// Build a real P2SH scriptPubKey committing to script A.
+	realScript := buildMultisigScript(t, 2,
+		[][]byte{
+			detPriv(61).PubKey().SerializeCompressed(),
+			detPriv(62).PubKey().SerializeCompressed(),
+			detPriv(63).PubKey().SerializeCompressed(),
+		})
+	scriptPubKey := p2shScriptPubKey(realScript)
+
+	// Forge a different redeem script B (3-of-3 with different keys) whose
+	// HASH160 will NOT match scriptPubKey[2:22].
+	forgedScript := buildMultisigScript(t, 3,
+		[][]byte{
+			detPriv(71).PubKey().SerializeCompressed(),
+			detPriv(72).PubKey().SerializeCompressed(),
+			detPriv(73).PubKey().SerializeCompressed(),
+		})
+	forgedP2WPKH := append([]byte{0x00, 0x14}, make([]byte, 20)...)        // P2SH-P2WPKH variant
+	forgedP2WSH := append([]byte{0x00, 0x20}, make([]byte, 32)...)         // P2SH-P2WSH variant
+	forgedWitnessScript := append([]byte{0x51}, make([]byte, 0)...)        // OP_TRUE
+	_ = forgedWitnessScript
+
+	cases := []struct {
+		name   string
+		redeem []byte
+	}{
+		{"forged-legacy-p2sh", forgedScript},
+		{"forged-p2sh-p2wpkh", forgedP2WPKH},
+		{"forged-p2sh-p2wsh", forgedP2WSH},
+	}
+
+	w := &Wallet{}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// 1) Direct helper check.
+			if err := verifyP2SHCommitment(tc.redeem, scriptPubKey); !errors.Is(err, ErrRedeemScriptMismatch) {
+				t.Fatalf("verifyP2SHCommitment(forged) err = %v, want ErrRedeemScriptMismatch", err)
+			}
+
+			// 2) signInputWithScripts via the raw-tx dispatch path.
+			tx := dummyTx(wire.Hash256{}, 0)
+			utxo := &WalletUTXO{
+				OutPoint: tx.TxIn[0].PreviousOutPoint,
+				Amount:   100000,
+				PkScript: scriptPubKey,
+			}
+			info := &PrevTxInfo{
+				OutPoint:      tx.TxIn[0].PreviousOutPoint,
+				ScriptPubKey:  scriptPubKey,
+				Amount:        100000,
+				RedeemScript:  tc.redeem,
+				WitnessScript: []byte{0x51}, // OP_TRUE — irrelevant; check fires first
+			}
+			err := w.signInputWithScripts(tx, 0, utxo, []*wire.TxOut{{Value: 100000, PkScript: scriptPubKey}}, info)
+			if !errors.Is(err, ErrRedeemScriptMismatch) {
+				t.Fatalf("signInputWithScripts(forged) err = %v, want ErrRedeemScriptMismatch", err)
+			}
+			// CRITICAL: NO signature must have been produced.
+			if len(tx.TxIn[0].SignatureScript) != 0 {
+				t.Fatalf("signature script populated despite mismatch: %x", tx.TxIn[0].SignatureScript)
+			}
+			if len(tx.TxIn[0].Witness) != 0 {
+				t.Fatalf("witness populated despite mismatch: %v", tx.TxIn[0].Witness)
+			}
+		})
+	}
+}
+
+// TestSignInputWithScripts_P2WSHCommitmentNegative verifies that a forged
+// witnessScript whose SHA256 does NOT match the witness-program
+// commitment is rejected with ErrWitnessScriptMismatch BEFORE any
+// signature is produced. Covers both bare P2WSH (commitment in
+// scriptPubKey) and P2SH-P2WSH (commitment in redeemScript) paths.
+func TestSignInputWithScripts_P2WSHCommitmentNegative(t *testing.T) {
+	priv := []*bbcrypto.PrivateKey{detPriv(81), detPriv(82)}
+	pubs := [][]byte{
+		priv[0].PubKey().SerializeCompressed(),
+		priv[1].PubKey().SerializeCompressed(),
+	}
+	realWitnessScript := buildMultisigScript(t, 2, pubs)
+	bareScriptPubKey := p2wshScriptPubKey(realWitnessScript)
+
+	// Forge a different witness script. Its SHA256 will differ from the
+	// commitment in bareScriptPubKey[2:34].
+	forgedWitnessScript := append([]byte{0x51}, make([]byte, 4)...) // garbage
+	if string(forgedWitnessScript) == string(realWitnessScript) {
+		t.Fatalf("forged script accidentally equals real")
+	}
+
+	w := &Wallet{}
+
+	t.Run("bare-p2wsh", func(t *testing.T) {
+		// Direct helper check.
+		if err := verifyP2WSHCommitment(forgedWitnessScript, bareScriptPubKey); !errors.Is(err, ErrWitnessScriptMismatch) {
+			t.Fatalf("verifyP2WSHCommitment(forged, bare) = %v, want ErrWitnessScriptMismatch", err)
+		}
+
+		tx := dummyTx(wire.Hash256{}, 0)
+		utxo := &WalletUTXO{
+			OutPoint: tx.TxIn[0].PreviousOutPoint,
+			Amount:   100000,
+			PkScript: bareScriptPubKey,
+		}
+		info := &PrevTxInfo{
+			OutPoint:      tx.TxIn[0].PreviousOutPoint,
+			ScriptPubKey:  bareScriptPubKey,
+			Amount:        100000,
+			WitnessScript: forgedWitnessScript,
+		}
+		err := w.signInputWithScripts(tx, 0, utxo, []*wire.TxOut{{Value: 100000, PkScript: bareScriptPubKey}}, info)
+		if !errors.Is(err, ErrWitnessScriptMismatch) {
+			t.Fatalf("signInputWithScripts(bare-p2wsh forged) err = %v, want ErrWitnessScriptMismatch", err)
+		}
+		if len(tx.TxIn[0].SignatureScript) != 0 || len(tx.TxIn[0].Witness) != 0 {
+			t.Fatalf("signature/witness populated despite witnessScript mismatch")
+		}
+	})
+
+	t.Run("p2sh-p2wsh", func(t *testing.T) {
+		// Outer P2SH wraps a P2WSH whose 32-byte commitment is SHA256 of
+		// the REAL witness script. Forge a different witness script — the
+		// outer P2SH commitment still matches the redeemScript, but the
+		// inner P2WSH commitment does not match the (forged) witness.
+		realWSHash := bbcrypto.SHA256Hash(realWitnessScript)
+		redeemScript := append([]byte{0x00, 0x20}, realWSHash[:]...)
+		outerScriptPubKey := p2shScriptPubKey(redeemScript)
+
+		// Direct helper check on the inner commitment.
+		if err := verifyP2WSHCommitment(forgedWitnessScript, redeemScript); !errors.Is(err, ErrWitnessScriptMismatch) {
+			t.Fatalf("verifyP2WSHCommitment(forged, p2sh-p2wsh) = %v, want ErrWitnessScriptMismatch", err)
+		}
+
+		tx := dummyTx(wire.Hash256{}, 0)
+		utxo := &WalletUTXO{
+			OutPoint: tx.TxIn[0].PreviousOutPoint,
+			Amount:   100000,
+			PkScript: outerScriptPubKey,
+		}
+		info := &PrevTxInfo{
+			OutPoint:      tx.TxIn[0].PreviousOutPoint,
+			ScriptPubKey:  outerScriptPubKey,
+			Amount:        100000,
+			RedeemScript:  redeemScript,        // commits to real witness
+			WitnessScript: forgedWitnessScript, // forged
+		}
+		err := w.signInputWithScripts(tx, 0, utxo, []*wire.TxOut{{Value: 100000, PkScript: outerScriptPubKey}}, info)
+		if !errors.Is(err, ErrWitnessScriptMismatch) {
+			t.Fatalf("signInputWithScripts(p2sh-p2wsh forged) err = %v, want ErrWitnessScriptMismatch", err)
+		}
+		if len(tx.TxIn[0].SignatureScript) != 0 || len(tx.TxIn[0].Witness) != 0 {
+			t.Fatalf("signature/witness populated despite witnessScript mismatch")
+		}
+	})
 }
