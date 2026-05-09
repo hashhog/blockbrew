@@ -10,6 +10,7 @@ import (
 	"io"
 	"sort"
 
+	bbcrypto "github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -745,12 +746,24 @@ func (p *PSBT) writeInput(w io.Writer, input *PSBTInput) error {
 		}
 	}
 
-	// Partial signatures (sorted by pubkey)
+	// Partial signatures.
+	// W45: sort by HASH160(pubkey), not raw pubkey bytes. Bitcoin Core
+	// stores partial sigs in `std::map<CKeyID, SigPair>` (see
+	// bitcoin-core/src/psbt.h:270 + :315) where CKeyID is the 20-byte
+	// HASH160 of the pubkey. Serialization order follows std::map's
+	// key ordering, so byte-identity to Core requires sorting by
+	// HASH160(pubkey) here as well. NOTE: bip32_derivation is
+	// `std::map<CPubKey, KeyOriginInfo>` in Core — keyed by the raw
+	// pubkey — so that loop below intentionally still sorts raw.
 	sigKeys := make([]string, 0, len(input.PartialSigs))
 	for k := range input.PartialSigs {
 		sigKeys = append(sigKeys, k)
 	}
-	sort.Strings(sigKeys)
+	sort.Slice(sigKeys, func(i, j int) bool {
+		hi := bbcrypto.Hash160([]byte(sigKeys[i]))
+		hj := bbcrypto.Hash160([]byte(sigKeys[j]))
+		return bytes.Compare(hi[:], hj[:]) < 0
+	})
 	for _, k := range sigKeys {
 		key := append([]byte{PSBTInPartialSig}, []byte(k)...)
 		if err := writeKeyValue(w, key, input.PartialSigs[k]); err != nil {
