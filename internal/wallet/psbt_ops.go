@@ -725,7 +725,16 @@ func finalizeP2SH(input *PSBTInput) (bool, error) {
 		return false, nil
 	}
 
-	if isP2WPKH(input.RedeemScript) {
+	// W45: snapshot the redeem script up front. W43-1 added an early
+	// clearInputSigningData call inside finalizeMultisig (which nils out
+	// input.RedeemScript for the P2SH-P2WSH branch). The subsequent
+	// buildScriptSig(input.RedeemScript) call below would then push
+	// an empty redeem script, producing FinalScriptSig=[0x00] instead
+	// of the correct 35-byte P2SH push. Use the local snapshot for
+	// every read going forward.
+	redeem := input.RedeemScript
+
+	if isP2WPKH(redeem) {
 		// P2SH-P2WPKH
 		if len(input.PartialSigs) != 1 {
 			return false, nil
@@ -739,13 +748,13 @@ func finalizeP2SH(input *PSBTInput) (bool, error) {
 		}
 
 		// scriptSig pushes the redeem script
-		input.FinalScriptSig = buildScriptSig(input.RedeemScript)
+		input.FinalScriptSig = buildScriptSig(redeem)
 		input.FinalScriptWitness = [][]byte{sig, pubKey}
 		clearInputSigningData(input)
 		return true, nil
 	}
 
-	if isP2WSH(input.RedeemScript) {
+	if isP2WSH(redeem) {
 		// P2SH-P2WSH
 		if len(input.WitnessScript) == 0 {
 			return false, nil
@@ -769,13 +778,13 @@ func finalizeP2SH(input *PSBTInput) (bool, error) {
 			return false, nil
 		}
 
-		input.FinalScriptSig = buildScriptSig(input.RedeemScript)
+		input.FinalScriptSig = buildScriptSig(redeem)
 		clearInputSigningData(input)
 		return true, nil
 	}
 
 	// Legacy P2SH
-	if isMultisigScript(input.RedeemScript) {
+	if isMultisigScript(redeem) {
 		return finalizeLegacyMultisig(input)
 	}
 
@@ -787,7 +796,7 @@ func finalizeP2SH(input *PSBTInput) (bool, error) {
 			break
 		}
 		// Build scriptSig: OP_0 sig pubkey redeemScript
-		scriptSig := buildLegacyScriptSig([][]byte{sig, pubKey}, input.RedeemScript)
+		scriptSig := buildLegacyScriptSig([][]byte{sig, pubKey}, redeem)
 		input.FinalScriptSig = scriptSig
 		clearInputSigningData(input)
 		return true, nil

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	bbcrypto "github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -1702,6 +1703,278 @@ func TestFinalizeMultisig_W43_ClearsProducerFields(t *testing.T) {
 	}
 	if len(d.FinalScriptWitness) != 4 {
 		t.Errorf("decoded FinalScriptWitness shape lost: got %d items", len(d.FinalScriptWitness))
+	}
+}
+
+// TestFinalizeP2SHP2WSH_W45_RedeemScriptSnapshot regression-tests Patch A
+// (W45). W43-1 (commit b1625b2) added an early `clearInputSigningData(input)`
+// call inside finalizeMultisig, which nils out input.RedeemScript. The
+// surrounding finalizeP2SH then read input.RedeemScript AFTER the clear
+// fired, so buildScriptSig got an empty redeem script and produced
+// FinalScriptSig=[0x00] for P2SH-P2WSH inputs. With the snapshot fix,
+// FinalScriptSig must be the 35-byte P2SH push of the 34-byte
+// witness-program redeem script (1 length byte + 0x00 0x20 + 32 bytes).
+func TestFinalizeP2SHP2WSH_W45_RedeemScriptSnapshot(t *testing.T) {
+	prevHash, _ := wire.NewHash256FromHex("00000000000000000000000000000000000000000000000000000000ab12cd34")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 3},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    54_321,
+				PkScript: []byte{0x00, 0x14, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x01, 0x02, 0x03, 0x04, 0x05},
+			},
+		},
+	}
+
+	// Two compressed pubkeys (asymmetric — first byte differs, body bytes
+	// are non-palindromic per W32-B).
+	pubKey1 := make([]byte, 33)
+	pubKey1[0] = 0x02
+	for i := 1; i < 33; i++ {
+		pubKey1[i] = byte(0x40 + i)
+	}
+	pubKey2 := make([]byte, 33)
+	pubKey2[0] = 0x03
+	for i := 1; i < 33; i++ {
+		pubKey2[i] = byte(0xc0 - i)
+	}
+
+	mkSig := func(seed byte) []byte {
+		sig := make([]byte, 71)
+		sig[0] = 0x30
+		sig[1] = 0x44
+		sig[2] = 0x02
+		sig[3] = 0x20
+		for i := 4; i < 36; i++ {
+			sig[i] = seed ^ byte(i+3)
+		}
+		sig[36] = 0x02
+		sig[37] = 0x20
+		for i := 38; i < 70; i++ {
+			sig[i] = seed ^ byte(0xb7-i)
+		}
+		sig[70] = 0x01
+		return sig
+	}
+	sig1 := mkSig(0x29)
+	sig2 := mkSig(0x5d)
+
+	// Witness script: OP_2 <pubKey1> <pubKey2> OP_2 OP_CHECKMULTISIG.
+	witnessScript := []byte{0x52, 0x21}
+	witnessScript = append(witnessScript, pubKey1...)
+	witnessScript = append(witnessScript, 0x21)
+	witnessScript = append(witnessScript, pubKey2...)
+	witnessScript = append(witnessScript, 0x52, 0xae)
+
+	// Redeem script for P2SH-P2WSH: OP_0 <SHA256(witnessScript)>.
+	wshHash := bbcrypto.SHA256Hash(witnessScript)
+	redeemScript := append([]byte{0x00, 0x20}, wshHash[:]...)
+	if len(redeemScript) != 34 {
+		t.Fatalf("expected 34-byte redeem script, got %d", len(redeemScript))
+	}
+
+	// P2SH UTXO program: OP_HASH160 <HASH160(redeemScript)> OP_EQUAL.
+	scriptHash := bbcrypto.Hash160(redeemScript)
+	pkScript := append([]byte{0xa9, 0x14}, scriptHash[:]...)
+	pkScript = append(pkScript, 0x87)
+
+	psbt := &PSBT{
+		UnsignedTx: tx,
+		Inputs:     make([]PSBTInput, 1),
+		Outputs:    make([]PSBTOutput, 1),
+	}
+	in := &psbt.Inputs[0]
+	in.WitnessUTXO = &wire.TxOut{Value: 100_000, PkScript: pkScript}
+	in.RedeemScript = redeemScript
+	in.WitnessScript = witnessScript
+	in.SighashType = 0x01
+	in.PartialSigs = map[string][]byte{
+		string(pubKey1): sig1,
+		string(pubKey2): sig2,
+	}
+
+	complete, err := FinalizePSBT(psbt)
+	if err != nil {
+		t.Fatalf("FinalizePSBT: %v", err)
+	}
+	if !complete {
+		t.Fatal("expected P2SH-P2WSH multisig PSBT to finalize")
+	}
+
+	// Expected FinalScriptSig is a single push of the 34-byte redeem
+	// script: 1 length byte (0x22 = 34) + redeem script bytes = 35 bytes.
+	want := append([]byte{byte(len(redeemScript))}, redeemScript...)
+	if len(in.FinalScriptSig) != 35 {
+		t.Fatalf("FinalScriptSig wrong length: want 35, got %d (bytes=%x)",
+			len(in.FinalScriptSig), in.FinalScriptSig)
+	}
+	if !bytes.Equal(in.FinalScriptSig, want) {
+		t.Fatalf("FinalScriptSig mismatch:\n  want: %x\n   got: %x", want, in.FinalScriptSig)
+	}
+
+	// Sanity: must NOT be the W43-1 regression bytes [0x00].
+	if bytes.Equal(in.FinalScriptSig, []byte{0x00}) {
+		t.Fatal("FinalScriptSig is [0x00] — W43-1 regression: redeem script was cleared before buildScriptSig ran")
+	}
+
+	// And the witness side must be the multisig stack.
+	if len(in.FinalScriptWitness) != 4 {
+		t.Fatalf("expected 4 witness items (OP_0 sig1 sig2 wsScript), got %d", len(in.FinalScriptWitness))
+	}
+	if !bytes.Equal(in.FinalScriptWitness[3], witnessScript) {
+		t.Errorf("witness[3] != witnessScript")
+	}
+}
+
+// TestPSBTPartialSigsEncodedHash160Order regression-tests Patch B (W45).
+// Bitcoin Core stores partial signatures in std::map<CKeyID, SigPair>
+// (bitcoin-core/src/psbt.h:270, :315) where CKeyID is HASH160(pubkey),
+// and serializes in std::map iteration order. Sorting by raw pubkey
+// bytes (the previous blockbrew behavior) only matched Core
+// accidentally when raw-pubkey order and HASH160 order coincide.
+//
+// This test constructs two pubkeys that DO NOT have coincident orders —
+// pubKeyA < pubKeyB by raw-byte compare, but HASH160(pubKeyA) >
+// HASH160(pubKeyB). The encoded PSBT must list pubKeyB's PSBT_IN_PARTIAL_SIG
+// record before pubKeyA's, matching Core.
+func TestPSBTPartialSigsEncodedHash160Order(t *testing.T) {
+	// Find two compressed pubkeys whose raw and HASH160 orders disagree.
+	// Brute-force search over fabricated 33-byte pubkeys; this is
+	// deterministic and fast.
+	mkPub := func(seed byte) []byte {
+		p := make([]byte, 33)
+		p[0] = 0x02
+		for i := 1; i < 33; i++ {
+			p[i] = seed ^ byte(i*7)
+		}
+		return p
+	}
+	var pubA, pubB []byte
+	for s1 := 0; s1 < 256; s1++ {
+		for s2 := s1 + 1; s2 < 256; s2++ {
+			a := mkPub(byte(s1))
+			b := mkPub(byte(s2))
+			rawCmp := bytes.Compare(a, b)
+			hA := bbcrypto.Hash160(a)
+			hB := bbcrypto.Hash160(b)
+			h160Cmp := bytes.Compare(hA[:], hB[:])
+			// Want: a < b raw, but HASH160(a) > HASH160(b).
+			if rawCmp < 0 && h160Cmp > 0 {
+				pubA = a
+				pubB = b
+				break
+			}
+		}
+		if pubA != nil {
+			break
+		}
+	}
+	if pubA == nil {
+		t.Fatal("could not synthesize test pubkeys with mismatched raw/HASH160 order")
+	}
+
+	// Sanity: confirm the asymmetry.
+	if bytes.Compare(pubA, pubB) >= 0 {
+		t.Fatalf("pubA must be < pubB raw")
+	}
+	hA := bbcrypto.Hash160(pubA)
+	hB := bbcrypto.Hash160(pubB)
+	if bytes.Compare(hA[:], hB[:]) <= 0 {
+		t.Fatalf("HASH160(pubA) must be > HASH160(pubB)")
+	}
+
+	prevHash, _ := wire.NewHash256FromHex("00000000000000000000000000000000000000000000000000000000deadc0de")
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 1},
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{
+				Value:    12_345,
+				PkScript: []byte{0x00, 0x14, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0},
+			},
+		},
+	}
+
+	mkSig := func(seed byte) []byte {
+		sig := make([]byte, 71)
+		sig[0] = 0x30
+		sig[1] = 0x44
+		sig[2] = 0x02
+		sig[3] = 0x20
+		for i := 4; i < 36; i++ {
+			sig[i] = seed ^ byte(i)
+		}
+		sig[36] = 0x02
+		sig[37] = 0x20
+		for i := 38; i < 70; i++ {
+			sig[i] = seed ^ byte(0x9c-i)
+		}
+		sig[70] = 0x01
+		return sig
+	}
+	sigA := mkSig(0x33)
+	sigB := mkSig(0x77)
+
+	psbt := &PSBT{
+		UnsignedTx: tx,
+		Inputs:     make([]PSBTInput, 1),
+		Outputs:    make([]PSBTOutput, 1),
+	}
+	in := &psbt.Inputs[0]
+	in.WitnessUTXO = &wire.TxOut{Value: 100_000, PkScript: []byte{0x00, 0x14, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14}}
+	in.PartialSigs = map[string][]byte{
+		string(pubA): sigA,
+		string(pubB): sigB,
+	}
+
+	encoded, err := psbt.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+
+	// Walk the encoded bytes and find the first occurrence of pubA and
+	// pubB inside PSBT_IN_PARTIAL_SIG keys. The earlier offset wins.
+	// PSBT_IN_PARTIAL_SIG key is 0x02 followed by the 33-byte pubkey.
+	findKey := func(blob, pub []byte) int {
+		needle := append([]byte{PSBTInPartialSig}, pub...)
+		return bytes.Index(blob, needle)
+	}
+	offA := findKey(encoded, pubA)
+	offB := findKey(encoded, pubB)
+	if offA < 0 || offB < 0 {
+		t.Fatalf("partial sig keys not found in encoded PSBT (offA=%d offB=%d)", offA, offB)
+	}
+
+	// HASH160(pubA) > HASH160(pubB), so pubB must come first.
+	if offB >= offA {
+		t.Fatalf("partial_sigs not HASH160-sorted: offB=%d should be < offA=%d (pubB has smaller HASH160 and must appear first)", offB, offA)
+	}
+
+	// And the round-tripped PSBT must still hold both sigs intact.
+	decoded, err := DecodePSBT(encoded)
+	if err != nil {
+		t.Fatalf("DecodePSBT: %v", err)
+	}
+	if len(decoded.Inputs) != 1 {
+		t.Fatalf("expected 1 input, got %d", len(decoded.Inputs))
+	}
+	d := decoded.Inputs[0]
+	if !bytes.Equal(d.PartialSigs[string(pubA)], sigA) {
+		t.Errorf("pubA sig lost in round-trip")
+	}
+	if !bytes.Equal(d.PartialSigs[string(pubB)], sigB) {
+		t.Errorf("pubB sig lost in round-trip")
 	}
 }
 
