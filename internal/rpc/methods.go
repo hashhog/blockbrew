@@ -20,6 +20,7 @@ import (
 	"github.com/hashhog/blockbrew/internal/mining"
 	"github.com/hashhog/blockbrew/internal/p2p"
 	"github.com/hashhog/blockbrew/internal/script"
+	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -312,44 +313,61 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 		confirmations = -1
 	}
 
-	// Calculate block size and weight
+	// Calculate block size (full serialization including witness).
 	var buf bytes.Buffer
 	block.Serialize(&buf)
 	size := buf.Len()
-	weight := calcBlockWeight(block)
 
 	// Compute stripped size (no-witness serialization).
-	strippedSize := 80 // header
+	// Mirrors Core's GetSerializeSize(TX_NO_WITNESS(block)):
+	// header(80) + varint(ntx) + sum(no-witness tx sizes).
+	var noWitBuf bytes.Buffer
+	block.Header.Serialize(&noWitBuf)
+	wire.WriteCompactSize(&noWitBuf, uint64(len(block.Transactions)))
 	for _, tx := range block.Transactions {
-		var noWitBuf bytes.Buffer
 		tx.SerializeNoWitness(&noWitBuf)
-		strippedSize += noWitBuf.Len()
 	}
+	strippedSize := noWitBuf.Len()
 
-	// Calculate difficulty
+	// Block weight = 3*strippedsize + size (BIP141 / Core's GetBlockWeight).
+	weight := 3*strippedSize + size
+
+	// Calculate difficulty using 16-significant-digit precision (BitcoinDifficulty).
 	genesisTarget := consensus.CompactToBig(0x1d00ffff)
 	currentTarget := consensus.CompactToBig(block.Header.Bits)
-	var difficulty float64
+	var difficulty BitcoinDifficulty
 	if currentTarget.Sign() > 0 {
 		diff := new(big.Float).SetInt(genesisTarget)
 		diff.Quo(diff, new(big.Float).SetInt(currentTarget))
-		difficulty, _ = diff.Float64()
+		f64, _ := diff.Float64()
+		difficulty = BitcoinDifficulty(f64)
 	}
 
-	// Build transaction list
+	// Read undo data for fee computation (verbosity >= 2).
+	// Mirrors Core's blockToJSON which calls ReadBlockUndo + passes txundo to
+	// TxToUniv. If undo data is unavailable (pruned or still IBD), fee is omitted.
+	var blockUndo *storage.BlockUndo
+	if verbosity >= 2 && s.chainDB != nil {
+		if undo, err := s.chainDB.ReadBlockUndo(hash); err == nil {
+			blockUndo = undo
+		}
+	}
+
+	// Build transaction list.
 	var txList []interface{}
 	for i, tx := range block.Transactions {
 		if verbosity == 1 {
 			// Just txids
 			txList = append(txList, tx.TxHash().String())
 		} else {
-			// Full transaction objects (verbosity >= 2)
-			txResult := buildTxResult(tx, i == 0)
-			txResult.BlockHash = hash.String()
-			txResult.Confirmations = confirmations
-			txResult.BlockTime = block.Header.Timestamp
-			txResult.Time = block.Header.Timestamp
-			txList = append(txList, txResult)
+			// Full transaction objects (verbosity >= 2).
+			// Mirrors TxToUniv with include_hex=true, block_hash=null.
+			// Coinbase tx (i==0) has no undo data and no fee.
+			var txUndo *storage.TxUndo
+			if blockUndo != nil && i > 0 && i-1 < len(blockUndo.TxUndos) {
+				txUndo = &blockUndo.TxUndos[i-1]
+			}
+			txList = append(txList, buildGetBlockTxJSON(tx, i == 0, txUndo, s.getNetwork()))
 		}
 	}
 

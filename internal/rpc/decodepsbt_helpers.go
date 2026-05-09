@@ -10,6 +10,7 @@ import (
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/script"
+	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -559,6 +560,100 @@ func buildDecodeRawTxJSON(tx *wire.MsgTx, net address.Network) map[string]any {
 		"vin":      vin,
 		"vout":     vout,
 	}
+}
+
+// buildGetBlockTxJSON builds the per-tx JSON for getblock verbosity=2.
+//
+// Mirrors Bitcoin Core's TxToUniv(tx, block_hash=null, include_hex=true, txundo, verbosity=SHOW_DETAILS)
+// in core_io.cpp. Key properties vs buildDecodeRawTxJSON:
+//   - `hex` field IS emitted (include_hex=true in TxToUniv)
+//   - `fee` IS emitted when txUndo != nil (computed from spent coins)
+//   - `blockhash` is NOT emitted (block_hash is null in Core's call)
+//   - `confirmations`, `time`, `blocktime` are NOT emitted (those are getrawtransaction extras)
+//   - Coinbase vin emits `txinwitness` array if present (TxToUniv always checks this)
+//   - Non-coinbase vin always emits `scriptSig: {asm, hex}` even when empty
+func buildGetBlockTxJSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo, net address.Network) map[string]any {
+	// Serialize for size/weight
+	var buf bytes.Buffer
+	tx.Serialize(&buf)
+	size := buf.Len()
+
+	weight := int(consensus.CalcTxWeight(tx))
+	vsize := (weight + 3) / 4
+
+	// vin array — mirrors TxToUniv's vin loop in core_io.cpp
+	vin := make([]map[string]any, len(tx.TxIn))
+	var amtTotalIn int64
+	haveUndo := txUndo != nil
+
+	for i, in := range tx.TxIn {
+		var vinObj map[string]any
+		if isCoinbase {
+			vinObj = map[string]any{
+				"coinbase": hex.EncodeToString(in.SignatureScript),
+				"sequence": in.Sequence,
+			}
+		} else {
+			vinObj = map[string]any{
+				"txid":      in.PreviousOutPoint.Hash.String(),
+				"vout":      in.PreviousOutPoint.Index,
+				"scriptSig": scriptSigToUniv(in.SignatureScript, true),
+				"sequence":  in.Sequence,
+			}
+			if haveUndo && i < len(txUndo.SpentCoins) {
+				amtTotalIn += txUndo.SpentCoins[i].TxOut.Value
+			}
+		}
+		// Emit txinwitness for ALL inputs (coinbase and non-coinbase) if present.
+		// Core's TxToUniv checks !tx.vin[i].scriptWitness.IsNull() for every input.
+		if len(in.Witness) > 0 {
+			witness := make([]string, len(in.Witness))
+			for j, w := range in.Witness {
+				witness[j] = hex.EncodeToString(w)
+			}
+			vinObj["txinwitness"] = witness
+		}
+		vin[i] = vinObj
+	}
+
+	// vout array
+	vout := make([]map[string]any, len(tx.TxOut))
+	var amtTotalOut int64
+	for i, out := range tx.TxOut {
+		vout[i] = map[string]any{
+			"value":        btcAmount(out.Value),
+			"n":            i,
+			"scriptPubKey": scriptPubKeyToUniv(out.PkScript, net),
+		}
+		if haveUndo {
+			amtTotalOut += out.Value
+		}
+	}
+
+	// Base result (matches TxToUniv field-emission order)
+	result := map[string]any{
+		"txid":     tx.TxHash().String(),
+		"hash":     tx.WTxHash().String(),
+		"version":  tx.Version,
+		"size":     size,
+		"vsize":    vsize,
+		"weight":   weight,
+		"locktime": tx.LockTime,
+		"vin":      vin,
+		"vout":     vout,
+	}
+
+	// Fee: emitted only when undo data is available (non-coinbase txs only).
+	// Core: entry.pushKV("fee", ValueFromAmount(fee)) after vin/vout loops.
+	if haveUndo && !isCoinbase {
+		fee := amtTotalIn - amtTotalOut
+		result["fee"] = btcAmount(fee)
+	}
+
+	// Hex: always emitted for getblock verbosity=2 (include_hex=true).
+	result["hex"] = hex.EncodeToString(buf.Bytes())
+
+	return result
 }
 
 // buildPSBTTxJSON builds the embedded `tx` sub-object for decodepsbt output,
