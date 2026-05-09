@@ -232,6 +232,63 @@ func IsUnspendable(pkScript []byte) bool {
 	return pkScript[0] == 0x6a // OP_RETURN
 }
 
+// IsNullData returns true if the script is a well-formed OP_RETURN (nulldata)
+// output matching Bitcoin Core's Solver NULL_DATA classification:
+// the script must start with OP_RETURN (0x6a) and every subsequent byte must
+// be a well-formed, non-truncated push opcode.  A script that starts with
+// OP_RETURN but whose remainder is not IsPushOnly (e.g. a truncated push like
+// 6a09deadbeef) is classified NONSTANDARD by Core and returns false here.
+// This is the canonical classifier shared by both the mempool policy gate and
+// the RPC decodescript path.
+func IsNullData(pkScript []byte) bool {
+	if len(pkScript) == 0 || pkScript[0] != 0x6a { // OP_RETURN = 0x6a
+		return false
+	}
+	// Walk every byte after OP_RETURN; each must be a well-formed push opcode.
+	i := 1
+	for i < len(pkScript) {
+		op := pkScript[i]
+		i++
+		var dataLen int
+		switch {
+		case op == 0x00: // OP_0 — push empty
+			dataLen = 0
+		case op >= 0x01 && op <= 0x4b: // direct push of N bytes
+			dataLen = int(op)
+		case op == 0x4c: // OP_PUSHDATA1
+			if i >= len(pkScript) {
+				return false // truncated length byte
+			}
+			dataLen = int(pkScript[i])
+			i++
+		case op == 0x4d: // OP_PUSHDATA2
+			if i+1 >= len(pkScript) {
+				return false
+			}
+			dataLen = int(pkScript[i]) | int(pkScript[i+1])<<8
+			i += 2
+		case op == 0x4e: // OP_PUSHDATA4
+			if i+3 >= len(pkScript) {
+				return false
+			}
+			dataLen = int(pkScript[i]) | int(pkScript[i+1])<<8 |
+				int(pkScript[i+2])<<16 | int(pkScript[i+3])<<24
+			i += 4
+		case op == 0x4f: // OP_1NEGATE
+			dataLen = 0
+		case op >= 0x51 && op <= 0x60: // OP_1 .. OP_16
+			dataLen = 0
+		default:
+			return false // non-push opcode → NONSTANDARD
+		}
+		if i+dataLen > len(pkScript) {
+			return false // truncated data → NONSTANDARD
+		}
+		i += dataLen
+	}
+	return true
+}
+
 // AddTxOutputs adds all outputs from a transaction to the UTXO view.
 // Outputs that are provably unspendable (OP_RETURN or empty script) are
 // skipped to avoid polluting the UTXO set.

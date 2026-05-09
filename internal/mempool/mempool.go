@@ -43,6 +43,9 @@ var (
 	// Coinbase maturity failure (mempool accept).
 	ErrImmatureCoinbaseSpend = errors.New("immature coinbase spend: output does not have enough confirmations")
 
+	// Output script is not a known standard type (Core: "scriptpubkey").
+	ErrNonStandardOutput = errors.New("nonstandard output script")
+
 
 	// Ancestor/descendant chain limits (Core DEFAULT_ANCESTOR_LIMIT/DEFAULT_DESCENDANT_LIMIT).
 	ErrTooManyAncestors   = errors.New("too many unconfirmed ancestors")
@@ -358,6 +361,20 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	// 5. Calculate virtual size
 	vsize := (weight + 3) / 4 // Round up
 
+	// 5a. Check output script standardness (Core IsStandardTx vout loop,
+	// policy/policy.cpp:140).  Each output must be a known standard type:
+	//   P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A, or well-formed nulldata
+	//   (OP_RETURN + IsPushOnly remainder per consensus.IsNullData).
+	// A script that starts with OP_RETURN but has a truncated or non-push
+	// trailing byte (e.g. 6a09deadbeef) is classified NONSTANDARD and
+	// rejected here — the W56 fix to isNullData now shares this logic via
+	// consensus.IsNullData so both the mempool gate and decodescript agree.
+	for i, out := range tx.TxOut {
+		if !isStandardOutputScript(out.PkScript) {
+			return fmt.Errorf("%w: output %d script is nonstandard", ErrNonStandardOutput, i)
+		}
+	}
+
 	// 5b. IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
 	// Mempool holds txs for the *next* block, so check against tipHeight+1
 	// and the current chain MTP (MEDIAN_TIME_PAST of the last 11 blocks).
@@ -568,7 +585,16 @@ func (mp *Mempool) GetUTXO(outpoint wire.OutPoint) *consensus.UTXOEntry {
 const AnchorDust int64 = 240
 
 // isDust checks if an output is dust (uneconomical to spend).
+// Mirrors Bitcoin Core's GetDustThreshold / IsDust (policy/policy.cpp):
+// provably unspendable outputs (OP_RETURN / empty) have a dust threshold of 0
+// and are therefore never dust — they carry no future spending cost.
 func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
+	// Provably unspendable outputs (OP_RETURN or empty) are never dust.
+	// Core's GetDustThreshold returns 0 for IsUnspendable(), so IsDust is false.
+	if consensus.IsUnspendable(txOut.PkScript) {
+		return false
+	}
+
 	// P2A (Pay-to-Anchor) outputs are exempt from normal dust rules.
 	// They are meant for fee bumping via CPFP and can have value 0.
 	// However, for standardness we cap them at AnchorDust satoshis.
@@ -590,6 +616,65 @@ func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 
 	dustThreshold := spendingSize * mp.config.MinRelayFeeRate / 1000
 	return txOut.Value < dustThreshold
+}
+
+// isStandardOutputScript returns true if pkScript is a known-standard output
+// type that blockbrew's mempool policy accepts.  Mirrors Bitcoin Core's
+// IsStandard (policy/policy.cpp:80) output classification:
+//
+//   - P2PKH, P2SH, P2WPKH, P2WSH, P2TR — always standard
+//   - P2A (pay-to-anchor) — standard
+//   - Nulldata: OP_RETURN followed by IsPushOnly bytes (consensus.IsNullData) —
+//     standard.  Starts-with-OP_RETURN but malformed (truncated push) → false.
+//   - Unknown witness programs — accepted as future-soft-fork outputs (Core
+//     TxoutType::WITNESS_UNKNOWN branch in IsStandard).
+//   - Everything else — nonstandard.
+func isStandardOutputScript(pkScript []byte) bool {
+	switch {
+	case consensus.IsP2PKH(pkScript),
+		consensus.IsP2SH(pkScript),
+		consensus.IsP2WPKH(pkScript),
+		consensus.IsP2WSH(pkScript),
+		consensus.IsP2TR(pkScript),
+		consensus.IsPayToAnchor(pkScript):
+		return true
+	case consensus.IsNullData(pkScript):
+		// Well-formed OP_RETURN with IsPushOnly remainder.
+		return true
+	case len(pkScript) > 0 && pkScript[0] == 0x6a:
+		// Starts with OP_RETURN but is NOT well-formed nulldata (e.g. truncated
+		// push bytes).  Core classifies this NONSTANDARD via its Solver check.
+		return false
+	default:
+		// Unknown witness programs are accepted (forward-compat with soft forks).
+		// A witness program is: OP_N (0x00|0x51..0x60) <2..40 byte push>.
+		if isUnknownWitnessProgram(pkScript) {
+			return true
+		}
+		// All other script forms are nonstandard.
+		return false
+	}
+}
+
+// isUnknownWitnessProgram returns true for segwit v2+ witness programs that
+// Core accepts as WITNESS_UNKNOWN (forward-compat for future soft forks).
+// Format: OP_N <push of 2..40 bytes> where N is 0x00 (v0), 0x51..0x60 (v1–v16).
+// v0 (P2WPKH/P2WSH) and v1 (P2TR) are handled above; only v2–v16 land here.
+func isUnknownWitnessProgram(pkScript []byte) bool {
+	if len(pkScript) < 4 || len(pkScript) > 42 {
+		return false
+	}
+	// First byte must be a witness version opcode.
+	ver := pkScript[0]
+	if ver != 0x00 && (ver < 0x51 || ver > 0x60) {
+		return false
+	}
+	// Second byte is the push length; must push 2..40 bytes.
+	pushLen := int(pkScript[1])
+	if pushLen < 2 || pushLen > 40 {
+		return false
+	}
+	return len(pkScript) == 2+pushLen
 }
 
 // getStandardScriptFlags returns script validation flags for mempool validation.
