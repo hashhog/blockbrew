@@ -885,7 +885,11 @@ func (s *Server) handleDecodeRawTransaction(params json.RawMessage) (interface{}
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %v", err)}
 	}
 
-	return buildTxResult(tx, false), nil
+	// Use buildDecodeRawTxJSON (W55): full Core-parity output with
+	// btcAmount, scriptPubKeyToUniv, inferDescriptor, rawtr(), coinbase vin,
+	// sighash-decoded asm. Replaces the old buildTxResult which had empty
+	// asm/desc, float64 values, and no coinbase vin handling.
+	return buildDecodeRawTxJSON(tx, s.getNetwork()), nil
 }
 
 // ============================================================================
