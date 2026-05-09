@@ -338,31 +338,192 @@ func (s *Server) handleDecodeScript(params json.RawMessage) (interface{}, *RPCEr
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Invalid hex encoding"}
 	}
 
-	// Disassemble script
-	asm := disassembleScript(scriptBytes)
+	net := s.getNetwork()
 
-	// Detect script type
-	scriptType := "nonstandard"
-	if consensus.IsP2PKH(scriptBytes) {
-		scriptType = "pubkeyhash"
-	} else if consensus.IsP2SH(scriptBytes) {
-		scriptType = "scripthash"
-	} else if consensus.IsP2WPKH(scriptBytes) {
-		scriptType = "witness_v0_keyhash"
-	} else if consensus.IsP2WSH(scriptBytes) {
-		scriptType = "witness_v0_scripthash"
-	} else if consensus.IsP2TR(scriptBytes) {
-		scriptType = "witness_v1_taproot"
-	} else if len(scriptBytes) > 0 && scriptBytes[0] == 0x6a {
-		scriptType = "nulldata"
-	} else if isMultisig(scriptBytes) {
-		scriptType = "multisig"
+	// Build top-level object using W52 helper (include_hex=false per Core's
+	// ScriptToUniv call in decodescript: include_hex=false, include_address=true).
+	r := scriptPubKeyToUniv(scriptBytes, net)
+	delete(r, "hex") // top-level decodescript never emits hex (Core: include_hex=false)
+
+	// ── can_wrap logic (mirrors Core rawtransaction.cpp:498-527) ─────────────
+	// can_wrap is true for PUBKEY/PUBKEYHASH/MULTISIG/NONSTANDARD/
+	// WITNESS_V0_KEYHASH/WITNESS_V0_SCRIPTHASH if the script has valid ops,
+	// is spendable, and contains no OP_CHECKSIGADD or OP_SUCCESSx.
+	sType := scriptTypeName(scriptBytes)
+	canWrap := false
+	switch sType {
+	case "pubkey", "pubkeyhash", "multisig", "nonstandard",
+		"witness_v0_keyhash", "witness_v0_scripthash":
+		canWrap = decodeScriptHasValidOps(scriptBytes) &&
+			!consensus.IsUnspendable(scriptBytes) &&
+			!decodeScriptHasTaprootOps(scriptBytes)
 	}
 
-	return &DecodeScriptResult{
-		Asm:  asm,
-		Type: scriptType,
-	}, nil
+	if canWrap {
+		// p2sh = P2SH-wrap of the input script: Hash160(script) → P2SH address.
+		h160 := bbcrypto.Hash160(scriptBytes)
+		p2shAddr, _ := address.NewP2SHAddress(h160, net).Encode()
+		r["p2sh"] = p2shAddr
+
+		// ── can_wrap_P2WSH (Core rawtransaction.cpp:533-560) ─────────────────
+		// P2WSH wrap is only possible for non-witness types with compressed keys.
+		canWrapP2WSH := false
+		switch sType {
+		case "pubkeyhash", "nonstandard":
+			canWrapP2WSH = true
+		case "pubkey":
+			// Compressed pubkey only: 33-byte push (0x21 prefix).
+			canWrapP2WSH = len(scriptBytes) == 35 && scriptBytes[0] == 0x21
+		case "multisig":
+			// All pubkeys must be compressed (33 bytes each).
+			canWrapP2WSH = decodeScriptMultisigAllCompressed(scriptBytes)
+		}
+
+		if canWrapP2WSH {
+			var segwitScript []byte
+			switch sType {
+			case "pubkey":
+				// P2WPKH wrap: hash the embedded pubkey with Hash160.
+				// script = <0x21> <33-byte-pubkey> <OP_CHECKSIG>
+				pubkey := scriptBytes[1:34]
+				pkh := bbcrypto.Hash160(pubkey)
+				segwitScript = make([]byte, 22)
+				segwitScript[0] = 0x00 // OP_0
+				segwitScript[1] = 0x14 // PUSH20
+				copy(segwitScript[2:], pkh[:])
+			case "pubkeyhash":
+				// P2WPKH wrap: reuse the embedded 20-byte hash.
+				// P2PKH script: OP_DUP OP_HASH160 <PUSH20> <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
+				// hash20 is at bytes [3:23].
+				segwitScript = make([]byte, 22)
+				segwitScript[0] = 0x00 // OP_0
+				segwitScript[1] = 0x14 // PUSH20
+				copy(segwitScript[2:], scriptBytes[3:23])
+			default:
+				// P2WSH wrap: SHA256 of the entire redeem script.
+				sh := bbcrypto.SHA256Hash(scriptBytes)
+				segwitScript = make([]byte, 34)
+				segwitScript[0] = 0x00 // OP_0
+				segwitScript[1] = 0x20 // PUSH32
+				copy(segwitScript[2:], sh[:])
+			}
+
+			// Build the segwit sub-object using scriptPubKeyToUniv (include_hex=true).
+			sr := scriptPubKeyToUniv(segwitScript, net)
+
+			// p2sh-segwit = P2SH-wrap of the segwit script.
+			sh160 := bbcrypto.Hash160(segwitScript)
+			p2shSegwitAddr, _ := address.NewP2SHAddress(sh160, net).Encode()
+			sr["p2sh-segwit"] = p2shSegwitAddr
+
+			r["segwit"] = sr
+		}
+	}
+
+	return r, nil
+}
+
+// decodeScriptHasValidOps returns true if the script has no truncated opcodes
+// (mirrors CScript::HasValidOps from script/script.h).
+func decodeScriptHasValidOps(s []byte) bool {
+	i := 0
+	for i < len(s) {
+		op := s[i]
+		i++
+		var dataLen int
+		switch {
+		case op >= 0x01 && op <= 0x4b:
+			dataLen = int(op)
+		case op == script.OP_PUSHDATA1:
+			if i >= len(s) {
+				return false
+			}
+			dataLen = int(s[i])
+			i++
+		case op == script.OP_PUSHDATA2:
+			if i+1 >= len(s) {
+				return false
+			}
+			dataLen = int(s[i]) | int(s[i+1])<<8
+			i += 2
+		case op == script.OP_PUSHDATA4:
+			if i+3 >= len(s) {
+				return false
+			}
+			dataLen = int(s[i]) | int(s[i+1])<<8 | int(s[i+2])<<16 | int(s[i+3])<<24
+			i += 4
+		}
+		if i+dataLen > len(s) {
+			return false
+		}
+		i += dataLen
+	}
+	return true
+}
+
+// decodeScriptHasTaprootOps returns true if the script contains OP_CHECKSIGADD
+// or any OP_SUCCESSx opcode (which disqualify it from P2SH wrapping).
+// We walk actual opcodes (skipping push-data payloads), mirroring Core's loop.
+func decodeScriptHasTaprootOps(s []byte) bool {
+	i := 0
+	for i < len(s) {
+		op := s[i]
+		i++
+		if op == script.OP_CHECKSIGADD || script.IsOpSuccess(op) {
+			return true
+		}
+		// Skip any push-data payload so we don't misinterpret data bytes.
+		var dataLen int
+		switch {
+		case op >= 0x01 && op <= 0x4b:
+			dataLen = int(op)
+		case op == script.OP_PUSHDATA1:
+			if i >= len(s) {
+				return false
+			}
+			dataLen = int(s[i])
+			i++
+		case op == script.OP_PUSHDATA2:
+			if i+1 >= len(s) {
+				return false
+			}
+			dataLen = int(s[i]) | int(s[i+1])<<8
+			i += 2
+		case op == script.OP_PUSHDATA4:
+			if i+3 >= len(s) {
+				return false
+			}
+			dataLen = int(s[i]) | int(s[i+1])<<8 | int(s[i+2])<<16 | int(s[i+3])<<24
+			i += 4
+		}
+		i += dataLen
+	}
+	return false
+}
+
+// decodeScriptMultisigAllCompressed returns true if every pubkey in a bare
+// multisig script is compressed (33 bytes, 0x02/0x03 prefix).
+// Assumes isBareMultisig(s) is true.
+func decodeScriptMultisigAllCompressed(s []byte) bool {
+	// s = OP_M <pubkeys...> OP_N OP_CHECKMULTISIG
+	if len(s) < 4 {
+		return false
+	}
+	pc := 1 // skip OP_M
+	for pc < len(s)-2 {
+		op := s[pc]
+		pc++
+		size := int(op)
+		if pc+size > len(s)-2 {
+			return false
+		}
+		// Compressed pubkey: exactly 33 bytes, prefix 0x02 or 0x03.
+		if size != 33 || (s[pc] != 0x02 && s[pc] != 0x03) {
+			return false
+		}
+		pc += size
+	}
+	return true
 }
 
 // ============================================================================
