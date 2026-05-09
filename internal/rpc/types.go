@@ -1,6 +1,9 @@
 package rpc
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strconv"
+)
 
 // JSON-RPC error codes (from Bitcoin Core).
 const (
@@ -138,23 +141,38 @@ type BlockResult struct {
 	CoinbaseTx    interface{}   `json:"coinbase_tx,omitempty"`
 }
 
+// BitcoinDifficulty is a float64 that serialises to JSON using 16
+// significant digits (matching Bitcoin Core's UniValue::setFloat which
+// uses std::ostringstream << std::setprecision(16)).  This ensures that
+// values like 53911173001054.59 are not collapsed to the shortest
+// round-trip representation (53911173001054.586) that Go's json.Marshal
+// would otherwise produce.
+type BitcoinDifficulty float64
+
+// MarshalJSON emits the difficulty using the same precision as Core.
+func (d BitcoinDifficulty) MarshalJSON() ([]byte, error) {
+	s := strconv.FormatFloat(float64(d), 'g', 16, 64)
+	return []byte(s), nil
+}
+
 // BlockHeaderResult represents a block header in RPC responses.
 type BlockHeaderResult struct {
-	Hash          string  `json:"hash"`
-	Confirmations int32   `json:"confirmations"`
-	Height        int32   `json:"height"`
-	Version       int32   `json:"version"`
-	VersionHex    string  `json:"versionHex"`
-	MerkleRoot    string  `json:"merkleroot"`
-	Time          uint32  `json:"time"`
-	MedianTime    int64   `json:"mediantime"`
-	Nonce         uint32  `json:"nonce"`
-	Bits          string  `json:"bits"`
-	Difficulty    float64 `json:"difficulty"`
-	ChainWork     string  `json:"chainwork,omitempty"`
-	NTx           int     `json:"nTx"`
-	PreviousHash  string  `json:"previousblockhash,omitempty"`
-	NextHash      string  `json:"nextblockhash,omitempty"`
+	Hash          string           `json:"hash"`
+	Confirmations int32            `json:"confirmations"`
+	Height        int32            `json:"height"`
+	Version       int32            `json:"version"`
+	VersionHex    string           `json:"versionHex"`
+	MerkleRoot    string           `json:"merkleroot"`
+	Time          uint32           `json:"time"`
+	MedianTime    int64            `json:"mediantime"`
+	Nonce         uint32           `json:"nonce"`
+	Bits          string           `json:"bits"`
+	Target        string           `json:"target,omitempty"`
+	Difficulty    BitcoinDifficulty `json:"difficulty"`
+	ChainWork     string           `json:"chainwork,omitempty"`
+	NTx           int              `json:"nTx"`
+	PreviousHash  string           `json:"previousblockhash,omitempty"`
+	NextHash      string           `json:"nextblockhash,omitempty"`
 }
 
 // TxResult represents a transaction in RPC responses (verbose mode).
