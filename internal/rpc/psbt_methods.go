@@ -842,6 +842,13 @@ func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[st
 			inp["partial_signatures"] = partialSigs
 		}
 
+		// PSBT_IN_SIGHASH_TYPE (0x03): emit as string when present (non-zero).
+		// Core: SighashToStr(sighash_type) — see core_io.cpp:343 and
+		// rpc/rawtransaction.cpp:1166. Unknown values emit "".
+		if input.SighashType != 0 {
+			inp["sighash"] = sighashToStr(input.SighashType)
+		}
+
 		if len(input.RedeemScript) > 0 {
 			inp["redeem_script"] = map[string]any{
 				"asm":  scriptToAsmStr(input.RedeemScript, false),
