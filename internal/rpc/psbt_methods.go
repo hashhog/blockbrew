@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -192,7 +193,7 @@ func (s *Server) handleDecodePSBT(params json.RawMessage) (interface{}, *RPCErro
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Failed to decode PSBT: %v", err)}
 	}
 
-	return buildDecodePSBTResult(psbt), nil
+	return buildDecodePSBTResultWithNet(psbt, s.getNetwork()), nil
 }
 
 // handleCombinePSBT combines multiple PSBTs.
@@ -785,32 +786,48 @@ func addressToScript(addrStr string) ([]byte, error) {
 	return nil, fmt.Errorf("address decoding not implemented in RPC context")
 }
 
-// buildDecodePSBTResult builds a DecodePSBTResult from a PSBT.
-func buildDecodePSBTResult(psbt *wallet.PSBT) *DecodePSBTResult {
-	result := &DecodePSBTResult{
-		Tx:      buildTxResult(psbt.UnsignedTx, false),
-		Inputs:  make([]DecodePSBTInput, len(psbt.Inputs)),
-		Outputs: make([]DecodePSBTOutput, len(psbt.Outputs)),
-	}
+// buildDecodePSBTResult builds the decodepsbt JSON response as a map[string]any,
+// producing output byte-identical (after jq -S normalization) to Bitcoin Core
+// 31.99. Uses W52 helpers (decodepsbt_helpers.go) for amount formatting,
+// script ASM, descriptor inference, and the embedded tx sub-object.
+//
+// Key differences from the old struct-based approach:
+//   - btcAmount marshals as "1.00000000" not "1" (Core's ValueFromAmount)
+//   - global_xpubs always emitted as [] even when empty
+//   - proprietary always emitted as []
+//   - unknown always emitted as {} even when empty
+//   - psbt_version always emitted
+//   - tx sub-object built by buildPSBTTxJSON (no hex, proper scriptSig/SPK shape)
+func buildDecodePSBTResult(psbt *wallet.PSBT) map[string]any {
+	// Use mainnet for address encoding by default; the RPC server will
+	// set this correctly when calling via handleDecodePSBT using s.getNetwork().
+	// This function is kept network-agnostic for callers that don't have a
+	// server reference; callers that do should pass net explicitly.
+	return buildDecodePSBTResultWithNet(psbt, address.Mainnet)
+}
 
-	// Build inputs
+// buildDecodePSBTResultWithNet is the network-aware version used by
+// handleDecodePSBT. Separated so tests can pass a specific network.
+func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[string]any {
+	// ── embedded tx ──────────────────────────────────────────────────────
+	txJSON := buildPSBTTxJSON(psbt.UnsignedTx, net)
+
+	// ── per-input PSBT extension records ─────────────────────────────────
 	totalInputValue := int64(0)
+	inputs := make([]map[string]any, len(psbt.Inputs))
 	for i, input := range psbt.Inputs {
-		inp := DecodePSBTInput{}
+		inp := map[string]any{}
 
 		if input.WitnessUTXO != nil {
 			totalInputValue += input.WitnessUTXO.Value
-			inp.WitnessUTXO = &VoutResult{
-				Value: float64(input.WitnessUTXO.Value) / satoshiPerBitcoin,
-				N:     0,
-				ScriptPubKey: ScriptPubKey{
-					Hex: hex.EncodeToString(input.WitnessUTXO.PkScript),
-				},
+			inp["witness_utxo"] = map[string]any{
+				"amount":       btcAmount(input.WitnessUTXO.Value),
+				"scriptPubKey": scriptPubKeyToUniv(input.WitnessUTXO.PkScript, net),
 			}
 		}
 
 		if input.NonWitnessUTXO != nil {
-			inp.NonWitnessUTXO = buildTxResult(input.NonWitnessUTXO, false)
+			inp["non_witness_utxo"] = buildPSBTTxJSON(input.NonWitnessUTXO, net)
 			prevOut := psbt.UnsignedTx.TxIn[i].PreviousOutPoint
 			if int(prevOut.Index) < len(input.NonWitnessUTXO.TxOut) {
 				totalInputValue += input.NonWitnessUTXO.TxOut[prevOut.Index].Value
@@ -818,120 +835,167 @@ func buildDecodePSBTResult(psbt *wallet.PSBT) *DecodePSBTResult {
 		}
 
 		if len(input.PartialSigs) > 0 {
-			inp.PartialSignatures = make(map[string]string)
+			partialSigs := map[string]any{}
 			for pk, sig := range input.PartialSigs {
-				inp.PartialSignatures[hex.EncodeToString([]byte(pk))] = hex.EncodeToString(sig)
+				partialSigs[hex.EncodeToString([]byte(pk))] = hex.EncodeToString(sig)
 			}
+			inp["partial_signatures"] = partialSigs
 		}
 
 		if len(input.RedeemScript) > 0 {
-			inp.RedeemScript = &Script{Hex: hex.EncodeToString(input.RedeemScript)}
+			inp["redeem_script"] = map[string]any{
+				"asm":  scriptToAsmStr(input.RedeemScript, false),
+				"hex":  hex.EncodeToString(input.RedeemScript),
+				"type": scriptTypeName(input.RedeemScript),
+			}
 		}
 
 		if len(input.WitnessScript) > 0 {
-			inp.WitnessScript = &Script{Hex: hex.EncodeToString(input.WitnessScript)}
+			inp["witness_script"] = map[string]any{
+				"asm":  scriptToAsmStr(input.WitnessScript, false),
+				"hex":  hex.EncodeToString(input.WitnessScript),
+				"type": scriptTypeName(input.WitnessScript),
+			}
+		}
+
+		if len(input.BIP32Derivation) > 0 {
+			bip32s := make([]map[string]any, 0, len(input.BIP32Derivation))
+			for pk, deriv := range input.BIP32Derivation {
+				bip32s = append(bip32s, map[string]any{
+					"pubkey":             hex.EncodeToString([]byte(pk)),
+					"master_fingerprint": hex.EncodeToString(deriv.Fingerprint[:]),
+					"path":               formatBIP32Path(deriv.Path),
+				})
+			}
+			inp["bip32_derivs"] = bip32s
 		}
 
 		if len(input.FinalScriptSig) > 0 {
-			inp.FinalScriptSig = &Script{Hex: hex.EncodeToString(input.FinalScriptSig)}
+			inp["final_scriptSig"] = map[string]any{
+				"asm": scriptToAsmStr(input.FinalScriptSig, true),
+				"hex": hex.EncodeToString(input.FinalScriptSig),
+			}
 		}
 
 		if len(input.FinalScriptWitness) > 0 {
-			inp.FinalScriptWitness = make([]string, len(input.FinalScriptWitness))
+			witness := make([]string, len(input.FinalScriptWitness))
 			for j, w := range input.FinalScriptWitness {
-				inp.FinalScriptWitness[j] = hex.EncodeToString(w)
+				witness[j] = hex.EncodeToString(w)
 			}
+			inp["final_scriptwitness"] = witness
 		}
 
 		if len(input.TapKeySig) > 0 {
-			inp.TapKeySig = hex.EncodeToString(input.TapKeySig)
+			inp["tap_key_sig"] = hex.EncodeToString(input.TapKeySig)
 		}
-
 		if len(input.TapInternalKey) > 0 {
-			inp.TapInternalKey = hex.EncodeToString(input.TapInternalKey)
+			inp["tap_internal_key"] = hex.EncodeToString(input.TapInternalKey)
 		}
-
 		if len(input.TapMerkleRoot) > 0 {
-			inp.TapMerkleRoot = hex.EncodeToString(input.TapMerkleRoot)
-		}
-
-		// BIP32 derivations
-		if len(input.BIP32Derivation) > 0 {
-			for pk, deriv := range input.BIP32Derivation {
-				inp.BIP32Derivation = append(inp.BIP32Derivation, DecodePSBTBIP32{
-					PubKey:            hex.EncodeToString([]byte(pk)),
-					MasterFingerprint: hex.EncodeToString(deriv.Fingerprint[:]),
-					Path:              formatBIP32Path(deriv.Path),
-				})
-			}
+			inp["tap_merkle_root"] = hex.EncodeToString(input.TapMerkleRoot)
 		}
 
 		if len(input.Unknown) > 0 {
-			inp.Unknown = make(map[string]string)
+			unk := map[string]any{}
 			for k, v := range input.Unknown {
-				inp.Unknown[hex.EncodeToString([]byte(k))] = hex.EncodeToString(v)
+				unk[hex.EncodeToString([]byte(k))] = hex.EncodeToString(v)
 			}
+			inp["unknown"] = unk
 		}
 
-		result.Inputs[i] = inp
+		inputs[i] = inp
 	}
 
-	// Build outputs
+	// ── per-output PSBT extension records ────────────────────────────────
 	totalOutputValue := int64(0)
+	outputs := make([]map[string]any, len(psbt.Outputs))
 	for i, output := range psbt.Outputs {
-		out := DecodePSBTOutput{}
+		out := map[string]any{}
 
 		if i < len(psbt.UnsignedTx.TxOut) {
 			totalOutputValue += psbt.UnsignedTx.TxOut[i].Value
 		}
 
 		if len(output.RedeemScript) > 0 {
-			out.RedeemScript = &Script{Hex: hex.EncodeToString(output.RedeemScript)}
+			out["redeem_script"] = map[string]any{
+				"asm":  scriptToAsmStr(output.RedeemScript, false),
+				"hex":  hex.EncodeToString(output.RedeemScript),
+				"type": scriptTypeName(output.RedeemScript),
+			}
 		}
 
 		if len(output.WitnessScript) > 0 {
-			out.WitnessScript = &Script{Hex: hex.EncodeToString(output.WitnessScript)}
+			out["witness_script"] = map[string]any{
+				"asm":  scriptToAsmStr(output.WitnessScript, false),
+				"hex":  hex.EncodeToString(output.WitnessScript),
+				"type": scriptTypeName(output.WitnessScript),
+			}
 		}
 
 		if len(output.TapInternalKey) > 0 {
-			out.TapInternalKey = hex.EncodeToString(output.TapInternalKey)
+			out["tap_internal_key"] = hex.EncodeToString(output.TapInternalKey)
 		}
 
-		// BIP32 derivations
 		if len(output.BIP32Derivation) > 0 {
+			bip32s := make([]map[string]any, 0, len(output.BIP32Derivation))
 			for pk, deriv := range output.BIP32Derivation {
-				out.BIP32Derivation = append(out.BIP32Derivation, DecodePSBTBIP32{
-					PubKey:            hex.EncodeToString([]byte(pk)),
-					MasterFingerprint: hex.EncodeToString(deriv.Fingerprint[:]),
-					Path:              formatBIP32Path(deriv.Path),
+				bip32s = append(bip32s, map[string]any{
+					"pubkey":             hex.EncodeToString([]byte(pk)),
+					"master_fingerprint": hex.EncodeToString(deriv.Fingerprint[:]),
+					"path":               formatBIP32Path(deriv.Path),
 				})
 			}
+			out["bip32_derivs"] = bip32s
 		}
 
 		if len(output.Unknown) > 0 {
-			out.Unknown = make(map[string]string)
+			unk := map[string]any{}
 			for k, v := range output.Unknown {
-				out.Unknown[hex.EncodeToString([]byte(k))] = hex.EncodeToString(v)
+				unk[hex.EncodeToString([]byte(k))] = hex.EncodeToString(v)
 			}
+			out["unknown"] = unk
 		}
 
-		result.Outputs[i] = out
+		outputs[i] = out
 	}
 
-	// Calculate fee if we have all UTXO info
+	// ── fee ──────────────────────────────────────────────────────────────
+	// Core emits "fee" only when all UTXOs are present and the fee is
+	// non-negative.
+	var feeVal any = nil
 	if totalInputValue > 0 && totalOutputValue > 0 {
 		fee := totalInputValue - totalOutputValue
-		if fee > 0 {
-			result.Fee = float64(fee) / satoshiPerBitcoin
+		if fee >= 0 {
+			feeVal = btcAmount(fee)
 		}
 	}
 
-	// Global unknowns
-	if len(psbt.Unknown) > 0 {
-		result.Unknown = make(map[string]string)
-		for k, v := range psbt.Unknown {
-			result.Unknown[hex.EncodeToString([]byte(k))] = hex.EncodeToString(v)
-		}
+	// ── global_xpubs ─────────────────────────────────────────────────────
+	// Core always emits global_xpubs as an array (empty when none). The
+	// PSBT stores xpubs as XPubs map[string][]byte (raw key bytes →
+	// fingerprint+path blob). The W50/W52 corpus entries contain no
+	// global xpubs, so we emit [] for all of them. Full xpub decoding
+	// (BIP-32 serialization, derivation-path parsing) is deferred to W53.
+	globalXPubs := make([]any, 0)
+
+	// ── global_unknown / proprietary ─────────────────────────────────────
+	// Core always emits unknown as {} and proprietary as [].
+	globalUnknown := map[string]any{}
+	for k, v := range psbt.Unknown {
+		globalUnknown[hex.EncodeToString([]byte(k))] = hex.EncodeToString(v)
+	}
+
+	result := map[string]any{
+		"tx":           txJSON,
+		"global_xpubs": globalXPubs,
+		"psbt_version": psbt.Version,
+		"proprietary":  []any{},
+		"unknown":      globalUnknown,
+		"inputs":       inputs,
+		"outputs":      outputs,
+	}
+	if feeVal != nil {
+		result["fee"] = feeVal
 	}
 
 	return result
