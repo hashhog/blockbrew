@@ -411,10 +411,15 @@ func extractAddressFromScript(s []byte, net address.Network) (string, bool) {
 // inferDescriptor returns the BIP-380 descriptor string + 8-char checksum
 // for a scriptPubKey, mirroring InferDescriptor(script, DUMMY_SIGNING_PROVIDER)
 // from script/descriptor.cpp:2897. Without key material:
-//   - bare PUBKEY  → pk(<hex>)#cs
-//   - bare MULTISIG → multi(M,<hex>,...)#cs
+//   - bare PUBKEY       → pk(<hex>)#cs
+//   - bare MULTISIG     → multi(M,<hex>,...)#cs
+//   - witness_v1_taproot → rawtr(<32-byte-x-only-hex>)#cs  (BIP-386)
 //   - address-recognizable → addr(<address>)#cs
-//   - everything else → raw(<hex>)#cs
+//   - everything else   → raw(<hex>)#cs
+//
+// NOTE: P2TR outputs use rawtr() not addr() — Core's InferDescriptor calls
+// InferRawtrDescriptor for witness_v1_taproot programs. The address is still
+// emitted separately in scriptPubKeyToUniv via extractAddressFromScript.
 func inferDescriptor(s []byte, net address.Network) string {
 	if isBarePubkey(s) {
 		var pk []byte
@@ -437,6 +442,13 @@ func inferDescriptor(s []byte, net address.Network) string {
 		}
 		expr += ")"
 		return wallet.AddChecksum(expr)
+	}
+	// witness_v1_taproot: OP_1 <32-byte push> → rawtr(<x-only-pubkey-hex>)
+	// Mirrors Core's InferRawtrDescriptor (script/descriptor.cpp). The desc
+	// field carries rawtr() even though an address can also be derived.
+	if consensus.IsP2TR(s) && len(s) == 34 {
+		xOnly := hex.EncodeToString(s[2:34])
+		return wallet.AddChecksum("rawtr(" + xOnly + ")")
 	}
 	if addr, ok := extractAddressFromScript(s, net); ok {
 		return wallet.AddChecksum("addr(" + addr + ")")

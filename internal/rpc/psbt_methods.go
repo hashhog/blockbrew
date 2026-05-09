@@ -819,7 +819,6 @@ func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[st
 		inp := map[string]any{}
 
 		if input.WitnessUTXO != nil {
-			totalInputValue += input.WitnessUTXO.Value
 			inp["witness_utxo"] = map[string]any{
 				"amount":       btcAmount(input.WitnessUTXO.Value),
 				"scriptPubKey": scriptPubKeyToUniv(input.WitnessUTXO.PkScript, net),
@@ -832,6 +831,11 @@ func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[st
 			if int(prevOut.Index) < len(input.NonWitnessUTXO.TxOut) {
 				totalInputValue += input.NonWitnessUTXO.TxOut[prevOut.Index].Value
 			}
+		} else if input.WitnessUTXO != nil {
+			// Use witness_utxo for fee calculation only when non_witness_utxo
+			// is absent. Mirrors Core's rawtransaction.cpp fee calculation:
+			// non_witness_utxo takes precedence when both are present.
+			totalInputValue += input.WitnessUTXO.Value
 		}
 
 		if len(input.PartialSigs) > 0 {
@@ -892,14 +896,78 @@ func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[st
 			inp["final_scriptwitness"] = witness
 		}
 
+		// BIP-371 taproot input fields — field names must match Core's
+		// rpc/rawtransaction.cpp:1251-1313 exactly.
 		if len(input.TapKeySig) > 0 {
-			inp["tap_key_sig"] = hex.EncodeToString(input.TapKeySig)
+			inp["taproot_key_path_sig"] = hex.EncodeToString(input.TapKeySig)
 		}
+
+		// taproot_script_path_sigs: array of {pubkey, leaf_hash, sig}
+		if len(input.TapScriptSigs) > 0 {
+			scriptSigs := make([]map[string]any, 0, len(input.TapScriptSigs))
+			for sigKey, sig := range input.TapScriptSigs {
+				scriptSigs = append(scriptSigs, map[string]any{
+					"pubkey":    hex.EncodeToString(sigKey.XOnlyPubKey[:]),
+					"leaf_hash": hex.EncodeToString(sigKey.LeafHash[:]),
+					"sig":       hex.EncodeToString(sig),
+				})
+			}
+			inp["taproot_script_path_sigs"] = scriptSigs
+		}
+
+		// taproot_scripts: group TapLeafScripts by (script, leaf_ver) →
+		// collecting all control_blocks for the same leaf. Mirrors Core's
+		// std::map<std::pair<CScript,int>,std::set<std::vector<unsigned char>>>
+		// m_tap_scripts. (rpc/rawtransaction.cpp:1271-1283)
+		if len(input.TapLeafScripts) > 0 {
+			type leafKey struct {
+				script  string
+				leafVer byte
+			}
+			// Use insertion order via a slice of unique keys.
+			seenLeaves := make(map[leafKey]int) // key → index in tapScripts
+			tapScripts := make([]map[string]any, 0)
+			for _, leaf := range input.TapLeafScripts {
+				k := leafKey{script: string(leaf.Script), leafVer: leaf.LeafVersion}
+				if idx, found := seenLeaves[k]; found {
+					// Append control block to existing entry
+					existing := tapScripts[idx]["control_blocks"].([]string)
+					tapScripts[idx]["control_blocks"] = append(existing, hex.EncodeToString(leaf.ControlBlock))
+				} else {
+					seenLeaves[k] = len(tapScripts)
+					tapScripts = append(tapScripts, map[string]any{
+						"script":         hex.EncodeToString(leaf.Script),
+						"leaf_ver":       int(leaf.LeafVersion),
+						"control_blocks": []string{hex.EncodeToString(leaf.ControlBlock)},
+					})
+				}
+			}
+			inp["taproot_scripts"] = tapScripts
+		}
+
+		// taproot_bip32_derivs: array of {pubkey, master_fingerprint, path, leaf_hashes[]}
+		if len(input.TapBIP32Derivation) > 0 {
+			tapBip32s := make([]map[string]any, 0, len(input.TapBIP32Derivation))
+			for pk, deriv := range input.TapBIP32Derivation {
+				leafHashes := make([]string, 0, len(deriv.LeafHashes))
+				for _, h := range deriv.LeafHashes {
+					leafHashes = append(leafHashes, hex.EncodeToString(h[:]))
+				}
+				tapBip32s = append(tapBip32s, map[string]any{
+					"pubkey":             hex.EncodeToString([]byte(pk)),
+					"master_fingerprint": hex.EncodeToString(deriv.Fingerprint[:]),
+					"path":               formatBIP32Path(deriv.Path),
+					"leaf_hashes":        leafHashes,
+				})
+			}
+			inp["taproot_bip32_derivs"] = tapBip32s
+		}
+
 		if len(input.TapInternalKey) > 0 {
-			inp["tap_internal_key"] = hex.EncodeToString(input.TapInternalKey)
+			inp["taproot_internal_key"] = hex.EncodeToString(input.TapInternalKey)
 		}
 		if len(input.TapMerkleRoot) > 0 {
-			inp["tap_merkle_root"] = hex.EncodeToString(input.TapMerkleRoot)
+			inp["taproot_merkle_root"] = hex.EncodeToString(input.TapMerkleRoot)
 		}
 
 		if len(input.Unknown) > 0 {
@@ -939,10 +1007,6 @@ func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[st
 			}
 		}
 
-		if len(output.TapInternalKey) > 0 {
-			out["tap_internal_key"] = hex.EncodeToString(output.TapInternalKey)
-		}
-
 		if len(output.BIP32Derivation) > 0 {
 			bip32s := make([]map[string]any, 0, len(output.BIP32Derivation))
 			for pk, deriv := range output.BIP32Derivation {
@@ -953,6 +1017,59 @@ func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[st
 				})
 			}
 			out["bip32_derivs"] = bip32s
+		}
+
+		// BIP-371 output taproot fields — field names match Core's
+		// rpc/rawtransaction.cpp:1421-1453 exactly.
+		if len(output.TapInternalKey) > 0 {
+			out["taproot_internal_key"] = hex.EncodeToString(output.TapInternalKey)
+		}
+
+		// taproot_tree: array of {depth, leaf_ver, script}
+		if len(output.TapTree) > 0 {
+			tree := make([]map[string]any, 0, len(output.TapTree))
+			for _, leaf := range output.TapTree {
+				tree = append(tree, map[string]any{
+					"depth":    int(leaf.Depth),
+					"leaf_ver": int(leaf.LeafVersion),
+					"script":   hex.EncodeToString(leaf.Script),
+				})
+			}
+			out["taproot_tree"] = tree
+		}
+
+		// taproot_bip32_derivs: array of {pubkey, master_fingerprint, path, leaf_hashes[]}
+		if len(output.TapBIP32Derivation) > 0 {
+			tapBip32s := make([]map[string]any, 0, len(output.TapBIP32Derivation))
+			for pk, deriv := range output.TapBIP32Derivation {
+				leafHashes := make([]string, 0, len(deriv.LeafHashes))
+				for _, h := range deriv.LeafHashes {
+					leafHashes = append(leafHashes, hex.EncodeToString(h[:]))
+				}
+				tapBip32s = append(tapBip32s, map[string]any{
+					"pubkey":             hex.EncodeToString([]byte(pk)),
+					"master_fingerprint": hex.EncodeToString(deriv.Fingerprint[:]),
+					"path":               formatBIP32Path(deriv.Path),
+					"leaf_hashes":        leafHashes,
+				})
+			}
+			out["taproot_bip32_derivs"] = tapBip32s
+		}
+
+		// musig2_participant_pubkeys: array of {aggregate_pubkey, participant_pubkeys[]}
+		if len(output.MuSig2Participants) > 0 {
+			musigArr := make([]map[string]any, 0, len(output.MuSig2Participants))
+			for _, entry := range output.MuSig2Participants {
+				parts := make([]string, 0, len(entry.ParticipantPubkeys))
+				for _, p := range entry.ParticipantPubkeys {
+					parts = append(parts, hex.EncodeToString(p))
+				}
+				musigArr = append(musigArr, map[string]any{
+					"aggregate_pubkey":   hex.EncodeToString(entry.AggregatePubkey),
+					"participant_pubkeys": parts,
+				})
+			}
+			out["musig2_participant_pubkeys"] = musigArr
 		}
 
 		if len(output.Unknown) > 0 {
@@ -1008,7 +1125,9 @@ func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[st
 	return result
 }
 
-// formatBIP32Path formats a BIP32 derivation path as a string.
+// formatBIP32Path formats a BIP32 derivation path as a string, matching
+// Bitcoin Core's WriteHDKeypath (util/bip32.cpp:61). Core defaults to 'h'
+// for hardened derivation (apostrophe=false) e.g. "m/84h/1h/0h/0/0".
 func formatBIP32Path(path []uint32) string {
 	if len(path) == 0 {
 		return "m"
@@ -1017,7 +1136,7 @@ func formatBIP32Path(path []uint32) string {
 	result := "m"
 	for _, idx := range path {
 		if idx >= wallet.HardenedKeyStart {
-			result += fmt.Sprintf("/%d'", idx-wallet.HardenedKeyStart)
+			result += fmt.Sprintf("/%dh", idx-wallet.HardenedKeyStart)
 		} else {
 			result += fmt.Sprintf("/%d", idx)
 		}
