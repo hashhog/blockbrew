@@ -486,6 +486,79 @@ func scriptSigToUniv(s []byte, attemptSighashDecode bool) map[string]any {
 	}
 }
 
+// buildDecodeRawTxJSON builds the JSON result for decoderawtransaction,
+// mirroring Bitcoin Core's TxToUniv (core_io.cpp) with fVerbose=true.
+//
+// This function reuses all W52-W54 helpers (btcAmount, scriptPubKeyToUniv,
+// scriptSigToUniv, inferDescriptor, rawtr branch) and adds coinbase-vin
+// handling:
+//   - Coinbase input: emit {coinbase, sequence, txinwitness?} — no txid/vout/scriptSig
+//   - Non-coinbase input: emit {txid, vout, scriptSig, sequence, txinwitness?}
+//   - No `hex` field (Core omits it from decoderawtransaction output)
+//   - vout.value uses btcAmount (8 fixed decimal places)
+func buildDecodeRawTxJSON(tx *wire.MsgTx, net address.Network) map[string]any {
+	// Serialize for size/weight
+	var buf bytes.Buffer
+	tx.Serialize(&buf)
+	size := buf.Len()
+
+	weight := int(consensus.CalcTxWeight(tx))
+	vsize := (weight + 3) / 4
+
+	// vin array
+	vin := make([]map[string]any, len(tx.TxIn))
+	for i, in := range tx.TxIn {
+		// Coinbase detection: null outpoint (all-zero hash + 0xFFFFFFFF index).
+		// Mirrors Bitcoin Core's CTxIn::IsCoinBase() which is used in
+		// TxToUniv (core_io.cpp) to emit the coinbase field.
+		isCoinbaseIn := in.PreviousOutPoint.Hash.IsZero() && in.PreviousOutPoint.Index == 0xFFFFFFFF
+		var vinObj map[string]any
+		if isCoinbaseIn {
+			vinObj = map[string]any{
+				"coinbase": hex.EncodeToString(in.SignatureScript),
+				"sequence": in.Sequence,
+			}
+		} else {
+			vinObj = map[string]any{
+				"txid":      in.PreviousOutPoint.Hash.String(),
+				"vout":      in.PreviousOutPoint.Index,
+				"scriptSig": scriptSigToUniv(in.SignatureScript, true),
+				"sequence":  in.Sequence,
+			}
+		}
+		if len(in.Witness) > 0 {
+			witness := make([]string, len(in.Witness))
+			for j, w := range in.Witness {
+				witness[j] = hex.EncodeToString(w)
+			}
+			vinObj["txinwitness"] = witness
+		}
+		vin[i] = vinObj
+	}
+
+	// vout array
+	vout := make([]map[string]any, len(tx.TxOut))
+	for i, out := range tx.TxOut {
+		vout[i] = map[string]any{
+			"value":        btcAmount(out.Value),
+			"n":            i,
+			"scriptPubKey": scriptPubKeyToUniv(out.PkScript, net),
+		}
+	}
+
+	return map[string]any{
+		"txid":     tx.TxHash().String(),
+		"hash":     tx.WTxHash().String(),
+		"version":  tx.Version,
+		"size":     size,
+		"vsize":    vsize,
+		"weight":   weight,
+		"locktime": tx.LockTime,
+		"vin":      vin,
+		"vout":     vout,
+	}
+}
+
 // buildPSBTTxJSON builds the embedded `tx` sub-object for decodepsbt output,
 // mirroring Bitcoin Core's TxToUniv call in rpc/rawtransaction.cpp::decodepsbt.
 //
