@@ -333,9 +333,60 @@ func isBareMultisig(s []byte) bool {
 	return count == expectedKeys && pc == len(s)-2
 }
 
-// isNullData: OP_RETURN ...
+// isNullData mirrors Core's NULL_DATA detection in Solver (solver.cpp:185):
+// OP_RETURN followed by IsPushOnly bytes.  A script that starts with OP_RETURN
+// but whose remaining bytes are not all valid, well-formed push opcodes is
+// classified NONSTANDARD by Core (e.g. OP_RETURN <PUSH32> <data> <truncated-push>).
 func isNullData(s []byte) bool {
-	return len(s) > 0 && s[0] == script.OP_RETURN
+	if len(s) == 0 || s[0] != script.OP_RETURN {
+		return false
+	}
+	// Verify every byte after OP_RETURN is a well-formed push opcode.
+	i := 1
+	for i < len(s) {
+		op := s[i]
+		i++
+		// OP_0 (0x00) is a push; OP_1NEGATE (0x4f) is a push; OP_1..OP_16 are pushes.
+		// Data-push opcodes: 0x01-0x4b push that many bytes; PUSHDATA1/2/4 follow.
+		// Non-push opcodes: anything > OP_16 (0x60) that is not a push. Core's
+		// IsPushOnly rejects ops that are not in the data-push or OP_N range.
+		var dataLen int
+		switch {
+		case op == 0x00: // OP_0 — push empty (ok)
+			dataLen = 0
+		case op >= 0x01 && op <= 0x4b: // direct push
+			dataLen = int(op)
+		case op == script.OP_PUSHDATA1:
+			if i >= len(s) {
+				return false // truncated
+			}
+			dataLen = int(s[i])
+			i++
+		case op == script.OP_PUSHDATA2:
+			if i+1 >= len(s) {
+				return false
+			}
+			dataLen = int(s[i]) | int(s[i+1])<<8
+			i += 2
+		case op == script.OP_PUSHDATA4:
+			if i+3 >= len(s) {
+				return false
+			}
+			dataLen = int(s[i]) | int(s[i+1])<<8 | int(s[i+2])<<16 | int(s[i+3])<<24
+			i += 4
+		case op == 0x4f: // OP_1NEGATE — push (ok)
+			dataLen = 0
+		case op >= 0x51 && op <= 0x60: // OP_1..OP_16 — push small int (ok)
+			dataLen = 0
+		default:
+			return false // non-push opcode → NONSTANDARD
+		}
+		if i+dataLen > len(s) {
+			return false // truncated data → NONSTANDARD
+		}
+		i += dataLen
+	}
+	return true
 }
 
 // isAnchor: OP_1 <0x4e73> (P2A)
