@@ -162,6 +162,15 @@ type TapBIP32Derivation struct {
 	Path        []uint32
 }
 
+// MuSig2ParticipantEntry represents one aggregate-pubkey → participant-pubkeys
+// mapping from PSBT_IN/OUT_MUSIG2_PARTICIPANT_PUBKEYS (BIP-327 / type 0x1a/0x08).
+// Wire format: key = [type_byte] | agg_pubkey(33 bytes),
+//              value = N×33 bytes of participant compressed pubkeys.
+type MuSig2ParticipantEntry struct {
+	AggregatePubkey  []byte   // 33-byte compressed pubkey
+	ParticipantPubkeys [][]byte // N×33-byte compressed pubkeys
+}
+
 // PSBTInput contains all data for a single PSBT input.
 type PSBTInput struct {
 	// UTXOs (at least one required)
@@ -216,6 +225,9 @@ type PSBTOutput struct {
 	TapInternalKey     []byte // 32 bytes
 	TapTree            []TapTreeLeaf
 	TapBIP32Derivation map[string]*TapBIP32Derivation
+
+	// MuSig2 fields (BIP-327, PSBT_OUT_MUSIG2_PARTICIPANT_PUBKEYS = 0x08)
+	MuSig2Participants []MuSig2ParticipantEntry
 
 	// Unknown key-value pairs
 	Unknown map[string][]byte
@@ -633,6 +645,30 @@ func (p *PSBT) readOutput(r io.Reader, output *PSBTOutput) error {
 				return err
 			}
 			output.TapBIP32Derivation[string(keyData)] = deriv
+
+		case PSBTOutMuSig2ParticipantPubkeys:
+			// Wire format: key = [0x08] | agg_pubkey(33 bytes)
+			//              value = N×33-byte participant compressed pubkeys
+			// Mirrors Core's DeserializeMuSig2ParticipantPubkeys (psbt.h:205).
+			if len(keyData) != 33 {
+				return errors.New("invalid musig2 aggregate pubkey key length")
+			}
+			if len(value)%33 != 0 {
+				return errors.New("musig2 participant pubkeys value size is not a multiple of 33")
+			}
+			aggPubkey := make([]byte, 33)
+			copy(aggPubkey, keyData)
+			numParts := len(value) / 33
+			parts := make([][]byte, numParts)
+			for i := 0; i < numParts; i++ {
+				p := make([]byte, 33)
+				copy(p, value[i*33:(i+1)*33])
+				parts[i] = p
+			}
+			output.MuSig2Participants = append(output.MuSig2Participants, MuSig2ParticipantEntry{
+				AggregatePubkey:    aggPubkey,
+				ParticipantPubkeys: parts,
+			})
 
 		default:
 			output.Unknown[keyStr] = value
