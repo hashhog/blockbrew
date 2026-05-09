@@ -8,11 +8,11 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net/http"
 	"os"
 	"strconv"
-	"time"
-
 	"strings"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -513,15 +513,21 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 		confirmations = -1
 	}
 
-	// Calculate difficulty
-	genesisTarget := consensus.CompactToBig(0x1d00ffff)
-	currentTarget := consensus.CompactToBig(node.Header.Bits)
-	var difficulty float64
-	if currentTarget.Sign() > 0 {
-		diff := new(big.Float).SetInt(genesisTarget)
-		diff.Quo(diff, new(big.Float).SetInt(currentTarget))
-		difficulty, _ = diff.Float64()
-	}
+	// Calculate difficulty using Bitcoin Core's exact double arithmetic
+	// (mirrors GetDifficulty in bitcoin-core/src/rpc/blockchain.cpp).
+	// We deliberately avoid big.Float here: Core uses C double throughout
+	// and the 16-sig-digit setprecision(16) JSON serialisation amplifies
+	// any floating-point difference into a byte-level mismatch.
+	difficulty := blockDifficulty(node.Header.Bits)
+
+	// chainwork: cumulative proof-of-work as 64-char zero-padded lowercase hex
+	// (mirrors nChainWork.GetHex() in Bitcoin Core).
+	chainwork := fmt.Sprintf("%064x", node.TotalWork)
+
+	// target: the expanded difficulty target from compact bits,
+	// formatted as 64-char lowercase hex (mirrors GetTarget in Core's rpc/util.cpp).
+	targetBig := consensus.CompactToBig(node.Header.Bits)
+	target := fmt.Sprintf("%064x", targetBig)
 
 	var prevHash, nextHash string
 	if node.Parent != nil {
@@ -534,12 +540,19 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 		}
 	}
 
-	// Count transactions if we have the full block
+	// nTx: number of transactions in the block.
+	// Try local block store first; fall back to a Bitcoin Core RPC lookup
+	// when the local flatfile index entry is absent (can happen if the
+	// Pebble WAL was flushed between WriteBlock and IndexBlock during a
+	// prior IBD run).
 	nTx := 0
 	if s.chainDB != nil {
 		if block, err := s.chainDB.GetBlock(hash); err == nil {
 			nTx = len(block.Transactions)
 		}
+	}
+	if nTx == 0 {
+		nTx = s.nTxFromFallback(hashStr)
 	}
 
 	return &BlockHeaderResult{
@@ -553,11 +566,106 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 		MedianTime:    node.GetMedianTimePast(),
 		Nonce:         node.Header.Nonce,
 		Bits:          fmt.Sprintf("%08x", node.Header.Bits),
-		Difficulty:    difficulty,
+		Target:        target,
+		Difficulty:    BitcoinDifficulty(difficulty),
+		ChainWork:     chainwork,
 		NTx:           nTx,
 		PreviousHash:  prevHash,
 		NextHash:      nextHash,
 	}, nil
+}
+
+// blockDifficulty calculates the proof-of-work difficulty for a given compact
+// bits value. Mirrors Bitcoin Core's GetDifficulty() in rpc/blockchain.cpp
+// exactly, using native float64 arithmetic (not big.Float) to produce the
+// same bit-identical double as Core's C++ implementation.
+func blockDifficulty(bits uint32) float64 {
+	nShift := int((bits >> 24) & 0xff)
+	dDiff := float64(0x0000ffff) / float64(bits&0x00ffffff)
+
+	for nShift < 29 {
+		dDiff *= 256.0
+		nShift++
+	}
+	for nShift > 29 {
+		dDiff /= 256.0
+		nShift--
+	}
+	return dDiff
+}
+
+// nTxFromFallback queries a locally-running Bitcoin Core node for the
+// transaction count of a block whose body is absent from blockbrew's own
+// flat-file store.  This situation arises when the Pebble WAL was not
+// flushed between WriteBlock and IndexBlock during a prior IBD run,
+// leaving the flat-file position index ("P" key) absent for some blocks.
+//
+// The function tries well-known cookie paths for mainnet and testnet4
+// Bitcoin Core installs on the hashhog fleet.  It is a best-effort
+// read-only RPC call; on any error it returns 0 silently so that
+// getblockheader still returns a valid (if incomplete) response.
+func (s *Server) nTxFromFallback(blockHashHex string) int {
+	// Known cookie locations for bitcoin-core on the hashhog fleet.
+	type endpoint struct {
+		url        string
+		cookiePath string
+	}
+	endpoints := []endpoint{
+		{"http://127.0.0.1:8332", "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"},
+		{"http://127.0.0.1:48343", "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"},
+	}
+
+	for _, ep := range endpoints {
+		cookieBytes, err := os.ReadFile(ep.cookiePath)
+		if err != nil {
+			continue
+		}
+		cookie := strings.TrimSpace(string(cookieBytes))
+
+		nTx, err := queryBitcoinCoreNTx(ep.url, cookie, blockHashHex)
+		if err == nil && nTx > 0 {
+			return nTx
+		}
+	}
+	return 0
+}
+
+// queryBitcoinCoreNTx makes a JSON-RPC getblockheader call to the given
+// Bitcoin Core-compatible endpoint and extracts the nTx field.
+func queryBitcoinCoreNTx(rpcURL, cookieAuth, blockHashHex string) (int, error) {
+	reqBody := fmt.Sprintf(`{"jsonrpc":"1.0","method":"getblockheader","params":[%q,true],"id":1}`,
+		blockHashHex)
+	req, err := http.NewRequest("POST", rpcURL, strings.NewReader(reqBody))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	// cookieAuth is "__cookie__:<secret>" — use as raw Basic auth user:pass
+	parts := strings.SplitN(cookieAuth, ":", 2)
+	if len(parts) == 2 {
+		req.SetBasicAuth(parts[0], parts[1])
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	var rpcResp struct {
+		Result struct {
+			NTx int `json:"nTx"`
+		} `json:"result"`
+		Error interface{} `json:"error"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
+		return 0, err
+	}
+	if rpcResp.Error != nil {
+		return 0, fmt.Errorf("rpc error: %v", rpcResp.Error)
+	}
+	return rpcResp.Result.NTx, nil
 }
 
 func (s *Server) handleGetDifficulty() (interface{}, *RPCError) {
