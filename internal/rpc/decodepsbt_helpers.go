@@ -57,19 +57,83 @@ func (a btcAmount) MarshalJSON() ([]byte, error) {
 // Compile-time check: btcAmount must satisfy json.Marshaler.
 var _ json.Marshaler = btcAmount(0)
 
+// sighashToStr converts a PSBT sighash type byte to its string name, mirroring
+// Bitcoin Core's SighashToStr (core_io.cpp:343). Unknown values return "".
+// 0x00 is NOT in the table (PSBT treats it as absent/default).
+func sighashToStr(t uint32) string {
+	switch byte(t) {
+	case 0x01:
+		return "ALL"
+	case 0x02:
+		return "NONE"
+	case 0x03:
+		return "SINGLE"
+	case 0x81:
+		return "ALL|ANYONECANPAY"
+	case 0x82:
+		return "NONE|ANYONECANPAY"
+	case 0x83:
+		return "SINGLE|ANYONECANPAY"
+	}
+	return ""
+}
+
+// isValidSigForAsmDecode returns true when vch looks like a DER-encoded ECDSA
+// signature with a defined hashtype, mirroring the condition Core uses before
+// stripping the last byte in ScriptToAsmStr (core_io.cpp:382):
+//
+//	CheckSignatureEncoding(vch, SCRIPT_VERIFY_STRICTENC, nullptr)
+//
+// which requires IsValidSignatureEncoding(vch) && IsDefinedHashtypeSignature(vch).
+// The IsDefinedHashtypeSignature check is just: last byte & 0x1f ∈ {1,2,3}.
+func isValidSigForAsmDecode(vch []byte) bool {
+	// IsValidSignatureEncoding: 9 ≤ len ≤ 73, DER structure
+	n := len(vch)
+	if n < 9 || n > 73 {
+		return false
+	}
+	if vch[0] != 0x30 {
+		return false
+	}
+	if int(vch[1]) != n-3 {
+		return false
+	}
+	lenR := int(vch[3])
+	if 5+lenR >= n {
+		return false
+	}
+	lenS := int(vch[5+lenR])
+	if lenR+lenS+7 != n {
+		return false
+	}
+	if vch[2] != 0x02 {
+		return false
+	}
+	// IsDefinedHashtypeSignature: (last & 0x1f) ∈ {1,2,3}
+	ht := vch[n-1] & 0x1f
+	if ht < 1 || ht > 3 {
+		return false
+	}
+	return true
+}
+
 // scriptToAsmStr renders a CScript byte sequence to Bitcoin Core's asm
-// representation, mirroring core_io.cpp::ScriptToAsmStr with
-// fAttemptSighashDecode=false (the PSBT unsigned-tx path always has empty
-// scriptSigs; sighash decode is a no-op for the corpus).
+// representation, mirroring core_io.cpp::ScriptToAsmStr.
+//
+// When fAttemptSighashDecode is true and a push data item (>4 bytes) passes
+// IsValidSignatureEncoding + IsDefinedHashtypeSignature, the last byte (the
+// hashtype) is stripped from the displayed hex and a "[ALL]"/"[NONE]"/etc.
+// suffix is appended. This is the behaviour Core uses for scriptSig asm in
+// finalized PSBT inputs.
 //
 // Core rules:
 //   - Push opcodes: emit the pushed data. If ≤4 bytes, decode as a
 //     CScriptNum (signed little-endian) and emit the decimal integer.
-//     If >4 bytes, emit lowercase hex.
+//     If >4 bytes, emit lowercase hex (with optional sighash suffix).
 //   - OP_1NEGATE (0x4f) → "-1"
 //   - OP_1..OP_16 (0x51..0x60) → "1".."16"
 //   - All other non-push opcodes → GetOpName string (e.g. "OP_DUP")
-func scriptToAsmStr(s []byte, _ bool) string {
+func scriptToAsmStr(s []byte, fAttemptSighashDecode bool) string {
 	var out []byte
 	pc := 0
 	first := true
@@ -115,6 +179,13 @@ func scriptToAsmStr(s []byte, _ bool) string {
 			if len(vch) <= 4 {
 				v, _ := scriptNumToInt64(vch)
 				out = append(out, []byte(strconv.FormatInt(v, 10))...)
+			} else if fAttemptSighashDecode && isValidSigForAsmDecode(vch) {
+				// Strip last byte (hashtype) from the hex; append "[TYPE]" suffix.
+				// Core: vch.pop_back(); str += HexStr(vch) + strSigHashDecode;
+				htByte := vch[len(vch)-1]
+				body := vch[:len(vch)-1]
+				suffix := "[" + sighashToStr(uint32(htByte)) + "]"
+				out = append(out, []byte(hex.EncodeToString(body)+suffix)...)
 			} else {
 				out = append(out, []byte(hex.EncodeToString(vch))...)
 			}
