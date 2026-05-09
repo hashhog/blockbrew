@@ -814,7 +814,7 @@ func (s *Server) buildRESTBlockResult(block *wire.MsgBlock, hash wire.Hash256, i
 		Nonce:         block.Header.Nonce,
 		Bits:          fmt.Sprintf("%08x", block.Header.Bits),
 		Target:        fmt.Sprintf("%064x", consensus.CompactToBig(block.Header.Bits)),
-		Difficulty:    difficulty,
+		Difficulty:    BitcoinDifficulty(difficulty),
 		ChainWork:     chainWork,
 		NTx:           len(block.Transactions),
 		PreviousHash:  prevHash,

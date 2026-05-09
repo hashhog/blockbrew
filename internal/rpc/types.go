@@ -133,7 +133,7 @@ type BlockResult struct {
 	Nonce         uint32        `json:"nonce"`
 	Bits          string        `json:"bits"`
 	Target        string        `json:"target"`
-	Difficulty    float64       `json:"difficulty"`
+	Difficulty    BitcoinDifficulty `json:"difficulty"`
 	ChainWork     string        `json:"chainwork"`
 	NTx           int           `json:"nTx"`
 	PreviousHash  string        `json:"previousblockhash,omitempty"`
