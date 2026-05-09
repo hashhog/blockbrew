@@ -868,7 +868,7 @@ func (s *Server) buildBlockHeaderResult(header *wire.BlockHeader, height int32) 
 		Time:          header.Timestamp,
 		Nonce:         header.Nonce,
 		Bits:          fmt.Sprintf("%08x", header.Bits),
-		Difficulty:    calcDifficulty(header.Bits),
+		Difficulty:    BitcoinDifficulty(calcDifficulty(header.Bits)),
 		ChainWork:     chainWork,
 		PreviousHash:  prevHash,
 		NextHash:      nextHash,
