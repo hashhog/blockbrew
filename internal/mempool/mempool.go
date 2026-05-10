@@ -21,6 +21,11 @@ var (
 	ErrAlreadyInMempool   = errors.New("transaction already in mempool")
 	ErrCoinbaseNotAllowed = errors.New("coinbase transactions not allowed in mempool")
 	ErrTxTooLarge         = errors.New("transaction exceeds maximum standard weight")
+	ErrTxTooSmall         = errors.New("transaction non-witness size below minimum (65 bytes)")
+	ErrTxVersion          = errors.New("transaction version out of standard range [1,3]")
+	ErrScriptSigTooLarge  = errors.New("scriptsig exceeds maximum standard size (1650 bytes)")
+	ErrScriptSigNotPushOnly = errors.New("scriptsig is not push-only")
+	ErrDataCarrierTooLarge  = errors.New("total OP_RETURN payload exceeds datacarrier limit")
 	ErrDoubleSpend        = errors.New("input already spent by mempool transaction")
 	ErrMissingInputs      = errors.New("transaction references missing inputs")
 	ErrNegativeFee        = errors.New("transaction fee is negative")
@@ -92,6 +97,33 @@ const (
 	// nSequence = 0xfffffffe (anti-fee-snipe locktime, no RBF intent)
 	// must NOT be marked replaceable.
 	MaxBIP125RBFSequence uint32 = 0xFFFFFFFD
+)
+
+// Standard transaction policy constants (mirrors policy/policy.h).
+const (
+	// TxMinStandardVersion is the minimum standard transaction version.
+	// Mirrors Bitcoin Core's TX_MIN_STANDARD_VERSION = 1.
+	TxMinStandardVersion = 1
+
+	// TxMaxStandardVersion is the maximum standard transaction version.
+	// Mirrors Bitcoin Core's TX_MAX_STANDARD_VERSION = 3.
+	TxMaxStandardVersion = 3
+
+	// MaxStandardScriptSigSize is the maximum size in bytes of a standard
+	// scriptSig. Mirrors Bitcoin Core's MAX_STANDARD_SCRIPTSIG_SIZE = 1650.
+	MaxStandardScriptSigSize = 1650
+
+	// MinStandardTxNonWitnessSize is the minimum non-witness serialized size
+	// for a standard transaction, to mitigate CVE-2017-12842 (64-byte
+	// transaction merkle-branch confusion). Mirrors Bitcoin Core's
+	// MIN_STANDARD_TX_NONWITNESS_SIZE = 65 (policy.h:40, validation.cpp:813).
+	MinStandardTxNonWitnessSize = 65
+
+	// MaxOpReturnRelay is the maximum cumulative OP_RETURN (nulldata) payload
+	// bytes allowed per transaction. Mirrors Bitcoin Core's
+	// MAX_OP_RETURN_RELAY = MAX_STANDARD_TX_WEIGHT / WITNESS_SCALE_FACTOR
+	// = 400_000 / 4 = 100_000 bytes (policy.h:84).
+	MaxOpReturnRelay = 100_000
 )
 
 // Package relay constants (BIP331 / Bitcoin Core policy).
@@ -352,16 +384,50 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		return ErrCoinbaseNotAllowed
 	}
 
+	// 3a. Transaction version range check (Core IsStandardTx line 102,
+	// policy.h TX_MIN_STANDARD_VERSION=1 / TX_MAX_STANDARD_VERSION=3).
+	// Rejects version 0 and any version > 3 as non-standard.
+	if tx.Version < TxMinStandardVersion || tx.Version > TxMaxStandardVersion {
+		return fmt.Errorf("%w: got %d, want [%d, %d]",
+			ErrTxVersion, tx.Version, TxMinStandardVersion, TxMaxStandardVersion)
+	}
+
 	// 4. Check transaction weight (max standard tx weight: 400,000 WU)
 	weight := consensus.CalcTxWeight(tx)
 	if weight > consensus.MaxStandardTxWeight {
 		return fmt.Errorf("%w: weight %d exceeds maximum %d", ErrTxTooLarge, weight, consensus.MaxStandardTxWeight)
 	}
 
+	// 4a. Minimum non-witness size check (Core validation.cpp:813,
+	// MIN_STANDARD_TX_NONWITNESS_SIZE = 65). Mitigates CVE-2017-12842
+	// (64-byte tx merkle-branch confusion attack).
+	{
+		var nwBuf bytes.Buffer
+		_ = tx.SerializeNoWitness(&nwBuf)
+		if nwBuf.Len() < MinStandardTxNonWitnessSize {
+			return fmt.Errorf("%w: got %d bytes", ErrTxTooSmall, nwBuf.Len())
+		}
+	}
+
 	// 5. Calculate virtual size
 	vsize := (weight + 3) / 4 // Round up
 
-	// 5a. Check output script standardness (Core IsStandardTx vout loop,
+	// 5a. Per-input scriptSig policy (Core IsStandardTx input loop,
+	// policy/policy.cpp:117-135):
+	//   - scriptSig size must not exceed MAX_STANDARD_SCRIPTSIG_SIZE (1650 bytes).
+	//   - scriptSig must be push-only (IsPushOnly).
+	// Both mitigate CPU-exhaustion DoS from large/non-push scriptSigs.
+	for i, in := range tx.TxIn {
+		if len(in.SignatureScript) > MaxStandardScriptSigSize {
+			return fmt.Errorf("%w: input %d scriptSig %d bytes > %d",
+				ErrScriptSigTooLarge, i, len(in.SignatureScript), MaxStandardScriptSigSize)
+		}
+		if len(in.SignatureScript) > 0 && !script.IsPushOnly(in.SignatureScript) {
+			return fmt.Errorf("%w: input %d", ErrScriptSigNotPushOnly, i)
+		}
+	}
+
+	// 5b. Check output script standardness (Core IsStandardTx vout loop,
 	// policy/policy.cpp:140).  Each output must be a known standard type:
 	//   P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A, or well-formed nulldata
 	//   (OP_RETURN + IsPushOnly remainder per consensus.IsNullData).
@@ -369,13 +435,26 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	// trailing byte (e.g. 6a09deadbeef) is classified NONSTANDARD and
 	// rejected here — the W56 fix to isNullData now shares this logic via
 	// consensus.IsNullData so both the mempool gate and decodescript agree.
-	for i, out := range tx.TxOut {
-		if !isStandardOutputScript(out.PkScript) {
-			return fmt.Errorf("%w: output %d script is nonstandard", ErrNonStandardOutput, i)
+	// Also enforce MAX_OP_RETURN_RELAY (100_000 bytes) cumulative budget
+	// across all OP_RETURN outputs in the transaction (Core policy.cpp:147).
+	{
+		var datacarrierBytesUsed int
+		for i, out := range tx.TxOut {
+			if !isStandardOutputScript(out.PkScript) {
+				return fmt.Errorf("%w: output %d script is nonstandard", ErrNonStandardOutput, i)
+			}
+			// Track OP_RETURN (nulldata) bytes for datacarrier budget.
+			if consensus.IsNullData(out.PkScript) {
+				datacarrierBytesUsed += len(out.PkScript)
+				if datacarrierBytesUsed > MaxOpReturnRelay {
+					return fmt.Errorf("%w: %d bytes > %d",
+						ErrDataCarrierTooLarge, datacarrierBytesUsed, MaxOpReturnRelay)
+				}
+			}
 		}
 	}
 
-	// 5b. IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
+	// 5c. IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
 	// Mempool holds txs for the *next* block, so check against tipHeight+1
 	// and the current chain MTP (MEDIAN_TIME_PAST of the last 11 blocks).
 	// Mirrors Bitcoin Core MemPoolAccept::PreChecks → CheckFinalTxAtTip
