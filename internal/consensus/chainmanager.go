@@ -676,11 +676,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			utxoMods = append(utxoMods, utxoModification{txIdx: i, addedOuts: addedOuts})
 			// Count coinbase sigops (legacy only; CountP2SHSigOps + CountWitnessSigOps
 			// both short-circuit to 0 for coinbase txs).
+			// Use INACCURATE counting (CHECKMULTISIG=20), matching Core's
+			// GetLegacySigOpCount → GetSigOpCount(fAccurate=false).
 			for _, txIn := range tx.TxIn {
-				nSigOpsCost += CountSigOps(txIn.SignatureScript) * WitnessScaleFactor
+				nSigOpsCost += CountSigOpsInaccurate(txIn.SignatureScript) * WitnessScaleFactor
 			}
 			for _, txOut := range tx.TxOut {
-				nSigOpsCost += CountSigOps(txOut.PkScript) * WitnessScaleFactor
+				nSigOpsCost += CountSigOpsInaccurate(txOut.PkScript) * WitnessScaleFactor
 			}
 			continue
 		}
@@ -750,11 +752,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// Count BEFORE spending inputs so cachedView still holds the prevout data
 		// needed by CountP2SHSigOps and CountWitnessSigOps.
 		// Mirrors Core's per-tx nSigOpsCost accumulation (validation.cpp ~line 2568).
+		// Use INACCURATE counting (CHECKMULTISIG=20) for legacy sigops, matching
+		// Core's GetLegacySigOpCount → GetSigOpCount(fAccurate=false).
 		for _, txIn := range tx.TxIn {
-			nSigOpsCost += CountSigOps(txIn.SignatureScript) * WitnessScaleFactor
+			nSigOpsCost += CountSigOpsInaccurate(txIn.SignatureScript) * WitnessScaleFactor
 		}
 		for _, txOut := range tx.TxOut {
-			nSigOpsCost += CountSigOps(txOut.PkScript) * WitnessScaleFactor
+			nSigOpsCost += CountSigOpsInaccurate(txOut.PkScript) * WitnessScaleFactor
 		}
 		nSigOpsCost += CountP2SHSigOps(tx, cachedView)
 		nSigOpsCost += CountWitnessSigOps(tx, cachedView)

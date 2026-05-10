@@ -83,6 +83,21 @@ const (
 	// MaxStandardTxWeight is the max weight of a "standard" transaction (400,000 WU).
 	MaxStandardTxWeight = 400_000
 
+	// MaxStandardTxSigOpsCost is the maximum sigops cost for a standard (relay/mine)
+	// transaction. Transactions exceeding this are rejected as non-standard.
+	// Core: policy/policy.h:44  MAX_STANDARD_TX_SIGOPS_COST = MAX_BLOCK_SIGOPS_COST/5.
+	MaxStandardTxSigOpsCost int64 = MaxBlockSigOpsCost / 5 // = 16_000
+
+	// MaxP2SHSigOpsPerInput is the maximum number of sigops a P2SH redeemScript
+	// may contain for a single input to be considered standard.
+	// Core: policy/policy.h:42  MAX_P2SH_SIGOPS = 15.
+	MaxP2SHSigOpsPerInput = 15
+
+	// MaxTxLegacySigOps is the maximum number of non-witness (legacy) sigops
+	// allowed across an entire standard transaction (BIP-54 gate).
+	// Core: policy/policy.h:46  MAX_TX_LEGACY_SIGOPS = 2_500.
+	MaxTxLegacySigOps = 2_500
+
 	// DustRelayFeeRate is the fee rate below which outputs are considered dust (3000 sat/kvB).
 	DustRelayFeeRate int64 = 3000
 
