@@ -286,13 +286,14 @@ func computeTxSigOpsCost(tx *wire.MsgTx, utxoView consensus.UTXOView) int64 {
 
 	// Legacy sigops: count CHECKSIG/CHECKMULTISIG opcodes in scriptSig of every
 	// input AND scriptPubKey of every output, then scale by 4. Matches
-	// GetLegacySigOpCount in Core.
+	// GetLegacySigOpCount in Core which uses GetSigOpCount(fAccurate=false):
+	// CHECKMULTISIG always counts as 20 regardless of preceding push opcode.
 	legacy := 0
 	for _, in := range tx.TxIn {
-		legacy += consensus.CountSigOps(in.SignatureScript)
+		legacy += consensus.CountSigOpsInaccurate(in.SignatureScript)
 	}
 	for _, out := range tx.TxOut {
-		legacy += consensus.CountSigOps(out.PkScript)
+		legacy += consensus.CountSigOpsInaccurate(out.PkScript)
 	}
 	cost := int64(legacy) * int64(consensus.WitnessScaleFactor)
 
