@@ -32,7 +32,37 @@ var (
 	ErrInsufficientFee    = errors.New("fee rate below minimum relay fee")
 	ErrDustOutput         = errors.New("output is dust")
 	ErrScriptValidation   = errors.New("script validation failed")
-	ErrWitnessStuffing    = errors.New("witness stuffing: P2A input must have empty witness")
+	// IsWitnessStandard gate 1: P2A input with non-empty witness.
+	// Core: policy.cpp:283-285, reason "bad-witness-nonstandard".
+	ErrWitnessStuffing = errors.New("witness stuffing: P2A input must have empty witness")
+
+	// IsWitnessStandard gate 2: P2SH scriptSig failed to evaluate or produced
+	// an empty stack (cannot extract redeemScript).
+	ErrWitnessNonstandardP2SHRedeem = errors.New("bad-witness-nonstandard: P2SH scriptSig eval failed or empty stack")
+
+	// IsWitnessStandard gate 3: non-witness prevScript paired with a witness.
+	ErrWitnessNonstandardNonWitness = errors.New("bad-witness-nonstandard: witness on non-witness program")
+
+	// IsWitnessStandard gate 4a: P2WSH witness script exceeds 3600 bytes.
+	ErrWitnessNonstandardP2WSHScriptSize = errors.New("bad-witness-nonstandard: P2WSH script exceeds 3600 bytes")
+
+	// IsWitnessStandard gate 4b: P2WSH stack depth (excluding script) exceeds 100.
+	ErrWitnessNonstandardP2WSHStackDepth = errors.New("bad-witness-nonstandard: P2WSH stack depth exceeds 100 items")
+
+	// IsWitnessStandard gate 4c: P2WSH stack item (excluding script) exceeds 80 bytes.
+	ErrWitnessNonstandardP2WSHStackItemSize = errors.New("bad-witness-nonstandard: P2WSH stack item exceeds 80 bytes")
+
+	// IsWitnessStandard gate 5a: taproot annex present (nonstandard).
+	ErrWitnessNonstandardTaprootAnnex = errors.New("bad-witness-nonstandard: taproot annex present")
+
+	// IsWitnessStandard gate 5b: taproot script-path empty control block.
+	ErrWitnessNonstandardTaprootEmptyControl = errors.New("bad-witness-nonstandard: taproot empty control block")
+
+	// IsWitnessStandard gate 5c: tapscript (leaf 0xc0) stack item exceeds 80 bytes.
+	ErrWitnessNonstandardTapscriptStackItemSize = errors.New("bad-witness-nonstandard: tapscript stack item exceeds 80 bytes")
+
+	// IsWitnessStandard gate 5d: taproot spend with empty witness stack.
+	ErrWitnessNonstandardTaprootEmptyStack = errors.New("bad-witness-nonstandard: taproot spend with empty witness stack")
 	ErrMempoolFull        = errors.New("mempool is full")
 	ErrOrphanPoolFull     = errors.New("orphan pool is full")
 	ErrRBFNotSignaled     = errors.New("conflicting transaction does not signal RBF")
@@ -549,6 +579,18 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		}
 	}
 
+	// 9e. IsWitnessStandard (Core policy.cpp:265-352, validation.cpp:904).
+	// Called only when the tx carries witness data, before script evaluation,
+	// so rejections return descriptive sentinel errors unwrappable with errors.Is.
+	if tx.HasWitness() {
+		witnessLookup := func(op wire.OutPoint) *consensus.UTXOEntry {
+			return mp.lookupOutputLocked(op)
+		}
+		if err := isWitnessStandard(tx, witnessLookup); err != nil {
+			return err
+		}
+	}
+
 	// 10. Validate scripts
 	flags := mp.getStandardScriptFlags()
 	if err := mp.validateScriptsLocked(tx, flags); err != nil {
@@ -787,13 +829,6 @@ func (mp *Mempool) validateScriptsLocked(tx *wire.MsgTx, flags script.ScriptFlag
 		utxo := mp.lookupOutputLocked(in.PreviousOutPoint)
 		if utxo == nil {
 			return consensus.ErrMissingInput
-		}
-
-		// Check for P2A witness stuffing (policy check).
-		// P2A outputs are anyone-can-spend and require an empty witness.
-		// Having witness data attached to a P2A spend is non-standard.
-		if consensus.IsPayToAnchor(utxo.PkScript) && len(in.Witness) > 0 {
-			return ErrWitnessStuffing
 		}
 
 		err := script.VerifyScript(
