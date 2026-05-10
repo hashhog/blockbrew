@@ -664,6 +664,9 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	case "getrpcinfo":
 		return s.handleGetRPCInfo(params)
 
+	case "validateaddress":
+		return s.handleValidateAddress(params)
+
 	default:
 		return nil, &RPCError{Code: RPCErrMethodNotFound, Message: fmt.Sprintf("Method not found: %s", method)}
 	}
