@@ -81,6 +81,20 @@ var (
 	// Output script is not a known standard type (Core: "scriptpubkey").
 	ErrNonStandardOutput = errors.New("nonstandard output script")
 
+	// ErrTxSigOpsCostTooHigh is returned when GetTransactionSigOpCost exceeds
+	// MAX_STANDARD_TX_SIGOPS_COST (16000). Core: validation.cpp:941,
+	// reason "bad-txns-too-many-sigops".
+	ErrTxSigOpsCostTooHigh = errors.New("transaction sigops cost exceeds maximum standard limit (16000)")
+
+	// ErrP2SHSigOpsTooMany is returned when a single P2SH input's redeemScript
+	// contains more than MAX_P2SH_SIGOPS (15) sigops. Core: policy.cpp:255,
+	// reason "bad-txns-nonstandard-inputs".
+	ErrP2SHSigOpsTooMany = errors.New("P2SH redeemscript sigops exceed per-input limit (15)")
+
+	// ErrTxLegacySigOpsTooMany is returned when the total number of non-witness
+	// (legacy) sigops across all inputs exceeds MAX_TX_LEGACY_SIGOPS (2500).
+	// Core: policy.cpp:188 (CheckSigopsBIP54), reason "bad-txns-nonstandard-inputs".
+	ErrTxLegacySigOpsTooMany = errors.New("non-witness sigops exceed BIP54 limit (2500)")
 
 	// Ancestor/descendant chain limits (Core DEFAULT_ANCESTOR_LIMIT/DEFAULT_DESCENDANT_LIMIT).
 	ErrTooManyAncestors   = errors.New("too many unconfirmed ancestors")
@@ -505,6 +519,77 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		}
 	}
 
+	// 5d. Sigops policy gates.
+	//
+	// Gate 1 — per-tx sigops cost (BIP141 weighted, MAX_STANDARD_TX_SIGOPS_COST=16000).
+	// Mirrors Bitcoin Core MemPoolAccept::PreChecks:
+	//   nSigOpsCost = GetTransactionSigOpCost(tx, m_view, …)
+	//   if nSigOpsCost > MAX_STANDARD_TX_SIGOPS_COST → reject "bad-txns-too-many-sigops"
+	// Core: validation.cpp:908-943.
+	//
+	// We build a thin UTXOView over mp.lookupOutputLocked so P2SH redeem-script
+	// and witness sigops are counted accurately (requires prevout scriptPubKey).
+	{
+		mempoolView := &mempoolUTXOView{mp: mp}
+		txSigOpsCost := consensus.GetTransactionSigOpCost(tx, mempoolView)
+		if txSigOpsCost > consensus.MaxStandardTxSigOpsCost {
+			return fmt.Errorf("%w: cost %d > %d",
+				ErrTxSigOpsCostTooHigh, txSigOpsCost, consensus.MaxStandardTxSigOpsCost)
+		}
+	}
+
+	// Gate 2 — per-P2SH-input redeemScript sigop limit (MAX_P2SH_SIGOPS=15).
+	// For every input spending a P2SH output the redeemScript (last push in
+	// scriptSig) must have ≤ 15 sigops (accurate counting). This prevents
+	// relay of txns with pathological P2SH redeemScripts.
+	// Core: policy.cpp:254-258, ValidateInputsStandardness.
+	{
+		mempoolView := &mempoolUTXOView{mp: mp}
+		for i, in := range tx.TxIn {
+			utxo := mempoolView.GetUTXO(in.PreviousOutPoint)
+			if utxo == nil {
+				continue
+			}
+			if !script.IsP2SH(utxo.PkScript) {
+				continue
+			}
+			// Count sigops in the redeemScript extracted from scriptSig.
+			sigops := consensus.CountScriptSigOps(in.SignatureScript)
+			if sigops > consensus.MaxP2SHSigOpsPerInput {
+				return fmt.Errorf("%w: input %d has %d sigops > %d",
+					ErrP2SHSigOpsTooMany, i, sigops, consensus.MaxP2SHSigOpsPerInput)
+			}
+		}
+	}
+
+	// Gate 3 — total non-witness (legacy) sigops across all inputs (BIP54,
+	// MAX_TX_LEGACY_SIGOPS=2500). Counts: scriptSig sigops (accurate) +
+	// prevout scriptPubKey sigops (P2SH-accurate). Witness sigops excluded.
+	// Core: policy.cpp:170-193 (CheckSigopsBIP54), called from
+	// ValidateInputsStandardness at policy.cpp:221.
+	{
+		mempoolView := &mempoolUTXOView{mp: mp}
+		var legacySigops int
+		overLimit := false
+		for _, in := range tx.TxIn {
+			// scriptSig sigops (accurate).
+			legacySigops += consensus.CountSigOpsAccurate(in.SignatureScript)
+			// prevout scriptPubKey sigops (P2SH-accurate).
+			utxo := mempoolView.GetUTXO(in.PreviousOutPoint)
+			if utxo != nil {
+				legacySigops += consensus.CountScriptPubKeySigOps(utxo.PkScript, in.SignatureScript)
+			}
+			if legacySigops > consensus.MaxTxLegacySigOps {
+				overLimit = true
+				break
+			}
+		}
+		if overLimit {
+			return fmt.Errorf("%w: %d > %d",
+				ErrTxLegacySigOpsTooMany, legacySigops, consensus.MaxTxLegacySigOps)
+		}
+	}
+
 	// 6. Check for double spends (with RBF support) and gather input values
 	var totalInputValue int64
 	var missingInputs []wire.OutPoint
@@ -706,6 +791,19 @@ func (mp *Mempool) GetUTXO(outpoint wire.OutPoint) *consensus.UTXOEntry {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
 	return mp.lookupOutputLocked(outpoint)
+}
+
+// mempoolUTXOView is a thin consensus.UTXOView adapter that calls
+// mp.lookupOutputLocked without acquiring mp.mu. It is only valid to use
+// while mp.mu is already held (e.g. inside AddTransaction).
+type mempoolUTXOView struct {
+	mp *Mempool
+}
+
+// GetUTXO implements consensus.UTXOView without acquiring mp.mu.
+// Must only be called while the caller holds mp.mu.
+func (v *mempoolUTXOView) GetUTXO(outpoint wire.OutPoint) *consensus.UTXOEntry {
+	return v.mp.lookupOutputLocked(outpoint)
 }
 
 // AnchorDust is the maximum value allowed for P2A outputs (in satoshis).
