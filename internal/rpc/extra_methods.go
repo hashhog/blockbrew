@@ -77,28 +77,18 @@ func (s *Server) handleGetTxOut(params json.RawMessage) (interface{}, *RPCError)
 	bestHash, tipHeight := s.chainMgr.BestBlock()
 	confs := tipHeight - utxo.Height + 1
 
-	scriptType := "unknown"
-	if consensus.IsP2PKH(utxo.PkScript) {
-		scriptType = "pubkeyhash"
-	} else if consensus.IsP2SH(utxo.PkScript) {
-		scriptType = "scripthash"
-	} else if consensus.IsP2WPKH(utxo.PkScript) {
-		scriptType = "witness_v0_keyhash"
-	} else if consensus.IsP2WSH(utxo.PkScript) {
-		scriptType = "witness_v0_scripthash"
-	} else if consensus.IsP2TR(utxo.PkScript) {
-		scriptType = "witness_v1_taproot"
-	}
+	// Build scriptPubKey using scriptPubKeyToUniv — mirrors Core's ScriptToUniv
+	// (core_io.cpp:409): full {asm, desc, hex, address?, type} shape.
+	spkMap := scriptPubKeyToUniv(utxo.PkScript, s.getNetwork())
 
-	return &TxOutResult{
-		BestBlock:     bestHash.String(),
-		Confirmations: confs,
-		Value:         float64(utxo.Amount) / satoshiPerBitcoin,
-		ScriptPubKey: ScriptPubKey{
-			Hex:  hex.EncodeToString(utxo.PkScript),
-			Type: scriptType,
-		},
-		Coinbase: utxo.IsCoinbase,
+	// Return Core-compatible shape. Value uses btcAmount for 8 fixed decimal
+	// places ("0.03600000" not "0.036"), mirroring Core's ValueFromAmount.
+	return map[string]any{
+		"bestblock":     bestHash.String(),
+		"confirmations": confs,
+		"value":         btcAmount(utxo.Amount),
+		"scriptPubKey":  spkMap,
+		"coinbase":      utxo.IsCoinbase,
 	}, nil
 }
 
