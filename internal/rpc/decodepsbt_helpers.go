@@ -656,6 +656,113 @@ func buildGetBlockTxJSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo
 	return result
 }
 
+// buildGetRawTxV2JSON builds the getrawtransaction verbosity=2 response object,
+// mirroring TxToUniv(SHOW_DETAILS_AND_PREVOUT) in Bitcoin Core 31.99.
+//
+// When txUndo != nil (non-coinbase tx with undo data available):
+//   - Each vin gains a "prevout" sub-object: {generated, height, value, scriptPubKey}
+//   - Top-level "fee" field is emitted (sum(inputs) - sum(outputs))
+//
+// When txUndo == nil (coinbase or undo data unavailable):
+//   - No "prevout" per vin, no "fee" (same as verbosity=1)
+//
+// The caller is responsible for adding block-context fields:
+// in_active_chain, blockhash, confirmations, time, blocktime.
+func buildGetRawTxV2JSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo, net address.Network) map[string]any {
+	// Serialize for size/weight
+	var buf bytes.Buffer
+	tx.Serialize(&buf)
+	size := buf.Len()
+
+	weight := int(consensus.CalcTxWeight(tx))
+	vsize := (weight + 3) / 4
+
+	haveUndo := txUndo != nil
+	var amtTotalIn int64
+
+	// vin array — mirrors TxToUniv vin loop with SHOW_DETAILS_AND_PREVOUT.
+	vin := make([]map[string]any, len(tx.TxIn))
+	for i, in := range tx.TxIn {
+		var vinObj map[string]any
+		if isCoinbase {
+			vinObj = map[string]any{
+				"coinbase": hex.EncodeToString(in.SignatureScript),
+				"sequence": in.Sequence,
+			}
+		} else {
+			vinObj = map[string]any{
+				"txid":      in.PreviousOutPoint.Hash.String(),
+				"vout":      in.PreviousOutPoint.Index,
+				"scriptSig": scriptSigToUniv(in.SignatureScript, true),
+				"sequence":  in.Sequence,
+			}
+
+			// Add prevout enrichment when undo data is available.
+			// Mirrors core_io.cpp: if (have_undo) { ... if (SHOW_DETAILS_AND_PREVOUT) { p = ...; in.pushKV("prevout", p); } }
+			if haveUndo && i < len(txUndo.SpentCoins) {
+				spent := &txUndo.SpentCoins[i]
+				amtTotalIn += spent.TxOut.Value
+
+				prevout := map[string]any{
+					"generated": spent.Coinbase,
+					"height":    spent.Height,
+					"value":     btcAmount(spent.TxOut.Value),
+					"scriptPubKey": scriptPubKeyToUniv(spent.TxOut.PkScript, net),
+				}
+				vinObj["prevout"] = prevout
+			}
+		}
+		// Emit txinwitness for ALL inputs when present.
+		if len(in.Witness) > 0 {
+			witness := make([]string, len(in.Witness))
+			for j, w := range in.Witness {
+				witness[j] = hex.EncodeToString(w)
+			}
+			vinObj["txinwitness"] = witness
+		}
+		vin[i] = vinObj
+	}
+
+	// vout array
+	var amtTotalOut int64
+	vout := make([]map[string]any, len(tx.TxOut))
+	for i, out := range tx.TxOut {
+		vout[i] = map[string]any{
+			"value":        btcAmount(out.Value),
+			"n":            i,
+			"scriptPubKey": scriptPubKeyToUniv(out.PkScript, net),
+		}
+		if haveUndo {
+			amtTotalOut += out.Value
+		}
+	}
+
+	// Base result (matches TxToUniv field-emission order)
+	result := map[string]any{
+		"txid":     tx.TxHash().String(),
+		"hash":     tx.WTxHash().String(),
+		"version":  tx.Version,
+		"size":     size,
+		"vsize":    vsize,
+		"weight":   weight,
+		"locktime": tx.LockTime,
+		"vin":      vin,
+		"vout":     vout,
+	}
+
+	// Fee: emitted only when undo data is available and tx is not coinbase.
+	// Core: entry.pushKV("fee", ValueFromAmount(fee)) after vin/vout loops.
+	if haveUndo && !isCoinbase {
+		fee := amtTotalIn - amtTotalOut
+		result["fee"] = btcAmount(fee)
+	}
+
+	// Hex: always emitted for getrawtransaction (include_hex=true).
+	result["hex"] = hex.EncodeToString(buf.Bytes())
+
+	return result
+}
+
 // buildPSBTTxJSON builds the embedded `tx` sub-object for decodepsbt output,
 // mirroring Bitcoin Core's TxToUniv call in rpc/rawtransaction.cpp::decodepsbt.
 //

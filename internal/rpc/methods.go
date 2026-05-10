@@ -754,12 +754,16 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid"}
 	}
 
-	verbose := false
+	// Parse verbosity: 0=hex, 1=verbose JSON, 2=verbose+prevout+fee.
+	// Accepts int (0/1/2) or bool (false=0, true=1) per Core's ParseVerbosity.
+	verbosity := 0
 	if len(args) >= 2 {
 		if v, ok := args[1].(bool); ok {
-			verbose = v
+			if v {
+				verbosity = 1
+			}
 		} else if v, ok := args[1].(float64); ok {
-			verbose = v != 0
+			verbosity = int(v)
 		}
 	}
 
@@ -785,6 +789,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 	var blockTime uint32
 	var confirmations int32
 	var isCoinbase bool
+	var txIndexInBlock int = -1 // position of tx in block (-1 = unknown/mempool)
 
 	// If blockhash is provided, look up the transaction in that specific block
 	if blockHashParam != nil {
@@ -802,6 +807,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 			if btx.TxHash() == txid {
 				tx = btx
 				isCoinbase = (i == 0)
+				txIndexInBlock = i
 				break
 			}
 		}
@@ -838,6 +844,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 						if btx.TxHash() == txid {
 							tx = btx
 							isCoinbase = (i == 0)
+							txIndexInBlock = i
 							blockHash = entry.BlockHash
 							blockTime = block.Header.Timestamp
 							break
@@ -869,7 +876,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 	}
 
 	// Non-verbose: return hex
-	if !verbose {
+	if verbosity <= 0 {
 		var buf bytes.Buffer
 		if err := tx.Serialize(&buf); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to serialize transaction"}
@@ -877,13 +884,38 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 		return hex.EncodeToString(buf.Bytes()), nil
 	}
 
-	// Verbose: return full transaction object
-	result := buildTxResult(tx, isCoinbase)
+	// Verbosity >= 1: rich JSON output.
+	// For verbosity=2, fetch undo data to populate per-vin prevout + fee.
+	var txUndo *storage.TxUndo
+	if verbosity >= 2 && !isCoinbase && txIndexInBlock > 0 && !blockHash.IsZero() && s.chainDB != nil {
+		if blockUndo, err := s.chainDB.ReadBlockUndo(blockHash); err == nil && blockUndo != nil {
+			// blockUndo.TxUndos is indexed by non-coinbase tx position (txIndex-1)
+			undoIdx := txIndexInBlock - 1
+			if undoIdx < len(blockUndo.TxUndos) {
+				txUndo = &blockUndo.TxUndos[undoIdx]
+			}
+		}
+	}
+
+	// Build the base verbose response using the Core-parity helper.
+	// buildGetRawTxV2JSON mirrors TxToUniv(SHOW_DETAILS_AND_PREVOUT) when
+	// txUndo != nil, or TxToUniv(SHOW_DETAILS) when nil.
+	result := buildGetRawTxV2JSON(tx, isCoinbase, txUndo, s.getNetwork())
+
+	// Add in_active_chain when a blockhash was explicitly provided (Core:
+	// result.pushKV("in_active_chain", chainman.ActiveChain().Contains(blockindex))
+	// before TxToJSON call).
+	if blockHashParam != nil {
+		result["in_active_chain"] = true
+	}
+
+	// Add block-context fields (blockhash, confirmations, time, blocktime)
+	// when the transaction was found in a block.
 	if !blockHash.IsZero() {
-		result.BlockHash = blockHash.String()
-		result.Confirmations = confirmations
-		result.BlockTime = blockTime
-		result.Time = blockTime
+		result["blockhash"] = blockHash.String()
+		result["confirmations"] = confirmations
+		result["time"] = blockTime
+		result["blocktime"] = blockTime
 	}
 
 	return result, nil
