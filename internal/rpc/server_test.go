@@ -764,8 +764,10 @@ func TestNullID(t *testing.T) {
 }
 
 func TestGetRawTransactionFromMempool(t *testing.T) {
-	// Create a simple transaction. Use OP_1 (0x51) as the output script
-	// (anyone-can-spend) so script validation passes with an empty scriptSig.
+	// Create a simple transaction. Output: OP_RETURN <4-byte payload> — standard
+	// nulldata, never dust, value=0. Non-witness size ≥ 65 bytes.
+	// UTXO: OP_1 (anyone-can-spend) so script validation passes with empty scriptSig.
+	nullDataScript := []byte{0x6a, 0x04, 0x00, 0x00, 0x00, 0x00} // OP_RETURN <4 bytes>
 	tx := &wire.MsgTx{
 		Version: 2,
 		TxIn: []*wire.TxIn{{
@@ -777,19 +779,19 @@ func TestGetRawTransactionFromMempool(t *testing.T) {
 			Sequence:        0xFFFFFFFF,
 		}},
 		TxOut: []*wire.TxOut{{
-			Value:    1000000,
-			PkScript: []byte{0x51}, // OP_1 (anyone-can-spend)
+			Value:    0,              // OP_RETURN outputs carry no value
+			PkScript: nullDataScript, // standard nulldata
 		}},
 		LockTime: 0,
 	}
 
 	txid := tx.TxHash()
 
-	// Provide a UTXO set with OP_1 output and excess value for fees.
+	// Provide a UTXO set with OP_1 (anyone-can-spend) and enough value for fees.
 	utxoView := consensus.NewInMemoryUTXOView()
 	utxoView.AddUTXO(tx.TxIn[0].PreviousOutPoint, &consensus.UTXOEntry{
-		Amount:   tx.TxOut[0].Value + 100000, // excess = fees
-		PkScript: []byte{0x51},               // OP_1 (anyone-can-spend)
+		Amount:   1_100_000,     // fee = 1_100_000 - 0 = 1_100_000 sat
+		PkScript: []byte{0x51}, // OP_1 (anyone-can-spend)
 		Height:   1,
 	})
 	mp := mempool.New(mempool.DefaultConfig(), utxoView)
