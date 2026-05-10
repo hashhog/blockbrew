@@ -96,6 +96,13 @@ var (
 	// transactions or their in-mempool ancestors.
 	ErrRBFNewUnconfirmedInput = errors.New("replacement adds new unconfirmed input not in conflicts' ancestor set")
 
+	// ErrRBFAncestorConflict is returned when the replacement transaction's
+	// in-mempool ancestors overlap with the set of direct conflicts — i.e., the
+	// replacement spends an output of a transaction it is trying to replace.
+	// Mirrors Bitcoin Core rbf.cpp::EntriesAndTxidsDisjoint (rbf.cpp:85-98),
+	// called from validation.cpp:1356 with error "bad-txns-spends-conflicting-tx".
+	ErrRBFAncestorConflict = errors.New("replacement spends conflicting transaction")
+
 	// Package validation errors.
 	ErrPackageEmpty            = errors.New("package is empty")
 	ErrPackageTooManyTxs       = errors.New("package exceeds maximum transaction count")
@@ -1664,42 +1671,86 @@ func (mp *Mempool) Clear() {
 
 // checkRBFLocked validates whether a replacement transaction satisfies BIP125 rules.
 // Must be called with mu held.
+//
+// Gates enforced (mirroring Bitcoin Core):
+//   1. Conflicting tx (or any of its in-mempool ancestors) signals RBF.
+//      Core: IsRBFOptIn → SignalsOptInRBF + ancestor walk (rbf.cpp:24-50,
+//      util/rbf.cpp:9-17).
+//   2. Replacement must not introduce new unconfirmed inputs.
+//      Core: checkRBFNoNewUnconfirmedInputsLocked (validation.cpp, BIP-125 Rule 2).
+//   3. Replacement's in-mempool ancestors must not overlap with direct conflicts
+//      (replacement cannot spend an output of the tx it replaces).
+//      Core: EntriesAndTxidsDisjoint (rbf.cpp:85-98, validation.cpp:1356).
+//   4. Rule #5: total evicted transactions ≤ MAX_REPLACEMENT_CANDIDATES (100).
+//      Core: GetEntriesForConflicts (rbf.cpp:64-75).
+//   5. Rule #3: replacement_fees >= original_fees (rbf.cpp:109-112).
+//   6. Rule #4: additional_fees >= incremental_relay_fee × replacement_vsize
+//      (rbf.cpp:114-123). Uses IncrementalRelayFee (not MinRelayFeeRate).
 func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash256]bool, totalInputValue int64) error {
-	// BIP125 Rule 1: All conflicting transactions must signal replaceability.
-	// A transaction signals RBF if any of its inputs have nSequence < 0xFFFFFFFF.
+	// Gate 1 + Gate 2: BIP-125 Rule 1 — each conflicting tx must signal
+	// opt-in RBF. A conflicting tx is considered opt-in if:
+	//   (a) it directly signals (any input nSequence <= 0xfffffffd), OR
+	//   (b) any of its in-mempool ancestors signals.
+	// Mirrors Bitcoin Core IsRBFOptIn (rbf.cpp:24-50) which checks the tx
+	// itself first, then walks mempool ancestors via CalculateMemPoolAncestors.
 	for txHash := range conflicting {
 		entry, ok := mp.pool[txHash]
 		if !ok {
 			continue
 		}
 		if !signalsRBF(entry.Tx) {
-			return fmt.Errorf("%w: tx %s does not signal RBF", ErrRBFNotSignaled, txHash)
+			// Check if any in-mempool ancestor signals RBF (inherited opt-in).
+			// Core rbf.cpp:39-48.
+			ancestorSignals := false
+			visited := make(map[wire.Hash256]bool)
+			for _, ancHash := range mp.collectAncestorsLocked(txHash, visited) {
+				if ancEntry, ok := mp.pool[ancHash]; ok && signalsRBF(ancEntry.Tx) {
+					ancestorSignals = true
+					break
+				}
+			}
+			if !ancestorSignals {
+				return fmt.Errorf("%w: tx %s does not signal RBF (neither directly nor via ancestor)",
+					ErrRBFNotSignaled, txHash)
+			}
 		}
 	}
 
-	// BIP125 Rule 2: the replacement must not introduce any new unconfirmed
-	// inputs that were not already known when the conflicts entered the
-	// mempool. Concretely, every mempool-resident parent of the replacement
-	// must either be one of the directly-conflicting txs, or itself a
-	// mempool ancestor of one of those conflicts. This prevents an attacker
-	// from forcing extra mempool work / state churn by pulling in fresh
-	// unconfirmed dependencies that the original conflicts never depended on
-	// (DoS surface called out in BIP-125 and Core's
-	// `policy/rbf.cpp::EntriesAndTxidsDisjoint` companion check).
-	//
-	// Reference: `bitcoin-core/src/policy/rbf.cpp` and
-	// `bitcoin-core/src/util/rbf.h`. (Core master folded the explicit
-	// `HasNoNewUnconfirmed` check into the cluster mempool's
-	// EntriesAndTxidsDisjoint + change-set logic; for blockbrew's
-	// BIP-125-style enforcement we keep the classic check.)
+	// Gate 3: BIP-125 Rule 2 — replacement must not introduce new unconfirmed
+	// inputs that were not already in the conflicting txs' ancestor set.
+	// Core: checkRBFNoNewUnconfirmedInputsLocked (validation.cpp).
 	if err := mp.checkRBFNoNewUnconfirmedInputsLocked(newTx, conflicting); err != nil {
 		return err
 	}
 
-	// BIP125 Rule 3: The replacement must pay an absolute fee higher than
-	// the total fees of all conflicting transactions.
+	// Gate 4: EntriesAndTxidsDisjoint — the replacement's in-mempool ancestors
+	// must not overlap with the direct conflicts. A replacement that spends an
+	// output of a tx it is trying to replace is logically inconsistent.
+	// Core: rbf.cpp:85-98, called from validation.cpp:1356.
+	{
+		visited := make(map[wire.Hash256]bool)
+		for _, in := range newTx.TxIn {
+			parentHash := in.PreviousOutPoint.Hash
+			if _, inMempool := mp.pool[parentHash]; !inMempool {
+				continue
+			}
+			// Walk ancestors of the replacement tx.
+			for _, ancHash := range mp.collectAncestorsLocked(parentHash, visited) {
+				if conflicting[ancHash] {
+					return fmt.Errorf("%w: %s spends conflicting transaction %s",
+						ErrRBFAncestorConflict, newTx.TxHash(), ancHash)
+				}
+			}
+			// Also check the direct parent itself.
+			if conflicting[parentHash] {
+				return fmt.Errorf("%w: %s spends conflicting transaction %s",
+					ErrRBFAncestorConflict, newTx.TxHash(), parentHash)
+			}
+		}
+	}
+
+	// Collect all transactions that would be evicted (conflicts + their descendants).
 	var totalConflictingFee int64
-	var totalConflictingSize int64
 	var totalEvicted int
 
 	for txHash := range conflicting {
@@ -1708,10 +1759,9 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 			continue
 		}
 		totalConflictingFee += entry.Fee
-		totalConflictingSize += entry.Size
 		totalEvicted++
 
-		// Include descendants
+		// Include descendants in fee sum and eviction count.
 		visited := make(map[wire.Hash256]bool)
 		descendants := mp.collectDescendantsLocked(txHash, visited)
 		for _, descHash := range descendants {
@@ -1722,34 +1772,39 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 		}
 	}
 
-	// BIP125 Rule 5: The number of replaced transactions (plus descendants) must
-	// not exceed MaxRBFReplacedTxs.
+	// Gate 5: BIP-125 Rule #5 — total evicted transactions must not exceed
+	// MAX_REPLACEMENT_CANDIDATES (100). Mirrors GetEntriesForConflicts
+	// (rbf.cpp:64-75). Core counts unique clusters; blockbrew counts individual
+	// txs (equivalent for non-cluster-mempool deployments).
 	if totalEvicted > MaxRBFReplacedTxs {
 		return fmt.Errorf("%w: would evict %d transactions (max %d)",
 			ErrRBFTooManyConflicts, totalEvicted, MaxRBFReplacedTxs)
 	}
 
-	// Calculate new transaction fee
+	// Calculate new transaction fee.
 	var totalOutputValue int64
 	for _, out := range newTx.TxOut {
 		totalOutputValue += out.Value
 	}
 	newFee := totalInputValue - totalOutputValue
 
-	// Rule 3: New fee must be higher than all conflicting fees combined
-	if newFee <= totalConflictingFee {
-		return fmt.Errorf("%w: new fee %d <= conflicting fees %d",
+	// Gate 6a: BIP-125 Rule #3 — replacement_fees >= original_fees.
+	// Core: rbf.cpp:109-112. Note: equal fees must PASS Rule 3 (the fee bump
+	// to cover relay is enforced by Rule 4 below). Pre-fix blockbrew used
+	// `<=` which incorrectly rejected equal-fee replacements.
+	if newFee < totalConflictingFee {
+		return fmt.Errorf("%w: rejecting replacement, less fees than conflicting txs; %d < %d",
 			ErrRBFInsufficientFee, newFee, totalConflictingFee)
 	}
 
-	// BIP125 Rule 4: The replacement must pay for its own bandwidth at the
-	// minimum relay fee rate (the fee increase must cover at least the
-	// relay cost of the replacement).
+	// Gate 6b: BIP-125 Rule #4 — additional_fees >= incremental_relay_fee × vsize.
+	// Core: rbf.cpp:114-123. Uses IncrementalRelayFee (separate from
+	// MinRelayFeeRate). Pre-fix blockbrew used MinRelayFeeRate here.
 	weight := consensus.CalcTxWeight(newTx)
 	newVSize := (weight + 3) / 4
-	minFeeBump := (newVSize * mp.config.MinRelayFeeRate + 999) / 1000
+	minFeeBump := (newVSize * mp.config.IncrementalRelayFee + 999) / 1000
 	if newFee-totalConflictingFee < minFeeBump {
-		return fmt.Errorf("%w: fee increase %d < minimum bump %d",
+		return fmt.Errorf("%w: rejecting replacement, not enough additional fees to relay; %d < %d",
 			ErrRBFInsufficientFee, newFee-totalConflictingFee, minFeeBump)
 	}
 
