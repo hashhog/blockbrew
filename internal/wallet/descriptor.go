@@ -43,6 +43,7 @@ const (
 	DescRaw                              // raw(HEX)
 	DescAddr                             // addr(ADDRESS)
 	DescMiniscript                       // wsh(MINISCRIPT) or tr(KEY, MINISCRIPT)
+	DescRawTR                            // rawtr(KEY) — x-only key, no tweak
 )
 
 // String returns the function name for the descriptor type.
@@ -70,6 +71,8 @@ func (t DescriptorType) String() string {
 		return "raw"
 	case DescAddr:
 		return "addr"
+	case DescRawTR:
+		return "rawtr"
 	default:
 		return "unknown"
 	}
@@ -441,21 +444,33 @@ func (t *TapTreeDescriptor) isRange() bool {
 	return false
 }
 
-// IsSolvable returns true if private keys are available for signing.
+// IsSolvable returns true if the descriptor type inherently knows how to
+// construct a scriptSig/witness for the output, even without private keys.
+// Mirrors Bitcoin Core DescriptorImpl::IsSolvable(): the base class returns
+// true (and checks sub-descriptors); addr() and raw() override to false.
 func (d *Descriptor) IsSolvable() bool {
-	for _, key := range d.Keys {
-		if key.IsPrivate() {
-			return true
+	switch d.Type {
+	case DescAddr, DescRaw:
+		return false
+	case DescWSH, DescSH:
+		if d.Subdesc != nil {
+			return d.Subdesc.IsSolvable()
 		}
+		return false
+	default:
+		return true
 	}
-	if d.Subdesc != nil {
-		return d.Subdesc.IsSolvable()
-	}
-	return false
 }
 
-// HasPrivateKeys returns true if all keys have private key information.
+// HasPrivateKeys returns true if all keys in the descriptor have private key
+// information available. Mirrors Bitcoin Core DescriptorImpl::HavePrivateKeys():
+// returns false when there are no keys and no sub-descriptors (e.g. addr/raw),
+// and checks each key/sub-descriptor otherwise.
 func (d *Descriptor) HasPrivateKeys() bool {
+	// addr() and raw() carry no key material at all → false.
+	if len(d.Keys) == 0 && d.Subdesc == nil {
+		return false
+	}
 	for _, key := range d.Keys {
 		if !key.IsPrivate() {
 			return false
@@ -492,6 +507,8 @@ func (d *Descriptor) Expand(pos uint32) ([][]byte, error) {
 		return [][]byte{d.RawScript}, nil
 	case DescAddr:
 		return d.expandAddr()
+	case DescRawTR:
+		return d.expandRawTR(pos)
 	case DescMiniscript:
 		return d.expandMiniscript(pos)
 	default:
@@ -816,6 +833,26 @@ func (d *Descriptor) expandCombo(pos uint32) ([][]byte, error) {
 	return results, nil
 }
 
+func (d *Descriptor) expandRawTR(pos uint32) ([][]byte, error) {
+	if len(d.Keys) != 1 {
+		return nil, ErrInvalidDescriptor
+	}
+	pubKey, err := d.Keys[0].GetPubKey(pos)
+	if err != nil {
+		return nil, err
+	}
+	// Extract x-only (32 bytes) from the compressed pubkey.
+	compressed := pubKey.SerializeCompressed()
+	xOnly := compressed[1:33]
+
+	// P2TR with no tweak: OP_1 <x-only-pubkey>
+	s := make([]byte, 34)
+	s[0] = 0x51 // OP_1
+	s[1] = 0x20 // Push 32 bytes
+	copy(s[2:], xOnly)
+	return [][]byte{s}, nil
+}
+
 func (d *Descriptor) expandAddr() ([][]byte, error) {
 	addr, err := address.DecodeAddress(d.AddrStr, d.Network)
 	if err != nil {
@@ -935,6 +972,8 @@ func (d *Descriptor) stringWithoutChecksum() string {
 		return fmt.Sprintf("raw(%s)", hex.EncodeToString(d.RawScript))
 	case DescAddr:
 		return fmt.Sprintf("addr(%s)", d.AddrStr)
+	case DescRawTR:
+		return fmt.Sprintf("rawtr(%s)", d.Keys[0].String())
 	case DescMiniscript:
 		if d.MiniscriptStr != "" {
 			return fmt.Sprintf("wsh(%s)", d.MiniscriptStr)
@@ -1030,6 +1069,8 @@ func (p *descriptorParser) parseDescriptor() (*Descriptor, error) {
 		d, err = p.parseRaw()
 	case "addr":
 		d, err = p.parseAddr()
+	case "rawtr":
+		d, err = p.parseRawTR()
 	default:
 		return nil, fmt.Errorf("%w: unknown function %s", ErrUnsupportedDescriptor, fn)
 	}
@@ -1204,6 +1245,39 @@ func (p *descriptorParser) parseAddr() (*Descriptor, error) {
 		return nil, fmt.Errorf("%w: invalid address %s", ErrInvalidDescriptor, addrStr)
 	}
 	return &Descriptor{Type: DescAddr, AddrStr: addrStr}, nil
+}
+
+func (p *descriptorParser) parseRawTR() (*Descriptor, error) {
+	// rawtr(KEY) — KEY is an x-only pubkey (32-byte / 64-hex chars) or any
+	// standard pubkey expression (compressed pubkey, xpub with derivation path).
+	// Peek ahead to check if it is an x-only hex key before calling parseKey.
+	keyStart := p.pos
+	keyStr := p.parseUntil(')')
+
+	// x-only pubkey: 32 bytes = 64 hex chars.  Promote to ConstPubkeyProvider
+	// by prepending the 0x02 prefix so the secp256k1 parser accepts it.
+	if len(keyStr) == 64 && isHex(keyStr) {
+		pubKeyBytes, err := hex.DecodeString("02" + keyStr)
+		if err != nil {
+			return nil, fmt.Errorf("%w: invalid x-only pubkey in rawtr()", ErrInvalidKey)
+		}
+		pubKey, err := bbcrypto.PublicKeyFromBytes(pubKeyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrInvalidKey, err)
+		}
+		// Store the original 64-char hex so String() round-trips correctly.
+		provider := &ConstPubkeyProvider{PubKey: pubKey, HexStr: keyStr}
+		return &Descriptor{Type: DescRawTR, Keys: []PubkeyProvider{provider}}, nil
+	}
+
+	// Not an x-only key — rewind and use the standard key parser (handles
+	// compressed pubkeys, xpub/xprv with derivation paths, WIF, etc.).
+	p.pos = keyStart
+	key, err := p.parseKey()
+	if err != nil {
+		return nil, err
+	}
+	return &Descriptor{Type: DescRawTR, Keys: []PubkeyProvider{key}}, nil
 }
 
 func (p *descriptorParser) parseKey() (PubkeyProvider, error) {
