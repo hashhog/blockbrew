@@ -16,6 +16,15 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// rollingFeeHalflife is the halflife for the rolling minimum fee rate decay.
+// Core: txmempool.h:212 — ROLLING_FEE_HALFLIFE = 60 * 60 * 12 (12 hours).
+const rollingFeeHalflife = float64(12 * 60 * 60) // 12 hours in seconds
+
+// DefaultMempoolExpiryHours is the number of hours after which mempool
+// transactions are expired. Core: kernel/mempool_options.h:23 —
+// DEFAULT_MEMPOOL_EXPIRY_HOURS = 336 (14 days).
+const DefaultMempoolExpiryHours = 336
+
 // Mempool errors.
 var (
 	ErrAlreadyInMempool   = errors.New("transaction already in mempool")
@@ -410,6 +419,18 @@ type Mempool struct {
 	utxoSet     consensus.UTXOView
 	chainHeight int32
 	clusters    *ClusterManager               // Cluster-based mempool structure
+
+	// Rolling minimum fee state (mirrors Core txmempool.cpp).
+	// rollingMinimumFeeRate is the current floor in sat/kvB as a float64;
+	// it is bumped when chunks are evicted (trackPackageRemovedLocked) and
+	// decays toward zero between blocks (GetMinFeeRate / getMinFeeRateLocked).
+	// blockSinceLastRollingFeeBump is true after each block is connected,
+	// which arms the decay timer.  lastRollingFeeUpdate is the Unix timestamp
+	// of the last decay computation.
+	// Core: txmempool.h:207-212, txmempool.cpp:829-859.
+	rollingMinimumFeeRate    float64 // sat/kvB
+	blockSinceLastRollingFeeBump bool
+	lastRollingFeeUpdate     int64   // Unix seconds
 }
 
 // New creates a new mempool.
@@ -432,12 +453,13 @@ func New(config Config, utxoSet consensus.UTXOView) *Mempool {
 	}
 
 	return &Mempool{
-		config:    config,
-		pool:      make(map[wire.Hash256]*TxEntry),
-		outpoints: make(map[wire.OutPoint]wire.Hash256),
-		orphans:   make(map[wire.Hash256]*orphanEntry),
-		utxoSet:   utxoSet,
-		clusters:  NewClusterManager(),
+		config:               config,
+		pool:                 make(map[wire.Hash256]*TxEntry),
+		outpoints:            make(map[wire.OutPoint]wire.Hash256),
+		orphans:              make(map[wire.Hash256]*orphanEntry),
+		utxoSet:              utxoSet,
+		clusters:             NewClusterManager(),
+		lastRollingFeeUpdate: time.Now().Unix(),
 	}
 }
 
@@ -1562,8 +1584,27 @@ func (mp *Mempool) CheckSpend(outpoint wire.OutPoint) *wire.Hash256 {
 	return nil
 }
 
+// trackPackageRemovedLocked updates the rolling minimum fee rate when a chunk
+// is evicted from the mempool.  The rate is set to the removed chunk's feerate
+// (in sat/kvB) if that is higher than the current floor.  Also clears
+// blockSinceLastRollingFeeBump so subsequent calls to getMinFeeRateLocked
+// do not decay the rate immediately.
+//
+// Core: txmempool.cpp:853-859 (CTxMemPool::trackPackageRemoved).
+// Must be called with mu held.
+func (mp *Mempool) trackPackageRemovedLocked(feeRateSatKvB float64) {
+	if feeRateSatKvB > mp.rollingMinimumFeeRate {
+		mp.rollingMinimumFeeRate = feeRateSatKvB
+		mp.blockSinceLastRollingFeeBump = false
+	}
+}
+
 // maybeEvictLocked evicts transactions if the mempool is too large.
-// Uses cluster-based eviction: removes the lowest-feerate chunk from the worst cluster.
+// Uses cluster-based eviction: removes the lowest-feerate chunk from the worst
+// cluster.  After each eviction the rolling minimum fee rate is bumped via
+// trackPackageRemovedLocked so that subsequent adds must pay incremental relay
+// fee above the evicted chunk's rate.
+// Core: txmempool.cpp:861-911 (CTxMemPool::TrimToSize).
 // Must be called with mu held.
 func (mp *Mempool) maybeEvictLocked() {
 	for mp.totalSize > mp.config.MaxSize && len(mp.pool) > 0 {
@@ -1587,14 +1628,37 @@ func (mp *Mempool) maybeEvictLocked() {
 				break
 			}
 
+			// Bump rolling minimum: feerate of removed tx + incremental relay fee.
+			// Core: txmempool.cpp:876-878.
+			removedRateKvB := worst.DescendantFeeRate() * 1000
+			mp.trackPackageRemovedLocked(removedRateKvB + float64(mp.config.IncrementalRelayFee))
+
 			mp.removeWithDescendantsLocked(worst.TxHash)
 			continue
 		}
 
-		// Build reverse map from index to txHash for this cluster
+		// Compute the feerate for the worst chunk (total fee / total vsize * 1000).
+		var chunkFee int64
+		var chunkSize int64
 		idxToHash := make(map[int]wire.Hash256)
 		for txHash, idx := range worstCluster.Transactions {
 			idxToHash[idx] = txHash
+		}
+		for _, idx := range worstChunk.Txs {
+			if txHash, ok := idxToHash[idx]; ok {
+				if entry, ok := mp.pool[txHash]; ok {
+					chunkFee += entry.Fee
+					chunkSize += entry.Size
+				}
+			}
+		}
+
+		// Bump rolling minimum: chunk feerate + incremental relay fee.
+		// Core: txmempool.cpp:870-878 (removed += incremental_relay_feerate;
+		// trackPackageRemoved(removed)).
+		if chunkSize > 0 {
+			chunkRateKvB := float64(chunkFee) / float64(chunkSize) * 1000
+			mp.trackPackageRemovedLocked(chunkRateKvB + float64(mp.config.IncrementalRelayFee))
 		}
 
 		// Remove all transactions in the worst chunk
@@ -1714,6 +1778,10 @@ func (mp *Mempool) OrphanCount() int {
 // Block connection/disconnection
 
 // BlockConnected removes transactions that were included in a new block.
+// Also arms the rolling-fee decay timer (blockSinceLastRollingFeeBump = true)
+// so GetMinFeeRate will decay the rate back toward zero over the next 12 hours.
+// Core: txmempool.cpp:405-431 (removeForBlock sets lastRollingFeeUpdate +
+// blockSinceLastRollingFeeBump = true).
 func (mp *Mempool) BlockConnected(block *wire.MsgBlock) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
@@ -1733,6 +1801,13 @@ func (mp *Mempool) BlockConnected(block *wire.MsgBlock) {
 			}
 		}
 	}
+
+	// Arm the rolling-fee decay timer.  Core resets lastRollingFeeUpdate to
+	// GetTime() here; we do the same so the 10-second cooldown in
+	// getMinFeeRateLocked is measured from the block arrival time, not from
+	// the last call to GetMinFeeRate.
+	mp.lastRollingFeeUpdate = time.Now().Unix()
+	mp.blockSinceLastRollingFeeBump = true
 }
 
 // BlockDisconnected re-adds transactions from a disconnected block
@@ -1749,6 +1824,128 @@ func (mp *Mempool) BlockDisconnected(block *wire.MsgBlock) {
 		}
 		_ = mp.AddTransaction(tx) // Ignore errors
 	}
+}
+
+// Expire removes transactions that were added before cutoff, along with all of
+// their in-mempool descendants.  Returns the number of transactions removed.
+// Callers typically pass (time.Now() - DefaultMempoolExpiryHours * time.Hour).
+//
+// Core: txmempool.cpp:811-827 (CTxMemPool::Expire).
+func (mp *Mempool) Expire(cutoff time.Time) int {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	// Collect all entries added before cutoff.
+	var toExpire []wire.Hash256
+	for txHash, entry := range mp.pool {
+		if entry.Time.Before(cutoff) {
+			toExpire = append(toExpire, txHash)
+		}
+	}
+
+	// For each expired tx, also collect its in-mempool descendants so they
+	// are removed together.  Core uses CalculateDescendants here.
+	visited := make(map[wire.Hash256]bool)
+	stage := make([]wire.Hash256, 0)
+	for _, txHash := range toExpire {
+		if !visited[txHash] {
+			descs := mp.collectDescendantsLocked(txHash, visited)
+			stage = append(stage, descs...)
+			stage = append(stage, txHash)
+			visited[txHash] = true
+		}
+	}
+
+	// Remove collected transactions.
+	for _, txHash := range stage {
+		mp.removeSingleTxLocked(txHash)
+	}
+	return len(stage)
+}
+
+// RemoveForReorg evicts mempool transactions that are no longer valid after a
+// chain reorganisation.  A transaction becomes invalid when:
+//
+//  (a) It is non-final at the new chain tip (nLockTime / BIP-68 sequence locks
+//      no longer satisfied at the new tip height + median-time-past).
+//  (b) It directly spends a coinbase output that has become immature again
+//      (fewer than CoinbaseMaturity = 100 confirmations at the new tip).
+//
+// All descendants of an invalid transaction are also removed.
+//
+// This mirrors Core's CTxMemPool::removeForReorg (txmempool.cpp:360-386).
+// The function is a no-op when ChainState is not wired; in that case the
+// caller is responsible for validity.
+func (mp *Mempool) RemoveForReorg() int {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	if mp.config.ChainState == nil {
+		return 0
+	}
+
+	tipHeight := mp.config.ChainState.TipHeight()
+	tipMTP := uint32(mp.config.ChainState.TipMTP())
+
+	var invalid []wire.Hash256
+	for txHash, entry := range mp.pool {
+		if mp.txInvalidAtTip(entry.Tx, tipHeight, tipMTP) {
+			invalid = append(invalid, txHash)
+		}
+	}
+
+	visited := make(map[wire.Hash256]bool)
+	stage := make([]wire.Hash256, 0)
+	for _, txHash := range invalid {
+		if !visited[txHash] {
+			descs := mp.collectDescendantsLocked(txHash, visited)
+			stage = append(stage, descs...)
+			stage = append(stage, txHash)
+			visited[txHash] = true
+		}
+	}
+
+	for _, txHash := range stage {
+		mp.removeSingleTxLocked(txHash)
+	}
+	return len(stage)
+}
+
+// txInvalidAtTip reports whether tx must be evicted after a reorg to the
+// current chain tip.
+//
+// Two conditions checked (Core: txmempool.cpp:360-386, check_final_and_mature
+// callback passed to removeForReorg):
+//  1. Non-final: IsFinalTx fails at (tipHeight+1, tipMTP).
+//     Core uses the *next* block's height/time to match the mempool-accept gate.
+//  2. Immature coinbase spend: any input that spends a coinbase output with
+//     fewer than CoinbaseMaturity (100) confirmations at the new tip.
+//
+// Must be called with mp.mu held.
+func (mp *Mempool) txInvalidAtTip(tx *wire.MsgTx, tipHeight int32, tipMTP uint32) bool {
+	// Gate 1 — non-final tx.
+	// Core evaluates at nBlockHeight = active_chain.Height()+1 and
+	// nBlockTime = active_chain.Tip()->GetMedianTimePast().
+	if !consensus.IsFinalTx(tx, tipHeight+1, tipMTP) {
+		return true
+	}
+
+	// Gate 2 — immature coinbase spend.
+	// A confirmed coinbase output at height H has (tipHeight - H + 1)
+	// confirmations.  It is spendable when that value >= CoinbaseMaturity.
+	if mp.utxoSet != nil {
+		for _, in := range tx.TxIn {
+			utxo := mp.utxoSet.GetUTXO(in.PreviousOutPoint)
+			if utxo != nil && utxo.IsCoinbase {
+				confirmations := tipHeight - utxo.Height + 1
+				if confirmations < consensus.CoinbaseMaturity {
+					return true
+				}
+			}
+		}
+	}
+
+	return false
 }
 
 // Fee estimation
@@ -1806,33 +2003,76 @@ func (mp *Mempool) GetMinFeeRate() int64 {
 	return mp.getMinFeeRateLocked()
 }
 
-// getMinFeeRateLocked returns the minimum fee rate (must hold lock).
+// getMinFeeRateLocked returns the current dynamic minimum fee rate in sat/kvB.
+// It implements the Core rolling-fee halflife decay:
+//
+//  1. If no block has been connected since the last eviction
+//     (blockSinceLastRollingFeeBump is false), or the rolling rate is zero,
+//     return the stored rate without decay.
+//  2. Otherwise, if more than 10 seconds have elapsed since the last update,
+//     decay the rate by pow(2, elapsed/halflife) where halflife is:
+//     - 12 h (base) when mempool is >= sizelimit/2,
+//     - 6 h (halved) when mempool is between sizelimit/4 and sizelimit/2,
+//     - 3 h (quartered) when mempool is < sizelimit/4.
+//  3. If the decayed rate falls below incremental_relay_feerate/2, zero it.
+//  4. Return max(decayed_rate, incremental_relay_feerate), but always at
+//     least config.MinRelayFeeRate.
+//
+// Core: txmempool.cpp:829-851 (CTxMemPool::GetMinFee).
+// Must be called with mp.mu held.
 func (mp *Mempool) getMinFeeRateLocked() int64 {
-	// Start with the configured minimum
-	minRate := mp.config.MinRelayFeeRate
+	incrementalKvB := float64(mp.config.IncrementalRelayFee)
 
-	// If the mempool is at capacity, we need a higher fee rate
-	if mp.totalSize >= mp.config.MaxSize {
-		// Find the lowest fee rate in the mempool
-		lowestRate := int64(math.MaxInt64)
-		for _, entry := range mp.pool {
-			// Convert sat/vB to sat/kvB for comparison
-			feeRateKvB := int64(entry.FeeRate * 1000)
-			if feeRateKvB < lowestRate {
-				lowestRate = feeRateKvB
-			}
+	// No decay while blockSinceLastRollingFeeBump is false (just evicted).
+	if !mp.blockSinceLastRollingFeeBump || mp.rollingMinimumFeeRate == 0 {
+		rolling := int64(math.Round(mp.rollingMinimumFeeRate))
+		return max64(rolling, mp.config.MinRelayFeeRate)
+	}
+
+	now := time.Now().Unix()
+	if now > mp.lastRollingFeeUpdate+10 {
+		// Choose halflife based on current mempool fullness.
+		// Core: txmempool.cpp:836-840.
+		halflife := rollingFeeHalflife
+		sizelimit := mp.config.MaxSize
+		if mp.totalSize*4 < sizelimit { // < sizelimit/4
+			halflife /= 4
+		} else if mp.totalSize*2 < sizelimit { // < sizelimit/2
+			halflife /= 2
 		}
 
-		if lowestRate < math.MaxInt64 {
-			// Require incremental relay fee above the lowest rate
-			requiredRate := lowestRate + mp.config.IncrementalRelayFee
-			if requiredRate > minRate {
-				minRate = requiredRate
-			}
+		elapsed := float64(now - mp.lastRollingFeeUpdate)
+		mp.rollingMinimumFeeRate = mp.rollingMinimumFeeRate / math.Pow(2.0, elapsed/halflife)
+		mp.lastRollingFeeUpdate = now
+
+		// Zero out when decayed below incremental_relay_feerate/2.
+		// Core: txmempool.cpp:845-848.
+		if mp.rollingMinimumFeeRate < incrementalKvB/2 {
+			mp.rollingMinimumFeeRate = 0
+			return mp.config.MinRelayFeeRate
 		}
 	}
 
-	return minRate
+	// Return max(rollingMinimumFeeRate, incremental_relay_feerate), but at
+	// least MinRelayFeeRate.  Core: txmempool.cpp:850.
+	rolling := int64(math.Round(mp.rollingMinimumFeeRate))
+	incremental := int64(math.Round(incrementalKvB))
+	result := rolling
+	if incremental > result {
+		result = incremental
+	}
+	if mp.config.MinRelayFeeRate > result {
+		result = mp.config.MinRelayFeeRate
+	}
+	return result
+}
+
+// max64 returns the larger of a and b.
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 // GetMinFee returns the minimum fee required for a transaction of given vsize.
