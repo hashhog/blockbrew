@@ -1456,6 +1456,13 @@ func TestPackageRejectsInvalidTopology(t *testing.T) {
 }
 
 // TestGetMinFeeRate tests the dynamic minimum fee rate calculation.
+// TestGetMinFeeRate tests the rolling minimum fee rate logic.
+//
+// Core model (txmempool.cpp:829-851): the rate is controlled by
+// rollingMinimumFeeRate, which is bumped by trackPackageRemoved when chunks
+// are evicted.  Simply being at capacity (without eviction) does NOT raise the
+// rate — only actual evictions do.  The rate decays back toward zero after a
+// block is connected (blockSinceLastRollingFeeBump = true) via a 12-hour halflife.
 func TestGetMinFeeRate(t *testing.T) {
 	utxoSet := newTestUTXOSet()
 	config := Config{
@@ -1467,44 +1474,59 @@ func TestGetMinFeeRate(t *testing.T) {
 	}
 	mp := New(config, utxoSet)
 
-	// Initially, minimum fee rate should be the configured value
+	// Initially: rolling rate = 0, no block bump armed.
+	// Result: max(0, incremental=1000, minRelay=1000) = 1000.
 	minRate := mp.GetMinFeeRate()
 	if minRate != 1000 {
 		t.Errorf("GetMinFeeRate() = %d, want 1000 (initial)", minRate)
 	}
 
-	// Add a transaction to the mempool (simulating mempool state)
-	// Create a fake entry directly
+	// Simulate eviction: trackPackageRemovedLocked bumps rolling rate to
+	// chunk_rate + incremental = 1500 + 1000 = 2500 sat/kvB.
 	mp.mu.Lock()
-	mp.pool[wire.Hash256{}] = &TxEntry{
-		Fee:     100,  // 100 satoshis
-		Size:    100,  // 100 vbytes = 1 sat/vB = 1000 sat/kvB
-		FeeRate: 1.0,  // 1 sat/vB
-	}
-	mp.totalSize = 100
+	mp.trackPackageRemovedLocked(2500)
 	mp.mu.Unlock()
 
-	// Still below capacity - minimum should be base rate
+	// Rolling rate = 2500, blockSinceLastRollingFeeBump = false (no decay).
+	// Result: max(2500, 1000) = 2500.
 	minRate = mp.GetMinFeeRate()
-	if minRate != 1000 {
-		t.Errorf("GetMinFeeRate() = %d, want 1000 (below capacity)", minRate)
+	if minRate != 2500 {
+		t.Errorf("GetMinFeeRate() = %d, want 2500 (after eviction bump)", minRate)
 	}
 
-	// Fill mempool to capacity
+	// Arm decay by simulating a block connection.
 	mp.mu.Lock()
-	mp.totalSize = 1000 // At max size
+	mp.blockSinceLastRollingFeeBump = true
+	// Push lastRollingFeeUpdate far into the past so the decay fires.
+	// After 12 h (one halflife) the rate halves: 2500 / 2 = 1250.
+	// After 24 h (two halflives): 2500 / 4 = 625.
+	// After 36 h (three halflives): 2500 / 8 = 312.5 which rounds to 313,
+	// still above incremental/2 = 500?  No, 312 < 500 → zeroed.
+	// Let's set elapsed to just over 12 h so rate halves to 1250.
+	mp.lastRollingFeeUpdate = time.Now().Unix() - int64(12*60*60+1) // 12h+1s ago
+	mp.totalSize = 0 // empty → use /4 halflife = 3h
+	// At <sizelimit/4, halflife = 3h, elapsed = 12h+1s → pow(2, (12*3600+1)/3/3600)
+	// ≈ pow(2, 4.0003) ≈ 16.00; 2500/16 ≈ 156.25 < 500 → zeroed to 0.
+	// But we want to test the non-zero path, so set size to 600 (> maxsize/2=500)
+	// → halflife = 12h; 2500 / pow(2, (43201/43200)) ≈ 2500/2.0 = 1250.
+	mp.totalSize = 600
 	mp.mu.Unlock()
 
-	// At capacity - minimum should be lowest rate + incremental
-	// Lowest rate is 1000 sat/kvB, incremental is 1000 sat/kvB
-	// So minimum should be 2000 sat/kvB
 	minRate = mp.GetMinFeeRate()
-	if minRate != 2000 {
-		t.Errorf("GetMinFeeRate() = %d, want 2000 (at capacity)", minRate)
+	// Halflife = 12h (totalSize=600 >= sizelimit/2=500).
+	// elapsed ≈ 12h+1s.  2500 / pow(2, ~1.000023) ≈ 1250.
+	// Result: max(1250, incremental=1000) = 1250.
+	if minRate < 1200 || minRate > 1300 {
+		t.Errorf("GetMinFeeRate() = %d, want ~1250 (after 12h decay)", minRate)
 	}
 }
 
-// TestIncrementalRelayFeeEnforcement tests that transactions below the dynamic minimum are rejected.
+// TestIncrementalRelayFeeEnforcement tests that after an eviction the rolling
+// minimum fee rate is raised so that new transactions must pay the incremental
+// relay fee above the evicted chunk's rate.
+//
+// Core: txmempool.cpp:876-878 — removed += incremental_relay_feerate;
+// trackPackageRemoved(removed).
 func TestIncrementalRelayFeeEnforcement(t *testing.T) {
 	utxoSet := newTestUTXOSet()
 	config := Config{
@@ -1516,21 +1538,22 @@ func TestIncrementalRelayFeeEnforcement(t *testing.T) {
 	}
 	mp := New(config, utxoSet)
 
-	// Add a low-fee transaction to the mempool manually
-	// to simulate a full mempool state
-	mp.mu.Lock()
-	mp.pool[wire.Hash256{1}] = &TxEntry{
-		Fee:     100,
-		Size:    100,
-		FeeRate: 1.0, // 1 sat/vB = 1000 sat/kvB
+	// Before any eviction, rate equals MinRelayFeeRate (rolling = 0).
+	minRate := mp.GetMinFeeRate()
+	if minRate != 1000 {
+		t.Errorf("GetMinFeeRate() = %d, want 1000 (no eviction yet)", minRate)
 	}
-	mp.totalSize = 500 // At capacity
+
+	// Simulate eviction of a chunk with 1000 sat/kvB feerate.
+	// trackPackageRemoved bumps rolling to 1000 + 1000 = 2000.
+	mp.mu.Lock()
+	mp.trackPackageRemovedLocked(2000) // evicted chunk rate + incremental
 	mp.mu.Unlock()
 
-	// Now the minimum fee rate should be 2000 sat/kvB (1000 + 1000 incremental)
-	minRate := mp.GetMinFeeRate()
+	// Now the rolling minimum is 2000 sat/kvB.
+	minRate = mp.GetMinFeeRate()
 	if minRate != 2000 {
-		t.Errorf("GetMinFeeRate() = %d, want 2000", minRate)
+		t.Errorf("GetMinFeeRate() = %d, want 2000 (after eviction)", minRate)
 	}
 }
 
