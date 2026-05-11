@@ -426,8 +426,18 @@ func CheckBIP30(block *wire.MsgBlock, height int32, blockHash wire.Hash256, para
 	// Gate 4: BIP34 short-circuit — once BIP34 is unambiguously active on this
 	// chain (block at BIP34Height matches the expected BIP34Hash), unique coinbase
 	// heights make duplicates structurally impossible.
-	// Mirrors: validation.cpp:2460-2462.
-	if enforce && height >= params.BIP34Height && ancestorHashAt != nil && !params.BIP34Hash.IsZero() {
+	//
+	// W93 fix #5 (use PREVIOUS block's ancestor): Bitcoin Core looks up the
+	// ancestor of pindex->pprev (validation.cpp:2460), not pindex itself. The
+	// distinction matters at exactly height == BIP34Height: pprev sits at
+	// BIP34Height-1 and has NO ancestor at BIP34Height, so Core leaves
+	// fEnforceBIP30 = true. The previous blockbrew code used the current node
+	// (height == BIP34Height) for the ancestor lookup, returning the block's
+	// own hash. If that hash happened to equal BIP34Hash the short-circuit
+	// fired one block too early. The fix is to compare against ancestor at
+	// (height-1) which mirrors Core. For height > BIP34Height the result is
+	// identical to the previous code.
+	if enforce && height > params.BIP34Height && ancestorHashAt != nil && !params.BIP34Hash.IsZero() {
 		if ancHash, ok := ancestorHashAt(params.BIP34Height); ok && ancHash == params.BIP34Hash {
 			enforce = false
 		}
