@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/big"
 	"math/rand/v2"
 	"runtime"
 	"sync"
@@ -251,6 +252,13 @@ type SyncManager struct {
 	// in a batch, reset on the first connecting batch, and triggers
 	// disconnect once it would exceed MaxNumUnconnectingHeadersMsgs.
 	unconnectingHeaders map[string]int
+
+	// peerHeadersSync tracks the per-peer HeadersSyncState for the
+	// PRESYNC/REDOWNLOAD pipeline (Bitcoin Core headerssync.cpp, Core 24+).
+	// A state is created when we start syncing headers with a peer whose
+	// chain work is below nMinimumChainWork, and destroyed when the sync
+	// completes, fails, or the peer disconnects.  Protected by mu.
+	peerHeadersSync map[string]*HeadersSyncState
 }
 
 // ChainConnector is the interface for connecting blocks to the chain.
@@ -334,6 +342,7 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		nextStaleTipCheck: now.Add(StaleTipCheckInterval),
 		pruner:            config.Pruner,
 		unconnectingHeaders: make(map[string]int),
+		peerHeadersSync:     make(map[string]*HeadersSyncState),
 	}
 	// IBD starts true from the moment the sync manager is created; it is
 	// only latched to false by updateIBDStatus() once the chain tip is
@@ -461,11 +470,61 @@ func (sm *SyncManager) startHeaderSync() {
 	sm.syncPeer = syncPeer
 	log.Printf("sync: starting header sync with %s (height %d)", syncPeer.Address(), syncPeer.StartHeight())
 
+	addr := syncPeer.Address()
+
+	// Determine whether we need the PRESYNC/REDOWNLOAD pipeline.
+	// We use it when our current chain tip has less work than nMinimumChainWork,
+	// meaning we cannot yet trust that the peer's chain is legitimate.
+	// This matches Bitcoin Core net_processing.cpp::ProcessHeadersMessage:
+	// "if we're in initial headers sync and the peer's chain doesn't have enough
+	//  work, start the headerssync process."
+	if sm.needsHeadersSync() {
+		chainStart := sm.headerIndex.BestTip()
+		minWork := sm.computeMinimumRequiredWork()
+		delete(sm.peerHeadersSync, addr) // clear any stale state
+		sm.peerHeadersSync[addr] = NewHeadersSyncState(addr, sm.chainParams, chainStart, minWork)
+		log.Printf("sync: starting PRESYNC pipeline with %s (tip_work < min_work)", addr)
+	}
+
 	// Build locator from our current best tip
 	locator := sm.headerIndex.BestTip().BuildLocator()
 
 	// Send getheaders request
 	sm.sendGetHeaders(syncPeer, locator)
+}
+
+// needsHeadersSync returns true if our current chain tip has less work than
+// nMinimumChainWork, meaning we should use the PRESYNC/REDOWNLOAD pipeline.
+// Must be called with sm.mu held.
+func (sm *SyncManager) needsHeadersSync() bool {
+	minWork := sm.chainParams.MinimumChainWork
+	if minWork == nil || minWork.Sign() == 0 {
+		return false
+	}
+	tip := sm.headerIndex.BestTip()
+	if tip == nil || tip.TotalWork == nil {
+		return true // no tip means definitely below threshold
+	}
+	return tip.TotalWork.Cmp(minWork) < 0
+}
+
+// computeMinimumRequiredWork returns the minimum chain work threshold that a
+// peer's chain must meet.  This is the greater of the chain tip's work and
+// nMinimumChainWork, matching Bitcoin Core net_processing.cpp:2643.
+func (sm *SyncManager) computeMinimumRequiredWork() *big.Int {
+	chainMinWork := sm.chainParams.MinimumChainWork
+	if chainMinWork == nil {
+		chainMinWork = big.NewInt(0)
+	}
+	tip := sm.headerIndex.BestTip()
+	if tip == nil || tip.TotalWork == nil {
+		return new(big.Int).Set(chainMinWork)
+	}
+	tipWork := tip.TotalWork
+	if tipWork.Cmp(chainMinWork) > 0 {
+		return new(big.Int).Set(tipWork)
+	}
+	return new(big.Int).Set(chainMinWork)
 }
 
 // sendGetHeaders sends a getheaders message to a peer.
@@ -513,6 +572,11 @@ func (sm *SyncManager) selectSyncPeer() *Peer {
 
 // HandleHeaders processes a received headers message.
 // This should be called from the peer manager's OnHeaders callback.
+//
+// When our chain work is below nMinimumChainWork the PRESYNC/REDOWNLOAD
+// pipeline (Bitcoin Core headerssync.cpp) is used to avoid committing low-work
+// headers to permanent memory.  Headers are only passed to headerIndex.AddHeader
+// once the pipeline has verified they sit on a chain with sufficient PoW.
 func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
@@ -528,6 +592,71 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 		return
 	}
 
+	addr := peer.Address()
+
+	// -----------------------------------------------------------------------
+	// PRESYNC / REDOWNLOAD pipeline (Core headerssync.cpp)
+	// -----------------------------------------------------------------------
+	// If a HeadersSyncState exists for this peer, route the batch through it.
+	// The pipeline returns either:
+	//   - Success=false → disconnect/penalise the peer, abandon sync.
+	//   - Success=true + RequestMore=true → send a follow-up GETHEADERS.
+	//   - POWValidatedHeaders non-empty → promote these to the normal path.
+	// Once the state transitions to FINAL (i.e. success=true, request_more=false)
+	// we delete it and fall through to the normal completion logic.
+	if hss, ok := sm.peerHeadersSync[addr]; ok {
+		fullMsg := len(msg.Headers) == MaxHeadersPerRequest
+		result := hss.ProcessNextHeaders(msg.Headers, fullMsg)
+
+		if !result.Success {
+			// Peer violated the protocol — penalise and restart.
+			log.Printf("headerssync: pipeline failure with peer=%s, disconnecting", addr)
+			delete(sm.peerHeadersSync, addr)
+			peer.Misbehaving(ScoreHeadersDontConnect, "headerssync pipeline failure")
+			peer.Disconnect()
+			sm.syncPeer = nil
+			go sm.startHeaderSync()
+			return
+		}
+
+		if result.RequestMore {
+			// Still in PRESYNC or REDOWNLOAD — ask for the next batch.
+			locator := hss.NextLocator(func(height int32) wire.Hash256 {
+				n := sm.headerIndex.BestTip().GetAncestor(height)
+				if n == nil {
+					return wire.Hash256{}
+				}
+				return n.Hash
+			})
+			if len(locator) == 0 {
+				locator = sm.headerIndex.BestTip().BuildLocator()
+			}
+			sm.sendGetHeaders(peer, locator)
+			return
+		}
+
+		// Pipeline complete (FINAL): promote the PoW-validated headers.
+		delete(sm.peerHeadersSync, addr)
+		if len(result.POWValidatedHeaders) > 0 {
+			sm.addValidatedHeaders(peer, result.POWValidatedHeaders)
+		}
+		// After a successful PRESYNC/REDOWNLOAD cycle the pipeline produced
+		// all confirmed headers; continue to the regular completion path below.
+		// If addValidatedHeaders already triggered sync completion, the guard
+		// at the bottom will be a no-op.
+		return
+	}
+	// -----------------------------------------------------------------------
+	// Normal path (chain already above nMinimumChainWork)
+	// -----------------------------------------------------------------------
+	sm.addValidatedHeaders(peer, msg.Headers)
+}
+
+// addValidatedHeaders inserts a batch of headers (already PoW-vetted) into the
+// header index and drives the normal sync-completion / block-download logic.
+// The caller must hold sm.mu.
+func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeader) {
+	addr := peer.Address()
 	startHeight := sm.headerIndex.BestHeight()
 	headersAdded := 0
 
@@ -545,11 +674,11 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	// turns out to be invalid.
 	var pendingHeaders []storage.HeaderBatchEntry
 	if sm.chainDB != nil {
-		pendingHeaders = make([]storage.HeaderBatchEntry, 0, len(msg.Headers))
+		pendingHeaders = make([]storage.HeaderBatchEntry, 0, len(headers))
 	}
 
-	for i := range msg.Headers {
-		hdr := msg.Headers[i]
+	for i := range headers {
+		hdr := headers[i]
 		node, err := sm.headerIndex.AddHeader(hdr)
 		if err != nil {
 			if err == consensus.ErrDuplicateHeader {
@@ -568,7 +697,6 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 			// CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
 			// (Pattern B).
 			if err == consensus.ErrOrphanHeader && i == 0 {
-				addr := peer.Address()
 				sm.unconnectingHeaders[addr]++
 				count := sm.unconnectingHeaders[addr]
 				// Flush any earlier-good headers before bailing.
@@ -625,7 +753,7 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 				}
 			}
 			log.Printf("sync: bad header from %s at height %d: %v",
-				peer.Address(), sm.headerIndex.BestHeight()+1, err)
+				addr, sm.headerIndex.BestHeight()+1, err)
 			// Flush any headers we accepted before the bad one so crash
 			// recovery sees them.
 			if sm.chainDB != nil && len(pendingHeaders) > 0 {
@@ -647,7 +775,7 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 		if sm.chainDB != nil {
 			pendingHeaders = append(pendingHeaders, storage.HeaderBatchEntry{
 				Hash:   node.Hash,
-				Header: &msg.Headers[i],
+				Header: &headers[i],
 			})
 		}
 	}
@@ -667,7 +795,7 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 		// successfully-connecting batch from this peer.  Mirrors
 		// nUnconnectingHeaders = 0 in the success path of
 		// net_processing.cpp::ProcessHeadersMessage.
-		delete(sm.unconnectingHeaders, peer.Address())
+		delete(sm.unconnectingHeaders, addr)
 	}
 
 	// W17 chainmgr-startup recovery: if the chain manager is still holding
@@ -703,7 +831,7 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	}
 
 	// Check if we received a full batch
-	if len(msg.Headers) == MaxHeadersPerRequest {
+	if len(headers) == MaxHeadersPerRequest {
 		// More headers available — request next batch
 		locator := sm.headerIndex.BestTip().BuildLocator()
 		sm.sendGetHeaders(peer, locator)
@@ -768,11 +896,15 @@ func (sm *SyncManager) HandlePeerDisconnected(peer *Peer) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 
+	// Clean up any PRESYNC/REDOWNLOAD state for this peer.
+	addr := peer.Address()
+	delete(sm.peerHeadersSync, addr)
+
 	// If our sync peer disconnected, find a new one
 	if peer == sm.syncPeer {
 		sm.syncPeer = nil
 		if !sm.headersSynced {
-			log.Printf("sync: sync peer %s disconnected, finding new peer", peer.Address())
+			log.Printf("sync: sync peer %s disconnected, finding new peer", addr)
 			// Release lock before starting sync
 			sm.mu.Unlock()
 			sm.startHeaderSync()
