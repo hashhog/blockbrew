@@ -60,6 +60,14 @@ type ChainParams struct {
 
 	// NetworkMagic is the 4-byte message start bytes for this network.
 	NetworkMagic [4]byte
+
+	// MinimumChainWork is the minimum cumulative chain work required to
+	// consider a headers chain worth storing.  Mirrors Bitcoin Core's
+	// Consensus::Params::nMinimumChainWork.  Used by HeadersSyncState to
+	// determine when the PRESYNC phase has seen enough work to transition
+	// to REDOWNLOAD.  Must be non-nil; use big.NewInt(0) for networks with
+	// no effective threshold (e.g. regtest).
+	MinimumChainWork *big.Int
 }
 
 // mainnetPowLimit is the highest proof of work value a Bitcoin block can have
@@ -190,6 +198,14 @@ func MainnetParams() *ChainParams {
 
 		// Network magic (message start bytes)
 		NetworkMagic: [4]byte{0xf9, 0xbe, 0xb4, 0xd9},
+
+		// Minimum chain work for mainnet (Core kernel/chainparams.cpp:109).
+		// "0000000000000000000000000000000000000001128750f82f4c366153a3a030"
+		MinimumChainWork: func() *big.Int {
+			n := new(big.Int)
+			n.SetString("0000000000000000000000000000000000000001128750f82f4c366153a3a030", 16)
+			return n
+		}(),
 	}
 	return mainnetParams
 }
@@ -268,6 +284,14 @@ func TestnetParams() *ChainParams {
 
 		// Network magic
 		NetworkMagic: [4]byte{0x0b, 0x11, 0x09, 0x07},
+
+		// Minimum chain work for testnet3 (Core kernel/chainparams.cpp:232).
+		// "0000000000000000000000000000000000000000000017dde1c649f3708d14b6"
+		MinimumChainWork: func() *big.Int {
+			n := new(big.Int)
+			n.SetString("0000000000000000000000000000000000000000000017dde1c649f3708d14b6", 16)
+			return n
+		}(),
 	}
 	return testnetParams
 }
@@ -325,6 +349,9 @@ func RegtestParams() *ChainParams {
 
 		// Network magic
 		NetworkMagic: [4]byte{0xfa, 0xbf, 0xb5, 0xda},
+
+		// Regtest: no minimum chain work (accept any chain for testing).
+		MinimumChainWork: big.NewInt(0),
 	}
 	return regtestParams
 }
@@ -385,6 +412,14 @@ func SignetParams() *ChainParams {
 
 		// Network magic
 		NetworkMagic: [4]byte{0x0a, 0x03, 0xcf, 0x40},
+
+		// Minimum chain work for signet (Core kernel/chainparams.cpp:423).
+		// "00000000000000000000000000000000000000000000000000000b463ea0a4b8"
+		MinimumChainWork: func() *big.Int {
+			n := new(big.Int)
+			n.SetString("00000000000000000000000000000000000000000000000000000b463ea0a4b8", 16)
+			return n
+		}(),
 	}
 	return signetParams
 }
@@ -455,6 +490,14 @@ func Testnet4Params() *ChainParams {
 
 		// Network magic
 		NetworkMagic: [4]byte{0x1c, 0x16, 0x3f, 0x28},
+
+		// Minimum chain work for testnet4 (Core kernel/chainparams.cpp:332).
+		// "0000000000000000000000000000000000000000000009a0fe15d0177d086304"
+		MinimumChainWork: func() *big.Int {
+			n := new(big.Int)
+			n.SetString("0000000000000000000000000000000000000000000009a0fe15d0177d086304", 16)
+			return n
+		}(),
 	}
 	return testnet4Params
 }
