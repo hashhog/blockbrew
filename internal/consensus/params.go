@@ -80,6 +80,20 @@ const (
 	// MinTransactionSize is the minimum transaction size (60 bytes for a non-witness tx).
 	MinTransactionSize = 60
 
+	// MinTransactionWeight is the minimum weight for a valid transaction (BIP141).
+	// 60 is the lower bound for the size of a valid serialized CTransaction;
+	// weight = 60 × WITNESS_SCALE_FACTOR = 240 WU.
+	// Mirrors Bitcoin Core consensus/consensus.h:23
+	//   MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60.
+	MinTransactionWeight = WitnessScaleFactor * MinTransactionSize // 240
+
+	// MinSerializableTransactionWeight is the minimum weight for a serializable
+	// (but not necessarily consensus-valid) transaction.
+	// 10 is the lower bound for the size of a serialized CTransaction.
+	// Mirrors Bitcoin Core consensus/consensus.h:24
+	//   MIN_SERIALIZABLE_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 10.
+	MinSerializableTransactionWeight = WitnessScaleFactor * 10 // 40
+
 	// MaxStandardTxWeight is the max weight of a "standard" transaction (400,000 WU).
 	MaxStandardTxWeight = 400_000
 
@@ -97,6 +111,11 @@ const (
 	// allowed across an entire standard transaction (BIP-54 gate).
 	// Core: policy/policy.h:46  MAX_TX_LEGACY_SIGOPS = 2_500.
 	MaxTxLegacySigOps = 2_500
+
+	// DefaultBytesPerSigOp is the vbyte cost per sigop for the sigop-adjusted vsize
+	// calculation used in mempool fee/priority accounting.
+	// Mirrors Bitcoin Core policy/policy.h:50  DEFAULT_BYTES_PER_SIGOP = 20.
+	DefaultBytesPerSigOp = 20
 
 	// DustRelayFeeRate is the fee rate below which outputs are considered dust (3000 sat/kvB).
 	DustRelayFeeRate int64 = 3000
