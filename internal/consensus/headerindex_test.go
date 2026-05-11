@@ -785,3 +785,377 @@ func TestAddHeaderAcceptsTimestampAtFutureBoundary(t *testing.T) {
 		t.Fatalf("AddHeader(boundary) node = %+v, want height 1", node)
 	}
 }
+
+// buildBIP94Chain builds a chain of n blocks (heights 1..n) suitable for
+// testing the BIP-94 timewarp gate.  The first n-1 blocks have small,
+// monotonically increasing timestamps so that the MTP at block n-1 is low.
+// The last block (n) has a much larger timestamp; this is used as the "prev"
+// when testing whether a boundary block is accepted or rejected.
+//
+// The trick: to isolate the BIP-94 gate from the MTP gate we need a chain
+// where MTP << prevBlock.Timestamp.  We achieve this by making blocks 1..10
+// advance their timestamps by only 1 second each, then giving block 11 a big
+// jump.  The MTP at block 11 is then approximately genesis+5 (median of 11
+// values in a slowly-increasing series), while block 11's own timestamp is far
+// above that.
+//
+// Returns the HeaderIndex and the tip BlockNode (height n).
+func buildBIP94Chain(t *testing.T, params *ChainParams, n int, pinnedNow int64) (*HeaderIndex, *BlockNode) {
+	t.Helper()
+	idx := NewHeaderIndex(params)
+
+	// Blocks 1..(n-1): slow-walk timestamps so MTP stays low.
+	genTS := int64(params.GenesisBlock.Header.Timestamp)
+	prevNode := idx.genesis
+	for i := 1; i < n; i++ {
+		ts := uint32(genTS + int64(i)) // +1s per block
+		hdr := createTestHeader(prevNode.Hash, ts, uint32(i))
+		node, err := idx.AddHeader(hdr)
+		if err != nil {
+			t.Fatalf("buildBIP94Chain height %d: AddHeader err = %v", i, err)
+		}
+		prevNode = node
+	}
+
+	// Block n: big timestamp jump so block n's timestamp is well above MTP.
+	bigTS := uint32(pinnedNow - 20_000)
+	hdrN := createTestHeader(prevNode.Hash, bigTS, uint32(n))
+	nodeN, err := idx.AddHeader(hdrN)
+	if err != nil {
+		t.Fatalf("buildBIP94Chain height %d (big-jump): AddHeader err = %v", n, err)
+	}
+	return idx, nodeN
+}
+
+// TestBIP94TimewarpRejected verifies that AddHeader rejects a block at a
+// difficulty adjustment boundary whose timestamp is more than MaxTimewarp (600s)
+// behind the previous block's timestamp (validation.cpp:4097-4104,
+// "time-timewarp-attack").
+//
+// Strategy: use DifficultyAdjInterval=12, build heights 1..11 with slow-
+// walking timestamps + a big jump on h11, then test h12 (the boundary).
+// At h11 the MTP is approximately genesis+5 (well below bigTS), so a
+// candidate timestamp of bigTS - MaxTimewarp - 1 passes the MTP gate but
+// fails the BIP-94 gate.
+func TestBIP94TimewarpRejected(t *testing.T) {
+	params := *RegtestParams()
+	params.EnforceBIP94 = true
+	params.DifficultyAdjInterval = 12 // boundary at height 12
+	params.TargetTimespan = 12 * 10 * 60
+	params.TargetSpacing = 10 * 60
+
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	idx, node11 := buildBIP94Chain(t, &params, 11, pinnedNow)
+
+	// Height 12 is the first adjustment boundary.
+	// timestamp = node11.Timestamp - MaxTimewarp - 1 → ErrTimeWarpAttack.
+	tooEarlyTS := uint32(int64(node11.Header.Timestamp) - MaxTimewarp - 1)
+
+	// Sanity: tooEarlyTS must be above MTP at node11 (otherwise MTP fires first).
+	mtp11 := node11.GetMedianTimePast()
+	if int64(tooEarlyTS) <= mtp11 {
+		t.Skipf("tooEarlyTS %d <= MTP %d; test precondition not met — bigTS too small?",
+			tooEarlyTS, mtp11)
+	}
+
+	h12bad := createTestHeader(node11.Hash, tooEarlyTS, 1)
+	_, err := idx.AddHeader(h12bad)
+	if err != ErrTimeWarpAttack {
+		t.Fatalf("height 12 (timewarp attack): AddHeader err = %v, want ErrTimeWarpAttack", err)
+	}
+
+	// Index must not have grown beyond genesis + h1..h11.
+	if idx.NodeCount() != 12 {
+		t.Errorf("NodeCount = %d after rejected timewarp header, want 12", idx.NodeCount())
+	}
+}
+
+// TestBIP94TimewarpBoundaryAccepted verifies that a block at the adjustment
+// boundary with timestamp exactly equal to prevBlock.Timestamp - MaxTimewarp
+// is accepted (the check is strict less-than, so the boundary value is valid).
+// Core: block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP
+func TestBIP94TimewarpBoundaryAccepted(t *testing.T) {
+	params := *RegtestParams()
+	params.EnforceBIP94 = true
+	params.DifficultyAdjInterval = 12
+	params.TargetTimespan = 12 * 10 * 60
+	params.TargetSpacing = 10 * 60
+
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	idx, node11 := buildBIP94Chain(t, &params, 11, pinnedNow)
+
+	// Exactly at the boundary: prevTS - MaxTimewarp.
+	// Core rejects strictly less than, so this exact value is valid.
+	boundaryTS := uint32(int64(node11.Header.Timestamp) - MaxTimewarp)
+
+	mtp11 := node11.GetMedianTimePast()
+	if int64(boundaryTS) <= mtp11 {
+		t.Skipf("boundaryTS %d <= MTP %d; test precondition not met", boundaryTS, mtp11)
+	}
+
+	h12 := createTestHeader(node11.Hash, boundaryTS, 1)
+	node12, err := idx.AddHeader(h12)
+	if err != nil {
+		t.Fatalf("height 12 (timewarp boundary exact): AddHeader err = %v, want nil", err)
+	}
+	if node12 == nil || node12.Height != 12 {
+		t.Fatalf("height 12 (timewarp boundary exact): node = %+v, want height 12", node12)
+	}
+}
+
+// TestBIP94TimewarpNotAppliedOnMainnet verifies that the timewarp check is
+// skipped for networks without EnforceBIP94 (e.g., mainnet).
+func TestBIP94TimewarpNotAppliedOnMainnet(t *testing.T) {
+	params := *RegtestParams()
+	params.EnforceBIP94 = false
+	params.DifficultyAdjInterval = 12
+	params.TargetTimespan = 12 * 10 * 60
+	params.TargetSpacing = 10 * 60
+
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	idx, node11 := buildBIP94Chain(t, &params, 11, pinnedNow)
+
+	// Timestamp that would fail BIP-94 (< prevTS - MaxTimewarp - 1)
+	// but must pass without EnforceBIP94.
+	tooEarlyTS := uint32(int64(node11.Header.Timestamp) - MaxTimewarp - 1)
+
+	mtp11 := node11.GetMedianTimePast()
+	if int64(tooEarlyTS) <= mtp11 {
+		t.Skipf("tooEarlyTS %d <= MTP %d; test precondition not met", tooEarlyTS, mtp11)
+	}
+
+	h12 := createTestHeader(node11.Hash, tooEarlyTS, 1)
+	_, err := idx.AddHeader(h12)
+	if err != nil {
+		t.Fatalf("height 12 (no BIP94 enforcement): AddHeader err = %v, want nil", err)
+	}
+}
+
+// TestBIP94TimewarpNotAppliedAtNonAdjustmentHeight verifies that the timewarp
+// check fires only at adjustment boundaries, not at intermediate heights.
+func TestBIP94TimewarpNotAppliedAtNonAdjustmentHeight(t *testing.T) {
+	// DifficultyAdjInterval = 12 so boundary is at height 12.
+	// Heights 1..11 are not boundaries — even a large backwards jump is OK.
+	params := *RegtestParams()
+	params.EnforceBIP94 = true
+	params.DifficultyAdjInterval = 12
+	params.TargetTimespan = 12 * 10 * 60
+	params.TargetSpacing = 10 * 60
+
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	// Build heights 1..10 slowly, then attempt height 11 (non-boundary) with
+	// a timestamp far behind the previous block but above the chain MTP.
+	idx, node10 := buildBIP94Chain(t, &params, 10, pinnedNow)
+
+	// node10 has a big-jump timestamp (pinnedNow - 20_000).
+	// Height 11 is NOT a boundary (11 % 12 != 0), so a far-back timestamp
+	// should be accepted (subject only to MTP).
+	tooEarlyTS := uint32(int64(node10.Header.Timestamp) - MaxTimewarp - 1)
+
+	mtp10 := node10.GetMedianTimePast()
+	if int64(tooEarlyTS) <= mtp10 {
+		t.Skipf("tooEarlyTS %d <= MTP %d; test precondition not met", tooEarlyTS, mtp10)
+	}
+
+	h11 := createTestHeader(node10.Hash, tooEarlyTS, 1)
+	_, err := idx.AddHeader(h11)
+	if err != nil {
+		t.Fatalf("height 11 (non-boundary with BIP94): AddHeader err = %v, want nil", err)
+	}
+}
+
+// TestGetMedianTimePastN1 verifies GetMedianTimePast for a chain of exactly 1
+// block (the genesis itself): MTP == genesis timestamp.
+func TestGetMedianTimePastN1(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	mtp := idx.genesis.GetMedianTimePast()
+	if mtp != int64(params.GenesisBlock.Header.Timestamp) {
+		t.Errorf("N=1 MTP = %d, want %d", mtp, params.GenesisBlock.Header.Timestamp)
+	}
+}
+
+// TestGetMedianTimePastN5 verifies GetMedianTimePast for a chain of 5 blocks.
+// With 5 timestamps sorted, the median is at index 2.
+func TestGetMedianTimePastN5(t *testing.T) {
+	params := RegtestParams()
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	idx := NewHeaderIndex(params)
+
+	// Build 5 blocks with monotonically increasing timestamps.
+	timestamps := []uint32{
+		params.GenesisBlock.Header.Timestamp, // height 0
+		uint32(pinnedNow - 40_000),           // height 1
+		uint32(pinnedNow - 30_000),           // height 2
+		uint32(pinnedNow - 20_000),           // height 3
+		uint32(pinnedNow - 10_000),           // height 4
+		uint32(pinnedNow - 5_000),            // height 5
+	}
+
+	prevNode := idx.genesis
+	for i := 1; i < len(timestamps); i++ {
+		hdr := createTestHeader(prevNode.Hash, timestamps[i], uint32(i))
+		node, err := idx.AddHeader(hdr)
+		if err != nil {
+			t.Fatalf("height %d: AddHeader err = %v", i, err)
+		}
+		prevNode = node
+	}
+
+	// At height 5, MTP = GetMedianTimePast() of node at height 5.
+	// Collects timestamps from heights 5,4,3,2,1 (5 values since 5 < 11).
+	// Sorted ascending, median = index 5/2 = index 2.
+	ts := timestamps[1:] // heights 1..5, most-recent-first in collection
+	_ = ts               // collected in descending order then sorted
+	// Sorted: ts[4]<ts[3]<ts[2]<ts[1]<ts[0]  (all ascending already)
+	// After sort: [pinnedNow-40k, pinnedNow-30k, pinnedNow-20k, pinnedNow-10k, pinnedNow-5k]
+	// Median at [5/2] = [2] = pinnedNow-20k
+	expected := int64(pinnedNow - 20_000)
+	got := prevNode.GetMedianTimePast()
+	if got != expected {
+		t.Errorf("N=5 MTP = %d, want %d", got, expected)
+	}
+}
+
+// TestGetMedianTimePastN10 verifies the 10-block case (just below the 11-block cap).
+func TestGetMedianTimePastN10(t *testing.T) {
+	params := RegtestParams()
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	idx := NewHeaderIndex(params)
+
+	// Build 10 additional blocks (heights 1..10).
+	prevNode := idx.genesis
+	for i := 1; i <= 10; i++ {
+		ts := uint32(pinnedNow - int64(11-i)*10_000)
+		hdr := createTestHeader(prevNode.Hash, ts, uint32(i))
+		node, err := idx.AddHeader(hdr)
+		if err != nil {
+			t.Fatalf("height %d: AddHeader err = %v", i, err)
+		}
+		prevNode = node
+	}
+
+	// At height 10, MTP collects from heights 10..0 (11 entries including
+	// genesis, since 10 < MedianTimeSpan).
+	// Values: genesis (1296688602), h1 (pinnedNow-100k), h2 (pinnedNow-90k),
+	//         ..., h10 (pinnedNow-10k).
+	// After sort: [genesis, pinnedNow-100k, -90k, -80k, -70k, -60k,
+	//              -50k, -40k, -30k, -20k, -10k] (11 values, genesis is tiny).
+	// Median at [11/2] = [5] = the 6th value = pinnedNow-60k
+	expected := int64(pinnedNow - 60_000)
+	got := prevNode.GetMedianTimePast()
+	if got != expected {
+		t.Errorf("N=10 MTP = %d, want %d", got, expected)
+	}
+}
+
+// TestGetMedianTimePastN12 verifies that GetMedianTimePast caps at 11 entries
+// even when more than 11 ancestors exist.  A chain of 12 blocks should use
+// only the most-recent 11 timestamps.
+func TestGetMedianTimePastN12(t *testing.T) {
+	params := RegtestParams()
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	idx := NewHeaderIndex(params)
+
+	// Build 12 blocks.  Heights 1..12; timestamps ascending.
+	prevNode := idx.genesis
+	for i := 1; i <= 12; i++ {
+		ts := uint32(pinnedNow - int64(13-i)*10_000)
+		hdr := createTestHeader(prevNode.Hash, ts, uint32(i))
+		node, err := idx.AddHeader(hdr)
+		if err != nil {
+			t.Fatalf("height %d: AddHeader err = %v", i, err)
+		}
+		prevNode = node
+	}
+
+	// At height 12, MTP collects from heights 12..2 (11 entries, capped).
+	// Heights 2..12 timestamps: pinnedNow-110k, -100k, ..., -10k
+	// (heights 2 through 12 inclusive, values -110k to -10k in steps of 10k)
+	// After sort: same order.  Median at [11/2] = [5] = pinnedNow-60k
+	expected := int64(pinnedNow - 60_000)
+	got := prevNode.GetMedianTimePast()
+	if got != expected {
+		t.Errorf("N=12 MTP (capped at 11) = %d, want %d", got, expected)
+	}
+}
+
+// TestMTPTimeOldBoundaryStrict verifies that the MTP check is strict (<=),
+// not non-strict.  A block with timestamp == MTP must be rejected; a block
+// with timestamp == MTP+1 must be accepted.
+func TestMTPTimeOldBoundaryStrict(t *testing.T) {
+	params := RegtestParams()
+	pinnedNow := int64(2_000_000_000)
+	prevNow := headerNowUnix
+	headerNowUnix = func() int64 { return pinnedNow }
+	defer func() { headerNowUnix = prevNow }()
+
+	idx := NewHeaderIndex(params)
+
+	// Build 11 blocks with known timestamps so we can predict MTP exactly.
+	timestamps := [12]uint32{
+		params.GenesisBlock.Header.Timestamp, // height 0 — genesis
+	}
+	for i := 1; i <= 11; i++ {
+		timestamps[i] = uint32(pinnedNow - int64(12-i)*1_000)
+	}
+	prevNode := idx.genesis
+	for i := 1; i <= 11; i++ {
+		hdr := createTestHeader(prevNode.Hash, timestamps[i], uint32(i))
+		node, err := idx.AddHeader(hdr)
+		if err != nil {
+			t.Fatalf("height %d: AddHeader err = %v", i, err)
+		}
+		prevNode = node
+	}
+
+	// MTP at height 11: collects timestamps[1..11] (11 values), sorted ascending,
+	// median at index 5.
+	mtp := prevNode.GetMedianTimePast()
+
+	// Reject: timestamp == MTP (strict <=).
+	badHdr := createTestHeader(prevNode.Hash, uint32(mtp), 1)
+	_, err := idx.AddHeader(badHdr)
+	if err != ErrTimestampTooEarly {
+		t.Fatalf("timestamp == MTP: AddHeader err = %v, want ErrTimestampTooEarly", err)
+	}
+
+	// Accept: timestamp == MTP + 1.
+	goodHdr := createTestHeader(prevNode.Hash, uint32(mtp)+1, 2)
+	node12, err := idx.AddHeader(goodHdr)
+	if err != nil {
+		t.Fatalf("timestamp == MTP+1: AddHeader err = %v, want nil", err)
+	}
+	if node12 == nil || node12.Height != 12 {
+		t.Fatalf("timestamp == MTP+1: node = %+v, want height 12", node12)
+	}
+}
