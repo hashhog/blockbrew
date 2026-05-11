@@ -1666,10 +1666,13 @@ func TestBIP22ResultString(t *testing.T) {
 		{consensus.ErrTimestampBeforeMTP, "time-too-old"},
 		{consensus.ErrTimestampTooEarly, "time-too-old"},
 		{consensus.ErrTimestampTooFar, "time-too-new"},
+		// Sequence locks not met — Core maps to "bad-txns-nonfinal" (validation.cpp:2558)
+		{consensus.ErrSequenceLockNotMet, "bad-txns-nonfinal"},
+		// Also wrapped (ConnectBlock path)
+		{fmt.Errorf("tx 1: %w", consensus.ErrSequenceLockNotMet), "bad-txns-nonfinal"},
 		// Catch-all
 		{consensus.ErrNoTransactions, "rejected"},
 		{consensus.ErrFirstTxNotCoinbase, "rejected"},
-		{consensus.ErrSequenceLockNotMet, "rejected"},
 	}
 
 	for _, tc := range tests {
