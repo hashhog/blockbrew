@@ -1743,3 +1743,458 @@ func TestBIP30ExceptionHeights(t *testing.T) {
 		}
 	}
 }
+
+// buildSegwitBlock assembles a minimal segwit block:
+// - one coinbase with a proper witness commitment output
+// - one coinbase input whose scriptWitness stack is the witnessStack parameter
+// Returns the block and the params with SegwitHeight=0 (always active).
+//
+// commitment = SHA256d(witnessMerkleRoot || nonce) where the witness merkle root
+// treats the coinbase wtxid as all-zeros.
+func buildSegwitBlock(t *testing.T, witnessStack [][]byte, extraOutputs ...*wire.TxOut) *wire.MsgBlock {
+	t.Helper()
+
+	// Build a minimal coinbase with OP_RETURN witness commitment and the
+	// provided witness stack.
+	coinbase := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x03, 0x01, 0x00, 0x00}, // BIP34 height=1
+			Sequence:         0xFFFFFFFF,
+			Witness:          witnessStack,
+		}},
+		TxOut: []*wire.TxOut{
+			{Value: 50_0000_0000, PkScript: []byte{0x51}}, // miner payout
+		},
+		LockTime: 0,
+	}
+
+	// Append any extra outputs before the commitment output so the test can
+	// exercise LAST-occurrence scan.
+	coinbase.TxOut = append(coinbase.TxOut, extraOutputs...)
+
+	// Compute the witness merkle root: coinbase wtxid = 0x00..00, no other txs.
+	nonce := witnessStack
+	var nonceBuf []byte
+	if len(nonce) == 1 && len(nonce[0]) == 32 {
+		nonceBuf = nonce[0]
+	} else {
+		nonceBuf = make([]byte, 32) // use zeros so computation doesn't panic
+	}
+	wtxids := []wire.Hash256{{}} // coinbase wtxid = all zeros (Gate 5)
+	witnessRoot := CalcWitnessMerkleRoot(wtxids)
+
+	// commitment = SHA256d(witnessRoot || nonce) — double-SHA256 (Gate 7)
+	data := make([]byte, 64)
+	copy(data[:32], witnessRoot[:])
+	copy(data[32:], nonceBuf)
+	commitment := wire.DoubleHashB(data)
+
+	// Build the OP_RETURN witness commitment script (38 bytes, Gate 2)
+	commitScript := make([]byte, 38)
+	commitScript[0] = 0x6a // OP_RETURN
+	commitScript[1] = 0x24 // push 36 bytes
+	commitScript[2] = 0xaa
+	commitScript[3] = 0x21
+	commitScript[4] = 0xa9
+	commitScript[5] = 0xed
+	copy(commitScript[6:], commitment[:])
+	coinbase.TxOut = append(coinbase.TxOut, &wire.TxOut{Value: 0, PkScript: commitScript})
+
+	txid := coinbase.TxHash()
+	root := CalcMerkleRoot([]wire.Hash256{txid})
+
+	return &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    0x20000000,
+			PrevBlock:  wire.Hash256{},
+			MerkleRoot: root,
+			Timestamp:  1231006505 + 1,
+			Bits:       0x207fffff,
+		},
+		Transactions: []*wire.MsgTx{coinbase},
+	}
+}
+
+// buildSegwitParams returns regtest params with SegwitHeight=0 (always active)
+// and all other soft-forks pushed above height 1 so they don't interfere.
+func buildSegwitParams() *ChainParams {
+	p := *RegtestParams()
+	p.SegwitHeight = 0
+	p.BIP34Height = 200_000
+	p.BIP65Height = 200_000
+	p.BIP66Height = 200_000
+	p.CSVHeight = 200_000
+	p.TaprootHeight = 200_000
+	return &p
+}
+
+// TestWitnessCommitment_Gate2_MinimumSize verifies Gate 2: MINIMUM_WITNESS_COMMITMENT=38.
+// A coinbase output whose PkScript is only 37 bytes (off-by-one) must be ignored
+// (not treated as a commitment), causing the block to be accepted with no commitment
+// expected (since no witness data in txs) OR rejected as missing commitment when
+// witness data is present.
+func TestWitnessCommitment_Gate2_MinimumSize(t *testing.T) {
+	params := buildSegwitParams()
+
+	// Build a 37-byte script that would otherwise match (one byte short of 38).
+	shortScript := make([]byte, 37)
+	shortScript[0] = 0x6a // OP_RETURN
+	shortScript[1] = 0x24
+	shortScript[2] = 0xaa
+	shortScript[3] = 0x21
+	shortScript[4] = 0xa9
+	shortScript[5] = 0xed
+	// only 31 bytes of commitment hash follow (not 32)
+
+	coinbase := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x03, 0x01, 0x00, 0x00},
+			Sequence:         0xFFFFFFFF,
+			Witness:          nil,
+		}},
+		TxOut: []*wire.TxOut{
+			{Value: 50_0000_0000, PkScript: []byte{0x51}},
+			{Value: 0, PkScript: shortScript}, // 37 bytes — too short
+		},
+		LockTime: 0,
+	}
+
+	txid := coinbase.TxHash()
+	root := CalcMerkleRoot([]wire.Hash256{txid})
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    0x20000000,
+			Timestamp:  1231006506,
+			MerkleRoot: root,
+			Bits:       0x207fffff,
+		},
+		Transactions: []*wire.MsgTx{coinbase},
+	}
+
+	// Block has no real witness data and no valid commitment (37 < 38).
+	// Should be accepted (no witness data → commitment is optional).
+	err := CheckBlockContext(block, nil, 1, params)
+	if err != nil {
+		t.Errorf("Gate2: 37-byte script (too short) must be ignored; block should pass, got: %v", err)
+	}
+}
+
+// TestWitnessCommitment_Gate3_LastOccurrence verifies Gate 3: the LAST matching
+// coinbase output wins (Core overwrites commitpos on every match; blockbrew scans
+// backward and breaks on first).
+func TestWitnessCommitment_Gate3_LastOccurrence(t *testing.T) {
+	params := buildSegwitParams()
+
+	// We build a block with two witness commitment outputs: one with a wrong hash
+	// (at index 1) and one with the correct hash (at index 2, the LAST one).
+	// Core uses the last one, so the block should pass.
+
+	validNonce := make([]byte, 32)
+	wtxids := []wire.Hash256{{}} // coinbase wtxid = zeros
+	witnessRoot := CalcWitnessMerkleRoot(wtxids)
+
+	data := make([]byte, 64)
+	copy(data[:32], witnessRoot[:])
+	copy(data[32:], validNonce)
+	correctCommitment := wire.DoubleHashB(data)
+
+	// Wrong commitment: all-0xff
+	wrongHash := make([]byte, 32)
+	for i := range wrongHash {
+		wrongHash[i] = 0xff
+	}
+
+	makeCommitScript := func(hash []byte) []byte {
+		s := make([]byte, 38)
+		s[0] = 0x6a
+		s[1] = 0x24
+		s[2] = 0xaa; s[3] = 0x21; s[4] = 0xa9; s[5] = 0xed
+		copy(s[6:], hash)
+		return s
+	}
+
+	coinbase := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x03, 0x01, 0x00, 0x00},
+			Sequence:         0xFFFFFFFF,
+			Witness:          [][]byte{validNonce},
+		}},
+		TxOut: []*wire.TxOut{
+			{Value: 50_0000_0000, PkScript: []byte{0x51}},
+			{Value: 0, PkScript: makeCommitScript(wrongHash)},   // FIRST — wrong
+			{Value: 0, PkScript: makeCommitScript(correctCommitment[:])}, // LAST — correct
+		},
+		LockTime: 0,
+	}
+	txid := coinbase.TxHash()
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version: 0x20000000, Timestamp: 1231006506,
+			MerkleRoot: CalcMerkleRoot([]wire.Hash256{txid}),
+			Bits:       0x207fffff,
+		},
+		Transactions: []*wire.MsgTx{coinbase},
+	}
+
+	// Must succeed: last commitment is correct.
+	if err := CheckBlockContext(block, nil, 1, params); err != nil {
+		t.Errorf("Gate3 (last wins): should accept block with correct LAST commitment, got: %v", err)
+	}
+
+	// Now flip: first is correct, last is wrong → should FAIL.
+	coinbase2 := *coinbase
+	txin2 := *coinbase.TxIn[0]
+	txin2.Witness = [][]byte{validNonce}
+	coinbase2.TxIn = []*wire.TxIn{&txin2}
+	coinbase2.TxOut = []*wire.TxOut{
+		{Value: 50_0000_0000, PkScript: []byte{0x51}},
+		{Value: 0, PkScript: makeCommitScript(correctCommitment[:])}, // FIRST — correct
+		{Value: 0, PkScript: makeCommitScript(wrongHash)},             // LAST — wrong
+	}
+	txid2 := coinbase2.TxHash()
+	block2 := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version: 0x20000000, Timestamp: 1231006506,
+			MerkleRoot: CalcMerkleRoot([]wire.Hash256{txid2}),
+			Bits:       0x207fffff,
+		},
+		Transactions: []*wire.MsgTx{&coinbase2},
+	}
+	if err := CheckBlockContext(block2, nil, 1, params); err == nil {
+		t.Error("Gate3 (last wins): should reject block where LAST commitment is wrong but FIRST is correct")
+	}
+}
+
+// TestWitnessCommitment_Gate5_CoinbaseWtxidZeros verifies Gate 5: the coinbase
+// wtxid used in the witness merkle tree is 0x00..00 (not the real txid/wtxid).
+// This is enforced by CalcWitnessMerkleRoot: it zeroes index 0.
+func TestWitnessCommitment_Gate5_CoinbaseWtxidZeros(t *testing.T) {
+	params := buildSegwitParams()
+
+	// Build a block where the commitment is computed with coinbase wtxid = zeros.
+	nonce := make([]byte, 32)
+	block := buildSegwitBlock(t, [][]byte{nonce})
+
+	if err := CheckBlockContext(block, nil, 1, params); err != nil {
+		t.Errorf("Gate5: block with coinbase-wtxid=zeros commitment should pass, got: %v", err)
+	}
+
+	// Now corrupt the commitment to use the real coinbase txid instead of zeros.
+	coinbase := block.Transactions[0]
+	realWtxid := coinbase.WTxHash() // real witness txid
+	wtxidsReal := []wire.Hash256{realWtxid}
+	witnessRootBad := CalcMerkleRoot(wtxidsReal) // using real txid, not zeros
+
+	data := make([]byte, 64)
+	copy(data[:32], witnessRootBad[:])
+	copy(data[32:], nonce)
+	badCommit := wire.DoubleHashB(data)
+
+	// Patch the commitment output of the coinbase.
+	lastOut := coinbase.TxOut[len(coinbase.TxOut)-1]
+	badScript := make([]byte, 38)
+	copy(badScript, lastOut.PkScript[:6])
+	copy(badScript[6:], badCommit[:])
+	coinbase.TxOut[len(coinbase.TxOut)-1] = &wire.TxOut{Value: 0, PkScript: badScript}
+
+	txid2 := coinbase.TxHash()
+	block.Header.MerkleRoot = CalcMerkleRoot([]wire.Hash256{txid2})
+
+	if err := CheckBlockContext(block, nil, 1, params); err == nil {
+		t.Error("Gate5: commitment using real coinbase wtxid (not zeros) should fail")
+	}
+}
+
+// TestWitnessCommitment_Gate6_NonceSizeValidation verifies Gate 6:
+// the coinbase scriptWitness must have exactly 1 stack element of exactly 32 bytes.
+// Core: "bad-witness-nonce-size" (validation.cpp:3880-3885).
+func TestWitnessCommitment_Gate6_NonceSizeValidation(t *testing.T) {
+	params := buildSegwitParams()
+
+	tests := []struct {
+		name        string
+		witnessStack [][]byte
+		wantErr     bool
+	}{
+		{
+			name:         "valid: exactly 1 element of 32 bytes",
+			witnessStack: [][]byte{make([]byte, 32)},
+			wantErr:      false,
+		},
+		{
+			name:         "invalid: empty witness stack",
+			witnessStack: [][]byte{},
+			wantErr:      true,
+		},
+		{
+			name:         "invalid: nil witness stack",
+			witnessStack: nil,
+			wantErr:      true,
+		},
+		{
+			name:         "invalid: one element of 31 bytes (too short)",
+			witnessStack: [][]byte{make([]byte, 31)},
+			wantErr:      true,
+		},
+		{
+			name:         "invalid: one element of 33 bytes (too long)",
+			witnessStack: [][]byte{make([]byte, 33)},
+			wantErr:      true,
+		},
+		{
+			name:         "invalid: two elements of 32 bytes each",
+			witnessStack: [][]byte{make([]byte, 32), make([]byte, 32)},
+			wantErr:      true,
+		},
+		{
+			name:         "invalid: one element of 0 bytes",
+			witnessStack: [][]byte{{}},
+			wantErr:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			block := buildSegwitBlock(t, tt.witnessStack)
+			err := CheckBlockContext(block, nil, 1, params)
+			if tt.wantErr && err == nil {
+				t.Error("expected error but got nil")
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("expected no error but got: %v", err)
+			}
+			// For the error cases, confirm we get ErrBadWitnessNonceSize.
+			if tt.wantErr && err != nil && !errors.Is(err, ErrBadWitnessNonceSize) {
+				t.Errorf("expected ErrBadWitnessNonceSize, got: %v", err)
+			}
+		})
+	}
+}
+
+// TestWitnessCommitment_Gate7_DoubleSHA256 verifies Gate 7: the witness commitment
+// hash uses SHA256d (double SHA256), not single SHA256.
+// We test this by:
+// 1. Verifying a block with a correct SHA256d commitment passes.
+// 2. Verifying a block with a wrong (all-zeros) commitment fails with ErrBadWitnessCommitment.
+// If the implementation used single-SHA256, case 1 would fail, exposing the bug.
+func TestWitnessCommitment_Gate7_DoubleSHA256(t *testing.T) {
+	params := buildSegwitParams()
+
+	// A correctly double-SHA256'd block should pass.
+	nonce := make([]byte, 32)
+	block := buildSegwitBlock(t, [][]byte{nonce})
+	if err := CheckBlockContext(block, nil, 1, params); err != nil {
+		t.Errorf("Gate7: block with SHA256d commitment should pass, got: %v", err)
+	}
+
+	// Corrupt the commitment to all-zeros (a value that matches neither SHA256
+	// nor SHA256d of the real input). Should fail with ErrBadWitnessCommitment.
+	coinbase := block.Transactions[0]
+	badScript := make([]byte, 38)
+	copy(badScript, coinbase.TxOut[len(coinbase.TxOut)-1].PkScript[:6]) // preserve magic
+	// bytes [6:38] remain zero — wrong commitment
+	coinbase.TxOut[len(coinbase.TxOut)-1] = &wire.TxOut{Value: 0, PkScript: badScript}
+
+	txid2 := coinbase.TxHash()
+	block.Header.MerkleRoot = CalcMerkleRoot([]wire.Hash256{txid2})
+
+	if err := CheckBlockContext(block, nil, 1, params); err == nil {
+		t.Error("Gate7: block with corrupted commitment should fail")
+	} else if !errors.Is(err, ErrBadWitnessCommitment) {
+		t.Errorf("Gate7: expected ErrBadWitnessCommitment, got: %v", err)
+	}
+}
+
+// TestWitnessCommitment_Gate9_UnexpectedWitness verifies Gate 9: when segwit is
+// NOT active (height < SegwitHeight), any transaction with witness data must be
+// rejected. Bitcoin Core: "unexpected-witness" (validation.cpp:3905-3913).
+func TestWitnessCommitment_Gate9_UnexpectedWitness(t *testing.T) {
+	params := *RegtestParams()
+	params.SegwitHeight = 100 // segwit activates at 100
+	params.BIP34Height = 200_000
+	params.BIP65Height = 200_000
+	params.BIP66Height = 200_000
+	params.CSVHeight = 200_000
+	params.TaprootHeight = 200_000
+
+	// Build a coinbase with witness data (in a pre-segwit block).
+	coinbase := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x03, 0x01, 0x00, 0x00},
+			Sequence:         0xFFFFFFFF,
+			Witness:          [][]byte{make([]byte, 32)}, // witness data — unexpected
+		}},
+		TxOut: []*wire.TxOut{
+			{Value: 50_0000_0000, PkScript: []byte{0x51}},
+		},
+		LockTime: 0,
+	}
+	txid := coinbase.TxHash()
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version: 0x20000000, Timestamp: 1231006506,
+			MerkleRoot: CalcMerkleRoot([]wire.Hash256{txid}),
+			Bits:       0x207fffff,
+		},
+		Transactions: []*wire.MsgTx{coinbase},
+	}
+
+	// At height 50 (< SegwitHeight=100): witness data → must be rejected.
+	err := CheckBlockContext(block, nil, 50, &params)
+	if err == nil {
+		t.Error("Gate9: pre-segwit block with witness data should be rejected")
+	} else if !errors.Is(err, ErrUnexpectedWitnessInBlock) {
+		t.Errorf("Gate9: expected ErrUnexpectedWitnessInBlock, got: %v", err)
+	}
+
+	// At height 99 (still < SegwitHeight=100): same block must be rejected.
+	err = CheckBlockContext(block, nil, 99, &params)
+	if err == nil {
+		t.Error("Gate9: pre-segwit block (h=99) with witness data should be rejected")
+	}
+
+	// Sanity: no-witness coinbase at height 50 must pass (no spurious rejection).
+	coinbaseNoWitness := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x03, 0x01, 0x00, 0x00},
+			Sequence:         0xFFFFFFFF,
+		}},
+		TxOut: []*wire.TxOut{
+			{Value: 50_0000_0000, PkScript: []byte{0x51}},
+		},
+		LockTime: 0,
+	}
+	txid2 := coinbaseNoWitness.TxHash()
+	blockNoWitness := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version: 0x20000000, Timestamp: 1231006506,
+			MerkleRoot: CalcMerkleRoot([]wire.Hash256{txid2}),
+			Bits:       0x207fffff,
+		},
+		Transactions: []*wire.MsgTx{coinbaseNoWitness},
+	}
+	if err := CheckBlockContext(blockNoWitness, nil, 50, &params); err != nil {
+		t.Errorf("Gate9: pre-segwit block without witness should pass, got: %v", err)
+	}
+}
+
+// TestWitnessCommitment_FullValid verifies the complete happy-path: a segwit block
+// with a valid commitment, a correct 32-byte nonce, and coinbase wtxid=zeros.
+func TestWitnessCommitment_FullValid(t *testing.T) {
+	params := buildSegwitParams()
+	nonce := make([]byte, 32)
+	block := buildSegwitBlock(t, [][]byte{nonce})
+	if err := CheckBlockContext(block, nil, 1, params); err != nil {
+		t.Errorf("FullValid: should pass, got: %v", err)
+	}
+}
