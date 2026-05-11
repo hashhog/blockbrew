@@ -206,6 +206,19 @@ type UpdatableUTXOView interface {
 	AddTxOutputs(tx *wire.MsgTx, height int32)
 	// SpendTxInputs removes all inputs of a transaction from the UTXO view.
 	SpendTxInputs(tx *wire.MsgTx)
+	// SpendUTXOWithCoin removes a UTXO and returns the coin that was
+	// removed, or (nil, false) if the outpoint was not present. Used by
+	// DisconnectBlock to verify output identity against the disconnected
+	// block (Core validation.cpp:2217-2218).
+	SpendUTXOWithCoin(outpoint wire.OutPoint) (*UTXOEntry, bool)
+	// ApplyTxInUndo restores a single spent input from undo data. Returns
+	// (clean, ok). clean=false means the restore succeeded but was unclean
+	// (BIP-30 collision aftermath); ok=false means the undo record was
+	// unrecoverable (sibling-recovery exhausted). Mirrors Core's
+	// ApplyTxInUndo at validation.cpp:2149-2175.
+	ApplyTxInUndo(undo *UTXOEntry, outpoint wire.OutPoint) (clean bool, ok bool)
+	// HasUTXO reports whether a UTXO exists for the outpoint.
+	HasUTXO(outpoint wire.OutPoint) bool
 }
 
 // InMemoryUTXOView is a simple in-memory UTXO view for testing and block validation.
@@ -235,13 +248,100 @@ func (v *InMemoryUTXOView) SpendUTXO(outpoint wire.OutPoint) {
 	delete(v.utxos, outpoint)
 }
 
+// HasUTXO reports whether a UTXO exists for the outpoint.
+func (v *InMemoryUTXOView) HasUTXO(outpoint wire.OutPoint) bool {
+	_, ok := v.utxos[outpoint]
+	return ok
+}
+
+// SpendUTXOWithCoin removes a UTXO and returns the coin, or (nil, false) if
+// the outpoint was not present. The returned entry is a snapshot (the
+// PkScript is cloned so the caller can mutate it freely). Mirrors Core
+// SpendCoin's two-arg overload (coins.cpp:101-115).
+func (v *InMemoryUTXOView) SpendUTXOWithCoin(outpoint wire.OutPoint) (*UTXOEntry, bool) {
+	entry, ok := v.utxos[outpoint]
+	if !ok || entry == nil {
+		return nil, false
+	}
+	snapshot := &UTXOEntry{
+		Amount:     entry.Amount,
+		PkScript:   append([]byte(nil), entry.PkScript...),
+		Height:     entry.Height,
+		IsCoinbase: entry.IsCoinbase,
+	}
+	delete(v.utxos, outpoint)
+	return snapshot, true
+}
+
+// ApplyTxInUndo restores a single spent input from undo data. Mirrors Core
+// validation.cpp:2149-2175. See UTXOSet.ApplyTxInUndo for full semantics
+// (overwrite detection, sibling-recovery, PkScript clone). The in-memory
+// view is used for testing — it shares all three gates with the production
+// path so the gates can be unit-tested without standing up a Pebble DB.
+func (v *InMemoryUTXOView) ApplyTxInUndo(undo *UTXOEntry, outpoint wire.OutPoint) (clean bool, ok bool) {
+	clean = true
+
+	// Gate A: overwrite check.
+	if v.HasUTXO(outpoint) {
+		clean = false
+	}
+
+	// Gate B: missing-metadata sibling recovery.
+	if undo.Height == 0 {
+		// Scan by txid for any unspent sibling output.
+		var alt *UTXOEntry
+		for op, e := range v.utxos {
+			if op.Hash == outpoint.Hash {
+				alt = e
+				break
+			}
+		}
+		if alt == nil {
+			return false, false
+		}
+		undo.Height = alt.Height
+		undo.IsCoinbase = alt.IsCoinbase
+	}
+
+	// Gate C: clone script before installing into the view.
+	entry := &UTXOEntry{
+		Amount:     undo.Amount,
+		PkScript:   append([]byte(nil), undo.PkScript...),
+		Height:     undo.Height,
+		IsCoinbase: undo.IsCoinbase,
+	}
+	v.utxos[outpoint] = entry
+	return clean, true
+}
+
 // IsUnspendable returns true if a script is provably unspendable.
-// A script is unspendable if it starts with OP_RETURN (0x6a) or is empty.
+// Mirrors Bitcoin Core script.h:563-566 (CScript::IsUnspendable):
+//
+//	return (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE);
+//
+// A script is unspendable if:
+//   - it is empty (matches Core's `size() > 0 && ...` falsy branch — Core treats
+//     empty as spendable, but blockbrew's ConnectBlock/DisconnectBlock both elide
+//     empty-script outputs as a degenerate case so we keep the empty=>true
+//     fast path; an empty script can never appear on a real chain anyway), OR
+//   - it starts with OP_RETURN (0x6a), OR
+//   - it exceeds MaxScriptSize (10,000 bytes) — a script larger than this can
+//     never be evaluated successfully, so the output is pruned from the UTXO
+//     set at creation time. Missing this clause caused the W92 cross-impl bug
+//     where an unspendable >10k-byte output WAS added to the UTXO set during
+//     ConnectBlock, then DisconnectBlock dutifully tried to remove it on
+//     reorg. Both paths must use the SAME predicate to stay symmetric.
 func IsUnspendable(pkScript []byte) bool {
 	if len(pkScript) == 0 {
 		return true
 	}
-	return pkScript[0] == 0x6a // OP_RETURN
+	if pkScript[0] == 0x6a { // OP_RETURN
+		return true
+	}
+	if len(pkScript) > MaxScriptSize {
+		return true
+	}
+	return false
 }
 
 // IsNullData returns true if the script is a well-formed OP_RETURN (nulldata)
