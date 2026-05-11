@@ -1662,29 +1662,36 @@ func TestCheckBlockSanityCVE20122459(t *testing.T) {
 }
 
 // TestBIP30ExceptionHeights verifies that the BIP-30 duplicate-coinbase check
-// uses the correct exception heights (91842 and 91880), not the previously
-// wrong values (91722 and 91812).
+// uses the correct exception logic: BOTH the right height AND the exact block
+// hash must match (IsBIP30Repeat).  The two historical mainnet duplicate-coinbase
+// blocks (h=91842 and h=91880 with their specific hashes) are exempt; all other
+// heights and any block at those heights with a DIFFERENT hash are enforced.
 //
-// Reference: Bitcoin Core validation.cpp ConnectBlock / IsBIP30Repeat().
-// The two mainnet blocks at h=91842 and h=91880 intentionally duplicate earlier
-// coinbase txids and must be exempted; all other heights must be enforced.
+// Also verifies that the old "unspendable" heights (91722 and 91812) are NOT
+// exempt from BIP-30 enforcement.
 //
-// This test calls CheckBIP30 directly — the same helper invoked by
-// ChainManager.ConnectBlock — so it exercises the live production code path.
+// Reference: Bitcoin Core validation.cpp IsBIP30Repeat() line 6189-6193.
 func TestBIP30ExceptionHeights(t *testing.T) {
 	// Use regtest params (maximal PoW limit) so any block hash passes PoW.
-	// Override activation heights so BIP-context checks don't interfere with
-	// the BIP-30 assertion: push all soft-fork activations above h=200000 so
-	// the test heights (91842, 91843, 91880, 91722, 91812) are all pre-activation.
+	// Override activation heights so BIP-context checks don't interfere:
+	// push all soft-fork activations above h=200000 so the test heights
+	// (91842, 91843, 91880, 91722, 91812) are all pre-BIP34 (BIP30 always on).
 	params := *RegtestParams()
 	params.BIP34Height = 200_000
+	params.BIP34Hash = wire.Hash256{} // zero = no short-circuit
 	params.BIP65Height = 200_000
 	params.BIP66Height = 200_000
 	params.CSVHeight = 200_000
 	params.SegwitHeight = 200_000
 	params.TaprootHeight = 200_000
 
-	// Build a minimal coinbase transaction.
+	// The exact historical hashes from Bitcoin Core IsBIP30Repeat().
+	hash91842, _ := wire.NewHash256FromHex("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")
+	hash91880, _ := wire.NewHash256FromHex("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")
+	// A dummy hash that does NOT match any exception.
+	wrongHash := wire.Hash256{0xde, 0xad, 0xbe, 0xef}
+
+	// Build a minimal coinbase transaction with a known txid.
 	coinbaseTx := &wire.MsgTx{
 		Version: 1,
 		TxIn: []*wire.TxIn{
@@ -1712,6 +1719,7 @@ func TestBIP30ExceptionHeights(t *testing.T) {
 		Transactions: []*wire.MsgTx{coinbaseTx},
 	}
 
+	// A UTXO view that contains the coinbase output — simulating a duplicate.
 	newView := func() *InMemoryUTXOView {
 		v := NewInMemoryUTXOView()
 		v.AddUTXO(
@@ -1721,26 +1729,179 @@ func TestBIP30ExceptionHeights(t *testing.T) {
 		return v
 	}
 
-	// Test 1: height=91842 — EXEMPT.
-	if err := CheckBIP30(block, 91842, &params, newView()); errors.Is(err, ErrDuplicateTx) {
-		t.Errorf("height 91842: BIP-30 exception must NOT reject duplicate coinbase, got ErrDuplicateTx")
+	// Test 1: height=91842 + CORRECT hash — EXEMPT (IsBIP30Repeat).
+	if err := CheckBIP30(block, 91842, hash91842, &params, newView(), nil); errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("h=91842 correct hash: BIP-30 exception must NOT reject, got ErrDuplicateTx")
 	}
 
-	// Test 2: height=91843 — NOT exempt.
-	if err := CheckBIP30(block, 91843, &params, newView()); !errors.Is(err, ErrDuplicateTx) {
-		t.Errorf("height 91843: BIP-30 must reject duplicate coinbase, got: %v", err)
+	// Test 2: height=91842 + WRONG hash — NOT exempt (hash must match).
+	if err := CheckBIP30(block, 91842, wrongHash, &params, newView(), nil); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("h=91842 wrong hash: must be enforced (hash mismatch), got: %v", err)
 	}
 
-	// Test 3: height=91880 — EXEMPT.
-	if err := CheckBIP30(block, 91880, &params, newView()); errors.Is(err, ErrDuplicateTx) {
-		t.Errorf("height 91880: BIP-30 exception must NOT reject duplicate coinbase, got ErrDuplicateTx")
+	// Test 3: height=91843 — NOT exempt at all.
+	if err := CheckBIP30(block, 91843, wrongHash, &params, newView(), nil); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("h=91843: BIP-30 must reject duplicate coinbase, got: %v", err)
 	}
 
-	// Verify old wrong heights (91722 and 91812) are NOT exempt.
+	// Test 4: height=91880 + CORRECT hash — EXEMPT (IsBIP30Repeat).
+	if err := CheckBIP30(block, 91880, hash91880, &params, newView(), nil); errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("h=91880 correct hash: BIP-30 exception must NOT reject, got ErrDuplicateTx")
+	}
+
+	// Test 5: height=91880 + WRONG hash — NOT exempt.
+	if err := CheckBIP30(block, 91880, wrongHash, &params, newView(), nil); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("h=91880 wrong hash: must be enforced (hash mismatch), got: %v", err)
+	}
+
+	// Test 6: heights 91722 and 91812 (IsBIP30Unspendable) — NOT exempt from BIP-30.
+	// These are the blocks whose outputs became unspendable (pre-BIP30 originals),
+	// not the repeat blocks. Core never exempts them from ConnectBlock BIP-30.
 	for _, wrongHeight := range []int32{91722, 91812} {
-		if err := CheckBIP30(block, wrongHeight, &params, newView()); !errors.Is(err, ErrDuplicateTx) {
-			t.Errorf("height %d: must NOT be BIP-30 exempt (wrong old height), got: %v", wrongHeight, err)
+		if err := CheckBIP30(block, wrongHeight, wrongHash, &params, newView(), nil); !errors.Is(err, ErrDuplicateTx) {
+			t.Errorf("h=%d: must NOT be BIP-30 exempt (IsBIP30Unspendable heights are not repeats), got: %v", wrongHeight, err)
 		}
+	}
+}
+
+// TestIsBIP30Repeat verifies IsBIP30Repeat requires both height AND hash.
+func TestIsBIP30Repeat(t *testing.T) {
+	hash91842, _ := wire.NewHash256FromHex("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")
+	hash91880, _ := wire.NewHash256FromHex("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")
+	wrongHash := wire.Hash256{0x01}
+
+	tests := []struct {
+		height   int32
+		hash     wire.Hash256
+		expected bool
+	}{
+		{91842, hash91842, true},  // correct height + correct hash
+		{91842, wrongHash, false}, // correct height + wrong hash
+		{91843, hash91842, false}, // wrong height (off by 1)
+		{91880, hash91880, true},  // correct height + correct hash
+		{91880, wrongHash, false}, // correct height + wrong hash
+		{91879, hash91880, false}, // wrong height (off by 1)
+		// IsBIP30Unspendable heights are NOT IsBIP30Repeat
+		{91722, wire.Hash256{}, false},
+		{91812, wire.Hash256{}, false},
+		{0, wire.Hash256{}, false},
+		{227931, wire.Hash256{}, false},
+	}
+	for _, tt := range tests {
+		got := IsBIP30Repeat(tt.height, tt.hash)
+		if got != tt.expected {
+			t.Errorf("IsBIP30Repeat(%d, %s) = %v, want %v", tt.height, tt.hash, got, tt.expected)
+		}
+	}
+}
+
+// TestIsBIP30Unspendable verifies IsBIP30Unspendable requires both height AND hash.
+func TestIsBIP30Unspendable(t *testing.T) {
+	hash91722, _ := wire.NewHash256FromHex("00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e")
+	hash91812, _ := wire.NewHash256FromHex("00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f")
+	wrongHash := wire.Hash256{0x02}
+
+	tests := []struct {
+		height   int32
+		hash     wire.Hash256
+		expected bool
+	}{
+		{91722, hash91722, true},
+		{91722, wrongHash, false},
+		{91723, hash91722, false},
+		{91812, hash91812, true},
+		{91812, wrongHash, false},
+		{91813, hash91812, false},
+		// IsBIP30Repeat heights are NOT IsBIP30Unspendable
+		{91842, wire.Hash256{}, false},
+		{91880, wire.Hash256{}, false},
+	}
+	for _, tt := range tests {
+		got := IsBIP30Unspendable(tt.height, tt.hash)
+		if got != tt.expected {
+			t.Errorf("IsBIP30Unspendable(%d, %s) = %v, want %v", tt.height, tt.hash, got, tt.expected)
+		}
+	}
+}
+
+// TestCheckBIP30BIP34ShortCircuit verifies that the BIP34 short-circuit
+// disables BIP-30 enforcement once BIP34 is active at the right hash, and that
+// it re-enables at BIP34_IMPLIES_BIP30_LIMIT (1,983,702).
+func TestCheckBIP30BIP34ShortCircuit(t *testing.T) {
+	// Use a custom BIP34Hash that matches the mock ancestor.
+	fakeBIP34Hash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000aabbcc")
+	params := *RegtestParams()
+	params.BIP34Height = 227_931
+	params.BIP34Hash = fakeBIP34Hash
+	params.BIP65Height = 500_000
+	params.BIP66Height = 500_000
+	params.CSVHeight = 500_000
+	params.SegwitHeight = 500_000
+	params.TaprootHeight = 500_000
+
+	// Ancestor lookup that returns the fake BIP34Hash at height 227,931.
+	rightAncestor := func(h int32) (wire.Hash256, bool) {
+		if h == 227_931 {
+			return fakeBIP34Hash, true
+		}
+		return wire.Hash256{}, false
+	}
+	// Ancestor lookup that returns the WRONG hash at height 227,931.
+	wrongAncestor := func(h int32) (wire.Hash256, bool) {
+		return wire.Hash256{0xff}, true
+	}
+
+	// Build a coinbase with a duplicate UTXO in the view.
+	coinbaseTx := &wire.MsgTx{
+		Version: 1,
+		TxIn:    []*wire.TxIn{{PreviousOutPoint: wire.OutPoint{Index: 0xffffffff}, Sequence: 0xffffffff, SignatureScript: []byte{0x51}}},
+		TxOut:   []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x51}}},
+	}
+	txid := coinbaseTx.TxHash()
+	block := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Bits: 0x207fffff},
+		Transactions: []*wire.MsgTx{coinbaseTx},
+	}
+	newView := func() *InMemoryUTXOView {
+		v := NewInMemoryUTXOView()
+		v.AddUTXO(wire.OutPoint{Hash: txid, Index: 0}, &UTXOEntry{Amount: 100, PkScript: []byte{0x51}})
+		return v
+	}
+	anyHash := wire.Hash256{0x99}
+
+	// Pre-BIP34 (height 100): BIP30 enforced.
+	if err := CheckBIP30(block, 100, anyHash, &params, newView(), rightAncestor); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("pre-BIP34 h=100: expected ErrDuplicateTx, got: %v", err)
+	}
+
+	// Post-BIP34, RIGHT hash: BIP30 skipped (short-circuit).
+	if err := CheckBIP30(block, 300_000, anyHash, &params, newView(), rightAncestor); err != nil {
+		t.Errorf("post-BIP34 right-hash: BIP30 should be skipped, got: %v", err)
+	}
+
+	// Post-BIP34, WRONG hash: BIP30 still enforced (chain not canonical).
+	if err := CheckBIP30(block, 300_000, anyHash, &params, newView(), wrongAncestor); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("post-BIP34 wrong-hash: expected ErrDuplicateTx (non-canonical chain), got: %v", err)
+	}
+
+	// Post-BIP34, nil ancestorHashAt: BIP30 enforced (safe fallback — no short-circuit).
+	if err := CheckBIP30(block, 300_000, anyHash, &params, newView(), nil); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("post-BIP34 nil ancestor: expected ErrDuplicateTx (safe fallback), got: %v", err)
+	}
+
+	// BIP34_IMPLIES_BIP30_LIMIT (1,983,702): always enforced regardless of BIP34.
+	if err := CheckBIP30(block, 1_983_702, anyHash, &params, newView(), rightAncestor); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("h=1,983,702: expected ErrDuplicateTx (re-enforce), got: %v", err)
+	}
+
+	// Above BIP34_IMPLIES_BIP30_LIMIT: still enforced.
+	if err := CheckBIP30(block, 2_000_000, anyHash, &params, newView(), rightAncestor); !errors.Is(err, ErrDuplicateTx) {
+		t.Errorf("h=2,000,000: expected ErrDuplicateTx (re-enforce), got: %v", err)
+	}
+
+	// Below BIP34_IMPLIES_BIP30_LIMIT, BIP34 active, right hash: still skipped.
+	if err := CheckBIP30(block, 1_983_701, anyHash, &params, newView(), rightAncestor); err != nil {
+		t.Errorf("h=1,983,701 right-hash: BIP30 should be skipped (just below limit), got: %v", err)
 	}
 }
 
