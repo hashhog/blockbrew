@@ -187,28 +187,49 @@ const (
 	MaxPackageWeight = 404_000
 )
 
-// Ancestor/descendant chain limits matching Bitcoin Core
-// (src/kernel/mempool_limits.h DEFAULT_ANCESTOR_LIMIT /
-// DEFAULT_DESCENDANT_LIMIT and DEFAULT_{ANCESTOR,DESCENDANT}_SIZE_LIMIT_KVB).
+// Ancestor/descendant/cluster chain limits matching Bitcoin Core
+// (src/policy/policy.h, src/kernel/mempool_limits.h).
 const (
 	// DefaultAncestorLimit is the maximum number of in-mempool ancestors a tx
-	// may have (including itself).
+	// may have (including itself). Matches Core DEFAULT_ANCESTOR_LIMIT=25
+	// (src/policy/policy.h:76).
 	DefaultAncestorLimit = 25
 
 	// DefaultDescendantLimit is the maximum number of in-mempool descendants
-	// a tx may have (including itself).
+	// a tx may have (including itself). Matches Core DEFAULT_DESCENDANT_LIMIT=25
+	// (src/policy/policy.h:78).
 	DefaultDescendantLimit = 25
 
 	// DefaultAncestorSizeLimitKvB caps the total virtual size (kvB) of a
 	// transaction's in-mempool ancestor set, including itself. Matches
-	// Core's `DEFAULT_ANCESTOR_SIZE_LIMIT_KVB = 101`. A short chain of
+	// Core's historical DEFAULT_ANCESTOR_SIZE_LIMIT_KVB = 101. A short chain of
 	// large transactions may respect the count cap and still violate this.
 	DefaultAncestorSizeLimitKvB = 101
 
 	// DefaultDescendantSizeLimitKvB caps the total virtual size (kvB) of
 	// any in-mempool ancestor's descendant set, including itself. Matches
-	// Core's `DEFAULT_DESCENDANT_SIZE_LIMIT_KVB = 101`.
+	// Core's historical DEFAULT_DESCENDANT_SIZE_LIMIT_KVB = 101.
 	DefaultDescendantSizeLimitKvB = 101
+
+	// DefaultClusterSizeLimitKvB is the maximum total virtual size (kvB) of a
+	// cluster. Matches Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101
+	// (src/policy/policy.h:74). The cluster count limit is MaxClusterSize=64
+	// (cluster.go, matching Core DEFAULT_CLUSTER_LIMIT=64, policy.h:72).
+	DefaultClusterSizeLimitKvB = 101
+
+	// ExtraDescendantTxSizeLimit is the maximum vsize (vbytes) of an extra
+	// descendant that qualifies for the CPFP carve-out exemption. A single
+	// transaction with exactly one in-mempool ancestor and vsize ≤ this value
+	// may enter the mempool even when the descendant count or size limit is
+	// otherwise exceeded. Matches Core EXTRA_DESCENDANT_TX_SIZE_LIMIT=10000
+	// (src/policy/policy.h:90).
+	//
+	// NOTE: Core 27+ dropped the per-tx ancestor/descendant limits in favour
+	// of cluster-based limits (DEFAULT_CLUSTER_LIMIT / DEFAULT_CLUSTER_SIZE_LIMIT_KVB).
+	// The carve-out is therefore deprecated in cluster-mempool mode but the
+	// constant is preserved for documentation and future -limitancestorcount
+	// command-line compatibility.
+	ExtraDescendantTxSizeLimit = 10_000
 
 	// vbytesPerKvB is the byte/vbyte conversion factor used by the kvB-
 	// denominated mempool limits. 1 kvB = 1000 vB.
@@ -247,6 +268,24 @@ type Config struct {
 	// sequence-locks against the chain tip's MTP. When nil (legacy/test
 	// callers), the BIP-68 check is skipped.
 	ChainState ChainState
+
+	// AncestorLimit overrides DefaultAncestorLimit when > 0.
+	// Set to math.MaxInt to disable the ancestor count check (NoLimits mode).
+	// Matches Core -limitancestorcount (src/node/mempool_args.cpp:39).
+	AncestorLimit int
+
+	// DescendantLimit overrides DefaultDescendantLimit when > 0.
+	// Set to math.MaxInt to disable the descendant count check.
+	// Matches Core -limitdescendantcount (src/node/mempool_args.cpp:41).
+	DescendantLimit int
+
+	// AncestorSizeLimitKvB overrides DefaultAncestorSizeLimitKvB when > 0.
+	// Set to math.MaxInt to disable the ancestor size check.
+	AncestorSizeLimitKvB int
+
+	// DescendantSizeLimitKvB overrides DefaultDescendantSizeLimitKvB when > 0.
+	// Set to math.MaxInt to disable the descendant size check.
+	DescendantSizeLimitKvB int
 }
 
 // DefaultConfig returns a mempool config with sensible defaults.
@@ -258,6 +297,19 @@ func DefaultConfig() Config {
 		MaxOrphanTxs:        100,
 		ChainParams:         consensus.MainnetParams(),
 	}
+}
+
+// NoLimitsConfig returns a Config with all chain-length limits disabled.
+// Equivalent to Bitcoin Core's CTxMemPool::Limits::NoLimits()
+// (src/kernel/mempool_limits.h:31). Intended for test-only use — production
+// mempools MUST use default or tighter limits.
+func NoLimitsConfig() Config {
+	cfg := DefaultConfig()
+	cfg.AncestorLimit = math.MaxInt
+	cfg.DescendantLimit = math.MaxInt
+	cfg.AncestorSizeLimitKvB = math.MaxInt
+	cfg.DescendantSizeLimitKvB = math.MaxInt
+	return cfg
 }
 
 // TxEntry represents a transaction in the mempool.
@@ -1101,6 +1153,25 @@ func (mp *Mempool) checkChainLimitsLocked(tx *wire.MsgTx) error {
 }
 
 func (mp *Mempool) checkChainLimitsWithSizeLocked(tx *wire.MsgTx, candidateVSize int64) error {
+	// Resolve effective limits: Config fields override defaults when > 0.
+	// math.MaxInt in a Config field disables that check entirely (NoLimits mode).
+	ancestorLimit := DefaultAncestorLimit
+	if mp.config.AncestorLimit > 0 {
+		ancestorLimit = mp.config.AncestorLimit
+	}
+	descendantLimit := DefaultDescendantLimit
+	if mp.config.DescendantLimit > 0 {
+		descendantLimit = mp.config.DescendantLimit
+	}
+	ancestorSizeKvB := DefaultAncestorSizeLimitKvB
+	if mp.config.AncestorSizeLimitKvB > 0 {
+		ancestorSizeKvB = mp.config.AncestorSizeLimitKvB
+	}
+	descendantSizeKvB := DefaultDescendantSizeLimitKvB
+	if mp.config.DescendantSizeLimitKvB > 0 {
+		descendantSizeKvB = mp.config.DescendantSizeLimitKvB
+	}
+
 	// Ancestor limit: candidate + union of ancestor-sets of its mempool parents.
 	// Build the union by visiting each parent, then expanding via Depends.
 	ancestorSet := make(map[wire.Hash256]bool)
@@ -1122,14 +1193,23 @@ func (mp *Mempool) checkChainLimitsWithSizeLocked(tx *wire.MsgTx, candidateVSize
 		addAncestors(in.PreviousOutPoint.Hash)
 	}
 	// |ancestorSet| is the number of distinct in-mempool ancestors. +1 for self.
-	if len(ancestorSet)+1 > DefaultAncestorLimit {
+	// Matches Core CalculateMemPoolAncestors self-counts-as-ancestor convention.
+	selfPlusAncestors := len(ancestorSet) + 1
+	if selfPlusAncestors > ancestorLimit {
 		return fmt.Errorf("%w: %d > %d", ErrTooManyAncestors,
-			len(ancestorSet)+1, DefaultAncestorLimit)
+			selfPlusAncestors, ancestorLimit)
 	}
 
 	// Ancestor SIZE limit (Core DEFAULT_ANCESTOR_SIZE_LIMIT_KVB, 101 kvB):
 	// sum of vsizes of all ancestors plus the candidate.
-	maxAncestorBytes := int64(DefaultAncestorSizeLimitKvB) * vbytesPerKvB
+	// Use math.MaxInt64 sentinel when the KvB limit is math.MaxInt (NoLimits mode)
+	// to avoid int64 overflow from int64(math.MaxInt)*1000.
+	var maxAncestorBytes int64
+	if ancestorSizeKvB >= math.MaxInt/vbytesPerKvB {
+		maxAncestorBytes = math.MaxInt64
+	} else {
+		maxAncestorBytes = int64(ancestorSizeKvB) * vbytesPerKvB
+	}
 	var ancestorBytes int64
 	for ancHash := range ancestorSet {
 		if entry, ok := mp.pool[ancHash]; ok {
@@ -1137,7 +1217,7 @@ func (mp *Mempool) checkChainLimitsWithSizeLocked(tx *wire.MsgTx, candidateVSize
 		}
 	}
 	totalAncestorBytes := ancestorBytes + candidateVSize
-	if totalAncestorBytes > maxAncestorBytes {
+	if maxAncestorBytes < math.MaxInt64 && totalAncestorBytes > maxAncestorBytes {
 		return fmt.Errorf("%w: %d vB > %d vB",
 			ErrAncestorSizeTooLarge, totalAncestorBytes, maxAncestorBytes)
 	}
@@ -1145,32 +1225,41 @@ func (mp *Mempool) checkChainLimitsWithSizeLocked(tx *wire.MsgTx, candidateVSize
 	// Descendant limit: for each in-mempool ancestor of the candidate, adding
 	// the candidate would push that ancestor's descendant-set by one. Core
 	// counts descendants-including-self; the candidate is a new descendant.
-	maxDescendantBytes := int64(DefaultDescendantSizeLimitKvB) * vbytesPerKvB
+	// Matches Core CalculateMemPoolDescendants recursive walk.
+	var maxDescendantBytes int64
+	if descendantSizeKvB >= math.MaxInt/vbytesPerKvB {
+		maxDescendantBytes = math.MaxInt64
+	} else {
+		maxDescendantBytes = int64(descendantSizeKvB) * vbytesPerKvB
+	}
 	for ancHash := range ancestorSet {
 		descVisited := make(map[wire.Hash256]bool)
 		descs := mp.collectDescendantsLocked(ancHash, descVisited)
 		// descs excludes ancHash itself. After adding candidate, the count
 		// including self becomes len(descs) + 1 (self) + 1 (new candidate).
-		if len(descs)+2 > DefaultDescendantLimit {
+		selfPlusDescs := len(descs) + 2
+		if selfPlusDescs > descendantLimit {
 			return fmt.Errorf("%w: ancestor %s would have %d descendants > %d",
-				ErrTooManyDescendants, ancHash, len(descs)+2,
-				DefaultDescendantLimit)
+				ErrTooManyDescendants, ancHash, selfPlusDescs,
+				descendantLimit)
 		}
 
 		// Descendant SIZE limit: ancestor.Size + sum(descendant vsizes) + candidate.
-		var descBytes int64
-		if anc, ok := mp.pool[ancHash]; ok {
-			descBytes = anc.Size
-		}
-		for _, dHash := range descs {
-			if d, ok := mp.pool[dHash]; ok {
-				descBytes += d.Size
+		if maxDescendantBytes < math.MaxInt64 {
+			var descBytes int64
+			if anc, ok := mp.pool[ancHash]; ok {
+				descBytes = anc.Size
 			}
-		}
-		descBytes += candidateVSize
-		if descBytes > maxDescendantBytes {
-			return fmt.Errorf("%w: ancestor %s would have descendant size %d vB > %d vB",
-				ErrDescendantSizeTooLarge, ancHash, descBytes, maxDescendantBytes)
+			for _, dHash := range descs {
+				if d, ok := mp.pool[dHash]; ok {
+					descBytes += d.Size
+				}
+			}
+			descBytes += candidateVSize
+			if descBytes > maxDescendantBytes {
+				return fmt.Errorf("%w: ancestor %s would have descendant size %d vB > %d vB",
+					ErrDescendantSizeTooLarge, ancHash, descBytes, maxDescendantBytes)
+			}
 		}
 	}
 	return nil
