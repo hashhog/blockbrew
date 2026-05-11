@@ -799,3 +799,516 @@ func TestGetPeriodEndHeight(t *testing.T) {
 		}
 	}
 }
+
+// TestGetDeploymentState_StartedThresholdBoundary exercises the exact threshold
+// boundary: count == threshold-1 must NOT lock in; count == threshold MUST.
+func TestGetDeploymentState_StartedThresholdBoundary(t *testing.T) {
+	params := RegtestParams()
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	threshold := int32(8)
+
+	// Helper: build a chain where the second period contains `signalers` blocks
+	// signaling for bit 0.
+	build := func(signalers int) *BlockNode {
+		chain := newMockChain(params)
+		// Period 1: before start time → DEFINED at end of this period
+		for i := 0; i < int(period); i++ {
+			chain.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+		}
+		// Period 2: MTP past start time → STARTED.  Fill with `signalers` signaling
+		// blocks and the rest non-signaling.
+		for i := 0; i < int(period); i++ {
+			ver := int32(0x20000000)
+			if i < signalers {
+				ver = 0x20000001 // bit 0
+			}
+			chain.addBlock(ver, uint32(startTime+int64(period)*600+int64(i)*600))
+		}
+		return chain.tip()
+	}
+
+	dep := &BIP9Deployment{
+		Name:      "boundary",
+		Bit:       0,
+		StartTime: startTime - 10000,
+		Timeout:   NoTimeout,
+		Period:    period,
+		Threshold: threshold,
+	}
+
+	// count = threshold-1 → still STARTED
+	tip := build(int(threshold) - 1)
+	got := GetDeploymentState(dep, 0, tip, params, nil)
+	if got != DeploymentStarted {
+		t.Errorf("count=threshold-1 (%d): want started, got %s", threshold-1, got)
+	}
+
+	// count = threshold → LOCKED_IN
+	tip = build(int(threshold))
+	got = GetDeploymentState(dep, 0, tip, params, nil)
+	if got != DeploymentLockedIn {
+		t.Errorf("count=threshold (%d): want locked_in, got %s", threshold, got)
+	}
+}
+
+// TestGetDeploymentState_StartedThresholdBeatsTimeout verifies that Bitcoin Core
+// semantics are respected: if count >= threshold AND MTP >= timeout in the same
+// period, the transition is LOCKED_IN (not FAILED).
+// Core versionbits.cpp:83-98 — count is checked before timeout.
+func TestGetDeploymentState_StartedThresholdBeatsTimeout(t *testing.T) {
+	params := RegtestParams()
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	threshold := int32(8)
+	// Timeout expires exactly at the MTP of the second period's end block.
+	// We will set the block timestamps so MTP at period-end >= timeout AND
+	// the block also carries threshold-many signals.
+	timeout := startTime + int64(period)*600 // expires right when period 2 starts/ends
+
+	chain := newMockChain(params)
+	// Period 1 (before start): all non-signaling, timestamps below start
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+	}
+	// Period 2: timestamps >= timeout (so MTP will reach timeout), but ALL blocks
+	// signal — count == period >= threshold.
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000001, uint32(timeout+int64(i)*600))
+	}
+
+	dep := &BIP9Deployment{
+		Name:      "lockin-beats-timeout",
+		Bit:       0,
+		StartTime: startTime - 10000,
+		Timeout:   timeout,
+		Period:    period,
+		Threshold: threshold,
+	}
+
+	got := GetDeploymentState(dep, 0, chain.tip(), params, nil)
+	if got != DeploymentLockedIn {
+		t.Errorf("threshold reached AND timeout expired: want locked_in, got %s", got)
+	}
+}
+
+// TestGetDeploymentState_TimeoutExactBoundary verifies that a deployment
+// transitions to FAILED when MTP first reaches (>=) the timeout value and the
+// threshold has NOT been reached.
+func TestGetDeploymentState_TimeoutExactBoundary(t *testing.T) {
+	params := RegtestParams()
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	// Timeout fires in the second signaling period.
+	timeout := startTime + int64(period)*600 + 1 // just after period 1's MTP
+
+	chain := newMockChain(params)
+	// Period 1 (DEFINED→STARTED transition)
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+	}
+	// Period 2: no signaling, timestamps push MTP past timeout
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(timeout+int64(i)*600))
+	}
+
+	dep := &BIP9Deployment{
+		Name:      "timeout-boundary",
+		Bit:       0,
+		StartTime: startTime - 10000,
+		Timeout:   timeout,
+		Period:    period,
+		Threshold: 8,
+	}
+
+	got := GetDeploymentState(dep, 0, chain.tip(), params, nil)
+	if got != DeploymentFailed {
+		t.Errorf("MTP>=timeout without threshold: want failed, got %s", got)
+	}
+}
+
+// TestGetDeploymentState_LockedInExactActivationHeight checks the fence-post on
+// min_activation_height:
+//   - activationHeight == minActivationHeight → ACTIVE
+//   - activationHeight == minActivationHeight-1 → stays LOCKED_IN
+func TestGetDeploymentState_LockedInExactActivationHeight(t *testing.T) {
+	params := RegtestParams()
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	threshold := int32(8)
+
+	// Build enough periods to reach LOCKED_IN (period 2 has threshold signals).
+	buildToLockedIn := func() *mockChain {
+		c := newMockChain(params)
+		for i := 0; i < int(period); i++ {
+			c.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+		}
+		for i := 0; i < int(period); i++ {
+			c.addBlock(0x20000001, uint32(startTime+int64(period)*600+int64(i)*600))
+		}
+		return c
+	}
+
+	chain := buildToLockedIn()
+	// At end of period 2 the chain is at height 19 (LOCKED_IN after eval of period 2).
+	// activationHeight for the NEXT period = 20; minActivationHeight = 21 → stays LOCKED_IN.
+	depStaysLocked := &BIP9Deployment{
+		Name:                "locked-stays",
+		Bit:                 0,
+		StartTime:           startTime - 10000,
+		Timeout:             NoTimeout,
+		Period:              period,
+		Threshold:           threshold,
+		MinActivationHeight: 21, // first block of period 3 is 20, below 21
+	}
+	got := GetDeploymentState(depStaysLocked, 0, chain.tip(), params, nil)
+	if got != DeploymentLockedIn {
+		t.Errorf("activationHeight<minActivationHeight: want locked_in, got %s", got)
+	}
+
+	// Add one more period (heights 20-29).  activationHeight = 30 >= 21 → ACTIVE.
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(2*period)*600+int64(i)*600))
+	}
+	depActivates := &BIP9Deployment{
+		Name:                "locked-activates",
+		Bit:                 0,
+		StartTime:           startTime - 10000,
+		Timeout:             NoTimeout,
+		Period:              period,
+		Threshold:           threshold,
+		MinActivationHeight: 21, // 30 >= 21 → ACTIVE
+	}
+	got = GetDeploymentState(depActivates, 0, chain.tip(), params, nil)
+	if got != DeploymentActive {
+		t.Errorf("activationHeight>=minActivationHeight: want active, got %s", got)
+	}
+}
+
+// TestGetDeploymentState_CacheCorrectness verifies that cached results are
+// reused and that Clear() invalidates them.
+func TestGetDeploymentState_CacheCorrectness(t *testing.T) {
+	params := RegtestParams()
+	chain := newMockChain(params)
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	threshold := int32(8)
+
+	// Build to LOCKED_IN.
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+	}
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000001, uint32(startTime+int64(period)*600+int64(i)*600))
+	}
+
+	dep := &BIP9Deployment{
+		Name:      "cache-test",
+		Bit:       0,
+		StartTime: startTime - 10000,
+		Timeout:   NoTimeout,
+		Period:    period,
+		Threshold: threshold,
+	}
+
+	cache := NewVersionBitsCache()
+
+	// First call: primes the cache.
+	got1 := GetDeploymentState(dep, 0, chain.tip(), params, cache)
+	// Second call: must return the same result using the cache.
+	got2 := GetDeploymentState(dep, 0, chain.tip(), params, cache)
+	if got1 != got2 {
+		t.Errorf("cache: first=%s, second=%s (must be equal)", got1, got2)
+	}
+	if got1 != DeploymentLockedIn {
+		t.Errorf("cache: expected locked_in, got %s", got1)
+	}
+
+	// Clear and re-compute: same result but cache was rebuilt.
+	cache.Clear()
+	got3 := GetDeploymentState(dep, 0, chain.tip(), params, cache)
+	if got3 != DeploymentLockedIn {
+		t.Errorf("after Clear: expected locked_in, got %s", got3)
+	}
+}
+
+// TestComputeBlockVersion_LockedInSetsSignalingBit verifies that
+// ComputeBlockVersion ORs in the deployment bit for LOCKED_IN state (not just
+// STARTED). Core versionbits.cpp:273: sets bit for LOCKED_IN || STARTED.
+func TestComputeBlockVersion_LockedInSetsSignalingBit(t *testing.T) {
+	params := RegtestParams()
+	chain := newMockChain(params)
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	threshold := int32(8)
+
+	// Period 1: DEFINED→STARTED transition (no signaling)
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+	}
+	// Period 2: signal for bit 3 to achieve threshold → LOCKED_IN.
+	// Version 0x20000008 = VERSIONBITS_TOP_BITS | (1<<3).
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000008, uint32(startTime+int64(period)*600+int64(i)*600))
+	}
+
+	deployments := []*BIP9Deployment{
+		{
+			Name:      "locked-bit",
+			Bit:       3,
+			StartTime: startTime - 10000,
+			Timeout:   NoTimeout,
+			Period:    period,
+			Threshold: threshold,
+		},
+	}
+
+	// Verify state is indeed LOCKED_IN at tip.
+	state := GetDeploymentState(deployments[0], 0, chain.tip(), params, nil)
+	if state != DeploymentLockedIn {
+		t.Fatalf("prerequisite: expected locked_in, got %s", state)
+	}
+
+	version := ComputeBlockVersion(chain.tip(), deployments, params, nil)
+	expected := VersionBitsTopBits | (1 << 3)
+	if version != expected {
+		t.Errorf("LOCKED_IN bit not set: got 0x%x, want 0x%x", version, expected)
+	}
+}
+
+// TestComputeBlockVersion_ActiveDoesNotSetBit verifies that deployments in
+// ACTIVE state do NOT set their signaling bit (Core only signals for
+// STARTED and LOCKED_IN; once ACTIVE there is nothing to signal).
+func TestComputeBlockVersion_ActiveDoesNotSetBit(t *testing.T) {
+	params := RegtestParams()
+	chain := newMockChain(params)
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	threshold := int32(8)
+
+	// Period 1
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+	}
+	// Period 2: lock in — version 0x20000020 = VERSIONBITS_TOP_BITS | (1<<5)
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000020, uint32(startTime+int64(period)*600+int64(i)*600))
+	}
+	// Period 3: transition to ACTIVE
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(2*period)*600+int64(i)*600))
+	}
+
+	deployments := []*BIP9Deployment{
+		{
+			Name:                "active-no-bit",
+			Bit:                 5,
+			StartTime:           startTime - 10000,
+			Timeout:             NoTimeout,
+			Period:              period,
+			Threshold:           threshold,
+			MinActivationHeight: 0,
+		},
+	}
+
+	state := GetDeploymentState(deployments[0], 0, chain.tip(), params, nil)
+	if state != DeploymentActive {
+		t.Fatalf("prerequisite: expected active, got %s", state)
+	}
+
+	version := ComputeBlockVersion(chain.tip(), deployments, params, nil)
+	if version != VersionBitsTopBits {
+		t.Errorf("ACTIVE state should not set bit: got 0x%x, want 0x%x (base only)",
+			version, VersionBitsTopBits)
+	}
+}
+
+// TestComputeBlockVersion_FailedDoesNotSetBit verifies that a FAILED deployment
+// does NOT set its bit in the computed version.
+func TestComputeBlockVersion_FailedDoesNotSetBit(t *testing.T) {
+	params := RegtestParams()
+	chain := newMockChain(params)
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	timeout := startTime + int64(period)*600 + 1
+
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+	}
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(timeout+int64(i)*600))
+	}
+
+	deployments := []*BIP9Deployment{
+		{
+			Name:      "failed-no-bit",
+			Bit:       7,
+			StartTime: startTime - 10000,
+			Timeout:   timeout,
+			Period:    period,
+			Threshold: 8,
+		},
+	}
+
+	state := GetDeploymentState(deployments[0], 0, chain.tip(), params, nil)
+	if state != DeploymentFailed {
+		t.Fatalf("prerequisite: expected failed, got %s", state)
+	}
+
+	version := ComputeBlockVersion(chain.tip(), deployments, params, nil)
+	if version != VersionBitsTopBits {
+		t.Errorf("FAILED state should not set bit: got 0x%x, want 0x%x (base only)",
+			version, VersionBitsTopBits)
+	}
+}
+
+// TestGetStateSinceHeight_AlwaysActiveAndNeverActive checks that ALWAYS_ACTIVE
+// and NEVER_ACTIVE both return since=0 (genesis), matching Core.
+func TestGetStateSinceHeight_AlwaysActiveAndNeverActive(t *testing.T) {
+	params := RegtestParams()
+	chain := newMockChain(params)
+	chain.addBlocksWithVersion(20, 0x20000000, 1600000000)
+
+	depAlways := &BIP9Deployment{
+		Name:      "always",
+		Bit:       0,
+		StartTime: AlwaysActive,
+		Timeout:   NoTimeout,
+		Period:    10,
+	}
+	depNever := &BIP9Deployment{
+		Name:      "never",
+		Bit:       1,
+		StartTime: NeverActive,
+		Timeout:   NoTimeout,
+		Period:    10,
+	}
+
+	if h := GetStateSinceHeight(depAlways, 0, chain.tip(), params, nil); h != 0 {
+		t.Errorf("AlwaysActive since: got %d, want 0", h)
+	}
+	if h := GetStateSinceHeight(depNever, 1, chain.tip(), params, nil); h != 0 {
+		t.Errorf("NeverActive since: got %d, want 0", h)
+	}
+}
+
+// TestGetStateSinceHeight_ActiveSince verifies that GetStateSinceHeight returns
+// the correct height since which ACTIVE state applies.
+//
+// Blockbrew follows Bitcoin Core's GetStateSinceHeightFor convention:
+// GetDeploymentState(tip=X) returns the state for the block AFTER X.  So at
+// tip height 29 (end of the third period) the state is ACTIVE for block 30
+// onward.  GetStateSinceHeight walks the period-aligned pointers and returns
+// pindexPrev.Height + 1, which is 30 in this configuration.
+func TestGetStateSinceHeight_ActiveSince(t *testing.T) {
+	params := RegtestParams()
+	chain := newMockChain(params)
+
+	period := int32(10)
+	startTime := int64(1600000000)
+	threshold := int32(8)
+
+	// Period 1 (heights 0-9): DEFINED
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(i)*600))
+	}
+	// Period 2 (heights 10-19): STARTED → LOCKED_IN (all 10 signal bit 0)
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000001, uint32(startTime+int64(period)*600+int64(i)*600))
+	}
+	// Period 3 (heights 20-29): LOCKED_IN → ACTIVE (one period after lock-in)
+	for i := 0; i < int(period); i++ {
+		chain.addBlock(0x20000000, uint32(startTime+int64(2*period)*600+int64(i)*600))
+	}
+
+	dep := &BIP9Deployment{
+		Name:                "active-since",
+		Bit:                 0,
+		StartTime:           startTime - 10000,
+		Timeout:             NoTimeout,
+		Period:              period,
+		Threshold:           threshold,
+		MinActivationHeight: 0,
+	}
+
+	// Verify state is indeed ACTIVE at tip height 29.
+	state := GetDeploymentState(dep, 0, chain.tip(), params, nil)
+	if state != DeploymentActive {
+		t.Fatalf("prerequisite: expected active at height 29, got %s", state)
+	}
+
+	// GetStateSinceHeight with tip=29: aligns to period end at 29,
+	// checks parent at 19 (LOCKED_IN ≠ ACTIVE), stops.
+	// Returns 29 + 1 = 30.  Block 30 is the first block in ACTIVE state.
+	since := GetStateSinceHeight(dep, 0, chain.tip(), params, nil)
+	if since != 30 {
+		t.Errorf("ACTIVE since: got %d, want 30", since)
+	}
+}
+
+// TestGetStateSinceHeight_Defined verifies that DEFINED state returns 0
+// (genesis), matching Core's GetStateSinceHeightFor behaviour.
+func TestGetStateSinceHeight_Defined(t *testing.T) {
+	params := RegtestParams()
+	chain := newMockChain(params)
+	chain.addBlocksWithVersion(5, 0x20000000, 1600000000)
+
+	dep := &BIP9Deployment{
+		Name:      "far-future",
+		Bit:       0,
+		StartTime: int64(9999999999), // far in the future
+		Timeout:   NoTimeout,
+		Period:    10,
+		Threshold: 8,
+	}
+
+	since := GetStateSinceHeight(dep, 0, chain.tip(), params, nil)
+	if since != 0 {
+		t.Errorf("DEFINED since: got %d, want 0", since)
+	}
+}
+
+// TestBlockSignals_Bit28Mask verifies the highest signaling bit (28) works
+// correctly with the VersionBitsTopMask.  0x30000000 = 0x20000000 | (1<<28).
+func TestBlockSignals_Bit28Mask(t *testing.T) {
+	// 0x30000000 = 0x20000000 | 0x10000000; top-3 bits = 001 → valid BIP9 + bit 28 set.
+	if !BlockSignals(0x30000000, 1<<28) {
+		t.Error("bit 28 should signal in version 0x30000000")
+	}
+	// 0x20000000 alone: bit 28 NOT set.
+	if BlockSignals(0x20000000, 1<<28) {
+		t.Error("bit 28 should NOT signal in base version 0x20000000")
+	}
+}
+
+// TestVersionBitsConstants verifies the three BIP9 protocol constants match
+// the values specified in BIP-9 and Bitcoin Core.
+func TestVersionBitsConstants(t *testing.T) {
+	// Core src/versionbits.h: VERSIONBITS_TOP_BITS = 0x20000000UL
+	if VersionBitsTopBits != 0x20000000 {
+		t.Errorf("VersionBitsTopBits = 0x%x, want 0x20000000", VersionBitsTopBits)
+	}
+	// Core: VERSIONBITS_TOP_MASK = 0xE0000000UL (= -0x20000000 in int32 two's complement)
+	if VersionBitsTopMask != -0x20000000 {
+		t.Errorf("VersionBitsTopMask = 0x%x, want 0xe0000000 (−0x20000000 as int32)", VersionBitsTopMask)
+	}
+	// Core: VERSIONBITS_NUM_BITS = 29
+	if VersionBitsNumBits != 29 {
+		t.Errorf("VersionBitsNumBits = %d, want 29", VersionBitsNumBits)
+	}
+	// Special time constants
+	if AlwaysActive != -1 {
+		t.Errorf("AlwaysActive = %d, want -1", AlwaysActive)
+	}
+	if NeverActive != -2 {
+		t.Errorf("NeverActive = %d, want -2", NeverActive)
+	}
+}
