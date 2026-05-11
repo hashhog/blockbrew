@@ -1041,10 +1041,11 @@ func TestCalcBlockWeight(t *testing.T) {
 
 	weight := CalcBlockWeight(block)
 
-	// Header weight is 80 * 4 = 320
-	// Plus transaction weight
+	// Header weight is 80 × 4 = 320 WU.
+	// Tx-count varint: 1 tx → 1 byte → 1 × 4 = 4 WU.
+	// Plus transaction weight.
 	txWeight := CalcTxWeight(block.Transactions[0])
-	expectedWeight := int64(320) + txWeight
+	expectedWeight := int64(320) + 4 + txWeight // varint contributes 4 WU
 
 	if weight != expectedWeight {
 		t.Errorf("CalcBlockWeight() = %d, want %d", weight, expectedWeight)
