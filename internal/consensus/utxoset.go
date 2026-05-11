@@ -508,14 +508,20 @@ func (u *UTXOSet) maybeFlush() error {
 }
 
 // AddTxOutputs adds all outputs from a transaction to the UTXO set.
-// Skips provably unspendable outputs (OP_RETURN).
+// Skips provably unspendable outputs (OP_RETURN, oversized scripts).
+//
+// Uses IsUnspendable for the skip predicate so ConnectBlock and DisconnectBlock
+// share the same filter — otherwise a >10k-byte script would be admitted by
+// ConnectBlock but skipped by DisconnectBlock on reorg, leaving a stale UTXO
+// behind. Mirrors Core's validation.cpp:2218 reverse-check of the same set
+// of outputs that ConnectBlock skipped.
 func (u *UTXOSet) AddTxOutputs(tx *wire.MsgTx, height int32) {
 	txHash := tx.TxHash()
 	isCoinbase := IsCoinbaseTx(tx)
 
 	for i, out := range tx.TxOut {
-		// Skip provably unspendable outputs (OP_RETURN)
-		if len(out.PkScript) > 0 && out.PkScript[0] == 0x6a {
+		// Skip provably unspendable outputs (OP_RETURN, oversized scripts).
+		if IsUnspendable(out.PkScript) {
 			continue
 		}
 
@@ -1005,4 +1011,182 @@ func (u *UTXOSet) DisconnectBlockUTXOs(block *wire.MsgBlock, undo *UndoBlock) er
 	}
 
 	return nil
+}
+
+// DisconnectResult mirrors Bitcoin Core validation.h:451-455 (DisconnectResult).
+// The two-state success result is what surfaces "the disconnect rolled back the
+// UTXO set, but at least one output was missing or its identity didn't match"
+// up to the caller. ActivateBestChain treats DISCONNECT_UNCLEAN as success —
+// the chainstate write still happens — but logs the inconsistency so the issue
+// can be tracked.
+type DisconnectResult int
+
+const (
+	// DisconnectOK means "All good." — no missing UTXOs, no identity
+	// mismatches, all undo entries applied cleanly.
+	DisconnectOK DisconnectResult = iota
+	// DisconnectUnclean means "Rolled back, but UTXO set was inconsistent
+	// with the block." This can happen for blocks that contain transactions
+	// later overwritten by a duplicate (BIP-30 collisions h=91722/91812):
+	// during reverse iteration we find an output already missing, or a coin
+	// that records different height/coinbase metadata than the tx itself.
+	// Mirrors Core's DISCONNECT_UNCLEAN return code (validation.h:453).
+	DisconnectUnclean
+)
+
+// AccessByTxid mirrors Bitcoin Core coins.cpp::AccessByTxid. It scans the
+// UTXO set looking for ANY unspent output of the given transaction id. Used
+// by ApplyTxInUndo to recover missing per-coin metadata (height + coinbase
+// flag) from a sibling output of the same transaction. Older undo records
+// only included this metadata for the LAST spend of a tx's outputs; if we
+// restore an earlier-spent output, we need to fish the metadata back out
+// of whatever sibling output is still unspent.
+//
+// Returns nil if no unspent sibling exists. The scan caps at
+// MAX_OUTPUTS_PER_BLOCK (≈80k) so a malformed undo record cannot pin us in
+// an unbounded loop.
+//
+// NOTE: Core's AccessByTxid takes a CCoinsViewCache and scans by index
+// inside the coins-per-tx structure. Our UTXOSet stores per-output entries
+// keyed by (txid, vout), so we scan by walking vout = 0,1,2,... and probe
+// until we miss MAX_PROBE_GAP consecutive outputs. Pragmatic but adequate
+// for legacy undo metadata recovery; the path is only hit on undo records
+// from Bitcoin Core <0.9 that round-tripped through us.
+func (u *UTXOSet) AccessByTxid(txid wire.Hash256) *UTXOEntry {
+	const maxProbe = 1 << 16 // hard cap (≈consensus MAX_TX_OUT count)
+	const maxProbeGap = 256  // give up after this many consecutive misses
+	gap := 0
+	for vout := uint32(0); vout < maxProbe; vout++ {
+		outpoint := wire.OutPoint{Hash: txid, Index: vout}
+		if e := u.GetUTXO(outpoint); e != nil {
+			return e
+		}
+		gap++
+		if gap >= maxProbeGap {
+			return nil
+		}
+	}
+	return nil
+}
+
+// ApplyTxInUndo restores a single spent input back into the UTXO set during
+// block disconnect. Mirrors Bitcoin Core validation.cpp:2149-2175.
+//
+// Gate A — HaveCoin overwrite detection: if the outpoint we're about to
+// restore is somehow already present in the UTXO set, the result is
+// "unclean" — we still proceed (Core's possible_overwrite=true path), but
+// we signal DisconnectUnclean to the caller. Real chains never trigger
+// this except in BIP-30 collision blocks.
+//
+// Gate B — Missing-metadata sibling recovery: if undo.Height == 0 (legacy
+// undo blob from pre-0.9 Core, or any undo that elided per-coin metadata),
+// scan the UTXO set for any sibling output of the same transaction and
+// borrow its Height + IsCoinbase. If no sibling exists, the restore is
+// impossible — return false (Core's DISCONNECT_FAILED).
+//
+// Gate C — pkScript aliasing: the undo blob we got from the database is a
+// fresh allocation, but the caller is free to keep using it after we
+// return. We bytes.Clone the script before installing into the UTXO cache
+// (W82 pattern: blockbrew's FindAndDelete slice-aliasing bug taught us
+// that holding a slice in the UTXO map while a separate code path mutates
+// the backing array silently corrupts state).
+//
+// Returns (clean, ok). clean=true iff fully clean; ok=false iff the undo
+// record was unrecoverable (sibling-recovery failed). A return of
+// (false, true) means "restored, but unclean — caller should propagate
+// DisconnectUnclean".
+func (u *UTXOSet) ApplyTxInUndo(undo *UTXOEntry, outpoint wire.OutPoint) (clean bool, ok bool) {
+	clean = true
+
+	// Gate A: overwrite check. HaveCoin on Core; HasUTXO here.
+	if u.HasUTXO(outpoint) {
+		clean = false // overwriting an unspent UTXO — unclean but not fatal
+	}
+
+	// Gate B: missing-metadata sibling recovery for legacy undo records.
+	if undo.Height == 0 {
+		alt := u.AccessByTxid(outpoint.Hash)
+		if alt == nil {
+			// No sibling unspent output exists — we have no way to
+			// reconstruct the per-coin metadata. Mirrors Core's
+			// DISCONNECT_FAILED return at validation.cpp:2164.
+			return false, false
+		}
+		undo.Height = alt.Height
+		undo.IsCoinbase = alt.IsCoinbase
+	}
+
+	// Gate C: defensive clone of the script bytes before they enter the
+	// UTXO cache. The undo blob's PkScript may alias storage owned by the
+	// caller (e.g. a long-lived BlockUndo cached for retry); the UTXO map
+	// outlives those callers. W82 pattern.
+	entry := &UTXOEntry{
+		Amount:     undo.Amount,
+		PkScript:   bytes.Clone(undo.PkScript),
+		Height:     undo.Height,
+		IsCoinbase: undo.IsCoinbase,
+	}
+	u.AddUTXO(outpoint, entry)
+
+	return clean, true
+}
+
+// SpendUTXOWithCoin marks a UTXO as spent and returns the coin that was
+// removed, or nil if the outpoint was not present. Used by DisconnectBlock
+// to verify output identity (height + coinbase + value + script) against
+// the block being disconnected — Core's validation.cpp:2217-2218.
+//
+// Returns the pre-spend entry. If the outpoint did not exist the return is
+// (nil, false). Concurrent callers see the same lock semantics as SpendUTXO.
+func (u *UTXOSet) SpendUTXOWithCoin(outpoint wire.OutPoint) (*UTXOEntry, bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	// Snapshot the existing entry (if any) before mutating cache state.
+	// Use a deep-ish copy of the script so the returned entry doesn't alias
+	// the now-deleted cache slot.
+	var snapshot *UTXOEntry
+	if existing, ok := u.cache[outpoint]; ok {
+		snapshot = &UTXOEntry{
+			Amount:     existing.Amount,
+			PkScript:   bytes.Clone(existing.PkScript),
+			Height:     existing.Height,
+			IsCoinbase: existing.IsCoinbase,
+		}
+		u.cacheBytes -= estimateEntrySize(existing)
+		delete(u.cache, outpoint)
+		delete(u.dirty, outpoint)
+		if u.fresh[outpoint] {
+			delete(u.fresh, outpoint)
+			u.freshHits++
+			return snapshot, true
+		}
+		u.deleted[outpoint] = true
+		return snapshot, true
+	}
+
+	// Fall back to a DB lookup — if the entry was already flushed we want
+	// its metadata for the identity check before tombstoning it. Skip the
+	// DB probe in tests that pass a nil ChainDB.
+	if u.db != nil {
+		if u.deleted[outpoint] {
+			return nil, false
+		}
+		key := storage.MakeUTXOKey(outpoint)
+		data, err := u.db.DB().Get(key)
+		if err == nil && data != nil {
+			if entry, derr := DeserializeUTXOEntry(data); derr == nil {
+				snapshot = &UTXOEntry{
+					Amount:     entry.Amount,
+					PkScript:   bytes.Clone(entry.PkScript),
+					Height:     entry.Height,
+					IsCoinbase: entry.IsCoinbase,
+				}
+				u.deleted[outpoint] = true
+				return snapshot, true
+			}
+		}
+	}
+
+	return nil, false
 }
