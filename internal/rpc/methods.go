@@ -1655,7 +1655,10 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 		CoinbaseAux:              map[string]string{},
 		CoinbaseValue:            template.CoinbaseValue,
 		Target:                   targetHex,
-		MinTime:                  int64(template.Block.Header.Timestamp),
+		// MinTime: GetMinimumTime(pindexPrev, diffAdjInterval) per Core rpc/mining.cpp:1004.
+		// = max(MTP+1, prevBlockTime−MAX_TIMEWARP) at retarget boundaries (BIP-94).
+		// Bug fixed: was template.Block.Header.Timestamp (current time, not consensus minimum).
+		MinTime:                  template.MinTime,
 		Mutable:                  []string{"time", "transactions", "prevblock"},
 		NonceRange:               "00000000ffffffff",
 		SigOpLimit:               consensus.MaxBlockSigOpsCost,
