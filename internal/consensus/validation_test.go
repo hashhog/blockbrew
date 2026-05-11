@@ -2359,3 +2359,490 @@ func TestWitnessCommitment_FullValid(t *testing.T) {
 		t.Errorf("FullValid: should pass, got: %v", err)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// W84 — CheckTransaction + CheckTxInputs + CVE-2018-17144 + GetBlockSubsidy
+// Comprehensive gate tests.  Reference: bitcoin-core/src/consensus/tx_check.cpp,
+// tx_verify.cpp:164-214, validation.cpp:1839-1850, consensus/amount.h.
+// ---------------------------------------------------------------------------
+
+// TestCheckTransactionSanity_OversizeBug tests that the oversize check uses
+// the non-witness serialized size × WITNESS_SCALE_FACTOR (Core tx_check.cpp:19)
+// rather than the full weight.  A tx with large witness but small non-witness
+// body is valid in Core but was falsely rejected by the old CalcTxWeight check.
+func TestCheckTransactionSanity_OversizeBug(t *testing.T) {
+	// Build a tx whose non-witness size is just under 1 MB (the implicit limit
+	// from the Core formula: non_witness * 4 > 4_000_000 → non_witness > 1_000_000).
+	// We use a 999,900-byte scriptSig so non_witness ≈ 999,946 bytes.
+	// Then add 4 MB of witness data to push actual weight far above 4,000,000.
+	// Core would ACCEPT this (non_witness * 4 < 4,000,000); old blockbrew would REJECT.
+	const scriptSigSize = 999_900
+	largeSig := make([]byte, scriptSigSize)
+
+	// Build witness with total bytes exceeding 4 MB.
+	// Each witness stack item is ~50 KB; 100 items = ~5 MB witness.
+	witnessItem := make([]byte, 50_000)
+	var witnessStack [][]byte
+	for i := 0; i < 100; i++ {
+		witnessStack = append(witnessStack, witnessItem)
+	}
+
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+				SignatureScript:  largeSig,
+				Witness:          witnessStack,
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 1000, PkScript: []byte{0x76, 0xa9}},
+		},
+	}
+
+	// Verify the tx is actually oversized in actual weight but within non-witness limit
+	strippedSize := CalcTxSerializeSizeNoWitness(tx)
+	weight := CalcTxWeight(tx)
+	if strippedSize*WitnessScaleFactor > MaxBlockWeight {
+		t.Skipf("test setup: non-witness size %d × 4 = %d exceeds limit; adjust scriptSigSize",
+			strippedSize, strippedSize*WitnessScaleFactor)
+	}
+	if weight <= MaxBlockWeight {
+		t.Skipf("test setup: actual weight %d does not exceed limit; add more witness data", weight)
+	}
+
+	// After the fix: should PASS (non-witness body is within limit)
+	err := CheckTransactionSanity(tx)
+	if err != nil {
+		t.Errorf("oversized-witness tx should pass after fix (non-witness within limit), got: %v", err)
+	}
+}
+
+// TestCheckTransactionSanity_OversizeNonWitness tests that a tx whose non-witness
+// body exceeds 1 MB is rejected (Core: non_witness * 4 > MAX_BLOCK_WEIGHT).
+func TestCheckTransactionSanity_OversizeNonWitness(t *testing.T) {
+	// non_witness_size = 1_000_100 → non_witness * 4 = 4_000_400 > 4_000_000
+	largeSig := make([]byte, 1_000_100)
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+				SignatureScript:  largeSig,
+				Sequence:         0xffffffff,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 1000, PkScript: []byte{0x76, 0xa9}},
+		},
+	}
+	err := CheckTransactionSanity(tx)
+	if err == nil {
+		t.Errorf("expected ErrOversizedTx for large non-witness tx, got nil")
+	}
+	if err != ErrOversizedTx {
+		t.Errorf("expected ErrOversizedTx, got %v", err)
+	}
+}
+
+// TestCheckTransactionSanity_CVE_2018_17144 tests the duplicate-input check
+// that prevents the inflation bug (CVE-2018-17144).
+// Reference: bitcoin-core/src/consensus/tx_check.cpp:36-45.
+func TestCheckTransactionSanity_CVE_2018_17144(t *testing.T) {
+	hash1 := wire.Hash256{0x01}
+	hash2 := wire.Hash256{0x02}
+
+	tests := []struct {
+		name    string
+		inputs  []*wire.TxIn
+		wantErr bool
+	}{
+		{
+			name: "same hash same index → duplicate (must reject)",
+			inputs: []*wire.TxIn{
+				{PreviousOutPoint: wire.OutPoint{Hash: hash1, Index: 0}, SignatureScript: []byte{0x00}},
+				{PreviousOutPoint: wire.OutPoint{Hash: hash1, Index: 0}, SignatureScript: []byte{0x00}},
+			},
+			wantErr: true,
+		},
+		{
+			name: "same hash different index → not duplicate (must accept)",
+			inputs: []*wire.TxIn{
+				{PreviousOutPoint: wire.OutPoint{Hash: hash1, Index: 0}, SignatureScript: []byte{0x00}},
+				{PreviousOutPoint: wire.OutPoint{Hash: hash1, Index: 1}, SignatureScript: []byte{0x00}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "different hash same index → not duplicate (must accept)",
+			inputs: []*wire.TxIn{
+				{PreviousOutPoint: wire.OutPoint{Hash: hash1, Index: 0}, SignatureScript: []byte{0x00}},
+				{PreviousOutPoint: wire.OutPoint{Hash: hash2, Index: 0}, SignatureScript: []byte{0x00}},
+			},
+			wantErr: false,
+		},
+		{
+			name: "three inputs, third duplicates first",
+			inputs: []*wire.TxIn{
+				{PreviousOutPoint: wire.OutPoint{Hash: hash1, Index: 0}, SignatureScript: []byte{0x00}},
+				{PreviousOutPoint: wire.OutPoint{Hash: hash2, Index: 0}, SignatureScript: []byte{0x00}},
+				{PreviousOutPoint: wire.OutPoint{Hash: hash1, Index: 0}, SignatureScript: []byte{0x00}},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := &wire.MsgTx{
+				Version: 1,
+				TxIn:    tt.inputs,
+				TxOut:   []*wire.TxOut{{Value: 1000, PkScript: []byte{0x76, 0xa9}}},
+			}
+			err := CheckTransactionSanity(tx)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error (duplicate input), got nil")
+				} else if err != ErrDuplicateInput {
+					t.Errorf("expected ErrDuplicateInput, got %v", err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckTransactionSanity_CoinbaseScriptBoundaries tests the exact 2-byte
+// and 100-byte boundaries for coinbase scriptSig length.
+// Reference: bitcoin-core/src/consensus/tx_check.cpp:49.
+func TestCheckTransactionSanity_CoinbaseScriptBoundaries(t *testing.T) {
+	makeCoibaseTx := func(scriptLen int) *wire.MsgTx {
+		return &wire.MsgTx{
+			Version: 1,
+			TxIn: []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xffffffff},
+					SignatureScript:  make([]byte, scriptLen),
+					Sequence:         0xffffffff,
+				},
+			},
+			TxOut: []*wire.TxOut{{Value: 5_000_000_000, PkScript: []byte{0x76, 0xa9}}},
+		}
+	}
+
+	tests := []struct {
+		name    string
+		len     int
+		wantErr bool
+	}{
+		{"length 1 (too short)", 1, true},
+		{"length 2 (minimum, must pass)", 2, false},
+		{"length 50 (middle, must pass)", 50, false},
+		{"length 100 (maximum, must pass)", 100, false},
+		{"length 101 (too long)", 101, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := makeCoibaseTx(tt.len)
+			err := CheckTransactionSanity(tx)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected ErrCoinbaseScriptSize for len=%d, got nil", tt.len)
+				} else if err != ErrCoinbaseScriptSize {
+					t.Errorf("expected ErrCoinbaseScriptSize for len=%d, got %v", tt.len, err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error for len=%d: %v", tt.len, err)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckTransactionSanity_OutputSumOverflow tests that two outputs each
+// below MaxMoney but summing above MaxMoney are rejected.
+// Reference: bitcoin-core/src/consensus/tx_check.cpp:31-33 (bad-txns-txouttotal-toolarge).
+func TestCheckTransactionSanity_OutputSumOverflow(t *testing.T) {
+	// MaxMoney/2 + 1 + MaxMoney/2 + 1 > MaxMoney
+	half := MaxMoney/2 + 1
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0}, SignatureScript: []byte{0x00}},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: half, PkScript: []byte{0x76, 0xa9}},
+			{Value: half, PkScript: []byte{0x76, 0xa9}},
+		},
+	}
+	err := CheckTransactionSanity(tx)
+	if err == nil {
+		t.Errorf("expected ErrTotalOutputTooLarge for output sum > MaxMoney, got nil")
+	}
+	if err != ErrTotalOutputTooLarge {
+		t.Errorf("expected ErrTotalOutputTooLarge, got %v", err)
+	}
+}
+
+// TestCheckTransactionSanity_OutputsExactMaxMoney tests that a single output
+// of exactly MaxMoney is accepted.
+func TestCheckTransactionSanity_OutputsExactMaxMoney(t *testing.T) {
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0}, SignatureScript: []byte{0x00}},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: MaxMoney, PkScript: []byte{0x76, 0xa9}},
+		},
+	}
+	if err := CheckTransactionSanity(tx); err != nil {
+		t.Errorf("exact MaxMoney output should pass, got: %v", err)
+	}
+}
+
+// TestCheckTransactionInputs_CoinbaseMaturityBoundaries tests the exact
+// COINBASE_MATURITY (100) depth boundary.
+// Reference: bitcoin-core/src/consensus/tx_verify.cpp:179.
+func TestCheckTransactionInputs_CoinbaseMaturityBoundaries(t *testing.T) {
+	utxoView := NewInMemoryUTXOView()
+	// Coinbase UTXO created at height 100
+	utxoView.AddUTXO(wire.OutPoint{Hash: wire.Hash256{0xAB}, Index: 0}, &UTXOEntry{
+		Amount:     5_000_000_000,
+		PkScript:   []byte{0x76, 0xa9},
+		Height:     100,
+		IsCoinbase: true,
+	})
+
+	spendTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0xAB}, Index: 0}, SignatureScript: []byte{0x00}},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 4_000_000_000, PkScript: []byte{0x76, 0xa9}},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		txHeight  int32
+		wantErr   bool
+		errTarget error
+	}{
+		// depth = txHeight - utxoHeight = 99/100/101
+		{"depth 99 (immature)", 199, true, ErrImmatureCoinbase},
+		{"depth 100 (exactly mature)", 200, false, nil},
+		{"depth 101 (more than mature)", 201, false, nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := CheckTransactionInputs(spendTx, tt.txHeight, utxoView)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error at depth %d, got nil", tt.txHeight-100)
+				} else if !containsError(err, tt.errTarget) {
+					t.Errorf("expected %v, got %v", tt.errTarget, err)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error at depth %d: %v", tt.txHeight-100, err)
+				}
+			}
+		})
+	}
+}
+
+// TestCheckTransactionInputs_InputValueRange tests MoneyRange enforcement on
+// individual and accumulated input values.
+// Reference: bitcoin-core/src/consensus/tx_verify.cpp:186-188.
+func TestCheckTransactionInputs_InputValueRange(t *testing.T) {
+	// Negative input value
+	viewNeg := NewInMemoryUTXOView()
+	viewNeg.AddUTXO(wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0}, &UTXOEntry{
+		Amount:     -1,
+		PkScript:   []byte{0x76},
+		Height:     0,
+		IsCoinbase: false,
+	})
+	txNeg := &wire.MsgTx{
+		Version: 1,
+		TxIn:    []*wire.TxIn{{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0}, SignatureScript: []byte{0x00}}},
+		TxOut:   []*wire.TxOut{{Value: 0, PkScript: []byte{0x76}}},
+	}
+	if _, err := CheckTransactionInputs(txNeg, 500, viewNeg); err == nil {
+		t.Errorf("negative input amount should be rejected")
+	}
+
+	// Input amount > MaxMoney
+	viewLarge := NewInMemoryUTXOView()
+	viewLarge.AddUTXO(wire.OutPoint{Hash: wire.Hash256{0x02}, Index: 0}, &UTXOEntry{
+		Amount:     MaxMoney + 1,
+		PkScript:   []byte{0x76},
+		Height:     0,
+		IsCoinbase: false,
+	})
+	txLarge := &wire.MsgTx{
+		Version: 1,
+		TxIn:    []*wire.TxIn{{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x02}, Index: 0}, SignatureScript: []byte{0x00}}},
+		TxOut:   []*wire.TxOut{{Value: 0, PkScript: []byte{0x76}}},
+	}
+	if _, err := CheckTransactionInputs(txLarge, 500, viewLarge); err == nil {
+		t.Errorf("input amount > MaxMoney should be rejected")
+	}
+
+	// Accumulated inputs > MaxMoney (two inputs each at MaxMoney)
+	viewAccum := NewInMemoryUTXOView()
+	viewAccum.AddUTXO(wire.OutPoint{Hash: wire.Hash256{0x03}, Index: 0}, &UTXOEntry{
+		Amount:     MaxMoney,
+		PkScript:   []byte{0x76},
+		Height:     0,
+		IsCoinbase: false,
+	})
+	viewAccum.AddUTXO(wire.OutPoint{Hash: wire.Hash256{0x03}, Index: 1}, &UTXOEntry{
+		Amount:     MaxMoney,
+		PkScript:   []byte{0x76},
+		Height:     0,
+		IsCoinbase: false,
+	})
+	txAccum := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x03}, Index: 0}, SignatureScript: []byte{0x00}},
+			{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x03}, Index: 1}, SignatureScript: []byte{0x00}},
+		},
+		TxOut: []*wire.TxOut{{Value: 0, PkScript: []byte{0x76}}},
+	}
+	if _, err := CheckTransactionInputs(txAccum, 500, viewAccum); err == nil {
+		t.Errorf("accumulated inputs > MaxMoney should be rejected")
+	}
+}
+
+// TestCheckTransactionInputs_FeeCalculation tests correct fee calculation
+// at various input/output combinations including zero-fee and exact-match.
+func TestCheckTransactionInputs_FeeCalculation(t *testing.T) {
+	utxoView := NewInMemoryUTXOView()
+	utxoView.AddUTXO(wire.OutPoint{Hash: wire.Hash256{0x10}, Index: 0}, &UTXOEntry{
+		Amount:     1_000_000,
+		PkScript:   []byte{0x76},
+		Height:     0,
+		IsCoinbase: false,
+	})
+
+	tests := []struct {
+		name     string
+		outValue int64
+		wantFee  int64
+		wantErr  bool
+	}{
+		{"zero fee (in == out)", 1_000_000, 0, false},
+		{"normal fee", 900_000, 100_000, false},
+		{"outputs > inputs (reject)", 1_000_001, 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tx := &wire.MsgTx{
+				Version: 1,
+				TxIn:    []*wire.TxIn{{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x10}, Index: 0}, SignatureScript: []byte{0x00}}},
+				TxOut:   []*wire.TxOut{{Value: tt.outValue, PkScript: []byte{0x76}}},
+			}
+			fee, err := CheckTransactionInputs(tx, 500, utxoView)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("expected error, got nil")
+				}
+			} else {
+				if err != nil {
+					t.Errorf("unexpected error: %v", err)
+				}
+				if fee != tt.wantFee {
+					t.Errorf("fee = %d, want %d", fee, tt.wantFee)
+				}
+			}
+		})
+	}
+}
+
+// TestCalcBlockSubsidyAllHalvingBoundaries tests every significant halving
+// boundary including the critical halvings >= 64 UB-guard.
+// Reference: bitcoin-core/src/validation.cpp:1839-1850.
+func TestCalcBlockSubsidyAllHalvingBoundaries(t *testing.T) {
+	// InitialSubsidy = 50 BTC = 5,000,000,000 satoshis
+	// Last non-zero halving: halving 32 (5,000,000,000 >> 32 = 1 sat).
+	// Halving 33+: 0 sats.
+	// The halvings >= 64 guard prevents UB in C++ (Go right-shifts are always safe,
+	// but the gate is required for consensus-equivalence with Core).
+	tests := []struct {
+		name    string
+		height  int32
+		subsidy int64
+	}{
+		// --- Boundaries of the first halving ---
+		{"last block before halving 1 (h=209999)", 209_999, 5_000_000_000},
+		{"first block of halving 1 (h=210000)", 210_000, 2_500_000_000},
+
+		// --- Last non-zero subsidy ---
+		{"last block before halving 32 (h=6719999)", 6_719_999, 2},
+		{"first block of halving 32 (h=6720000, subsidy=1 sat)", 6_720_000, 1},
+		{"last block at halving 32 (h=6929999)", 6_929_999, 1},
+
+		// --- First zero-subsidy halving ---
+		{"first block of halving 33 (h=6930000)", 6_930_000, 0},
+		{"mid-halving 33 (h=7000000)", 7_000_000, 0},
+
+		// --- halvings >= 64 guard (critical: prevents >> 64 UB in C++) ---
+		{"last block before halvings=64 (h=13439999)", 13_439_999, 0},
+		{"first block at halvings=64 (h=13440000)", 13_440_000, 0},
+		{"block well past halvings=64 (h=14000000)", 14_000_000, 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := CalcBlockSubsidy(tt.height)
+			if got != tt.subsidy {
+				t.Errorf("CalcBlockSubsidy(%d) = %d, want %d", tt.height, got, tt.subsidy)
+			}
+		})
+	}
+}
+
+// TestCalcBlockSubsidyAllHalvings verifies every halving from 0 to 64
+// matches the reference formula: InitialSubsidy >> halving (capped at 0 for >= 64).
+func TestCalcBlockSubsidyAllHalvings(t *testing.T) {
+	for halving := int32(0); halving <= 65; halving++ {
+		height := halving * SubsidyHalvingInterval
+		got := CalcBlockSubsidy(height)
+
+		var want int64
+		if halving < 64 {
+			want = InitialSubsidy >> uint(halving)
+		}
+		if got != want {
+			t.Errorf("CalcBlockSubsidy(%d) [halving=%d] = %d, want %d", height, halving, got, want)
+		}
+	}
+}
+
+// TestGetBlockSubsidyMoneyRange verifies that CalcBlockSubsidy always returns
+// a value in MoneyRange [0, MaxMoney].
+func TestGetBlockSubsidyMoneyRange(t *testing.T) {
+	testHeights := []int32{
+		0, 1, 209_999, 210_000, 420_000, 6_720_000, 6_930_000,
+		13_440_000, 13_440_001, 14_000_000,
+	}
+	for _, h := range testHeights {
+		s := CalcBlockSubsidy(h)
+		if s < 0 || s > MaxMoney {
+			t.Errorf("CalcBlockSubsidy(%d) = %d is outside MoneyRange [0, %d]", h, s, MaxMoney)
+		}
+	}
+}
