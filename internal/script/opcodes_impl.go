@@ -663,8 +663,15 @@ func (e *Engine) opCheckSig(script []byte) error {
 		if e.sigVersion == SigVersionBase {
 			// For legacy, get scriptCode from after last OP_CODESEPARATOR
 			scriptCode := e.currentScript[e.lastCodeSepIdx:]
-			// Apply FindAndDelete to remove the push-encoded signature from scriptCode
-			scriptCode = FindAndDelete(scriptCode, sigBytes)
+			// Apply FindAndDelete to remove the push-encoded signature from scriptCode.
+			// CONST_SCRIPTCODE (BIP-342): if the signature was actually found and
+			// deleted, the script is non-constant — reject it. Mirrors Core
+			// EvalChecksigPreTapscript interpreter.cpp:330-332.
+			var found int
+			scriptCode, found = FindAndDeleteCount(scriptCode, sigBytes)
+			if found > 0 && (e.flags&ScriptVerifyConstScriptCode != 0) {
+				return ErrSigFindAndDelete
+			}
 			sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
 		} else {
 			// For witness v0, use BIP143 sighash.
@@ -816,19 +823,26 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 	// For legacy scripts, prepare scriptCode by:
 	// 1. Taking script from after last OP_CODESEPARATOR
 	// 2. Applying FindAndDelete for ALL signatures before verification
-	// This matches Bitcoin Core's behavior in interpreter.cpp lines 1138-1150
+	// CONST_SCRIPTCODE (BIP-342): reject if any signature was actually found and
+	// deleted from the scriptCode. Mirrors Core interpreter.cpp:1142-1149.
 	var scriptCode []byte
 	if e.sigVersion == SigVersionBase {
 		scriptCode = e.currentScript[e.lastCodeSepIdx:]
-		// Remove all signatures from scriptCode before verification
 		for _, sigBytes := range sigs {
-			scriptCode = FindAndDelete(scriptCode, sigBytes)
+			var found int
+			scriptCode, found = FindAndDeleteCount(scriptCode, sigBytes)
+			if found > 0 && (e.flags&ScriptVerifyConstScriptCode != 0) {
+				return ErrSigFindAndDelete
+			}
 		}
 	}
 
-	// Verify signatures — matches Bitcoin Core's CHECKMULTISIG logic:
-	// iterate sigs; for each sig, iterate pubkeys from where we left off.
-	// After each pubkey attempt (hit or miss), check if enough pubkeys remain.
+	// Verify signatures — mirrors Bitcoin Core's CHECKMULTISIG logic exactly:
+	// for each remaining sig, try each remaining pubkey in order. An empty sig
+	// passes CheckSignatureEncoding (Core returns true for empty) then fails
+	// ECDSA, consuming one pubkey attempt. We must NOT break early on an empty
+	// sig — that would skip encoding checks on subsequent sigs/pubkeys (bug).
+	// Core: interpreter.cpp:1152-1181.
 	success := true
 	sigIdx := 0
 	pubKeyIdx := 0
@@ -838,37 +852,37 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 	for success && nSigsRemaining > 0 {
 		sigBytes := sigs[sigIdx]
 
-		if len(sigBytes) == 0 {
-			success = false
-			break
-		}
+		// Empty signatures are valid encoding (CheckSignatureEncoding returns true
+		// for empty — Core interpreter.cpp:204-206). They simply fail ECDSA.
+		// Apply encoding checks only for non-empty sigs, matching Core's
+		// CheckSignatureEncoding semantics.
+		if len(sigBytes) > 0 {
+			// DER signature encoding check (BIP66)
+			if (e.flags&ScriptVerifyDERSig != 0) || (e.flags&ScriptVerifyLowS != 0) || (e.flags&ScriptVerifyStrictEncoding != 0) {
+				if !IsValidDERSignatureEncoding(sigBytes) {
+					return ErrSigDER
+				}
+			}
 
-		// DER signature encoding check (BIP66)
-		if (e.flags&ScriptVerifyDERSig != 0) || (e.flags&ScriptVerifyLowS != 0) || (e.flags&ScriptVerifyStrictEncoding != 0) {
-			if !IsValidDERSignatureEncoding(sigBytes) {
-				return ErrSigDER
+			// Low-S check (BIP62 rule 5)
+			if e.flags&ScriptVerifyLowS != 0 {
+				if !IsLowSSignature(sigBytes) {
+					return ErrSigHighS
+				}
+			}
+
+			// STRICTENC: check hashtype is defined
+			if e.flags&ScriptVerifyStrictEncoding != 0 {
+				if !IsDefinedHashtype(sigBytes) {
+					return ErrSigHashType
+				}
 			}
 		}
-
-		// Low-S check (BIP62 rule 5)
-		if e.flags&ScriptVerifyLowS != 0 {
-			if !IsLowSSignature(sigBytes) {
-				return ErrSigHighS
-			}
-		}
-
-		// STRICTENC: check hashtype is defined
-		if e.flags&ScriptVerifyStrictEncoding != 0 {
-			if !IsDefinedHashtype(sigBytes) {
-				return ErrSigHashType
-			}
-		}
-
-		hashType := SigHashType(sigBytes[len(sigBytes)-1])
-		sig := sigBytes[:len(sigBytes)-1]
 
 		pubKeyBytes := pubKeys[pubKeyIdx]
 
+		// CheckPubKeyEncoding applies regardless of sig content (Core calls it in
+		// the same loop iteration as the sig encoding check).
 		// STRICTENC: check pubkey is compressed or uncompressed (reject hybrid)
 		if e.flags&ScriptVerifyStrictEncoding != 0 {
 			if !IsCompressedOrUncompressedPubKey(pubKeyBytes) {
@@ -883,23 +897,28 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 			}
 		}
 
-		// Attempt verification
+		// Attempt ECDSA verification. Empty sigs always fail (matched = false).
 		matched := false
-		var sighash [32]byte
-		switch e.sigVersion {
-		case SigVersionBase:
-			sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
-		case SigVersionWitnessV0:
-			// BIP143 scriptCode: use witness script from after the last
-			// OP_CODESEPARATOR (no FindAndDelete in witness v0).
-			witnessScriptCode := e.currentScript[e.lastCodeSepIdx:]
-			sighash, err = CalcWitnessSignatureHash(witnessScriptCode, hashType, e.tx, e.txIdx, e.amount)
-		}
-		if err == nil {
-			pubKey, pkErr := crypto.PublicKeyFromBytes(pubKeyBytes)
-			if pkErr == nil {
-				if crypto.VerifyECDSALax(pubKey, sighash, sig) {
-					matched = true
+		if len(sigBytes) > 0 {
+			hashType := SigHashType(sigBytes[len(sigBytes)-1])
+			sig := sigBytes[:len(sigBytes)-1]
+
+			var sighash [32]byte
+			switch e.sigVersion {
+			case SigVersionBase:
+				sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
+			case SigVersionWitnessV0:
+				// BIP143 scriptCode: use witness script from after the last
+				// OP_CODESEPARATOR (no FindAndDelete in witness v0).
+				witnessScriptCode := e.currentScript[e.lastCodeSepIdx:]
+				sighash, err = CalcWitnessSignatureHash(witnessScriptCode, hashType, e.tx, e.txIdx, e.amount)
+			}
+			if err == nil {
+				pubKey, pkErr := crypto.PublicKeyFromBytes(pubKeyBytes)
+				if pkErr == nil {
+					if crypto.VerifyECDSALax(pubKey, sighash, sig) {
+						matched = true
+					}
 				}
 			}
 		}
