@@ -20,6 +20,14 @@ const (
 	// MaxCFCheckptPerRequest is the maximum number of checkpoints per getcfcheckpt response.
 	// One checkpoint per 1000 blocks.
 	MaxCFCheckptPerRequest = 1000
+
+	// CFCheckptInterval is the spacing between compact filter header checkpoints
+	// (in blocks). Core: CFCHECKPT_INTERVAL = 1000 (net_processing.cpp:178).
+	// getcfcheckpt returns one filter header per CFCheckptInterval blocks up
+	// to the stop hash, at heights CFCheckptInterval-1, 2*CFCheckptInterval-1,
+	// etc. (i.e. at every height that is 0 mod CFCheckptInterval after the
+	// genesis offset). This matches BIP-157 §getcfcheckpt.
+	CFCheckptInterval = 1000
 )
 
 // MsgGetCFilters is the "getcfilters" message (BIP157) requesting compact block
