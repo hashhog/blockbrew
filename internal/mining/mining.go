@@ -11,6 +11,28 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// Block template weight / sigops constants — mirror Bitcoin Core's policy/policy.h.
+//
+// DefaultBlockReservedWeight: space permanently reserved for the block header,
+// tx-count varint, and coinbase tx (Core DEFAULT_BLOCK_RESERVED_WEIGHT = 8000).
+// Core miner.cpp:114 — nBlockWeight starts at this value.
+//
+// MinimumBlockReservedWeight: lowest value accepted by ClampOptions
+// (Core MINIMUM_BLOCK_RESERVED_WEIGHT = 2000).
+const (
+	DefaultBlockReservedWeight  = 8_000
+	MinimumBlockReservedWeight  = 2_000
+	blockFullEnoughWeightDelta  = 4_000 // Core miner.cpp:285 BLOCK_FULL_ENOUGH_WEIGHT_DELTA
+	maxConsecutiveFailures      = 1_000 // Core miner.cpp:284 MAX_CONSECUTIVE_FAILURES
+)
+
+// coinbaseMaxSequenceNonfinal is the nSequence value used for the coinbase
+// input. It equals CTxIn::MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) from Core
+// primitives/transaction.h:82, making the coinbase's nLockTime enforceable.
+// Using 0xFFFFFFFF (SEQUENCE_FINAL) would bypass the locktime check entirely.
+// Core miner.cpp:171.
+const coinbaseMaxSequenceNonfinal uint32 = 0xFFFFFFFE
+
 // BlockTemplate is a fully constructed block ready for mining (finding a valid nonce).
 type BlockTemplate struct {
 	Block             *wire.MsgBlock
@@ -24,6 +46,13 @@ type BlockTemplate struct {
 	// CBlockTemplate::vTxSigOpsCost (see node/miner.cpp). Used by getblocktemplate
 	// to populate the per-tx `sigops` field.
 	TxSigOpsCost []int64
+	// MinTime is the minimum timestamp valid for the next block, per
+	// GetMinimumTime (Core node/miner.cpp:36-47). Always MTP+1; at difficulty
+	// adjustment boundaries also bounded below by prevBlock.time − MAX_TIMEWARP
+	// (BIP-94 timewarp rule). Used by getblocktemplate's "mintime" field.
+	// Bug fixed: was set to template.Block.Header.Timestamp (current time)
+	// instead of the consensus minimum.
+	MinTime int64
 }
 
 // TemplateConfig configures block template generation.
@@ -37,11 +66,12 @@ type TemplateConfig struct {
 
 // TemplateGenerator generates block templates from the mempool.
 type TemplateGenerator struct {
-	chainParams *consensus.ChainParams
-	chainMgr    ChainStateProvider
-	mp          MempoolProvider
-	headerIndex HeaderIndexProvider
-	utxoSrc     UTXOViewProvider // Optional; nil falls back to output-only sigops estimate.
+	chainParams   *consensus.ChainParams
+	chainMgr      ChainStateProvider
+	mp            MempoolProvider
+	headerIndex   HeaderIndexProvider
+	utxoSrc       UTXOViewProvider        // Optional; nil falls back to output-only sigops estimate.
+	blockProvider consensus.BlockProvider // Optional; used by GetNextWorkRequired for testnet4 min-diff.
 }
 
 // ChainStateProvider provides chain state for template generation.
@@ -87,7 +117,19 @@ func NewTemplateGenerator(
 	if up, ok := cm.(UTXOViewProvider); ok {
 		tg.utxoSrc = up
 	}
+	// If the header index also implements BlockProvider (production HeaderIndex
+	// does), wire it up so GetNextWorkRequired can walk back for testnet4
+	// min-difficulty blocks. Core miner.cpp:219 / pow.cpp.
+	if bp, ok := idx.(consensus.BlockProvider); ok {
+		tg.blockProvider = bp
+	}
 	return tg
+}
+
+// SetBlockProvider overrides the BlockProvider used for difficulty calculation.
+// Primarily used by tests that construct a minimal mock index.
+func (tg *TemplateGenerator) SetBlockProvider(bp consensus.BlockProvider) {
+	tg.blockProvider = bp
 }
 
 // SetUTXOSource overrides the UTXO source used for per-tx sigops accounting.
@@ -103,36 +145,54 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 	tipNode := tg.headerIndex.GetNode(tipHash)
 	newHeight := tipHeight + 1
 
-	// 2. Calculate difficulty for the new block
-	var newBits uint32
-	if newHeight%int32(tg.chainParams.DifficultyAdjInterval) == 0 {
-		// Need to recalculate difficulty
-		blocksBack := int32(tg.chainParams.DifficultyAdjInterval) - 1
-		firstNode := tipNode.GetAncestor(tipHeight - blocksBack)
-		newBits = consensus.CalcNextRequiredDifficulty(
-			tg.chainParams,
-			tipNode.Header.Bits,
-			int64(firstNode.Header.Timestamp),
-			int64(tipNode.Header.Timestamp),
-		)
-	} else {
-		newBits = tipNode.Header.Bits
-	}
-
-	// 3. Build the block header
+	// 3. Build the block header — timestamp first so GetNextWorkRequired can
+	// apply the testnet4 20-minute min-difficulty rule (Core miner.cpp:147,219).
 	header := wire.BlockHeader{
 		Version:   0x20000000, // BIP9 version bits signaling
 		PrevBlock: tipHash,
 		Timestamp: uint32(time.Now().Unix()),
-		Bits:      newBits,
+		Bits:      0, // set below after timestamp is finalised
 		Nonce:     0, // Miner will iterate this
 	}
 
-	// Ensure timestamp is after MTP
+	// Ensure timestamp is strictly after MTP (BIP-113 / Core miner.cpp:148).
 	mtp := tipNode.GetMedianTimePast()
 	if int64(header.Timestamp) <= mtp {
 		header.Timestamp = uint32(mtp + 1)
 	}
+
+	// 2. Calculate difficulty using the full GetNextWorkRequired so that the
+	// testnet4 20-minute min-difficulty exception (fPowAllowMinDifficultyBlocks)
+	// is handled correctly. Core UpdateTime (miner.cpp:60-62) re-runs nBits
+	// calculation after the timestamp is finalised for exactly this reason.
+	// Bug fixed: previously used CalcNextRequiredDifficulty only at retarget
+	// boundaries, missing the testnet4 min-diff rule entirely.
+	// Core reference: miner.cpp:219-220, pow.cpp:GetNextWorkRequired.
+	var newBits uint32
+	if tg.blockProvider != nil {
+		newBits = consensus.GetNextWorkRequired(
+			tg.chainParams,
+			newHeight,
+			int64(header.Timestamp),
+			tipNode,
+			tg.blockProvider,
+		)
+	} else {
+		// Fallback (tests without a full BlockProvider): use simple interval check.
+		if newHeight%int32(tg.chainParams.DifficultyAdjInterval) == 0 {
+			blocksBack := int32(tg.chainParams.DifficultyAdjInterval) - 1
+			firstNode := tipNode.GetAncestor(tipHeight - blocksBack)
+			newBits = consensus.CalcNextRequiredDifficulty(
+				tg.chainParams,
+				tipNode.Header.Bits,
+				int64(firstNode.Header.Timestamp),
+				int64(tipNode.Header.Timestamp),
+			)
+		} else {
+			newBits = tipNode.Header.Bits
+		}
+	}
+	header.Bits = newBits
 
 	// 4. Select transactions from the mempool
 	maxWeight := config.MaxWeight
@@ -144,8 +204,13 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 		maxSigOps = consensus.MaxBlockSigOpsCost
 	}
 
-	// Reserve weight for the coinbase transaction (~4000 WU is conservative)
-	coinbaseReserve := int64(4000)
+	// Reserve DefaultBlockReservedWeight WU for the fixed block overhead:
+	// 80-byte header (320 WU) + tx-count varint + coinbase tx.
+	// Core miner.cpp:114: nBlockWeight = *Assert(m_options.block_reserved_weight)
+	// where block_reserved_weight defaults to DEFAULT_BLOCK_RESERVED_WEIGHT=8000.
+	// Bug fixed: was 4000 (half of Core's reserved budget), allowing templates
+	// that were 4000 WU too heavy and could fail block-weight validation.
+	coinbaseReserve := int64(DefaultBlockReservedWeight)
 	availableWeight := maxWeight - coinbaseReserve
 
 	// Resolve a UTXO view if the chain state exposes one. This lets us count
@@ -158,7 +223,7 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 	}
 
 	selectedTxs, txSigOpsCost, totalFees, totalSigOps := selectTransactions(
-		tg.mp, availableWeight, maxSigOps, config.MinTxFeeRate, utxoView)
+		tg.mp, availableWeight, maxSigOps, newHeight, uint32(mtp), config.MinTxFeeRate, utxoView)
 
 	// 5. Calculate the subsidy
 	subsidy := consensus.CalcBlockSubsidy(newHeight)
@@ -193,6 +258,18 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 	}
 	header.MerkleRoot = consensus.CalcMerkleRoot(txHashes)
 
+	// Compute MinTime per GetMinimumTime (Core node/miner.cpp:36-47):
+	// always MTP+1; at retarget boundaries also bounded by
+	// prevBlock.time − MAX_TIMEWARP (BIP-94 timewarp rule).
+	minTime := mtp + 1
+	if tg.chainParams.EnforceBIP94 &&
+		newHeight%int32(tg.chainParams.DifficultyAdjInterval) == 0 {
+		timeWarpMin := int64(tipNode.Header.Timestamp) - consensus.MaxTimewarp
+		if timeWarpMin > minTime {
+			minTime = timeWarpMin
+		}
+	}
+
 	return &BlockTemplate{
 		Block: &wire.MsgBlock{
 			Header:       header,
@@ -204,6 +281,7 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 		CoinbaseValue:     coinbaseValue,
 		WitnessCommitment: witnessCommitment,
 		TxSigOpsCost:      txSigOpsCost,
+		MinTime:           minTime,
 	}, nil
 }
 
@@ -212,13 +290,17 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 // parallel slice of per-tx sigops cost (sigops cost units, already scaled),
 // total fees, and total sigops cost.
 //
+// blockHeight and lockTimeCutoff are the height and MTP of the block being
+// built; they are forwarded to IsFinalTx to reject non-final transactions.
+// Core reference: TestChunkTransactions (miner.cpp:252-260).
+//
 // If utxoView is non-nil, sigops counting matches Bitcoin Core's
 // GetTransactionSigOpCost: legacy (vin+vout) scaled by 4 + P2SH redeem-script
 // sigops scaled by 4 + witness sigops (unscaled). If utxoView is nil, falls
 // back to the conservative output-script estimate so callers without a UTXO
 // view (e.g. early-init regtest tests) still get budget enforcement and
 // non-zero per-tx reporting.
-func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, minFeeRate float64, utxoView consensus.UTXOView) ([]*wire.MsgTx, []int64, int64, int64) {
+func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, blockHeight int32, lockTimeCutoff uint32, minFeeRate float64, utxoView consensus.UTXOView) ([]*wire.MsgTx, []int64, int64, int64) {
 	entries := mp.GetSortedByAncestorFeeRate()
 
 	var selected []*wire.MsgTx
@@ -228,6 +310,11 @@ func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, minFeeRa
 	var totalWeight int64
 	included := make(map[wire.Hash256]bool)
 
+	// Consecutive-failure early-exit mirrors Core addChunks() heuristic:
+	// Core miner.cpp:284-316 — give up after MAX_CONSECUTIVE_FAILURES skips
+	// when the block is already close to full (within BLOCK_FULL_ENOUGH_WEIGHT_DELTA).
+	consecutiveFailed := 0
+
 	for _, entry := range entries {
 		if entry.FeeRate < minFeeRate {
 			continue
@@ -235,15 +322,43 @@ func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, minFeeRa
 
 		txWeight := consensus.CalcTxWeight(entry.Tx)
 
-		// Check weight limit
-		if totalWeight+txWeight > maxWeight {
-			continue // Try next (smaller) transaction
+		// Weight limit: use >= to match Core's TestChunkBlockLimits.
+		// Core miner.cpp:241: if (nBlockWeight + chunk.size >= nBlockMaxWeight)
+		// Bug fixed: was > (strictly greater), allowing exactly-at-limit blocks.
+		if totalWeight+txWeight >= maxWeight {
+			consecutiveFailed++
+			if consecutiveFailed > maxConsecutiveFailures &&
+				totalWeight+blockFullEnoughWeightDelta > maxWeight {
+				break
+			}
+			continue
 		}
 
 		txSigOps := computeTxSigOpsCost(entry.Tx, utxoView)
 
-		// Check sigops limit (MAX_BLOCK_SIGOPS_COST = 80_000)
-		if totalSigOps+txSigOps > maxSigOps {
+		// Sigops limit: use >= to match Core's TestChunkBlockLimits.
+		// Core miner.cpp:244: if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST)
+		// Bug fixed: was > (strictly greater), allowing exactly-at-limit blocks.
+		if totalSigOps+txSigOps >= maxSigOps {
+			consecutiveFailed++
+			if consecutiveFailed > maxConsecutiveFailures &&
+				totalWeight+blockFullEnoughWeightDelta > maxWeight {
+				break
+			}
+			continue
+		}
+
+		// IsFinalTx check: reject non-final transactions.
+		// Core miner.cpp:252-260 TestChunkTransactions: each tx must pass
+		// IsFinalTx(tx, nHeight, m_lock_time_cutoff) where m_lock_time_cutoff
+		// = pindexPrev->GetMedianTimePast() (BIP-113).
+		// Bug fixed: IsFinalTx was never called during template building.
+		if !consensus.IsFinalTx(entry.Tx, blockHeight, lockTimeCutoff) {
+			consecutiveFailed++
+			if consecutiveFailed > maxConsecutiveFailures &&
+				totalWeight+blockFullEnoughWeightDelta > maxWeight {
+				break
+			}
 			continue
 		}
 
@@ -256,9 +371,15 @@ func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, minFeeRa
 			}
 		}
 		if !allParentsIncluded {
+			consecutiveFailed++
+			if consecutiveFailed > maxConsecutiveFailures &&
+				totalWeight+blockFullEnoughWeightDelta > maxWeight {
+				break
+			}
 			continue // Skip — parent not yet selected
 		}
 
+		consecutiveFailed = 0
 		selected = append(selected, entry.Tx)
 		sigOpsCosts = append(sigOpsCosts, txSigOps)
 		included[entry.TxHash] = true
@@ -319,6 +440,16 @@ func CreateCoinbaseTx(height int32, minerScript []byte, extraNonce []byte, subsi
 		scriptSig = append(scriptSig, make([]byte, 8)...)
 	}
 
+	// nLockTime = height - 1 per Core miner.cpp:196 — makes the coinbase
+	// enforceable only after the block at height-1. Combined with
+	// nSequence = MAX_SEQUENCE_NONFINAL (0xFFFFFFFE) which opts the input into
+	// locktime enforcement (Core miner.cpp:171). Using 0xFFFFFFFF would signal
+	// SEQUENCE_FINAL which bypasses the locktime check entirely.
+	// Bug fixed: was nLockTime=0 and nSequence=0xFFFFFFFF.
+	lockTime := uint32(0)
+	if height > 0 {
+		lockTime = uint32(height - 1)
+	}
 	tx := &wire.MsgTx{
 		Version: 2,
 		TxIn: []*wire.TxIn{{
@@ -327,13 +458,13 @@ func CreateCoinbaseTx(height int32, minerScript []byte, extraNonce []byte, subsi
 				Index: 0xFFFFFFFF,
 			},
 			SignatureScript: scriptSig,
-			Sequence:        0xFFFFFFFF,
+			Sequence:        coinbaseMaxSequenceNonfinal, // 0xFFFFFFFE = MAX_SEQUENCE_NONFINAL
 		}},
 		TxOut: []*wire.TxOut{{
 			Value:    subsidy + fees,
 			PkScript: minerScript,
 		}},
-		LockTime: 0,
+		LockTime: lockTime, // nHeight - 1 per Core miner.cpp:196
 	}
 
 	// Add witness commitment output (BIP141)
