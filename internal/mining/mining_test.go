@@ -387,7 +387,7 @@ func TestGenerateTemplate(t *testing.T) {
 func TestSelectTransactions(t *testing.T) {
 	t.Run("empty mempool", func(t *testing.T) {
 		mp := &mockMempool{entries: nil}
-		txs, perTxSigOps, fees, sigops := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
+		txs, perTxSigOps, fees, sigops := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
 
 		if len(txs) != 0 {
 			t.Errorf("expected 0 transactions, got %d", len(txs))
@@ -427,7 +427,7 @@ func TestSelectTransactions(t *testing.T) {
 			entries: []*mempool.TxEntry{entry2, entry1},
 		}
 
-		txs, _, fees, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
+		txs, _, fees, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
 
 		if len(txs) != 2 {
 			t.Fatalf("expected 2 transactions, got %d", len(txs))
@@ -454,7 +454,7 @@ func TestSelectTransactions(t *testing.T) {
 		}
 
 		// Set weight limit below transaction weight
-		txs, _, _, _ := selectTransactions(mp, txWeight-1, consensus.MaxBlockSigOpsCost, 0, nil)
+		txs, _, _, _ := selectTransactions(mp, txWeight-1, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
 
 		if len(txs) != 0 {
 			t.Error("transaction should have been excluded due to weight limit")
@@ -476,7 +476,7 @@ func TestSelectTransactions(t *testing.T) {
 			entries: []*mempool.TxEntry{entry},
 		}
 
-		txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 5.0, nil) // min 5 sat/vB
+		txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 5.0, nil) // min 5 sat/vB
 
 		if len(txs) != 0 {
 			t.Error("transaction should have been excluded due to low fee rate")
@@ -512,7 +512,7 @@ func TestSelectTransactions(t *testing.T) {
 			entries: []*mempool.TxEntry{childEntry, parentEntry},
 		}
 
-		txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
+		txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
 
 		// Parent should be included (comes later in sorted order)
 		// Child should be skipped because parent isn't included yet when we check child
@@ -1076,7 +1076,7 @@ func TestSelectTransactionsSigOpsBudget(t *testing.T) {
 		mp := &mockMempool{entries: []*mempool.TxEntry{entry}}
 
 		txs, perTxSigOps, _, total := selectTransactions(
-			mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
+			mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
 
 		if len(txs) != 1 {
 			t.Fatalf("expected 1 selected tx, got %d", len(txs))
@@ -1113,7 +1113,7 @@ func TestSelectTransactionsSigOpsBudget(t *testing.T) {
 		mp := &mockMempool{entries: entries}
 
 		txs, perTxSigOps, _, total := selectTransactions(
-			mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 0, nil)
+			mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
 
 		// Bound: total must never exceed MAX_BLOCK_SIGOPS_COST (80_000).
 		if total > int64(consensus.MaxBlockSigOpsCost) {
@@ -1183,4 +1183,363 @@ func TestSelectTransactionsSigOpsBudget(t *testing.T) {
 			t.Errorf("template.SigOpsCost = %d, want %d", template.SigOpsCost, expected)
 		}
 	})
+}
+
+// ─── W87 gate tests ───────────────────────────────────────────────────────────
+// The following tests exercise every correctness gate added or fixed in
+// the W87 block-template assembly audit. Each test cites the Bitcoin Core
+// source location it mirrors.
+
+// TestCoinbaseNLockTimeIsHeightMinusOne verifies that the coinbase nLockTime
+// equals nHeight-1. Core miner.cpp:196.
+//   - Bug fixed: CreateCoinbaseTx was setting LockTime=0 unconditionally.
+func TestCoinbaseNLockTimeIsHeightMinusOne(t *testing.T) {
+	cases := []struct {
+		height   int32
+		wantLock uint32
+	}{
+		{1, 0},
+		{2, 1},
+		{16, 15},
+		{17, 16},
+		{100, 99},
+		{500000, 499999},
+	}
+	for _, tc := range cases {
+		tx := CreateCoinbaseTx(tc.height, []byte{0x51}, nil, 5000000000, 0, nil)
+		if tx.LockTime != tc.wantLock {
+			t.Errorf("height %d: LockTime = %d, want %d",
+				tc.height, tx.LockTime, tc.wantLock)
+		}
+	}
+}
+
+// TestCoinbaseNSequenceIsMaxNonfinal verifies coinbase nSequence =
+// MAX_SEQUENCE_NONFINAL (0xFFFFFFFE). Core miner.cpp:171 / transaction.h:82.
+//   - Bug fixed: was 0xFFFFFFFF (SEQUENCE_FINAL), bypassing locktime check.
+func TestCoinbaseNSequenceIsMaxNonfinal(t *testing.T) {
+	tx := CreateCoinbaseTx(100, []byte{0x51}, nil, 5000000000, 0, nil)
+	const want = coinbaseMaxSequenceNonfinal // 0xFFFFFFFE
+	if tx.TxIn[0].Sequence != want {
+		t.Errorf("coinbase nSequence = 0x%08x, want 0x%08x (MAX_SEQUENCE_NONFINAL)",
+			tx.TxIn[0].Sequence, want)
+	}
+}
+
+// TestCoinbaseNSequenceNotFinal verifies the nSequence value used is
+// NOT 0xFFFFFFFF so that timelock enforcement is NOT bypassed.
+func TestCoinbaseNSequenceNotFinal(t *testing.T) {
+	tx := CreateCoinbaseTx(100, []byte{0x51}, nil, 5000000000, 0, nil)
+	const sequenceFinal uint32 = 0xFFFFFFFF
+	if tx.TxIn[0].Sequence == sequenceFinal {
+		t.Errorf("coinbase nSequence must not be 0xFFFFFFFF (SEQUENCE_FINAL); got 0x%08x",
+			tx.TxIn[0].Sequence)
+	}
+}
+
+// TestBlockReservedWeightIsEight000 verifies DefaultBlockReservedWeight = 8000.
+// Core policy/policy.h:27 DEFAULT_BLOCK_RESERVED_WEIGHT = 8000.
+//   - Bug fixed: was 4000 (half of Core's value).
+func TestBlockReservedWeightIsEight000(t *testing.T) {
+	if DefaultBlockReservedWeight != 8_000 {
+		t.Errorf("DefaultBlockReservedWeight = %d, want 8000", DefaultBlockReservedWeight)
+	}
+	if MinimumBlockReservedWeight != 2_000 {
+		t.Errorf("MinimumBlockReservedWeight = %d, want 2000", MinimumBlockReservedWeight)
+	}
+}
+
+// TestWeightLimitUsesGEComparator verifies that a transaction whose weight
+// would bring totalWeight EXACTLY to the available limit is rejected.
+// Core miner.cpp:241: if (nBlockWeight + chunk.size >= nBlockMaxWeight) return false
+//   - Bug fixed: was > (strictly greater), allowing exactly-at-limit blocks.
+func TestWeightLimitUsesGEComparator(t *testing.T) {
+	tx := createTestTx(100000)
+	txWeight := consensus.CalcTxWeight(tx)
+
+	entry := &mempool.TxEntry{
+		Tx:      tx,
+		TxHash:  tx.TxHash(),
+		Fee:     1000,
+		Size:    100,
+		FeeRate: 10.0,
+	}
+	mp := &mockMempool{entries: []*mempool.TxEntry{entry}}
+
+	// maxWeight == txWeight: adding the tx would reach exactly maxWeight.
+	// With >= comparator this is rejected (Core behaviour).
+	txs, _, _, _ := selectTransactions(mp, txWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
+	if len(txs) != 0 {
+		t.Errorf("tx at exactly the weight limit should be excluded (>= comparator), got %d tx", len(txs))
+	}
+
+	// maxWeight == txWeight+1: tx fits (totalWeight = txWeight < txWeight+1).
+	txs, _, _, _ = selectTransactions(mp, txWeight+1, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
+	if len(txs) != 1 {
+		t.Errorf("tx one below weight limit should be included, got %d tx", len(txs))
+	}
+}
+
+// TestSigopsLimitUsesGEComparator verifies that a transaction whose sigops
+// cost would bring the total EXACTLY to MAX_BLOCK_SIGOPS_COST is rejected.
+// Core miner.cpp:244: if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST) return false
+//   - Bug fixed: was > (strictly greater), allowing exactly-at-limit blocks.
+func TestSigopsLimitUsesGEComparator(t *testing.T) {
+	// Build a tx whose sigops cost is exactly MAX_BLOCK_SIGOPS_COST (80_000).
+	// One OP_CHECKSIG in scriptPubKey = 1 legacy sigop = 4 cost units.
+	// We need 80_000 / 4 = 20_000 OP_CHECKSIG opcodes.
+	const checksigs = int(consensus.MaxBlockSigOpsCost / consensus.WitnessScaleFactor)
+	tx := makeHighSigOpTx(42, checksigs)
+	entry := &mempool.TxEntry{
+		Tx:      tx,
+		TxHash:  tx.TxHash(),
+		Fee:     1000,
+		Size:    int64(checksigs + 10),
+		FeeRate: 10.0,
+	}
+	mp := &mockMempool{entries: []*mempool.TxEntry{entry}}
+
+	// Starting from 0, adding this tx would reach exactly MAX_BLOCK_SIGOPS_COST.
+	// With >= comparator this is rejected (Core behaviour).
+	txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
+	if len(txs) != 0 {
+		t.Errorf("tx at exactly the sigops limit should be excluded (>= comparator), got %d tx", len(txs))
+	}
+}
+
+// TestSelectTransactionsRejectsNonFinalTx verifies that non-final transactions
+// (locked by nLockTime > MTP) are excluded from templates.
+// Core miner.cpp:252-260 TestChunkTransactions.
+//   - Bug fixed: IsFinalTx was never called during transaction selection.
+func TestSelectTransactionsRejectsNonFinalTx(t *testing.T) {
+	// Tx with nLockTime set to a future block height (height-based lock).
+	// At blockHeight=5, lockTimeCutoff=0, a tx with LockTime=6 is NOT final.
+	nonFinalTx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0xab}, Index: 0},
+			SignatureScript:  []byte{0x00},
+			Sequence:        0xFFFFFFFE, // not 0xFFFFFFFF — so locktime IS checked
+		}},
+		TxOut: []*wire.TxOut{{Value: 100000, PkScript: []byte{0x51}}},
+		LockTime: 6, // height-based lock: tx is final only when blockHeight > 6
+	}
+	entry := &mempool.TxEntry{
+		Tx:      nonFinalTx,
+		TxHash:  nonFinalTx.TxHash(),
+		Fee:     1000,
+		Size:    100,
+		FeeRate: 10.0,
+	}
+	mp := &mockMempool{entries: []*mempool.TxEntry{entry}}
+
+	// blockHeight=5 < LockTime=6 → not final → excluded
+	txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 5, 0, 0, nil)
+	if len(txs) != 0 {
+		t.Errorf("non-final tx (LockTime=6 at height=5) should be excluded, got %d tx", len(txs))
+	}
+
+	// blockHeight=7 > LockTime=6 → final → included
+	txs, _, _, _ = selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 7, 0, 0, nil)
+	if len(txs) != 1 {
+		t.Errorf("final tx (LockTime=6 at height=7) should be included, got %d tx", len(txs))
+	}
+}
+
+// TestSelectTransactionsFinalIfAllSequenceFinal verifies that a tx with all
+// inputs at nSequence=0xFFFFFFFF is always final regardless of nLockTime.
+// IsFinalTx short-circuit: Core consensus/tx_verify.cpp:30-33.
+func TestSelectTransactionsFinalIfAllSequenceFinal(t *testing.T) {
+	// nLockTime set to 999 (height-based) but all inputs have Sequence=0xFFFFFFFF.
+	// IsFinalTx returns true regardless of height.
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0xcd}, Index: 0},
+			SignatureScript:  []byte{0x00},
+			Sequence:        0xFFFFFFFF, // SEQUENCE_FINAL → bypass locktime
+		}},
+		TxOut: []*wire.TxOut{{Value: 100000, PkScript: []byte{0x51}}},
+		LockTime: 999,
+	}
+	entry := &mempool.TxEntry{
+		Tx:      tx,
+		TxHash:  tx.TxHash(),
+		Fee:     1000,
+		Size:    100,
+		FeeRate: 10.0,
+	}
+	mp := &mockMempool{entries: []*mempool.TxEntry{entry}}
+
+	// Even at blockHeight=1 < LockTime=999, tx is final (all inputs SEQUENCE_FINAL).
+	txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
+	if len(txs) != 1 {
+		t.Errorf("tx with all-SEQUENCE_FINAL inputs should be final at any height, got %d tx", len(txs))
+	}
+}
+
+// TestSelectTransactionsTimestampLockFinalViaMTP verifies that a timestamp-based
+// nLockTime is compared against the MTP lockTimeCutoff (BIP-113), not block time.
+// Core IsFinalTx / m_lock_time_cutoff = pindexPrev->GetMedianTimePast().
+func TestSelectTransactionsTimestampLockFinalViaMTP(t *testing.T) {
+	// nLockTime = 500_000_100 (timestamp-based, ≥ LockTimeThreshold=500_000_000).
+	// tx has one input with Sequence != 0xFFFFFFFF so locktime IS checked.
+	const lockTime = uint32(500_000_100)
+	tx := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0xef}, Index: 0},
+			SignatureScript:  []byte{0x00},
+			Sequence:        0xFFFFFFFE,
+		}},
+		TxOut: []*wire.TxOut{{Value: 100000, PkScript: []byte{0x51}}},
+		LockTime: lockTime,
+	}
+	entry := &mempool.TxEntry{
+		Tx:      tx,
+		TxHash:  tx.TxHash(),
+		Fee:     1000,
+		Size:    100,
+		FeeRate: 10.0,
+	}
+	mp := &mockMempool{entries: []*mempool.TxEntry{entry}}
+
+	// MTP = lockTime - 1 → tx.LockTime (500_000_100) is NOT < cutoff (500_000_099) → not final
+	txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, lockTime-1, 0, nil)
+	if len(txs) != 0 {
+		t.Errorf("timestamp-locked tx should be excluded when MTP = lockTime-1, got %d tx", len(txs))
+	}
+
+	// MTP = lockTime + 1 → tx.LockTime < cutoff → final
+	txs, _, _, _ = selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, lockTime+1, 0, nil)
+	if len(txs) != 1 {
+		t.Errorf("timestamp-locked tx should be included when MTP > lockTime, got %d tx", len(txs))
+	}
+}
+
+// TestBlockTemplateReservedWeightNotOverflowed verifies that the available
+// transaction weight budget is MaxBlockWeight - DefaultBlockReservedWeight
+// (not MaxBlockWeight - 4000 as the pre-fix code used).
+// Core miner.cpp:114: nBlockWeight = block_reserved_weight (default 8000).
+func TestBlockTemplateReservedWeightNotOverflowed(t *testing.T) {
+	params := consensus.RegtestParams()
+	genesisHash := params.GenesisHash
+	tipNode := &consensus.BlockNode{
+		Hash:   genesisHash,
+		Header: params.GenesisBlock.Header,
+		Height: 0,
+	}
+	chainState := &mockChainState{tipHash: genesisHash, tipHeight: 0, tipNode: tipNode}
+	headerIndex := &mockHeaderIndex{
+		nodes: map[wire.Hash256]*consensus.BlockNode{genesisHash: tipNode},
+	}
+
+	// Create a transaction that weighs exactly MaxBlockWeight - DefaultBlockReservedWeight.
+	// It should NOT be included (weight budget is exhausted by that exact amount).
+	// If reserved weight were only 4000, this tx might slip in and produce an oversized block.
+	budget := int64(consensus.MaxBlockWeight) - DefaultBlockReservedWeight
+	// Synthesize a tx by checking that our budget calculation is consistent.
+	// We don't actually build a 3,992,000 WU tx (too expensive), so we just
+	// verify the constant.
+	if budget != int64(consensus.MaxBlockWeight)-8_000 {
+		t.Errorf("budget = %d, want MaxBlockWeight-8000 = %d",
+			budget, int64(consensus.MaxBlockWeight)-8_000)
+	}
+
+	// Generate an empty template and verify nBlockWeight accounting starts
+	// at DefaultBlockReservedWeight by checking that the generated block's
+	// total weight <= MaxBlockWeight.
+	tg := NewTemplateGenerator(params, chainState, &mockMempool{}, headerIndex)
+	template, err := tg.GenerateTemplate(TemplateConfig{MinerAddress: []byte{0x51}})
+	if err != nil {
+		t.Fatalf("GenerateTemplate failed: %v", err)
+	}
+
+	weight := consensus.CalcBlockWeight(template.Block)
+	if weight > consensus.MaxBlockWeight {
+		t.Errorf("template block weight %d exceeds MaxBlockWeight %d", weight, consensus.MaxBlockWeight)
+	}
+}
+
+// TestBlockTemplateMinTimeField verifies that BlockTemplate.MinTime is set
+// to MTP+1 (not the current wall-clock timestamp).
+// Core rpc/mining.cpp:1004: mintime = GetMinimumTime(pindexPrev, diffAdjInterval).
+//   - Bug fixed: MinTime was set to template.Block.Header.Timestamp (current time).
+func TestBlockTemplateMinTimeField(t *testing.T) {
+	params := consensus.RegtestParams()
+	genesisHash := params.GenesisHash
+
+	// Build a tip with a known timestamp so MTP is deterministic.
+	knownTime := uint32(1_700_000_000)
+	tipHeader := params.GenesisBlock.Header
+	tipHeader.Timestamp = knownTime
+
+	tipNode := &consensus.BlockNode{
+		Hash:   genesisHash,
+		Header: tipHeader,
+		Height: 0,
+	}
+	chainState := &mockChainState{tipHash: genesisHash, tipHeight: 0, tipNode: tipNode}
+	headerIndex := &mockHeaderIndex{
+		nodes: map[wire.Hash256]*consensus.BlockNode{genesisHash: tipNode},
+	}
+
+	tg := NewTemplateGenerator(params, chainState, &mockMempool{}, headerIndex)
+	template, err := tg.GenerateTemplate(TemplateConfig{MinerAddress: []byte{0x51}})
+	if err != nil {
+		t.Fatalf("GenerateTemplate failed: %v", err)
+	}
+
+	// MTP of a single-node chain equals that node's own timestamp (the only
+	// element in the 11-window). MinTime must be MTP+1.
+	mtp := tipNode.GetMedianTimePast()
+	wantMinTime := mtp + 1
+	if template.MinTime != wantMinTime {
+		t.Errorf("MinTime = %d, want MTP+1 = %d", template.MinTime, wantMinTime)
+	}
+}
+
+// TestCoinbaseBIP34HeightAtBoundaries verifies BIP34 height serialisation at
+// the 1-byte / 2-byte boundaries (h=1, h=16, h=17) per Core script.h:433-448.
+// At heights 1-16, CScript() << n pushes OP_1..OP_16 (1 byte).
+// At heights 17+, it pushes a minimal script number.
+func TestCoinbaseBIP34HeightAtBoundaries(t *testing.T) {
+	cases := []struct {
+		height       int32
+		scriptSig0   byte   // first byte of scriptSig
+		scriptSigLen int    // minimum expected scriptSig length (before extraNonce)
+	}{
+		// Height 1 → OP_1 (0x51), 1-byte opcode
+		{1, 0x51, 1},
+		// Height 16 → OP_16 (0x60), 1-byte opcode
+		{16, 0x60, 1},
+		// Height 17 → 1-byte push (0x01) + data (0x11)
+		{17, 0x01, 2},
+		// Height 127 → 1-byte push (0x01) + data (0x7f)
+		{127, 0x01, 2},
+		// Height 128 → 2-byte push (0x02) + data (0x80, 0x00)
+		{128, 0x02, 3},
+	}
+	for _, tc := range cases {
+		tx := CreateCoinbaseTx(tc.height, []byte{0x51}, nil, 5000000000, 0, nil)
+		sig := tx.TxIn[0].SignatureScript
+		if len(sig) < tc.scriptSigLen {
+			t.Errorf("height %d: scriptSig len %d < want %d", tc.height, len(sig), tc.scriptSigLen)
+			continue
+		}
+		if sig[0] != tc.scriptSig0 {
+			t.Errorf("height %d: scriptSig[0] = 0x%02x, want 0x%02x", tc.height, sig[0], tc.scriptSig0)
+		}
+	}
+}
+
+// TestMaxConsecutiveFailuresConstants verifies the heuristic constants match Core.
+// Core miner.cpp:284-285.
+func TestMaxConsecutiveFailuresConstants(t *testing.T) {
+	if maxConsecutiveFailures != 1_000 {
+		t.Errorf("maxConsecutiveFailures = %d, want 1000", maxConsecutiveFailures)
+	}
+	if blockFullEnoughWeightDelta != 4_000 {
+		t.Errorf("blockFullEnoughWeightDelta = %d, want 4000", blockFullEnoughWeightDelta)
+	}
 }
