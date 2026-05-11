@@ -476,14 +476,27 @@ func removeOpCodeSeparators(script []byte) []byte {
 	return result
 }
 
-// FindAndDelete removes all occurrences of a push-encoded signature from scriptCode.
-// Only applies to legacy (sig_version BASE) transactions.
+// FindAndDelete removes all occurrences of a push-encoded signature from
+// scriptCode and returns the modified script. Only applies to legacy
+// (sig_version BASE) transactions.
 func FindAndDelete(script []byte, sig []byte) []byte {
+	result, _ := FindAndDeleteCount(script, sig)
+	return result
+}
+
+// FindAndDeleteCount removes all occurrences of a push-encoded signature from
+// scriptCode and returns the modified script together with the number of
+// occurrences removed. Callers that need to enforce CONST_SCRIPTCODE (BIP-342)
+// should use this variant and check whether count > 0.
+//
+// The returned slice is always a fresh copy; the caller's backing array is
+// never modified.
+func FindAndDeleteCount(script []byte, sig []byte) ([]byte, int) {
 	if len(sig) == 0 {
-		return script
+		return script, 0
 	}
 
-	// Build the push encoding of the signature
+	// Build the push encoding of the signature (matches Core's CScript << vchSig).
 	var pushSig []byte
 	if len(sig) < OP_PUSHDATA1 {
 		pushSig = append([]byte{byte(len(sig))}, sig...)
@@ -495,14 +508,29 @@ func FindAndDelete(script []byte, sig []byte) []byte {
 		pushSig = append([]byte{OP_PUSHDATA4, byte(len(sig)), byte(len(sig) >> 8), byte(len(sig) >> 16), byte(len(sig) >> 24)}, sig...)
 	}
 
-	// Remove all occurrences
+	// Fast-path: if the pattern doesn't appear at all, return a fresh copy
+	// without the overhead of additional scanning.
+	if !bytes.Contains(script, pushSig) {
+		return script, 0
+	}
+
+	// Make a copy so we never mutate the caller's backing array.  The
+	// original FindAndDelete in Bitcoin Core operates on a CScript value
+	// (copy-on-write), but Go slices share their backing array, so an in-place
+	// append would corrupt e.currentScript / prevOut.PkScript.
+	result := make([]byte, len(script))
+	copy(result, script)
+
+	// Remove all occurrences and count them.
+	count := 0
 	for {
-		idx := bytes.Index(script, pushSig)
+		idx := bytes.Index(result, pushSig)
 		if idx == -1 {
 			break
 		}
-		script = append(script[:idx], script[idx+len(pushSig):]...)
+		result = append(result[:idx], result[idx+len(pushSig):]...)
+		count++
 	}
 
-	return script
+	return result, count
 }

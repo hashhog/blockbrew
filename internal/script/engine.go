@@ -47,6 +47,7 @@ var (
 	ErrWitnessPubKeyType        = errors.New("witness v0 requires compressed public key")
 	ErrEvalFalse                = errors.New("script evaluated to false")
 	ErrCleanStack               = errors.New("stack not clean after witness script execution")
+	ErrSigFindAndDelete         = errors.New("signature found in script with CONST_SCRIPTCODE active")
 )
 
 // ScriptFlags control which script validation rules are enabled.
