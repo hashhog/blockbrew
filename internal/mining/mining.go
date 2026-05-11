@@ -147,8 +147,16 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 
 	// 3. Build the block header — timestamp first so GetNextWorkRequired can
 	// apply the testnet4 20-minute min-difficulty rule (Core miner.cpp:147,219).
+	//
+	// Version is computed via ComputeBlockVersion (BIP9, Core miner.cpp:156-158):
+	// start with VERSIONBITS_TOP_BITS (0x20000000) and OR in the signaling bits
+	// for every deployment currently in STARTED or LOCKED_IN state.  Hardcoding
+	// 0x20000000 is wrong — it silently omits miner signaling for active BIP9
+	// deployments.  Core reference: versionbits.cpp:265-278 (ComputeBlockVersion),
+	// miner.cpp:156 (pblock->nVersion = g_versionbitscache.ComputeBlockVersion).
+	blockVersion := consensus.ComputeBlockVersion(tipNode, tg.chainParams.Deployments, tg.chainParams, nil)
 	header := wire.BlockHeader{
-		Version:   0x20000000, // BIP9 version bits signaling
+		Version:   blockVersion,
 		PrevBlock: tipHash,
 		Timestamp: uint32(time.Now().Unix()),
 		Bits:      0, // set below after timestamp is finalised
