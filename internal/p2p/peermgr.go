@@ -135,6 +135,16 @@ type PeerManagerConfig struct {
 	// only the most recent NODE_NETWORK_LIMITED_MIN_BLOCKS (288) blocks
 	// and must not request older blocks via getdata.
 	AdvertiseNodeNetworkLimited bool
+
+	// AdvertiseCompactFilters controls whether NODE_COMPACT_FILTERS (BIP-157,
+	// 1<<6) is OR'd into our advertised service bits in the version handshake.
+	// Set when -blockfilterindex is enabled, mirroring Bitcoin Core's
+	// net_processing.cpp / init.cpp which adds NODE_COMPACT_FILTERS to
+	// g_local_services when the block filter index is active.
+	// When unset, blockbrew will still process incoming getcfilters /
+	// getcfheaders / getcfcheckpt messages (if handlers are wired), but will
+	// not advertise to peers that it can serve those requests proactively.
+	AdvertiseCompactFilters bool
 }
 
 // BanInfo contains information about a banned peer.
@@ -1304,6 +1314,12 @@ func (pm *PeerManager) makePeerConfig() PeerConfig {
 	// keep NODE_NETWORK set as well.
 	if pm.config.AdvertiseNodeNetworkLimited {
 		services |= ServiceNodeNetworkLimited
+	}
+	// BIP-157: signal compact filter serving when the blockfilterindex is
+	// enabled, mirroring Core's net_processing.cpp handling where
+	// NODE_COMPACT_FILTERS is added when the basic filter index is active.
+	if pm.config.AdvertiseCompactFilters {
+		services |= ServiceNodeCompactFilters
 	}
 
 	return PeerConfig{

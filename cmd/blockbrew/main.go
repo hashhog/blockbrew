@@ -989,6 +989,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		PreferV2:                    cfg.BIP324V2,
 		AdvertiseNodeBloom:          cfg.PeerBloomFilters,
 		AdvertiseNodeNetworkLimited: cfg.Prune > 0,
+		AdvertiseCompactFilters:     cfg.BlockFilterIndex,
 	})
 
 	// 8. Initialize wallet early so sync callbacks can reference it
@@ -1156,6 +1157,126 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		}
 	}
 
+	// BIP-157 P2P handlers: getcfilters / getcfheaders / getcfcheckpt.
+	//
+	// These are only wired when -blockfilterindex is enabled. The handlers
+	// mirror Bitcoin Core's net_processing.cpp:ProcessCompactFilters which
+	// gates every response on whether the block filter index is active and
+	// whether the requesting peer's start/stop heights are sane.
+	//
+	// Range limits mirror Core's MAX_GETCFILTERS_SIZE (1000) and
+	// MAX_GETCFHEADERS_SIZE (2000) constants (net_processing.cpp:176-177).
+	// The getcfcheckpt response is one header per CFCHECKPT_INTERVAL (1000)
+	// blocks up to the stop hash (BIP-157 §getcfcheckpt).
+	if blockFilterIndex != nil {
+		// getcfilters: peer requests raw GCS-encoded filters for a height range.
+		// Wire format: filter_type(1) || start_height(4 LE) || stop_hash(32).
+		// Core: net_processing.cpp ProcessCompactFilters / GETCFILTERS handler.
+		syncListeners.OnGetCFilters = func(peer *p2p.Peer, msg *p2p.MsgGetCFilters) {
+			if msg.FilterType != p2p.FilterTypeBasic {
+				return // unknown type — silently ignore (Core returns early)
+			}
+			stopNode := headerIndex.GetNode(msg.StopHash)
+			if stopNode == nil {
+				return
+			}
+			startHeight := int32(msg.StartHeight)
+			stopHeight := stopNode.Height
+			if startHeight < 0 || startHeight > stopHeight {
+				return
+			}
+			count := stopHeight - startHeight + 1
+			if count > p2p.MaxCFiltersPerRequest {
+				return // violates protocol limit — ignore
+			}
+			for h := startHeight; h <= stopHeight; h++ {
+				fd, err := blockFilterIndex.GetFilter(h)
+				if err != nil {
+					return // filter not yet built for this height
+				}
+				peer.SendMessage(&p2p.MsgCFilter{
+					FilterType: p2p.FilterTypeBasic,
+					BlockHash:  fd.BlockHash,
+					Filter:     fd.Filter,
+				})
+			}
+		}
+
+		// getcfheaders: peer requests filter headers for a height range.
+		// Wire format: filter_type(1) || start_height(4 LE) || stop_hash(32).
+		// Response: cfheaders containing prev_filter_header + list of filter hashes.
+		// Core: net_processing.cpp GETCFHEADERS handler.
+		syncListeners.OnGetCFHeaders = func(peer *p2p.Peer, msg *p2p.MsgGetCFHeaders) {
+			if msg.FilterType != p2p.FilterTypeBasic {
+				return
+			}
+			stopNode := headerIndex.GetNode(msg.StopHash)
+			if stopNode == nil {
+				return
+			}
+			startHeight := int32(msg.StartHeight)
+			stopHeight := stopNode.Height
+			if startHeight < 0 || startHeight > stopHeight {
+				return
+			}
+			count := stopHeight - startHeight + 1
+			if count > p2p.MaxCFHeadersPerRequest {
+				return
+			}
+			// The prev_filter_header is the header of the block *before*
+			// start_height (all zeros at genesis). Core: ReadFilterHeader at
+			// start_height - 1.
+			var prevFilterHeader wire.Hash256
+			if startHeight > 0 {
+				fd, err := blockFilterIndex.GetFilter(startHeight - 1)
+				if err == nil {
+					prevFilterHeader = fd.FilterHeader
+				}
+			}
+			hashes := make([]wire.Hash256, 0, count)
+			for h := startHeight; h <= stopHeight; h++ {
+				fd, err := blockFilterIndex.GetFilter(h)
+				if err != nil {
+					return
+				}
+				hashes = append(hashes, fd.FilterHash)
+			}
+			peer.SendMessage(&p2p.MsgCFHeaders{
+				FilterType:       p2p.FilterTypeBasic,
+				StopHash:         msg.StopHash,
+				PrevFilterHeader: prevFilterHeader,
+				FilterHashes:     hashes,
+			})
+		}
+
+		// getcfcheckpt: peer requests evenly-spaced filter header checkpoints.
+		// One checkpoint per CFCHECKPT_INTERVAL (1000) blocks up to stop_hash.
+		// Core: net_processing.cpp GETCFCHECKPT handler.
+		syncListeners.OnGetCFCheckpt = func(peer *p2p.Peer, msg *p2p.MsgGetCFCheckpt) {
+			if msg.FilterType != p2p.FilterTypeBasic {
+				return
+			}
+			stopNode := headerIndex.GetNode(msg.StopHash)
+			if stopNode == nil {
+				return
+			}
+			stopHeight := stopNode.Height
+			headers := make([]wire.Hash256, 0)
+			for h := int32(p2p.CFCheckptInterval - 1); h <= stopHeight; h += p2p.CFCheckptInterval {
+				fd, err := blockFilterIndex.GetFilter(h)
+				if err != nil {
+					break // index doesn't have this height yet
+				}
+				headers = append(headers, fd.FilterHeader)
+			}
+			peer.SendMessage(&p2p.MsgCFCheckpt{
+				FilterType:    p2p.FilterTypeBasic,
+				StopHash:      msg.StopHash,
+				FilterHeaders: headers,
+			})
+		}
+	}
+
 	peerMgr = p2p.NewPeerManager(p2p.PeerManagerConfig{
 		Network:     networkMagic(chainParams),
 		ChainParams: chainParams,
@@ -1177,6 +1298,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		PreferV2:                    cfg.BIP324V2,
 		AdvertiseNodeBloom:          cfg.PeerBloomFilters,
 		AdvertiseNodeNetworkLimited: cfg.Prune > 0,
+		// BIP-157: advertise NODE_COMPACT_FILTERS when blockfilterindex is
+		// active. Mirrors Core's init.cpp g_local_services |= NODE_COMPACT_FILTERS.
+		AdvertiseCompactFilters: cfg.BlockFilterIndex,
 	})
 
 	// Wire the peer manager back into the sync manager (breaks circular dependency)
