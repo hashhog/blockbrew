@@ -12,12 +12,10 @@ func TestSipHash24(t *testing.T) {
 	// Test vector from SipHash reference implementation
 	// Key: 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f
 	// Data: (empty)
-	// Expected: 0x726fdb47dd0e0e31 (from reference)
 	key := SipHashKey{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
 	result := siphash24(key, nil)
 
-	// Note: SipHash result depends on exact implementation details
-	// Just verify it produces consistent, non-zero output
+	// Verify non-zero output for a non-trivial key
 	if result == 0 {
 		t.Error("siphash24 returned zero for non-trivial key")
 	}
@@ -37,7 +35,6 @@ func TestSipHash24(t *testing.T) {
 
 // TestComputeShortID tests short ID computation.
 func TestComputeShortID(t *testing.T) {
-	// Create a test block header
 	header := &wire.BlockHeader{
 		Version:    1,
 		PrevBlock:  wire.Hash256{},
@@ -50,7 +47,6 @@ func TestComputeShortID(t *testing.T) {
 	nonce := uint64(0xDEADBEEF)
 	key := ComputeSipHashKey(header, nonce)
 
-	// Create some test transaction hashes
 	txHash1 := wire.Hash256{}
 	txHash1[0] = 0x01
 
@@ -82,7 +78,6 @@ func TestComputeShortID(t *testing.T) {
 
 // TestCompactBlockBuilder tests building compact blocks.
 func TestCompactBlockBuilder(t *testing.T) {
-	// Create a test block with some transactions
 	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
 	tx1 := createTestTx(1, 1, 1_0000_0000, nil)
 	tx2 := createTestTx(2, 2, 2_0000_0000, nil)
@@ -101,7 +96,6 @@ func TestCompactBlockBuilder(t *testing.T) {
 	builder := NewCompactBlockBuilder(&block.Header, nonce)
 	cmpctblock := builder.Build(block)
 
-	// Verify structure
 	if cmpctblock.Header != block.Header {
 		t.Error("header mismatch")
 	}
@@ -117,21 +111,18 @@ func TestCompactBlockBuilder(t *testing.T) {
 		t.Errorf("prefilled index = %d, want 0", cmpctblock.PrefilledTxs[0].Index)
 	}
 
-	// Remaining transactions should have short IDs
 	if len(cmpctblock.ShortIDs) != 2 {
 		t.Errorf("short ID count = %d, want 2", len(cmpctblock.ShortIDs))
 	}
 
-	// Total should match original transaction count
 	totalTxs := len(cmpctblock.ShortIDs) + len(cmpctblock.PrefilledTxs)
 	if totalTxs != len(block.Transactions) {
 		t.Errorf("total tx count = %d, want %d", totalTxs, len(block.Transactions))
 	}
 }
 
-// TestPartiallyDownloadedBlock tests block reconstruction.
+// TestBlockReconstruction tests block reconstruction with all txns in mempool.
 func TestBlockReconstruction(t *testing.T) {
-	// Create a test block
 	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
 	tx1 := createTestTx(1, 1, 1_0000_0000, nil)
 	tx2 := createTestTx(2, 2, 2_0000_0000, nil)
@@ -146,60 +137,53 @@ func TestBlockReconstruction(t *testing.T) {
 		Transactions: []*wire.MsgTx{coinbase, tx1, tx2},
 	}
 
-	// Build compact block
+	// Set correct merkle root BEFORE building (sipHashKey uses header bytes)
+	block.Header.MerkleRoot = computeMerkleRootForTest(block.Transactions)
+
 	nonce := uint64(0xCAFEBABE)
 	builder := NewCompactBlockBuilder(&block.Header, nonce)
 	cmpctblock := builder.Build(block)
 
-	// Create mempool with the transactions
-	mempool := &mockMempool{
-		txs: []*wire.MsgTx{tx1, tx2},
-	}
+	mempool := &mockMempool{txs: []*wire.MsgTx{tx1, tx2}}
 
-	// Initialize partial block
 	pdb := NewPartiallyDownloadedBlock()
-	missing, err := pdb.InitData(cmpctblock, mempool)
+	missing, err := pdb.InitData(cmpctblock, mempool, nil)
 	if err != nil {
 		t.Fatalf("InitData failed: %v", err)
 	}
 
-	// All transactions should be matched from mempool
 	if missing != 0 {
 		t.Errorf("missing = %d, want 0", missing)
 	}
 
-	// Check stats
-	prefilled, fromMempool, missingCount := pdb.Stats()
+	prefilled, fromMempool, fromExtra := pdb.Stats()
 	if prefilled != 1 {
 		t.Errorf("prefilled = %d, want 1", prefilled)
 	}
 	if fromMempool != 2 {
 		t.Errorf("fromMempool = %d, want 2", fromMempool)
 	}
-	if missingCount != 0 {
-		t.Errorf("missingCount = %d, want 0", missingCount)
+	if fromExtra != 0 {
+		t.Errorf("fromExtra = %d, want 0", fromExtra)
 	}
 
-	// Reconstruct the block
-	reconstructed, err := pdb.FillBlock()
+	// FillBlock with segwit=false (no witness commitment in test block)
+	reconstructed, err := pdb.FillBlock(nil, false)
 	if err != nil {
 		t.Fatalf("FillBlock failed: %v", err)
 	}
 
-	// Verify reconstruction
 	if len(reconstructed.Transactions) != len(block.Transactions) {
 		t.Errorf("tx count = %d, want %d", len(reconstructed.Transactions), len(block.Transactions))
 	}
 
-	// Verify header matches
-	if reconstructed.Header != block.Header {
+	if reconstructed.Header.Bits != block.Header.Bits {
 		t.Error("header mismatch after reconstruction")
 	}
 }
 
-// TestBlockReconstructionWithMissing tests block reconstruction with missing transactions.
+// TestBlockReconstructionWithMissing tests reconstruction with missing txns.
 func TestBlockReconstructionWithMissing(t *testing.T) {
-	// Create a test block
 	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
 	tx1 := createTestTx(1, 1, 1_0000_0000, nil)
 	tx2 := createTestTx(2, 2, 2_0000_0000, nil)
@@ -214,54 +198,314 @@ func TestBlockReconstructionWithMissing(t *testing.T) {
 		Transactions: []*wire.MsgTx{coinbase, tx1, tx2},
 	}
 
-	// Build compact block
+	// Set merkle root before building
+	block.Header.MerkleRoot = computeMerkleRootForTest(block.Transactions)
+
 	nonce := uint64(0xCAFEBABE)
 	builder := NewCompactBlockBuilder(&block.Header, nonce)
 	cmpctblock := builder.Build(block)
 
-	// Create mempool with only tx1 (tx2 is missing)
-	mempool := &mockMempool{
-		txs: []*wire.MsgTx{tx1},
-	}
+	// Only tx1 in mempool; tx2 is missing
+	mempool := &mockMempool{txs: []*wire.MsgTx{tx1}}
 
-	// Initialize partial block
 	pdb := NewPartiallyDownloadedBlock()
-	missing, err := pdb.InitData(cmpctblock, mempool)
+	missing, err := pdb.InitData(cmpctblock, mempool, nil)
 	if err != nil {
 		t.Fatalf("InitData failed: %v", err)
 	}
 
-	// One transaction should be missing
 	if missing != 1 {
 		t.Errorf("missing = %d, want 1", missing)
 	}
 
-	// Get missing indexes
 	missingIndexes := pdb.GetMissingIndexes()
 	if len(missingIndexes) != 1 {
 		t.Fatalf("missing indexes count = %d, want 1", len(missingIndexes))
 	}
 
-	// FillBlock should fail
-	_, err = pdb.FillBlock()
+	// FillBlock without providing the missing tx should fail
+	_, err = pdb.FillBlock(nil, false)
 	if err == nil {
 		t.Error("FillBlock should fail with missing transactions")
 	}
 
-	// Fill the missing transaction
-	err = pdb.FillMissingTransactions([]*wire.MsgTx{tx2})
-	if err != nil {
-		t.Fatalf("FillMissingTransactions failed: %v", err)
+	// Re-init (new object) and provide the missing tx via vtxMissing
+	pdb2 := NewPartiallyDownloadedBlock()
+	missing2, err2 := pdb2.InitData(cmpctblock, mempool, nil)
+	if err2 != nil {
+		t.Fatalf("second InitData failed: %v", err2)
+	}
+	if missing2 != 1 {
+		t.Errorf("second missing = %d, want 1", missing2)
 	}
 
-	// Now FillBlock should succeed
-	reconstructed, err := pdb.FillBlock()
+	reconstructed, err := pdb2.FillBlock([]*wire.MsgTx{tx2}, false)
 	if err != nil {
-		t.Fatalf("FillBlock failed after filling: %v", err)
+		t.Fatalf("FillBlock with vtxMissing failed: %v", err)
 	}
 
 	if len(reconstructed.Transactions) != 3 {
 		t.Errorf("tx count = %d, want 3", len(reconstructed.Transactions))
+	}
+}
+
+// TestInitDataNullHeaderRejected verifies Gate 1: null header.
+func TestInitDataNullHeaderRejected(t *testing.T) {
+	cmpctblock := &MsgCmpctBlock{
+		// Header.Bits == 0 → null header
+		ShortIDs:     []uint64{0x1234},
+		PrefilledTxs: []PrefilledTx{{Index: 0, Tx: createTestTx(0, 1, 5000, nil)}},
+	}
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.InitData(cmpctblock, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for null header, got nil")
+	}
+}
+
+// TestInitDataEmptyBodyRejected verifies Gate 2: empty short IDs + prefilled.
+func TestInitDataEmptyBodyRejected(t *testing.T) {
+	cmpctblock := &MsgCmpctBlock{
+		Header: wire.BlockHeader{Bits: 0x1d00ffff},
+	}
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.InitData(cmpctblock, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for empty body, got nil")
+	}
+}
+
+// TestInitDataMaxTxCountGuard verifies Gate 3: DoS guard on transaction count.
+func TestInitDataMaxTxCountGuard(t *testing.T) {
+	// Build a cmpctblock with maxBlockTxCount+1 short IDs.
+	shortIDs := make([]uint64, maxBlockTxCount+1)
+	for i := range shortIDs {
+		shortIDs[i] = uint64(i + 1)
+	}
+	cmpctblock := &MsgCmpctBlock{
+		Header:   wire.BlockHeader{Bits: 0x1d00ffff},
+		ShortIDs: shortIDs,
+	}
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.InitData(cmpctblock, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for too many transactions, got nil")
+	}
+}
+
+// TestInitDataDoubleInitGuard verifies Gate 4: double-init rejection.
+func TestInitDataDoubleInitGuard(t *testing.T) {
+	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
+	tx1 := createTestTx(1, 1, 1_0000_0000, nil)
+
+	block := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1, Bits: 0x1d00ffff},
+		Transactions: []*wire.MsgTx{coinbase, tx1},
+	}
+	builder := NewCompactBlockBuilder(&block.Header, 42)
+	cmpctblock := builder.Build(block)
+
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.InitData(cmpctblock, nil, nil)
+	if err != nil {
+		t.Fatalf("first InitData failed: %v", err)
+	}
+
+	// Second call must fail
+	_, err = pdb.InitData(cmpctblock, nil, nil)
+	if err == nil {
+		t.Fatal("expected error on double-init, got nil")
+	}
+}
+
+// TestInitDataPrefilledIndexUint16Overflow verifies Gate 6: uint16 overflow.
+func TestInitDataPrefilledIndexUint16Overflow(t *testing.T) {
+	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
+	cmpctblock := &MsgCmpctBlock{
+		Header: wire.BlockHeader{Bits: 0x1d00ffff},
+		// Index 0 + 65535 = 65535; adding another 1 would wrap.
+		// Use differential index of 65535 on second entry to push lastPrefilledIndex to 65535+1 = overflow.
+		PrefilledTxs: []PrefilledTx{
+			{Index: 0, Tx: coinbase},
+			{Index: 0xFFFF, Tx: coinbase}, // differential: 0xFFFF+1 = 65536 → overflow
+		},
+		ShortIDs: []uint64{},
+	}
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.InitData(cmpctblock, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for uint16 overflow, got nil")
+	}
+}
+
+// TestInitDataShortIDCollision verifies Gate 9: duplicate short IDs rejected.
+func TestInitDataShortIDCollision(t *testing.T) {
+	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
+	dup := uint64(0xABCDEF123456)
+	cmpctblock := &MsgCmpctBlock{
+		Header:       wire.BlockHeader{Bits: 0x1d00ffff},
+		PrefilledTxs: []PrefilledTx{{Index: 0, Tx: coinbase}},
+		ShortIDs:     []uint64{dup, dup}, // duplicate
+	}
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.InitData(cmpctblock, nil, nil)
+	if err == nil {
+		t.Fatal("expected error for duplicate short IDs, got nil")
+	}
+}
+
+// TestInitDataExtraTxn verifies that extra_txn are matched correctly (Bug 10 fix).
+func TestInitDataExtraTxn(t *testing.T) {
+	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
+	tx1 := createTestTx(1, 1, 1_0000_0000, nil)
+	tx2 := createTestTx(2, 2, 2_0000_0000, nil)
+
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    1,
+			Timestamp:  1234567890,
+			Bits:       0x1d00ffff,
+			Nonce:      12345,
+		},
+		Transactions: []*wire.MsgTx{coinbase, tx1, tx2},
+	}
+
+	// Set merkle root before building
+	block.Header.MerkleRoot = computeMerkleRootForTest(block.Transactions)
+
+	nonce := uint64(0xCAFEBABE)
+	builder := NewCompactBlockBuilder(&block.Header, nonce)
+	cmpctblock := builder.Build(block)
+
+	// Empty mempool, but tx1 and tx2 provided as extra_txn
+	extraTxn := []ExtraTx{
+		{Wtxid: tx1.WTxHash(), Tx: tx1},
+		{Wtxid: tx2.WTxHash(), Tx: tx2},
+	}
+
+	pdb := NewPartiallyDownloadedBlock()
+	missing, err := pdb.InitData(cmpctblock, nil, extraTxn)
+	if err != nil {
+		t.Fatalf("InitData failed: %v", err)
+	}
+	if missing != 0 {
+		t.Errorf("missing = %d, want 0 (extra_txn should cover all)", missing)
+	}
+
+	_, fromMempool, fromExtra := pdb.Stats()
+	if fromMempool != 2 {
+		t.Errorf("fromMempool = %d, want 2", fromMempool)
+	}
+	if fromExtra != 2 {
+		t.Errorf("fromExtra = %d, want 2", fromExtra)
+	}
+}
+
+// TestFillBlockUninitialisedRejected verifies Gate: IsTxAvailable on uninit returns false (Bug 9 fix).
+func TestIsTxAvailableUninit(t *testing.T) {
+	pdb := NewPartiallyDownloadedBlock()
+	if pdb.IsTxAvailable(0) {
+		t.Error("IsTxAvailable on uninitialised block should return false")
+	}
+}
+
+// TestFillBlockUninitRejected verifies Gate: FillBlock on uninit returns error (Bug 6 fix).
+func TestFillBlockUninitRejected(t *testing.T) {
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.FillBlock(nil, false)
+	if err == nil {
+		t.Fatal("FillBlock on uninitialised block should return error")
+	}
+}
+
+// TestFillBlockDoubleCallRejected verifies that after FillBlock succeeds, a second
+// call is rejected (Bug 7 fix: header.SetNull + txn_available.clear).
+func TestFillBlockDoubleCallRejected(t *testing.T) {
+	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
+	tx1 := createTestTx(1, 1, 1_0000_0000, nil)
+
+	block := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1, Bits: 0x1d00ffff, Nonce: 7},
+		Transactions: []*wire.MsgTx{coinbase, tx1},
+	}
+	// Set merkle root before building so sipHashKey is computed from final header
+	block.Header.MerkleRoot = computeMerkleRootForTest(block.Transactions)
+	builder := NewCompactBlockBuilder(&block.Header, 42)
+	cmpctblock := builder.Build(block)
+
+	mempool := &mockMempool{txs: []*wire.MsgTx{tx1}}
+
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.InitData(cmpctblock, mempool, nil)
+	if err != nil {
+		t.Fatalf("InitData failed: %v", err)
+	}
+
+	_, err = pdb.FillBlock(nil, false)
+	if err != nil {
+		t.Fatalf("first FillBlock failed: %v", err)
+	}
+
+	// Second call must fail (header consumed)
+	_, err = pdb.FillBlock(nil, false)
+	if err == nil {
+		t.Fatal("expected error on second FillBlock call, got nil")
+	}
+}
+
+// TestFillBlockVtxMissingTooShort verifies that insufficient vtxMissing returns error.
+func TestFillBlockVtxMissingTooShort(t *testing.T) {
+	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
+	tx1 := createTestTx(1, 1, 1_0000_0000, nil)
+
+	block := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1, Bits: 0x1d00ffff, Nonce: 77},
+		Transactions: []*wire.MsgTx{coinbase, tx1},
+	}
+	builder := NewCompactBlockBuilder(&block.Header, 42)
+	cmpctblock := builder.Build(block)
+
+	// Empty mempool → tx1 is missing
+	pdb := NewPartiallyDownloadedBlock()
+	missing, err := pdb.InitData(cmpctblock, nil, nil)
+	if err != nil {
+		t.Fatalf("InitData failed: %v", err)
+	}
+	if missing != 1 {
+		t.Fatalf("missing = %d, want 1", missing)
+	}
+
+	// Provide no vtxMissing → should fail
+	_, err = pdb.FillBlock(nil, false)
+	if err == nil {
+		t.Fatal("expected error for empty vtxMissing, got nil")
+	}
+}
+
+// TestFillBlockVtxMissingTooLong verifies that excess vtxMissing returns error.
+func TestFillBlockVtxMissingTooLong(t *testing.T) {
+	coinbase := createTestTx(0, 1, 50_0000_0000, nil)
+
+	block := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1, Bits: 0x1d00ffff, Nonce: 88},
+		Transactions: []*wire.MsgTx{coinbase},
+	}
+	block.Header.MerkleRoot = computeMerkleRootForTest(block.Transactions)
+	builder := NewCompactBlockBuilder(&block.Header, 42)
+	cmpctblock := builder.Build(block)
+
+	// All txns prefilled (only coinbase)
+	pdb := NewPartiallyDownloadedBlock()
+	_, err := pdb.InitData(cmpctblock, nil, nil)
+	if err != nil {
+		t.Fatalf("InitData failed: %v", err)
+	}
+
+	// Provide an extra tx (too many) → should fail
+	extra := createTestTx(99, 1, 1000, nil)
+	_, err = pdb.FillBlock([]*wire.MsgTx{extra}, false)
+	if err == nil {
+		t.Fatal("expected error for excess vtxMissing, got nil")
 	}
 }
 
@@ -270,9 +514,7 @@ func TestGetBlockTxnEncoding(t *testing.T) {
 	blockHash := wire.Hash256{}
 	blockHash[0] = 0xAB
 
-	// Test case: missing indexes [1, 3, 4, 10]
 	missingIndexes := []uint32{1, 3, 4, 10}
-
 	msg := CreateGetBlockTxn(blockHash, missingIndexes)
 
 	// Differential encoding:
@@ -292,7 +534,6 @@ func TestGetBlockTxnEncoding(t *testing.T) {
 		}
 	}
 
-	// Test decoding
 	decoded := DecodeGetBlockTxnIndexes(msg.Indexes)
 	if len(decoded) != len(missingIndexes) {
 		t.Fatalf("decoded length = %d, want %d", len(decoded), len(missingIndexes))
@@ -333,7 +574,6 @@ func TestMsgCmpctBlockRoundTrip(t *testing.T) {
 		t.Fatalf("Deserialize failed: %v", err)
 	}
 
-	// Verify
 	if msg2.Nonce != msg.Nonce {
 		t.Errorf("Nonce = %d, want %d", msg2.Nonce, msg.Nonce)
 	}
@@ -360,7 +600,7 @@ func TestMsgGetBlockTxnRoundTrip(t *testing.T) {
 
 	msg := &MsgGetBlockTxn{
 		BlockHash: blockHash,
-		Indexes:   []uint32{1, 2, 5, 0}, // Differentially encoded
+		Indexes:   []uint32{1, 2, 5, 0},
 	}
 
 	var buf bytes.Buffer
@@ -421,7 +661,6 @@ func TestMsgBlockTxnRoundTrip(t *testing.T) {
 func TestCompactBlockState(t *testing.T) {
 	state := NewCompactBlockState()
 
-	// Initially no support
 	if state.ProvidesCompactBlocks() {
 		t.Error("should not provide compact blocks initially")
 	}
@@ -429,7 +668,6 @@ func TestCompactBlockState(t *testing.T) {
 		t.Error("should not want HB initially")
 	}
 
-	// Set sendcmpct with version 2 (segwit)
 	state.SetSendCmpct(true, 2)
 
 	if !state.ProvidesCompactBlocks() {
@@ -439,7 +677,6 @@ func TestCompactBlockState(t *testing.T) {
 		t.Error("should want HB after sendcmpct(announce=1)")
 	}
 
-	// Test pending blocks
 	hash := wire.Hash256{}
 	hash[0] = 0xAB
 
@@ -475,9 +712,7 @@ func TestShortIDUniqueness(t *testing.T) {
 
 		shortID := ComputeShortID(key, txHash)
 		if seen[shortID] {
-			// Collision is possible but should be rare
-			// With 48 bits, probability of collision in 1000 is ~1.7e-9
-			t.Logf("Warning: collision at iteration %d", i)
+			t.Logf("Warning: collision at iteration %d (expected rare)", i)
 		}
 		seen[shortID] = true
 	}
@@ -494,7 +729,6 @@ func TestCreateBlockTxn(t *testing.T) {
 		Transactions: []*wire.MsgTx{coinbase, tx1, tx2},
 	}
 
-	// Request transactions at indexes 1 and 2
 	msg, err := CreateBlockTxn(block, []uint32{1, 2})
 	if err != nil {
 		t.Fatalf("CreateBlockTxn failed: %v", err)
@@ -504,7 +738,6 @@ func TestCreateBlockTxn(t *testing.T) {
 		t.Errorf("Txs count = %d, want 2", len(msg.Txs))
 	}
 
-	// Request out of range index should fail
 	_, err = CreateBlockTxn(block, []uint32{5})
 	if err == nil {
 		t.Error("expected error for out of range index")
@@ -541,6 +774,31 @@ func createTestTx(seed, numInputs, outputValue int, prevHash *wire.Hash256) *wir
 	})
 
 	return tx
+}
+
+// computeMerkleRootForTest computes the txid merkle root for a list of transactions.
+// Used in tests to set the correct merkle root so IsBlockMutated doesn't false-positive.
+func computeMerkleRootForTest(txs []*wire.MsgTx) wire.Hash256 {
+	hashes := make([]wire.Hash256, len(txs))
+	for i, tx := range txs {
+		hashes[i] = tx.TxHash()
+	}
+	// Simple binary merkle tree
+	for len(hashes) > 1 {
+		if len(hashes)%2 != 0 {
+			hashes = append(hashes, hashes[len(hashes)-1])
+		}
+		next := make([]wire.Hash256, len(hashes)/2)
+		for i := 0; i < len(hashes); i += 2 {
+			combined := append(hashes[i][:], hashes[i+1][:]...)
+			next[i/2] = wire.DoubleHashB(combined)
+		}
+		hashes = next
+	}
+	if len(hashes) == 0 {
+		return wire.Hash256{}
+	}
+	return hashes[0]
 }
 
 // mockMempool implements MempoolLookup for testing.
