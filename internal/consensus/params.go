@@ -44,6 +44,13 @@ const (
 	// MedianTimeSpan is the number of blocks used for median time calculation.
 	MedianTimeSpan = 11
 
+	// MaxTimewarp is the maximum allowed time difference between the first block
+	// of a difficulty adjustment period and the last block of the previous period,
+	// used by BIP-94 to prevent timewarp attacks (testnet4 and regtest when
+	// enforce_BIP94 is set).
+	// Mirrors Bitcoin Core consensus/consensus.h:35 MAX_TIMEWARP = 600.
+	MaxTimewarp int64 = 600
+
 	// MaxScriptSize is the maximum size of a script in bytes.
 	MaxScriptSize = 10_000
 

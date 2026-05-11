@@ -13,14 +13,15 @@ import (
 
 // Header validation errors.
 var (
-	ErrOrphanHeader         = errors.New("header has unknown parent")
-	ErrDuplicateHeader      = errors.New("header already exists")
-	ErrInvalidPoW           = errors.New("header has invalid proof of work")
-	ErrTimestampTooEarly    = errors.New("header timestamp is before median time past")
+	ErrOrphanHeader          = errors.New("header has unknown parent")
+	ErrDuplicateHeader       = errors.New("header already exists")
+	ErrInvalidPoW            = errors.New("header has invalid proof of work")
+	ErrTimestampTooEarly     = errors.New("header timestamp is before median time past")
 	ErrTimestampTooFarFuture = errors.New("header timestamp is more than 2 hours in the future")
-	ErrBadDifficulty        = errors.New("header has incorrect difficulty bits")
-	ErrCheckpointMismatch   = errors.New("header does not match checkpoint")
-	ErrForkBeforeCheckpoint = errors.New("fork before last checkpoint is not allowed")
+	ErrTimeWarpAttack        = errors.New("block timestamp violates BIP-94 timewarp rule at difficulty adjustment boundary")
+	ErrBadDifficulty         = errors.New("header has incorrect difficulty bits")
+	ErrCheckpointMismatch    = errors.New("header does not match checkpoint")
+	ErrForkBeforeCheckpoint  = errors.New("fork before last checkpoint is not allowed")
 )
 
 // headerNowUnix returns the current wall-clock time in seconds since epoch.
@@ -389,10 +390,25 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 		return nil, ErrInvalidPoW
 	}
 
-	// Check timestamp > median time past
+	// Check timestamp > median time past (validation.cpp:4092-4093, "time-too-old").
 	mtp := parent.GetMedianTimePast()
 	if int64(header.Timestamp) <= mtp {
 		return nil, ErrTimestampTooEarly
+	}
+
+	// BIP-94 timewarp check (validation.cpp:4097-4104, "time-timewarp-attack").
+	// Testnet4 and regtest (when EnforceBIP94 is set): at every difficulty
+	// adjustment boundary (height % 2016 == 0, skipping genesis at height 0),
+	// the new block's timestamp must not be more than MaxTimewarp seconds
+	// (600s) behind the immediately preceding block's timestamp.
+	//
+	// Core: if (nHeight % DifficultyAdjustmentInterval() == 0)
+	//           if (block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP)
+	//               reject "time-timewarp-attack"
+	if idx.params.EnforceBIP94 && height%int32(idx.params.DifficultyAdjInterval) == 0 {
+		if int64(header.Timestamp) < int64(parent.Header.Timestamp)-MaxTimewarp {
+			return nil, ErrTimeWarpAttack
+		}
 	}
 
 	// Future-time check at header acceptance (Bitcoin Core's
