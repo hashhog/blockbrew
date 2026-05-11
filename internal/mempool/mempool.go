@@ -735,12 +735,6 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		}
 	}
 
-	// 10. Validate scripts
-	flags := mp.getStandardScriptFlags()
-	if err := mp.validateScriptsLocked(tx, flags); err != nil {
-		return fmt.Errorf("%w: %v", ErrScriptValidation, err)
-	}
-
 	// 10b. BIP-68 sequence-lock check (Bitcoin Core
 	//      validation.cpp::CheckSequenceLocksAtTip in PreChecks).
 	//      Locks are evaluated against the *next* block (tip height + 1)
@@ -756,6 +750,26 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	//      side-effect free.
 	if err := mp.checkChainLimitsWithSizeLocked(tx, vsize); err != nil {
 		return err
+	}
+
+	// 10d. BIP-431 TRUC (version=3) policy checks. Runs before script
+	//      validation (expensive) to give fast policy rejections.
+	//      Must run after outpoint/input resolution (step 6) so we know
+	//      in-mempool parents. Uses sigop-adjusted vsize per
+	//      truc_policy.h TRUC_MAX_VSIZE / TRUC_CHILD_MAX_VSIZE.
+	//      Core: SingleTRUCChecks (truc_policy.cpp:171-261), called from
+	//      MemPoolAccept::PreChecks (validation.cpp) before CheckInputScripts.
+	if err := mp.singleTRUCChecks(tx, conflictingTxs); err != nil {
+		// Sibling eviction: caller could attempt RBF eviction of the sibling,
+		// but in the single-tx path we conservatively reject. The caller of
+		// AcceptPackage may handle sibling eviction in the package path.
+		return err
+	}
+
+	// 10. Validate scripts
+	flags := mp.getStandardScriptFlags()
+	if err := mp.validateScriptsLocked(tx, flags); err != nil {
+		return fmt.Errorf("%w: %v", ErrScriptValidation, err)
 	}
 
 	// 11. Create entry and add to mempool
@@ -2377,6 +2391,17 @@ func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResul
 			return result, result.PackageError
 		}
 
+		// BIP-431 PackageTRUCChecks: enforce TRUC topology rules with the full
+		// package context. Core: PackageTRUCChecks (truc_policy.cpp:57-169).
+		pkgIdx := indexOf(toEvaluate, tx)
+		sigopVsize := mp.trucSigopVsize(tx)
+		if err := mp.packageTRUCChecks(tx, sigopVsize, toEvaluate, pkgIdx); err != nil {
+			txResult.Error = err
+			result.PackageError = fmt.Errorf("transaction %s failed TRUC package check: %w", txid, err)
+			mp.rollbackPackageLocked(toEvaluate[:pkgIdx])
+			return result, result.PackageError
+		}
+
 		// Add to mempool
 		if err := mp.addTransactionLocked(tx, fee, vsize); err != nil {
 			txResult.Error = err
@@ -2501,6 +2526,12 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 
 	// Ancestor/descendant chain limits (count + size).
 	if err := mp.checkChainLimitsWithSizeLocked(tx, vsize); err != nil {
+		return 0, 0, err
+	}
+
+	// BIP-431 TRUC checks (single-tx path, no package context).
+	// Core: SingleTRUCChecks (truc_policy.cpp:171-261).
+	if err := mp.singleTRUCChecks(tx, nil); err != nil {
 		return 0, 0, err
 	}
 
