@@ -64,9 +64,13 @@ func CheckTransactionSanity(tx *wire.MsgTx) error {
 		return ErrNoOutputs
 	}
 
-	// 2. Transaction serialized size must not exceed MaxBlockWeight
-	weight := CalcTxWeight(tx)
-	if weight > MaxBlockWeight {
+	// 2. Transaction non-witness serialized size must not exceed MaxBlockWeight
+	// when scaled by WITNESS_SCALE_FACTOR.
+	// Core tx_check.cpp:19: GetSerializeSize(TX_NO_WITNESS(tx)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+	// Intentionally excludes witness data per Core comment:
+	//   "this doesn't take the witness into account, as that hasn't been checked for malleability"
+	strippedSize := CalcTxSerializeSizeNoWitness(tx)
+	if strippedSize*WitnessScaleFactor > MaxBlockWeight {
 		return ErrOversizedTx
 	}
 
@@ -178,8 +182,16 @@ func CheckTransactionInputs(tx *wire.MsgTx, txHeight int32, utxoView UTXOView) (
 			ErrInsufficientFunds, totalInput, totalOutput)
 	}
 
-	// Return the fee (inputs - outputs)
-	return totalInput - totalOutput, nil
+	// 6. Fee (inputs - outputs) must be in [0, MaxMoney].
+	// Core tx_verify.cpp:202-210: MoneyRange(txfee_aux) check with comment
+	// "Unreachable, given the following preconditions" — but the gate is present
+	// in Core for defence-in-depth and we mirror it for consensus fidelity.
+	fee := totalInput - totalOutput
+	if fee < 0 || fee > MaxMoney {
+		return 0, fmt.Errorf("bad-txns-fee-outofrange: fee %d", fee)
+	}
+
+	return fee, nil
 }
 
 // UpdatableUTXOView extends UTXOView with modification capabilities.
