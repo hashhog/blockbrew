@@ -10,8 +10,9 @@ import (
 )
 
 // MaxClusterSize is the maximum number of transactions allowed in a cluster.
+// Matches Bitcoin Core's DEFAULT_CLUSTER_LIMIT (src/policy/policy.h:72).
 // Larger clusters are rejected to ensure linearization remains fast.
-const MaxClusterSize = 100
+const MaxClusterSize = 64
 
 // ErrClusterTooLarge is returned when a transaction would create a cluster
 // exceeding MaxClusterSize.
@@ -96,7 +97,7 @@ func (f FeeFrac) FeeRate() float64 {
 // ============================================================================
 
 // BitSet is a fixed-size bit set for efficient set operations.
-// Supports up to 128 elements (2 uint64s). This is sufficient for MaxClusterSize=100.
+// Supports up to 128 elements (2 uint64s). This is more than sufficient for MaxClusterSize=64.
 type BitSet struct {
 	bits [2]uint64
 }
