@@ -566,7 +566,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 
 	// Genesis block special case: the genesis coinbase is unspendable.
 	// Bitcoin Core skips transaction connection for the genesis block.
-	if node.Height == 0 {
+	//
+	// W93 fix #4 (genesis-by-hash, not height): Bitcoin Core compares the
+	// block hash to params.GetConsensus().hashGenesisBlock (validation.cpp:2339)
+	// rather than height==0. Height-based detection can misfire on regtest /
+	// custom networks where a fork could in principle plant a non-genesis
+	// block at height 0. The hash-based comparison is the canonical check
+	// and matches every other Bitcoin Core reference site (chain.cpp,
+	// chainparams.cpp). Fall back to height as a safety net for the
+	// HeaderIndex contract that genesis is always node.Height==0 with
+	// node.Hash == params.GenesisHash.
+	if hash == cm.params.GenesisHash || node.Height == 0 {
 		// Store empty undo data and update chain state
 		cm.tipNode = node
 		cm.tipHeight = node.Height
@@ -638,6 +648,21 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// rollbackUTXOs undoes all UTXO changes made during the first pass.
 	// This is critical: without rollback, a failed ConnectBlock corrupts the
 	// UTXO set and causes all subsequent blocks to fail validation too.
+	//
+	// W93 fix #1 (slice misalignment): the previous implementation walked
+	// mod.spentCoins and indexed mod.spentInputs[0]/[1:], which only worked
+	// when spentCoins and spentInputs had identical length. Bug 1 (below)
+	// arranged for them to ALWAYS be 1:1, so this loop indexes them with the
+	// same `j` and never mutates the local slice header (defensive: keeps
+	// the rollback idempotent if invoked twice).
+	//
+	// W93 fix #6 (PkScript aliasing on restore — W82/W92 pattern): clone the
+	// PkScript when constructing the restored UTXOEntry so subsequent
+	// mutations of the spentCoin's backing buffer cannot corrupt the cache
+	// entry. The bug surfaces when the rollback is invoked AFTER the same
+	// pkScript slice has already been recorded into blockUndo (persisted on
+	// the success path), or when test harnesses mutate input buffers between
+	// validation passes.
 	rollbackUTXOs := func() {
 		// Undo in reverse order
 		for i := len(utxoMods) - 1; i >= 0; i-- {
@@ -646,15 +671,22 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			for _, op := range mod.addedOuts {
 				cm.utxoSet.SpendUTXO(op)
 			}
-			// Restore inputs that were spent
-			for _, sc := range mod.spentCoins {
-				cm.utxoSet.AddUTXO(mod.spentInputs[0], &UTXOEntry{
+			// Restore inputs that were spent. spentCoins and spentInputs are
+			// always parallel arrays of the same length (see Bug 1 fix below).
+			if len(mod.spentCoins) != len(mod.spentInputs) {
+				// Should be unreachable; log loudly so any future regression
+				// is caught instead of silently misaligning the undo data.
+				log.Printf("chainmgr: BUG: rollback length mismatch txIdx=%d coins=%d inputs=%d",
+					mod.txIdx, len(mod.spentCoins), len(mod.spentInputs))
+				continue
+			}
+			for j, sc := range mod.spentCoins {
+				cm.utxoSet.AddUTXO(mod.spentInputs[j], &UTXOEntry{
 					Amount:     sc.TxOut.Value,
-					PkScript:   sc.TxOut.PkScript,
+					PkScript:   bytes.Clone(sc.TxOut.PkScript),
 					Height:     sc.Height,
 					IsCoinbase: sc.Coinbase,
 				})
-				mod.spentInputs = mod.spentInputs[1:]
 			}
 		}
 	}
@@ -776,20 +808,57 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// Always record spent UTXOs for in-memory rollback. Without this,
 		// a validation failure mid-block leaves the UTXO set corrupted
 		// because spent inputs cannot be restored.
+		//
+		// W93 fix #1 (spentInputs/spentCoins must be 1:1):
+		// Mirrors Bitcoin Core UpdateCoins (validation.cpp:1999-2011) which
+		// reserves vprevout.size() == tx.vin.size() and asserts(is_spent) for
+		// every input. Without 1:1 alignment, the persisted blockundo would
+		// have fewer SpentCoins than tx.vin and DisconnectBlock's
+		// "len(txUndo.SpentCoins) != len(tx.TxIn)" guard rejects the reorg
+		// (chainmanager.go:1371). The block becomes silently UNDISCONNECTABLE
+		// on the success path of ConnectBlock — a critical correctness bug.
+		//
+		// W93 fix #2 (PkScript slice aliasing — W82/W92 pattern):
+		// utxo.PkScript points into the UTXOEntry held by cachedView /
+		// cm.utxoSet. Recording the slice into storage.SpentCoin without a
+		// bytes.Clone leaves the SpentCoin's PkScript aliased to that
+		// backing array. Subsequent flushes/evictions in the same batch
+		// could mutate (or, more commonly, drop) the entry while the
+		// blockundo still references it. The block-replay-from-disk path
+		// is unaffected (serialization copies bytes) but the in-memory
+		// rollback path uses these PkScripts directly via AddUTXO, and
+		// reorg dispatchers can re-flush before the rollback fires.
+		// Clone defensively to mirror AddTxOutputs (utxoset.go:534) which
+		// already clones on the outbound path.
+		//
+		// W93 fix #3 (loud failure on nil prevout): the previous code
+		// silently elided a SpentCoin when utxo was nil. Reaching this loop
+		// with a nil prevout is a consensus violation that CheckTransactionInputs
+		// should have caught upstream. If somehow it leaks through, we now
+		// rollback + return an error rather than mis-shape the undo data.
 		spentInputs := make([]wire.OutPoint, 0, len(tx.TxIn))
 		spentCoins := make([]storage.SpentCoin, 0, len(tx.TxIn))
 		for _, in := range tx.TxIn {
 			// W69d: Direct cache read — populated above, same UTXOs.
-			if utxo, ok := cachedView.cache[in.PreviousOutPoint]; ok && utxo != nil {
-				spentCoins = append(spentCoins, storage.SpentCoin{
-					TxOut: wire.TxOut{
-						Value:    utxo.Amount,
-						PkScript: utxo.PkScript,
-					},
-					Height:   utxo.Height,
-					Coinbase: utxo.IsCoinbase,
-				})
+			utxo, ok := cachedView.cache[in.PreviousOutPoint]
+			if !ok || utxo == nil {
+				// Should have been caught by CheckTransactionInputs above
+				// (which returned ErrMissingInput). Reaching here means a
+				// gap between input-validation and spend-recording — most
+				// likely a future refactor that re-orders the passes.
+				// Mirrors Core's `assert(is_spent)` in UpdateCoins.
+				rollbackUTXOs()
+				return fmt.Errorf("tx %d: bad-txns-inputs-missingorspent: prevout %s:%d not in cached view",
+					i, in.PreviousOutPoint.Hash.String()[:16], in.PreviousOutPoint.Index)
 			}
+			spentCoins = append(spentCoins, storage.SpentCoin{
+				TxOut: wire.TxOut{
+					Value:    utxo.Amount,
+					PkScript: bytes.Clone(utxo.PkScript),
+				},
+				Height:   utxo.Height,
+				Coinbase: utxo.IsCoinbase,
+			})
 			spentInputs = append(spentInputs, in.PreviousOutPoint)
 		}
 
@@ -1384,9 +1453,16 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 				idx := j - 1
 				spentCoin := &txUndo.SpentCoins[idx]
 				outpoint := tx.TxIn[idx].PreviousOutPoint
+				// W93 fix #6 (PkScript aliasing on disconnect — W82/W92 pattern):
+				// clone the script when handing it to the UTXOSet cache so the
+				// downstream cache entry has its own backing buffer. The
+				// deserialized SpentCoin slice may be freed/recycled when
+				// txUndo goes out of scope (escape analysis may keep it live in
+				// practice today, but the contract is fragile). Mirrors the
+				// clone discipline used by AddTxOutputs (utxoset.go:534).
 				undoEntry := &UTXOEntry{
 					Amount:     spentCoin.TxOut.Value,
-					PkScript:   spentCoin.TxOut.PkScript,
+					PkScript:   bytes.Clone(spentCoin.TxOut.PkScript),
 					Height:     spentCoin.Height,
 					IsCoinbase: spentCoin.Coinbase,
 				}

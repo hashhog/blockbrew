@@ -971,10 +971,20 @@ func (u *UTXOSet) ConnectBlockUTXOs(block *wire.MsgBlock, height int32) (*UndoBl
 					return nil, ErrUTXONotFound
 				}
 
-				// Record for undo
+				// Record for undo.
+				// W93 fix #6 (PkScript aliasing): *entry shallow-copies the
+				// struct but the PkScript slice still aliases the UTXOSet's
+				// cache entry. After SpendUTXO removes that entry from the
+				// cache, Go's GC keeps the backing array alive as long as
+				// the SpentOutput retains the slice — so this is safe today.
+				// But the clone makes the contract explicit and matches the
+				// W82/W92 audit pattern (slice aliasing across logical
+				// ownership boundaries).
+				recorded := *entry
+				recorded.PkScript = bytes.Clone(recorded.PkScript)
 				undo.SpentOutputs = append(undo.SpentOutputs, SpentOutput{
 					OutPoint: in.PreviousOutPoint,
-					Entry:    *entry,
+					Entry:    recorded,
 				})
 
 				// Spend it
@@ -1004,9 +1014,17 @@ func (u *UTXOSet) DisconnectBlockUTXOs(block *wire.MsgBlock, undo *UndoBlock) er
 		}
 	}
 
-	// Restore all spent UTXOs from undo data
+	// Restore all spent UTXOs from undo data.
+	//
+	// W93 fix #6 (PkScript aliasing on UTXO restore — W82/W92 pattern):
+	// `entry := so.Entry` shallow-copies the struct but its PkScript slice
+	// header still points at undo.SpentOutputs[i].Entry.PkScript's backing
+	// array. Cloning the slice ensures the restored cache entry holds its
+	// own buffer so subsequent mutations of `undo` cannot corrupt the
+	// UTXOSet. Mirrors the clone discipline used by AddTxOutputs.
 	for _, so := range undo.SpentOutputs {
-		entry := so.Entry // copy
+		entry := so.Entry // shallow copy
+		entry.PkScript = bytes.Clone(entry.PkScript)
 		u.AddUTXO(so.OutPoint, &entry)
 	}
 
