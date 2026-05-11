@@ -688,3 +688,312 @@ func TestChainParamsFlags(t *testing.T) {
 		})
 	}
 }
+
+// ---------------------------------------------------------------------------
+// BUG-1: compact overflow detection in CheckProofOfWork
+// ---------------------------------------------------------------------------
+
+// TestCompactToBigFullOverflow verifies that compactToBigFull correctly detects
+// overflow. Core's SetCompact overflow conditions (arith_uint256.cpp:190-192):
+//   - nSize > 34 (exponent > 34)
+//   - nWord > 0xff && nSize > 33
+//   - nWord > 0xffff && nSize > 32
+func TestCompactToBigFullOverflow(t *testing.T) {
+	tests := []struct {
+		name       string
+		compact    uint32
+		wantNeg    bool
+		wantOvfl   bool
+	}{
+		// Valid values — no overflow
+		{"genesis 0x1d00ffff", 0x1d00ffff, false, false},
+		{"regtest 0x207fffff", 0x207fffff, false, false},
+		{"zero mantissa", 0x03000000, false, false},
+		// Negative flag: bit 23 (0x00800000) of mantissa set AND mantissa != 0.
+		// Core: *pfNegative = nWord != 0 && (nCompact & 0x00800000) != 0
+		// 0x03800001: exponent=3, mantissa_raw=0x800001, nWord=0x000001 (after mask), bit23 set.
+		{"negative mantissa", 0x03800001, true, false},
+		// 0x03800000: exponent=3, mantissa_raw=0x800000, nWord=0x000000 → NOT negative (mantissa is zero).
+		{"zero mantissa with bit23 is not negative", 0x03800000, false, false},
+		// Overflow: exponent > 34
+		{"exponent=35 mantissa=1", 0x23000001, false, true},
+		{"exponent=36", 0x24000001, false, true},
+		// Overflow: mantissa > 0xff and exponent == 34
+		{"exponent=34 mantissa=0x100", 0x22000100, false, true},
+		// Overflow: mantissa > 0xffff and exponent == 33
+		{"exponent=33 mantissa=0x10000", 0x21010000, false, true},
+		// No overflow: mantissa==0xff exponent==34 is exactly at boundary
+		{"exponent=34 mantissa=0xff", 0x220000ff, false, false},
+		// No overflow: mantissa==0xffff exponent==33 is exactly at boundary
+		{"exponent=33 mantissa=0xffff", 0x2100ffff, false, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, gotNeg, gotOvfl := compactToBigFull(tt.compact)
+			if gotNeg != tt.wantNeg {
+				t.Errorf("compact=%08x: isNegative=%v, want %v", tt.compact, gotNeg, tt.wantNeg)
+			}
+			if gotOvfl != tt.wantOvfl {
+				t.Errorf("compact=%08x: isOverflow=%v, want %v", tt.compact, gotOvfl, tt.wantOvfl)
+			}
+		})
+	}
+}
+
+// TestCheckProofOfWorkOverflow verifies that an overflowing compact target is
+// rejected by CheckProofOfWork, not silently accepted as a huge target.
+// Before the fix, CompactToBig returned a huge positive number for overflow
+// compacts; CheckProofOfWork would then compare the block hash against a
+// 256+-bit target which could always pass.
+func TestCheckProofOfWorkOverflow(t *testing.T) {
+	// exponent=35, mantissa=1 → overflow. Old code accepted this as a huge target.
+	overflowBits := uint32(0x23000001)
+	var anyHash wire.Hash256 // all-zero hash is always "easy" — would pass with huge target
+
+	err := CheckProofOfWork(anyHash, overflowBits, MainnetParams().PowLimit)
+	if err == nil {
+		t.Errorf("CheckProofOfWork with overflow bits should return an error, got nil")
+	}
+	if err != ErrTargetTooHigh {
+		t.Errorf("CheckProofOfWork with overflow bits: want ErrTargetTooHigh, got %v", err)
+	}
+}
+
+// TestCheckProofOfWorkNegative verifies that a negative compact target is rejected.
+func TestCheckProofOfWorkNegative(t *testing.T) {
+	// mantissa has bit 23 set → negative
+	negativeBits := uint32(0x03800001)
+	var anyHash wire.Hash256
+
+	err := CheckProofOfWork(anyHash, negativeBits, MainnetParams().PowLimit)
+	if err == nil {
+		t.Errorf("CheckProofOfWork with negative bits should return an error, got nil")
+	}
+	if err != ErrNegativeTarget {
+		t.Errorf("CheckProofOfWork with negative bits: want ErrNegativeTarget, got %v", err)
+	}
+}
+
+// TestCheckProofOfWorkZeroTarget verifies that a zero target is rejected.
+func TestCheckProofOfWorkZeroTarget(t *testing.T) {
+	// exponent=3, mantissa=0 → target==0
+	zeroBits := uint32(0x03000000)
+	var anyHash wire.Hash256
+
+	err := CheckProofOfWork(anyHash, zeroBits, MainnetParams().PowLimit)
+	if err == nil {
+		t.Errorf("CheckProofOfWork with zero target should return an error, got nil")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BUG-2: PermittedDifficultyTransition
+// ---------------------------------------------------------------------------
+
+// TestPermittedDifficultyTransitionMainnet exercises all gate paths on mainnet.
+func TestPermittedDifficultyTransitionMainnet(t *testing.T) {
+	params := MainnetParams()
+
+	// Reference bits: genesis 0x1d00ffff.
+	genesisBits := uint32(0x1d00ffff)
+
+	// Higher difficulty (smaller target): 0x1c00ffff.
+	hardBits := uint32(0x1c00ffff)
+
+	// ---- Non-retarget heights (height % 2016 != 0) ----
+	// Must keep nBits identical.
+	t.Run("non-retarget same bits allowed", func(t *testing.T) {
+		if !PermittedDifficultyTransition(params, 1, genesisBits, genesisBits) {
+			t.Error("same nBits at non-retarget height should be permitted")
+		}
+	})
+	t.Run("non-retarget different bits rejected", func(t *testing.T) {
+		if PermittedDifficultyTransition(params, 1, genesisBits, hardBits) {
+			t.Error("different nBits at non-retarget height should NOT be permitted")
+		}
+	})
+	t.Run("non-retarget different bits rejected height 2015", func(t *testing.T) {
+		if PermittedDifficultyTransition(params, 2015, genesisBits, hardBits) {
+			t.Error("different nBits at non-retarget height 2015 should NOT be permitted")
+		}
+	})
+
+	// ---- Retarget heights (height % 2016 == 0) ----
+	t.Run("retarget same bits allowed", func(t *testing.T) {
+		if !PermittedDifficultyTransition(params, 2016, genesisBits, genesisBits) {
+			t.Error("same nBits at retarget height should be permitted")
+		}
+	})
+
+	// Maximum 4× increase in target (difficulty halved by 4): should be allowed.
+	// new_target = old_target * 4  →  new_bits encodes that
+	oldTarget := CompactToBig(genesisBits)
+	maxNewTarget := new(big.Int).Mul(oldTarget, big.NewInt(4))
+	// Clamp to powLimit
+	if maxNewTarget.Cmp(params.PowLimit) > 0 {
+		maxNewTarget.Set(params.PowLimit)
+	}
+	maxNewBits := BigToCompact(maxNewTarget)
+	t.Run("retarget 4x target increase allowed", func(t *testing.T) {
+		if !PermittedDifficultyTransition(params, 2016, genesisBits, maxNewBits) {
+			t.Errorf("4x target increase at retarget should be permitted (new bits %08x)", maxNewBits)
+		}
+	})
+
+	// 4× difficulty increase (target ÷ 4): should be allowed from non-min-limit bits.
+	smallNewTarget := new(big.Int).Div(CompactToBig(hardBits), big.NewInt(4))
+	smallNewBits := BigToCompact(smallNewTarget)
+	t.Run("retarget 4x difficulty increase allowed", func(t *testing.T) {
+		if !PermittedDifficultyTransition(params, 2016, hardBits, smallNewBits) {
+			t.Errorf("4x difficulty increase at retarget should be permitted (new bits %08x)", smallNewBits)
+		}
+	})
+
+	// Target increase beyond 4× must be rejected.
+	// We compute old_target * 5 to exceed the 4x limit.
+	wayTooEasyTarget := new(big.Int).Mul(CompactToBig(hardBits), big.NewInt(5))
+	if wayTooEasyTarget.Cmp(params.PowLimit) <= 0 {
+		wayTooEasyBits := BigToCompact(wayTooEasyTarget)
+		t.Run("retarget 5x target increase rejected", func(t *testing.T) {
+			if PermittedDifficultyTransition(params, 2016, hardBits, wayTooEasyBits) {
+				t.Error("5x target increase at retarget should NOT be permitted")
+			}
+		})
+	}
+}
+
+// TestPermittedDifficultyTransitionTestnet verifies the testnet bypass: all
+// transitions are allowed when MinDiffReductionTime is true. This mirrors
+// Core's fPowAllowMinDifficultyBlocks early-return.
+func TestPermittedDifficultyTransitionTestnet(t *testing.T) {
+	for _, params := range []*ChainParams{TestnetParams(), Testnet4Params(), RegtestParams()} {
+		name := params.Name
+		t.Run(name+" non-retarget different bits allowed", func(t *testing.T) {
+			// Any transition should pass on testnet/regtest.
+			if !PermittedDifficultyTransition(params, 1, 0x1d00ffff, 0x1c00ffff) {
+				t.Errorf("%s: different nBits at non-retarget height should be allowed (fPowAllowMinDifficultyBlocks)", name)
+			}
+		})
+		t.Run(name+" retarget absurd transition allowed", func(t *testing.T) {
+			if !PermittedDifficultyTransition(params, 2016, 0x1d00ffff, 0x207fffff) {
+				t.Errorf("%s: absurd retarget should be allowed (fPowAllowMinDifficultyBlocks)", name)
+			}
+		})
+	}
+}
+
+// TestPermittedDifficultyTransitionSignet verifies mainnet-like strictness on
+// signet (MinDiffReductionTime=false).
+func TestPermittedDifficultyTransitionSignet(t *testing.T) {
+	params := SignetParams()
+	if !params.MinDiffReductionTime {
+		// Non-retarget must keep bits equal
+		if PermittedDifficultyTransition(params, 1, 0x1e0377ae, 0x1d00ffff) {
+			t.Error("signet non-retarget with different bits should NOT be permitted")
+		}
+		if !PermittedDifficultyTransition(params, 1, 0x1e0377ae, 0x1e0377ae) {
+			t.Error("signet non-retarget with same bits should be permitted")
+		}
+	}
+}
+
+// TestPermittedDifficultyTransitionBoundary tests the exact 4× boundary.
+// The boundary value should be ALLOWED; one step beyond should be REJECTED.
+// This mirrors the round-trip compact comparison in Core pow.cpp:113-114.
+func TestPermittedDifficultyTransitionBoundary(t *testing.T) {
+	params := MainnetParams()
+	// Use a moderate difficulty so 4× doesn't hit powLimit.
+	oldBits := uint32(0x1b00ffff)
+	oldTarget := CompactToBig(oldBits)
+
+	// Exact 4× target increase — should be permitted.
+	exactMax := new(big.Int).Mul(oldTarget, big.NewInt(params.TargetTimespan*4))
+	exactMax.Div(exactMax, big.NewInt(params.TargetTimespan))
+	if exactMax.Cmp(params.PowLimit) > 0 {
+		exactMax.Set(params.PowLimit)
+	}
+	exactMaxBits := BigToCompact(exactMax)
+	if !PermittedDifficultyTransition(params, 2016, oldBits, exactMaxBits) {
+		t.Errorf("exact 4x boundary (%08x→%08x) should be permitted", oldBits, exactMaxBits)
+	}
+
+	// One bit beyond the maximum (larger target = easier) — should be rejected.
+	// Increment the decoded target by 1 and re-encode.
+	beyondMax := new(big.Int).Add(CompactToBig(exactMaxBits), big.NewInt(1))
+	beyondMaxBits := BigToCompact(beyondMax)
+	// Only test if the beyond value is actually different after compact encoding.
+	if beyondMaxBits != exactMaxBits && beyondMax.Cmp(params.PowLimit) <= 0 {
+		if PermittedDifficultyTransition(params, 2016, oldBits, beyondMaxBits) {
+			t.Errorf("one-beyond-4x boundary (%08x→%08x) should NOT be permitted", oldBits, beyondMaxBits)
+		}
+	}
+
+	// Exact ÷4 difficulty (×4 target decrease) — should be permitted.
+	exactMin := new(big.Int).Mul(oldTarget, big.NewInt(params.TargetTimespan/4))
+	exactMin.Div(exactMin, big.NewInt(params.TargetTimespan))
+	exactMinBits := BigToCompact(exactMin)
+	if !PermittedDifficultyTransition(params, 2016, oldBits, exactMinBits) {
+		t.Errorf("exact ÷4 boundary (%08x→%08x) should be permitted", oldBits, exactMinBits)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// BUG-3: validateDifficulty exact comparison (no tolerance)
+// ---------------------------------------------------------------------------
+
+// TestValidateDifficultyExact verifies that validateDifficulty rejects a
+// header whose nBits differs from GetNextWorkRequired by even one compact step,
+// even if the targets are numerically close. The old code allowed ±0.1%.
+func TestValidateDifficultyExact(t *testing.T) {
+	params := MainnetParams()
+	idx := NewHeaderIndex(params)
+
+	// Build a retarget-boundary chain so we can test a subtle nBits mismatch.
+	// Create 2016 blocks at genesis difficulty with exact 600s spacing.
+	genesisTS := uint32(1231006505) // mainnet genesis timestamp
+	var prev *BlockNode = idx.genesis
+	for h := int32(1); h <= 2015; h++ {
+		node := &BlockNode{
+			Hash:      wire.Hash256{byte(h), byte(h >> 8)}, // unique fake hash
+			Height:    h,
+			Parent:    prev,
+			TotalWork: prev.TotalWork,
+			Header: wire.BlockHeader{
+				Bits:      params.PowLimitBits,
+				Timestamp: genesisTS + uint32(h)*600,
+			},
+		}
+		node.buildSkip()
+		idx.nodes[node.Hash] = node
+		idx.bestTip = node
+		idx.cachedBestHeight.Store(h)
+		prev = node
+	}
+
+	// Compute expected nBits for block 2016.
+	newTimestamp := int64(genesisTS) + 2016*600
+	expectedBits := GetNextWorkRequired(params, 2016, newTimestamp, prev, idx)
+
+	// Build a header with expected bits — should pass.
+	goodHeader := wire.BlockHeader{
+		Bits:      expectedBits,
+		Timestamp: uint32(newTimestamp),
+	}
+	if err := idx.validateDifficulty(goodHeader, prev, 2016); err != nil {
+		t.Errorf("correct nBits: validateDifficulty returned error: %v", err)
+	}
+
+	// Tweak nBits by adding 1 to the compact mantissa — very small target
+	// change, formerly within the 0.1% tolerance. Should now be rejected.
+	tweakedBits := expectedBits + 1
+	if tweakedBits != expectedBits { // guard against wrapping
+		badHeader := wire.BlockHeader{
+			Bits:      tweakedBits,
+			Timestamp: uint32(newTimestamp),
+		}
+		if err := idx.validateDifficulty(badHeader, prev, 2016); err == nil {
+			t.Errorf("tweaked nBits (+1 compact) should be rejected (no tolerance), was accepted")
+		}
+	}
+}
