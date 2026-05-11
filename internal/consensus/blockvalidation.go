@@ -35,11 +35,20 @@ var (
 	ErrBadBIP34Height          = errors.New("coinbase does not contain valid block height")
 	ErrMissingWitnessCommitment = errors.New("segwit block missing witness commitment")
 	ErrBadWitnessCommitment    = errors.New("witness commitment mismatch")
-	ErrSigOpsCostTooHigh       = errors.New("block sigops cost exceeds maximum")
-	ErrBadCoinbaseValue        = errors.New("coinbase value exceeds allowed subsidy plus fees")
-	ErrDuplicateTx             = errors.New("block contains duplicate transaction outputs (BIP30)")
-	ErrDuplicateCoinbase       = errors.New("block contains duplicate coinbase outputs (BIP30)")
-	ErrBadDifficultyBits       = errors.New("block difficulty bits do not match expected value")
+	// ErrBadWitnessNonceSize signals that the coinbase scriptWitness does not
+	// contain exactly one 32-byte element. Bitcoin Core: "bad-witness-nonce-size"
+	// (validation.cpp:3880-3885, CheckWitnessMalleation).
+	ErrBadWitnessNonceSize = errors.New("bad-witness-nonce-size")
+	// ErrUnexpectedWitnessInBlock signals that witness data was found in a block
+	// where no witness commitment exists (pre-segwit or malformed post-segwit
+	// block). Bitcoin Core: "unexpected-witness"
+	// (validation.cpp:3906-3912, CheckWitnessMalleation).
+	ErrUnexpectedWitnessInBlock = errors.New("unexpected-witness")
+	ErrSigOpsCostTooHigh        = errors.New("block sigops cost exceeds maximum")
+	ErrBadCoinbaseValue         = errors.New("coinbase value exceeds allowed subsidy plus fees")
+	ErrDuplicateTx              = errors.New("block contains duplicate transaction outputs (BIP30)")
+	ErrDuplicateCoinbase        = errors.New("block contains duplicate coinbase outputs (BIP30)")
+	ErrBadDifficultyBits        = errors.New("block difficulty bits do not match expected value")
 )
 
 // WitnessCommitmentMagic is the magic prefix for witness commitment in coinbase.
@@ -141,10 +150,26 @@ func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, heigh
 		}
 	}
 
-	// 5. If segwit is active, validate witness commitment
+	// 5. Witness commitment / malleation check.
+	//
+	// When segwit is active: require a valid witness commitment AND validate the
+	// witness reserved value size.
+	//
+	// When segwit is NOT active: no transaction in the block may carry witness
+	// data. Bitcoin Core calls CheckWitnessMalleation with expect_witness_commitment
+	// = (segwit active) and — in the "no commitment" branch — rejects any block
+	// whose transactions contain witness data with "unexpected-witness"
+	// (validation.cpp:3905-3913).
 	if height >= params.SegwitHeight {
 		if err := checkWitnessCommitment(block); err != nil {
 			return err
+		}
+	} else {
+		// Pre-segwit: witness data in any transaction is invalid.
+		for _, tx := range block.Transactions {
+			if tx.HasWitness() {
+				return ErrUnexpectedWitnessInBlock
+			}
 		}
 	}
 
@@ -217,14 +242,16 @@ func checkWitnessCommitment(block *wire.MsgBlock) error {
 		return ErrMissingWitnessCommitment
 	}
 
-	// Get witness reserved value from coinbase witness
-	var witnessReservedValue []byte
-	if len(coinbase.TxIn) > 0 && len(coinbase.TxIn[0].Witness) > 0 {
-		witnessReservedValue = coinbase.TxIn[0].Witness[0]
-	} else {
-		// Default to 32 zero bytes
-		witnessReservedValue = make([]byte, 32)
+	// Validate witness reserved value: coinbase input[0] scriptWitness must have
+	// exactly one stack element of exactly 32 bytes. Bitcoin Core:
+	//   if (witness_stack.size() != 1 || witness_stack[0].size() != 32)
+	//       return state.Invalid(BLOCK_MUTATED, "bad-witness-nonce-size", ...)
+	// (validation.cpp:3880-3885, CheckWitnessMalleation).
+	witnessStack := coinbase.TxIn[0].Witness
+	if len(witnessStack) != 1 || len(witnessStack[0]) != 32 {
+		return ErrBadWitnessNonceSize
 	}
+	witnessReservedValue := witnessStack[0]
 
 	// Calculate witness transaction IDs
 	wtxids := make([]wire.Hash256, len(block.Transactions))
