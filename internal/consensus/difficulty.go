@@ -14,8 +14,12 @@ var ErrDifficultyTooLow = errors.New("block hash does not meet target difficulty
 // ErrNegativeTarget is returned when the compact target decodes to a negative value.
 var ErrNegativeTarget = errors.New("negative target")
 
-// ErrTargetTooHigh is returned when the target exceeds the pow limit.
+// ErrTargetTooHigh is returned when the target exceeds the pow limit or overflows.
 var ErrTargetTooHigh = errors.New("target exceeds pow limit")
+
+// ErrBadDifficultyTransition is returned when a non-retarget block changes nBits,
+// or when a retarget block's nBits falls outside the 4× permitted range.
+var ErrBadDifficultyTransition = errors.New("difficulty transition not permitted")
 
 // CompactToBig converts a Bitcoin compact target representation to a big.Int.
 // Compact format: the first byte is the exponent (number of bytes), the next
@@ -26,27 +30,45 @@ var ErrTargetTooHigh = errors.New("target exceeds pow limit")
 // the mantissa is set, the result is negative. Bitcoin never uses negative
 // targets, so this is mainly for completeness.
 func CompactToBig(compact uint32) *big.Int {
-	// Extract the mantissa and exponent
+	n, _, _ := compactToBigFull(compact)
+	return n
+}
+
+// compactToBigFull converts a compact target and also returns the negative and
+// overflow flags. This mirrors Bitcoin Core's arith_uint256::SetCompact.
+//
+// Overflow is true when the encoded value cannot be represented in 256 bits:
+//   - exponent > 34, OR
+//   - exponent == 34 and mantissa > 0xff, OR
+//   - exponent == 33 and mantissa > 0xffff
+//
+// These conditions correspond exactly to Core arith_uint256.cpp:190-192.
+func compactToBigFull(compact uint32) (n *big.Int, isNegative, isOverflow bool) {
 	exponent := compact >> 24
 	mantissa := compact & 0x007fffff
 
+	// Negative flag: bit 23 of the original compact word.
+	isNegative = (mantissa != 0) && (compact&0x00800000 != 0)
+
+	// Overflow flag: mirrors Core's SetCompact overflow check.
+	isOverflow = mantissa != 0 && (exponent > 34 ||
+		(mantissa > 0xff && exponent > 33) ||
+		(mantissa > 0xffff && exponent > 32))
+
 	var target *big.Int
 	if exponent <= 3 {
-		// For small exponents, we need to right-shift the mantissa
 		mantissa >>= 8 * (3 - exponent)
 		target = big.NewInt(int64(mantissa))
 	} else {
-		// For larger exponents, we shift left
 		target = big.NewInt(int64(mantissa))
 		target.Lsh(target, 8*(uint(exponent)-3))
 	}
 
-	// Handle negative bit (bit 23 of mantissa means negative)
-	if compact&0x00800000 != 0 {
+	if isNegative {
 		target.Neg(target)
 	}
 
-	return target
+	return target, isNegative, isOverflow
 }
 
 // BigToCompact converts a big.Int target to compact representation.
@@ -162,11 +184,29 @@ func HashToBig(hash wire.Hash256) *big.Int {
 // CheckProofOfWork verifies that the block hash meets the target difficulty.
 // The hash must be less than or equal to the target derived from bits.
 // Returns nil if the proof of work is valid, an error otherwise.
+//
+// Mirrors Bitcoin Core's CheckProofOfWorkImpl / DeriveTarget (pow.cpp):
+//   - negative compact → reject
+//   - overflow compact → reject (exponent encodes > 256 bits)
+//   - target == 0 → reject
+//   - target > powLimit → reject
+//   - hash > target → reject
 func CheckProofOfWork(hash wire.Hash256, bits uint32, powLimit *big.Int) error {
-	target := CompactToBig(bits)
+	target, isNegative, isOverflow := compactToBigFull(bits)
 
-	// Check for negative target
-	if target.Sign() <= 0 {
+	// Check for negative target (sign bit set in compact mantissa).
+	if isNegative {
+		return ErrNegativeTarget
+	}
+
+	// Check for overflow (compact exponent encodes more than 256 bits).
+	// Core: DeriveTarget returns {} when fOverflow is true (pow.cpp:154-156).
+	if isOverflow {
+		return ErrTargetTooHigh
+	}
+
+	// Zero target is invalid.
+	if target.Sign() == 0 {
 		return ErrNegativeTarget
 	}
 
@@ -310,4 +350,71 @@ func CalculateNextWorkRequired(params *ChainParams, height int32, lastNode *Bloc
 	}
 
 	return BigToCompact(newTarget)
+}
+
+// PermittedDifficultyTransition reports whether the difficulty transition from
+// old_nbits to new_nbits at the given height is valid.
+//
+// Mirrors Bitcoin Core's PermittedDifficultyTransition (pow.cpp:89-136):
+//   - On networks where min-difficulty blocks are allowed (testnet/regtest),
+//     always returns true.
+//   - At retarget boundaries (height % 2016 == 0): new_nbits must be within
+//     the [÷4, ×4] factor of old_nbits. Comparison uses a compact round-trip
+//     (BigToCompact(GetCompact-decoded-value)) to match Core exactly.
+//   - At all other heights: new_nbits must equal old_nbits exactly.
+//
+// Note: this is a defence-in-depth guard for headers-first sync. It is called
+// in addition to (not instead of) GetNextWorkRequired, which already computes
+// the correct expected bits.
+func PermittedDifficultyTransition(params *ChainParams, height int32, oldNBits, newNBits uint32) bool {
+	// Networks allowing min-difficulty blocks skip this check.
+	// Core: if (params.fPowAllowMinDifficultyBlocks) return true; (pow.cpp:91)
+	if params.MinDiffReductionTime {
+		return true
+	}
+
+	powLimit := params.PowLimit
+
+	if height%int32(params.DifficultyAdjInterval) == 0 {
+		// Retarget boundary: verify new_nbits is within ×4 / ÷4 of old_nbits.
+		smallestTimespan := params.TargetTimespan / 4
+		largestTimespan := params.TargetTimespan * 4
+
+		observedNew := CompactToBig(newNBits)
+
+		// Calculate the largest (easiest) permitted difficulty value:
+		// largest_target = old_target * (4 * TargetTimespan) / TargetTimespan
+		largestTarget := CompactToBig(oldNBits)
+		largestTarget.Mul(largestTarget, big.NewInt(largestTimespan))
+		largestTarget.Div(largestTarget, big.NewInt(params.TargetTimespan))
+		if largestTarget.Cmp(powLimit) > 0 {
+			largestTarget.Set(powLimit)
+		}
+		// Round-trip through compact encoding, as Core does (pow.cpp:113-114).
+		maximumNew := CompactToBig(BigToCompact(largestTarget))
+		if maximumNew.Cmp(observedNew) < 0 {
+			return false
+		}
+
+		// Calculate the smallest (hardest) permitted difficulty value:
+		// smallest_target = old_target * (TargetTimespan/4) / TargetTimespan
+		smallestTarget := CompactToBig(oldNBits)
+		smallestTarget.Mul(smallestTarget, big.NewInt(smallestTimespan))
+		smallestTarget.Div(smallestTarget, big.NewInt(params.TargetTimespan))
+		if smallestTarget.Cmp(powLimit) > 0 {
+			smallestTarget.Set(powLimit)
+		}
+		// Round-trip through compact encoding (pow.cpp:130-131).
+		minimumNew := CompactToBig(BigToCompact(smallestTarget))
+		if minimumNew.Cmp(observedNew) > 0 {
+			return false
+		}
+	} else {
+		// Non-retarget height: nBits must be unchanged.
+		// Core: else if (old_nbits != new_nbits) { return false; } (pow.cpp:132-133)
+		if oldNBits != newNBits {
+			return false
+		}
+	}
+	return true
 }
