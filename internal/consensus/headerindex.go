@@ -462,45 +462,18 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 }
 
 // validateDifficulty checks that the header has the correct difficulty target.
+//
+// Mirrors Bitcoin Core's ContextualCheckBlockHeader (validation.cpp): compute
+// expected nBits via GetNextWorkRequired and require an exact match.
+// No tolerance is applied — compact encoding is deterministic and Core uses
+// a direct equality check.
 func (idx *HeaderIndex) validateDifficulty(header wire.BlockHeader, parent *BlockNode, height int32) error {
-	// Use GetNextWorkRequired to calculate the expected difficulty
+	// Compute the expected nBits for this block.
 	expectedBits := GetNextWorkRequired(idx.params, height, int64(header.Timestamp), parent, idx)
 
-	// For regtest with no-retargeting, just check against expected
-	if idx.params.PowNoRetargeting {
-		if header.Bits != expectedBits {
-			return ErrBadDifficulty
-		}
-		return nil
-	}
-
-	// For testnet, min-difficulty blocks are allowed when > 20 min gap
-	if idx.params.MinDiffReductionTime {
-		if IsMinDifficultyBlock(idx.params, int64(header.Timestamp), int64(parent.Header.Timestamp)) {
-			// Block can use either min difficulty or the expected difficulty
-			if header.Bits == idx.params.PowLimitBits {
-				return nil
-			}
-		}
-	}
-
-	// Compare expected vs actual bits
-	if header.Bits == expectedBits {
-		return nil
-	}
-
-	// Allow small rounding differences by comparing the actual targets
-	expectedTarget := CompactToBig(expectedBits)
-	actualTarget := CompactToBig(header.Bits)
-
-	// Targets must match (or be very close due to compact encoding rounding)
-	diff := new(big.Int).Sub(actualTarget, expectedTarget)
-	diff.Abs(diff)
-	tolerance := new(big.Int).Div(expectedTarget, big.NewInt(1000))
-	if diff.Cmp(tolerance) > 0 {
+	if header.Bits != expectedBits {
 		return ErrBadDifficulty
 	}
-
 	return nil
 }
 
