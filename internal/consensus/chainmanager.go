@@ -590,8 +590,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// BIP-30: Reject any block whose transactions would overwrite existing
 	// (unspent) UTXOs.  Logic lives in CheckBIP30 (blockvalidation.go) so
 	// tests can exercise it without a full ChainManager.
-	// Mirrors Bitcoin Core validation.cpp ConnectBlock ~line 2467-2476.
-	if err := CheckBIP30(block, node.Height, cm.params, cm.utxoSet); err != nil {
+	// Mirrors Bitcoin Core validation.cpp ConnectBlock ~line 2402-2476.
+	//
+	// Pass the block hash (for IsBIP30Repeat height+hash check) and an
+	// ancestor-hash lookup (for BIP34 short-circuit via BIP34Hash).
+	if err := CheckBIP30(block, node.Height, hash, cm.params, cm.utxoSet,
+		func(h int32) (wire.Hash256, bool) { return node.GetAncestorHashAtHeight(h) },
+	); err != nil {
 		return err
 	}
 

@@ -21,6 +21,13 @@ type ChainParams struct {
 	DifficultyAdjInterval  int64
 	SubsidyHalvingInterval int32
 	BIP34Height            int32
+	// BIP34Hash is the hash of the block at BIP34Height. Used by the BIP-30
+	// short-circuit: once BIP34 is active and the block at BIP34Height on the
+	// current chain matches this hash, BIP-30 duplicate-UTXO checking is skipped
+	// (unique coinbase heights make duplicates structurally impossible).
+	// Mirrors Bitcoin Core consensus/params.h BIP34Hash + validation.cpp:2460-2462.
+	// Zero for networks where BIP34 is active from genesis (testnet4, regtest, signet).
+	BIP34Hash              wire.Hash256
 	BIP65Height            int32
 	BIP66Height            int32
 	CSVHeight              int32
@@ -117,7 +124,15 @@ func MainnetParams() *ChainParams {
 		TargetSpacing:          TargetSpacing,
 		DifficultyAdjInterval:  DifficultyAdjustmentInterval,
 		SubsidyHalvingInterval: SubsidyHalvingInterval,
-		BIP34Height:            227931,
+		BIP34Height: 227931,
+		// BIP34Hash: hash of mainnet block 227,931 — the block whose coinbase
+		// first included the block height, confirming BIP34 activation.
+		// Bitcoin Core kernel/chainparams.cpp:90
+		// "000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8"
+		BIP34Hash: func() wire.Hash256 {
+			h, _ := wire.NewHash256FromHex("000000000000024b89b42a942fe0d9fea3bb44ab7bd1b19115dd6a759c0808b8")
+			return h
+		}(),
 		BIP65Height:            388381,
 		BIP66Height:            363725,
 		CSVHeight:              419328,
@@ -205,7 +220,14 @@ func TestnetParams() *ChainParams {
 		TargetSpacing:          TargetSpacing,
 		DifficultyAdjInterval:  DifficultyAdjustmentInterval,
 		SubsidyHalvingInterval: SubsidyHalvingInterval,
-		BIP34Height:            21111,
+		BIP34Height: 21111,
+		// BIP34Hash: hash of testnet3 block 21,111.
+		// Bitcoin Core kernel/chainparams.cpp:213
+		// "0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8"
+		BIP34Hash: func() wire.Hash256 {
+			h, _ := wire.NewHash256FromHex("0000000023b3a96d3484e5abb3755c413e7d41500f8e2a5c3f0dd01299cd8ef8")
+			return h
+		}(),
 		BIP65Height:            581885,
 		BIP66Height:            330776,
 		CSVHeight:              770112,

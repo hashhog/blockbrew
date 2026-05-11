@@ -351,6 +351,50 @@ func decodeScriptNum(data []byte) int64 {
 	return result
 }
 
+// IsBIP30Repeat reports whether blockIndex is one of the two historical
+// mainnet blocks that intentionally duplicated a coinbase transaction before
+// BIP-30 was enforced.  These blocks are exempt from the duplicate-UTXO check.
+//
+// Mirrors Bitcoin Core validation.cpp IsBIP30Repeat() (line 6189-6193):
+//
+//	h=91842, hash=00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec
+//	h=91880, hash=00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721
+//
+// NOTE: the check requires BOTH the correct height AND the exact block hash.
+// A block at h=91842 with a different hash is NOT exempt.
+func IsBIP30Repeat(height int32, blockHash wire.Hash256) bool {
+	if height == 91842 {
+		h, _ := wire.NewHash256FromHex("00000000000a4d0a398161ffc163c503763b1f4360639393e0e4c8e300e0caec")
+		return blockHash == h
+	}
+	if height == 91880 {
+		h, _ := wire.NewHash256FromHex("00000000000743f190a18c5577a3c2d2a1f610ae9601ac046a38084ccb7cd721")
+		return blockHash == h
+	}
+	return false
+}
+
+// IsBIP30Unspendable reports whether blockHash/height is one of the two
+// historical mainnet blocks whose coinbase outputs are unspendable due to
+// the BIP-30 duplicate coinbase situation.  Used during DisconnectBlock to
+// skip the UTXO consistency check for those blocks.
+//
+// Mirrors Bitcoin Core validation.cpp IsBIP30Unspendable() (line 6195-6199):
+//
+//	h=91722, hash=00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e
+//	h=91812, hash=00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f
+func IsBIP30Unspendable(height int32, blockHash wire.Hash256) bool {
+	if height == 91722 {
+		h, _ := wire.NewHash256FromHex("00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e")
+		return blockHash == h
+	}
+	if height == 91812 {
+		h, _ := wire.NewHash256FromHex("00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f")
+		return blockHash == h
+	}
+	return false
+}
+
 // CheckBIP30 reports whether a block at the given height must enforce the
 // BIP-30 duplicate-UTXO rule and, if so, whether any of its transactions
 // would overwrite an existing UTXO entry in utxoView.
@@ -360,23 +404,47 @@ func decodeScriptNum(data []byte) int64 {
 // This helper exists so the rule can also be unit-tested without a full
 // ChainManager.
 //
-// Exemptions (mirrors Bitcoin Core ConnectBlock / IsBIP30Repeat()):
-//   - Heights 91842 and 91880: historical mainnet blocks that pre-date BIP-30.
-//   - BIP34 active window (BIP34Height … 1,983,701): unique-height coinbase
-//     makes duplicate txids structurally impossible.
-//   - At h ≥ 1,983,702 BIP34 modular arithmetic wraps; re-enforce.
-func CheckBIP30(block *wire.MsgBlock, height int32, params *ChainParams, utxoView UTXOView) error {
+// Parameters:
+//   - blockHash: the hash of the block being connected (for IsBIP30Repeat check)
+//   - ancestorHashAt: optional fn that returns the hash of the block at a given
+//     height on the current chain (used for BIP34 short-circuit).  May be nil,
+//     in which case the BIP34 short-circuit is skipped (safe: over-checking).
+//
+// Exemption logic (mirrors Bitcoin Core ConnectBlock validation.cpp:2402-2476):
+//  1. IsBIP30Repeat: h=91842 OR h=91880 with EXACT matching hash → exempt.
+//  2. BIP34 short-circuit: if BIP34 is active AND the block at BIP34Height on
+//     this chain matches params.BIP34Hash → exempt (unique heights prevent dups).
+//  3. BIP34_IMPLIES_BIP30_LIMIT (1,983,702): always enforce at this height or
+//     above, regardless of BIP34 (modular arithmetic could create duplicates).
+func CheckBIP30(block *wire.MsgBlock, height int32, blockHash wire.Hash256, params *ChainParams, utxoView UTXOView, ancestorHashAt func(int32) (wire.Hash256, bool)) error {
 	const bip34ImpliesBIP30Limit int32 = 1_983_702
-	enforce := height != 91842 && height != 91880
-	if enforce && height >= params.BIP34Height {
-		enforce = false
+
+	// Gate 1+2: IsBIP30Repeat — exempt the two historical duplicate-coinbase blocks.
+	// Requires BOTH correct height AND exact block hash (Core IsBIP30Repeat, line 6189).
+	enforce := !IsBIP30Repeat(height, blockHash)
+
+	// Gate 4: BIP34 short-circuit — once BIP34 is unambiguously active on this
+	// chain (block at BIP34Height matches the expected BIP34Hash), unique coinbase
+	// heights make duplicates structurally impossible.
+	// Mirrors: validation.cpp:2460-2462.
+	if enforce && height >= params.BIP34Height && ancestorHashAt != nil && !params.BIP34Hash.IsZero() {
+		if ancHash, ok := ancestorHashAt(params.BIP34Height); ok && ancHash == params.BIP34Hash {
+			enforce = false
+		}
 	}
-	if !enforce && height >= bip34ImpliesBIP30Limit {
+
+	// Gate 5: BIP34_IMPLIES_BIP30_LIMIT — re-enforce above height 1,983,702.
+	// Mirrors: validation.cpp:2467 "if (fEnforceBIP30 || pindex->nHeight >= BIP34_IMPLIES_BIP30_LIMIT)".
+	if height >= bip34ImpliesBIP30Limit {
 		enforce = true
 	}
+
 	if !enforce {
 		return nil
 	}
+
+	// Gate 1 (UTXO lookup): reject if any output would overwrite an existing UTXO.
+	// Mirrors: validation.cpp:2468-2475.
 	for _, tx := range block.Transactions {
 		txHash := tx.TxHash()
 		for i := range tx.TxOut {
