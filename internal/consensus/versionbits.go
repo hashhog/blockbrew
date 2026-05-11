@@ -312,15 +312,17 @@ func computeNextState(
 		return DeploymentDefined
 
 	case DeploymentStarted:
-		// Check for timeout first (MTP >= Timeout means FAILED)
-		if deployment.Timeout != NoTimeout && mtp >= deployment.Timeout {
-			return DeploymentFailed
-		}
-
-		// Count signaling blocks in this period
+		// Count signaling blocks in this period first.  Bitcoin Core checks the
+		// threshold BEFORE the timeout so that if both conditions are met in the
+		// same period the transition is LOCKED_IN rather than FAILED.
+		// Core versionbits.cpp:83-98 (GetStateFor STARTED case).
 		count := countSignalingBlocks(deployment, periodEnd, period, tip)
 		if count >= threshold {
 			return DeploymentLockedIn
+		}
+		// Threshold not reached; check whether the deployment has expired.
+		if deployment.Timeout != NoTimeout && mtp >= deployment.Timeout {
+			return DeploymentFailed
 		}
 		return DeploymentStarted
 
