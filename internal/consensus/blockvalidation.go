@@ -494,6 +494,54 @@ func CheckBlockTimestamp(blockTimestamp uint32, medianTimePast uint32) error {
 }
 
 
+// IsBlockMutated returns true if the block's merkle root or witness commitment
+// is inconsistent with its transactions, indicating a possible short-ID collision
+// or block malleation.
+//
+// checkWitnessRoot controls whether the segwit witness commitment is validated;
+// pass true when segwit is active for the block's height.
+//
+// Mirrors Bitcoin Core validation.cpp:4027-4056:
+//
+//	bool IsBlockMutated(const CBlock& block, bool check_witness_root)
+//	{
+//	    BlockValidationState state;
+//	    if (!CheckMerkleRoot(block, state)) return true;
+//	    if (!CheckWitnessMalleation(block, check_witness_root, state)) return true;
+//	    return false;
+//	}
+func IsBlockMutated(block *wire.MsgBlock, checkWitnessRoot bool) bool {
+	if len(block.Transactions) == 0 {
+		return true
+	}
+
+	// Check txid merkle root (CVE-2012-2459 mutation detection).
+	txHashes := make([]wire.Hash256, len(block.Transactions))
+	for i, tx := range block.Transactions {
+		txHashes[i] = tx.TxHash()
+	}
+	root, mutated := CalcMerkleRootMutation(txHashes)
+	if root != block.Header.MerkleRoot || mutated {
+		return true
+	}
+
+	// Check witness malleation when segwit is active.
+	if checkWitnessRoot {
+		if err := checkWitnessCommitment(block); err != nil {
+			return true
+		}
+	} else {
+		// Pre-segwit: no witness data allowed.
+		for _, tx := range block.Transactions {
+			if tx.HasWitness() {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // AddTxOutputs adds all outputs from a transaction to the UTXO view.
 // This is implemented on InMemoryUTXOView, defined here as a method on the interface
 // for documentation purposes.
