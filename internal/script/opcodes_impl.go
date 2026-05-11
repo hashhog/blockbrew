@@ -1023,7 +1023,10 @@ func (e *Engine) opCheckLockTimeVerify() error {
 
 	// Peek at the value (don't pop - CLTV leaves the value on stack)
 	lockTimeBytes, _ := e.stack.Peek()
-	lockTime, err := ScriptNumDeserialize(lockTimeBytes, 5, false) // 5 bytes allowed for CLTV
+	// 5-byte CScriptNum is allowed for CLTV (avoids year-2038 problem).
+	// fRequireMinimal must honour the engine's minimal-data policy: Core uses
+	// CScriptNum(stacktop(-1), fRequireMinimal, 5) — interpreter.cpp:546.
+	lockTime, err := ScriptNumDeserialize(lockTimeBytes, 5, e.requireMinimalData())
 	if err != nil {
 		return ErrCLTVFailed
 	}
@@ -1062,7 +1065,10 @@ func (e *Engine) opCheckSequenceVerify() error {
 
 	// Peek at the value (don't pop - CSV leaves the value on stack)
 	sequenceBytes, _ := e.stack.Peek()
-	sequence, err := ScriptNumDeserialize(sequenceBytes, 5, false) // 5 bytes allowed for CSV
+	// 5-byte CScriptNum is allowed for CSV (matches CLTV and avoids year-2038 problem).
+	// fRequireMinimal must honour the engine's minimal-data policy: Core uses
+	// CScriptNum(stacktop(-1), fRequireMinimal, 5) — interpreter.cpp:574.
+	sequence, err := ScriptNumDeserialize(sequenceBytes, 5, e.requireMinimalData())
 	if err != nil {
 		return ErrCSVFailed
 	}
