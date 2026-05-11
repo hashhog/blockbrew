@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
@@ -1301,7 +1302,8 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 		return fmt.Errorf("failed to read undo data for block %s: %w", hash.String()[:16], err)
 	}
 
-	// Verify undo data consistency
+	// Verify undo data consistency.
+	// Mirrors Core validation.cpp:2190 "vtxundo.size() + 1 != vtx.size()".
 	nonCoinbaseTxCount := len(block.Transactions) - 1
 	if nonCoinbaseTxCount < 0 {
 		nonCoinbaseTxCount = 0
@@ -1311,44 +1313,105 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 			len(blockUndo.TxUndos), nonCoinbaseTxCount)
 	}
 
-	// Process transactions in REVERSE order (critical for correct UTXO restoration)
+	// BIP-30 exception: the two historical mainnet blocks at heights 91722
+	// and 91812 contained coinbase transactions that duplicated the txid of
+	// an earlier (still-unspent) coinbase. When we disconnect one of these
+	// blocks the output-identity check below will see the "wrong" coin
+	// metadata in the UTXO set — that is expected. Skip the inconsistency
+	// signal in that one case (mirrors Core validation.cpp:2201-2202).
+	tipHeight := cm.tipNode.Height
+	enforceBIP30 := !IsBIP30Unspendable(tipHeight, hash)
+
+	// Track DisconnectResult-equivalent. Even if fClean goes false we still
+	// finish the rollback — Core treats UNCLEAN as a successful disconnect
+	// (the chain state advances; we just log the inconsistency).
+	fClean := true
+
+	// Process transactions in REVERSE order (critical for correct UTXO restoration).
+	// Mirrors Core validation.cpp:2205-2242.
 	for i := len(block.Transactions) - 1; i >= 0; i-- {
 		tx := block.Transactions[i]
 		txHash := tx.TxHash()
+		isCoinbase := i == 0 // tx 0 is the coinbase by consensus
+		isBIP30Exception := isCoinbase && !enforceBIP30
 
-		// Remove outputs created by this transaction (skip unspendable outputs
-		// since they were never added to the UTXO set)
+		// Check that all outputs are available and match the outputs in the
+		// block itself exactly. Mirrors Core validation.cpp:2213-2224. We use
+		// SpendUTXOWithCoin so we can compare height + coinbase + value +
+		// script of the coin we're removing.
 		for idx, out := range tx.TxOut {
 			if IsUnspendable(out.PkScript) {
 				continue
 			}
 			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
-			cm.utxoSet.SpendUTXO(outpoint)
+			coin, isSpent := cm.utxoSet.SpendUTXOWithCoin(outpoint)
+			if !isSpent || coin == nil {
+				if !isBIP30Exception {
+					fClean = false
+				}
+				continue
+			}
+			// Identity check: value + script + height + coinbase must match.
+			if coin.Amount != out.Value ||
+				!bytes.Equal(coin.PkScript, out.PkScript) ||
+				coin.Height != tipHeight ||
+				coin.IsCoinbase != isCoinbase {
+				if !isBIP30Exception {
+					fClean = false
+				}
+			}
 		}
 
-		// For non-coinbase transactions, restore the inputs that were spent
+		// For non-coinbase transactions, restore the inputs that were spent.
 		if i > 0 {
 			// Get the TxUndo for this transaction (i-1 because index 0 is coinbase)
 			txUndo := &blockUndo.TxUndos[i-1]
 
-			// Verify input count matches
+			// Verify input count matches. Mirrors Core validation.cpp:2229.
 			if len(txUndo.SpentCoins) != len(tx.TxIn) {
 				return fmt.Errorf("tx %d undo mismatch: %d spent coins but %d inputs",
 					i, len(txUndo.SpentCoins), len(tx.TxIn))
 			}
 
-			// Restore each spent UTXO
-			for j, in := range tx.TxIn {
-				spentCoin := &txUndo.SpentCoins[j]
-				cm.utxoSet.AddUTXO(in.PreviousOutPoint, &UTXOEntry{
+			// REVERSE iteration over inputs. Mirrors Core validation.cpp:2233-2239
+			// ("for (unsigned int j = tx.vin.size(); j > 0;)").
+			// While the end-state UTXO set is order-independent for normal txs,
+			// the reverse order matters under BIP-30 collisions and during
+			// ApplyTxInUndo's overwrite detection — if a tx spends two inputs
+			// that resolve to the same outpoint (degenerate), restoring in
+			// reverse preserves LIFO semantics with the original spend order.
+			for j := len(tx.TxIn); j > 0; j-- {
+				idx := j - 1
+				spentCoin := &txUndo.SpentCoins[idx]
+				outpoint := tx.TxIn[idx].PreviousOutPoint
+				undoEntry := &UTXOEntry{
 					Amount:     spentCoin.TxOut.Value,
 					PkScript:   spentCoin.TxOut.PkScript,
 					Height:     spentCoin.Height,
 					IsCoinbase: spentCoin.Coinbase,
-				})
+				}
+				clean, ok := cm.utxoSet.ApplyTxInUndo(undoEntry, outpoint)
+				if !ok {
+					// Sibling-recovery failed; mirrors Core's DISCONNECT_FAILED.
+					return fmt.Errorf("disconnect failed: missing undo metadata for %s:%d (no unspent sibling)",
+						outpoint.Hash.String()[:16], outpoint.Index)
+				}
+				if !clean {
+					fClean = false
+				}
 			}
 		}
-		// Coinbase (i == 0) has no inputs to restore - we just removed its outputs above
+		// Coinbase (i == 0) has no inputs to restore — we just removed its
+		// outputs above.
+	}
+
+	if !fClean {
+		// Log but do not error. Mirrors Core's DISCONNECT_UNCLEAN: the
+		// chainstate write still lands, but the inconsistency is recorded.
+		// Typically only fires for BIP-30 collision aftermath (h=91722/91812)
+		// during deep reorg tests.
+		log.Printf("chainmgr: DisconnectBlock unclean for %s at h=%d (BIP-30 aftermath or undo-mismatch)",
+			hash.String()[:16], tipHeight)
 	}
 
 	// Delete undo data from database.
