@@ -40,6 +40,12 @@ const (
 	// ConnInbound is a connection initiated by a remote peer.
 	// Limit: 117 (DEFAULT_MAX_PEER_CONNECTIONS - MAX_OUTBOUND).
 	ConnInbound
+
+	// ConnManual is a user-configured outbound connection added via addnode RPC.
+	// Bitcoin Core: CONNECTION_TYPE::MANUAL (node/connection_types.h).
+	// Manual connections are NEVER banned or discouraged, even on misbehavior,
+	// because the operator explicitly requested them (anchor nodes, trusted peers).
+	ConnManual
 )
 
 // Peer manager constants.
@@ -351,6 +357,15 @@ func (pm *PeerManager) updatePeerCounts(info *PeerInfo, delta int) {
 				delete(pm.subnetCounts, info.subnet)
 			}
 		}
+	case ConnManual:
+		// Manual connections count toward outbound but bypass the cap check.
+		pm.outbound += delta
+		if info.subnet != "" {
+			pm.subnetCounts[info.subnet] += delta
+			if pm.subnetCounts[info.subnet] <= 0 {
+				delete(pm.subnetCounts, info.subnet)
+			}
+		}
 	case ConnInbound:
 		pm.inbound += delta
 	}
@@ -412,8 +427,74 @@ func (pm *PeerManager) SetBan(ip string, duration time.Duration, reason string) 
 }
 
 // handlePeerBan is the callback invoked when a peer exceeds the misbehavior threshold.
+//
+// W99 G2 fix: mirrors Bitcoin Core MaybeDiscourageAndDisconnect (net_processing.cpp:5083):
+//
+//	if HasPermission(NoBan) → no-op (noBan already guarded in Peer.Misbehaving, but
+//	                            double-check here for callers that bypass Misbehaving).
+//	if IsManualConn()       → no-op (operator explicitly added this peer).
+//	if addr.IsLocal()       → disconnect ONLY, do NOT add to discourage/ban list.
+//	otherwise               → disconnect + discourage (BanPeer).
 func (pm *PeerManager) handlePeerBan(p *Peer) {
-	pm.BanPeer(p.Address(), DefaultBanDuration, "misbehavior threshold exceeded")
+	addr := p.Address()
+
+	// Guard 1: NoBan permission — never disconnect or discourage.
+	if p.IsNoBan() {
+		log.Printf("handlePeerBan: peer %s has NoBan permission — skipping ban", addr)
+		return
+	}
+
+	// Guard 2: Manual connection — never disconnect or discourage.
+	pm.mu.RLock()
+	info, exists := pm.peers[addr]
+	isManual := exists && info.connType == ConnManual
+	pm.mu.RUnlock()
+	if isManual {
+		log.Printf("handlePeerBan: peer %s is a manual connection — skipping ban", addr)
+		return
+	}
+
+	// Guard 3: Local address — disconnect only, do NOT add to ban list.
+	// Bitcoin Core: pnode.addr.IsLocal() → fDisconnect = true (no Discourage).
+	if isLocalAddr(addr) {
+		log.Printf("handlePeerBan: peer %s is a local address — disconnecting without banning", addr)
+		pm.disconnectPeerOnly(addr)
+		return
+	}
+
+	// Regular inbound/outbound peer: disconnect + add to discourage list.
+	pm.BanPeer(addr, DefaultBanDuration, "misbehavior threshold exceeded")
+}
+
+// disconnectPeerOnly disconnects a peer without adding it to the ban list.
+// Used for local-address peers that misbehave (Core: disconnect-but-don't-discourage).
+func (pm *PeerManager) disconnectPeerOnly(addr string) {
+	pm.mu.Lock()
+	info, ok := pm.peers[addr]
+	if ok {
+		delete(pm.peers, addr)
+		pm.updatePeerCounts(info, -1)
+	}
+	pm.mu.Unlock()
+	if ok {
+		log.Printf("disconnecting peer %s (local-addr misbehavior, no ban)", addr)
+		info.peer.Disconnect()
+	}
+}
+
+// isLocalAddr returns true if addr refers to a loopback or local (RFC1918 /
+// link-local) address. Bitcoin Core's CNetAddr::IsLocal() covers loopback +
+// link-local; we match that here.
+func isLocalAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()
 }
 
 // IsBanned checks if an IP is banned.
@@ -604,7 +685,7 @@ func (pm *PeerManager) ConnectManualPeer(addr string) {
 			LastSeen: time.Now(),
 		}
 	}
-	go pm.connectToPeerWithType(ka, ConnFullRelay)
+	go pm.connectToPeerWithType(ka, ConnManual)
 }
 
 // MarkBlockReceived records that we received a block from a peer.
@@ -651,6 +732,8 @@ func (ct ConnType) String() string {
 		return "feeler"
 	case ConnInbound:
 		return "inbound"
+	case ConnManual:
+		return "manual"
 	default:
 		return "unknown"
 	}
@@ -945,8 +1028,8 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 			pm.mu.RUnlock()
 			return
 		}
-	case ConnFeeler:
-		// Feelers always proceed
+	case ConnFeeler, ConnManual:
+		// Feelers and manual connections always proceed (manual bypasses cap).
 	}
 	pm.mu.RUnlock()
 
@@ -993,6 +1076,8 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 			peer.Disconnect()
 			return
 		}
+	case ConnManual:
+		// Manual connections bypass capacity limits — always proceed.
 	}
 	pm.peers[addr] = peerInfo
 	pm.updatePeerCounts(peerInfo, +1)
