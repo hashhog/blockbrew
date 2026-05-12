@@ -1350,16 +1350,18 @@ func (p *Peer) IsNoBan() bool {
 	return p.noBan
 }
 
-// Misbehaving adds a misbehavior score to the peer.
-// If the score reaches MisbehaviorThreshold (100), the peer is flagged for disconnect/ban.
-// Returns true if the threshold was reached (on this call or a prior one).
+// Misbehaving discourages a peer immediately on the first call.
 //
-// W13 fix: once shouldBan is latched, further scoring is a no-op. Previously
-// a stalling peer could accumulate score +50 → 450 → 750 → 800+ (visible in
-// the pre-freeze log) because checkStaleRequests kept calling Misbehaving on
-// the same in-flight block slots before the async ban callback had a chance
-// to disconnect. The callback also received a phantom &Peer{addr:addr} so
-// handlePeerBan could not observe any per-peer state on the banned peer.
+// Bitcoin Core 2022 PR #25974: Misbehaving() now sets m_should_discourage=true
+// on the first call regardless of the numeric score. There is no threshold
+// accumulation — any single misbehavior event is sufficient to discourage the
+// peer. The score parameter is retained for diagnostic logging only.
+//
+// W13 fix (still applies): once shouldBan is latched, further calls are a
+// no-op so the ban callback is not re-fired after the async disconnect is
+// already in flight.
+//
+// W99 G1 fix: replaced score-accumulate model with single-event discourage.
 func (p *Peer) Misbehaving(score int, reason string) bool {
 	p.mu.Lock()
 
@@ -1372,31 +1374,28 @@ func (p *Peer) Misbehaving(score int, reason string) bool {
 	}
 
 	if p.shouldBan {
-		// Already flagged for ban — stop amplifying the score and don't
-		// re-fire the callback. The ban is already in flight.
+		// Already flagged for ban — don't re-fire the callback.
+		// The ban is already in flight.
 		p.mu.Unlock()
 		return true
 	}
 
+	// Record score for diagnostics/logging (not used for ban decision).
 	p.misbehaviorScore += score
-	log.Printf("peer %s misbehaving (%+d → %d): %s",
-		p.addr, score, p.misbehaviorScore, reason)
+	log.Printf("peer %s misbehaving (%+d): %s — discouraging immediately (Core PR #25974)",
+		p.addr, score, reason)
 
-	if p.misbehaviorScore >= MisbehaviorThreshold {
-		p.shouldBan = true
-		cb := p.banCallback
-		log.Printf("peer %s: misbehavior threshold reached, flagging for ban", p.addr)
-		p.mu.Unlock()
-
-		// Call ban callback outside the lock with the real peer so
-		// handlePeerBan → BanPeer can correctly match and disconnect.
-		if cb != nil {
-			go cb(p)
-		}
-		return true
-	}
+	// Single-event discourage: any Misbehaving() call immediately flags for ban.
+	p.shouldBan = true
+	cb := p.banCallback
 	p.mu.Unlock()
-	return false
+
+	// Call ban callback outside the lock with the real peer so
+	// handlePeerBan → BanPeer can correctly match and disconnect.
+	if cb != nil {
+		go cb(p)
+	}
+	return true
 }
 
 // MisbehaviorScore returns the current misbehavior score.

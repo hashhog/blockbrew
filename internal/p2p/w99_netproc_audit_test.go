@@ -13,21 +13,36 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 // G1 — Misbehaving: single-event discourage (NOT score-accumulating)
 //
-// Bitcoin Core 2022: Misbehaving() now sets m_should_discourage immediately
-// on the first call (no threshold accumulation). blockbrew still uses the old
-// "score += N; if score >= 100 then ban" model.  This is a CORRECTNESS bug:
-// a peer that sends one obviously-invalid block (score=100) is correctly
-// banned, but a peer that sends 5 mildly-bad messages (score=20 each) is
-// banned exactly at 100 — which matches Core's old (pre-2022) behaviour but
-// NOT Core's current single-event model.  For peers with score < 100 in Core
-// they are now immediately discouraged; blockbrew ignores them until 100.
+// Bitcoin Core 2022 PR #25974: Misbehaving() sets m_should_discourage=true
+// immediately on the first call regardless of numeric score. No threshold.
+//
+// W99 G1 fix: blockbrew now matches Core — any single Misbehaving() call
+// immediately sets shouldBan=true and fires the ban callback.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW99_G1_MisbehavingSingleEventModel(t *testing.T) {
-	t.Skip("W99 audit — G1: blockbrew uses legacy score-accumulation model; " +
-		"Core 2022 sets m_should_discourage on first Misbehaving() call regardless of score. " +
-		"blockbrew Misbehaving() only bans once misbehaviorScore >= MisbehaviorThreshold (100). " +
-		"Bug: peers sending low-score infractions (score < 100) are never discouraged in blockbrew, " +
-		"diverging from Core 2022+ behaviour where any single Misbehaving() event triggers discouragement.")
+	// A low-score event (score=20) must immediately discourage the peer.
+	banCalled := false
+	p := &Peer{
+		addr:      "1.2.3.4:8333",
+		sendQueue: make(chan Message, SendQueueSize),
+		quit:      make(chan struct{}),
+	}
+	p.banCallback = func(_ *Peer) { banCalled = true }
+
+	result := p.Misbehaving(20, "minor infraction")
+
+	if !result {
+		t.Error("G1: Misbehaving(20) must return true (single-event discourage)")
+	}
+	if !p.ShouldBan() {
+		t.Error("G1: shouldBan must be set immediately on first Misbehaving() call")
+	}
+
+	// Give the async goroutine a moment to execute the callback.
+	time.Sleep(10 * time.Millisecond)
+	if !banCalled {
+		t.Error("G1: ban callback must fire on first Misbehaving() call (score=20)")
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -645,8 +660,8 @@ func TestW99_G30_FeeFilterAfterVerack(t *testing.T) {
 // Additional G-class tests covering specific bugs
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestW99_MisbehaviorScoreAccumulation documents the G1 score model gap.
-// blockbrew accumulates score; Core discourages on any single event.
+// TestW99_MisbehaviorScoreAccumulation verifies the W99 G1 fix:
+// single-event discourage, score recorded for diagnostics only.
 func TestW99_MisbehaviorScoreAccumulation(t *testing.T) {
 	p := &Peer{
 		addr:      "1.2.3.4:8333",
@@ -654,23 +669,23 @@ func TestW99_MisbehaviorScoreAccumulation(t *testing.T) {
 		quit:      make(chan struct{}),
 	}
 
-	// Score 20 — should NOT ban yet in blockbrew
+	// Score 20 — single-event model: must discourage immediately (G1 fix).
 	result := p.Misbehaving(20, "minor infraction")
-	if result {
-		t.Error("Misbehaving(20) should not reach threshold in blockbrew's score model")
+	if !result {
+		t.Error("Misbehaving(20) must return true under single-event model (W99 G1 fix)")
 	}
+	// Score is still recorded for diagnostics.
 	if p.misbehaviorScore != 20 {
-		t.Errorf("misbehaviorScore = %d, want 20", p.misbehaviorScore)
+		t.Errorf("misbehaviorScore = %d, want 20 (diagnostic only)", p.misbehaviorScore)
 	}
-
-	// In Core 2022+, this single Misbehaving() call would immediately
-	// set m_should_discourage = true (G1 bug).
-	if p.shouldBan {
-		t.Error("shouldBan should be false at score=20")
+	// shouldBan must be set immediately.
+	if !p.shouldBan {
+		t.Error("shouldBan must be true after first Misbehaving() call (single-event, W99 G1 fix)")
 	}
 }
 
-// TestW99_MisbehaviorThresholdReached verifies ban fires at exactly 100.
+// TestW99_MisbehaviorThresholdReached verifies ban fires on the first call (W99 G1 fix).
+// Under the single-event model there is no threshold — the first event discourages.
 func TestW99_MisbehaviorThresholdReached(t *testing.T) {
 	banFired := false
 	p := &Peer{
@@ -682,19 +697,24 @@ func TestW99_MisbehaviorThresholdReached(t *testing.T) {
 		},
 	}
 
-	p.Misbehaving(99, "just under threshold")
-	if p.shouldBan {
-		t.Error("shouldBan should be false at score=99")
+	// Under single-event model: ANY Misbehaving() call fires the ban immediately.
+	p.Misbehaving(1, "single event")
+	if !p.shouldBan {
+		t.Error("shouldBan must be true after first Misbehaving() call (single-event model)")
 	}
 
-	p.Misbehaving(1, "final point")
-	// Give the goroutine a moment to execute the callback
+	// Give the goroutine a moment to execute the callback.
 	time.Sleep(10 * time.Millisecond)
 	if !banFired {
-		t.Error("ban callback should fire when score reaches 100")
+		t.Error("ban callback must fire on first Misbehaving() call")
 	}
-	if !p.shouldBan {
-		t.Error("shouldBan should be true after reaching threshold")
+
+	// Second call must be a no-op (already banned — callback must not re-fire).
+	banFired = false
+	p.Misbehaving(99, "second event — must be no-op")
+	time.Sleep(10 * time.Millisecond)
+	if banFired {
+		t.Error("ban callback must NOT re-fire when peer is already banned")
 	}
 }
 
