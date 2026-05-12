@@ -595,17 +595,19 @@ func (pm *PeerManager) AnnounceBlock(header wire.BlockHeader, hash wire.Hash256)
 // This is called when a transaction is added to the mempool (e.g., via sendrawtransaction RPC).
 // The fromPeer parameter is the address of the peer that sent us this transaction; we skip
 // announcing back to them. Pass empty string if the transaction originated locally.
+// txHash is the txid (legacy hash), wtxHash is the witness txid (wtxid, BIP-339).
 // fee is the transaction fee in satoshis, vsize is the virtual size in vbytes.
 // These are used to filter by peer's feefilter (BIP133).
-func (pm *PeerManager) RelayTransaction(txHash wire.Hash256, fee, vsize int64, fromPeer string) {
+//
+// Per BIP-339 and Bitcoin Core net_processing.cpp RelayTransaction:
+//   - Peers with wtxidrelay negotiated: announce as inv{MSG_WTX=5, wtxid}
+//   - Legacy peers:                     announce as inv{MSG_TX=1, txid}
+// MSG_WITNESS_TX (0x40000001) is a BIP-144 getdata witness request flag and
+// must NOT be used in inv announcements — Core peers log "Unknown inv type"
+// and discard any inv with that type value.
+func (pm *PeerManager) RelayTransaction(txHash, wtxHash wire.Hash256, fee, vsize int64, fromPeer string) {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
-
-	inv := &MsgInv{
-		InvList: []*InvVect{
-			{Type: InvTypeWitnessTx, Hash: txHash},
-		},
-	}
 
 	for addr, info := range pm.peers {
 		// Skip the peer that sent us this transaction
@@ -623,6 +625,23 @@ func (pm *PeerManager) RelayTransaction(txHash wire.Hash256, fee, vsize int64, f
 			continue
 		}
 
+		// Select inv type and hash per BIP-339 / Core RelayTransaction logic:
+		// wtxid-relay peers get MSG_WTX=5 + wtxid; legacy peers get MSG_TX=1 + txid.
+		var invType InvType
+		var hash wire.Hash256
+		if info.peer.WTxidRelay() {
+			invType = InvTypeWtx
+			hash = wtxHash
+		} else {
+			invType = InvTypeTx
+			hash = txHash
+		}
+
+		inv := &MsgInv{
+			InvList: []*InvVect{
+				{Type: invType, Hash: hash},
+			},
+		}
 		info.peer.SendMessage(inv)
 	}
 }

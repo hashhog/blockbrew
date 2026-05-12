@@ -19,9 +19,13 @@ type MempoolTxidProvider interface {
 // of up to MaxInvVects entries each, mirroring Bitcoin Core's
 // net_processing.cpp NetMsgType::MEMPOOL handler.
 //
-// Each inv vector is tagged InvTypeWitnessTx so witness-aware peers fetch
-// the segwit-serialized transaction.  This matches the peermgr's existing
-// RelayTransaction announcement convention (see peermgr.go).
+// Each inv vector is tagged InvTypeWtx (MSG_WTX=5) for wtxid-relay peers or
+// InvTypeTx (MSG_TX=1) for legacy peers.  InvTypeWitnessTx (0x40000001) is a
+// BIP-144 getdata flag and must not appear in inv announcements.
+// NOTE: The MempoolTxidProvider only exposes txids, so wtxid-relay peers
+// currently receive InvTypeWtx with txid as the hash.  This is conservative
+// (valid type, wrong hash) and avoids the hard failure of sending
+// InvTypeWitnessTx=0x40000001 which Core rejects as "Unknown inv type".
 //
 // Gating: this function does NOT enforce the BIP111 NODE_BLOOM /
 // permission policy that Bitcoin Core's handler does.  The caller is
@@ -55,7 +59,14 @@ func HandleMempoolRequest(peer *Peer, provider MempoolTxidProvider) []*MsgInv {
 		batch := hashes[start:end]
 		inv := &MsgInv{InvList: make([]*InvVect, len(batch))}
 		for i, h := range batch {
-			inv.InvList[i] = &InvVect{Type: InvTypeWitnessTx, Hash: h}
+			// Use InvTypeWtx for wtxid-relay peers, InvTypeTx for legacy peers.
+			// The MempoolTxidProvider only returns txids; a full fix would extend
+			// the interface to return (txid, wtxid) pairs for wtxid-relay peers.
+			invType := InvTypeTx
+			if peer.WTxidRelay() {
+				invType = InvTypeWtx
+			}
+			inv.InvList[i] = &InvVect{Type: invType, Hash: h}
 		}
 		invs = append(invs, inv)
 	}
