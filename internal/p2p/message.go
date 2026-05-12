@@ -15,8 +15,10 @@ const (
 	// MessageHeaderSize is the size of a Bitcoin P2P message header in bytes.
 	MessageHeaderSize = 24
 
-	// MaxPayloadSize is the maximum allowed message payload (32 MB).
-	MaxPayloadSize = 32 * 1024 * 1024
+	// MaxPayloadSize is the maximum allowed message payload.
+	// Matches Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000
+	// (bitcoin-core/src/net.h:65). Previously 32 MiB (8× too large).
+	MaxPayloadSize = 4 * 1000 * 1000
 
 	// CommandSize is the fixed size of the command field in bytes.
 	CommandSize = 12

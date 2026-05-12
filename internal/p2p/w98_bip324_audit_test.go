@@ -37,9 +37,8 @@ package p2p
 // G21 PASS  — Short IDs 0x01..0x1c for 28 commands match Core V2_MESSAGE_IDS[1..28]. ✓
 // G22 PASS  — Long-form: 0x00 byte + 12-byte NUL-padded command. ✓
 // G23 PASS  — Unknown short IDs return error "unknown message type ID: 0x%02x". ✓
-// G24 BUG   — CORRECTNESS: MaxPayloadSize = 32*1024*1024 (33,554,432 B) vs Core 4,000,000 B.
-//             blockbrew accepts packets ~8× larger than any Core peer will send; sends up to 32 MB
-//             which a Core peer (MAX_PROTOCOL_MESSAGE_LENGTH=4,000,000) would reject.
+// G24 FIXED — CORRECTNESS: MaxPayloadSize = 4*1000*1000 (4,000,000 B) matching Core.
+//             Previously 32*1024*1024 (33,554,432 B) = ~8× too large.
 //             Reference: bitcoin-core/src/net.h:65 MAX_PROTOCOL_MESSAGE_LENGTH.
 // G25 PASS  — Garbage random length 0..MaxGarbageLen (uniform: 65536/4096=16 exact). ✓
 // G26 PASS  — Random ent32 per connection via crypto/rand (GenerateEllSwiftPrivKey). ✓
@@ -257,21 +256,17 @@ func TestW98G18_DecoyBeforeVersionCausesFailure(t *testing.T) {
 // G24: MaxPayloadSize 32MB vs Core 4,000,000 bytes
 // ---------------------------------------------------------------------------
 
-// TestW98G24_MaxPayloadSizeTooLarge documents that blockbrew's MaxPayloadSize
-// (32 MiB = 33,554,432 bytes) is ~8× larger than Bitcoin Core's
-// MAX_PROTOCOL_MESSAGE_LENGTH (4,000,000 bytes).
+// TestW98G24_MaxPayloadSizeTooLarge asserts that blockbrew's MaxPayloadSize
+// matches Bitcoin Core's MAX_PROTOCOL_MESSAGE_LENGTH (4,000,000 bytes).
+// Previously 32 MiB (33,554,432 bytes) = ~8× too large (W98 G24 fixed).
 func TestW98G24_MaxPayloadSizeTooLarge(t *testing.T) {
 	const coreMaxProtocolMessageLength = 4_000_000 // bitcoin-core/src/net.h:65
 
-	if MaxPayloadSize <= coreMaxProtocolMessageLength {
-		// If this ever passes, the bug has been fixed.
-		return
+	if MaxPayloadSize != coreMaxProtocolMessageLength {
+		t.Errorf("W98 G24: MaxPayloadSize=%d != Core MAX_PROTOCOL_MESSAGE_LENGTH=%d; "+
+			"revert the fix in message.go",
+			MaxPayloadSize, coreMaxProtocolMessageLength)
 	}
-
-	t.Errorf("W98 G24 BUG: MaxPayloadSize=%d but Core MAX_PROTOCOL_MESSAGE_LENGTH=%d (ratio %.1f×); "+
-		"blockbrew accepts packets that Core will reject, and may send oversized packets that Core disconnects",
-		MaxPayloadSize, coreMaxProtocolMessageLength,
-		float64(MaxPayloadSize)/float64(coreMaxProtocolMessageLength))
 }
 
 // TestW98G24_V2ReadMessageEnforcesMaxPayload verifies the size check is at least
