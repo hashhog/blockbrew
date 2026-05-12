@@ -3,6 +3,7 @@ package crypto
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"runtime"
 )
 
 // HKDF implements HKDF-SHA256 with a fixed output length of 32 bytes as used in BIP324.
@@ -36,4 +37,15 @@ func (h *HKDF) Expand32(info string) [32]byte {
 	var result [32]byte
 	copy(result[:], mac.Sum(nil))
 	return result
+}
+
+// Zeroize clears the PRK field from memory.
+// Call this after all Expand32 calls are complete to prevent the ECDH-derived
+// pseudorandom key from persisting on the heap until GC.
+// Mirrors Core's memory_cleanse(&hkdf, sizeof(hkdf)) in bip324.cpp.
+func (h *HKDF) Zeroize() {
+	for i := range h.prk {
+		h.prk[i] = 0
+	}
+	runtime.KeepAlive(h)
 }
