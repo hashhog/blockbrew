@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
-	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/crypto"
 	"golang.org/x/crypto/ripemd160"
@@ -697,26 +696,46 @@ func (e *Engine) opCheckSig(script []byte) error {
 		}
 
 	case SigVersionTapscript:
-		// Empty pubkey is a hard error in tapscript
-		if len(pubKeyBytes) == 0 {
-			return fmt.Errorf("tapscript empty pubkey")
+		// Core EvalChecksigTapscript interpreter.cpp:347-385 fixes the order:
+		//   1. success = !sig.empty()
+		//   2. if success: decrement weight budget (and fail if exhausted)
+		//   3. check pubkey size: empty → hard error; 32 → schnorr verify; else upgradable
+		// Previously blockbrew checked empty-pubkey FIRST, which meant a
+		// non-empty sig + empty pubkey would error with EMPTY_PUBKEY instead
+		// of (potentially) TAPSCRIPT_VALIDATION_WEIGHT.  Both still reject,
+		// but order matters for error reporting and matches Core's
+		// "consensus-critical" sequence comment.
+		success := len(sigBytes) > 0
+		if success {
+			e.sigopBudget -= ValidationWeightPerSigopPass
+			if e.sigopBudget < 0 {
+				return ErrTapscriptValidationWeight
+			}
 		}
 
-		// Empty signature pushes false (soft failure, no budget cost)
-		if len(sigBytes) == 0 {
-			e.stack.PushBool(false)
+		// Empty pubkey is always a hard error (Core 367-368).
+		if len(pubKeyBytes) == 0 {
+			return ErrTapscriptEmptyPubKey
+		}
+
+		// 32-byte pubkey: BIP-340 schnorr verify path.  Non-32-byte:
+		// upgradable pubkey-type (forward-compat success unless the
+		// SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE relay-policy flag
+		// is set — previously blockbrew had no such flag at all).
+		if len(pubKeyBytes) != 32 {
+			if e.flags&ScriptVerifyDiscourageUpgradablePubKeyType != 0 {
+				return ErrDiscourageUpgradablePubKeyType
+			}
+			// Mirror Core's stack push: success on non-empty sig pushes
+			// true, empty sig pushes false (Core never overwrites success
+			// in the upgradable branch).
+			e.stack.PushBool(success)
 			return nil
 		}
 
-		// Decrement tapscript signature validation weight budget (BIP342)
-		e.sigopBudget -= TapscriptSigopBudgetCost
-		if e.sigopBudget < 0 {
-			return fmt.Errorf("tapscript validation weight exceeded")
-		}
-
-		// For non-32-byte pubkeys (unknown key version), push true for upgradability
-		if len(pubKeyBytes) != 32 {
-			e.stack.PushBool(true)
+		// Empty signature with valid 32-byte pubkey: push false, no verify.
+		if !success {
+			e.stack.PushBool(false)
 			return nil
 		}
 
@@ -732,15 +751,17 @@ func (e *Engine) opCheckSig(script []byte) error {
 		} else if len(sigBytes) == 65 {
 			hashType = SigHashType(sigBytes[64])
 			if hashType == SigHashDefault {
-				return fmt.Errorf("schnorr signature hash type 0x00 not allowed with 65-byte signature")
+				return ErrTapscriptInvalidSigSize
 			}
 			sig = sigBytes[:64]
 		} else {
-			return fmt.Errorf("invalid schnorr signature size: %d", len(sigBytes))
+			return ErrTapscriptInvalidSigSize
 		}
 
-		// Get tapscript-specific sighash
-		leafHash := TapLeaf(0xC0, script) // 0xC0 is TAPSCRIPT_LEAF_MASK
+		// Get tapscript-specific sighash.  TapLeaf is invoked with the
+		// post-mask leaf-version constant (Core only enters this path when
+		// the leaf-version equals TaprootLeafTapscript=0xC0).
+		leafHash := TapLeaf(TaprootLeafTapscript, script)
 		opts := &TaprootSigHashOptions{
 			TapLeafHash: &leafHash,
 			KeyVersion:  0,
@@ -754,7 +775,7 @@ func (e *Engine) opCheckSig(script []byte) error {
 
 		// In tapscript, non-empty signature that fails verification is a HARD error
 		if !valid {
-			return fmt.Errorf("schnorr signature verification failed")
+			return ErrTaprootSigVerify
 		}
 
 	default:
@@ -950,7 +971,10 @@ func (e *Engine) opCheckMultiSig(script []byte) error {
 }
 
 func (e *Engine) opCheckSigAdd(script []byte) error {
-	// Tapscript only
+	// Tapscript only — Core EvalScript interpreter.cpp:1087 guards this.
+	if e.sigVersion == SigVersionBase || e.sigVersion == SigVersionWitnessV0 {
+		return ErrInvalidOpcode
+	}
 	if e.sigVersion != SigVersionTapscript {
 		return ErrInvalidOpcode
 	}
@@ -959,7 +983,8 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 		return ErrStackUnderflow
 	}
 
-	// Pop pubkey (top), n, sig
+	// Pop pubkey (top), n, sig — matches Core stack order pubkey/num/sig
+	// (Core interpreter.cpp:1089-1094 uses stacktop(-1/-2/-3)).
 	pubKeyBytes, _ := e.stack.Pop()
 	n, err := e.stack.PopInt(MaxScriptNumLen, e.requireMinimalData())
 	if err != nil {
@@ -970,33 +995,45 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 		return err
 	}
 
-	// Empty pubkey is a hard error in tapscript
-	if len(pubKeyBytes) == 0 {
-		return fmt.Errorf("tapscript empty pubkey")
+	// Sequence per Core EvalChecksigTapscript (interpreter.cpp:347-385):
+	//   1. success = !sig.empty()
+	//   2. if success → decrement weight budget
+	//   3. pubkey size check (empty → error; 32 → verify; else upgradable)
+	success := len(sigBytes) > 0
+	if success {
+		e.sigopBudget -= ValidationWeightPerSigopPass
+		if e.sigopBudget < 0 {
+			return ErrTapscriptValidationWeight
+		}
 	}
 
-	// If signature is empty, just push n (no budget cost for empty sig)
-	if len(sigBytes) == 0 {
+	if len(pubKeyBytes) == 0 {
+		return ErrTapscriptEmptyPubKey
+	}
+
+	// Non-32-byte pubkey: upgradable type. Push `n + (success ? 1 : 0)` per
+	// Core's (num + (success ? 1 : 0)).getvch() (interpreter.cpp:1101) —
+	// blockbrew previously always pushed n+1 here, which was wrong for the
+	// empty-sig case (should push n).  Discourage policy gate added.
+	if len(pubKeyBytes) != 32 {
+		if e.flags&ScriptVerifyDiscourageUpgradablePubKeyType != 0 {
+			return ErrDiscourageUpgradablePubKeyType
+		}
+		if success {
+			e.stack.PushInt(n + 1)
+		} else {
+			e.stack.PushInt(n)
+		}
+		return nil
+	}
+
+	// Valid 32-byte pubkey, empty signature: push n unchanged.
+	if !success {
 		e.stack.PushInt(n)
 		return nil
 	}
 
-	// Decrement tapscript signature validation weight budget (BIP342)
-	e.sigopBudget -= TapscriptSigopBudgetCost
-	if e.sigopBudget < 0 {
-		return fmt.Errorf("tapscript validation weight exceeded")
-	}
-
-	// For non-32-byte pubkeys (unknown key version), push n+1 for upgradability
-	if len(pubKeyBytes) != 32 {
-		e.stack.PushInt(n + 1)
-		return nil
-	}
-
-	// Schnorr signature length handling:
-	// 64 bytes: SIGHASH_DEFAULT (0x00), signature is entire blob
-	// 65 bytes: last byte is hashType, signature is first 64 bytes
-	// Other: hard error
+	// Schnorr signature length handling.
 	var hashType SigHashType
 	var sig []byte
 	if len(sigBytes) == 64 {
@@ -1005,15 +1042,15 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 	} else if len(sigBytes) == 65 {
 		hashType = SigHashType(sigBytes[64])
 		if hashType == SigHashDefault {
-			return fmt.Errorf("schnorr signature hash type 0x00 not allowed with 65-byte signature")
+			return ErrTapscriptInvalidSigSize
 		}
 		sig = sigBytes[:64]
 	} else {
-		return fmt.Errorf("invalid schnorr signature size: %d", len(sigBytes))
+		return ErrTapscriptInvalidSigSize
 	}
 
-	// Compute sighash
-	leafHash := TapLeaf(0xC0, script)
+	// Compute sighash with tapscript leaf hash.
+	leafHash := TapLeaf(TaprootLeafTapscript, script)
 	opts := &TaprootSigHashOptions{
 		TapLeafHash: &leafHash,
 		KeyVersion:  0,
@@ -1026,11 +1063,10 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 
 	if crypto.VerifySchnorr(pubKeyBytes, sighash, sig) {
 		e.stack.PushInt(n + 1)
-	} else {
-		// In tapscript, non-empty signature that fails verification is a HARD error
-		return fmt.Errorf("schnorr signature verification failed")
+		return nil
 	}
-	return nil
+	// In tapscript, non-empty signature that fails verification is a HARD error
+	return ErrTaprootSigVerify
 }
 
 // Locktime operations

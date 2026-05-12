@@ -32,6 +32,13 @@ var (
 	ErrWitnessMismatch      = errors.New("witness data mismatch")
 	ErrWitnessMalleated     = errors.New("witness malleated")
 	ErrTaprootSigVerify         = errors.New("taproot signature verification failed")
+	ErrDiscourageUpgradableTaprootVersion = errors.New("upgradable taproot leaf version (discouraged)")
+	ErrDiscourageUpgradablePubKeyType     = errors.New("upgradable tapscript pubkey type (discouraged)")
+	ErrTapscriptEmptyPubKey               = errors.New("tapscript: empty pubkey not allowed")
+	ErrTapscriptInvalidSigSize            = errors.New("tapscript: invalid schnorr signature size")
+	ErrTapscriptValidationWeight          = errors.New("tapscript validation weight budget exceeded")
+	ErrInitialStackSize                   = errors.New("witness initial stack size exceeds limit")
+	ErrInitialPushSize                    = errors.New("witness initial element size exceeds limit")
 	ErrMinimalData              = errors.New("non-minimal data push")
 	ErrCLTVFailed               = errors.New("OP_CHECKLOCKTIMEVERIFY failed")
 	ErrCSVFailed                = errors.New("OP_CHECKSEQUENCEVERIFY failed")
@@ -74,6 +81,11 @@ const (
 	ScriptVerifyDiscourageOpSuccess                ScriptFlags = 1 << 16 // Discourage OP_SUCCESSx in tapscript
 	ScriptVerifyDiscourageUpgradableWitnessProgram ScriptFlags = 1 << 17 // Discourage unknown witness versions
 	ScriptVerifyMinimalIf                          ScriptFlags = 1 << 18 // Require minimal IF/NOTIF arguments
+	// BIP-341/342 policy flags previously missing — mirrors Bitcoin Core
+	// SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION /
+	// SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_PUBKEYTYPE.
+	ScriptVerifyDiscourageUpgradableTaprootVersion ScriptFlags = 1 << 19 // Discourage unknown leaf versions in P2TR script-path
+	ScriptVerifyDiscourageUpgradablePubKeyType     ScriptFlags = 1 << 20 // Discourage unknown pubkey lengths in tapscript CHECKSIG(ADD)
 )
 
 // SigVersion indicates the signature validation rules to use.
@@ -100,6 +112,7 @@ type Engine struct {
 	opCount     int           // Number of operations executed
 	codesepPos  uint32        // Position of last OP_CODESEPARATOR (for tapscript)
 	sigopBudget int           // Tapscript signature validation weight budget
+	opSuccess   bool          // True if an OP_SUCCESSx short-circuit fired in the most recent tapscript executeScript()
 
 	// For legacy sighash: track the script and the byte offset after last OP_CODESEPARATOR
 	currentScript    []byte // The script currently being executed
@@ -280,13 +293,23 @@ func (e *Engine) executeWitnessProgram(version int, program []byte, witness [][]
 			// P2A is always anyone-can-spend, no verification needed
 			return nil
 		}
-		// Taproot (v1) with 32-byte program
-		if len(program) == 32 && e.flags&ScriptVerifyTaproot != 0 {
+		// W94 fix: mirror Core interpreter.cpp:1947-1989 exactly.  For a v1
+		// taproot-sized (32-byte) program with !is_p2sh: if TAPROOT flag is
+		// not enabled, succeed silently — do NOT fall into the
+		// DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM branch.  Previously blockbrew
+		// would reject when the discourage flag was set without TAPROOT,
+		// which diverged from Core (Core treats !TAPROOT as immediate
+		// success for v1+32B before the discourage branch is reached).
+		if len(program) == WitnessV1TaprootSize {
+			if e.flags&ScriptVerifyTaproot == 0 {
+				return nil
+			}
 			// Taproot uses witness in wire order (not reversed); the control block
 			// and script are the last elements, and executeTaproot indexes from the end.
 			return e.executeTaproot(program, witness)
 		}
-		// Non-taproot v1 (or taproot not enabled): future anyone-can-spend
+		// Non-32-byte v1 program (and not P2A): future anyone-can-spend, but
+		// discourage if the policy flag is set.
 		if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
 			return ErrWitnessProgram
 		}
@@ -323,6 +346,17 @@ func (e *Engine) verifyWitnessCleanStack() error {
 // executeWitnessV0 executes a segwit v0 program.
 func (e *Engine) executeWitnessV0(program []byte, witness [][]byte) error {
 	e.sigVersion = SigVersionWitnessV0
+
+	// Core ExecuteWitnessScript interpreter.cpp:1858-1861 rejects any witness
+	// stack element > MAX_SCRIPT_ELEMENT_SIZE before EvalScript runs.  This
+	// applies to *both* witness v0 and tapscript paths.  Previously blockbrew
+	// only relied on per-opcode push-size checks, missing oversized witness
+	// stack items that were never pushed via PUSHDATA.
+	for _, item := range witness {
+		if len(item) > MaxScriptElementSize {
+			return ErrInitialPushSize
+		}
+	}
 
 	if len(program) == 20 {
 		// P2WPKH
@@ -387,7 +421,7 @@ func (e *Engine) executeWitnessV0(program []byte, witness [][]byte) error {
 
 // executeTaproot executes a taproot (segwit v1) program.
 func (e *Engine) executeTaproot(program []byte, witness [][]byte) error {
-	if len(program) != 32 {
+	if len(program) != WitnessV1TaprootSize {
 		return ErrWitnessProgram
 	}
 
@@ -395,9 +429,11 @@ func (e *Engine) executeTaproot(program []byte, witness [][]byte) error {
 		return ErrWitnessMismatch
 	}
 
-	// Check for annex (starts with 0x50)
+	// Annex detection (Core interpreter.cpp:1951).  Must have at least two
+	// items so removing the annex still leaves something to verify, the last
+	// item must be non-empty, and the first byte must be ANNEX_TAG (0x50).
 	var annex []byte
-	if len(witness) >= 2 && len(witness[len(witness)-1]) > 0 && witness[len(witness)-1][0] == 0x50 {
+	if len(witness) >= 2 && len(witness[len(witness)-1]) > 0 && witness[len(witness)-1][0] == AnnexTag {
 		annex = witness[len(witness)-1]
 		witness = witness[:len(witness)-1]
 	}
@@ -471,24 +507,29 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	script := witness[len(witness)-2]
 	stackItems := witness[:len(witness)-2]
 
-	// Control block: [leaf version + parity] [internal pubkey (32)] [merkle path (32*n)]
-	if len(controlBlock) < 33 || len(controlBlock) > 4129 || (len(controlBlock)-33)%32 != 0 {
+	// Control block: [leaf version + parity] [internal pubkey (32)] [merkle path (32*n)].
+	// Sizes mirror Core interpreter.cpp:1970 + interpreter.h:241-246.
+	if len(controlBlock) < TaprootControlBaseSize ||
+		len(controlBlock) > TaprootControlMaxSize ||
+		(len(controlBlock)-TaprootControlBaseSize)%TaprootControlNodeSize != 0 {
 		return ErrTaprootControlBlockSize
 	}
 
 	leafVersionAndParity := controlBlock[0]
-	leafVersion := leafVersionAndParity & 0xFE
-	internalPubKey := controlBlock[1:33]
-	merklePath := controlBlock[33:]
+	leafVersion := leafVersionAndParity & TaprootLeafMask
+	internalPubKey := controlBlock[1:TaprootControlBaseSize]
+	merklePath := controlBlock[TaprootControlBaseSize:]
 
-	// Compute leaf hash
+	// Compute leaf hash using the *unmasked* leaf version per Core.  We pass
+	// the already-masked `leafVersion` here so the call is byte-identical
+	// regardless of TapLeaf's internal masking (see sighash.go).
 	leafHash := TapLeaf(leafVersion, script)
 
-	// Compute merkle root
+	// Compute merkle root by walking the path with lex-ordered sibling hashing.
 	k := leafHash
-	for i := 0; i < len(merklePath); i += 32 {
+	for i := 0; i < len(merklePath); i += TaprootControlNodeSize {
 		node := [32]byte{}
-		copy(node[:], merklePath[i:i+32])
+		copy(node[:], merklePath[i:i+TaprootControlNodeSize])
 		k = TapBranch(k, node)
 	}
 
@@ -502,10 +543,30 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 		return ErrWitnessProgram
 	}
 
-	// Fix #6: Only execute as tapscript if leaf version is 0xc0.
-	// Unknown leaf versions succeed unconditionally.
-	if leafVersion != 0xc0 {
+	// Unknown leaf versions: forward-compat success (Core 1985-1988).
+	// Honour the SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_TAPROOT_VERSION policy
+	// flag — blockbrew previously had no flag here so a relay-policy node
+	// would still relay txns with unknown leaf versions.
+	if leafVersion != TaprootLeafTapscript {
+		if e.flags&ScriptVerifyDiscourageUpgradableTaprootVersion != 0 {
+			return ErrDiscourageUpgradableTaprootVersion
+		}
 		return nil
+	}
+
+	// BIP-342 initial validity checks on the witness stack BEFORE the
+	// interpreter runs (Core ExecuteWitnessScript interpreter.cpp:1855-1861):
+	//   * tapscript: initial stack size <= MAX_STACK_SIZE
+	//   * all sigversions: every stack element <= MAX_SCRIPT_ELEMENT_SIZE.
+	// `stackItems` here is the post-pop, post-annex view, matching Core's
+	// `stack_span` after SpanPopBack(script)+SpanPopBack(control).
+	if len(stackItems) > MaxStackSize {
+		return ErrInitialStackSize
+	}
+	for _, item := range stackItems {
+		if len(item) > MaxScriptElementSize {
+			return ErrInitialPushSize
+		}
 	}
 
 	// Set up stack and execute the script.
@@ -519,7 +580,7 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	// Set leaf hash for sighash computation
 	e.codesepPos = 0xFFFFFFFF
 
-	// Fix #9: Initialize tapscript signature validation weight budget (BIP342).
+	// Initialize tapscript signature validation weight budget (BIP-342).
 	// Budget = VALIDATION_WEIGHT_OFFSET (50) + serialized witness size.
 	// Serialized witness size uses the ORIGINAL witness (including annex if present).
 	// Format: compact_size(num_items) + sum(compact_size(len(item)) + len(item)).
@@ -534,13 +595,21 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	if annex != nil {
 		witnessSize += compactSizeLen(len(annex)) + len(annex)
 	}
-	e.sigopBudget = 50 + witnessSize
+	e.sigopBudget = ValidationWeightOffset + witnessSize
 
 	e.opCount = 0
+	e.opSuccess = false
 	if err := e.executeScript(script); err != nil {
 		return err
 	}
-	// BIP342: tapscript also implicitly requires cleanstack
+	// OP_SUCCESSx short-circuits ExecuteWitnessScript (Core 1850) — clean-stack
+	// must NOT be checked in that case.  Previously blockbrew would accept the
+	// OP_SUCCESS branch from executeScript but then reject the script because
+	// the witness stack still held leftover items.
+	if e.opSuccess {
+		return nil
+	}
+	// BIP-342: tapscript implicitly requires cleanstack.
 	return e.verifyWitnessCleanStack()
 }
 
@@ -656,6 +725,10 @@ func (e *Engine) executeScript(script []byte) error {
 				if e.flags&ScriptVerifyDiscourageOpSuccess != 0 {
 					return errors.New("discouraged OP_SUCCESS opcode in tapscript")
 				}
+				// Signal to the caller (executeTaprootScriptPath) that this
+				// invocation short-circuited via OP_SUCCESSx so it can skip
+				// the clean-stack check (Core ExecuteWitnessScript 1850).
+				e.opSuccess = true
 				return nil
 			}
 		}
