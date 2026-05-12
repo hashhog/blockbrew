@@ -135,6 +135,41 @@ var (
 	ErrPackageConflict         = errors.New("package contains conflicting transactions")
 	ErrPackageNotChildWithParents = errors.New("package topology must be child-with-unconfirmed-parents")
 	ErrPackageInsufficientFee  = errors.New("package feerate below minimum relay fee")
+
+	// W96 ATMP gates (mirrors Bitcoin Core MemPoolAccept).
+
+	// ErrSameTxidDifferentWitness fires when a transaction sharing the txid of
+	// an in-mempool tx but with a different witness (different wtxid) is
+	// submitted. Mirrors Core validation.cpp:828 — TX_CONFLICT,
+	// "txn-same-nonwitness-data-in-mempool". Distinguishing this from the
+	// vanilla wtxid-duplicate case lets p2p code suppress retransmission of a
+	// known witness-mutated variant.
+	ErrSameTxidDifferentWitness = errors.New("txn-same-nonwitness-data-in-mempool")
+
+	// ErrTxnAlreadyKnown fires when a submitted tx's inputs are missing from
+	// the UTXO view yet its own outputs are already cached in the UTXO set —
+	// the wallet/peer is replaying a tx whose effects we already committed.
+	// Mirrors Core validation.cpp:862 — TX_CONFLICT, "txn-already-known".
+	// Distinguishes this case from a true orphan (missing parents), so the
+	// caller does NOT add the tx to the orphan pool.
+	ErrTxnAlreadyKnown = errors.New("txn-already-known")
+
+	// ErrEphemeralDustNonZeroFee fires when a tx with a dust output is
+	// submitted with non-zero fee. Mirrors Core PreCheckEphemeralTx
+	// (policy/ephemeral_policy.cpp:23-30) — "tx with dust output must be
+	// 0-fee". Ephemeral anchors must be CPFP-mined, so giving them
+	// stand-alone mining incentive is a relay DoS vector.
+	ErrEphemeralDustNonZeroFee = errors.New("dust: tx with dust output must be 0-fee")
+
+	// ErrTxConsensus is returned when ConsensusScriptChecks (the second
+	// CheckInputScripts pass run with the current tip's MANDATORY/consensus
+	// block flags) fails AFTER PolicyScriptChecks (STANDARD flags) succeeded.
+	// This indicates a real consensus divergence (or a bug in our STANDARD
+	// flag handling). Mirrors Core validation.cpp:1184 — LogError
+	// "BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block
+	// but not STANDARD flags". Returning a distinct error keeps the
+	// TX_NOT_STANDARD/TX_CONSENSUS split visible to callers.
+	ErrTxConsensus = errors.New("consensus-script-fail: STANDARD pass but block-flags reject")
 )
 
 // RBF constants (BIP125).
@@ -336,6 +371,13 @@ type TxEntry struct {
 	AncestorSize   int64         // Total size of this tx + all ancestors
 	DescendantFee  int64         // Total fee of this tx + all descendants
 	DescendantSize int64         // Total size of this tx + all descendants
+	// SpendsCoinbase is true if any input of this tx spends a coinbase output
+	// from the UTXO set (not a mempool parent). Set in AcceptToMemoryPool /
+	// AddTransaction's input loop. Mirrors Core's CTxMemPoolEntry::spendsCoinbase
+	// (kernel/mempool_entry.h:101). Used by reorg handlers (Core
+	// removeForReorg, validation.cpp:1191-1232) to re-scan transactions whose
+	// coinbase parents may now be immature after a chain rewind.
+	SpendsCoinbase bool
 }
 
 // AncestorFeeRate returns the ancestor fee rate (sat/vB).
@@ -488,15 +530,35 @@ func (mp *Mempool) AcceptToMemoryPool(tx *wire.MsgTx) error {
 
 // AddTransaction validates and adds a transaction to the mempool.
 // Returns nil if accepted, error with reason if rejected.
+//
+// Pipeline mirrors Bitcoin Core MemPoolAccept::PreChecks → ReplacementChecks
+// → PolicyScriptChecks → ConsensusScriptChecks (validation.cpp:782-1190).
+// The ordering of gates is deliberately consensus-faithful: cheap context-free
+// checks first (sanity, coinbase, IsStandardTx, MIN_STANDARD_TX_NONWITNESS_SIZE,
+// IsFinalTx), then sigops + chain-context (BIP-68 + CheckTxInputs), then
+// expensive script verification last.
 func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	txHash := tx.TxHash()
+	wtxid := tx.WTxHash()
 
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
-	// 1. Reject if already in mempool
-	if _, ok := mp.pool[txHash]; ok {
-		return fmt.Errorf("%w: %s", ErrAlreadyInMempool, txHash)
+	// 1. Wtxid-aware duplicate detection (W96, mirrors Core validation.cpp:823-830).
+	// Core makes two distinct exists() probes — first against the wtxid, then
+	// against the txid — so that a witness-mutated variant of an already-known
+	// tx is distinguishable from a vanilla duplicate. Both are TX_CONFLICT,
+	// but the p2p layer caches them differently: "txn-already-in-mempool" can
+	// be cleared on reorg, "txn-same-nonwitness-data-in-mempool" must remain
+	// suppressed (the wire bytes are different but the consensus state is
+	// already committed).
+	if existing, ok := mp.pool[txHash]; ok {
+		if existing.Tx.WTxHash() == wtxid {
+			// Exact (wtxid) duplicate.
+			return fmt.Errorf("%w: %s", ErrAlreadyInMempool, txHash)
+		}
+		// Same txid, different wtxid — witness-mutated variant.
+		return fmt.Errorf("%w: %s", ErrSameTxidDifferentWitness, txHash)
 	}
 
 	// 2. Basic sanity checks
@@ -668,6 +730,12 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	var totalInputValue int64
 	var missingInputs []wire.OutPoint
 	var conflictingTxs map[wire.Hash256]bool // Transactions to replace via RBF
+	// W96: fSpendsCoinbase — record whether ANY input spends a confirmed
+	// coinbase output. Carried into the TxEntry so reorg handlers
+	// (removeForReorg) can re-verify maturity when the chain shortens.
+	// Mirrors Core CTxMemPoolEntry::spendsCoinbase + PreChecks loop at
+	// validation.cpp:912-919.
+	var spendsCoinbase bool
 
 	for _, in := range tx.TxIn {
 		// Check mempool double-spend
@@ -688,15 +756,33 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 			// can be spent in the mempool.
 			// Mirrors Bitcoin Core MemPoolAccept::PreChecks / CheckTxInputs
 			// (consensus/tx_verify.cpp).
-			if utxo.IsCoinbase && mp.config.ChainState != nil {
-				tipHeight := mp.config.ChainState.TipHeight()
-				age := tipHeight - utxo.Height
-				if age < consensus.CoinbaseMaturity {
-					return fmt.Errorf("%w: age %d < %d required",
-						ErrImmatureCoinbaseSpend, age, consensus.CoinbaseMaturity)
+			if utxo.IsCoinbase {
+				spendsCoinbase = true
+				if mp.config.ChainState != nil {
+					tipHeight := mp.config.ChainState.TipHeight()
+					age := tipHeight - utxo.Height
+					if age < consensus.CoinbaseMaturity {
+						return fmt.Errorf("%w: age %d < %d required",
+							ErrImmatureCoinbaseSpend, age, consensus.CoinbaseMaturity)
+					}
 				}
 			}
+			// W96: per-input MoneyRange check (Core CheckTxInputs at
+			// tx_verify.cpp:179-184, called from PreChecks at
+			// validation.cpp:892). Defence-in-depth: prevout amounts
+			// pulled from UTXO storage must be in [0, MAX_MONEY].
+			if utxo.Amount < 0 || utxo.Amount > consensus.MaxMoney {
+				return fmt.Errorf("bad-txns-inputvalues-outofrange: input %s value %d",
+					in.PreviousOutPoint.Hash, utxo.Amount)
+			}
 			totalInputValue += utxo.Amount
+			// W96: accumulated MoneyRange (Core tx_verify.cpp:185-189).
+			// A pathological set of barely-in-range inputs can still sum
+			// past MAX_MONEY (overflow attack class CVE-2010-5139 territory).
+			if totalInputValue < 0 || totalInputValue > consensus.MaxMoney {
+				return fmt.Errorf("bad-txns-inputvalues-outofrange: accumulated %d",
+					totalInputValue)
+			}
 		}
 	}
 
@@ -711,6 +797,22 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		for txHash := range conflictingTxs {
 			return fmt.Errorf("%w: input already spent by mempool tx %s",
 				ErrDoubleSpend, txHash)
+		}
+	}
+
+	// W96: tx-already-known distinction (Core validation.cpp:858-866).
+	// When inputs are missing, scan our own UTXO set for outpoints of THIS
+	// tx — if any of the tx's outputs are already present, the caller has
+	// replayed a tx we already accepted (its parents were spent on commit).
+	// This is TX_CONFLICT, not TX_MISSING_INPUTS, and we must NOT enrol it
+	// in the orphan pool (it would just churn there until expiry).
+	if len(missingInputs) > 0 && mp.utxoSet != nil {
+		for outIdx := range tx.TxOut {
+			op := wire.OutPoint{Hash: txHash, Index: uint32(outIdx)}
+			if existing := mp.utxoSet.GetUTXO(op); existing != nil {
+				return fmt.Errorf("%w: tx %s already committed (output %d in UTXO set)",
+					ErrTxnAlreadyKnown, txHash, outIdx)
+			}
 		}
 	}
 
@@ -738,11 +840,33 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 			ErrInsufficientFee, feeRate, minFeeRate)
 	}
 
-	// 9. Check dust outputs
+	// 9. PreCheckEphemeralTx + dust outputs (W96, BIP-431 ephemeral anchors).
+	//
+	// Core (policy/ephemeral_policy.cpp:23) carves out a narrow exception to
+	// the dust rule: a transaction that pays ZERO FEE may have dust outputs,
+	// on the understanding that it can only be mined via CPFP (a higher-fee
+	// child that consumes the dust). Any non-zero fee + dust output
+	// combination is rejected with "tx with dust output must be 0-fee".
+	//
+	// We wrap BOTH error paths through ErrDustOutput so existing callers
+	// (errors.Is(err, ErrDustOutput)) still work, while the W96 sentinel
+	// ErrEphemeralDustNonZeroFee is reachable as the wrapped cause for
+	// callers that want the fee==0 distinction.
 	for i, out := range tx.TxOut {
-		if mp.isDust(out) {
-			return fmt.Errorf("%w: output %d value %d", ErrDustOutput, i, out.Value)
+		if !mp.isDust(out) {
+			continue
 		}
+		if fee == 0 {
+			// Ephemeral anchor / 0-fee CPFP carrier: dust is permitted.
+			// Continue scanning — other outputs may still need checking
+			// (e.g. AnchorDust cap on P2A handled inside isDust).
+			continue
+		}
+		// Non-zero-fee tx with dust output. Wrap both sentinels so
+		// callers asserting either ErrDustOutput (legacy) or
+		// ErrEphemeralDustNonZeroFee (W96) succeed.
+		return fmt.Errorf("%w (%w): output %d value %d",
+			ErrDustOutput, ErrEphemeralDustNonZeroFee, i, out.Value)
 	}
 
 	// 9e. IsWitnessStandard (Core policy.cpp:265-352, validation.cpp:904).
@@ -788,10 +912,39 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		return err
 	}
 
-	// 10. Validate scripts
-	flags := mp.getStandardScriptFlags()
-	if err := mp.validateScriptsLocked(tx, flags); err != nil {
+	// 10. Validate scripts — two-pass STANDARD vs CONSENSUS split (W96).
+	//
+	// PolicyScriptChecks runs with STANDARD_SCRIPT_VERIFY_FLAGS (which is a
+	// strict superset of consensus block flags: adds NULLFAIL, STRICTENC,
+	// WITNESS_PUBKEYTYPE). A failure here means the tx is non-standard.
+	// Core: validation.cpp:1135-1156, mapped to TX_NOT_STANDARD.
+	//
+	// ConsensusScriptChecks then re-runs CheckInputScripts with the current
+	// tip's MANDATORY/consensus block flags. Because STANDARD ⊇ CONSENSUS,
+	// a STANDARD-pass result MUST also be a CONSENSUS-pass. If the second
+	// pass fails, that is either a bug in our STANDARD flag handling or a
+	// genuine consensus divergence — both are LogError "BUG! PLEASE REPORT"
+	// territory (Core validation.cpp:1184) and must be surfaced as a
+	// distinct error code (TX_CONSENSUS), NOT collapsed into TX_NOT_STANDARD.
+	//
+	// W96 fix: previously the mempool ran a single pass at STANDARD flags
+	// only, so a true consensus reject would be reported as ErrScriptValidation
+	// (interpreted by callers as policy-only). Now both passes run, and the
+	// CONSENSUS reject path returns ErrTxConsensus, which p2p / RPC layers
+	// can route to a louder warning channel.
+	policyFlags := mp.getStandardScriptFlags()
+	if err := mp.validateScriptsLocked(tx, policyFlags); err != nil {
 		return fmt.Errorf("%w: %v", ErrScriptValidation, err)
+	}
+	consensusFlags := mp.getConsensusScriptFlags()
+	if consensusFlags != policyFlags {
+		if err := mp.validateScriptsLocked(tx, consensusFlags); err != nil {
+			// This is a "BUG! PLEASE REPORT" scenario — we just passed the
+			// strict superset of these flags. Returning ErrTxConsensus
+			// (wrapped) keeps the policy / consensus distinction visible.
+			return fmt.Errorf("%w: tx %s rejected at MANDATORY flags after STANDARD pass: %v",
+				ErrTxConsensus, txHash, err)
+		}
 	}
 
 	// 11. Create entry and add to mempool
@@ -807,6 +960,7 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		AncestorSize:   vsize,
 		DescendantFee:  fee,
 		DescendantSize: vsize,
+		SpendsCoinbase: spendsCoinbase, // W96, see PreChecks loop above.
 	}
 
 	// Track dependencies (parent transactions in mempool)
@@ -855,15 +1009,28 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 
 // lookupOutputLocked looks up a UTXO from mempool or UTXO set.
 // Must be called with mu held.
+//
+// W96 slice-alias hardening: when the UTXO is sourced from a mempool tx's
+// output, copy the PkScript bytes into a fresh slice rather than aliasing
+// entry.Tx.TxOut[idx].PkScript. Callers (sigops counting, witness
+// standardness, signature evaluators with script interning) may mutate or
+// embed the returned PkScript in caches; sharing the backing array
+// silently corrupts the source transaction. Same defect class as
+// W82/W92/W93 PkScript aliasing in connect/disconnect paths.
 func (mp *Mempool) lookupOutputLocked(outpoint wire.OutPoint) *consensus.UTXOEntry {
 	// First check if a mempool transaction creates this output
 	if entry, ok := mp.pool[outpoint.Hash]; ok {
 		if int(outpoint.Index) < len(entry.Tx.TxOut) {
 			out := entry.Tx.TxOut[outpoint.Index]
+			pk := make([]byte, len(out.PkScript))
+			copy(pk, out.PkScript)
 			return &consensus.UTXOEntry{
 				Amount:   out.Value,
-				PkScript: out.PkScript,
+				PkScript: pk,
 				Height:   entry.Height,
+				// Coinbase txs are rejected at PreChecks step 3, so a
+				// mempool-output cannot be a coinbase. Leaving IsCoinbase
+				// at its zero value (false) is correct.
 			}
 		}
 	}
@@ -999,6 +1166,21 @@ func (mp *Mempool) getStandardScriptFlags() script.ScriptFlags {
 	// (exceptions are only for historical blocks during IBD).
 	var zeroHash wire.Hash256
 	return consensus.GetStandardScriptFlags(mp.chainHeight, mp.config.ChainParams, zeroHash)
+}
+
+// getConsensusScriptFlags returns the script verification flags that would
+// apply if this transaction were mined into the NEXT block at the current
+// chain tip. These are the MANDATORY consensus flags only — no policy-only
+// additions (no NULLFAIL / STRICTENC / WITNESS_PUBKEYTYPE).
+//
+// W96: used by ConsensusScriptChecks (the second of the PolicyScriptChecks /
+// ConsensusScriptChecks pair). Mirrors Core's
+// GetBlockScriptFlags(*m_active_chainstate.m_chain.Tip(), ...) called from
+// validation.cpp:1181. When the consensus and standard flag sets coincide
+// (no policy bits enabled at this height) the caller skips the second pass.
+func (mp *Mempool) getConsensusScriptFlags() script.ScriptFlags {
+	var zeroHash wire.Hash256
+	return consensus.GetBlockScriptFlags(mp.chainHeight, mp.config.ChainParams, zeroHash)
 }
 
 // validateScriptsLocked validates transaction scripts.
