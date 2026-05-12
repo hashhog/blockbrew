@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"runtime"
 
 	"github.com/hashhog/blockbrew/internal/crypto"
 )
@@ -146,6 +147,16 @@ func (c *BIP324Cipher) Initialize(theirPubKey crypto.EllSwiftPubKey, initiator b
 	sessionKey := hkdf.Expand32("session_id")
 	copy(c.sessionID[:], sessionKey[:])
 
+	// Zeroize sensitive key material — mirrors Core bip324.cpp:67-70:
+	//   memory_cleanse(ecdh_secret), memory_cleanse(hkdf_32_okm), memory_cleanse(&hkdf)
+	// Go has no memory_cleanse, but explicit zero-fill + runtime.KeepAlive prevents
+	// the compiler from treating these as dead stores.
+	hkdf.Zeroize()
+	for i := range ecdhSecret {
+		ecdhSecret[i] = 0
+	}
+	runtime.KeepAlive(&ecdhSecret)
+
 	c.initialized = true
 	return nil
 }
@@ -193,6 +204,16 @@ func (c *BIP324Cipher) InitializeWithMagic(theirPubKey crypto.EllSwiftPubKey, in
 	// Derive session ID
 	sessionKey := hkdf.Expand32("session_id")
 	copy(c.sessionID[:], sessionKey[:])
+
+	// Zeroize sensitive key material — mirrors Core bip324.cpp:67-70:
+	//   memory_cleanse(ecdh_secret), memory_cleanse(hkdf_32_okm), memory_cleanse(&hkdf)
+	// Go has no memory_cleanse, but explicit zero-fill + runtime.KeepAlive prevents
+	// the compiler from treating these as dead stores.
+	hkdf.Zeroize()
+	for i := range ecdhSecret {
+		ecdhSecret[i] = 0
+	}
+	runtime.KeepAlive(&ecdhSecret)
 
 	c.initialized = true
 	return nil
