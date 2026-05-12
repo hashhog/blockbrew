@@ -1778,6 +1778,20 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 				// cursor.
 				return
 			}
+			// G19c fTooFarAhead gate (Bitcoin Core validation.cpp:4325).
+			// An unrequested block more than MIN_BLOCKS_TO_KEEP (288) heights
+			// ahead of our active tip is dropped without further processing.
+			// Mirrors Core's `if (fTooFarAhead) return true;` on the
+			// !fRequested path. Solicited (queue-driven) blocks are exempt
+			// because they go through the inflight/blockQueue path above.
+			if sm.chainMgr != nil {
+				_, activeHeight := sm.chainMgr.BestBlock()
+				if consensus.IsTooFarAhead(nh, activeHeight) {
+					log.Printf("sync: dropping unsolicited block height=%d too far ahead of tip=%d (limit=%d)",
+						nh, activeHeight, activeHeight+int32(storage.MinBlocksToKeep))
+					return
+				}
+			}
 			// Now pass to validation
 			select {
 			case sm.validationChan <- &blockWithRequest{
