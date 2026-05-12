@@ -552,12 +552,77 @@ func TestW99_G24_UnknownMessageTypeIgnored(t *testing.T) {
 // for other peers it sends MSG_TX. blockbrew sends InvTypeWitnessTx
 // unconditionally regardless of peer's wtxidrelay support.
 // ─────────────────────────────────────────────────────────────────────────────
+// TestW99_G25_TxRelayWtxidSegregation verifies the G25 fix: RelayTransaction
+// now selects per-peer (InvTypeWtx=5/wtxid for wtxid-relay peers,
+// InvTypeTx=1/txid for legacy peers). Fixed by W103 FIX-15.
 func TestW99_G25_TxRelayWtxidSegregation(t *testing.T) {
-	t.Skip("W99 audit — G25: blockbrew RelayTransaction (peermgr.go:524) always uses " +
-		"InvTypeWitnessTx (MSG_WTX = 0x40000001) regardless of whether the peer negotiated " +
-		"wtxidrelay. Core (net_processing.cpp) only sends MSG_WTX to peers with " +
-		"m_wtxid_relay=true; non-wtxid peers receive MSG_TX. Sending MSG_WTX to a peer " +
-		"that didn't negotiate wtxidrelay is a protocol violation.")
+	pm := NewPeerManager(PeerManagerConfig{})
+
+	txHash := [32]byte{0xaa}
+	wtxHash := [32]byte{0xbb}
+
+	// --- wtxid-relay peer: must get InvTypeWtx=5 + wtxid ---
+	wtxPeer := &Peer{
+		addr:                "10.0.0.1:8333",
+		state:               PeerStateConnected,
+		sendQueue:           make(chan Message, 10),
+		quit:                make(chan struct{}),
+		wtxidRelaySupported: true,
+	}
+	wtxPeer.versionRecvd = true
+	wtxPeer.peerVersion = &MsgVersion{Relay: true}
+
+	// --- legacy peer: must get InvTypeTx=1 + txid ---
+	legacyPeer := &Peer{
+		addr:                "10.0.0.2:8333",
+		state:               PeerStateConnected,
+		sendQueue:           make(chan Message, 10),
+		quit:                make(chan struct{}),
+		wtxidRelaySupported: false,
+	}
+	legacyPeer.versionRecvd = true
+	legacyPeer.peerVersion = &MsgVersion{Relay: true}
+
+	pm.mu.Lock()
+	pm.peers[wtxPeer.addr] = &PeerInfo{peer: wtxPeer, connType: ConnFullRelay}
+	pm.peers[legacyPeer.addr] = &PeerInfo{peer: legacyPeer, connType: ConnFullRelay}
+	pm.mu.Unlock()
+
+	pm.RelayTransaction(txHash, wtxHash, 1000, 250, "")
+
+	// Check wtxid-relay peer.
+	select {
+	case msg := <-wtxPeer.sendQueue:
+		inv, ok := msg.(*MsgInv)
+		if !ok || len(inv.InvList) == 0 {
+			t.Fatal("G25: wtxid peer: expected non-empty MsgInv")
+		}
+		if inv.InvList[0].Type != InvTypeWtx {
+			t.Errorf("G25: wtxid peer got type 0x%x, want InvTypeWtx=5", inv.InvList[0].Type)
+		}
+		if inv.InvList[0].Hash != wtxHash {
+			t.Errorf("G25: wtxid peer got hash %x, want wtxid %x", inv.InvList[0].Hash, wtxHash)
+		}
+	default:
+		t.Error("G25: wtxid peer got no message")
+	}
+
+	// Check legacy peer.
+	select {
+	case msg := <-legacyPeer.sendQueue:
+		inv, ok := msg.(*MsgInv)
+		if !ok || len(inv.InvList) == 0 {
+			t.Fatal("G25: legacy peer: expected non-empty MsgInv")
+		}
+		if inv.InvList[0].Type != InvTypeTx {
+			t.Errorf("G25: legacy peer got type 0x%x, want InvTypeTx=1", inv.InvList[0].Type)
+		}
+		if inv.InvList[0].Hash != txHash {
+			t.Errorf("G25: legacy peer got hash %x, want txid %x", inv.InvList[0].Hash, txHash)
+		}
+	default:
+		t.Error("G25: legacy peer got no message")
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -804,18 +869,19 @@ func TestW99_PingTimeoutNotEnforced(t *testing.T) {
 	}
 }
 
-// TestW99_TxRelayAlwaysUsesWitnessTxInvType documents G25 bug.
+// TestW99_TxRelayAlwaysUsesWitnessTxInvType verifies G25 fix:
+// RelayTransaction now selects per-peer: InvTypeWtx=5 for wtxid-relay peers,
+// InvTypeTx=1 for legacy peers. InvTypeWitnessTx=0x40000001 must never appear
+// in inv announcements.
 func TestW99_TxRelayAlwaysUsesWitnessTxInvType(t *testing.T) {
-	// RelayTransaction in peermgr.go unconditionally uses InvTypeWitnessTx
-	// regardless of whether the peer negotiated wtxidrelay.
 	pm := NewPeerManager(PeerManagerConfig{})
 
 	// Create a non-wtxidrelay peer
 	p := &Peer{
-		addr:              "1.2.3.4:8333",
-		state:             PeerStateConnected,
-		sendQueue:         make(chan Message, 100),
-		quit:              make(chan struct{}),
+		addr:                "1.2.3.4:8333",
+		state:               PeerStateConnected,
+		sendQueue:           make(chan Message, 100),
+		quit:                make(chan struct{}),
 		wtxidRelaySupported: false, // Peer did NOT negotiate wtxidrelay
 	}
 	p.versionRecvd = true
@@ -825,20 +891,30 @@ func TestW99_TxRelayAlwaysUsesWitnessTxInvType(t *testing.T) {
 	pm.peers["1.2.3.4:8333"] = &PeerInfo{peer: p, connType: ConnFullRelay}
 	pm.mu.Unlock()
 
-	// Relay a tx to this non-wtxid peer
+	// Relay a tx to this non-wtxid peer (txid != wtxid intentionally).
 	txHash := [32]byte{0x01}
-	pm.RelayTransaction(txHash, 1000, 250, "")
+	wtxHash := [32]byte{0x02}
+	pm.RelayTransaction(txHash, wtxHash, 1000, 250, "")
 
-	// Check what inv type was used
+	// G25 FIX: legacy peer must receive InvTypeTx=1 + txid.
 	select {
 	case msg := <-p.sendQueue:
 		inv, ok := msg.(*MsgInv)
 		if !ok {
 			t.Fatal("expected MsgInv")
 		}
-		if len(inv.InvList) > 0 && inv.InvList[0].Type == InvTypeWitnessTx {
-			t.Log("G25 BUG CONFIRMED: InvTypeWitnessTx (MSG_WTX) sent to non-wtxidrelay peer; " +
-				"should use InvTypeTx (MSG_TX) for peers without wtxidrelay negotiation")
+		if len(inv.InvList) == 0 {
+			t.Fatal("G25: inv list empty")
+		}
+		if inv.InvList[0].Type == InvTypeWitnessTx {
+			t.Errorf("G25 BUG: InvTypeWitnessTx=0x%x sent to non-wtxidrelay peer; must use InvTypeTx=1",
+				InvTypeWitnessTx)
+		}
+		if inv.InvList[0].Type != InvTypeTx {
+			t.Errorf("G25: legacy peer got inv type 0x%x, want InvTypeTx=1", inv.InvList[0].Type)
+		}
+		if inv.InvList[0].Hash != txHash {
+			t.Errorf("G25: legacy peer got hash %x, want txid %x", inv.InvList[0].Hash, txHash)
 		}
 	default:
 		t.Log("G25: no message sent (peer relay conditions not met)")

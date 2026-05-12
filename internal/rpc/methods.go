@@ -978,7 +978,7 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		if s.peerMgr != nil {
 			entry := s.mempool.GetEntry(txid)
 			if entry != nil {
-				s.peerMgr.RelayTransaction(txid, entry.Fee, entry.Size, "")
+				s.peerMgr.RelayTransaction(txid, entry.Tx.WTxHash(), entry.Fee, entry.Size, "")
 			}
 		}
 		return txid.String(), nil
@@ -1011,7 +1011,7 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 	if s.peerMgr != nil {
 		entry := s.mempool.GetEntry(txid)
 		if entry != nil {
-			s.peerMgr.RelayTransaction(txid, entry.Fee, entry.Size, "")
+			s.peerMgr.RelayTransaction(txid, entry.Tx.WTxHash(), entry.Fee, entry.Size, "")
 		}
 	}
 
