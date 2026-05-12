@@ -491,27 +491,20 @@ func TestW99_G21_HandshakeMsgsPostVerackNotRejected(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G23 — MAX_PROTOCOL_MESSAGE_LENGTH = 4 MiB (Core); blockbrew uses 32 MiB
+// G23 — MAX_PROTOCOL_MESSAGE_LENGTH = 4,000,000 (Core); FIXED in blockbrew
 //
 // Bitcoin Core net.h:65: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 (4 MB)
-// blockbrew message.go:19: MaxPayloadSize = 32 * 1024 * 1024 (32 MB = 8× too large)
-// Severity: DOS — a peer can send up to 32 MB messages before blockbrew rejects
-// them. Core rejects at 4 MB. This allows 8× more network traffic per malicious
-// message before triggering the size limit.
+// blockbrew message.go: MaxPayloadSize = 4 * 1000 * 1000 (matches Core)
+// Previously 32 * 1024 * 1024 (32 MB = 8× too large) — W99 G23 fixed.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW99_G23_MaxProtocolMessageLength(t *testing.T) {
 	// Core: MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 = 4,000,000 bytes
 	const coreMaxProtocolMsgLen = 4 * 1000 * 1000
 
-	if MaxPayloadSize <= coreMaxProtocolMsgLen {
-		t.Logf("G23 PASS: MaxPayloadSize=%d <= Core limit=%d", MaxPayloadSize, coreMaxProtocolMsgLen)
-	} else {
-		t.Logf("G23 BUG: MaxPayloadSize=%d but Core MAX_PROTOCOL_MESSAGE_LENGTH=%d (blockbrew allows 8× larger messages)",
-			MaxPayloadSize, coreMaxProtocolMsgLen)
-	}
-	// Document the bug even though we can't fail (it's a DoS-class issue, not a crash)
 	if MaxPayloadSize != coreMaxProtocolMsgLen {
-		t.Logf("G23 BUG CONFIRMED: MaxPayloadSize=%d != Core %d", MaxPayloadSize, coreMaxProtocolMsgLen)
+		t.Errorf("W99 G23: MaxPayloadSize=%d != Core MAX_PROTOCOL_MESSAGE_LENGTH=%d; "+
+			"revert the fix in message.go",
+			MaxPayloadSize, coreMaxProtocolMsgLen)
 	}
 }
 
@@ -705,18 +698,17 @@ func TestW99_MisbehaviorThresholdReached(t *testing.T) {
 	}
 }
 
-// TestW99_MaxPayloadSizeVsCore documents the G23 32MB vs 4MB gap.
+// TestW99_MaxPayloadSizeVsCore asserts the G23 fix: MaxPayloadSize == Core 4 MB limit.
 func TestW99_MaxPayloadSizeVsCore(t *testing.T) {
 	// Core's MAX_PROTOCOL_MESSAGE_LENGTH = 4 * 1000 * 1000 bytes
 	const coreLimit = 4 * 1000 * 1000
-	const blockbrewLimit = MaxPayloadSize // 32 * 1024 * 1024
+	const blockbrewLimit = MaxPayloadSize // 4 * 1000 * 1000 (fixed from 32 * 1024 * 1024)
 
-	if blockbrewLimit > coreLimit {
-		t.Logf("G23 BUG: blockbrew MaxPayloadSize=%d (%.1f MB) > Core MAX_PROTOCOL_MESSAGE_LENGTH=%d (%.1f MB)",
+	if blockbrewLimit != coreLimit {
+		t.Errorf("W99 G23: MaxPayloadSize=%d (%.1f MB) != Core MAX_PROTOCOL_MESSAGE_LENGTH=%d (%.1f MB); "+
+			"revert the fix in message.go",
 			blockbrewLimit, float64(blockbrewLimit)/1e6,
 			coreLimit, float64(coreLimit)/1e6)
-		t.Logf("G23 BUG: blockbrew accepts messages %.1f× larger than Core allows",
-			float64(blockbrewLimit)/float64(coreLimit))
 	}
 }
 
