@@ -210,6 +210,11 @@ type Peer struct {
 	misbehaviorScore int           // Accumulated misbehavior score
 	shouldBan        bool          // Set to true when threshold reached
 	banCallback      func(*Peer)   // Called when peer should be banned
+
+	// W99 G2: NoBan flag — when set, the ban callback is suppressed entirely.
+	// Bitcoin Core equivalent: HasPermission(NetPermissionFlags::NoBan).
+	// Set by the peer manager for whitelisted / explicitly trusted peers.
+	noBan bool
 }
 
 // NewOutboundPeer creates a new outbound peer and initiates the TCP connection.
@@ -1329,6 +1334,22 @@ func (p *Peer) SetBanCallback(cb func(*Peer)) {
 	p.banCallback = cb
 }
 
+// SetNoBan marks the peer as exempt from banning.
+// Bitcoin Core equivalent: HasPermission(NetPermissionFlags::NoBan).
+// When set, Misbehaving() never fires the ban callback regardless of score.
+func (p *Peer) SetNoBan(v bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.noBan = v
+}
+
+// IsNoBan returns true if this peer is exempt from banning.
+func (p *Peer) IsNoBan() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.noBan
+}
+
 // Misbehaving adds a misbehavior score to the peer.
 // If the score reaches MisbehaviorThreshold (100), the peer is flagged for disconnect/ban.
 // Returns true if the threshold was reached (on this call or a prior one).
@@ -1341,6 +1362,14 @@ func (p *Peer) SetBanCallback(cb func(*Peer)) {
 // handlePeerBan could not observe any per-peer state on the banned peer.
 func (p *Peer) Misbehaving(score int, reason string) bool {
 	p.mu.Lock()
+
+	// W99 G2: NoBan peers are never banned regardless of score.
+	// Bitcoin Core MaybeDiscourageAndDisconnect: HasPermission(NoBan) → return false.
+	if p.noBan {
+		log.Printf("peer %s misbehaving (%+d): %s (noBan — skipping ban)", p.addr, score, reason)
+		p.mu.Unlock()
+		return false
+	}
 
 	if p.shouldBan {
 		// Already flagged for ban — stop amplifying the score and don't

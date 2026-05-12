@@ -31,45 +31,119 @@ func TestW99_G1_MisbehavingSingleEventModel(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G2 — Misbehaving: noban / manual / outbound-relay protections NOT honored
+// G2 — Misbehaving: noban / manual / local / regular protection (W99 G2 fix)
 //
-// Bitcoin Core MaybeDiscourageAndDisconnect (net_processing.cpp:5094-5104):
-//   - NoBan permission → never disconnect/discourage
-//   - IsManualConn()   → never disconnect/discourage
-//   - Local addr       → disconnect but do NOT discourage
+// Bitcoin Core MaybeDiscourageAndDisconnect (net_processing.cpp:5083):
+//   - NoBan permission → never disconnect/discourage (no-op)
+//   - IsManualConn()   → never disconnect/discourage (no-op)
+//   - Local addr       → disconnect only, NOT added to discourage list
+//   - Regular inbound  → disconnect + add to ban/discourage list
 //
-// blockbrew's Misbehaving()+handlePeerBan() has NO notion of NoBan, manual
-// connections, or local-address treatment. Any peer at score ≥ 100 gets
-// BanPeer() called unconditionally, including manually added peers
-// (addnode RPC via ConnectManualPeer) and whitelisted peers.
-// Severity: DOS — manual anchor peers can be permanently banned on one bad
-// block (e.g., during a reorg burst).
+// Four sub-tests assert each case is correctly handled after the W99 G2 fix.
 // ─────────────────────────────────────────────────────────────────────────────
-func TestW99_G2_NoBanManualProtectionMissing(t *testing.T) {
-	// Create a peer with a ban callback
-	banCalled := false
-	p := &Peer{
-		addr:      "127.0.0.1:8333",
-		sendQueue: make(chan Message, SendQueueSize),
-		quit:      make(chan struct{}),
-	}
-	p.banCallback = func(_ *Peer) {
-		banCalled = true
-	}
+func TestW99_G2_NoBanManualProtection(t *testing.T) {
+	// Sub-test 1: NoBan peer — Misbehaving must be a no-op (callback never fires).
+	t.Run("noban_no_op", func(t *testing.T) {
+		banCalled := false
+		p := &Peer{
+			addr:      "1.2.3.4:8333",
+			sendQueue: make(chan Message, SendQueueSize),
+			quit:      make(chan struct{}),
+		}
+		p.banCallback = func(_ *Peer) { banCalled = true }
+		p.SetNoBan(true)
 
-	// A single Misbehaving(100) call triggers the ban callback
-	p.Misbehaving(100, "invalid block")
+		p.Misbehaving(100, "invalid block")
 
-	if !banCalled {
-		t.Fatal("expected ban callback to be called")
-	}
+		if banCalled {
+			t.Error("G2 noban: ban callback must NOT fire for a NoBan peer")
+		}
+		if p.ShouldBan() {
+			t.Error("G2 noban: shouldBan flag must NOT be set for a NoBan peer")
+		}
+	})
 
-	// BUG: blockbrew has no way to mark this peer as NoBan / manual.
-	// Core's MaybeDiscourageAndDisconnect checks HasPermission(NetPermissionFlags::NoBan)
-	// and IsManualConn() before banning. blockbrew has neither concept.
-	// Regression: ConnectManualPeer-added peers can be permanently banned on
-	// any single-event score-100 infraction (e.g., one mutated block).
-	t.Log("G2 BUG CONFIRMED: blockbrew has no NoBan/manual-connection protection in Misbehaving path")
+	// Sub-test 2: Manual connection — handlePeerBan must be a no-op (no BanPeer).
+	t.Run("manual_no_op", func(t *testing.T) {
+		pm := NewPeerManager(PeerManagerConfig{
+			DataDir: t.TempDir(),
+		})
+		defer pm.Stop()
+
+		// Register a manual peer in the peers map without a real connection.
+		p := &Peer{
+			addr:      "5.6.7.8:8333",
+			sendQueue: make(chan Message, SendQueueSize),
+			quit:      make(chan struct{}),
+		}
+		pm.mu.Lock()
+		pm.peers[p.addr] = &PeerInfo{peer: p, connType: ConnManual, connectedAt: time.Now()}
+		pm.outbound++
+		pm.mu.Unlock()
+
+		// Simulate ban callback.
+		pm.handlePeerBan(p)
+
+		if pm.IsBanned("5.6.7.8:8333") {
+			t.Error("G2 manual: manual peer must NOT be added to ban list")
+		}
+	})
+
+	// Sub-test 3: Local (loopback) address — handlePeerBan must disconnect without banning.
+	t.Run("local_disconnect_no_ban", func(t *testing.T) {
+		pm := NewPeerManager(PeerManagerConfig{
+			DataDir: t.TempDir(),
+		})
+		defer pm.Stop()
+
+		// 127.0.0.1 is loopback — isLocalAddr returns true.
+		p := &Peer{
+			addr:      "127.0.0.1:8333",
+			sendQueue: make(chan Message, SendQueueSize),
+			quit:      make(chan struct{}),
+		}
+		pm.mu.Lock()
+		pm.peers[p.addr] = &PeerInfo{peer: p, connType: ConnInbound, connectedAt: time.Now()}
+		pm.inbound++
+		pm.mu.Unlock()
+
+		pm.handlePeerBan(p)
+
+		if pm.IsBanned("127.0.0.1:8333") {
+			t.Error("G2 local: loopback peer must NOT be added to ban list")
+		}
+		// Peer should have been removed from peers map (disconnected).
+		pm.mu.RLock()
+		_, stillConnected := pm.peers[p.addr]
+		pm.mu.RUnlock()
+		if stillConnected {
+			t.Error("G2 local: loopback peer should have been removed from peers map")
+		}
+	})
+
+	// Sub-test 4: Regular inbound peer — handlePeerBan must disconnect AND ban.
+	t.Run("regular_inbound_banned", func(t *testing.T) {
+		pm := NewPeerManager(PeerManagerConfig{
+			DataDir: t.TempDir(),
+		})
+		defer pm.Stop()
+
+		p := &Peer{
+			addr:      "203.0.113.1:8333",
+			sendQueue: make(chan Message, SendQueueSize),
+			quit:      make(chan struct{}),
+		}
+		pm.mu.Lock()
+		pm.peers[p.addr] = &PeerInfo{peer: p, connType: ConnInbound, connectedAt: time.Now()}
+		pm.inbound++
+		pm.mu.Unlock()
+
+		pm.handlePeerBan(p)
+
+		if !pm.IsBanned("203.0.113.1:8333") {
+			t.Error("G2 regular: regular inbound peer must be added to ban list")
+		}
+	})
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
