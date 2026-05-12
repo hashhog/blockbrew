@@ -1076,9 +1076,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			return
 		}
 		txHash := msg.Tx.TxHash()
+		wtxHash := msg.Tx.WTxHash()
 		entry := mp.GetEntry(txHash)
 		if entry != nil {
-			peerMgr.RelayTransaction(txHash, entry.Fee, entry.Size, peer.Address())
+			peerMgr.RelayTransaction(txHash, wtxHash, entry.Fee, entry.Size, peer.Address())
 		}
 		// ZMQ fan-out: hashtx / rawtx / sequence(A). Cheap no-op
 		// when no -zmqpub* endpoint is configured.
@@ -1157,7 +1158,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			if !txr.Accepted || txr.AlreadyInMempool {
 				continue
 			}
-			peerMgr.RelayTransaction(txr.TxID, txr.Fee, txr.VSize, peer.Address())
+			peerMgr.RelayTransaction(txr.TxID, txr.WTxID, txr.Fee, txr.VSize, peer.Address())
 		}
 	}
 
