@@ -9,6 +9,7 @@ import (
 	"hash"
 	"io"
 	"log"
+	"math"
 	"sort"
 	"sync"
 
@@ -18,14 +19,26 @@ import (
 
 // AssumeUTXO errors.
 var (
-	ErrInvalidSnapshotMagic    = errors.New("invalid snapshot magic bytes")
-	ErrUnsupportedVersion      = errors.New("unsupported snapshot version")
-	ErrNetworkMismatch         = errors.New("snapshot network does not match node network")
-	ErrUnknownSnapshotHeight   = errors.New("snapshot height not recognized in assumeutxo params")
-	ErrSnapshotHashMismatch    = errors.New("snapshot UTXO hash does not match expected value")
-	ErrSnapshotAlreadyLoaded   = errors.New("a snapshot chainstate is already loaded")
-	ErrSnapshotBlockNotFound   = errors.New("snapshot base block not found in headers")
+	ErrInvalidSnapshotMagic       = errors.New("invalid snapshot magic bytes")
+	ErrUnsupportedVersion         = errors.New("unsupported snapshot version")
+	ErrNetworkMismatch            = errors.New("snapshot network does not match node network")
+	ErrUnknownSnapshotHeight      = errors.New("snapshot height not recognized in assumeutxo params")
+	ErrSnapshotHashMismatch       = errors.New("snapshot UTXO hash does not match expected value")
+	ErrSnapshotAlreadyLoaded      = errors.New("a snapshot chainstate is already loaded")
+	ErrSnapshotBlockNotFound      = errors.New("snapshot base block not found in headers")
 	ErrBackgroundValidationFailed = errors.New("background validation failed to match snapshot")
+	// Per-coin guard errors (BUG-W102-01..03)
+	ErrCoinHeightExceedsBase  = errors.New("snapshot coin height exceeds snapshot base height")
+	ErrCoinAmountOutOfRange   = errors.New("snapshot coin amount out of MoneyRange")
+	ErrCoinOutpointIndexMax   = errors.New("snapshot coin outpoint index equals max uint32 (wrap-around risk)")
+	// Trailing-bytes error (BUG-W102-04)
+	ErrSnapshotTrailingBytes  = errors.New("unexpected trailing bytes after snapshot coin data")
+	// Precondition errors (BUG-W102-05..07)
+	ErrSnapshotBaseBlockInvalid   = errors.New("snapshot base block is marked invalid")
+	ErrSnapshotBaseBlockNotOnBestChain = errors.New("snapshot base block is not on the best header chain")
+	ErrMempoolNotEmpty            = errors.New("can't activate a snapshot when mempool is not empty")
+	// Metadata cross-check error (BUG-W102-14)
+	ErrSnapshotHeightMismatch = errors.New("snapshot file metadata height does not match assumeutxo table entry height")
 )
 
 // SnapshotMagic is the magic bytes identifying a UTXO snapshot file.
@@ -378,20 +391,21 @@ func (sr *SnapshotReader) Metadata() *SnapshotMetadata {
 	return &sr.metadata
 }
 
-// LoadSnapshot loads a UTXO snapshot into a UTXOSet.
-// Returns the populated UTXO set and statistics.
-func LoadSnapshot(r io.Reader, db *storage.ChainDB, expectedNetworkMagic [4]byte) (*UTXOSet, *SnapshotLoadStats, error) {
-	sr, err := NewSnapshotReader(r)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// Verify network magic
-	if sr.metadata.NetworkMagic != expectedNetworkMagic {
-		return nil, nil, ErrNetworkMismatch
-	}
-
-	// Create new UTXO set for the snapshot
+// LoadSnapshotCoins reads coins from an already-initialised SnapshotReader and
+// populates a new UTXOSet.  baseHeight is the snapshot base block's height from
+// the assumeutxo table (obtained by ForBlockHash BEFORE calling this function —
+// see BUG-W102-15).  Per-coin guards mirror Bitcoin Core's
+// PopulateAndValidateSnapshot (validation.cpp:5814–5883):
+//
+//   - BUG-W102-01: coin.nHeight > baseHeight → ErrCoinHeightExceedsBase
+//   - BUG-W102-02: !MoneyRange(coin.out.nValue) → ErrCoinAmountOutOfRange
+//   - BUG-W102-03: outpoint.n == UINT32_MAX → ErrCoinOutpointIndexMax
+//   - BUG-W102-04: trailing bytes after coins_left==0 → ErrSnapshotTrailingBytes
+//
+// Returns the populated UTXOSet and load statistics.  Does NOT flush the set
+// (see the deferred-flush note on LoadSnapshot).
+func LoadSnapshotCoins(sr *SnapshotReader, db *storage.ChainDB, baseHeight int32) (*UTXOSet, *SnapshotLoadStats, error) {
+	r := sr.r
 	utxoSet := NewUTXOSet(db)
 	stats := &SnapshotLoadStats{
 		BlockHash: sr.metadata.BlockHash,
@@ -418,10 +432,14 @@ func LoadSnapshot(r io.Reader, db *storage.ChainDB, expectedNetworkMagic [4]byte
 
 		// Read each coin
 		for i := uint64(0); i < count; i++ {
-			// Read vout
+			// BUG-W102-03: guard outpoint index against UINT32_MAX wrap-around
+			// (Core validation.cpp:5828 — ApplyHash uses index as array key).
 			vout, err := wire.ReadCompactSize(r)
 			if err != nil {
 				return nil, nil, fmt.Errorf("failed to read vout at coin %d: %w", coinsLoaded, err)
+			}
+			if vout >= uint64(math.MaxUint32) {
+				return nil, nil, fmt.Errorf("%w: index %d at coin %d", ErrCoinOutpointIndexMax, vout, coinsLoaded)
 			}
 
 			// Read coin data
@@ -430,7 +448,20 @@ func LoadSnapshot(r io.Reader, db *storage.ChainDB, expectedNetworkMagic [4]byte
 				return nil, nil, fmt.Errorf("failed to read coin at %d: %w", coinsLoaded, err)
 			}
 
-			// Add to UTXO set
+			// BUG-W102-01: per-coin height ≤ baseHeight
+			// Core validation.cpp:5826 — coin.nHeight > snapshot_start_block->nHeight.
+			if entry.Height > baseHeight {
+				return nil, nil, fmt.Errorf("%w: coin %d has height %d > base %d",
+					ErrCoinHeightExceedsBase, coinsLoaded, entry.Height, baseHeight)
+			}
+
+			// BUG-W102-02: MoneyRange per coin
+			// Core validation.cpp:5835 — !MoneyRange(coin.out.nValue).
+			if entry.Amount < 0 || entry.Amount > MaxMoney {
+				return nil, nil, fmt.Errorf("%w: coin %d amount %d", ErrCoinAmountOutOfRange, coinsLoaded, entry.Amount)
+			}
+
+			// Add to UTXO set (all guards passed)
 			outpoint := wire.OutPoint{Hash: txid, Index: uint32(vout)}
 			utxoSet.AddUTXO(outpoint, entry)
 
@@ -445,24 +476,52 @@ func LoadSnapshot(r io.Reader, db *storage.ChainDB, expectedNetworkMagic [4]byte
 		}
 	}
 
-	// Verify we consumed all coins
-	stats.CoinsLoaded = coinsLoaded
+	// BUG-W102-04: trailing-bytes check after all coins have been consumed.
+	// Core PopulateAndValidateSnapshot:5851-5864 tries to read one more byte and
+	// expects io.EOF; any successful read is a format error.
+	var probe [1]byte
+	switch n, err := r.Read(probe[:]); {
+	case n == 0 && err != nil:
+		// io.EOF or wrapped io.EOF — expected; snapshot ends cleanly.
+	case n > 0:
+		return nil, nil, fmt.Errorf("%w after %d coins", ErrSnapshotTrailingBytes, coinsLoaded)
+	case err == nil:
+		// Read returned 0 bytes with no error — treat as trailing data present.
+		return nil, nil, fmt.Errorf("%w after %d coins (zero-byte read without EOF)", ErrSnapshotTrailingBytes, coinsLoaded)
+	}
 
-	// IMPORTANT: do NOT call utxoSet.Flush() here. Flush() invokes the
-	// post-flush eviction (utxoset.go:299) which trims the cache to
-	// maxCacheBytes/4 once cacheBytes exceeds maxCacheBytes/2. For a
-	// real-world snapshot (165M coins ≈ 30 GiB cache) the eviction
-	// throws away ~95% of the freshly-loaded coins, after which the
-	// caller's HASH_SERIALIZED computation walks the (mostly empty)
-	// cache and produces a digest that doesn't match the snapshot —
-	// so the assumeutxo whitelist check rejects every real load.
-	//
-	// The caller is now responsible for: (1) computing the content
-	// hash against the in-memory cache, and (2) calling Flush() once
-	// the hash check passes (and accepting the cache trim that
-	// follows). See loadSnapshotFromFile in cmd/blockbrew/main.go.
+	stats.CoinsLoaded = coinsLoaded
 	log.Printf("[snapshot] loaded %d coins from snapshot (deferred flush)", coinsLoaded)
 	return utxoSet, stats, nil
+}
+
+// LoadSnapshot loads a UTXO snapshot into a UTXOSet.
+// Returns the populated UTXO set and statistics.
+//
+// IMPORTANT: For production use (loadtxoutset / -loadsnapshot), callers MUST
+// perform the assumeutxo table lookup BEFORE calling this function to avoid
+// UTXOSet pollution on error (BUG-W102-15).  Use LoadSnapshotCoins directly
+// via NewSnapshotReader + ForBlockHash for that path.
+//
+// This wrapper is kept for tests and dump/load symmetry.  It uses baseHeight=0
+// which disables the per-coin height guard; callers that know baseHeight should
+// call LoadSnapshotCoins directly.
+func LoadSnapshot(r io.Reader, db *storage.ChainDB, expectedNetworkMagic [4]byte) (*UTXOSet, *SnapshotLoadStats, error) {
+	sr, err := NewSnapshotReader(r)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Verify network magic
+	if sr.metadata.NetworkMagic != expectedNetworkMagic {
+		return nil, nil, ErrNetworkMismatch
+	}
+
+	// Delegate to LoadSnapshotCoins with baseHeight=math.MaxInt32 so the
+	// per-coin height guard is a no-op for callers that don't have a table entry.
+	// (Real production loads go through loadSnapshotFromFile which passes the
+	// correct baseHeight from the assumeutxo table.)
+	return LoadSnapshotCoins(sr, db, math.MaxInt32)
 }
 
 // readCoin reads a single coin from a Bitcoin Core-format snapshot.
