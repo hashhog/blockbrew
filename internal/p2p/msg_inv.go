@@ -12,10 +12,11 @@ type InvType uint32
 // Inventory vector type constants.
 const (
 	InvTypeError         InvType = 0
-	InvTypeTx            InvType = 1
+	InvTypeTx            InvType = 1  // MSG_TX — txid announcement (legacy peers)
 	InvTypeBlock         InvType = 2
 	InvTypeFilteredBlock InvType = 3
-	InvTypeWitnessTx     InvType = 0x40000001 // MSG_WITNESS_TX
+	InvTypeWtx           InvType = 5  // MSG_WTX — wtxid announcement (BIP-339, Core protocol.h:481)
+	InvTypeWitnessTx     InvType = 0x40000001 // MSG_WITNESS_TX — BIP-144 getdata witness flag (NOT for inv announcements)
 	InvTypeWitnessBlock  InvType = 0x40000002 // MSG_WITNESS_BLOCK
 )
 

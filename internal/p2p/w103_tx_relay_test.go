@@ -72,53 +72,100 @@ func TestW103_G1_InvMaxSize(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BUG-2 (P1-CDIV) G2: MSG_WTX (type 5) is missing entirely.
+// G2 (fixed): MSG_WTX = 5 constant now defined as InvTypeWtx.
 // Bitcoin Core protocol.h:481 defines MSG_WTX = 5 (BIP-339).
-// blockbrew defines only InvTypeTx=1 and InvTypeWitnessTx=0x40000001.
-// When a peer with wtxidrelay negotiated sends us inv{MSG_WTX, hash}, blockbrew
-// will fall through to the "unknown type" path instead of treating it as a tx
-// announcement. Conversely, when blockbrew announces txs to wtxid-capable
-// peers it uses InvTypeWitnessTx=0x40000001 instead of MSG_WTX=5.
-// Bitcoin Core interprets 0x40000001 as MSG_WITNESS_TX (legacy BIP-144 for
-// getdata only, NOT for announcements), and logs "Unknown inv type" for inv
-// messages with that type.
+// InvTypeWtx=5 is for wtxid inv announcements.
+// InvTypeWitnessTx=0x40000001 is retained as a BIP-144 getdata witness flag
+// (NOT for inv announcements).
 //
-// Test: assert MSG_WTX constant is missing and that RelayTransaction always
-// uses InvTypeWitnessTx regardless of peer's wtxid support (dead type for
-// announcements).
+// G27 (fixed): RelayTransaction now selects per-peer:
+//   - wtxid-relay peers: InvTypeWtx=5 + wtxid
+//   - legacy peers:      InvTypeTx=1  + txid
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW103_G2_G27_MsgWTXMissingAndRelayAlwaysWitnessTx(t *testing.T) {
-	// BUG-2: No MSG_WTX = 5 constant defined.
-	// InvTypeTx = 1 (legacy), InvTypeWitnessTx = 0x40000001 (MSG_WITNESS_TX).
-	// MSG_WTX = 5 per BIP-339 / Core protocol.h:481.
+	// G2 FIX: InvTypeWtx=5 must be defined.
 	if InvTypeTx != 1 {
 		t.Errorf("G2: InvTypeTx = %d, want 1", InvTypeTx)
 	}
+	if InvTypeWtx != 5 {
+		t.Errorf("G2: InvTypeWtx = %d, want 5 (MSG_WTX per BIP-339 / Core protocol.h:481)", InvTypeWtx)
+	}
 	if InvTypeWitnessTx != 0x40000001 {
-		t.Errorf("G2: InvTypeWitnessTx = 0x%x, want 0x40000001", InvTypeWitnessTx)
+		t.Errorf("G2: InvTypeWitnessTx = 0x%x, want 0x40000001 (BIP-144 getdata flag)", InvTypeWitnessTx)
 	}
-	// No MSG_WTX=5 analog. Confirm InvTypeWitnessTx is not 5.
-	if InvTypeWitnessTx == 5 {
-		t.Error("G2: InvTypeWitnessTx must not be 5; MSG_WTX=5 is a distinct constant from MSG_WITNESS_TX=0x40000001")
-	}
-
-	// BUG-2/G27: RelayTransaction always announces with InvTypeWitnessTx=0x40000001
-	// regardless of whether peer supports wtxid relay.
-	// Core: announce MSG_WTX=5 when peer.m_wtxid_relay, else MSG_TX=1.
-	// Fixture: build a minimal PeerManager and call RelayTransaction; capture the
-	// inv type sent to both a wtxid-relay peer and a non-wtxid peer.
-	//
-	// We assert the underlying constant used in RelayTransaction is InvTypeWitnessTx
-	// (documenting the bug) rather than the correct conditional MSG_WTX/MSG_TX split.
-	const announcedType = InvTypeWitnessTx // BUG: should be wtxid-conditional
-	if announcedType != InvTypeWitnessTx {
-		t.Error("G27: expected RelayTransaction to use InvTypeWitnessTx (documenting BUG-2)")
+	// MSG_WTX=5 and MSG_WITNESS_TX=0x40000001 must be distinct constants.
+	if InvTypeWtx == InvTypeWitnessTx {
+		t.Error("G2: InvTypeWtx and InvTypeWitnessTx must be distinct")
 	}
 
-	// Assert wtxid peer would need MSG_WTX=5, not 0x40000001.
-	const msgWTX InvType = 5
-	if announcedType == msgWTX {
-		t.Error("G2/G27: test setup error — MSG_WTX should not equal InvTypeWitnessTx")
+	// G27 FIX: RelayTransaction selects per-peer type+hash.
+	pm := NewPeerManager(PeerManagerConfig{})
+
+	txHash := [32]byte{0x11}
+	wtxHash := [32]byte{0x22}
+
+	wtxPeer := &Peer{
+		addr:                "10.0.0.1:8333",
+		state:               PeerStateConnected,
+		sendQueue:           make(chan Message, 10),
+		quit:                make(chan struct{}),
+		wtxidRelaySupported: true,
+	}
+	wtxPeer.versionRecvd = true
+	wtxPeer.peerVersion = &MsgVersion{Relay: true}
+
+	legacyPeer := &Peer{
+		addr:                "10.0.0.2:8333",
+		state:               PeerStateConnected,
+		sendQueue:           make(chan Message, 10),
+		quit:                make(chan struct{}),
+		wtxidRelaySupported: false,
+	}
+	legacyPeer.versionRecvd = true
+	legacyPeer.peerVersion = &MsgVersion{Relay: true}
+
+	pm.mu.Lock()
+	pm.peers[wtxPeer.addr] = &PeerInfo{peer: wtxPeer, connType: ConnFullRelay}
+	pm.peers[legacyPeer.addr] = &PeerInfo{peer: legacyPeer, connType: ConnFullRelay}
+	pm.mu.Unlock()
+
+	pm.RelayTransaction(txHash, wtxHash, 1000, 250, "")
+
+	// wtxid-relay peer must receive InvTypeWtx=5 + wtxid.
+	select {
+	case msg := <-wtxPeer.sendQueue:
+		inv, ok := msg.(*MsgInv)
+		if !ok || len(inv.InvList) == 0 {
+			t.Fatal("G27: wtxid peer: expected non-empty MsgInv")
+		}
+		if inv.InvList[0].Type == InvTypeWitnessTx {
+			t.Errorf("G2/G27 BUG: InvTypeWitnessTx=0x%x must not appear in inv announcements", InvTypeWitnessTx)
+		}
+		if inv.InvList[0].Type != InvTypeWtx {
+			t.Errorf("G27: wtxid peer got type 0x%x, want InvTypeWtx=5", inv.InvList[0].Type)
+		}
+		if inv.InvList[0].Hash != wtxHash {
+			t.Errorf("G27: wtxid peer got hash %x, want wtxid %x", inv.InvList[0].Hash, wtxHash)
+		}
+	default:
+		t.Error("G27: wtxid peer got no message")
+	}
+
+	// Legacy peer must receive InvTypeTx=1 + txid.
+	select {
+	case msg := <-legacyPeer.sendQueue:
+		inv, ok := msg.(*MsgInv)
+		if !ok || len(inv.InvList) == 0 {
+			t.Fatal("G2: legacy peer: expected non-empty MsgInv")
+		}
+		if inv.InvList[0].Type != InvTypeTx {
+			t.Errorf("G2: legacy peer got type 0x%x, want InvTypeTx=1", inv.InvList[0].Type)
+		}
+		if inv.InvList[0].Hash != txHash {
+			t.Errorf("G2: legacy peer got hash %x, want txid %x", inv.InvList[0].Hash, txHash)
+		}
+	default:
+		t.Error("G2: legacy peer got no message")
 	}
 }
 
@@ -436,32 +483,87 @@ func TestW103_G19_OrphanPromotionPathExists(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G20 / BUG-20 (P2): RelayTransaction uses InvTypeWitnessTx always.
+// G20 (fixed): RelayTransaction now selects per-peer announcement type.
 // Core: wtxid-relay peers get MSG_WTX=5, non-wtxid peers get MSG_TX=1.
-// blockbrew always sends InvTypeWitnessTx=0x40000001 regardless.
-// Bitcoin Core's peer does not recognise 0x40000001 as a valid announcement
-// type in an inv message; it only uses MSG_WTX=5 and MSG_TX=1 for tx invs.
-//
-// Test: verify RelayTransaction sends to fRelay=true peers only and
-// documents the wrong inv type.
+// InvTypeWitnessTx=0x40000001 must NOT appear in inv announcements.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW103_G20_RelayTransactionBroadcastSet(t *testing.T) {
-	// Verify RelayTransaction dispatches to peers that want tx relay.
-	// We can't call pm.RelayTransaction in a unit test without a live listener
-	// setup, but we can verify the constant used in the code path.
-	//
-	// BUG-20: RelayTransaction always uses InvTypeWitnessTx.
-	// Core uses MSG_WTX=5 for wtxid peers and MSG_TX=1 for others.
+	// G20 FIX: verify correct constants are defined.
 	if InvTypeWitnessTx != 0x40000001 {
-		t.Errorf("G20: InvTypeWitnessTx = 0x%x, want 0x40000001", InvTypeWitnessTx)
+		t.Errorf("G20: InvTypeWitnessTx = 0x%x, want 0x40000001 (BIP-144 getdata flag)", InvTypeWitnessTx)
 	}
-	// Document that MSG_WTX = 5 does not exist in the codebase.
-	const msgWTX InvType = 5
-	if msgWTX == InvTypeTx || msgWTX == InvTypeWitnessTx {
-		t.Error("G20: MSG_WTX=5 collides with an existing constant (unexpected)")
+	if InvTypeWtx != 5 {
+		t.Errorf("G20: InvTypeWtx = %d, want 5 (MSG_WTX, BIP-339 announcement type)", InvTypeWtx)
 	}
-	// The correct announcement for a wtxid-relay peer would use type 5,
-	// but blockbrew uses 0x40000001 instead.
+	// InvTypeWtx=5 and InvTypeWitnessTx=0x40000001 must be distinct.
+	if InvTypeWtx == InvTypeWitnessTx {
+		t.Error("G20: InvTypeWtx and InvTypeWitnessTx must be distinct constants")
+	}
+
+	// G20 FIX: exercise RelayTransaction with both peer types and verify
+	// InvTypeWitnessTx=0x40000001 never appears in any inv announcement.
+	pm := NewPeerManager(PeerManagerConfig{})
+
+	txHash := [32]byte{0x33}
+	wtxHash := [32]byte{0x44}
+
+	for _, tc := range []struct {
+		addr    string
+		wtxid   bool
+		wantTyp InvType
+		wantHash [32]byte
+	}{
+		{"10.1.0.1:8333", true, InvTypeWtx, wtxHash},
+		{"10.1.0.2:8333", false, InvTypeTx, txHash},
+	} {
+		p := &Peer{
+			addr:                tc.addr,
+			state:               PeerStateConnected,
+			sendQueue:           make(chan Message, 10),
+			quit:                make(chan struct{}),
+			wtxidRelaySupported: tc.wtxid,
+		}
+		p.versionRecvd = true
+		p.peerVersion = &MsgVersion{Relay: true}
+		pm.mu.Lock()
+		pm.peers[tc.addr] = &PeerInfo{peer: p, connType: ConnFullRelay}
+		pm.mu.Unlock()
+	}
+
+	pm.RelayTransaction(txHash, wtxHash, 1000, 250, "")
+
+	for addr, info := range pm.peers {
+		select {
+		case msg := <-info.peer.sendQueue:
+			inv, ok := msg.(*MsgInv)
+			if !ok || len(inv.InvList) == 0 {
+				t.Errorf("G20: peer %s: expected non-empty MsgInv", addr)
+				continue
+			}
+			got := inv.InvList[0].Type
+			if got == InvTypeWitnessTx {
+				t.Errorf("G20 BUG: peer %s received InvTypeWitnessTx=0x%x (invalid for inv announcements)",
+					addr, InvTypeWitnessTx)
+			}
+			pm.mu.RLock()
+			pInfo := pm.peers[addr]
+			pm.mu.RUnlock()
+			wantTyp := InvTypeTx
+			wantHash := txHash
+			if pInfo.peer.WTxidRelay() {
+				wantTyp = InvTypeWtx
+				wantHash = wtxHash
+			}
+			if got != wantTyp {
+				t.Errorf("G20: peer %s got type 0x%x, want 0x%x", addr, got, wantTyp)
+			}
+			if inv.InvList[0].Hash != wantHash {
+				t.Errorf("G20: peer %s got hash %x, want %x", addr, inv.InvList[0].Hash, wantHash)
+			}
+		default:
+			t.Errorf("G20: peer %s got no message", addr)
+		}
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -674,62 +776,76 @@ func TestW103_G30_PeerBloomFiltersAndWhitelistForceRelay(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Integration-level: G2/G27 combined — MSG_WTX constant and announcement type.
-// Documents the full BIP-339 announcement type divergence.
+// Asserts the full BIP-339 announcement type fix (W103 FIX-15).
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW103_G2_G27_WtxidRelayAnnouncementType(t *testing.T) {
 	// Per BIP-339 and Core protocol.h:
-	//   MSG_TX         = 1   (legacy txid announcement)
-	//   MSG_WTX        = 5   (wtxid announcement, BIP-339)
-	//   MSG_WITNESS_TX = 0x40000001 (getdata request flag, BIP-144 — NOT for inv announcements)
+	//   MSG_TX         = 1            (legacy txid announcement)
+	//   MSG_WTX        = 5            (wtxid announcement, BIP-339)
+	//   MSG_WITNESS_TX = 0x40000001   (BIP-144 getdata witness flag — NOT for inv)
 	//
-	// blockbrew defines:
-	//   InvTypeTx        = 1          (correct for MSG_TX)
-	//   InvTypeWitnessTx = 0x40000001 (correct for MSG_WITNESS_TX getdata flag)
-	//   MSG_WTX = 5 is ABSENT
-	//
-	// RelayTransaction always uses InvTypeWitnessTx=0x40000001 for announcements.
-	// Core rejects inv{0x40000001, hash} as unknown type.
-	// Core expects inv{5, wtxid} for wtxid-relay peers.
-	//
-	// This is a consensus-divergent announcement type (CDIV-1).
+	// blockbrew now defines InvTypeWtx=5 and selects per-peer in RelayTransaction.
 
-	// Verify type values.
+	// Verify all three type constants.
 	if InvTypeTx != 1 {
 		t.Errorf("InvTypeTx = %d, want 1", InvTypeTx)
+	}
+	if InvTypeWtx != 5 {
+		t.Errorf("InvTypeWtx = %d, want 5 (MSG_WTX, BIP-339)", InvTypeWtx)
 	}
 	if InvTypeWitnessTx != 0x40000001 {
 		t.Errorf("InvTypeWitnessTx = 0x%x, want 0x40000001", InvTypeWitnessTx)
 	}
-
-	// MSG_WTX=5 is a separate constant that Core uses for inv announcements
-	// from wtxid-relay peers. It must not equal InvTypeWitnessTx.
-	const msgWTXCore InvType = 5 // Core MSG_WTX
-	if msgWTXCore == InvTypeWitnessTx {
-		t.Error("MSG_WTX=5 and MSG_WITNESS_TX=0x40000001 must be distinct")
+	// All three must be distinct.
+	if InvTypeWtx == InvTypeWitnessTx {
+		t.Error("InvTypeWtx and InvTypeWitnessTx must be distinct")
 	}
-	if msgWTXCore == InvTypeTx {
-		t.Error("MSG_WTX=5 and MSG_TX=1 must be distinct")
+	if InvTypeWtx == InvTypeTx {
+		t.Error("InvTypeWtx and InvTypeTx must be distinct")
 	}
 
-	// Peer with wtxid relay support: should receive inv{MSG_WTX=5, wtxid}.
-	// Peer without wtxid relay:       should receive inv{MSG_TX=1, txid}.
-	// blockbrew always sends inv{InvTypeWitnessTx=0x40000001, txHash}.
-	// None of these are correct.
+	// Peer with wtxid relay support: must receive inv{InvTypeWtx=5, wtxid}.
+	pm := NewPeerManager(PeerManagerConfig{})
+	txHash := [32]byte{0x55}
+	wtxHash := [32]byte{0x66}
+
 	p := &Peer{
-		addr:        "1.2.3.4:8333",
-		sendQueue:   make(chan Message, SendQueueSize),
-		quit:        make(chan struct{}),
-		peerVersion: &MsgVersion{Relay: true},
+		addr:                "1.2.3.4:8333",
+		state:               PeerStateConnected,
+		sendQueue:           make(chan Message, SendQueueSize),
+		quit:                make(chan struct{}),
+		peerVersion:         &MsgVersion{Relay: true},
+		wtxidRelaySupported: true,
 	}
-	p.mu.Lock()
-	p.wtxidRelaySupported = true
-	p.mu.Unlock()
+	p.versionRecvd = true
+	pm.mu.Lock()
+	pm.peers[p.addr] = &PeerInfo{peer: p, connType: ConnFullRelay}
+	pm.mu.Unlock()
 
 	if !p.WTxidRelay() {
-		t.Error("peer should report wtxid relay support after flag set")
+		t.Fatal("peer should report wtxid relay support after flag set")
 	}
-	// For this peer, the correct announcement type is MSG_WTX=5.
-	// blockbrew would use InvTypeWitnessTx=0x40000001 (wrong).
+
+	pm.RelayTransaction(txHash, wtxHash, 1000, 250, "")
+
+	select {
+	case msg := <-p.sendQueue:
+		inv, ok := msg.(*MsgInv)
+		if !ok || len(inv.InvList) == 0 {
+			t.Fatal("G2/G27: expected non-empty MsgInv")
+		}
+		if inv.InvList[0].Type == InvTypeWitnessTx {
+			t.Errorf("G2/G27 BUG: InvTypeWitnessTx=0x%x must not appear in inv announcements", InvTypeWitnessTx)
+		}
+		if inv.InvList[0].Type != InvTypeWtx {
+			t.Errorf("G2/G27: wtxid peer got type 0x%x, want InvTypeWtx=5", inv.InvList[0].Type)
+		}
+		if inv.InvList[0].Hash != wtxHash {
+			t.Errorf("G2/G27: wtxid peer got hash %x, want wtxid %x", inv.InvList[0].Hash, wtxHash)
+		}
+	default:
+		t.Error("G2/G27: wtxid peer got no message from RelayTransaction")
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
