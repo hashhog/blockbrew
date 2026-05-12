@@ -88,7 +88,7 @@ type MempoolProvider interface {
 // HeaderIndexProvider provides header index access for template generation.
 type HeaderIndexProvider interface {
 	GetNode(hash wire.Hash256) *consensus.BlockNode
-	AddHeader(header wire.BlockHeader) (*consensus.BlockNode, error)
+	AddHeader(header wire.BlockHeader, minPowChecked bool) (*consensus.BlockNode, error)
 }
 
 // UTXOViewProvider returns the current UTXO view. Used by the template
@@ -670,9 +670,12 @@ func (m *BlockMiner) GenerateBlock(coinbaseScript []byte, txs []*wire.MsgTx, max
 		}
 	}
 
-	// Add the block header to the header index so ConnectBlock can find it
+	// Add the block header to the header index so ConnectBlock can find it.
+	// minPowChecked=true: the miner assembled this block locally; its chain
+	// work is already known to meet the threshold (we are mining on top of the
+	// active tip which is necessarily above MinimumChainWork).
 	if m.headerIndex != nil {
-		if _, err := m.headerIndex.AddHeader(block.Header); err != nil {
+		if _, err := m.headerIndex.AddHeader(block.Header, true); err != nil {
 			return wire.Hash256{}, fmt.Errorf("failed to add header to index: %w", err)
 		}
 	}

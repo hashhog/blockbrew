@@ -1828,9 +1828,12 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		return bip22ResultString(err), nil
 	}
 
-	// Add header to index
+	// Add header to index.
+	// minPowChecked=false: submitblock arrives from an external caller (RPC
+	// client / miner) that has NOT passed through the PRESYNC pipeline.
+	// AddHeader will enforce the MinimumChainWork gate itself.
 	hash := block.Header.BlockHash()
-	if _, err := s.headerIndex.AddHeader(block.Header); err != nil {
+	if _, err := s.headerIndex.AddHeader(block.Header, false); err != nil {
 		// If duplicate, that's OK — return "duplicate" per BIP-22
 		if errors.Is(err, consensus.ErrDuplicateHeader) {
 			return "duplicate", nil
@@ -1848,7 +1851,7 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	// Add header to index before connecting (ignore duplicate — headers may
 	// already be present from P2P header sync).
 	if s.chainMgr != nil {
-		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil && !errors.Is(err, consensus.ErrDuplicateHeader) {
+		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header, false); err != nil && !errors.Is(err, consensus.ErrDuplicateHeader) {
 			return bip22ResultString(err), nil
 		}
 
@@ -1950,7 +1953,8 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interfac
 		}
 
 		hash := block.Header.BlockHash()
-		if _, err := s.headerIndex.AddHeader(block.Header); err != nil && err != consensus.ErrDuplicateHeader {
+		// minPowChecked=false: same as submitblock — external caller, no PRESYNC.
+		if _, err := s.headerIndex.AddHeader(block.Header, false); err != nil && err != consensus.ErrDuplicateHeader {
 			results[i] = fmt.Sprintf("header validation failed: %v", err)
 			continue
 		}
@@ -1963,7 +1967,7 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interfac
 		}
 
 		if s.chainMgr != nil {
-			if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header); err != nil && err != consensus.ErrDuplicateHeader {
+			if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header, false); err != nil && err != consensus.ErrDuplicateHeader {
 				results[i] = fmt.Sprintf("failed to add header: %v", err)
 				continue
 			}

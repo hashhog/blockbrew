@@ -120,7 +120,7 @@ func TestConnectBlockValidBlock(t *testing.T) {
 	blockHash := block.Header.BlockHash()
 
 	// Add header to index first
-	_, err := idx.AddHeader(block.Header)
+	_, err := idx.AddHeader(block.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add header: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestConnectBlockInvalidPoW(t *testing.T) {
 	}
 
 	// Try to add header - should fail due to invalid PoW
-	_, err := idx.AddHeader(block.Header)
+	_, err := idx.AddHeader(block.Header, true)
 	if err == nil {
 		t.Error("expected error for invalid PoW header")
 	}
@@ -264,7 +264,7 @@ func TestConnectBlockInvalidTransaction(t *testing.T) {
 	}
 
 	// Add header to index
-	_, err := idx.AddHeader(block.Header)
+	_, err := idx.AddHeader(block.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add header: %v", err)
 	}
@@ -291,7 +291,7 @@ func TestChainReorg(t *testing.T) {
 
 	// Build chain A: genesis -> A1 -> A2
 	blockA1 := createTestBlock(t, params, genesis, nil)
-	nodeA1, err := idx.AddHeader(blockA1.Header)
+	nodeA1, err := idx.AddHeader(blockA1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add A1 header: %v", err)
 	}
@@ -301,7 +301,7 @@ func TestChainReorg(t *testing.T) {
 	}
 
 	blockA2 := createTestBlock(t, params, nodeA1, nil)
-	nodeA2, err := idx.AddHeader(blockA2.Header)
+	nodeA2, err := idx.AddHeader(blockA2.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add A2 header: %v", err)
 	}
@@ -329,21 +329,21 @@ func TestChainReorg(t *testing.T) {
 		}
 	}
 
-	nodeB1, err := idx.AddHeader(blockB1.Header)
+	nodeB1, err := idx.AddHeader(blockB1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add B1 header: %v", err)
 	}
 	db.StoreBlock(blockB1.Header.BlockHash(), blockB1)
 
 	blockB2 := createTestBlock(t, params, nodeB1, nil)
-	nodeB2, err := idx.AddHeader(blockB2.Header)
+	nodeB2, err := idx.AddHeader(blockB2.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add B2 header: %v", err)
 	}
 	db.StoreBlock(blockB2.Header.BlockHash(), blockB2)
 
 	blockB3 := createTestBlock(t, params, nodeB2, nil)
-	nodeB3, err := idx.AddHeader(blockB3.Header)
+	nodeB3, err := idx.AddHeader(blockB3.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add B3 header: %v", err)
 	}
@@ -410,7 +410,7 @@ func TestUTXOSetUpdates(t *testing.T) {
 
 	// Create and connect first block
 	block1 := createTestBlock(t, params, genesis, nil)
-	_, err := idx.AddHeader(block1.Header)
+	_, err := idx.AddHeader(block1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add header: %v", err)
 	}
@@ -468,7 +468,7 @@ func TestConnectDisconnectRestoresUTXO(t *testing.T) {
 	// Connect block 1 (just a coinbase)
 	block1 := createTestBlock(t, params, genesis, nil)
 	block1Hash := block1.Header.BlockHash()
-	node1, err := idx.AddHeader(block1.Header)
+	node1, err := idx.AddHeader(block1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add block1 header: %v", err)
 	}
@@ -490,7 +490,7 @@ func TestConnectDisconnectRestoresUTXO(t *testing.T) {
 	// Connect block 2 (another coinbase only)
 	block2 := createTestBlock(t, params, node1, nil)
 	block2Hash := block2.Header.BlockHash()
-	_, err = idx.AddHeader(block2.Header)
+	_, err = idx.AddHeader(block2.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add block2 header: %v", err)
 	}
@@ -562,7 +562,7 @@ func TestBlockUndoPersistence(t *testing.T) {
 	// Connect a block
 	block1 := createTestBlock(t, params, genesis, nil)
 	block1Hash := block1.Header.BlockHash()
-	_, err := idx.AddHeader(block1.Header)
+	_, err := idx.AddHeader(block1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add header: %v", err)
 	}
@@ -611,7 +611,7 @@ func TestInvalidateBlock(t *testing.T) {
 
 	// Build a chain: genesis -> block1 -> block2 -> block3
 	block1 := createTestBlock(t, params, genesis, nil)
-	node1, err := idx.AddHeader(block1.Header)
+	node1, err := idx.AddHeader(block1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add block1 header: %v", err)
 	}
@@ -621,7 +621,7 @@ func TestInvalidateBlock(t *testing.T) {
 	}
 
 	block2 := createTestBlock(t, params, node1, nil)
-	node2, err := idx.AddHeader(block2.Header)
+	node2, err := idx.AddHeader(block2.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add block2 header: %v", err)
 	}
@@ -631,7 +631,7 @@ func TestInvalidateBlock(t *testing.T) {
 	}
 
 	block3 := createTestBlock(t, params, node2, nil)
-	node3, err := idx.AddHeader(block3.Header)
+	node3, err := idx.AddHeader(block3.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add block3 header: %v", err)
 	}
@@ -688,7 +688,7 @@ func TestInvalidateBlockNonMainChain(t *testing.T) {
 
 	// Build main chain: genesis -> block1
 	block1 := createTestBlock(t, params, genesis, nil)
-	node1, err := idx.AddHeader(block1.Header)
+	node1, err := idx.AddHeader(block1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add block1 header: %v", err)
 	}
@@ -709,7 +709,7 @@ func TestInvalidateBlockNonMainChain(t *testing.T) {
 			break
 		}
 	}
-	forkNode, err := idx.AddHeader(forkBlock.Header)
+	forkNode, err := idx.AddHeader(forkBlock.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add fork header: %v", err)
 	}
@@ -752,7 +752,7 @@ func TestReconsiderBlock(t *testing.T) {
 
 	// Build a chain: genesis -> block1 -> block2
 	block1 := createTestBlock(t, params, genesis, nil)
-	node1, err := idx.AddHeader(block1.Header)
+	node1, err := idx.AddHeader(block1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add block1 header: %v", err)
 	}
@@ -762,7 +762,7 @@ func TestReconsiderBlock(t *testing.T) {
 	}
 
 	block2 := createTestBlock(t, params, node1, nil)
-	node2, err := idx.AddHeader(block2.Header)
+	node2, err := idx.AddHeader(block2.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add block2 header: %v", err)
 	}
@@ -820,7 +820,7 @@ func TestPreciousBlock(t *testing.T) {
 
 	// Build chain A: genesis -> A1
 	blockA1 := createTestBlock(t, params, genesis, nil)
-	nodeA1, err := idx.AddHeader(blockA1.Header)
+	nodeA1, err := idx.AddHeader(blockA1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add A1 header: %v", err)
 	}
@@ -841,7 +841,7 @@ func TestPreciousBlock(t *testing.T) {
 			break
 		}
 	}
-	nodeB1, err := idx.AddHeader(blockB1.Header)
+	nodeB1, err := idx.AddHeader(blockB1.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add B1 header: %v", err)
 	}
@@ -919,7 +919,7 @@ func TestStartupRecoverySavedTipPresent(t *testing.T) {
 	genesis := idx.Genesis()
 	block := createTestBlock(t, params, genesis, nil)
 	blockHash := block.Header.BlockHash()
-	if _, err := idx.AddHeader(block.Header); err != nil {
+	if _, err := idx.AddHeader(block.Header, true); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 	// Persist the height->hash mapping and saved chain state at height 1.
@@ -990,7 +990,7 @@ func TestStartupRecoverySavedTipMissingThenReload(t *testing.T) {
 	}
 
 	// Simulate P2P header sync catching up.
-	if _, err := idx.AddHeader(block1.Header); err != nil {
+	if _, err := idx.AddHeader(block1.Header, true); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 
@@ -1030,7 +1030,7 @@ func TestStartupRecoveryUnreachableTipStaysAtGenesis(t *testing.T) {
 	genesis := idx.Genesis()
 	block1 := createTestBlock(t, params, genesis, nil)
 	block1Hash := block1.Header.BlockHash()
-	if _, err := idx.AddHeader(block1.Header); err != nil {
+	if _, err := idx.AddHeader(block1.Header, true); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 	if err := db.SetBlockHeight(1, block1Hash); err != nil {
@@ -1053,7 +1053,7 @@ func TestStartupRecoveryUnreachableTipStaysAtGenesis(t *testing.T) {
 		Height: 1,
 		Header: block1.Header,
 	}, nil)
-	if _, err := idx.AddHeader(block2.Header); err != nil {
+	if _, err := idx.AddHeader(block2.Header, true); err != nil {
 		t.Fatalf("AddHeader block2: %v", err)
 	}
 
@@ -1090,7 +1090,7 @@ func TestStartupRecoveryDeferredUntilHeadersPast(t *testing.T) {
 	genesis := idx.Genesis()
 	block1 := createTestBlock(t, params, genesis, nil)
 	block1Hash := block1.Header.BlockHash()
-	if _, err := idx.AddHeader(block1.Header); err != nil {
+	if _, err := idx.AddHeader(block1.Header, true); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 	if err := db.SetBlockHeight(1, block1Hash); err != nil {
@@ -1184,7 +1184,7 @@ func TestConnectBlockOneGetUTXOPerInputW69d(t *testing.T) {
 	block := createTestBlock(t, params, idx.Genesis(), []*wire.MsgTx{spendTx})
 	blockHash := block.Header.BlockHash()
 
-	if _, err := idx.AddHeader(block.Header); err != nil {
+	if _, err := idx.AddHeader(block.Header, true); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 	if err := db.StoreBlock(blockHash, block); err != nil {
@@ -1275,7 +1275,7 @@ func TestVerifyChainstateConsistencyClean(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		blk := createTestBlock(t, params, prev, nil)
 		hash := blk.Header.BlockHash()
-		node, err := idx.AddHeader(blk.Header)
+		node, err := idx.AddHeader(blk.Header, true)
 		if err != nil {
 			t.Fatalf("AddHeader %d: %v", i, err)
 		}
@@ -1327,7 +1327,7 @@ func TestVerifyChainstateConsistencyMissingBlockBody(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		blk := createTestBlock(t, params, prev, nil)
 		hash := blk.Header.BlockHash()
-		node, err := idx.AddHeader(blk.Header)
+		node, err := idx.AddHeader(blk.Header, true)
 		if err != nil {
 			t.Fatalf("AddHeader %d: %v", i, err)
 		}
@@ -1422,7 +1422,7 @@ func TestAtomicShutdownFlushBatch(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		blk := createTestBlock(t, params, prev, nil)
 		hash := blk.Header.BlockHash()
-		node, err := idx.AddHeader(blk.Header)
+		node, err := idx.AddHeader(blk.Header, true)
 		if err != nil {
 			t.Fatalf("AddHeader %d: %v", i, err)
 		}
@@ -1549,7 +1549,7 @@ func createSiblingBlock(t *testing.T, params *ChainParams, prevNode *BlockNode, 
 // ErrSideBranchAccepted / other-error).
 func submitBlockToManager(t *testing.T, cm *ChainManager, idx *HeaderIndex, db *storage.ChainDB, block *wire.MsgBlock) error {
 	t.Helper()
-	if _, err := idx.AddHeader(block.Header); err != nil {
+	if _, err := idx.AddHeader(block.Header, true); err != nil {
 		return err
 	}
 	if err := db.StoreBlock(block.Header.BlockHash(), block); err != nil {
@@ -1795,7 +1795,7 @@ func TestDisconnectBlock_FiresOnBlockDisconnectedCallback(t *testing.T) {
 	genesis := idx.Genesis()
 	a1 := createTestBlock(t, params, genesis, nil)
 	a1Hash := a1.Header.BlockHash()
-	if _, err := idx.AddHeader(a1.Header); err != nil {
+	if _, err := idx.AddHeader(a1.Header, true); err != nil {
 		t.Fatalf("add A1 header: %v", err)
 	}
 	if err := db.StoreBlock(a1Hash, a1); err != nil {
@@ -1852,7 +1852,7 @@ func TestSetOnBlockDisconnected_PostConstruction(t *testing.T) {
 
 	genesis := idx.Genesis()
 	a1 := createTestBlock(t, params, genesis, nil)
-	if _, err := idx.AddHeader(a1.Header); err != nil {
+	if _, err := idx.AddHeader(a1.Header, true); err != nil {
 		t.Fatalf("add A1 header: %v", err)
 	}
 	if err := db.StoreBlock(a1.Header.BlockHash(), a1); err != nil {
@@ -1899,7 +1899,7 @@ func TestReorgTo_FiresOnBlockDisconnectedPerPeel(t *testing.T) {
 
 	// Chain A: A1, A2 (becomes initial tip).
 	a1 := createTestBlock(t, params, genesis, nil)
-	nodeA1, err := idx.AddHeader(a1.Header)
+	nodeA1, err := idx.AddHeader(a1.Header, true)
 	if err != nil {
 		t.Fatalf("A1 header: %v", err)
 	}
@@ -1911,7 +1911,7 @@ func TestReorgTo_FiresOnBlockDisconnectedPerPeel(t *testing.T) {
 	}
 
 	a2 := createTestBlock(t, params, nodeA1, nil)
-	if _, err := idx.AddHeader(a2.Header); err != nil {
+	if _, err := idx.AddHeader(a2.Header, true); err != nil {
 		t.Fatalf("A2 header: %v", err)
 	}
 	if err := db.StoreBlock(a2.Header.BlockHash(), a2); err != nil {
@@ -1923,7 +1923,7 @@ func TestReorgTo_FiresOnBlockDisconnectedPerPeel(t *testing.T) {
 
 	// Chain B: B1, B2, B3 (heavier). Use createSiblingBlock for distinct hashes.
 	b1 := createSiblingBlock(t, params, genesis, 0xB1)
-	nodeB1, err := idx.AddHeader(b1.Header)
+	nodeB1, err := idx.AddHeader(b1.Header, true)
 	if err != nil {
 		t.Fatalf("B1 header: %v", err)
 	}
@@ -1932,7 +1932,7 @@ func TestReorgTo_FiresOnBlockDisconnectedPerPeel(t *testing.T) {
 	}
 
 	b2 := createSiblingBlock(t, params, nodeB1, 0xB2)
-	nodeB2, err := idx.AddHeader(b2.Header)
+	nodeB2, err := idx.AddHeader(b2.Header, true)
 	if err != nil {
 		t.Fatalf("B2 header: %v", err)
 	}
@@ -1941,7 +1941,7 @@ func TestReorgTo_FiresOnBlockDisconnectedPerPeel(t *testing.T) {
 	}
 
 	b3 := createSiblingBlock(t, params, nodeB2, 0xB3)
-	nodeB3, err := idx.AddHeader(b3.Header)
+	nodeB3, err := idx.AddHeader(b3.Header, true)
 	if err != nil {
 		t.Fatalf("B3 header: %v", err)
 	}
@@ -2080,7 +2080,7 @@ func TestConnectBlock_FiresOnBlockConnectedCallback(t *testing.T) {
 	genesis := idx.Genesis()
 	a1 := createTestBlock(t, params, genesis, nil)
 	a1Hash := a1.Header.BlockHash()
-	if _, err := idx.AddHeader(a1.Header); err != nil {
+	if _, err := idx.AddHeader(a1.Header, true); err != nil {
 		t.Fatalf("add A1 header: %v", err)
 	}
 	if err := db.StoreBlock(a1Hash, a1); err != nil {
@@ -2129,7 +2129,7 @@ func TestSetOnBlockConnected_PostConstruction(t *testing.T) {
 
 	genesis := idx.Genesis()
 	a1 := createTestBlock(t, params, genesis, nil)
-	if _, err := idx.AddHeader(a1.Header); err != nil {
+	if _, err := idx.AddHeader(a1.Header, true); err != nil {
 		t.Fatalf("add A1 header: %v", err)
 	}
 	if err := db.StoreBlock(a1.Header.BlockHash(), a1); err != nil {
@@ -2233,7 +2233,7 @@ func TestReorgTo_FiresOnBlockConnectedPerReplay(t *testing.T) {
 
 	// A-chain: 2 blocks via the happy ConnectBlock path.
 	a1 := createTestBlock(t, params, genesis, nil)
-	nodeA1, err := idx.AddHeader(a1.Header)
+	nodeA1, err := idx.AddHeader(a1.Header, true)
 	if err != nil {
 		t.Fatalf("A1 header: %v", err)
 	}
@@ -2245,7 +2245,7 @@ func TestReorgTo_FiresOnBlockConnectedPerReplay(t *testing.T) {
 	}
 
 	a2 := createTestBlock(t, params, nodeA1, nil)
-	if _, err := idx.AddHeader(a2.Header); err != nil {
+	if _, err := idx.AddHeader(a2.Header, true); err != nil {
 		t.Fatalf("A2 header: %v", err)
 	}
 	if err := db.StoreBlock(a2.Header.BlockHash(), a2); err != nil {
@@ -2257,7 +2257,7 @@ func TestReorgTo_FiresOnBlockConnectedPerReplay(t *testing.T) {
 
 	// B-chain: 3 sibling blocks (heavier).
 	b1 := createSiblingBlock(t, params, genesis, 0xB1)
-	nodeB1, err := idx.AddHeader(b1.Header)
+	nodeB1, err := idx.AddHeader(b1.Header, true)
 	if err != nil {
 		t.Fatalf("B1 header: %v", err)
 	}
@@ -2266,7 +2266,7 @@ func TestReorgTo_FiresOnBlockConnectedPerReplay(t *testing.T) {
 	}
 
 	b2 := createSiblingBlock(t, params, nodeB1, 0xB2)
-	nodeB2, err := idx.AddHeader(b2.Header)
+	nodeB2, err := idx.AddHeader(b2.Header, true)
 	if err != nil {
 		t.Fatalf("B2 header: %v", err)
 	}
@@ -2275,7 +2275,7 @@ func TestReorgTo_FiresOnBlockConnectedPerReplay(t *testing.T) {
 	}
 
 	b3 := createSiblingBlock(t, params, nodeB2, 0xB3)
-	nodeB3, err := idx.AddHeader(b3.Header)
+	nodeB3, err := idx.AddHeader(b3.Header, true)
 	if err != nil {
 		t.Fatalf("B3 header: %v", err)
 	}
@@ -2376,7 +2376,7 @@ func TestReorgTo_CurrentReorgBatchVisibleToHooks(t *testing.T) {
 	// A-chain: A1, A2 via the per-block ConnectBlock path (no reorg yet,
 	// so CurrentReorgBatch must be nil for both fires).
 	a1 := createTestBlock(t, params, genesis, nil)
-	nodeA1, err := idx.AddHeader(a1.Header)
+	nodeA1, err := idx.AddHeader(a1.Header, true)
 	if err != nil {
 		t.Fatalf("A1 header: %v", err)
 	}
@@ -2388,7 +2388,7 @@ func TestReorgTo_CurrentReorgBatchVisibleToHooks(t *testing.T) {
 	}
 
 	a2 := createTestBlock(t, params, nodeA1, nil)
-	if _, err := idx.AddHeader(a2.Header); err != nil {
+	if _, err := idx.AddHeader(a2.Header, true); err != nil {
 		t.Fatalf("A2 header: %v", err)
 	}
 	if err := db.StoreBlock(a2.Header.BlockHash(), a2); err != nil {
@@ -2414,7 +2414,7 @@ func TestReorgTo_CurrentReorgBatchVisibleToHooks(t *testing.T) {
 
 	// B-chain: B1, B2, B3 (heavier). Use createSiblingBlock for distinct hashes.
 	b1 := createSiblingBlock(t, params, genesis, 0xB1)
-	nodeB1, err := idx.AddHeader(b1.Header)
+	nodeB1, err := idx.AddHeader(b1.Header, true)
 	if err != nil {
 		t.Fatalf("B1 header: %v", err)
 	}
@@ -2423,7 +2423,7 @@ func TestReorgTo_CurrentReorgBatchVisibleToHooks(t *testing.T) {
 	}
 
 	b2 := createSiblingBlock(t, params, nodeB1, 0xB2)
-	nodeB2, err := idx.AddHeader(b2.Header)
+	nodeB2, err := idx.AddHeader(b2.Header, true)
 	if err != nil {
 		t.Fatalf("B2 header: %v", err)
 	}
@@ -2432,7 +2432,7 @@ func TestReorgTo_CurrentReorgBatchVisibleToHooks(t *testing.T) {
 	}
 
 	b3 := createSiblingBlock(t, params, nodeB2, 0xB3)
-	nodeB3, err := idx.AddHeader(b3.Header)
+	nodeB3, err := idx.AddHeader(b3.Header, true)
 	if err != nil {
 		t.Fatalf("B3 header: %v", err)
 	}
@@ -2658,7 +2658,7 @@ func buildPatternDFork(
 	prev := genesis
 	for i := 0; i < aLen; i++ {
 		blk := createSiblingBlock(t, params, prev, byte(0xA0+i))
-		if _, err := idx.AddHeader(blk.Header); err != nil {
+		if _, err := idx.AddHeader(blk.Header, true); err != nil {
 			t.Fatalf("A%d AddHeader: %v", i+1, err)
 		}
 		if err := db.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
@@ -2677,7 +2677,7 @@ func buildPatternDFork(
 	bPath = make([]*BlockNode, 0, bLen)
 	for i := 0; i < bLen; i++ {
 		blk := createSiblingBlock(t, params, bPrev, byte(0xB0+i))
-		node, err := idx.AddHeader(blk.Header)
+		node, err := idx.AddHeader(blk.Header, true)
 		if err != nil {
 			t.Fatalf("B%d AddHeader: %v", i+1, err)
 		}
@@ -2869,7 +2869,7 @@ func TestReorgTo_MaxReorgDepthCap(t *testing.T) {
 	prev := genesis
 	for i := 0; i < MaxReorgDepth+1; i++ {
 		blk := createSiblingBlock(t, params, prev, byte(0x40+(i%160)))
-		if _, err := idx.AddHeader(blk.Header); err != nil {
+		if _, err := idx.AddHeader(blk.Header, true); err != nil {
 			t.Fatalf("A%d AddHeader: %v", i+1, err)
 		}
 		if err := chainDB.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
@@ -2888,7 +2888,7 @@ func TestReorgTo_MaxReorgDepthCap(t *testing.T) {
 	bPrev := genesis
 	for i := 0; i < MaxReorgDepth+2; i++ {
 		blk := createSiblingBlock(t, params, bPrev, byte(0xC0+(i%64)))
-		node, err := idx.AddHeader(blk.Header)
+		node, err := idx.AddHeader(blk.Header, true)
 		if err != nil {
 			t.Fatalf("B%d AddHeader: %v", i+1, err)
 		}

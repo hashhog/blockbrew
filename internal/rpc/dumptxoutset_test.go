@@ -117,7 +117,7 @@ func newDumpTxOutSetTestRig(t *testing.T, nBlocks int) *dumpTxOutSetTestRig {
 	prev := idx.Genesis()
 	for i := 0; i < nBlocks; i++ {
 		blk := buildRegtestBlock(t, params, prev)
-		node, err := idx.AddHeader(blk.Header)
+		node, err := idx.AddHeader(blk.Header, true)
 		if err != nil {
 			t.Fatalf("AddHeader at height %d: %v", prev.Height+1, err)
 		}

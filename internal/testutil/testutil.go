@@ -145,8 +145,10 @@ func MineNextBlock(t *testing.T, tc *TestChain) *wire.MsgBlock {
 		}
 	}
 
-	// Add header to index
-	_, err := tc.HeaderIndex.AddHeader(block.Header)
+	// Add header to index.
+	// minPowChecked=true: test helper mines blocks with valid regtest PoW;
+	// chain work is trusted for test purposes.
+	_, err := tc.HeaderIndex.AddHeader(block.Header, true)
 	if err != nil {
 		t.Fatalf("failed to add header to index: %v", err)
 	}

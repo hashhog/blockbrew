@@ -1860,8 +1860,10 @@ func handleImportBlocks(args []string) {
 			log.Fatalf("Error deserializing block at height %d: %v", frameHeight, err)
 		}
 
-		// Add header to header index (required by ConnectBlock)
-		_, err = headerIndex.AddHeader(block.Header)
+		// Add header to header index (required by ConnectBlock).
+		// minPowChecked=true: this is the import/replay path loading blocks
+		// from a trusted flat-file; the chain's work has already been validated.
+		_, err = headerIndex.AddHeader(block.Header, true)
 		if err != nil && err != consensus.ErrDuplicateHeader {
 			log.Fatalf("Error adding header at height %d: %v", frameHeight, err)
 		}
