@@ -307,7 +307,7 @@ func TestSyncManagerHandleGetHeaders(t *testing.T) {
 			prevNode.Header.Timestamp+600,
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -691,7 +691,7 @@ func TestSyncManagerHandleBlock(t *testing.T) {
 	blockHash := header.BlockHash()
 
 	// Add header to index
-	_, err := idx.AddHeader(header)
+	_, err := idx.AddHeader(header, true)
 	if err != nil {
 		t.Fatalf("failed to add header: %v", err)
 	}

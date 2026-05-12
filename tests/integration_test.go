@@ -49,7 +49,7 @@ func TestRegtestBlockProcessing(t *testing.T) {
 		block := createRegtestBlock(t, prevBlock, i, params, headerIndex)
 
 		// Add header to index first
-		_, err := headerIndex.AddHeader(block.Header)
+		_, err := headerIndex.AddHeader(block.Header, true)
 		if err != nil {
 			t.Fatalf("AddHeader at height %d failed: %v", i, err)
 		}
@@ -258,7 +258,7 @@ func TestRegtestHeaderIndex(t *testing.T) {
 			}
 		}
 
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("AddHeader at height %d failed: %v", i, err)
 		}
@@ -415,7 +415,7 @@ func TestRegtestMiningAndValidation(t *testing.T) {
 	}
 
 	// Add header and store block
-	_, err = headerIndex.AddHeader(block.Header)
+	_, err = headerIndex.AddHeader(block.Header, true)
 	if err != nil {
 		t.Fatalf("AddHeader failed: %v", err)
 	}

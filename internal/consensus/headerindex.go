@@ -22,6 +22,12 @@ var (
 	ErrBadDifficulty         = errors.New("header has incorrect difficulty bits")
 	ErrCheckpointMismatch    = errors.New("header does not match checkpoint")
 	ErrForkBeforeCheckpoint  = errors.New("fork before last checkpoint is not allowed")
+	// ErrTooLittleChainwork is returned by AddHeader when minPowChecked is false
+	// and the header's cumulative chain work does not meet the network's
+	// MinimumChainWork threshold.  Mirrors Bitcoin Core validation.cpp:4229:
+	//   if (!min_pow_checked)
+	//       return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
+	ErrTooLittleChainwork    = errors.New("too-little-chainwork")
 )
 
 // headerNowUnix returns the current wall-clock time in seconds since epoch.
@@ -364,7 +370,27 @@ func mustParseHash(s string) wire.Hash256 {
 }
 
 // AddHeader adds a validated header to the index. Returns the new BlockNode.
-func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
+//
+// minPowChecked must be true when the caller has already verified that the
+// header sits on a chain whose cumulative work meets or exceeds the network's
+// MinimumChainWork threshold (e.g. after the PRESYNC/REDOWNLOAD pipeline, or
+// for locally-generated blocks).  When false, AddHeader enforces the
+// MinimumChainWork gate itself: if the new header's cumulative work would
+// remain below MinimumChainWork the call is rejected with ErrTooLittleChainwork.
+//
+// This mirrors Bitcoin Core validation.cpp AcceptBlockHeader (line 4229):
+//
+//	if (!min_pow_checked) {
+//	    return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
+//	}
+//
+// Callers:
+//   - PRESYNC/REDOWNLOAD pipeline (addValidatedHeaders): pass true.
+//   - P2P unsolicited blocks (HandleBlock): pass false.
+//   - submitblock RPC: pass false.
+//   - Local miner / import path: pass true (blocks are locally generated or
+//     already trusted).
+func (idx *HeaderIndex) AddHeader(header wire.BlockHeader, minPowChecked bool) (*BlockNode, error) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
@@ -448,6 +474,20 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader) (*BlockNode, error) {
 	// Calculate total work
 	work := CalcWork(header.Bits)
 	totalWork := new(big.Int).Add(parent.TotalWork, work)
+
+	// G8. min_pow_checked gate (Bitcoin Core validation.cpp:4229).
+	// When the caller has NOT vouched for the cumulative work (e.g. a peer
+	// that bypassed the PRESYNC pipeline), verify that the new chain tip's
+	// total work meets the network's MinimumChainWork threshold.  This
+	// prevents low-work header flooding from peers that skip PRESYNC — they
+	// cannot grow the index with headers that don't contribute enough PoW.
+	// Regtest and other networks with MinimumChainWork == 0 are unaffected.
+	if !minPowChecked {
+		minWork := idx.params.MinimumChainWork
+		if minWork != nil && minWork.Sign() > 0 && totalWork.Cmp(minWork) < 0 {
+			return nil, ErrTooLittleChainwork
+		}
+	}
 
 	// Create new node
 	node := &BlockNode{
