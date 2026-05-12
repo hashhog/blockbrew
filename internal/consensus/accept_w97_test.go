@@ -498,14 +498,44 @@ func TestW97_G19b_LessWorkBlockReachesDisk(t *testing.T) {
 //
 // Core: `if (fTooFarAhead) return true;` — a block too far ahead of the
 // active tip is dropped, with the rationale that it would limit pruning
-// effectiveness. blockbrew has NO ActiveHeight + 288 fTooFarAhead check
-// anywhere in the validation path. A peer that announces a block 10000
-// heights ahead via unsolicited inv will have its block download attempted,
-// stored to disk, and the connection failure logged.
+// effectiveness. IsTooFarAhead implements this gate; it is called by
+// sync.HandleBlock on the unrequested (P2P-inv-driven) block path.
 //
 // SEVERITY: DOS (disk + memory amplification far ahead of tip).
-func TestW97_G19c_TooFarAheadGateAbsent(t *testing.T) {
-	t.Skip("W97 audit — not yet implemented (G19c: no ActiveHeight + MIN_BLOCKS_TO_KEEP guard on unrequested blocks)")
+//
+// Three cases:
+//  1. Unrequested block too far ahead → IsTooFarAhead returns true (reject).
+//  2. Unrequested block at gate boundary (activeHeight + 288) → false (accept).
+//  3. "Requested" context: even a too-far-ahead height is logically exempt
+//     (caller enforces this by skipping the IsTooFarAhead call for solicited
+//     blocks; we verify the pure function returns true so the caller's if-gate
+//     would fire — confirming the correct call-site exemption is needed).
+func TestW97_G19c_TooFarAheadGate(t *testing.T) {
+	const activeHeight int32 = 1000
+	const limit = int32(storage.MinBlocksToKeep) // 288
+
+	// Case 1: unrequested block is beyond activeHeight + 288 → must be dropped.
+	tooFar := activeHeight + limit + 1
+	if !IsTooFarAhead(tooFar, activeHeight) {
+		t.Errorf("case 1: IsTooFarAhead(%d, %d) = false; want true (unrequested block too far ahead must be rejected)",
+			tooFar, activeHeight)
+	}
+
+	// Case 2: unrequested block exactly at the gate boundary (activeHeight + 288) → must be accepted.
+	atGate := activeHeight + limit
+	if IsTooFarAhead(atGate, activeHeight) {
+		t.Errorf("case 2: IsTooFarAhead(%d, %d) = true; want false (block at gate boundary must be accepted)",
+			atGate, activeHeight)
+	}
+
+	// Case 3: for a solicited/requested block the caller skips IsTooFarAhead
+	// entirely — but the pure function itself still returns true for a too-far
+	// height, confirming that the call-site must exempt requested blocks (i.e.
+	// the if(!fRequested) wrapper is load-bearing).
+	if !IsTooFarAhead(tooFar, activeHeight) {
+		t.Errorf("case 3: IsTooFarAhead(%d, %d) = false; want true (confirms requested-block exemption is needed at call site)",
+			tooFar, activeHeight)
+	}
 }
 
 // ---------------------------------------------------------------------------

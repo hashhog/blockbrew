@@ -1243,6 +1243,25 @@ func (cm *ChainManager) SetParallelScripts(parallel bool) {
 	cm.parallelScripts = parallel
 }
 
+// IsTooFarAhead reports whether blockHeight is too far ahead of activeHeight
+// for an unrequested block to be admitted. Mirrors Bitcoin Core
+// validation.cpp:4325:
+//
+//	bool fTooFarAhead{pindex->nHeight > ActiveHeight() + int(MIN_BLOCKS_TO_KEEP)};
+//	if (!fRequested) {
+//	    ...
+//	    if (fTooFarAhead) return true;
+//	    ...
+//	}
+//
+// MIN_BLOCKS_TO_KEEP == storage.MinBlocksToKeep == 288. The check only
+// applies to unrequested (P2P-inv-driven) blocks; submitblock RPC and
+// in-order IBD blocks are exempt because they are always "requested" in
+// Core's terms.
+func IsTooFarAhead(blockHeight, activeHeight int32) bool {
+	return blockHeight > activeHeight+int32(storage.MinBlocksToKeep)
+}
+
 // flushUTXOs persists the UTXO set to disk.
 func (cm *ChainManager) flushUTXOs() {
 	// Check if the UTXO set supports flushing (database-backed UTXOSet)
