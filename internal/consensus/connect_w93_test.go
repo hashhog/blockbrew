@@ -39,7 +39,7 @@ func TestW93_UpdateCoins_SpentCoinsParallelToInputs(t *testing.T) {
 	// Build h=1 (one coinbase, one output we can later spend).
 	genesis := idx.Genesis()
 	block1 := createTestBlock(t, params, genesis, nil)
-	if _, err := idx.AddHeader(block1.Header); err != nil {
+	if _, err := idx.AddHeader(block1.Header, true); err != nil {
 		t.Fatalf("AddHeader h=1: %v", err)
 	}
 	if err := db.StoreBlock(block1.Header.BlockHash(), block1); err != nil {
@@ -74,7 +74,7 @@ func TestW93_UpdateCoins_SpentCoinsParallelToInputs(t *testing.T) {
 	// CoinbaseMaturity blocks to mature the coinbase.
 	for h := int32(2); h <= CoinbaseMaturity+1; h++ {
 		blk := createTestBlock(t, params, prev, nil)
-		if _, err := idx.AddHeader(blk.Header); err != nil {
+		if _, err := idx.AddHeader(blk.Header, true); err != nil {
 			t.Fatalf("AddHeader h=%d: %v", h, err)
 		}
 		if err := db.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
@@ -88,7 +88,7 @@ func TestW93_UpdateCoins_SpentCoinsParallelToInputs(t *testing.T) {
 
 	// Now mine a block at height CoinbaseMaturity+2 that spends h=1's coinbase.
 	block2 := createTestBlock(t, params, prev, []*wire.MsgTx{spendTx})
-	if _, err := idx.AddHeader(block2.Header); err != nil {
+	if _, err := idx.AddHeader(block2.Header, true); err != nil {
 		t.Fatalf("AddHeader spend block: %v", err)
 	}
 	if err := db.StoreBlock(block2.Header.BlockHash(), block2); err != nil {
@@ -399,7 +399,7 @@ func TestW93_ConnectTip_FullStateUpdate(t *testing.T) {
 
 	genesis := idx.Genesis()
 	block1 := createTestBlock(t, params, genesis, nil)
-	if _, err := idx.AddHeader(block1.Header); err != nil {
+	if _, err := idx.AddHeader(block1.Header, true); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 	if err := db.StoreBlock(block1.Header.BlockHash(), block1); err != nil {
@@ -496,7 +496,7 @@ func TestW93_BadCoinbaseValue_RejectsOverpaidCoinbase(t *testing.T) {
 		Header:       header,
 		Transactions: []*wire.MsgTx{overpayCoinbase},
 	}
-	if _, err := idx.AddHeader(block.Header); err != nil {
+	if _, err := idx.AddHeader(block.Header, true); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 	if err := db.StoreBlock(block.Header.BlockHash(), block); err != nil {

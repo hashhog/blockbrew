@@ -331,7 +331,7 @@ func TestW92_DisconnectBlock_FullReorgSmokeRestoresUTXOAndTip(t *testing.T) {
 	genesis := idx.Genesis()
 	block1 := createTestBlock(t, params, genesis, nil)
 	block1Hash := block1.Header.BlockHash()
-	if _, err := idx.AddHeader(block1.Header); err != nil {
+	if _, err := idx.AddHeader(block1.Header, true); err != nil {
 		t.Fatalf("addheader: %v", err)
 	}
 	if err := db.StoreBlock(block1Hash, block1); err != nil {

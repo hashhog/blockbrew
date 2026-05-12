@@ -47,11 +47,11 @@ func TestW97_G1_DuplicateHeaderReturnsExistingNode(t *testing.T) {
 	idx := NewHeaderIndex(params)
 
 	h := createTestHeader(params.GenesisHash, params.GenesisBlock.Header.Timestamp+600, 1)
-	first, err := idx.AddHeader(h)
+	first, err := idx.AddHeader(h, true)
 	if err != nil {
 		t.Fatalf("first add: %v", err)
 	}
-	dup, err := idx.AddHeader(h)
+	dup, err := idx.AddHeader(h, true)
 	if err != nil {
 		t.Fatalf("Core returns success on duplicate, got error: %v", err)
 	}
@@ -82,7 +82,7 @@ func TestW97_G2_GenesisHashIsPreloaded(t *testing.T) {
 	// returns ErrDuplicateHeader (which is the same observable behaviour as
 	// the Core early-return). When G1 is fixed, this becomes a hard
 	// equivalence test.
-	if _, err := idx.AddHeader(params.GenesisBlock.Header); err == nil {
+	if _, err := idx.AddHeader(params.GenesisBlock.Header, true); err == nil {
 		t.Logf("genesis re-add silently accepted (post-G1-fix behaviour)")
 	}
 }
@@ -104,13 +104,13 @@ func TestW97_G3_DuplicateInvalidReturnsCachedInvalid(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 	h := createTestHeader(params.GenesisHash, params.GenesisBlock.Header.Timestamp+600, 2)
-	node, err := idx.AddHeader(h)
+	node, err := idx.AddHeader(h, true)
 	if err != nil {
 		t.Fatalf("first add: %v", err)
 	}
 	// Simulate that consensus marked this header invalid later.
 	node.Status |= StatusInvalid
-	_, err = idx.AddHeader(h)
+	_, err = idx.AddHeader(h, true)
 	if err == nil {
 		t.Errorf("Core returns BLOCK_CACHED_INVALID/'duplicate-invalid' on re-submit, got nil")
 	}
@@ -138,7 +138,7 @@ func TestW97_G4_InvalidPoWRejected(t *testing.T) {
 		Bits:       0x1d00ffff, // mainnet difficulty — too hard for regtest
 		Nonce:      0,
 	}
-	_, err := idx.AddHeader(h)
+	_, err := idx.AddHeader(h, true)
 	if err == nil {
 		t.Errorf("expected PoW-invalid header to be rejected")
 	}
@@ -161,7 +161,7 @@ func TestW97_G5_OrphanHeaderRejected(t *testing.T) {
 	// Construct a header pointing at a non-existent parent.
 	bogusPrev := wire.Hash256{0xde, 0xad, 0xbe, 0xef}
 	h := createTestHeader(bogusPrev, params.GenesisBlock.Header.Timestamp+600, 3)
-	_, err := idx.AddHeader(h)
+	_, err := idx.AddHeader(h, true)
 	if !errors.Is(err, ErrOrphanHeader) {
 		t.Errorf("expected ErrOrphanHeader, got %v", err)
 	}
@@ -184,14 +184,14 @@ func TestW97_G6_HeaderOnInvalidParentRejected(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 	parent := createTestHeader(params.GenesisHash, params.GenesisBlock.Header.Timestamp+600, 4)
-	parentNode, err := idx.AddHeader(parent)
+	parentNode, err := idx.AddHeader(parent, true)
 	if err != nil {
 		t.Fatalf("parent add: %v", err)
 	}
 	parentNode.Status |= StatusInvalid
 
 	child := createTestHeader(parent.BlockHash(), parent.Timestamp+600, 5)
-	_, err = idx.AddHeader(child)
+	_, err = idx.AddHeader(child, true)
 	if err == nil {
 		t.Errorf("child of invalidated parent must be rejected (Core: bad-prevblk)")
 	}
@@ -221,7 +221,7 @@ func TestW97_G7_LowNVersionHeaderRejected(t *testing.T) {
 	idx := NewHeaderIndex(params)
 	h := createTestHeader(params.GenesisHash, params.GenesisBlock.Header.Timestamp+600, 6)
 	h.Version = 1 // <2 — illegal once BIP34 is active
-	_, err := idx.AddHeader(h)
+	_, err := idx.AddHeader(h, true)
 	if err == nil {
 		t.Errorf("Core rejects nVersion=1 at BIP34Height in ContextualCheckBlockHeader; got nil")
 	}
@@ -245,11 +245,74 @@ func TestW97_G7_LowNVersionHeaderRejected(t *testing.T) {
 // divergence from Core for the header-accept gate.
 //
 // SEVERITY: DOS (no chainwork-aware index pollution defense at the helper).
-func TestW97_G8_MinPowCheckedArgumentAbsent(t *testing.T) {
-	t.Skip("W97 audit — not yet implemented (G8: AddHeader signature lacks min_pow_checked; chainwork DoS gate is external in PRESYNC only)")
-	// This test pins the spec: AddHeader should accept a min_pow_checked
-	// argument and return ErrTooLittleChainwork when the caller has not
-	// vouched for the cumulative work.
+//
+// Three active cases (W97 FIX-4):
+//   1. Low-work header + minPowChecked=false → ErrTooLittleChainwork (rejected).
+//   2. Low-work header + minPowChecked=true  → accepted (PRESYNC vouched for it).
+//   3. High-work header + minPowChecked=false → accepted (chain already meets threshold).
+func TestW97_G8_MinPowCheckedGate(t *testing.T) {
+	// We need a network whose MinimumChainWork is non-zero but achievable with a
+	// regtest-difficulty chain.  Testnet4 has a real MinimumChainWork hex value,
+	// but its PoW limit requires mainnet-level mining which is impractical for
+	// unit tests.  Instead, construct a synthetic ChainParams that inherits
+	// regtest's very-easy PowLimit but carries a positive MinimumChainWork, so
+	// we can mine valid headers cheaply while still exercising the gate.
+	lowWork := new(big.Int)
+	lowWork.SetString("0000000000000000000000000000000000000000000000000001000000000000", 16)
+
+	params := *RegtestParams() // shallow copy — safe to modify MinimumChainWork
+	params.MinimumChainWork = new(big.Int).Set(lowWork)
+
+	idx := NewHeaderIndex(&params)
+
+	// Mine a single header on top of genesis. With regtest bits (0x207fffff)
+	// each block contributes only ~2 units of chain work, so one block's
+	// total work will be far below the synthetic MinimumChainWork threshold.
+	genesis := idx.Genesis()
+	h := createTestHeader(genesis.Hash, genesis.Header.Timestamp+600, uint32(genesis.Header.Bits))
+	// Verify the new header's projected TotalWork is actually below the threshold.
+	singleBlockWork := CalcWork(h.Bits)
+	projected := new(big.Int).Add(genesis.TotalWork, singleBlockWork)
+	if projected.Cmp(params.MinimumChainWork) >= 0 {
+		t.Skipf("synthetic MinimumChainWork %s is not above projected work %s; test precondition unmet",
+			params.MinimumChainWork.Text(16), projected.Text(16))
+	}
+
+	// Case 1: low-work header, minPowChecked=false → must be rejected.
+	_, err := idx.AddHeader(h, false)
+	if !errors.Is(err, ErrTooLittleChainwork) {
+		t.Errorf("case 1: low-work header + minPowChecked=false: want ErrTooLittleChainwork, got %v", err)
+	}
+
+	// Case 2: same low-work header, minPowChecked=true → must be accepted
+	// (PRESYNC pipeline has vouched for the cumulative work).
+	node, err := idx.AddHeader(h, true)
+	if err != nil {
+		t.Errorf("case 2: low-work header + minPowChecked=true: want nil error, got %v", err)
+	}
+	if node == nil {
+		t.Fatal("case 2: AddHeader returned nil node on success")
+	}
+
+	// Case 3: build a second header on top; after case 2 the first header is
+	// in the index.  Now raise MinimumChainWork to exactly the threshold so the
+	// second header's TotalWork meets it.  This exercises the "chain already
+	// meets threshold" path with minPowChecked=false.
+	h2 := createTestHeader(h.BlockHash(), h.Timestamp+600, uint32(h.Bits))
+	twoBlockWork := new(big.Int).Add(projected, singleBlockWork)
+	// Set MinimumChainWork to exactly two-block work so the second header meets it.
+	params.MinimumChainWork = new(big.Int).Set(twoBlockWork)
+	// Use a fresh index so we are not relying on case-2 state.
+	idx2 := NewHeaderIndex(&params)
+	// First block must pass with minPowChecked=true (it's low-work).
+	if _, err := idx2.AddHeader(h, true); err != nil {
+		t.Fatalf("case 3 setup: first header rejected: %v", err)
+	}
+	// Second block has cumulative work == MinimumChainWork; minPowChecked=false
+	// must succeed because twoBlockWork >= MinimumChainWork.
+	if _, err := idx2.AddHeader(h2, false); err != nil {
+		t.Errorf("case 3: high-work header + minPowChecked=false: want nil error, got %v", err)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +332,7 @@ func TestW97_G9_BestTipUpdatedOnMoreWork(t *testing.T) {
 	prev := idx.Genesis()
 	for i := 1; i <= 5; i++ {
 		h := createTestHeader(prev.Hash, prev.Header.Timestamp+600, uint32(100+i))
-		n, err := idx.AddHeader(h)
+		n, err := idx.AddHeader(h, true)
 		if err != nil {
 			t.Fatalf("add header %d: %v", i, err)
 		}
@@ -361,7 +424,7 @@ func TestW97_G13_EarlyReturnOnInvalidHeader(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 	h := createTestHeader(wire.Hash256{0x01}, params.GenesisBlock.Header.Timestamp+600, 8)
-	if _, err := idx.AddHeader(h); err == nil {
+	if _, err := idx.AddHeader(h, true); err == nil {
 		t.Fatalf("orphan header must error")
 	}
 }
@@ -598,7 +661,7 @@ func TestW97_G21_ContextualCheckBlockRuns(t *testing.T) {
 	cm.SetIBD(false)
 	genesis := idx.Genesis()
 	block := createTestBlock(t, params, genesis, nil)
-	if _, err := idx.AddHeader(block.Header); err != nil {
+	if _, err := idx.AddHeader(block.Header, true); err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 	if err := db.StoreBlock(block.Header.BlockHash(), block); err != nil {
@@ -788,7 +851,7 @@ func TestW97_G30_StatusFullyValidSetAfterConnect(t *testing.T) {
 	cm.SetIBD(false)
 	genesis := idx.Genesis()
 	block := createTestBlock(t, params, genesis, nil)
-	node, err := idx.AddHeader(block.Header)
+	node, err := idx.AddHeader(block.Header, true)
 	if err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
@@ -825,7 +888,7 @@ func TestW97_AddHeaderRejectsFarFutureTimestamp(t *testing.T) {
 	defer func() { headerNowUnix = headerNowUnixOrig }()
 
 	h := createTestHeader(params.GenesisHash, uint32(now+MaxTimeAdjustment+10), 7)
-	if _, err := idx.AddHeader(h); !errors.Is(err, ErrTimestampTooFarFuture) {
+	if _, err := idx.AddHeader(h, true); !errors.Is(err, ErrTimestampTooFarFuture) {
 		t.Errorf("expected ErrTimestampTooFarFuture, got %v", err)
 	}
 }
@@ -843,7 +906,7 @@ func TestW97_BestTipChainworkMonotone(t *testing.T) {
 	var lastWork *big.Int = new(big.Int).Set(prev.TotalWork)
 	for i := 1; i <= 3; i++ {
 		h := createTestHeader(prev.Hash, prev.Header.Timestamp+600, uint32(200+i))
-		n, err := idx.AddHeader(h)
+		n, err := idx.AddHeader(h, true)
 		if err != nil {
 			t.Fatalf("add header %d: %v", i, err)
 		}

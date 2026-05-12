@@ -272,7 +272,7 @@ func BenchmarkHeaderIndexAdd(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		idx.AddHeader(headers[i])
+		idx.AddHeader(headers[i], true)
 	}
 }
 
@@ -301,7 +301,7 @@ func BenchmarkBlockNodeGetAncestor(b *testing.B) {
 				break
 			}
 		}
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			b.Fatalf("AddHeader failed at %d: %v", i, err)
 		}
