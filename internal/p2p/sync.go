@@ -1834,6 +1834,13 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 	if sm.chainDB != nil {
 		if err := sm.chainDB.StoreBlockAt(hash, msg.Block, req.Height); err != nil {
 			log.Printf("sync: failed to store block %s: %v", hash.String()[:16], err)
+		} else {
+			// G1/G3 fix (W101): mark the header-index node as having block data
+			// stored on disk. Mirrors Bitcoin Core's ReceivedBlockTransactions
+			// (validation.cpp) which sets BLOCK_HAVE_DATA after the block body
+			// lands on disk. This allows recalculateBestTipLocked to filter
+			// data-absent nodes from chain selection.
+			sm.headerIndex.MarkDataStored(hash)
 		}
 	}
 

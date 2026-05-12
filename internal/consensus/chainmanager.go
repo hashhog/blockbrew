@@ -581,7 +581,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		cm.tipNode = node
 		cm.tipHeight = node.Height
 		cm.updateTipCache(node.Hash, node.Height)
-		node.Status |= StatusFullyValid
+		node.Status |= StatusFullyValid | StatusDataStored
 		if cm.chainDB != nil {
 			batch := cm.chainDB.NewBatch()
 			emptyUndo := &storage.BlockUndo{}
@@ -946,7 +946,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	cm.tipNode = node
 	cm.tipHeight = node.Height
 	cm.updateTipCache(node.Hash, node.Height)
-	node.Status |= StatusFullyValid
+	// G1/G3 fix (W101): set StatusDataStored so recalculateBestTipLocked can
+	// filter data-absent nodes. Mirrors Bitcoin Core's BLOCK_HAVE_DATA flag
+	// set in ReceivedBlockTransactions (validation.cpp). StatusDataStored is
+	// also set earlier (in sync.go after StoreBlockAt) so that side-branch
+	// nodes whose body was stored but not yet connected are also visible to
+	// the filter.
+	node.Status |= StatusFullyValid | StatusDataStored
 
 	// Exit IBD mode when close to current time
 	if cm.isIBD && cm.tipHeight == cm.assumeValidHeight {
