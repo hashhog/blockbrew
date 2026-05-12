@@ -361,4 +361,18 @@ const (
 	// TapscriptSigopBudgetCost is the cost per signature operation in tapscript (BIP342).
 	// The total budget is 50 + witness_size.
 	TapscriptSigopBudgetCost = 50
+
+	// Taproot/Tapscript named constants (BIP-341/342).  These mirror Bitcoin
+	// Core's interpreter.h / script.h definitions so we stop hard-coding
+	// magic numbers in the witness-program dispatcher.
+	TaprootLeafMask              byte = 0xFE // mask off parity bit
+	TaprootLeafTapscript         byte = 0xC0 // tapscript leaf version (BIP-342)
+	TaprootControlBaseSize       int  = 33   // leaf-version+parity (1) + internal pubkey (32)
+	TaprootControlNodeSize       int  = 32   // each merkle-path node
+	TaprootControlMaxNodeCount   int  = 128  // max merkle depth (BIP-341)
+	TaprootControlMaxSize        int  = TaprootControlBaseSize + TaprootControlNodeSize*TaprootControlMaxNodeCount
+	WitnessV1TaprootSize         int  = 32   // size of a P2TR witness program (x-only pubkey)
+	AnnexTag                     byte = 0x50 // identifies an annex item in the witness stack
+	ValidationWeightOffset       int  = 50   // BIP-342 budget = 50 + serialized witness size
+	ValidationWeightPerSigopPass int  = 50   // sigop budget cost per *passed* signature check
 )

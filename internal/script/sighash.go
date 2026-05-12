@@ -332,14 +332,23 @@ func TapSighash(data []byte) [32]byte {
 	return result
 }
 
-// TapLeaf computes the tagged hash for a taproot leaf.
+// TapLeaf computes the tagged hash for a taproot leaf.  Mirrors Bitcoin
+// Core's ComputeTapleafHash(interpreter.cpp:1872):
+//
+//	HashWriter{HASHER_TAPLEAF} << leaf_version << CompactSize(script.size()) << script
+//
+// The leaf-version byte is written *verbatim* — callers are responsible for
+// masking off the parity bit (controlBlock[0] & TaprootLeafMask) before
+// calling.  Previously blockbrew applied an extra & 0xFE here, which made
+// `TapLeaf(0xC1, …)` produce a different hash than Core does for the
+// (unmasked) 0xC1 input; not exercised in production but a footgun for
+// fuzzers and a divergence from Core's exact semantics.
 func TapLeaf(leafVersion byte, script []byte) [32]byte {
 	tagHash := sha256.Sum256([]byte("TapLeaf"))
 	h := sha256.New()
 	h.Write(tagHash[:])
 	h.Write(tagHash[:])
-	// Mask leaf version with 0xFE to strip parity bit
-	h.Write([]byte{leafVersion & 0xFE})
+	h.Write([]byte{leafVersion})
 	// Script with compact size prefix
 	var buf bytes.Buffer
 	wire.WriteVarBytes(&buf, script)
