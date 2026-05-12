@@ -304,7 +304,7 @@ func TestCheckpointForkRejectionInHeaderIndex(t *testing.T) {
 			prevNode.Header.Timestamp+600,
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -335,7 +335,7 @@ func TestCheckpointForkRejectionInHeaderIndex(t *testing.T) {
 		uint32(999), // Different nonce for different hash
 	)
 
-	_, err := idx.AddHeader(forkHeader)
+	_, err := idx.AddHeader(forkHeader, true)
 	if err != nil {
 		t.Errorf("fork below checkpoint with no checkpoint-conflict should be accepted, got %v", err)
 	}
@@ -346,7 +346,7 @@ func TestCheckpointForkRejectionInHeaderIndex(t *testing.T) {
 		nodes[5].Header.Timestamp+600,
 		uint32(6),
 	)
-	_, err = idx.AddHeader(extendHeader)
+	_, err = idx.AddHeader(extendHeader, true)
 	if err != nil {
 		t.Errorf("extending main chain should work, got error: %v", err)
 	}
@@ -358,7 +358,7 @@ func TestCheckpointForkRejectionInHeaderIndex(t *testing.T) {
 		nodes[4].Header.Timestamp+700,
 		uint32(1000),
 	)
-	_, err = idx.AddHeader(afterCheckpointFork)
+	_, err = idx.AddHeader(afterCheckpointFork, true)
 	if err != nil {
 		t.Errorf("fork after checkpoint should work, got error: %v", err)
 	}
@@ -378,7 +378,7 @@ func TestCheckpointForkActualConflict(t *testing.T) {
 	prev := idx.genesis
 	for i := 1; i <= 5; i++ {
 		h := createTestHeader(prev.Hash, prev.Header.Timestamp+600, uint32(i))
-		n, err := idx.AddHeader(h)
+		n, err := idx.AddHeader(h, true)
 		if err != nil {
 			t.Fatalf("main chain header %d: %v", i, err)
 		}
@@ -396,7 +396,7 @@ func TestCheckpointForkActualConflict(t *testing.T) {
 	// Candidate extending main chain from nodes[5] → height 6.
 	// Its ancestor at height 2 is nodes[2].Hash != bogusHash → conflict.
 	cand := createTestHeader(nodes[5].Hash, nodes[5].Header.Timestamp+600, uint32(777))
-	_, err := idx.AddHeader(cand)
+	_, err := idx.AddHeader(cand, true)
 	if err != ErrForkBeforeCheckpoint {
 		t.Errorf("expected ErrForkBeforeCheckpoint on actual checkpoint conflict, got %v", err)
 	}
@@ -417,7 +417,7 @@ func TestCheckpointMismatchRejection(t *testing.T) {
 			prevNode.Header.Timestamp+600,
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -439,7 +439,7 @@ func TestCheckpointMismatchRejection(t *testing.T) {
 	)
 
 	// The hash of badHeader almost certainly won't match expectedHash
-	_, err := idx.AddHeader(badHeader)
+	_, err := idx.AddHeader(badHeader, true)
 	if err != ErrCheckpointMismatch {
 		t.Errorf("expected ErrCheckpointMismatch, got %v", err)
 	}

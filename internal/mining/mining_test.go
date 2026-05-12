@@ -43,7 +43,7 @@ func (m *mockHeaderIndex) GetNode(hash wire.Hash256) *consensus.BlockNode {
 	return m.nodes[hash]
 }
 
-func (m *mockHeaderIndex) AddHeader(header wire.BlockHeader) (*consensus.BlockNode, error) {
+func (m *mockHeaderIndex) AddHeader(header wire.BlockHeader, minPowChecked bool) (*consensus.BlockNode, error) {
 	hash := header.BlockHash()
 	parent := m.nodes[header.PrevBlock]
 	var height int32

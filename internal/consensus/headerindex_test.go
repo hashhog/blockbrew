@@ -68,7 +68,7 @@ func TestAddHeaderChain(t *testing.T) {
 			uint32(i),
 		)
 
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -111,13 +111,13 @@ func TestAddDuplicateHeader(t *testing.T) {
 		1,
 	)
 
-	_, err := idx.AddHeader(header)
+	_, err := idx.AddHeader(header, true)
 	if err != nil {
 		t.Fatalf("first add failed: %v", err)
 	}
 
 	// Try to add again
-	_, err = idx.AddHeader(header)
+	_, err = idx.AddHeader(header, true)
 	if err != ErrDuplicateHeader {
 		t.Errorf("expected ErrDuplicateHeader, got %v", err)
 	}
@@ -138,7 +138,7 @@ func TestAddOrphanHeader(t *testing.T) {
 		1,
 	)
 
-	_, err := idx.AddHeader(header)
+	_, err := idx.AddHeader(header, true)
 	if err != ErrOrphanHeader {
 		t.Errorf("expected ErrOrphanHeader, got %v", err)
 	}
@@ -156,7 +156,7 @@ func TestAddHeaderTimestampTooEarly(t *testing.T) {
 		1,
 	)
 
-	_, err := idx.AddHeader(header)
+	_, err := idx.AddHeader(header, true)
 	if err != ErrTimestampTooEarly {
 		t.Errorf("expected ErrTimestampTooEarly, got %v", err)
 	}
@@ -174,7 +174,7 @@ func TestBlockLocator(t *testing.T) {
 			prevNode.Header.Timestamp+600,
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -231,7 +231,7 @@ func TestGetAncestor(t *testing.T) {
 			prevNode.Header.Timestamp+600,
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -277,7 +277,7 @@ func TestGetAncestorSkipList(t *testing.T) {
 	prev := idx.genesis
 	for i := 1; i <= chainLen; i++ {
 		header := createTestHeader(prev.Hash, prev.Header.Timestamp+600, uint32(i))
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("AddHeader(%d): %v", i, err)
 		}
@@ -348,7 +348,7 @@ func TestMedianTimePast(t *testing.T) {
 			timestamps[i],
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -381,7 +381,7 @@ func TestFindFork(t *testing.T) {
 			prevNode.Header.Timestamp+600,
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -399,7 +399,7 @@ func TestFindFork(t *testing.T) {
 			forkNode.Header.Timestamp+600,
 			uint32(100+i), // Different nonce for different hash
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add fork header %d: %v", i, err)
 		}
@@ -492,7 +492,7 @@ func TestTotalWorkAccumulation(t *testing.T) {
 			prevNode.Header.Timestamp+600,
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -527,7 +527,7 @@ func TestBestChainSelection(t *testing.T) {
 			prevNode.Header.Timestamp+600,
 			uint32(i),
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -547,7 +547,7 @@ func TestBestChainSelection(t *testing.T) {
 			forkNode.Header.Timestamp+600,
 			uint32(200+i), // Different nonce
 		)
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add fork header %d: %v", i, err)
 		}
@@ -587,7 +587,7 @@ func TestHasHeader(t *testing.T) {
 		params.GenesisBlock.Header.Timestamp+600,
 		1,
 	)
-	node, _ := idx.AddHeader(header)
+	node, _ := idx.AddHeader(header, true)
 
 	if !idx.HasHeader(node.Hash) {
 		t.Error("newly added header should exist")
@@ -630,7 +630,7 @@ func TestBlockNodeChildren(t *testing.T) {
 		params.GenesisBlock.Header.Timestamp+600,
 		1,
 	)
-	child, _ := idx.AddHeader(header)
+	child, _ := idx.AddHeader(header, true)
 
 	// Genesis should now have one child
 	if len(idx.genesis.Children) != 1 {
@@ -647,7 +647,7 @@ func TestBlockNodeChildren(t *testing.T) {
 		params.GenesisBlock.Header.Timestamp+700,
 		2, // Different nonce
 	)
-	child2, _ := idx.AddHeader(header2)
+	child2, _ := idx.AddHeader(header2, true)
 
 	// Genesis should have two children
 	if len(idx.genesis.Children) != 2 {
@@ -693,7 +693,7 @@ func TestBestHeightCache(t *testing.T) {
 			uint32(i),
 		)
 
-		node, err := idx.AddHeader(header)
+		node, err := idx.AddHeader(header, true)
 		if err != nil {
 			t.Fatalf("failed to add header %d: %v", i, err)
 		}
@@ -744,7 +744,7 @@ func TestAddHeaderRejectsFarFutureTimestamp(t *testing.T) {
 	farFutureTS := uint32(pinnedNow + MaxTimeAdjustment + 1)
 	header := createTestHeader(params.GenesisHash, farFutureTS, 1)
 
-	_, err := idx.AddHeader(header)
+	_, err := idx.AddHeader(header, true)
 	if err != ErrTimestampTooFarFuture {
 		t.Fatalf("AddHeader(far-future) err = %v, want ErrTimestampTooFarFuture", err)
 	}
@@ -777,7 +777,7 @@ func TestAddHeaderAcceptsTimestampAtFutureBoundary(t *testing.T) {
 	boundaryTS := uint32(pinnedNow + MaxTimeAdjustment)
 	header := createTestHeader(params.GenesisHash, boundaryTS, 1)
 
-	node, err := idx.AddHeader(header)
+	node, err := idx.AddHeader(header, true)
 	if err != nil {
 		t.Fatalf("AddHeader(boundary) err = %v, want nil", err)
 	}
@@ -810,7 +810,7 @@ func buildBIP94Chain(t *testing.T, params *ChainParams, n int, pinnedNow int64) 
 	for i := 1; i < n; i++ {
 		ts := uint32(genTS + int64(i)) // +1s per block
 		hdr := createTestHeader(prevNode.Hash, ts, uint32(i))
-		node, err := idx.AddHeader(hdr)
+		node, err := idx.AddHeader(hdr, true)
 		if err != nil {
 			t.Fatalf("buildBIP94Chain height %d: AddHeader err = %v", i, err)
 		}
@@ -820,7 +820,7 @@ func buildBIP94Chain(t *testing.T, params *ChainParams, n int, pinnedNow int64) 
 	// Block n: big timestamp jump so block n's timestamp is well above MTP.
 	bigTS := uint32(pinnedNow - 20_000)
 	hdrN := createTestHeader(prevNode.Hash, bigTS, uint32(n))
-	nodeN, err := idx.AddHeader(hdrN)
+	nodeN, err := idx.AddHeader(hdrN, true)
 	if err != nil {
 		t.Fatalf("buildBIP94Chain height %d (big-jump): AddHeader err = %v", n, err)
 	}
@@ -863,7 +863,7 @@ func TestBIP94TimewarpRejected(t *testing.T) {
 	}
 
 	h12bad := createTestHeader(node11.Hash, tooEarlyTS, 1)
-	_, err := idx.AddHeader(h12bad)
+	_, err := idx.AddHeader(h12bad, true)
 	if err != ErrTimeWarpAttack {
 		t.Fatalf("height 12 (timewarp attack): AddHeader err = %v, want ErrTimeWarpAttack", err)
 	}
@@ -902,7 +902,7 @@ func TestBIP94TimewarpBoundaryAccepted(t *testing.T) {
 	}
 
 	h12 := createTestHeader(node11.Hash, boundaryTS, 1)
-	node12, err := idx.AddHeader(h12)
+	node12, err := idx.AddHeader(h12, true)
 	if err != nil {
 		t.Fatalf("height 12 (timewarp boundary exact): AddHeader err = %v, want nil", err)
 	}
@@ -937,7 +937,7 @@ func TestBIP94TimewarpNotAppliedOnMainnet(t *testing.T) {
 	}
 
 	h12 := createTestHeader(node11.Hash, tooEarlyTS, 1)
-	_, err := idx.AddHeader(h12)
+	_, err := idx.AddHeader(h12, true)
 	if err != nil {
 		t.Fatalf("height 12 (no BIP94 enforcement): AddHeader err = %v, want nil", err)
 	}
@@ -974,7 +974,7 @@ func TestBIP94TimewarpNotAppliedAtNonAdjustmentHeight(t *testing.T) {
 	}
 
 	h11 := createTestHeader(node10.Hash, tooEarlyTS, 1)
-	_, err := idx.AddHeader(h11)
+	_, err := idx.AddHeader(h11, true)
 	if err != nil {
 		t.Fatalf("height 11 (non-boundary with BIP94): AddHeader err = %v, want nil", err)
 	}
@@ -1016,7 +1016,7 @@ func TestGetMedianTimePastN5(t *testing.T) {
 	prevNode := idx.genesis
 	for i := 1; i < len(timestamps); i++ {
 		hdr := createTestHeader(prevNode.Hash, timestamps[i], uint32(i))
-		node, err := idx.AddHeader(hdr)
+		node, err := idx.AddHeader(hdr, true)
 		if err != nil {
 			t.Fatalf("height %d: AddHeader err = %v", i, err)
 		}
@@ -1053,7 +1053,7 @@ func TestGetMedianTimePastN10(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		ts := uint32(pinnedNow - int64(11-i)*10_000)
 		hdr := createTestHeader(prevNode.Hash, ts, uint32(i))
-		node, err := idx.AddHeader(hdr)
+		node, err := idx.AddHeader(hdr, true)
 		if err != nil {
 			t.Fatalf("height %d: AddHeader err = %v", i, err)
 		}
@@ -1091,7 +1091,7 @@ func TestGetMedianTimePastN12(t *testing.T) {
 	for i := 1; i <= 12; i++ {
 		ts := uint32(pinnedNow - int64(13-i)*10_000)
 		hdr := createTestHeader(prevNode.Hash, ts, uint32(i))
-		node, err := idx.AddHeader(hdr)
+		node, err := idx.AddHeader(hdr, true)
 		if err != nil {
 			t.Fatalf("height %d: AddHeader err = %v", i, err)
 		}
@@ -1131,7 +1131,7 @@ func TestMTPTimeOldBoundaryStrict(t *testing.T) {
 	prevNode := idx.genesis
 	for i := 1; i <= 11; i++ {
 		hdr := createTestHeader(prevNode.Hash, timestamps[i], uint32(i))
-		node, err := idx.AddHeader(hdr)
+		node, err := idx.AddHeader(hdr, true)
 		if err != nil {
 			t.Fatalf("height %d: AddHeader err = %v", i, err)
 		}
@@ -1144,14 +1144,14 @@ func TestMTPTimeOldBoundaryStrict(t *testing.T) {
 
 	// Reject: timestamp == MTP (strict <=).
 	badHdr := createTestHeader(prevNode.Hash, uint32(mtp), 1)
-	_, err := idx.AddHeader(badHdr)
+	_, err := idx.AddHeader(badHdr, true)
 	if err != ErrTimestampTooEarly {
 		t.Fatalf("timestamp == MTP: AddHeader err = %v, want ErrTimestampTooEarly", err)
 	}
 
 	// Accept: timestamp == MTP + 1.
 	goodHdr := createTestHeader(prevNode.Hash, uint32(mtp)+1, 2)
-	node12, err := idx.AddHeader(goodHdr)
+	node12, err := idx.AddHeader(goodHdr, true)
 	if err != nil {
 		t.Fatalf("timestamp == MTP+1: AddHeader err = %v, want nil", err)
 	}

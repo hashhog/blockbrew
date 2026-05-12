@@ -679,7 +679,10 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 
 	for i := range headers {
 		hdr := headers[i]
-		node, err := sm.headerIndex.AddHeader(hdr)
+		// minPowChecked=true: these headers were already vetted by the
+		// PRESYNC/REDOWNLOAD pipeline (or our chain is above MinimumChainWork
+		// on the normal path), so no further work-threshold check is needed.
+		node, err := sm.headerIndex.AddHeader(hdr, true)
 		if err != nil {
 			if err == consensus.ErrDuplicateHeader {
 				// Skip duplicates silently
@@ -1753,7 +1756,10 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 			log.Printf("sync: received unsolicited block %s from %s, processing header first", hash, peer.Address())
 			resolvedHeight := false
 			if sm.headerIndex != nil {
-				node, err := sm.headerIndex.AddHeader(msg.Block.Header)
+				// minPowChecked=false: this is an unsolicited P2P block whose
+				// header has NOT been through the PRESYNC pipeline.  AddHeader
+				// will enforce the MinimumChainWork gate itself.
+				node, err := sm.headerIndex.AddHeader(msg.Block.Header, false)
 				if err == nil && node != nil {
 					log.Printf("sync: added header for unsolicited block (height %d)", node.Height)
 					nh = node.Height
