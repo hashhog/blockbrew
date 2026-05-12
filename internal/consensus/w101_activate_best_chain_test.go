@@ -20,59 +20,52 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// G1. FindMostWorkChain — recalculateBestTipLocked does NOT filter by
-//     StatusDataStored (Core's missing-data / HAVE_DATA guard).
+// G1. FindMostWorkChain — recalculateBestTipLocked filters by StatusDataStored.
 //
-// BUG: recalculateBestTipLocked (headerindex.go:706) iterates ALL nodes
-// and picks the highest-work node regardless of whether block body data
-// has been received. Core's FindMostWorkChain skips candidates where
-// BLOCK_HAVE_DATA is absent on the path to the fork.
+// FIX: recalculateBestTipLocked (headerindex.go) now skips candidates where
+// StatusDataStored is absent. Mirrors Bitcoin Core's FindMostWorkChain which
+// skips candidates where BLOCK_HAVE_DATA is absent on the path.
 //
-// In blockbrew, StatusDataStored is defined (headerindex.go:43) but NEVER
-// SET anywhere — neither ConnectBlock nor the sync path ever sets it.
-// Consequence: after a reorg or invalidation, recalculateBestTipLocked
-// may select a node whose block data is not on disk, causing ReorgTo →
-// chainDB.GetBlock to fail with "block not found".
-//
-// SEVERITY: CORRECTNESS (best-tip selection may point at data-absent node).
+// A header-only node (StatusDataStored not set) must never win chain selection
+// even if it has higher work than the active tip.
 // ---------------------------------------------------------------------------
-func TestW101_G1_RecalculateBestTipDoesNotFilterByDataStored(t *testing.T) {
+func TestW101_G1_RecalculateBestTipFiltersDataAbsentNodes(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 
 	genesis := idx.Genesis()
 
+	// Verify genesis has StatusDataStored (always present).
+	if genesis.Status&StatusDataStored == 0 {
+		t.Fatalf("G1: genesis node must have StatusDataStored after NewHeaderIndex fix")
+	}
+
 	// Add a header without storing block data — simulating a header-only chain.
-	// StatusDataStored is never set anywhere, so this is always the state.
+	// StatusDataStored is NOT set by AddHeader (block body not yet received).
 	h := createTestHeader(genesis.Hash, genesis.Header.Timestamp+600, 0)
 	node, err := idx.AddHeader(h, true)
 	if err != nil {
 		t.Fatalf("AddHeader: %v", err)
 	}
 
-	// Invariant: the node should NOT have StatusDataStored (the flag is dead).
+	// The new node must NOT have StatusDataStored (header-only).
 	if node.Status&StatusDataStored != 0 {
-		t.Errorf("StatusDataStored is now set; the dead-flag is no longer dead — update this test")
+		t.Errorf("G1: header-only node unexpectedly has StatusDataStored — test setup broken")
 	}
 
-	// recalculateBestTipLocked will still pick this node as best tip
-	// even though block data has never been stored.
+	// recalculateBestTipLocked must skip the data-absent node and fall back to genesis.
 	idx.RecalculateBestTip()
 	best := idx.BestTip()
 	if best == nil {
-		t.Fatal("bestTip is nil after RecalculateBestTip")
+		t.Fatal("G1: bestTip is nil after RecalculateBestTip")
 	}
 
-	// The node with higher work (but no data) is selected as best tip.
-	// Core would skip it because BLOCK_HAVE_DATA is absent.
-	// We pin the current (buggy) behavior: data-absent nodes CAN be best tip.
-	if best.Hash != node.Hash {
-		t.Errorf("G1 expectation changed: expected data-absent node to be best tip; got %s", best.Hash.String()[:8])
+	if best.Hash == node.Hash {
+		t.Errorf("G1 FIX BROKEN: data-absent header node was selected as best tip; recalculateBestTipLocked must filter StatusDataStored==0 nodes")
 	}
-
-	// Confirm StatusDataStored is still dead code.
-	if best.Status&StatusDataStored != 0 {
-		t.Errorf("G1: StatusDataStored unexpectedly set on best tip — flag should still be dead code at W101 audit time")
+	// Genesis (StatusDataStored set) should be the fallback.
+	if best.Hash != genesis.Hash {
+		t.Errorf("G1: expected genesis as best tip (only data-present node); got %s", best.Hash.String()[:8])
 	}
 }
 
@@ -103,6 +96,10 @@ func TestW101_G2_FailedMaskFilterCorrect(t *testing.T) {
 		t.Fatalf("AddHeader B: %v", err)
 	}
 
+	// Mark both as having data so they can participate in chain selection.
+	nodeA.Status |= StatusDataStored
+	nodeB.Status |= StatusDataStored
+
 	// Mark B as invalid — it must be excluded from best-tip selection.
 	nodeB.Status |= StatusInvalid
 	idx.RecalculateBestTip()
@@ -114,28 +111,26 @@ func TestW101_G2_FailedMaskFilterCorrect(t *testing.T) {
 	if best.Hash == nodeB.Hash {
 		t.Errorf("G2: invalid block selected as best tip — FAILED_MASK filter broken")
 	}
-	// nodeA should win (higher work than genesis).
+	// nodeA should win (higher work than genesis, has data, is valid).
 	if nodeA.TotalWork.Cmp(genesis.TotalWork) > 0 && best.Hash != nodeA.Hash {
 		t.Errorf("G2: valid node A not selected as best tip; got %s", best.Hash.String()[:8])
 	}
 }
 
 // ---------------------------------------------------------------------------
-// G3. FindMostWorkChain — missing-data ancestor check absent.
+// G3. FindMostWorkChain — ancestor data availability check present.
 //
-// BUG: recalculateBestTipLocked does NOT walk the ancestor chain to
-// verify BLOCK_HAVE_DATA on every link. Core's FindMostWorkChain walks
-// the candidate chain from the tip down to the fork and stops if any
-// ancestor is missing data. blockbrew picks the highest-work tip node
-// without checking whether all intermediate blocks have body data.
+// FIX: recalculateBestTipLocked now walks the ancestor chain to verify
+// StatusDataStored on every link. A candidate whose ancestor chain has
+// any node missing data must be skipped, just as Bitcoin Core's
+// FindMostWorkChain walks pindexTest toward the active chain checking
+// BLOCK_HAVE_DATA.
 //
-// Consequence: a deep side-branch that has only headers (no body data
-// on intermediate nodes) can be elected as best tip, causing ReorgTo →
-// chainDB.GetBlock to fail at an intermediate block.
-//
-// SEVERITY: CORRECTNESS.
+// Specifically: a two-deep fork (genesis → forkNode → forkNode2) where
+// forkNode has StatusDataStored set but forkNode2 does not (or vice-versa)
+// must NOT be elected best tip.
 // ---------------------------------------------------------------------------
-func TestW101_G3_AncestorDataAvailabilityNotChecked(t *testing.T) {
+func TestW101_G3_AncestorDataAvailabilityChecked(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 	genesis := idx.Genesis()
@@ -153,36 +148,68 @@ func TestW101_G3_AncestorDataAvailabilityNotChecked(t *testing.T) {
 		t.Fatalf("AddHeader fork2: %v", err)
 	}
 
-	// Neither node has StatusDataStored set (it is a dead flag).
+	// Neither fork node has StatusDataStored (header-only chain).
 	for _, n := range []*BlockNode{forkNode, forkNode2} {
 		if n.Status&StatusDataStored != 0 {
-			t.Errorf("G3: StatusDataStored unexpectedly set on fork node (flag should be dead)")
+			t.Errorf("G3: header-only fork node unexpectedly has StatusDataStored — test setup broken")
 		}
 	}
 
+	// With neither ancestor having data, neither candidate should win.
+	// The best tip must remain genesis (which always has StatusDataStored).
 	idx.RecalculateBestTip()
 	best := idx.BestTip()
 	if best == nil {
-		t.Fatal("bestTip nil")
+		t.Fatal("G3: bestTip nil")
 	}
-	// Pin current (buggy) behavior: forkNode2 (data absent) is best tip.
+	if best.Hash == forkNode2.Hash || best.Hash == forkNode.Hash {
+		t.Errorf("G3 FIX BROKEN: data-absent fork node selected as best tip; ancestor walk must block it")
+	}
+	if best.Hash != genesis.Hash {
+		t.Errorf("G3: expected genesis as best tip; got %s", best.Hash.String()[:8])
+	}
+
+	// Now mark forkNode as having data but NOT forkNode2.
+	// forkNode2 is the leaf and its parent (forkNode) has data, but forkNode2 itself does not.
+	// → forkNode2 must still be filtered (G1: candidate itself must have data).
+	forkNode.Status |= StatusDataStored
+	idx.RecalculateBestTip()
+	best = idx.BestTip()
+	if best == nil {
+		t.Fatal("G3: bestTip nil after marking forkNode data-stored")
+	}
+	if best.Hash == forkNode2.Hash {
+		t.Errorf("G3 FIX BROKEN: forkNode2 (no data) selected even though forkNode (ancestor) has data; G1 node-level filter must block it")
+	}
+	// forkNode itself has data and its ancestor chain (genesis) has data → it is eligible.
+	if best.Hash != forkNode.Hash {
+		t.Errorf("G3: expected forkNode as best tip after marking it data-stored; got %s", best.Hash.String()[:8])
+	}
+
+	// Mark forkNode2 as having data too → now the full chain has data.
+	// forkNode2 has more work so it must win.
+	forkNode2.Status |= StatusDataStored
+	idx.RecalculateBestTip()
+	best = idx.BestTip()
+	if best == nil {
+		t.Fatal("G3: bestTip nil after marking forkNode2 data-stored")
+	}
 	if best.Hash != forkNode2.Hash {
-		t.Errorf("G3 expectation changed: expected data-absent fork2 to be best; got %s", best.Hash.String()[:8])
+		t.Errorf("G3: expected forkNode2 as best tip after full chain has data; got %s", best.Hash.String()[:8])
 	}
 }
 
 // ---------------------------------------------------------------------------
-// G5. FindMostWorkChain — equal-work tiebreak is non-deterministic.
+// G5. FindMostWorkChain — equal-work tiebreak is deterministic via hash.
 //
-// BUG: when two non-precious nodes have equal work AND equal SequenceID
-// (both 0, the zero value for regular blocks), the winner is determined
-// by Go map iteration order — which is randomized. There is no secondary
-// hash-based tiebreak as in Bitcoin Core.
+// FIX: when two nodes with StatusDataStored have equal TotalWork and equal
+// SequenceID, recalculateBestTipLocked uses block hash as a stable secondary
+// tiebreak so Go map-iteration order cannot influence the result.
 //
-// SEVERITY: CORRECTNESS (non-deterministic chain selection in equal-work
-// scenarios; can cause peers to have diverging views of the best tip).
+// Verification: run RecalculateBestTip 30 times and confirm the same winner
+// is chosen every time.
 // ---------------------------------------------------------------------------
-func TestW101_G5_EqualWorkSequenceIDZeroIsNonDeterministic(t *testing.T) {
+func TestW101_G5_EqualWorkHashTiebreakIsDeterministic(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 	genesis := idx.Genesis()
@@ -197,19 +224,23 @@ func TestW101_G5_EqualWorkSequenceIDZeroIsNonDeterministic(t *testing.T) {
 		t.Fatalf("AddHeader: A=%v B=%v", errA, errB)
 	}
 
+	// Both must have equal TotalWork for the tie to matter.
+	if nodeA.TotalWork.Cmp(nodeB.TotalWork) != 0 {
+		t.Skip("G5: nodes have unequal work (nonces hit different difficulties); skip equal-work tiebreak test")
+	}
+
 	// Both are non-precious → SequenceID == 0.
 	if nodeA.SequenceID != 0 || nodeB.SequenceID != 0 {
 		t.Errorf("G5: expected SequenceID == 0 for non-precious nodes; A=%d B=%d",
 			nodeA.SequenceID, nodeB.SequenceID)
 	}
 
-	// Both must have equal TotalWork for the tie to matter.
-	if nodeA.TotalWork.Cmp(nodeB.TotalWork) != 0 {
-		t.Skip("G5: nodes have unequal work (nonces hit different difficulties); skip equal-work tiebreak test")
-	}
+	// Mark both nodes as having data — required for them to enter chain selection.
+	nodeA.Status |= StatusDataStored
+	nodeB.Status |= StatusDataStored
 
-	// Run RecalculateBestTip 30 times. Non-determinism will show up as
-	// different winners across iterations.
+	// Run RecalculateBestTip 30 times. With the hash tiebreak, the same winner
+	// must be chosen every time regardless of Go map iteration order.
 	var seen = make(map[wire.Hash256]int)
 	for i := 0; i < 30; i++ {
 		idx.RecalculateBestTip()
@@ -219,12 +250,31 @@ func TestW101_G5_EqualWorkSequenceIDZeroIsNonDeterministic(t *testing.T) {
 		}
 	}
 
-	if len(seen) > 1 {
-		// Non-deterministic tiebreak confirmed — pin the bug.
-		t.Logf("G5 BUG CONFIRMED: equal-work tiebreak is non-deterministic; %d different winners over 30 iterations: %v", len(seen), seen)
+	if len(seen) != 1 {
+		t.Errorf("G5 FIX BROKEN: equal-work tiebreak is non-deterministic; %d different winners over 30 iterations: %v", len(seen), seen)
 	} else {
-		// May be stable in this run due to consistent map iteration luck.
-		t.Logf("G5: 30 iterations returned consistent tip; map iteration was stable this run. Hash-based tiebreak is still absent.")
+		t.Logf("G5 FIXED: equal-work hash tiebreak is deterministic; winner stable over 30 iterations")
+	}
+
+	// Verify that the deterministic winner is the node with the lexicographically
+	// smaller hash (our chosen tiebreak direction).
+	tip := idx.BestTip()
+	if tip == nil {
+		t.Fatal("G5: bestTip nil")
+	}
+	expectedWinner := nodeA
+	for i := 0; i < len(nodeA.Hash); i++ {
+		if nodeB.Hash[i] < nodeA.Hash[i] {
+			expectedWinner = nodeB
+			break
+		}
+		if nodeB.Hash[i] > nodeA.Hash[i] {
+			break
+		}
+	}
+	if tip.Hash != expectedWinner.Hash {
+		t.Errorf("G5: expected lexicographically-smaller-hash winner %s; got %s",
+			expectedWinner.Hash.String()[:8], tip.Hash.String()[:8])
 	}
 }
 
@@ -719,18 +769,16 @@ func TestW101_G22_IBDExitEqualityCheckCanMissIfHeightJumps(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// G26. LoadGenesisBlock — StatusDataStored not set on genesis node.
+// G26. LoadGenesisBlock — StatusDataStored set on genesis node.
 //
-// BUG: Core sets BLOCK_VALID_ALL | BLOCK_HAVE_DATA on the genesis
-// CBlockIndex. blockbrew's NewHeaderIndex creates the genesis node with
-// StatusHeaderValid | StatusFullyValid (headerindex.go:296) but does NOT
-// set StatusDataStored (BLOCK_HAVE_DATA equivalent).
-// This is the same dead-flag finding from W97 G25, confirmed at genesis.
-//
-// SEVERITY: CORRECTNESS (dead code; will matter once the missing-data
-// filter in G1/G3 is fixed).
+// FIX: Core sets BLOCK_VALID_ALL | BLOCK_HAVE_DATA on the genesis
+// CBlockIndex. blockbrew's NewHeaderIndex now creates the genesis node with
+// StatusHeaderValid | StatusFullyValid | StatusDataStored.
+// This is required for recalculateBestTipLocked (G1/G3 fix) to allow
+// genesis to be a valid fallback candidate when all other nodes are
+// data-absent.
 // ---------------------------------------------------------------------------
-func TestW101_G26_GenesisNodeMissingStatusDataStored(t *testing.T) {
+func TestW101_G26_GenesisNodeHasStatusDataStored(t *testing.T) {
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 
@@ -739,18 +787,14 @@ func TestW101_G26_GenesisNodeMissingStatusDataStored(t *testing.T) {
 		t.Fatal("genesis node is nil")
 	}
 
-	// Core sets BLOCK_VALID_ALL | BLOCK_HAVE_DATA; blockbrew should set
-	// StatusFullyValid | StatusDataStored. We pin the current buggy state.
-	if genesis.Status&StatusDataStored != 0 {
-		t.Errorf("G26: StatusDataStored now set on genesis — dead flag is no longer dead; update test")
+	// Core sets BLOCK_VALID_ALL | BLOCK_HAVE_DATA; blockbrew must set
+	// StatusFullyValid | StatusDataStored on genesis.
+	if genesis.Status&StatusDataStored == 0 {
+		t.Errorf("G26 FIX BROKEN: genesis node missing StatusDataStored (BLOCK_HAVE_DATA equivalent); NewHeaderIndex must set it")
 	}
 	if genesis.Status&StatusFullyValid == 0 {
 		t.Errorf("G26: genesis missing StatusFullyValid (regression)")
 	}
-
-	t.Log("G26 BUG: genesis BlockNode missing StatusDataStored (BLOCK_HAVE_DATA equivalent). " +
-		"Core sets this in LoadGenesisBlock::ReceivedBlockTransactions. " +
-		"blockbrew's missing-data filter (G1/G3) is also absent, so this is currently a dead-dead gap.")
 }
 
 // ---------------------------------------------------------------------------

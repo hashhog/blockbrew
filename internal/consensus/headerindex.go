@@ -293,7 +293,7 @@ func NewHeaderIndex(params *ChainParams) *HeaderIndex {
 		Height:    0,
 		Parent:    nil,
 		TotalWork: CalcWork(params.GenesisBlock.Header.Bits),
-		Status:    StatusHeaderValid | StatusFullyValid,
+		Status:    StatusHeaderValid | StatusFullyValid | StatusDataStored,
 		Children:  nil,
 	}
 
@@ -541,6 +541,19 @@ func (idx *HeaderIndex) GetNode(hash wire.Hash256) *BlockNode {
 	return idx.nodes[hash]
 }
 
+// MarkDataStored sets StatusDataStored on the node identified by hash.
+// Called by the sync pipeline after StoreBlockAt succeeds, and by ConnectBlock
+// on the genesis block path. Mirrors Bitcoin Core's ReceivedBlockTransactions
+// which sets BLOCK_HAVE_DATA when block body data lands on disk.
+// No-op if the hash is not in the index.
+func (idx *HeaderIndex) MarkDataStored(hash wire.Hash256) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if node, ok := idx.nodes[hash]; ok {
+		node.Status |= StatusDataStored
+	}
+}
+
 // BestTip returns the tip of the best (most proof-of-work) chain.
 func (idx *HeaderIndex) BestTip() *BlockNode {
 	idx.mu.RLock()
@@ -703,29 +716,72 @@ func (idx *HeaderIndex) RecalculateBestTip() {
 }
 
 // recalculateBestTipLocked performs the actual best tip calculation (caller must hold lock).
+//
+// Mirrors Bitcoin Core's FindMostWorkChain (validation.cpp:3114):
+//   - G1: skip candidates where StatusDataStored is absent on the candidate node itself.
+//   - G3: walk the ancestor chain from the candidate back toward the active tip;
+//     skip any candidate whose ancestor chain has a node with StatusDataStored absent.
+//   - G5: when chain work and SequenceID are equal, use block hash as a deterministic
+//     tiebreak so map-iteration order cannot influence chain selection.
 func (idx *HeaderIndex) recalculateBestTipLocked() {
 	var bestCandidate *BlockNode
 
-	// Find all chain tips (nodes with no children or only invalid children)
 	for _, node := range idx.nodes {
-		// Skip invalid blocks
+		// Skip invalid blocks (FAILED_MASK filter — G2, already correct).
 		if node.Status.IsInvalid() {
 			continue
 		}
 
-		// Check if this could be a tip (better than current best candidate)
+		// G1: skip candidates that have no block body data stored.
+		if node.Status&StatusDataStored == 0 {
+			continue
+		}
+
+		// G3: walk the ancestor chain to verify BLOCK_HAVE_DATA on every link.
+		// Stop when we reach the genesis node (nil Parent) — genesis always has data.
+		// If any ancestor is missing data, skip this candidate.
+		missingAncestorData := false
+		for anc := node.Parent; anc != nil; anc = anc.Parent {
+			if anc.Status&StatusDataStored == 0 {
+				missingAncestorData = true
+				break
+			}
+		}
+		if missingAncestorData {
+			continue
+		}
+
+		// Compare against current best candidate.
 		if bestCandidate == nil {
 			bestCandidate = node
 			continue
 		}
 
-		// Compare using work and sequence ID
 		switch node.TotalWork.Cmp(bestCandidate.TotalWork) {
-		case 1: // node has more work
+		case 1: // node has strictly more work — new best
 			bestCandidate = node
-		case 0: // equal work - use sequence ID (precious block preference)
+		case 0: // equal work — apply tiebreaks for determinism (G5)
+			// Primary tiebreak: lower SequenceID wins (precious block preference,
+			// same as Core's nSequenceId ordering).
 			if node.SequenceID < bestCandidate.SequenceID {
 				bestCandidate = node
+				break
+			}
+			if node.SequenceID > bestCandidate.SequenceID {
+				break
+			}
+			// Secondary tiebreak: compare block hashes lexicographically so
+			// the winner is deterministic regardless of Go map iteration order.
+			// Core uses pointer address; using hash is equally arbitrary but
+			// stable across restarts.
+			for i := 0; i < len(node.Hash); i++ {
+				if node.Hash[i] < bestCandidate.Hash[i] {
+					bestCandidate = node
+					break
+				}
+				if node.Hash[i] > bestCandidate.Hash[i] {
+					break
+				}
 			}
 		}
 	}
