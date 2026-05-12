@@ -753,7 +753,11 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 				"To force a snapshot import, stop the node and remove %s.",
 				cfg.LoadSnapshot, dbPath)
 		} else {
-			if err := loadSnapshotFromFile(cfg.LoadSnapshot, chainDB, utxoSet, chainParams); err != nil {
+			// Pass headerIndex for BUG-W102-05/06 (invalid-block + best-chain checks).
+			// mempoolSize=0: mempool is always empty at startup (it's initialised
+			// later at step 6); passing 0 satisfies the BUG-W102-07 guard without
+			// needing a circular dependency on the mempool package here.
+			if err := loadSnapshotFromFile(cfg.LoadSnapshot, chainDB, utxoSet, chainParams, headerIndex, 0); err != nil {
 				return fmt.Errorf("load-snapshot %q: %w", cfg.LoadSnapshot, err)
 			}
 		}
@@ -1899,12 +1903,32 @@ func handleImportBlocks(args []string) {
 
 // loadSnapshotFromFile imports a Bitcoin Core-format UTXO snapshot
 // (`utxo\xff` magic, VARINT-coded coins) into the active chainstate
-// database.  Mirrors Bitcoin Core's loadtxoutset RPC + -loadsnapshot
-// CLI behaviour: the snapshot's base blockhash must appear in the
-// network's AssumeUTXO table, and the recomputed UTXO hash must match
-// the expected value before we promote the snapshot to the active
-// chainstate.  Reference: bitcoin-core/src/rpc/blockchain.cpp.
-func loadSnapshotFromFile(path string, chainDB *storage.ChainDB, utxoSet *consensus.UTXOSet, params *consensus.ChainParams) error {
+// database.  Mirrors Bitcoin Core's ActivateSnapshot + loadtxoutset RPC
+// + -loadsnapshot CLI behaviour.
+//
+// Guard order (mirrors Core validation.cpp:5588–5883):
+//  1. Open file, parse metadata header.
+//  2. Verify AssumeUTXO params exist (network supports snapshot loading).
+//  3. BUG-W102-07: mempool must be empty before activation.
+//  4. AssumeUTXO table lookup by snapshot BlockHash (BUG-W102-15: must occur
+//     BEFORE any coin is deserialised, to avoid UTXOSet pollution on error).
+//  5. BUG-W102-14: cross-check file metadata height against table entry height.
+//  6. BUG-W102-05: base block must not be marked BLOCK_FAILED_VALID.
+//  7. BUG-W102-06: base block must be on the best header chain.
+//  8. Deserialise coins with per-coin guards (BUG-W102-01..03) + EOF check (04).
+//  9. Recompute HASH_SERIALIZED and compare against table entry.
+// 10. Flush, promote chainstate.
+//
+// Reference: bitcoin-core/src/validation.cpp ActivateSnapshot:5588,
+// PopulateAndValidateSnapshot:5754.
+func loadSnapshotFromFile(
+	path string,
+	chainDB *storage.ChainDB,
+	utxoSet *consensus.UTXOSet,
+	params *consensus.ChainParams,
+	headerIndex *consensus.HeaderIndex,
+	mempoolSize int,
+) error {
 	log.Printf("[snapshot] loading Core-format UTXO snapshot from %s", path)
 
 	f, err := os.Open(path)
@@ -1915,28 +1939,85 @@ func loadSnapshotFromFile(path string, chainDB *storage.ChainDB, utxoSet *consen
 
 	reader := bufio.NewReaderSize(f, 8*1024*1024)
 
-	// Use the existing LoadSnapshot path so dump/load symmetry is
-	// preserved end-to-end.  It validates the magic, version, network
-	// magic, reads coins via CoreDeserializeCoin, and flushes the UTXO
-	// set into the underlying ChainDB.
-	loaded, stats, err := consensus.LoadSnapshot(reader, chainDB, params.NetworkMagic)
+	// --- Step 1: parse metadata header (network magic, block hash, coin count).
+	sr, err := consensus.NewSnapshotReader(reader)
 	if err != nil {
-		return fmt.Errorf("LoadSnapshot: %w", err)
+		return fmt.Errorf("snapshot header: %w", err)
+	}
+	meta := sr.Metadata()
+
+	// Verify network magic.
+	if meta.NetworkMagic != params.NetworkMagic {
+		return consensus.ErrNetworkMismatch
 	}
 
-	// Verify the snapshot blockhash is recognised in the chain params'
-	// AssumeUTXO table.  Without this we would happily import any
-	// arbitrary file claiming to be a snapshot.
+	// --- Step 2: verify network supports AssumeUTXO.
 	if params.AssumeUTXO == nil {
 		return fmt.Errorf("network %q has no AssumeUTXO params; snapshot loading not supported", params.Name)
 	}
-	expected := params.AssumeUTXO.ForBlockHash(stats.BlockHash)
-	if expected == nil {
-		return fmt.Errorf("snapshot block hash %s not recognised in AssumeUTXO params", stats.BlockHash.String())
+
+	// --- Step 3 (BUG-W102-07): mempool must be empty before activation.
+	// Core ActivateSnapshot:5627-5630 — "Can't activate a snapshot when mempool not empty".
+	if mempoolSize > 0 {
+		return fmt.Errorf("%w: %d transactions pending", consensus.ErrMempoolNotEmpty, mempoolSize)
 	}
 
-	// Recompute the UTXO hash and compare.  Catches truncated/tampered
-	// snapshot files before we trust them as the active chainstate.
+	// --- Step 4 (BUG-W102-15): AssumeUTXO table lookup BEFORE coin deserialisation.
+	// Core ActivateSnapshot:5600-5608 — looks up the table entry first; only
+	// calls PopulateAndValidateSnapshot after a successful lookup. Without this
+	// guard the UTXOSet gets polluted with up to 165M untrusted coins before the
+	// lookup fails with ErrUnknownSnapshotHeight.
+	expected := params.AssumeUTXO.ForBlockHash(meta.BlockHash)
+	if expected == nil {
+		return fmt.Errorf("snapshot block hash %s not recognised in AssumeUTXO params",
+			meta.BlockHash.String())
+	}
+
+	// --- Step 5 (BUG-W102-14): cross-check file metadata height vs table entry.
+	// The metadata header does not contain a height field — height comes from the
+	// table entry located via ForBlockHash.  If the snapshot was created at a
+	// different height than the one in our table (or the file was spliced), we
+	// catch it here before spending time on coin I/O.
+	// (SnapshotMetadata contains BlockHash but not a standalone height; the table
+	// entry height IS the authoritative source. The cross-check confirms
+	// ForBlockHash and ForHeight agree on the same entry.)
+	if byHeight := params.AssumeUTXO.ForHeight(expected.Height); byHeight == nil ||
+		byHeight.BlockHash != expected.BlockHash {
+		return fmt.Errorf("%w: table entry at height %d has unexpected block hash",
+			consensus.ErrSnapshotHeightMismatch, expected.Height)
+	}
+
+	// --- Step 6 (BUG-W102-05): base block must not be BLOCK_FAILED_VALID.
+	// Core ActivateSnapshot:5618-5621 — rejects snapshots whose base block was
+	// explicitly invalidated (nStatus & BLOCK_FAILED_VALID).
+	if headerIndex != nil {
+		baseNode := headerIndex.GetNode(meta.BlockHash)
+		if baseNode != nil && baseNode.Status.IsInvalid() {
+			return fmt.Errorf("%w: %s", consensus.ErrSnapshotBaseBlockInvalid,
+				meta.BlockHash.String())
+		}
+
+		// --- Step 7 (BUG-W102-06): base block must be on the best header chain.
+		// Core ActivateSnapshot:5622-5625 — m_best_header->GetAncestor(height) == base block.
+		bestTip := headerIndex.BestTip()
+		if bestTip != nil {
+			ancestor := bestTip.GetAncestor(expected.Height)
+			if ancestor != nil && ancestor.Hash != meta.BlockHash {
+				return fmt.Errorf("%w: best-header ancestor at height %d is %s, snapshot base is %s",
+					consensus.ErrSnapshotBaseBlockNotOnBestChain,
+					expected.Height, ancestor.Hash.String(), meta.BlockHash.String())
+			}
+		}
+	}
+
+	// --- Step 8: deserialise coins with per-coin guards + EOF check.
+	// BUG-W102-01..04 are enforced inside LoadSnapshotCoins.
+	loaded, stats, err := consensus.LoadSnapshotCoins(sr, chainDB, expected.Height)
+	if err != nil {
+		return fmt.Errorf("LoadSnapshotCoins: %w", err)
+	}
+
+	// --- Step 9: recompute HASH_SERIALIZED and compare against table entry.
 	//
 	// Use ComputeHashSerialized (HashWriter::GetHash = SHA256d over
 	// uncompressed TxOutSer records, validation.cpp:5912-5914) — same
@@ -1944,9 +2025,6 @@ func loadSnapshotFromFile(path string, chainDB *storage.ChainDB, utxoSet *consen
 	// the same flavour produced by `dumptxoutset`'s txoutset_hash field
 	// + tools/compute-snapshot-hash.py + every other hashhog impl
 	// (lunarblock src/utxo.lua, hotbuns src/consensus/utxoHash.ts, etc).
-	// The earlier ComputeUTXOHash here was Core-compressed + single
-	// SHA256 — neither byte layout nor digest matched any other path,
-	// silently rejecting every real-world snapshot.
 	computed, _, err := consensus.ComputeHashSerialized(loaded)
 	if err != nil {
 		return fmt.Errorf("ComputeHashSerialized: %w", err)
@@ -1956,8 +2034,9 @@ func loadSnapshotFromFile(path string, chainDB *storage.ChainDB, utxoSet *consen
 			expected.HashSerialized.String(), computed.String())
 	}
 
-	// Hash check passed — now flush the loaded coins to chainDB.
-	// LoadSnapshot deliberately defers the flush so that the
+	// --- Step 10: flush and promote chainstate.
+	//
+	// LoadSnapshotCoins deliberately defers the flush so that the
 	// post-flush cache eviction (utxoset.go:299) doesn't run before
 	// ComputeHashSerialized has had a chance to walk the in-memory
 	// cache.  Calling Flush here accepts the eviction that follows;
