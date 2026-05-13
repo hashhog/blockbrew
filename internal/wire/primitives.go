@@ -12,6 +12,11 @@ const MaxCompactSize = 0x02000000
 // ErrCompactSizeTooLarge is returned when a CompactSize value exceeds MaxCompactSize.
 var ErrCompactSizeTooLarge = errors.New("compact size too large")
 
+// ErrNonCanonicalCompactSize is returned when a CompactSize value uses a longer
+// encoding than necessary (e.g. 0xFD 0x00 0x00 for value 0). Bitcoin Core
+// rejects such encodings with "non-canonical ReadCompactSize()".
+var ErrNonCanonicalCompactSize = errors.New("non-canonical ReadCompactSize()")
+
 // ReadCompactSizeUnchecked reads a CompactSize-encoded integer without any upper
 // bound check. This is needed for fields like BIP155 service flags which are
 // valid uint64 values that may exceed MaxCompactSize.
@@ -27,15 +32,28 @@ func ReadCompactSizeUnchecked(r io.Reader) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
+		if uint64(v) < 0xFD {
+			return 0, ErrNonCanonicalCompactSize
+		}
 		return uint64(v), nil
 	case 0xFE:
 		v, err := ReadUint32LE(r)
 		if err != nil {
 			return 0, err
 		}
+		if uint64(v) < 0x10000 {
+			return 0, ErrNonCanonicalCompactSize
+		}
 		return uint64(v), nil
 	case 0xFF:
-		return ReadUint64LE(r)
+		v, err := ReadUint64LE(r)
+		if err != nil {
+			return 0, err
+		}
+		if v < 0x100000000 {
+			return 0, ErrNonCanonicalCompactSize
+		}
+		return v, nil
 	default:
 		return uint64(first), nil
 	}
@@ -202,17 +220,26 @@ func ReadCompactSize(r io.Reader) (uint64, error) {
 		if err != nil {
 			return 0, err
 		}
+		if uint64(v) < 0xFD {
+			return 0, ErrNonCanonicalCompactSize
+		}
 		val = uint64(v)
 	case 0xFE:
 		v, err := ReadUint32LE(r)
 		if err != nil {
 			return 0, err
 		}
+		if uint64(v) < 0x10000 {
+			return 0, ErrNonCanonicalCompactSize
+		}
 		val = uint64(v)
 	case 0xFF:
 		v, err := ReadUint64LE(r)
 		if err != nil {
 			return 0, err
+		}
+		if v < 0x100000000 {
+			return 0, ErrNonCanonicalCompactSize
 		}
 		val = v
 	default:
