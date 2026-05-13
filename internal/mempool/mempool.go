@@ -1535,13 +1535,26 @@ func (mp *Mempool) removeSingleTxLocked(txHash wire.Hash256) {
 		delete(mp.outpoints, in.PreviousOutPoint)
 	}
 
-	// Update parent's SpentBy lists
+	// Update direct parents' SpentBy lists.
 	for _, parentHash := range entry.Depends {
 		if parent, ok := mp.pool[parentHash]; ok {
 			parent.SpentBy = removeHash(parent.SpentBy, txHash)
-			// Update parent's descendant tracking
-			parent.DescendantFee -= entry.Fee
-			parent.DescendantSize -= entry.Size
+		}
+	}
+
+	// Decrement DescendantFee/Size on ALL transitive ancestors, not just
+	// direct parents.  Core delegates this to TxGraph which re-linearises
+	// the full cluster on every removal; we replicate the same accounting
+	// by walking the full ancestor set (W106 G2).
+	// Pass an empty visited map so collectAncestorsLocked walks up through
+	// all parents recursively (the removed tx itself is not in the pool yet
+	// because we delete it below, but we must not include it in visited or
+	// the function short-circuits on the first check).
+	ancVisited := make(map[wire.Hash256]bool)
+	for _, ancHash := range mp.collectAncestorsLocked(txHash, ancVisited) {
+		if anc, ok := mp.pool[ancHash]; ok {
+			anc.DescendantFee -= entry.Fee
+			anc.DescendantSize -= entry.Size
 		}
 	}
 

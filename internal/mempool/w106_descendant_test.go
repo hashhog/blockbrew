@@ -190,12 +190,9 @@ func TestW106_G1_AncestorCountIncludesSelf(t *testing.T) {
 // TestW106_G2_DescendantStatGrandparentNotUpdated tests that when a grandchild
 // is removed, the grandparent's DescendantFee/Size is updated correctly.
 //
-// BUG (MEDIUM): removeSingleTxLocked iterates entry.Depends (direct parents)
-// and decrements their DescendantFee/Size.  It does NOT walk up further to
-// update grandparents.  After removing grandchild, grandparent's
-// DescendantFee/Size remains inflated.
-//
-// Core: removeUnchecked → m_txgraph handles full cluster re-accounting.
+// Fixed (W106 G2): removeSingleTxLocked now walks all transitive ancestors via
+// collectAncestorsLocked and decrements each one's DescendantFee/Size, matching
+// Core's TxGraph cluster re-accounting on removeUnchecked.
 func TestW106_G2_DescendantStatGrandparentNotUpdated(t *testing.T) {
 	mp, _ := setupFundedMempool(0)
 	utxos := mp.utxoSet.(*testUTXOSet)
@@ -257,9 +254,8 @@ func TestW106_G2_DescendantStatGrandparentNotUpdated(t *testing.T) {
 	if gpAfter == nil {
 		t.Fatal("grandparent unexpectedly removed")
 	}
-	// BUG: grandparent DescendantFee is NOT updated to 200 — still 300.
 	if gpAfter.DescendantFee != 200 || gpAfter.DescendantSize != 200 {
-		t.Errorf("BUG G2: grandparent DescendantFee/Size after grandchild removal: got fee=%d size=%d, want fee=200 size=200",
+		t.Errorf("G2: grandparent DescendantFee/Size after grandchild removal: got fee=%d size=%d, want fee=200 size=200",
 			gpAfter.DescendantFee, gpAfter.DescendantSize)
 	}
 }
