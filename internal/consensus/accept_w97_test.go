@@ -731,24 +731,54 @@ func TestW97_G24_UpdateBlockInfoPathAbsent(t *testing.T) {
 //
 // Core: ReceivedBlockTransactions(block, pindex, blockPos) sets
 // nStatus |= BLOCK_HAVE_DATA + sets nTx, and propagates HAVE_DATA-and-up to
-// descendants. blockbrew defines StatusDataStored (headerindex.go:37) but
-// NEVER SETS it anywhere — a 'data stored' state that exists in the type
-// system but has no runtime effect. The chain-tip cascade (Core's
-// pindexBestHeader walk after ReceivedBlockTransactions) is also absent.
+// descendants. blockbrew sets StatusDataStored in ConnectBlock (after W101
+// fix) and via MarkDataStored after StoreBlockAt in sync.go.
 //
-// SEVERITY: CORRECT (the unset flag is dead code; downstream code does not
-// depend on it; cleanup candidate).
-func TestW97_G25_StatusDataStoredFlagUnused(t *testing.T) {
-	// Pin the dead-flag finding: StatusDataStored is defined but never |=ed
-	// in any *.go file in the codebase.
+// FIX-33 update: the original audit-time pin asserted genesis did NOT have
+// StatusDataStored, because the flag was dead code (never set). W101 fixed
+// that — ConnectBlock now sets StatusFullyValid|StatusDataStored. FIX-33
+// adds StatusHaveUndo set after undo data is written to disk.
+// This test verifies the FIXED behavior: both StatusDataStored and
+// StatusHaveUndo must be set after a block is connected.
+func TestW97_G25_StatusDataStoredFlagSet(t *testing.T) {
 	if StatusDataStored == 0 {
 		t.Fatalf("StatusDataStored constant has zero value (unexpected)")
 	}
-	// Whichever node we look at, the flag is never set.
+	if StatusHaveUndo == 0 {
+		t.Fatalf("StatusHaveUndo constant has zero value (unexpected)")
+	}
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
-	if idx.Genesis().Status&StatusDataStored != 0 {
-		t.Errorf("genesis Status unexpectedly has StatusDataStored bit (audit-time pin)")
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := NewChainManager(ChainManagerConfig{
+		Params: params, HeaderIndex: idx, ChainDB: db,
+	})
+	cm.SetIBD(false)
+	genesis := idx.Genesis()
+
+	// Build block1 on top of genesis and connect it.
+	block1 := createTestBlock(t, params, genesis, nil)
+	node1, err := idx.AddHeader(block1.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader block1: %v", err)
+	}
+	if err := db.StoreBlock(block1.Header.BlockHash(), block1); err != nil {
+		t.Fatalf("StoreBlock block1: %v", err)
+	}
+	if err := cm.ConnectBlock(block1); err != nil {
+		t.Fatalf("ConnectBlock block1: %v", err)
+	}
+
+	// StatusDataStored must be set on the connected node.
+	if node1.Status&StatusDataStored == 0 {
+		t.Errorf("G25 FIX: node1 StatusDataStored not set after ConnectBlock; want bit 0x%02x in Status=0x%02x",
+			StatusDataStored, node1.Status)
+	}
+	// StatusHaveUndo must also be set (FIX-33): ConnectBlock writes undo data
+	// (mirrors Core blockstorage.cpp:1029 BLOCK_HAVE_UNDO after rev*.dat write).
+	if node1.Status&StatusHaveUndo == 0 {
+		t.Errorf("G25/FIX-33: node1 StatusHaveUndo not set after ConnectBlock; want bit 0x%02x in Status=0x%02x",
+			StatusHaveUndo, node1.Status)
 	}
 }
 

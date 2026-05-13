@@ -39,11 +39,12 @@ var headerNowUnix = func() int64 { return time.Now().Unix() }
 type BlockStatus uint32
 
 const (
-	StatusHeaderValid BlockStatus = 1 << 0 // Header passed PoW and basic checks
-	StatusDataStored  BlockStatus = 1 << 1 // Full block data is stored
-	StatusFullyValid  BlockStatus = 1 << 2 // Block passed full validation
-	StatusInvalid     BlockStatus = 1 << 3 // Block is known invalid (explicitly marked via invalidateblock)
+	StatusHeaderValid  BlockStatus = 1 << 0 // Header passed PoW and basic checks
+	StatusDataStored   BlockStatus = 1 << 1 // Full block data is stored (mirrors Core's BLOCK_HAVE_DATA)
+	StatusFullyValid   BlockStatus = 1 << 2 // Block passed full validation
+	StatusInvalid      BlockStatus = 1 << 3 // Block is known invalid (explicitly marked via invalidateblock)
 	StatusInvalidChild BlockStatus = 1 << 4 // Block is invalid because ancestor is invalid
+	StatusHaveUndo     BlockStatus = 1 << 5 // Undo data is stored on disk (mirrors Core's BLOCK_HAVE_UNDO)
 )
 
 // IsInvalid returns true if this block is marked as invalid (either directly or via ancestor).
@@ -551,6 +552,20 @@ func (idx *HeaderIndex) MarkDataStored(hash wire.Hash256) {
 	defer idx.mu.Unlock()
 	if node, ok := idx.nodes[hash]; ok {
 		node.Status |= StatusDataStored
+	}
+}
+
+// MarkUndoStored sets StatusHaveUndo on the node identified by hash.
+// Called by ConnectBlock after undo data is written to disk (all paths:
+// genesis, reorg-batch, regular-batch, and IBD between-flush). Mirrors
+// Bitcoin Core's blockstorage.cpp:1029 where block.nStatus |= BLOCK_HAVE_UNDO
+// is set after writing the CBlockUndo to rev*.dat.
+// No-op if the hash is not in the index.
+func (idx *HeaderIndex) MarkUndoStored(hash wire.Hash256) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if node, ok := idx.nodes[hash]; ok {
+		node.Status |= StatusHaveUndo
 	}
 }
 
