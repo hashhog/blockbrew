@@ -74,6 +74,13 @@ const (
 	MaxHeaders      = 2000
 	MaxAddresses    = 1000
 	MaxBlockLocators = 101
+
+	// MaxGetDataSize is the maximum number of inventory vectors in a single
+	// outgoing getdata message. Matches Bitcoin Core's MAX_GETDATA_SZ (1000)
+	// defined in net_processing.cpp:128. This is distinct from MaxInvVects
+	// (50000) which caps inv messages. Sending more than 1000 items in a
+	// single getdata wastes bandwidth (50× amplification if MaxInvVects used).
+	MaxGetDataSize = 1000
 )
 
 // MessageHeader represents a Bitcoin P2P message header.
