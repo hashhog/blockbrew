@@ -102,6 +102,13 @@ const (
 	// two logs line up visually at 500-block boundaries during a side-by-
 	// side comparison between implementations.
 	ConnStatsLogEvery = 500
+
+	// OrphanExpireDriverInterval is how often the main loop fires the
+	// orphan expiry sweep (mempool.ExpireOrphans).  Bitcoin Core calls
+	// LimitOrphans inside every AddTx; blockbrew approximates that with a
+	// once-per-minute timer in cmd/blockbrew/main.go.  This constant is
+	// exported so the W103 BUG-22 test can assert the correct interval.
+	OrphanExpireDriverInterval = time.Minute
 )
 
 // numValidationWorkers returns how many validationWorker goroutines to

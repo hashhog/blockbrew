@@ -1400,6 +1400,32 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	syncMgr.Start()
 	log.Printf("Sync manager started")
 
+	// Periodic orphan expiry driver (W103 BUG-22 fix).
+	//
+	// Bitcoin Core calls LimitOrphans inside every AddTx / AddAnnouncer, so
+	// orphans older than ORPHAN_TX_EXPIRE_TIME (20 min) are evicted as a
+	// side-effect of the next incoming tx.  blockbrew's mempool has
+	// ExpireOrphans() but it was never called from production code until this
+	// fix.  We approximate Core's continuous sweep with a once-per-minute
+	// timer — cheap enough to be negligible and tight enough that orphans are
+	// evicted well within the 20-minute window.
+	//
+	// Interval: p2p.OrphanExpireDriverInterval (1 min).
+	// Constant: mempool.OrphanTxExpireTime (20 min) — see mempool/mempool.go.
+	orphanExpireQuit := make(chan struct{})
+	go func() {
+		orphanExpireTicker := time.NewTicker(p2p.OrphanExpireDriverInterval)
+		defer orphanExpireTicker.Stop()
+		for {
+			select {
+			case <-orphanExpireTicker.C:
+				mp.ExpireOrphans()
+			case <-orphanExpireQuit:
+				return
+			}
+		}
+	}()
+
 	if err := rpcServer.Start(); err != nil {
 		return fmt.Errorf("RPC server start failed: %w", err)
 	}
@@ -1544,6 +1570,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	go func() {
 		defer close(shutdownDone)
+
+		// Stop background goroutines first.
+		close(orphanExpireQuit)
 
 		// Stop RPC first so no new client requests start mid-shutdown.
 		if err := rpcServer.Stop(); err != nil {

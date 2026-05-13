@@ -1679,3 +1679,67 @@ func TestP2AStandardDust(t *testing.T) {
 		}
 	})
 }
+
+// TestExpireOrphans verifies that ExpireOrphans (W103 BUG-22 fix) correctly
+// removes orphans older than OrphanTxExpireTime and leaves young orphans alone.
+//
+// Bitcoin Core: ORPHAN_TX_EXPIRE_TIME = 20 minutes (net_processing.cpp).
+// blockbrew: OrphanTxExpireTime constant + ExpireOrphans() called from a
+// periodic timer in cmd/blockbrew/main.go (OrphanExpireDriverInterval = 1 min).
+func TestExpireOrphans(t *testing.T) {
+	// 1. Verify OrphanTxExpireTime matches Core's ORPHAN_TX_EXPIRE_TIME.
+	if OrphanTxExpireTime != 20*time.Minute {
+		t.Errorf("OrphanTxExpireTime = %v, want 20m (Core ORPHAN_TX_EXPIRE_TIME)", OrphanTxExpireTime)
+	}
+
+	utxoSet := newTestUTXOSet()
+	mp := newTestMempool(utxoSet)
+
+	// 2. Inject two orphan entries directly (bypassing AddTransaction so we
+	//    can control addedTime without sleeping for 20 minutes).
+	var hash1, hash2 wire.Hash256
+	hash1[0] = 0xE1
+	hash2[0] = 0xE2
+
+	freshOrphan := &wire.MsgTx{Version: 1, LockTime: 0}
+	staleOrphan := &wire.MsgTx{Version: 1, LockTime: 0}
+
+	mp.mu.Lock()
+	// Stale orphan: added 21 minutes ago — should be evicted.
+	mp.orphans[hash1] = &orphanEntry{
+		tx:        staleOrphan,
+		txHash:    hash1,
+		addedTime: time.Now().Add(-(OrphanTxExpireTime + time.Minute)),
+	}
+	// Fresh orphan: added 1 minute ago — must NOT be evicted.
+	mp.orphans[hash2] = &orphanEntry{
+		tx:        freshOrphan,
+		txHash:    hash2,
+		addedTime: time.Now().Add(-time.Minute),
+	}
+	mp.mu.Unlock()
+
+	if mp.OrphanCount() != 2 {
+		t.Fatalf("pre-expire: want 2 orphans, got %d", mp.OrphanCount())
+	}
+
+	// 3. Call ExpireOrphans — must evict only the stale entry.
+	mp.ExpireOrphans()
+
+	if mp.OrphanCount() != 1 {
+		t.Errorf("post-expire: want 1 orphan, got %d (stale entry not evicted)", mp.OrphanCount())
+	}
+
+	// 4. The surviving orphan must be the fresh one.
+	mp.mu.RLock()
+	_, freshSurvived := mp.orphans[hash2]
+	_, staleSurvived := mp.orphans[hash1]
+	mp.mu.RUnlock()
+
+	if !freshSurvived {
+		t.Error("post-expire: fresh orphan was incorrectly evicted")
+	}
+	if staleSurvived {
+		t.Error("post-expire: stale orphan was not evicted")
+	}
+}
