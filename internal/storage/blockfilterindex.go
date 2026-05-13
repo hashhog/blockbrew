@@ -21,8 +21,13 @@ const (
 // BlockFilterIndex key prefixes.
 var (
 	// BlockFilterPrefix stores height -> filter data mapping.
-	// Key: "f" + height (4 bytes big-endian)
-	BlockFilterPrefix = []byte("f")
+	// Key: "X" + height (4 bytes big-endian)
+	//
+	// Note: changed from "f" to "X" to avoid collision with blockFileInfoPrefix
+	// ("f" + uint32 fileNum) in flatfile.go. Both key spaces live in the same
+	// PebbleDB instance; using the same prefix caused silent data corruption
+	// when -blockfilterindex was active (W109 BUG-G12 P0).
+	BlockFilterPrefix = []byte("X")
 
 	// BlockFilterStateKey stores the index state.
 	BlockFilterStateKey = []byte("blockfilter_state")
