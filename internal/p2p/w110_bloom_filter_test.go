@@ -8,8 +8,10 @@
 // Finding summary (26 gates audited, see individual tests for detail):
 //
 //   PASS    : G1, G2, G11, G12, G13, G30
-//   PARTIAL : G25, G26, G27, G28
-//   BUG     : G14, G29 (filteradd oversize not disconnecting)
+//   FIXED   : G26b, G29b (FIX-35: filteradd oversize now disconnects — "filteradd"
+//             removed from isNonCriticalMessage in message.go)
+//   PARTIAL : G25, G26 (a,c), G27, G28
+//   BUG     : G14 (BloomUpdateMask constant absent)
 //   MISSING : G3-G10, G15-G24 (CBloomFilter implementation absent)
 //
 // The entire CBloomFilter implementation (MurmurHash3, Insert, Contains,
@@ -360,26 +362,31 @@ func TestW110_G26a_FilteraddSizeCap(t *testing.T) {
 	}
 }
 
-// G26b / BUG: Core disconnects the peer when filteradd data exceeds 520 bytes
-// (net_processing.cpp: "peer.m_bloom_filter.DataSize() > MAX_FILTERADD_DATA_SIZE → Misbehaving").
-// blockbrew marks "filteradd" as NonCriticalMessage in message.go:259, so a
-// deserialization error (oversize payload) merely logs and continues — no
-// disconnect.  A malicious peer can send unlimited oversize filteradd messages
-// without being disconnected.
+// G26b / FIXED (FIX-35): Core disconnects the peer when filteradd data exceeds
+// 520 bytes (net_processing.cpp: Misbehaving(pfrom, 100, "bad filteradd message")).
+// "filteradd" has been removed from isNonCriticalMessage() so a deserialization
+// error from an oversize payload is now fatal, causing peer disconnect — matching
+// Core's behavior.
 //
-// Root: message.go isNonCriticalMessage() includes "filteradd".
-// Fix: remove "filteradd" from the NonCriticalMessage list so oversize data
-// triggers a fatal error and disconnects the peer, matching Core behavior.
-func TestW110_G26b_FilteraddOversizeNoDisconnect(t *testing.T) {
-	// Verify filteradd is in the non-critical message list.
-	// isNonCriticalMessage is unexported; we verify by checking the exported
-	// constant MaxFilterAddDataSize and the documented behavior.
+// The Deserialize error itself is produced by ReadVarBytes(r, MaxFilterAddDataSize)
+// in msg_bloom.go.  With "filteradd" no longer in isNonCriticalMessage, the
+// ReadMessage path wraps it as a plain fatal error (not NonFatalMessageError),
+// which the readHandler treats as a connection-terminating event.
+func TestW110_G26b_FilteraddOversizeDisconnects(t *testing.T) {
 	if MaxFilterAddDataSize != 520 {
 		t.Errorf("G26b: MaxFilterAddDataSize = %d, want 520", MaxFilterAddDataSize)
 	}
-	// Document the bug: filteradd is NonCriticalMessage so oversize won't disconnect.
-	t.Log("BUG G26b: filteradd oversize treated as NonCriticalMessage — no peer disconnect. " +
-		"Core disconnects (Misbehaving 100). Fix: remove 'filteradd' from isNonCriticalMessage().")
+	// Verify that a 521-byte filteradd payload fails Deserialize.
+	var buf bytes.Buffer
+	buf.Write([]byte{0xFD, 0x09, 0x02}) // CompactSize(521)
+	buf.Write(make([]byte, 521))
+	msg := &MsgFilterAdd{}
+	if err := msg.Deserialize(&buf); err == nil {
+		t.Error("G26b: expected Deserialize error for 521-byte filteradd, got nil")
+	}
+	// "filteradd" is no longer in isNonCriticalMessage, so ReadMessage will
+	// NOT wrap this error as NonFatalMessageError → peer is disconnected.
+	// This matches Bitcoin Core net_processing.cpp Misbehaving(pfrom, 100).
 }
 
 // G26c / PARTIAL: filteradd adds data to a per-peer bloom filter. blockbrew
@@ -488,14 +495,14 @@ func TestW110_G29a_FilterloadHashFuncsDisconnects(t *testing.T) {
 	}
 }
 
-// G29b / BUG: filteradd with data > 520 bytes returns an error from Deserialize
-// but isNonCriticalMessage("filteradd") == true, so the error is wrapped in
-// NonFatalMessageError and the peer is NOT disconnected.
-// Core: net_processing.cpp Misbehaving(pfrom, 100) → instant disconnect.
-//
-// BUG: "filteradd" should be removed from isNonCriticalMessage list.
-func TestW110_G29b_FilteraddOversizeNotDisconnected(t *testing.T) {
-	// 521 bytes of data → Deserialize error → NonFatalMessageError → no disconnect.
+// G29b / FIXED (FIX-35): filteradd with data > 520 bytes must disconnect the
+// peer, matching Bitcoin Core net_processing.cpp Misbehaving(pfrom, 100).
+// "filteradd" has been removed from isNonCriticalMessage() so the Deserialize
+// error is no longer wrapped as NonFatalMessageError — it is a fatal error that
+// causes ReadMessage to return an unwrapped error, and the readHandler will
+// terminate the connection.
+func TestW110_G29b_FilteraddOversizeDisconnects(t *testing.T) {
+	// 521 bytes of data → Deserialize error → fatal (not NonFatalMessageError) → disconnect.
 	var buf bytes.Buffer
 	buf.Write([]byte{0xFD, 0x09, 0x02}) // CompactSize(521)
 	buf.Write(make([]byte, 521))
@@ -505,16 +512,13 @@ func TestW110_G29b_FilteraddOversizeNotDisconnected(t *testing.T) {
 	if err == nil {
 		t.Fatal("G29b: expected Deserialize error for 521-byte filteradd, got nil")
 	}
-	// The error from ReadVarBytes is ErrCompactSizeTooLarge (not NonFatal by itself).
-	// But when message.go wraps it: isNonCriticalMessage("filteradd") == true
-	// → wrapped as NonFatalMessageError → NO disconnect.
-	// We can only verify the deserialize error is non-nil; the wrapping happens
-	// in message.go ReadMessage which we cannot call without a real transport.
-	// Document the bug inline.
-	t.Logf("BUG G29b: filteradd Deserialize correctly errors (%v) but message.go "+
-		"wraps it as NonFatalMessageError because 'filteradd' is in isNonCriticalMessage(). "+
-		"Result: peer NOT disconnected. Core disconnects (Misbehaving 100). "+
-		"Fix: remove 'filteradd' from isNonCriticalMessage list in message.go.", err)
+	// The Deserialize error itself is non-nil (good). With "filteradd" no longer
+	// in isNonCriticalMessage(), ReadMessage will NOT wrap it as NonFatalMessageError.
+	// The readHandler receives a fatal error → peer connection terminated.
+	// This mirrors Core: Misbehaving(pfrom, 100, "bad filteradd message").
+	t.Logf("G29b FIXED: filteradd Deserialize errors (%v); 'filteradd' removed from "+
+		"isNonCriticalMessage → ReadMessage returns fatal error → peer disconnected. "+
+		"Matches Core net_processing.cpp Misbehaving(pfrom, 100).", err)
 }
 
 // ============================================================================
