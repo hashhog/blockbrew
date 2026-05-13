@@ -430,6 +430,9 @@ type DecodeScriptResult struct {
 // BlockTemplateResult represents the result of getblocktemplate.
 type BlockTemplateResult struct {
 	Version                  int32                 `json:"version"`
+	Rules                    []string              `json:"rules"`
+	Vbavailable              map[string]int        `json:"vbavailable"`
+	Vbrequired               int                   `json:"vbrequired"`
 	PreviousBlockHash        string                `json:"previousblockhash"`
 	Transactions             []BlockTemplateTx     `json:"transactions"`
 	CoinbaseAux              map[string]string     `json:"coinbaseaux"`
