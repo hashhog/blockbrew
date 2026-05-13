@@ -33,7 +33,9 @@ func (m *MsgGetData) Deserialize(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	if count > MaxInvVects {
+	// Bitcoin Core caps incoming getdata at MAX_GETDATA_SZ=1000
+	// (net_processing.cpp:128). Reject oversized messages.
+	if count > MaxGetDataSize {
 		return ErrTooManyInvVects
 	}
 	m.InvList = make([]*InvVect, count)
@@ -47,8 +49,10 @@ func (m *MsgGetData) Deserialize(r io.Reader) error {
 }
 
 // AddInvVect adds an inventory vector to the message.
+// Returns ErrTooManyInvVects once MaxGetDataSize (1000) entries are present,
+// matching Bitcoin Core's MAX_GETDATA_SZ cap.
 func (m *MsgGetData) AddInvVect(iv *InvVect) error {
-	if len(m.InvList) >= MaxInvVects {
+	if len(m.InvList) >= MaxGetDataSize {
 		return ErrTooManyInvVects
 	}
 	m.InvList = append(m.InvList, iv)
