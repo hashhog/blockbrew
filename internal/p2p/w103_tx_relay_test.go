@@ -587,24 +587,35 @@ func TestW103_G21_MaxOrphanTxs100(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BUG-22 (P2) G22: EvictExpiredOrphans uses 20-minute expiry.
-// Bitcoin Core: ORPHAN_TX_EXPIRE_TIME is 20 minutes (same). OK.
-// But Core calls LimitOrphans after every AddTx; blockbrew only evicts on
-// add-when-full. The periodic ExpireOrphans function exists but must be called
-// externally — there is no internal background timer.
+// G22 (FIXED): Periodic orphan expiry driver wired in main loop.
 //
-// Test: verify ExpireOrphans is available (not missing entirely) and that the
-// expiry window is 20 minutes.
+// Bitcoin Core: ORPHAN_TX_EXPIRE_TIME = 20 minutes; LimitOrphans called inside
+// every AddTx/AddAnnouncer.  blockbrew approximates this with a once-per-minute
+// timer in cmd/blockbrew/main.go that calls mempool.ExpireOrphans().
+//
+// This test asserts:
+//  1. OrphanExpireDriverInterval is exactly 1 minute (the periodic fire rate).
+//  2. The driver fires at the correct multiple: ≤ OrphanTxExpireTime (20 min),
+//     meaning orphans are evicted well before the 20-minute deadline.
+//
+// Reference: Bitcoin Core net_processing.cpp ORPHAN_TX_EXPIRE_TIME = 20min.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW103_G22_ExpireOrphansPresent(t *testing.T) {
-	// We cannot call mempool.ExpireOrphans from the p2p package directly.
-	// Document that ExpireOrphans is defined in the mempool package with
-	// a 20-minute cutoff (matching Core).
-	//
-	// BUG-22: No background goroutine in p2p or main drives ExpireOrphans
-	// periodically. Core calls LimitOrphans inside every AddTx/AddAnnouncer.
-	// blockbrew relies on external callers (not wired in SyncManager or peer handlers).
-	t.Log("G22: ExpireOrphans exists with 20min window but not driven internally (BUG-22)")
+	// OrphanExpireDriverInterval must be exactly 1 minute — the period at
+	// which the main loop fires mempool.ExpireOrphans (W103 BUG-22 fix).
+	const wantInterval = time.Minute
+	if OrphanExpireDriverInterval != wantInterval {
+		t.Errorf("G22: OrphanExpireDriverInterval = %v, want %v (Core ORPHAN_TX_EXPIRE_TIME = 20min; driver must fire more often)",
+			OrphanExpireDriverInterval, wantInterval)
+	}
+
+	// The driver interval must be strictly less than Core's 20-minute expiry
+	// window so orphans are actually evicted before they expire.
+	const coreExpireTime = 20 * time.Minute
+	if OrphanExpireDriverInterval >= coreExpireTime {
+		t.Errorf("G22: OrphanExpireDriverInterval (%v) must be < ORPHAN_TX_EXPIRE_TIME (%v)",
+			OrphanExpireDriverInterval, coreExpireTime)
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
