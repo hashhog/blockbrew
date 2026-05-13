@@ -256,7 +256,7 @@ func isNonCriticalMessage(cmd string) bool {
 	switch cmd {
 	case "addr", "addrv2", "inv", "feefilter", "sendcmpct", "sendheaders",
 		"sendaddrv2", "wtxidrelay", "sendtxrcncl", "ping", "pong",
-		"filterload", "filteradd", "filterclear", "merkleblock",
+		"filterload", "filterclear", "merkleblock",
 		"cmpctblock", "getblocktxn", "blocktxn",
 		"getcfilters", "cfilter", "getcfheaders", "cfheaders",
 		"getcfcheckpt", "cfcheckpt",
