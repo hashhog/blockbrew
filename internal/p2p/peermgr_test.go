@@ -506,19 +506,20 @@ func TestPeerManagerWrapListeners(t *testing.T) {
 		t.Error("wrapped OnAddr should not be nil")
 	}
 
-	// Test that addresses are added to the book
+	// Test that addresses are added to the book (must use routable IPs —
+	// RFC1918/loopback are rejected by the BUG-27 IsRoutable fix).
 	pm.addrBook.AddAddress(NetAddress{
-		IP:   net.ParseIP("10.0.0.1"),
+		IP:   net.ParseIP("1.2.3.1"),
 		Port: 8333,
 	}, "test")
 
 	initialSize := pm.addrBook.Size()
 
-	// Simulate receiving addresses
+	// Simulate receiving routable addresses
 	msg := &MsgAddr{
 		AddrList: []NetAddress{
-			{IP: net.ParseIP("192.168.1.1"), Port: 8333},
-			{IP: net.ParseIP("192.168.1.2"), Port: 8333},
+			{IP: net.ParseIP("1.2.3.2"), Port: 8333},
+			{IP: net.ParseIP("1.2.3.3"), Port: 8333},
 		},
 	}
 	wrapped.OnAddr(nil, msg)

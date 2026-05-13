@@ -491,15 +491,15 @@ func TestPickAddressWithDiversityFeeler(t *testing.T) {
 		Network: MainnetMagic,
 	})
 
-	// Add an address
+	// Add a routable address (1.2.3.x passes IsRoutable).
 	pm.addrBook.AddAddress(NetAddress{
-		IP:   net.ParseIP("192.168.1.1"),
+		IP:   net.ParseIP("1.2.3.1"),
 		Port: 8333,
 	}, "test")
 
-	// Saturate the subnet
+	// Saturate the subnet that the address belongs to.
 	pm.mu.Lock()
-	pm.subnetCounts["192.168"] = MaxPeersPerSubnet + 10
+	pm.subnetCounts["1.2"] = MaxPeersPerSubnet + 10
 	pm.mu.Unlock()
 
 	// Feelers should still pick this address (diversity not checked)
