@@ -198,71 +198,74 @@ func TestW107_G8_Decode0xFF(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// G9 – BUG: non-canonical encoding 0xFD + value < 253 MUST be rejected
+// G9 – non-canonical encoding 0xFD + value < 253 MUST be rejected
 //
 // Bitcoin Core: "non-canonical ReadCompactSize()" error when 0xFD is used
 // but the 2-byte value could have been encoded in 1 byte (i.e. value < 253).
-// Blockbrew's ReadCompactSize does NOT perform this check, accepting e.g.
-// 0xFD 0x00 0x00 (= 0) and 0xFD 0xFC 0x00 (= 252) silently.
-//
-// This is a protocol-level violation: a peer that sends non-canonical
-// CompactSize can fool blockbrew into accepting a message that Core would
-// reject as malformed. This gate is marked FAIL.
+// Fixed: ReadCompactSize now returns ErrNonCanonicalCompactSize for such inputs.
 // ---------------------------------------------------------------------------
 
-func TestW107_G9_NonCanonical_FD_BUG(t *testing.T) {
+func TestW107_G9_NonCanonical_FD(t *testing.T) {
 	// 0xFD 0x00 0x00 → value 0, should be encoded as 1 byte 0x00
 	data := []byte{0xFD, 0x00, 0x00}
-	v, err := ReadCompactSize(bytes.NewReader(data))
+	_, err := ReadCompactSize(bytes.NewReader(data))
 	if err == nil {
-		// BUG: Core rejects this with "non-canonical ReadCompactSize()"
-		// blockbrew silently accepts it.
-		t.Errorf("G9 BUG: ReadCompactSize(0xFD 0x00 0x00) returned %d without error; "+
-			"Core rejects non-canonical encoding (value %d < 253 must use 1-byte form)", v, v)
+		t.Errorf("G9: ReadCompactSize(0xFD 0x00 0x00) must be rejected as non-canonical; got nil error")
+	}
+	if !errors.Is(err, ErrNonCanonicalCompactSize) {
+		t.Errorf("G9: ReadCompactSize(0xFD 0x00 0x00) error = %v, want ErrNonCanonicalCompactSize", err)
 	}
 
 	// 0xFD 0xFC 0x00 → value 252, still non-canonical (< 253)
 	data2 := []byte{0xFD, 0xFC, 0x00}
-	v2, err2 := ReadCompactSize(bytes.NewReader(data2))
+	_, err2 := ReadCompactSize(bytes.NewReader(data2))
 	if err2 == nil {
-		t.Errorf("G9 BUG: ReadCompactSize(0xFD 0xFC 0x00) returned %d without error; "+
-			"Core rejects non-canonical encoding (value %d < 253 must use 1-byte form)", v2, v2)
+		t.Errorf("G9: ReadCompactSize(0xFD 0xFC 0x00) must be rejected as non-canonical; got nil error")
+	}
+	if !errors.Is(err2, ErrNonCanonicalCompactSize) {
+		t.Errorf("G9: ReadCompactSize(0xFD 0xFC 0x00) error = %v, want ErrNonCanonicalCompactSize", err2)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// G10 – BUG: non-canonical encoding 0xFE + value < 0x10000 MUST be rejected
+// G10 – non-canonical encoding 0xFE + value < 0x10000 MUST be rejected
 //       and 0xFF + value < 0x100000000 MUST be rejected
 //
-// Same category as G9: Core throws "non-canonical ReadCompactSize()" for
-// these, blockbrew silently accepts them.
+// Fixed: ReadCompactSize and ReadCompactSizeUnchecked now return
+// ErrNonCanonicalCompactSize for these inputs, matching Core behaviour.
 // ---------------------------------------------------------------------------
 
-func TestW107_G10_NonCanonical_FE_FF_BUG(t *testing.T) {
+func TestW107_G10_NonCanonical_FE_FF(t *testing.T) {
 	// 0xFE 0x00 0x00 0x00 0x00 → value 0 via 5-byte form, non-canonical
 	data := []byte{0xFE, 0x00, 0x00, 0x00, 0x00}
-	v, err := ReadCompactSize(bytes.NewReader(data))
+	_, err := ReadCompactSize(bytes.NewReader(data))
 	if err == nil {
-		t.Errorf("G10 BUG: ReadCompactSize(0xFE 0x00..0x00) returned %d without error; "+
-			"Core rejects non-canonical 0xFE-prefixed value %d < 0x10000", v, v)
+		t.Errorf("G10: ReadCompactSize(0xFE 0x00..0x00) must be rejected as non-canonical; got nil error")
+	}
+	if !errors.Is(err, ErrNonCanonicalCompactSize) {
+		t.Errorf("G10: ReadCompactSize(0xFE 0x00..0x00) error = %v, want ErrNonCanonicalCompactSize", err)
 	}
 
 	// 0xFE 0xFF 0xFF 0x00 0x00 → value 0xFFFF via 5-byte form, non-canonical
 	data2 := []byte{0xFE, 0xFF, 0xFF, 0x00, 0x00}
-	v2, err2 := ReadCompactSize(bytes.NewReader(data2))
+	_, err2 := ReadCompactSize(bytes.NewReader(data2))
 	if err2 == nil {
-		t.Errorf("G10 BUG: ReadCompactSize(0xFE 0xFF 0xFF 0x00 0x00) returned %d without error; "+
-			"Core rejects non-canonical 0xFE-prefixed value %d < 0x10000", v2, v2)
+		t.Errorf("G10: ReadCompactSize(0xFE 0xFF 0xFF 0x00 0x00) must be rejected as non-canonical; got nil error")
+	}
+	if !errors.Is(err2, ErrNonCanonicalCompactSize) {
+		t.Errorf("G10: ReadCompactSize(0xFE 0xFF 0xFF 0x00 0x00) error = %v, want ErrNonCanonicalCompactSize", err2)
 	}
 
 	// 0xFF 0x00..0x00 (8 bytes) → value 0 via 9-byte form, non-canonical
+	// ReadCompactSizeUnchecked skips MAX_SIZE check intentionally, but must
+	// still check for non-canonical encoding.
 	data3 := []byte{0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	v3, err3 := ReadCompactSizeUnchecked(bytes.NewReader(data3))
-	// ReadCompactSizeUnchecked skips MAX_SIZE check intentionally, but it
-	// still should check for non-canonical encoding.
-	if err3 == nil && v3 < 0x100000000 {
-		t.Errorf("G10 BUG: ReadCompactSizeUnchecked(0xFF 0x00...) returned %d without error; "+
-			"Core rejects non-canonical 0xFF-prefixed value < 0x100000000", v3)
+	_, err3 := ReadCompactSizeUnchecked(bytes.NewReader(data3))
+	if err3 == nil {
+		t.Errorf("G10: ReadCompactSizeUnchecked(0xFF 0x00...) must be rejected as non-canonical; got nil error")
+	}
+	if !errors.Is(err3, ErrNonCanonicalCompactSize) {
+		t.Errorf("G10: ReadCompactSizeUnchecked(0xFF 0x00...) error = %v, want ErrNonCanonicalCompactSize", err3)
 	}
 }
 
@@ -304,8 +307,10 @@ func TestW107_G12_ReadCompactSizeRejectsOverMax(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestW107_G13_ReadCompactSizeUnchecked(t *testing.T) {
-	// Encode a value larger than MaxCompactSize using 9-byte form.
-	large := uint64(MaxCompactSize + 1_000_000)
+	// Encode a value larger than MaxCompactSize and also >= 0x100000000
+	// (so the 9-byte / 0xFF-prefixed form is canonical). Service flags
+	// can legitimately be 64-bit values that exceed 4 GB.
+	large := uint64(0x100000000 + 1_000_000)
 	var buf bytes.Buffer
 	buf.WriteByte(0xFF)
 	var b [8]byte
