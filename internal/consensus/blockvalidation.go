@@ -749,9 +749,12 @@ func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, fla
 	// For small job counts, validate sequentially to avoid goroutine overhead
 	if len(jobs) <= 4 {
 		for _, job := range jobs {
-			txid := job.tx.TxHash()
+			// Use WTxHash (witness txid) so that segwit transactions with the
+			// same txid but different witnesses map to distinct cache entries
+			// (fix for W105-B8B).
+			wtxhash := job.tx.WTxHash()
 			// Check cache first
-			if cache != nil && cache.Lookup(txid, uint32(job.inputIdx), flags) {
+			if cache != nil && cache.Lookup(wtxhash, uint32(job.inputIdx), flags) {
 				continue
 			}
 
@@ -770,7 +773,7 @@ func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, fla
 
 			// Cache successful verification
 			if cache != nil {
-				cache.Insert(txid, uint32(job.inputIdx), flags)
+				cache.Insert(wtxhash, uint32(job.inputIdx), flags)
 			}
 		}
 		return nil
@@ -795,9 +798,12 @@ func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, fla
 				return
 			}
 
-			txid := j.tx.TxHash()
+			// Use WTxHash (witness txid) so that segwit transactions with the
+			// same txid but different witnesses map to distinct cache entries
+			// (fix for W105-B8B).
+			wtxhash := j.tx.WTxHash()
 			// Check cache first
-			if cache != nil && cache.Lookup(txid, uint32(j.inputIdx), flags) {
+			if cache != nil && cache.Lookup(wtxhash, uint32(j.inputIdx), flags) {
 				return
 			}
 
@@ -819,7 +825,7 @@ func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, fla
 
 			// Cache successful verification
 			if cache != nil {
-				cache.Insert(txid, uint32(j.inputIdx), flags)
+				cache.Insert(wtxhash, uint32(j.inputIdx), flags)
 			}
 		}(job)
 	}
