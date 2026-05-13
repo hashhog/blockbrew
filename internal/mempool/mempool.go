@@ -88,6 +88,12 @@ var (
 	ErrRBFInsufficientFee = errors.New("replacement fee too low")
 	ErrRBFTooManyConflicts = errors.New("replacement would evict too many transactions")
 
+	// ErrRBFFeerateDiagram is returned when the replacement does not strictly
+	// improve the mempool feerate diagram.
+	// Mirrors Bitcoin Core rbf.cpp::ImprovesFeerateDiagram (Core 27+,
+	// cluster-mempool).
+	ErrRBFFeerateDiagram = errors.New("insufficient feerate: does not improve feerate diagram")
+
 	// BIP-68 sequence-lock failure (mempool accept).
 	ErrSequenceLockNotMet = errors.New("non-final transaction (BIP-68 sequence locks not met)")
 
@@ -2444,6 +2450,23 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 			ErrRBFInsufficientFee, newFee-totalConflictingFee, minFeeBump)
 	}
 
+	// Gate 7: ImprovesFeerateDiagram — the replacement must strictly improve
+	// the mempool feerate diagram at every chunk boundary.
+	// Core: rbf.cpp::ImprovesFeerateDiagram (Core 27+, cluster-mempool).
+	// Build the full evicted set (conflicts + all descendants) to pass to the
+	// diagram checker.
+	evictedFull := make(map[wire.Hash256]bool, totalEvicted)
+	for txHash := range conflicting {
+		evictedFull[txHash] = true
+		visited := make(map[wire.Hash256]bool)
+		for _, descHash := range mp.collectDescendantsLocked(txHash, visited) {
+			evictedFull[descHash] = true
+		}
+	}
+	if err := mp.checkRBFImprovesFeerateDiagramLocked(newTx, evictedFull, newFee, int64(newVSize)); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -2500,6 +2523,215 @@ func (mp *Mempool) checkRBFNoNewUnconfirmedInputsLocked(
 		}
 	}
 	return nil
+}
+
+// checkRBFImprovesFeerateDiagramLocked checks that the replacement transaction
+// strictly improves the mempool feerate diagram, mirroring Bitcoin Core's
+// ImprovesFeerateDiagram / CalculateChunksForRBF (rbf.cpp, Core 27+).
+//
+// Algorithmic choice: "simulated cluster replacement"
+//   - We build a *temporary* in-memory DepGraph for each affected cluster
+//     (those containing a direct conflict or a descendant of a conflict).
+//   - The "before" diagram is the FeerateDiagram produced by the existing
+//     cluster chunks.
+//   - The "after" diagram is produced by removing all evicted transactions
+//     (conflicts + their descendants) and adding the replacement with its
+//     computed fee/vsize, inheriting the in-cluster parents it retains.
+//   - We require after.Compare(before) == 1, i.e. strictly better.
+//
+// This is equivalent to Core's CalculateChunksForRBF which does the same
+// simulation via CTxMemPool::ChangeSet::AddedTxInfo / removed set.
+//
+// Must be called with mp.mu held (read or write).
+func (mp *Mempool) checkRBFImprovesFeerateDiagramLocked(
+	newTx *wire.MsgTx,
+	evicted map[wire.Hash256]bool, // conflicts + all their descendants
+	newFee int64,
+	newVSize int64,
+) error {
+	// Collect the distinct set of clusters that are affected.
+	affectedClusters := make(map[uint64]*Cluster)
+	for txHash := range evicted {
+		if c := mp.clusters.GetCluster(txHash); c != nil {
+			affectedClusters[c.ID] = c
+		}
+	}
+
+	// If no clusters are tracked (e.g. empty or single-tx mempool with no
+	// cluster manager data), skip the diagram check — we cannot compute it.
+	if len(affectedClusters) == 0 {
+		return nil
+	}
+
+	// For each affected cluster, build before/after diagrams and compare.
+	//
+	// We concatenate all chunks across affected clusters into one combined
+	// before/after diagram. This is conservative: the combined diagram is
+	// dominated iff every individual cluster's diagram is dominated, because
+	// chunks are already sorted in descending feerate order.
+	var beforeChunks, afterChunks []Chunk
+
+	for _, cluster := range affectedClusters {
+		// --- BEFORE: current cluster chunks ---
+		for _, ch := range cluster.GetChunks() {
+			beforeChunks = append(beforeChunks, ch)
+		}
+
+		// --- AFTER: simulate removal of evicted txs + insertion of newTx ---
+		//
+		// Build a fresh DepGraph containing only the surviving transactions in
+		// this cluster, then add newTx (if any of its inputs are in this cluster).
+
+		// Step 1: identify surviving txs (cluster txs minus evicted).
+		type simTx struct {
+			txHash  wire.Hash256
+			fee     int64
+			size    int32
+			origIdx int // index in cluster.DepGraph
+		}
+		var survivors []simTx
+		for txHash, idx := range cluster.Transactions {
+			if !evicted[txHash] {
+				fr := cluster.DepGraph.FeeRate(idx)
+				survivors = append(survivors, simTx{
+					txHash:  txHash,
+					fee:     fr.Fee,
+					size:    fr.Size,
+					origIdx: idx,
+				})
+			}
+		}
+
+		// Step 2: Check if newTx has any in-cluster parents (that survive).
+		// A parent is in this cluster if one of newTx's inputs spends a tx in
+		// the cluster that was NOT evicted.
+		survivorSet := make(map[wire.Hash256]bool, len(survivors))
+		for _, s := range survivors {
+			survivorSet[s.txHash] = true
+		}
+		newTxParentsInCluster := false
+		for _, in := range newTx.TxIn {
+			if survivorSet[in.PreviousOutPoint.Hash] {
+				newTxParentsInCluster = true
+				break
+			}
+		}
+
+		// If newTx has no parents in this cluster AND there are survivors, the
+		// new tx will form its own new cluster later. We still need the after
+		// diagram for survivors in this cluster to be at least as good as before.
+		// newTx's contribution is added only to the cluster it actually joins.
+		//
+		// Determine whether newTx "joins" this cluster:
+		// It joins if it has at least one parent (surviving) in this cluster,
+		// OR if this is the sole affected cluster and newTx has no mempool parents
+		// at all (i.e. it's a standalone replacement of a root tx).
+		newTxJoinsCluster := newTxParentsInCluster
+		if !newTxJoinsCluster && len(affectedClusters) == 1 {
+			// Check if newTx has any surviving mempool parent at all.
+			hasAnyMempoolParent := false
+			for _, in := range newTx.TxIn {
+				if _, inPool := mp.pool[in.PreviousOutPoint.Hash]; inPool {
+					if !evicted[in.PreviousOutPoint.Hash] {
+						hasAnyMempoolParent = true
+						break
+					}
+				}
+			}
+			if !hasAnyMempoolParent {
+				// newTx is a root in the cluster (replaces the root conflict).
+				newTxJoinsCluster = true
+			}
+		}
+
+		// Step 3: Build a simulated DepGraph for the after-state.
+		simGraph := NewDepGraph()
+		simIdxMap := make(map[wire.Hash256]int, len(survivors)+1) // txHash -> simIdx
+
+		// Add survivors in topological order (parents before children).
+		// We use the original topological order from the cluster's linearization.
+		origLinear := cluster.GetLinearization() // already in topological order
+		for _, origIdx := range origLinear {
+			// Find txHash for this origIdx.
+			var txHash wire.Hash256
+			found := false
+			for h, idx := range cluster.Transactions {
+				if idx == origIdx {
+					txHash = h
+					found = true
+					break
+				}
+			}
+			if !found || !survivorSet[txHash] {
+				continue
+			}
+			fr := cluster.DepGraph.FeeRate(origIdx)
+			simIdx := simGraph.AddTransaction(fr)
+			simIdxMap[txHash] = simIdx
+
+			// Add dependencies to parents that are already in simGraph.
+			var parentSet BitSet
+			for _, in := range mp.pool[txHash].Tx.TxIn {
+				if pSimIdx, ok := simIdxMap[in.PreviousOutPoint.Hash]; ok {
+					parentSet.Set(pSimIdx)
+				}
+			}
+			if parentSet.Any() {
+				simGraph.AddDependencies(parentSet, simIdx)
+			}
+		}
+
+		// Add newTx if it joins this cluster.
+		if newTxJoinsCluster {
+			newSimIdx := simGraph.AddTransaction(FeeFrac{Fee: newFee, Size: int32(newVSize)})
+			if newSimIdx >= 0 {
+				var parentSet BitSet
+				for _, in := range newTx.TxIn {
+					if pSimIdx, ok := simIdxMap[in.PreviousOutPoint.Hash]; ok {
+						parentSet.Set(pSimIdx)
+					}
+				}
+				if parentSet.Any() {
+					simGraph.AddDependencies(parentSet, newSimIdx)
+				}
+			}
+		}
+
+		// Step 4: Compute after-chunks from the simulated DepGraph using the
+		// same greedy linearisation algorithm as Cluster.recomputeLinearization.
+		simCluster := &Cluster{
+			ID:           cluster.ID,
+			Transactions: make(map[wire.Hash256]int),
+			DepGraph:     simGraph,
+			dirty:        true,
+		}
+		for txHash, simIdx := range simIdxMap {
+			simCluster.Transactions[txHash] = simIdx
+		}
+		for _, ch := range simCluster.GetChunks() {
+			afterChunks = append(afterChunks, ch)
+		}
+	}
+
+	// Sort both chunk slices in descending feerate order so the combined
+	// feerate diagram is well-formed (monotonically non-increasing feerate).
+	sortChunksDesc(beforeChunks)
+	sortChunksDesc(afterChunks)
+
+	before := NewFeerateDiagram(beforeChunks)
+	after := NewFeerateDiagram(afterChunks)
+
+	if after.Compare(before) != 1 {
+		return ErrRBFFeerateDiagram
+	}
+	return nil
+}
+
+// sortChunksDesc sorts chunks in descending feerate order (highest feerate first).
+func sortChunksDesc(chunks []Chunk) {
+	sort.Slice(chunks, func(i, j int) bool {
+		return chunks[i].FeeRate.Compare(chunks[j].FeeRate) > 0
+	})
 }
 
 // Ensure Mempool implements consensus.UTXOView

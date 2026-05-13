@@ -858,55 +858,66 @@ func TestW106_G17_RBFAncestorConflict(t *testing.T) {
 }
 
 // ============================================================================
-// G18 — RBF feerate diagram (ImprovesFeerateDiagram) is ABSENT
+// G18 — RBF feerate diagram (ImprovesFeerateDiagram)
 // ============================================================================
 
-// TestW106_G18_ImprovesFeerateDiagramAbsent demonstrates that blockbrew does
-// NOT implement the feerate-diagram improvement check required by Core's
-// cluster-mempool RBF.
+// seedEntryWithCluster inserts a TxEntry into both the pool map and the
+// ClusterManager, so that checkRBFImprovesFeerateDiagramLocked can see cluster
+// data.  parentTxids lists in-mempool parents (may be nil for root txs).
+func seedEntryWithCluster(mp *Mempool, entry *TxEntry, parentTxids []wire.Hash256) {
+	seedEntry(mp, entry)
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	_, _ = mp.clusters.AddTransaction(
+		entry.TxHash,
+		entry.Fee,
+		int32(entry.Size),
+		parentTxids,
+	)
+}
+
+// TestW106_G18_ImprovesFeerateDiagram verifies that checkRBFLocked now
+// enforces the feerate-diagram improvement check (ImprovesFeerateDiagram /
+// CalculateChunksForRBF, Bitcoin Core 27+, rbf.cpp).
 //
-// BUG (HIGH): Core (validation.cpp + rbf.cpp::ImprovesFeerateDiagram) requires
-// that a replacement must strictly improve the mempool feerate diagram.  This
-// is separate from Rule #3 (absolute fee) and Rule #4 (incremental relay fee).
-// A replacement with slightly higher absolute fee but a worse chunk feerate
-// can be harmful to miners and SHOULD be rejected.
+// Topology: parent (fee=1_000_000, size=200) → old_child (fee=100_000, size=200)
+//   Before diagram: one chunk {parent+old_child}, feerate = 1_100_000/400 = 2750 sat/vB.
 //
-// blockbrew has no equivalent of ImprovesFeerateDiagram / CalculateChunksForRBF.
-// This test documents the gap by showing that a replacement which passes Rules
-// 3 & 4 but degrades the feerate diagram is accepted.
+// Case A — degrading replacement (MUST be rejected by Core + blockbrew):
+//   new_child fee=101_000, size=800.  Passes Rule 3 (101k>100k) and Rule 4
+//   (additional=1000 > incremental*800vB ≈ 800), but cluster feerate becomes
+//   1_101_000/1000 = 1101 sat/vB < 2750 sat/vB → diagram gets worse.
 //
-// The test constructs: parent (high feerate) → child_old (moderate feerate).
-// Replacement = child_new that has slightly higher absolute fee than child_old
-// but lower per-vbyte feerate (larger tx), so the chunk {parent, child_new}
-// has a worse effective feerate than {parent, child_old}.
+// Case B — improving replacement (MUST be accepted):
+//   new_child fee=500_000, size=200.  Cluster feerate = 1_500_000/400 = 3750 > 2750.
 //
-// Core would reject this.  blockbrew accepts it — this test asserts the bug.
-func TestW106_G18_ImprovesFeerateDiagramAbsent(t *testing.T) {
+// Reference: bitcoin-core/src/policy/rbf.cpp::ImprovesFeerateDiagram.
+func TestW106_G18_ImprovesFeerateDiagram(t *testing.T) {
 	mp, ops := setupFundedMempool(1)
 	utxos := mp.utxoSet.(*testUTXOSet)
 
-	// Seed a high-fee parent tx.
+	// Seed parent tx — root of cluster.
 	parentTx := makeTx([]wire.OutPoint{ops[0]}, 9_000_000, 0xffffffff)
 	parentEntry := &TxEntry{
 		Tx: parentTx, TxHash: parentTx.TxHash(),
 		Fee: 1_000_000, Size: 200,
 		DescendantFee: 1_000_000, DescendantSize: 200,
 	}
-	seedEntry(mp, parentEntry)
+	seedEntryWithCluster(mp, parentEntry, nil)
 	parentOutPoint := wire.OutPoint{Hash: parentEntry.TxHash, Index: 0}
 	utxos.AddUTXO(parentOutPoint, &consensus.UTXOEntry{
 		Amount: 9_000_000, PkScript: make([]byte, 22), Height: 1,
 	})
 
-	// Old child: signals RBF, moderate fee (100_000), small vsize (200 vB).
-	// chunk feerate = (1_000_000 + 100_000) / (200 + 200) = 2750 sat/vB
+	// Old child: signals RBF, fee=100_000, size=200.
+	// Combined cluster feerate before replacement: (1_000_000+100_000)/(200+200) = 2750 sat/vB.
 	oldChildTx := makeTx([]wire.OutPoint{parentOutPoint}, 8_900_000, 0xfffffffd)
 	oldChildEntry := &TxEntry{
 		Tx: oldChildTx, TxHash: oldChildTx.TxHash(),
 		Fee: 100_000, Size: 200,
 		DescendantFee: 100_000, DescendantSize: 200,
 	}
-	seedEntry(mp, oldChildEntry)
+	seedEntryWithCluster(mp, oldChildEntry, []wire.Hash256{parentEntry.TxHash})
 	mp.mu.Lock()
 	mp.outpoints[parentOutPoint] = oldChildEntry.TxHash
 	mp.pool[parentEntry.TxHash].SpentBy = append(mp.pool[parentEntry.TxHash].SpentBy, oldChildEntry.TxHash)
@@ -914,30 +925,54 @@ func TestW106_G18_ImprovesFeerateDiagramAbsent(t *testing.T) {
 	mp.pool[parentEntry.TxHash].DescendantSize = 400
 	mp.mu.Unlock()
 
-	// New child: signals RBF, slightly higher absolute fee (101_000), but
-	// larger virtual size would degrade chunk feerate.
-	// For the test, same vsize (200) is enough — absolute fee 101_000 > 100_000
-	// (passes Rule 3), additional fee = 1_000 > 200 (passes Rule 4).
-	// With feerate-diagram check it should still pass in this simple case,
-	// but the point is that the function *is missing* — there's no call to it.
-	newChildTx := makeTx([]wire.OutPoint{parentOutPoint}, 8_899_000, 0xfffffffd)
 	conflictMap := map[wire.Hash256]bool{oldChildEntry.TxHash: true}
 
+	// ---- Case A: replacement degrades the feerate diagram ----
+	// new_child: fee=101_000, size=800 vB (large, low feerate).
+	// Passes Rule 3 (101k > 100k) and Rule 4 (additional=1_000 > ~800 sat),
+	// but cluster {parent+new_child} feerate = 1_101_000/1000 = 1101 sat/vB < 2750.
+	// Core rejects this; blockbrew must too.
+	//
+	// Wire up a UTXO so newChildTx can be constructed with a large scriptSig to
+	// achieve the required vsize.  We use SignatureScript of 707 bytes (≈800 vB
+	// non-witness weight for a single-input tx).
+	degradingTx := &wire.MsgTx{Version: 2, LockTime: 0}
+	degradingTx.TxIn = []*wire.TxIn{{
+		PreviousOutPoint: parentOutPoint,
+		SignatureScript:  make([]byte, 707), // non-witness → vsize ≈ weight/4 ≈ 707 vB
+		Sequence:         0xfffffffd,
+	}}
+	pkScript := make([]byte, 22)
+	pkScript[0] = 0x00
+	pkScript[1] = 0x14
+	for j := 2; j < 22; j++ {
+		pkScript[j] = byte(j)
+	}
+	degradingTx.TxOut = []*wire.TxOut{{Value: 8_899_000, PkScript: pkScript}}
+	// totalInputValue = 9_000_000; fee = 9_000_000 - 8_899_000 = 101_000.
+
 	mp.mu.RLock()
-	err := mp.checkRBFLocked(newChildTx, conflictMap, 9_000_000)
+	errDegrade := mp.checkRBFLocked(degradingTx, conflictMap, 9_000_000)
 	mp.mu.RUnlock()
 
-	// In Core with feerate-diagram: this passes.  Without feerate-diagram (blockbrew):
-	// also passes.  The bug is structural — there is no ImprovesFeerateDiagram call.
-	// We document by asserting checkRBFLocked does NOT return a diagram-error
-	// (because the function doesn't exist).
-	if err != nil {
-		t.Logf("G18: checkRBFLocked returned %v (expected nil — no diagram check)", err)
+	if !errors.Is(errDegrade, ErrRBFFeerateDiagram) {
+		t.Errorf("G18 Case A: expected ErrRBFFeerateDiagram for diagram-degrading replacement, got: %v", errDegrade)
 	}
-	// The REAL assertion: blockbrew lacks ImprovesFeerateDiagram entirely.
-	// We cannot call it because it doesn't exist.  That IS the bug.
-	t.Log("BUG G18: ImprovesFeerateDiagram not implemented in blockbrew; " +
-		"checkRBFLocked only validates Rules 3 & 4, not cluster feerate diagram improvement")
+
+	// ---- Case B: replacement improves the feerate diagram ----
+	// new_child: fee=500_000, size=200 vB.
+	// Cluster {parent+new_child} feerate = (1_000_000+500_000)/400 = 3750 > 2750.
+	// Must be accepted.
+	improvingTx := makeTx([]wire.OutPoint{parentOutPoint}, 8_500_000, 0xfffffffd)
+	// totalInputValue = 9_000_000; fee = 9_000_000 - 8_500_000 = 500_000.
+
+	mp.mu.RLock()
+	errImprove := mp.checkRBFLocked(improvingTx, conflictMap, 9_000_000)
+	mp.mu.RUnlock()
+
+	if errImprove != nil {
+		t.Errorf("G18 Case B: expected nil for diagram-improving replacement, got: %v", errImprove)
+	}
 }
 
 // ============================================================================
