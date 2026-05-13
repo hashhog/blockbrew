@@ -19,7 +19,7 @@ package storage
 //
 // G6-G10  CBlockIndex fields
 //   G6  nStatus BLOCK_VALID_* ladder: 5 levels 0..5 (Unknown/Reserved/Tree/Txns/Chain/Scripts)
-//   G7  BLOCK_HAVE_DATA (StatusDataStored) and BLOCK_HAVE_UNDO — only HAVE_DATA exists
+//   G7  BLOCK_HAVE_DATA (StatusDataStored) and BLOCK_HAVE_UNDO (StatusHaveUndo) — both now present (FIX-33)
 //   G8  nTimeMax field MISSING — BlockNode has no cumulative max-time field
 //   G9  nTx / m_chain_tx_count fields MISSING — BlockNode carries no per-block tx count
 //   G10 SequenceID (nSequenceId) assigned only via SetPreciousBlock; new nodes default 0, not SEQ_ID_INIT_FROM_DISK (1)
@@ -250,20 +250,26 @@ func TestW109_G6_BlockStatusBitsDoNotOverlap(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// G7: BLOCK_HAVE_DATA exists; BLOCK_HAVE_UNDO MISSING
+// G7: BLOCK_HAVE_DATA and BLOCK_HAVE_UNDO undo key mechanics
 // --------------------------------------------------------------------------
 
-func TestW109_G7_HaveUndoStatusMissing(t *testing.T) {
-	// BUG-G7: Core has two distinct HAVE_* flags (BLOCK_HAVE_DATA=8,
-	// BLOCK_HAVE_UNDO=16). blockbrew only has StatusDataStored (bit 1).
-	// There is no equivalent of BLOCK_HAVE_UNDO. This means:
-	// 1. GetUndoPos().IsNull() equivalent is absent (there's no stored nUndoPos in BlockNode).
-	// 2. FindFilesToPrune cannot distinguish "has undo" from "has data".
-	// 3. nFile / nDataPos / nUndoPos per-node fields are absent (flat-file
-	//    positions are looked up via separate DB keys, not stored in BlockNode).
+func TestW109_G7_UndoKeyPrefixMechanics(t *testing.T) {
+	// FIX-33 update: StatusHaveUndo (Core BLOCK_HAVE_UNDO equivalent) has been
+	// added to the consensus package's BlockStatus in headerindex.go.
+	// ConnectBlock now sets it after writing undo data to disk (all paths:
+	// genesis, reorg-batch, regular-batch, IBD between-flush).
+	//
+	// This storage-package test verifies the undo key mechanics that underpin
+	// that functionality: both the inline-Pebble 'R' key and the flat-file
+	// position 'p' key must have correct prefixes so the DB can round-trip
+	// undo data correctly.
+	//
+	// Remaining limitations (still present):
+	// - nFile / nDataPos / nUndoPos per-node fields are absent (flat-file
+	//   positions are looked up via separate DB keys, not stored in BlockNode).
+	// - FindFilesToPrune cannot yet use StatusHaveUndo directly since it runs
+	//   from the storage package and BlockNode lives in consensus.
 
-	// The only undo-related flag blockbrew has is implicit: undo data is keyed
-	// by block hash. We verify the undo key uses 'R' prefix.
 	var h [32]byte
 	h[0] = 0x42
 	key := MakeUndoBlockKey(h)
@@ -277,9 +283,20 @@ func TestW109_G7_HaveUndoStatusMissing(t *testing.T) {
 		t.Errorf("G7: undo pos key prefix = 0x%02x, want 'p' (0x70)", undoPosKey[0])
 	}
 
-	// Document the missing BLOCK_HAVE_UNDO status flag.
-	t.Log("G7 BUG: BLOCK_HAVE_UNDO (Core StatusFlag bit 16) has no equivalent in blockbrew BlockStatus; " +
-		"per-node nUndoPos/nFile fields absent from BlockNode")
+	// Round-trip: write undo data and read it back to confirm the key mechanics
+	// are wired end-to-end.
+	db := NewMemDB()
+	undo := &BlockUndo{TxUndos: []TxUndo{}}
+	if err := db.Put(key, undo.Serialize()); err != nil {
+		t.Fatalf("G7: Put undo: %v", err)
+	}
+	got, err := db.Get(key)
+	if err != nil || len(got) == 0 {
+		t.Errorf("G7: Get undo failed: err=%v len=%d", err, len(got))
+	}
+
+	t.Log("G7 FIXED: StatusHaveUndo constant added to consensus.BlockStatus; " +
+		"ConnectBlock sets it after writing undo data; undo key mechanics verified")
 }
 
 // --------------------------------------------------------------------------
