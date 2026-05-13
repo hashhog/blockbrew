@@ -395,37 +395,44 @@ func TestW109_G11_BlockDataKeyPrefix(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestW109_G12_FPrefixCollision(t *testing.T) {
-	// BUG-G12: CRITICAL KEY COLLISION.
-	// flatfile.go:545:  blockFileInfoPrefix = "f"  key = "f" + uint32 fileNum
-	// blockfilterindex.go:25: BlockFilterPrefix = "f"  key = "f" + int32 height
+	// FIX-G12: 'f' prefix collision resolved — BlockFilterPrefix changed to "X".
+	//
+	// Previously both key spaces used "f":
+	//   flatfile.go:  blockFileInfoPrefix = "f"  key = "f" + uint32 fileNum
+	//   blockfilterindex.go: BlockFilterPrefix = "f"  key = "f" + int32 height
 	//
 	// Both key spaces live in the same PebbleDB (the main chain DB). When
-	// blockfilterindex is enabled AND there is at least one block file, the
-	// filter entry for height N and the file-info entry for file N use
-	// IDENTICAL keys. A write to either will silently overwrite the other.
+	// blockfilterindex was enabled AND there was at least one block file, the
+	// filter entry for height N and the file-info entry for file N used
+	// IDENTICAL keys — silent data corruption (W109 BUG-G12 P0).
 	//
-	// This is a DATA CORRUPTION bug: a node running with -blockfilterindex=1
-	// and flat-file pruning will corrupt either file info or filter data for
-	// any file/height pair that happens to have the same numeric value.
-	// On mainnet by block 128 both file 0 and filter[0] would alias.
-	//
-	// Core uses DIFFERENT namespaced DB handles for different index types
-	// (blocks/index/ vs blocks/filter/basic/). blockbrew shares one DB for all.
+	// Fix: BlockFilterPrefix is now "X". Verify that the first-byte differs so
+	// no numeric fileNum/height pair can alias.
 
 	blockFileKey0 := make([]byte, 1+4)
-	blockFileKey0[0] = 'f' // blockFileInfoPrefix
+	blockFileKey0[0] = 'f' // blockFileInfoPrefix — unchanged, matches Core 'f'
 	// file 0: remaining 4 bytes = 0x00000000
 
 	filterKey0 := MakeBlockFilterKey(0)
-	// height 0: key[0]='f', key[1..4] = 0x00000000
+	// height 0: key[0]='X', key[1..4] = 0x00000000
 
-	if !bytes.Equal(blockFileKey0, filterKey0) {
-		t.Errorf("G12: expected key collision for fileNum=0 and height=0, but keys differ: %v vs %v",
+	// After the fix the prefixes must differ at byte 0.
+	if blockFileKey0[0] == filterKey0[0] {
+		t.Errorf("G12: blockFileInfoPrefix and BlockFilterPrefix still share the same first byte 0x%02x — collision not fixed",
+			blockFileKey0[0])
+	}
+	if bytes.Equal(blockFileKey0, filterKey0) {
+		t.Errorf("G12: blockFileInfoPrefix key for file 0 = %v and BlockFilterPrefix key for height 0 = %v are still IDENTICAL — collision not fixed",
 			blockFileKey0, filterKey0)
 	}
-	// They are equal — this is the collision.
-	t.Logf("G12 BUG (COLLISION): blockFileInfoPrefix key for file 0 = %v, "+
-		"BlockFilterPrefix key for height 0 = %v — IDENTICAL", blockFileKey0, filterKey0)
+
+	// Verify the new prefix byte is 'X'.
+	if filterKey0[0] != 'X' {
+		t.Errorf("G12: BlockFilterPrefix[0] = 0x%02x, want 'X' (0x58)", filterKey0[0])
+	}
+
+	t.Logf("G12 FIXED: blockFileInfoPrefix[0]='f' (0x%02x), BlockFilterPrefix[0]='X' (0x%02x) — no collision",
+		blockFileKey0[0], filterKey0[0])
 }
 
 // --------------------------------------------------------------------------
