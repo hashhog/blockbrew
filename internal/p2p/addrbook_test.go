@@ -6,6 +6,23 @@ import (
 	"time"
 )
 
+// testIP returns a routable public IPv4 address in the 1.2.3.x/8.x.x.x/
+// range, safe for use in unit tests.  These are publicly assigned addresses
+// that are not RFC1918 / RFC3927 / RFC5737 / RFC6598 / RFC4843, so they
+// pass the IsRoutable filter added by the BUG-27 fix.
+var testIPs = []string{
+	"1.2.3.1",
+	"1.2.3.2",
+	"1.2.3.3",
+	"1.2.3.4",
+	"1.2.3.5",
+	"1.2.3.6",
+	"1.2.3.7",
+	"1.2.3.8",
+	"1.2.3.9",
+	"1.2.3.10",
+}
+
 func TestNewAddressBook(t *testing.T) {
 	ab := NewAddressBook()
 	if ab == nil {
@@ -19,9 +36,9 @@ func TestNewAddressBook(t *testing.T) {
 func TestAddressBookAddAddress(t *testing.T) {
 	ab := NewAddressBook()
 
-	// Add a valid address
+	// Add a valid routable address
 	addr := NetAddress{
-		IP:   net.ParseIP("192.168.1.1"),
+		IP:   net.ParseIP("1.2.3.1"),
 		Port: 8333,
 	}
 	ab.AddAddress(addr, "test")
@@ -38,7 +55,7 @@ func TestAddressBookAddAddress(t *testing.T) {
 
 	// Add different address
 	addr2 := NetAddress{
-		IP:   net.ParseIP("192.168.1.2"),
+		IP:   net.ParseIP("1.2.3.2"),
 		Port: 8333,
 	}
 	ab.AddAddress(addr2, "test")
@@ -69,15 +86,25 @@ func TestAddressBookAddInvalidAddress(t *testing.T) {
 	if ab.Size() != 0 {
 		t.Errorf("unspecified IP should not be added, got size %d", ab.Size())
 	}
+
+	// Add RFC1918 private address - should be rejected (BUG-27 fix)
+	addr = NetAddress{
+		IP:   net.ParseIP("192.168.1.1"),
+		Port: 8333,
+	}
+	ab.AddAddress(addr, "test")
+	if ab.Size() != 0 {
+		t.Errorf("RFC1918 address should not be added, got size %d", ab.Size())
+	}
 }
 
 func TestAddressBookAddAddresses(t *testing.T) {
 	ab := NewAddressBook()
 
 	addrs := []NetAddress{
-		{IP: net.ParseIP("192.168.1.1"), Port: 8333},
-		{IP: net.ParseIP("192.168.1.2"), Port: 8333},
-		{IP: net.ParseIP("192.168.1.3"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.1"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.2"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.3"), Port: 8333},
 	}
 	ab.AddAddresses(addrs, "test")
 
@@ -94,11 +121,11 @@ func TestAddressBookPickAddress(t *testing.T) {
 		t.Error("empty book should return nil")
 	}
 
-	// Add some addresses
+	// Add some routable addresses
 	addrs := []NetAddress{
-		{IP: net.ParseIP("192.168.1.1"), Port: 8333},
-		{IP: net.ParseIP("192.168.1.2"), Port: 8333},
-		{IP: net.ParseIP("192.168.1.3"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.1"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.2"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.3"), Port: 8333},
 	}
 	ab.AddAddresses(addrs, "test")
 
@@ -113,12 +140,12 @@ func TestAddressBookMarkAttempt(t *testing.T) {
 	ab := NewAddressBook()
 
 	addr := NetAddress{
-		IP:   net.ParseIP("192.168.1.1"),
+		IP:   net.ParseIP("1.2.3.1"),
 		Port: 8333,
 	}
 	ab.AddAddress(addr, "test")
 
-	key := "192.168.1.1:8333"
+	key := "1.2.3.1:8333"
 	ab.MarkAttempt(key)
 
 	ka := ab.GetAddress(key)
@@ -144,12 +171,12 @@ func TestAddressBookMarkSuccess(t *testing.T) {
 	ab := NewAddressBook()
 
 	addr := NetAddress{
-		IP:   net.ParseIP("192.168.1.1"),
+		IP:   net.ParseIP("1.2.3.1"),
 		Port: 8333,
 	}
 	ab.AddAddress(addr, "test")
 
-	key := "192.168.1.1:8333"
+	key := "1.2.3.1:8333"
 
 	// Mark some failed attempts
 	ab.MarkAttempt(key)
@@ -176,7 +203,7 @@ func TestAddressBookRemoveAddress(t *testing.T) {
 	ab := NewAddressBook()
 
 	addr := NetAddress{
-		IP:   net.ParseIP("192.168.1.1"),
+		IP:   net.ParseIP("1.2.3.1"),
 		Port: 8333,
 	}
 	ab.AddAddress(addr, "test")
@@ -185,7 +212,7 @@ func TestAddressBookRemoveAddress(t *testing.T) {
 		t.Errorf("expected size 1, got %d", ab.Size())
 	}
 
-	ab.RemoveAddress("192.168.1.1:8333")
+	ab.RemoveAddress("1.2.3.1:8333")
 
 	if ab.Size() != 0 {
 		t.Errorf("expected size 0 after remove, got %d", ab.Size())
@@ -196,9 +223,9 @@ func TestAddressBookGood(t *testing.T) {
 	ab := NewAddressBook()
 
 	addrs := []NetAddress{
-		{IP: net.ParseIP("192.168.1.1"), Port: 8333},
-		{IP: net.ParseIP("192.168.1.2"), Port: 8333},
-		{IP: net.ParseIP("192.168.1.3"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.1"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.2"), Port: 8333},
+		{IP: net.ParseIP("1.2.3.3"), Port: 8333},
 	}
 	ab.AddAddresses(addrs, "test")
 
@@ -209,7 +236,7 @@ func TestAddressBookGood(t *testing.T) {
 	}
 
 	// Mark one as successful
-	ab.MarkSuccess("192.168.1.1:8333")
+	ab.MarkSuccess("1.2.3.1:8333")
 
 	good = ab.Good()
 	if len(good) != 1 {
@@ -217,7 +244,7 @@ func TestAddressBookGood(t *testing.T) {
 	}
 
 	// Mark another as successful
-	ab.MarkSuccess("192.168.1.2:8333")
+	ab.MarkSuccess("1.2.3.2:8333")
 
 	good = ab.Good()
 	if len(good) != 2 {
@@ -233,10 +260,10 @@ func TestAddressBookNeedMoreAddresses(t *testing.T) {
 		t.Error("empty book should need more addresses")
 	}
 
-	// Add some addresses
+	// Add some addresses using routable IPs across multiple /24s
 	for i := 0; i < 100; i++ {
 		ab.AddAddress(NetAddress{
-			IP:   net.ParseIP("192.168.1." + itoa(i)),
+			IP:   net.ParseIP("5." + itoa(i/256+1) + "." + itoa(i%256) + ".1"),
 			Port: 8333,
 		}, "test")
 	}
@@ -250,7 +277,7 @@ func TestAddressBookNeedMoreAddresses(t *testing.T) {
 func TestKnownAddressIsRecentlyAttempted(t *testing.T) {
 	ka := &KnownAddress{
 		Addr: NetAddress{
-			IP:   net.ParseIP("192.168.1.1"),
+			IP:   net.ParseIP("1.2.3.1"),
 			Port: 8333,
 		},
 	}
@@ -276,7 +303,7 @@ func TestKnownAddressIsRecentlyAttempted(t *testing.T) {
 func TestKnownAddressIsBad(t *testing.T) {
 	ka := &KnownAddress{
 		Addr: NetAddress{
-			IP:   net.ParseIP("192.168.1.1"),
+			IP:   net.ParseIP("1.2.3.1"),
 			Port: 8333,
 		},
 	}
@@ -308,7 +335,7 @@ func TestKnownAddressIsBad(t *testing.T) {
 func TestKnownAddressChance(t *testing.T) {
 	ka := &KnownAddress{
 		Addr: NetAddress{
-			IP:   net.ParseIP("192.168.1.1"),
+			IP:   net.ParseIP("1.2.3.1"),
 			Port: 8333,
 		},
 		LastSeen: time.Now(), // recently seen
@@ -353,37 +380,37 @@ func TestKnownAddressChance(t *testing.T) {
 func TestKnownAddressKey(t *testing.T) {
 	ka := &KnownAddress{
 		Addr: NetAddress{
-			IP:   net.ParseIP("192.168.1.1"),
+			IP:   net.ParseIP("1.2.3.1"),
 			Port: 8333,
 		},
 	}
 
 	key := ka.Key()
-	if key != "192.168.1.1:8333" {
-		t.Errorf("expected key 192.168.1.1:8333, got %s", key)
+	if key != "1.2.3.1:8333" {
+		t.Errorf("expected key 1.2.3.1:8333, got %s", key)
 	}
 }
 
 func TestAddressBookPickPrefersSucessful(t *testing.T) {
 	ab := NewAddressBook()
 
-	// Add addresses
+	// Add routable addresses across different IPs
 	for i := 1; i <= 10; i++ {
 		ab.AddAddress(NetAddress{
-			IP:   net.ParseIP("192.168.1." + itoa(i)),
+			IP:   net.ParseIP("1.2.3." + itoa(i)),
 			Port: 8333,
 		}, "test")
 	}
 
 	// Mark one as successful
-	ab.MarkSuccess("192.168.1.5:8333")
+	ab.MarkSuccess("1.2.3.5:8333")
 
 	// Pick many times and count how often we get the successful one
 	successCount := 0
 	iterations := 100
 	for i := 0; i < iterations; i++ {
 		ka := ab.PickAddress()
-		if ka != nil && ka.Key() == "192.168.1.5:8333" {
+		if ka != nil && ka.Key() == "1.2.3.5:8333" {
 			successCount++
 		}
 	}
