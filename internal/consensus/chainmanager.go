@@ -591,6 +591,9 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			if err := batch.Write(); err != nil {
 				return fmt.Errorf("failed to write genesis block batch: %w", err)
 			}
+			// Mirror Core blockstorage.cpp:1029 — set BLOCK_HAVE_UNDO after
+			// undo data is committed to disk.
+			cm.headerIndex.MarkUndoStored(hash)
 		}
 		return nil
 	}
@@ -950,6 +953,14 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// nodes whose body was stored but not yet connected are also visible to
 	// the filter.
 	node.Status |= StatusFullyValid | StatusDataStored
+	// FIX-33 (W109 G14/G15): set StatusHaveUndo when undo data will be written
+	// to disk as part of this block connection. Mirrors Bitcoin Core's
+	// blockstorage.cpp:1029 (block.nStatus |= BLOCK_HAVE_UNDO after CBlockUndo
+	// is written to rev*.dat). When generateUndo is false (assume-valid IBD),
+	// no undo data is generated so the flag stays clear.
+	if generateUndo {
+		node.Status |= StatusHaveUndo
+	}
 
 	// Exit IBD mode when close to current time
 	if cm.isIBD && cm.tipHeight == cm.assumeValidHeight {
