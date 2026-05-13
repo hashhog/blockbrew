@@ -1648,8 +1648,69 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 		witnessCommitment = hex.EncodeToString(template.WitnessCommitment)
 	}
 
+	// Build rules[] and vbavailable{} per BIP-9 / Core rpc/mining.cpp:950-983.
+	//
+	// rules[]: active softfork rules the miner must understand.
+	//   "csv"     — always present (BIP 68/112/113, buried, always active on mainnet).
+	//   "!segwit" — present with "!" prefix once segwit is active (mandatory rule).
+	//   "taproot" — present without "!" (informational) once taproot is active.
+	//   "!signet" — present on signet networks (mandatory rule).
+	//
+	// vbavailable{}: BIP-9 deployments currently STARTED or LOCKED_IN, mapped
+	//   name → bit number (so pools can signal them in their block version).
+	//
+	// Reference: bitcoin-core/src/rpc/mining.cpp:950-983.
+	var gbtRules []string
+	gbtVbavailable := make(map[string]int)
+
+	// Determine tip height for buried-deployment checks.
+	tipHeight := template.Height - 1 // template.Height is the NEW block height
+
+	// CSV — always present on any chain where it is active.
+	if s.chainParams != nil && tipHeight >= s.chainParams.CSVHeight {
+		gbtRules = append(gbtRules, "csv")
+	} else {
+		// Pre-activation: still include "csv" per Core (always added first).
+		gbtRules = append(gbtRules, "csv")
+	}
+
+	// fPreSegWit: segwit NOT yet active → emit nothing for segwit/taproot.
+	// Post-segwit: emit "!segwit" (mandatory) and "taproot" (informational).
+	fPreSegWit := s.chainParams == nil || tipHeight < s.chainParams.SegwitHeight
+	if !fPreSegWit {
+		gbtRules = append(gbtRules, "!segwit")
+		if s.chainParams != nil && tipHeight >= s.chainParams.TaprootHeight {
+			gbtRules = append(gbtRules, "taproot")
+		}
+	}
+
+	// Signet mandatory rule.
+	if s.chainParams != nil && s.chainParams.Name == "signet" {
+		gbtRules = append(gbtRules, "!signet")
+	}
+
+	// BIP-9 vbavailable: STARTED and LOCKED_IN deployments.
+	// Core loops gbtstatus.signalling and gbtstatus.locked_in — we replicate
+	// that by calling GetDeploymentState for each registered BIP9 deployment.
+	if s.chainParams != nil {
+		var vbCache *consensus.VersionBitsCache
+		var tipNode *consensus.BlockNode
+		if s.chainMgr != nil {
+			tipNode = s.chainMgr.BestBlockNode()
+		}
+		for i, dep := range s.chainParams.Deployments {
+			state := consensus.GetDeploymentState(dep, i, tipNode, s.chainParams, vbCache)
+			if state == consensus.DeploymentStarted || state == consensus.DeploymentLockedIn {
+				gbtVbavailable[dep.Name] = dep.Bit
+			}
+		}
+	}
+
 	return &BlockTemplateResult{
 		Version:                  template.Block.Header.Version,
+		Rules:                    gbtRules,
+		Vbavailable:              gbtVbavailable,
+		Vbrequired:               0,
 		PreviousBlockHash:        template.Block.Header.PrevBlock.String(),
 		Transactions:             txs,
 		CoinbaseAux:              map[string]string{},

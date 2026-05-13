@@ -134,26 +134,89 @@ func TestW108_G5_LongPollIDMissingFromResponse(t *testing.T) {
 // G6 – GBT response must include "rules" array with active softforks.
 // Core (mining.cpp:950-963): aRules starts with "csv"; adds "!segwit" and
 // "taproot" post-activation; adds "!signet" on signet.
-// blockbrew BlockTemplateResult has no Rules field.
+//
+// FIX: BlockTemplateResult.Rules []string added; handler populates it from
+// chain params + tip height. Full RPC-level coverage:
+//   TestW108_G6_RulesInGBTResponse (internal/rpc/w108_gbt_rpc_test.go).
 // ---------------------------------------------------------------------------
 func TestW108_G6_RulesArrayMissingFromResponse(t *testing.T) {
-	t.Log("G6 BUG: BlockTemplateResult struct missing 'rules' array. " +
-		"Core mining.cpp:950: result.pushKV('rules', aRules) where aRules=" +
-		"['csv','!segwit','taproot',...]. BIP-9 spec: clients use this to " +
-		"understand which consensus rules are active.")
+	// Structural assertion: BlockTemplate (mining-layer) provides enough data
+	// for the RPC handler to compute rules[]. Verify the template is generated
+	// without error on a regtest chain (the RPC handler builds rules[] from
+	// chainParams + template.Height, not from BlockTemplate fields directly).
+	params := consensus.RegtestParams()
+	genesisHash := params.GenesisHash
+	tipNode := &consensus.BlockNode{
+		Hash:   genesisHash,
+		Header: params.GenesisBlock.Header,
+		Height: 0,
+	}
+	mp := &mockMempool{}
+	chainState := &mockChainState{tipHash: genesisHash, tipHeight: 0, tipNode: tipNode}
+	headerIndex := &mockHeaderIndex{nodes: map[wire.Hash256]*consensus.BlockNode{genesisHash: tipNode}}
+
+	tg := NewTemplateGenerator(params, chainState, mp, headerIndex)
+	template, err := tg.GenerateTemplate(TemplateConfig{MinerAddress: []byte{0x51}})
+	if err != nil {
+		t.Fatalf("G6: GenerateTemplate failed: %v", err)
+	}
+
+	// template.Height must be 1 (tip 0 + 1) so the RPC handler can compute
+	// tipHeight = template.Height - 1 = 0 and check burial heights correctly.
+	if template.Height != 1 {
+		t.Errorf("G6: template.Height = %d, want 1 (needed by rules[] computation)", template.Height)
+	}
+
+	// On regtest all buried heights are 0 (active from genesis):
+	// csv/segwit/taproot are all active. RPC handler must emit:
+	//   rules = ["csv", "!segwit", "taproot"]
+	// That logic lives in handleGetBlockTemplate; see
+	// TestW108_G6_RulesInGBTResponse in internal/rpc/w108_gbt_rpc_test.go.
+	t.Log("G6 FIXED: BlockTemplateResult.Rules []string added to rpc.BlockTemplateResult; " +
+		"handler computes [\"csv\",\"!segwit\",\"taproot\"] on regtest (post-segwit/taproot). " +
+		"Full assertion: TestW108_G6_RulesInGBTResponse (internal/rpc/w108_gbt_rpc_test.go).")
 }
 
 // ---------------------------------------------------------------------------
 // G7 – GBT response must include "vbavailable" map (BIP-9).
 // Core (mining.cpp:966-983): maps deployment name → bit for SIGNALLING+LOCKED_IN.
-// blockbrew BlockTemplateResult has no VbAvailable field.
+//
+// FIX: BlockTemplateResult.Vbavailable map[string]int added; handler populates
+// it by iterating cp.Deployments and calling GetDeploymentState. Full coverage:
+//   TestW108_G7_VbAvailableInGBTResponse (internal/rpc/w108_gbt_rpc_test.go).
 // ---------------------------------------------------------------------------
 func TestW108_G7_VbAvailableMissingFromResponse(t *testing.T) {
-	t.Log("G7 BUG: BlockTemplateResult struct missing 'vbavailable' map. " +
-		"Core mining.cpp:966: result.pushKV('vbavailable', vbavailable) " +
-		"where vbavailable maps deployment name to BIP-9 bit number for " +
-		"in-flight (STARTED/LOCKED_IN) deployments. " +
-		"Required for pools to signal correctly per BIP-9.")
+	// Structural: verify GetDeploymentState returns ACTIVE (not STARTED/LOCKED_IN)
+	// for AlwaysActive deployments so they do NOT appear in vbavailable.
+	dep := &consensus.BIP9Deployment{
+		Name:      "testdummy",
+		Bit:       28,
+		StartTime: consensus.AlwaysActive,
+		Timeout:   consensus.NoTimeout,
+		Period:    144,
+		Threshold: 108,
+	}
+	params := consensus.RegtestParams()
+	genesisHash := params.GenesisHash
+	tipNode := &consensus.BlockNode{
+		Hash:   genesisHash,
+		Header: params.GenesisBlock.Header,
+		Height: 0,
+	}
+
+	state := consensus.GetDeploymentState(dep, 0, tipNode, params, nil)
+	if state == consensus.DeploymentStarted || state == consensus.DeploymentLockedIn {
+		t.Errorf("G7: AlwaysActive deployment has state %v; must not appear in vbavailable "+
+			"(only STARTED/LOCKED_IN deployments are advertised per BIP-9 / Core mining.cpp:966-983)",
+			state)
+	}
+	if state != consensus.DeploymentActive {
+		t.Errorf("G7: AlwaysActive deployment state = %v, want DeploymentActive", state)
+	}
+
+	t.Log("G7 FIXED: BlockTemplateResult.Vbavailable map[string]int added to rpc.BlockTemplateResult; " +
+		"handler iterates cp.Deployments, emits name→bit for STARTED/LOCKED_IN states only. " +
+		"Full assertion: TestW108_G7_VbAvailableInGBTResponse (internal/rpc/w108_gbt_rpc_test.go).")
 }
 
 // ---------------------------------------------------------------------------
