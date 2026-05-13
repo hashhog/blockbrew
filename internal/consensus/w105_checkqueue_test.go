@@ -736,34 +736,37 @@ func TestW105_G27_StandardVsMandatoryFlags(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestW105_G28_Par1SerialPath_ConfigInverted(t *testing.T) {
-	// BUG W105-B11: the config logic for disabling parallel scripts is inverted.
+	// FIX W105-B11: the config logic for disabling parallel scripts was inverted.
 	//
-	// Reproduce the bug:
-	//   config.ParallelScripts = false
-	//   → if !config.ParallelScripts { cm.parallelScripts = true }
-	//   → cm.parallelScripts is set to true even though user requested false.
+	// Bug was:
+	//   if !config.ParallelScripts { cm.parallelScripts = true }
+	// This silently set parallelScripts=true whenever the user passed false.
 	//
-	// The fix is: cm.parallelScripts = config.ParallelScripts
+	// Fix: direct assignment cm.parallelScripts = config.ParallelScripts (via
+	// struct literal in NewChainManager; the bogus override block was removed).
 
-	config := ChainManagerConfig{
-		Params:          RegtestParams(),
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+
+	// When user requests serial (false), NewChainManager must honour it.
+	cmSerial := NewChainManager(ChainManagerConfig{
+		Params:          params,
+		HeaderIndex:     idx,
 		ParallelScripts: false, // user wants serial
+	})
+	if cmSerial.parallelScripts {
+		t.Error("W105-B11 regression: ParallelScripts=false must not be inverted to true by NewChainManager")
 	}
 
-	// Simulate what NewChainManager does (the buggy path):
-	simulatedParallelScripts := false // zero value
-	if !config.ParallelScripts {
-		simulatedParallelScripts = true // BUG: sets true when user wants false
+	// When user requests parallel (true), it must also be honoured.
+	cmParallel := NewChainManager(ChainManagerConfig{
+		Params:          params,
+		HeaderIndex:     idx,
+		ParallelScripts: true,
+	})
+	if !cmParallel.parallelScripts {
+		t.Error("W105-B11: ParallelScripts=true was not propagated into ChainManager")
 	}
-
-	// This assertion documents the bug: expected false, got true.
-	if !simulatedParallelScripts {
-		t.Error("W105-B11: expected bug to manifest: parallelScripts should be true (wrong) when config is false")
-	}
-	// We want this to assert the BUG is present, so the test passes when the bug exists.
-	// When the bug is fixed (cm.parallelScripts = config.ParallelScripts), this test
-	// should be updated to assert simulatedParallelScripts == false.
-	t.Log("W105-B11: --parallelscripts=false is inverted; node always runs parallel — BUG CONFIRMED")
 }
 
 // ---------------------------------------------------------------------------
