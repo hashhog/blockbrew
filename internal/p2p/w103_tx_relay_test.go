@@ -266,36 +266,35 @@ func TestW103_G4_G18_MempoolRateLimitAbsent(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G5 / BUG-5 (P1): MAX_GETDATA_SZ=1000 not enforced for tx getdata batches.
+// G5 (FIXED): MAX_GETDATA_SZ=1000 cap enforced for getdata messages.
 // Bitcoin Core net_processing.cpp:128: MAX_GETDATA_SZ = 1000.
 // Core: vGetData.size() >= MAX_GETDATA_SZ → flush and start new getdata.
-// blockbrew's MsgGetData.Deserialize uses MaxInvVects (50000) not 1000.
+// blockbrew now defines MaxGetDataSize=1000 (distinct from MaxInvVects=50000)
+// and uses it in MsgGetData.AddInvVect / Deserialize.
 //
-// Test: verify MaxInvVects is used (documents missing 1000 cap for getdata).
+// Test: assert MaxGetDataSize=1000, AddInvVect refuses >1000, and that
+// MaxInvVects (inv cap) remains 50000 and separate.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW103_G5_GetDataSizeCap(t *testing.T) {
-	// Bitcoin Core defines a separate MAX_GETDATA_SZ = 1000 for getdata batches,
-	// distinct from MAX_INV_SZ = 50000 for inv messages.
-	// blockbrew uses the same MaxInvVects=50000 for both MsgInv and MsgGetData
-	// (msg_getdata.go:36 checks count > MaxInvVects).
-	//
-	// This is BUG-5: getdata should refuse >1000 entries, not >50000.
-	const coreMaxGetDataSz = 1000
-	if MaxInvVects == coreMaxGetDataSz {
-		t.Log("G5: MaxInvVects equals Core MAX_GETDATA_SZ=1000 (not the bug scenario)")
-	} else {
-		// Document: MaxInvVects=50000 is applied to getdata, 50x too large.
-		if MaxInvVects != 50000 {
-			t.Errorf("G5: unexpected MaxInvVects value %d", MaxInvVects)
-		}
-		// Document the bug: getdata batch cap should be 1000, not 50000.
-		// A peer can request 50000 txs in a single getdata message (DoS).
+	// MaxGetDataSize must match Core MAX_GETDATA_SZ = 1000.
+	if MaxGetDataSize != 1000 {
+		t.Errorf("G5: MaxGetDataSize = %d, want 1000 (Core MAX_GETDATA_SZ)", MaxGetDataSize)
 	}
 
-	// Verify getdata parses correctly using the current (too-large) cap.
+	// MaxInvVects (inv cap) must remain 50000 — distinct from getdata cap.
+	if MaxInvVects != 50000 {
+		t.Errorf("G5: MaxInvVects = %d, want 50000 (Core MAX_INV_SZ)", MaxInvVects)
+	}
+
+	// AddInvVect must accept exactly 1000 entries and refuse the 1001st.
 	msg := &MsgGetData{}
-	if err := msg.AddInvVect(&InvVect{Type: InvTypeTx}); err != nil {
-		t.Errorf("G5: AddInvVect failed unexpectedly: %v", err)
+	for i := 0; i < MaxGetDataSize; i++ {
+		if err := msg.AddInvVect(&InvVect{Type: InvTypeTx}); err != nil {
+			t.Fatalf("G5: unexpected error adding invvect #%d: %v", i, err)
+		}
+	}
+	if err := msg.AddInvVect(&InvVect{Type: InvTypeTx}); err == nil {
+		t.Error("G5: AddInvVect must return error when list exceeds MaxGetDataSize (1000)")
 	}
 }
 
