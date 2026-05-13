@@ -1625,10 +1625,17 @@ func (sm *SyncManager) requestBlocks() {
 	// Save round-robin index for next call
 	sm.peerRoundIdx = peerIdx
 
-	// Send batched getdata requests
+	// Send batched getdata requests, capped at MaxGetDataSize=1000 items per
+	// message (Bitcoin Core MAX_GETDATA_SZ, net_processing.cpp:128). Previously
+	// the entire invList was sent as one message, allowing up to MaxInvVects
+	// (50000) items — 50× the protocol limit.
 	for peer, invList := range peerRequests {
-		if len(invList) > 0 {
-			peer.SendMessage(&MsgGetData{InvList: invList})
+		for start := 0; start < len(invList); start += MaxGetDataSize {
+			end := start + MaxGetDataSize
+			if end > len(invList) {
+				end = len(invList)
+			}
+			peer.SendMessage(&MsgGetData{InvList: invList[start:end]})
 		}
 	}
 
