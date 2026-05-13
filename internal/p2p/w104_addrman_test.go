@@ -449,33 +449,50 @@ func TestW104_G26_AddrTokenBucketRateLimitAbsent(t *testing.T) {
 	t.Log("BUG-26: no per-peer addr token bucket; ADDR flood protection absent (Core m_addr_token_bucket)")
 }
 
-// BUG-27 (G27): Source connectivity guard absent.
-// Core AddSingle: if (!addr.IsRoutable()) return false — only routable
-// addresses are added.  blockbrew.AddAddress only filters nil IP and
-// IsUnspecified; it does not call IsGlobalUnicast() or equivalent to
-// reject RFC1918 private, link-local, or loopback addresses from gossip.
-func TestW104_G27_SourceRoutabilityCheckAbsent(t *testing.T) {
+// TestW104_G27_SourceRoutabilityCheck verifies that non-routable addresses are
+// rejected from the address book, mirroring Core's AddrMan::AddSingle which
+// calls IsRoutable() before storing any gossip-learned address.
+//
+// Fixed by: adding isRoutableIP() predicate and calling it at the top of
+// AddAddress() (addrbook.go).  Covers RFC1918, link-local (RFC3927/RFC4862),
+// loopback, RFC2544, RFC6598, RFC5737, RFC4193, RFC4843, RFC7343 — all ranges
+// that Core's CNetAddr::IsRoutable() rejects.
+func TestW104_G27_SourceRoutabilityCheck(t *testing.T) {
 	ab := NewAddressBook()
 
-	// RFC1918 private addresses — Core would reject these from gossip
-	privAddrs := []NetAddress{
-		{IP: net.ParseIP("192.168.1.1"), Port: 8333},  // RFC1918
-		{IP: net.ParseIP("10.0.0.1"), Port: 8333},     // RFC1918
-		{IP: net.ParseIP("172.16.0.1"), Port: 8333},   // RFC1918
-		{IP: net.ParseIP("169.254.1.1"), Port: 8333},  // link-local
-		{IP: net.ParseIP("127.0.0.1"), Port: 8333},    // loopback
+	// Non-routable addresses — Core rejects all of these from gossip.
+	nonRoutable := []struct {
+		addr NetAddress
+		desc string
+	}{
+		{NetAddress{IP: net.ParseIP("192.168.1.1"), Port: 8333}, "RFC1918 192.168/16"},
+		{NetAddress{IP: net.ParseIP("10.0.0.1"), Port: 8333}, "RFC1918 10/8"},
+		{NetAddress{IP: net.ParseIP("172.16.0.1"), Port: 8333}, "RFC1918 172.16/12"},
+		{NetAddress{IP: net.ParseIP("169.254.1.1"), Port: 8333}, "RFC3927 link-local"},
+		{NetAddress{IP: net.ParseIP("127.0.0.1"), Port: 8333}, "loopback 127/8"},
+		{NetAddress{IP: net.ParseIP("198.18.1.1"), Port: 8333}, "RFC2544 benchmarking"},
+		{NetAddress{IP: net.ParseIP("100.64.1.1"), Port: 8333}, "RFC6598 CGNAT"},
+		{NetAddress{IP: net.ParseIP("192.0.2.1"), Port: 8333}, "RFC5737 TEST-NET-1"},
+		{NetAddress{IP: net.ParseIP("198.51.100.1"), Port: 8333}, "RFC5737 TEST-NET-2"},
+		{NetAddress{IP: net.ParseIP("203.0.113.1"), Port: 8333}, "RFC5737 TEST-NET-3"},
+		{NetAddress{IP: net.ParseIP("fc00::1"), Port: 8333}, "RFC4193 ULA"},
+		{NetAddress{IP: net.ParseIP("fe80::1"), Port: 8333}, "RFC4862 link-local IPv6"},
+		{NetAddress{IP: net.ParseIP("::1"), Port: 8333}, "IPv6 loopback"},
 	}
 
-	for _, addr := range privAddrs {
-		ab.AddAddress(addr, "peer")
+	for _, tc := range nonRoutable {
+		ab.AddAddress(tc.addr, "peer")
 	}
 
-	// BUG-27: Core rejects non-routable addresses from AddSingle.
-	// blockbrew accepts all of these.
-	if ab.Size() == len(privAddrs) {
-		t.Logf("BUG-27: %d non-routable addresses accepted; Core would reject all (IsRoutable check missing)", ab.Size())
-	} else {
-		t.Logf("note: %d/%d addresses stored — partial filter may be present", ab.Size(), len(privAddrs))
+	if ab.Size() != 0 {
+		t.Errorf("G27 BROKEN: %d non-routable address(es) accepted; want 0 (IsRoutable check failed)", ab.Size())
+	}
+
+	// Sanity: a genuinely routable address must still be accepted.
+	routable := NetAddress{IP: net.ParseIP("1.2.3.4"), Port: 8333}
+	ab.AddAddress(routable, "peer")
+	if ab.Size() != 1 {
+		t.Errorf("G27: routable address rejected; want size=1, got %d", ab.Size())
 	}
 }
 

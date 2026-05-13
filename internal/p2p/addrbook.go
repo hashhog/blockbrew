@@ -7,6 +7,88 @@ import (
 	"time"
 )
 
+// isRoutableIP returns true if ip is publicly routable on the global internet,
+// mirroring Bitcoin Core's CNetAddr::IsRoutable() in netaddress.cpp:462.
+//
+// Core rejects: RFC1918, RFC2544, RFC3927, RFC4862, RFC6598, RFC5737,
+//               RFC4193, RFC4843, RFC7343, local (loopback/unspecified), internal.
+//
+// Go stdlib covers: loopback (IsLoopback), RFC1918+RFC4193 (IsPrivate),
+//                   RFC3927+RFC4862 link-local (IsLinkLocalUnicast).
+// The remaining ranges are checked explicitly via CIDR nets.
+func isRoutableIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	// Normalise to 16-byte form so all comparisons work uniformly.
+	ip = ip.To16()
+	if ip == nil {
+		return false
+	}
+
+	// Unspecified (0.0.0.0 / ::)
+	if ip.IsUnspecified() {
+		return false
+	}
+	// Loopback: 127.0.0.0/8 (IPv4-mapped) and ::1/128
+	if ip.IsLoopback() {
+		return false
+	}
+	// RFC1918 (10/8, 172.16/12, 192.168/16) and RFC4193 (fc00::/7 ULA)
+	// Go 1.17+ IsPrivate covers exactly these ranges.
+	if ip.IsPrivate() {
+		return false
+	}
+	// Link-local unicast: 169.254.0.0/16 (RFC3927) and fe80::/10 (RFC4862)
+	if ip.IsLinkLocalUnicast() {
+		return false
+	}
+	// Multicast
+	if ip.IsMulticast() {
+		return false
+	}
+
+	// Ranges not covered by Go stdlib — checked via parsed CIDRs (initialised
+	// once at package init).
+	for _, cidr := range nonRoutableCIDRs {
+		if cidr.Contains(ip) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// nonRoutableCIDRs contains IPv4/IPv6 ranges that Core rejects but that Go's
+// stdlib helpers do not cover:
+//   - 198.18.0.0/15   RFC2544 benchmarking
+//   - 100.64.0.0/10   RFC6598 shared address space (CGNAT)
+//   - 192.0.2.0/24    RFC5737 TEST-NET-1
+//   - 198.51.100.0/24 RFC5737 TEST-NET-2
+//   - 203.0.113.0/24  RFC5737 TEST-NET-3
+//   - 2001:10::/28    RFC4843 ORCHID
+//   - 2001:20::/28    RFC7343 ORCHIDv2
+var nonRoutableCIDRs []*net.IPNet
+
+func init() {
+	cidrs := []string{
+		"198.18.0.0/15",    // RFC2544 benchmarking
+		"100.64.0.0/10",    // RFC6598 shared address space (CGNAT)
+		"192.0.2.0/24",     // RFC5737 TEST-NET-1
+		"198.51.100.0/24",  // RFC5737 TEST-NET-2
+		"203.0.113.0/24",   // RFC5737 TEST-NET-3
+		"2001:10::/28",     // RFC4843 ORCHID
+		"2001:20::/28",     // RFC7343 ORCHIDv2
+	}
+	for _, s := range cidrs {
+		_, cidr, err := net.ParseCIDR(s)
+		if err != nil {
+			panic("isRoutableIP: bad CIDR " + s + ": " + err.Error())
+		}
+		nonRoutableCIDRs = append(nonRoutableCIDRs, cidr)
+	}
+}
+
 // Address selection tuning constants.
 const (
 	// MinRetryInterval is the minimum time between connection attempts to the same address.
@@ -147,12 +229,16 @@ func NewAddressBook() *AddressBook {
 }
 
 // AddAddress adds a new address to the book.
+// Non-routable addresses (RFC1918 private, loopback, link-local, benchmarking,
+// shared address space, documentation ranges, ORCHID/ORCHIDv2) are rejected,
+// mirroring Bitcoin Core AddrMan::AddSingle which calls IsRoutable() before
+// storing any gossip-learned address (addrman.cpp).
 func (ab *AddressBook) AddAddress(addr NetAddress, source string) {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
 
-	// Skip invalid addresses
-	if addr.IP == nil || addr.IP.IsUnspecified() {
+	// Reject non-routable addresses (Core: if (!addr.IsRoutable()) return false)
+	if !isRoutableIP(addr.IP) {
 		return
 	}
 
