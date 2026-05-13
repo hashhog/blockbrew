@@ -25,6 +25,16 @@ const rollingFeeHalflife = float64(12 * 60 * 60) // 12 hours in seconds
 // DEFAULT_MEMPOOL_EXPIRY_HOURS = 336 (14 days).
 const DefaultMempoolExpiryHours = 336
 
+// OrphanTxExpireTime is the maximum age of an orphan transaction before it
+// is evicted from the orphan pool.  Matches Bitcoin Core's
+// ORPHAN_TX_EXPIRE_TIME in net_processing.cpp / txorphanage.cpp:
+//
+//	static constexpr auto ORPHAN_TX_EXPIRE_TIME{20min};
+//
+// Core calls LimitOrphans (which eventually evicts old entries) after every
+// AddTx; blockbrew drives ExpireOrphans on a periodic timer instead.
+const OrphanTxExpireTime = 20 * time.Minute
+
 // Mempool errors.
 var (
 	ErrAlreadyInMempool   = errors.New("transaction already in mempool")
@@ -1882,8 +1892,8 @@ func (mp *Mempool) evictRandomOrphanLocked() {
 		return
 	}
 
-	// First try to evict expired orphans (> 20 minutes old)
-	expiry := time.Now().Add(-20 * time.Minute)
+	// First try to evict expired orphans (older than OrphanTxExpireTime)
+	expiry := time.Now().Add(-OrphanTxExpireTime)
 	for hash, orphan := range mp.orphans {
 		if orphan.addedTime.Before(expiry) {
 			delete(mp.orphans, hash)
@@ -1937,12 +1947,15 @@ func (mp *Mempool) processOrphansLocked(newTxHash wire.Hash256) {
 	}
 }
 
-// ExpireOrphans removes orphans older than 20 minutes.
+// ExpireOrphans removes orphans that have been in the pool longer than
+// OrphanTxExpireTime.  Matches Bitcoin Core's ORPHAN_TX_EXPIRE_TIME (20
+// minutes).  Called periodically by the main loop — see the orphanExpireTicker
+// goroutine in cmd/blockbrew/main.go.
 func (mp *Mempool) ExpireOrphans() {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
-	expiry := time.Now().Add(-20 * time.Minute)
+	expiry := time.Now().Add(-OrphanTxExpireTime)
 	for hash, orphan := range mp.orphans {
 		if orphan.addedTime.Before(expiry) {
 			delete(mp.orphans, hash)
