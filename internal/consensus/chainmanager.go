@@ -253,11 +253,8 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 		onBlockConnected:    config.OnBlockConnected,
 	}
 
-	// Default to parallel script validation
-	if !config.ParallelScripts {
-		// Only disable if explicitly set (zero value means not set)
-		cm.parallelScripts = true
-	}
+	// parallelScripts is already set from config.ParallelScripts in the struct
+	// literal above. No override needed.
 
 	// Initialize tip from genesis if no UTXO set provided
 	if cm.utxoSet == nil {
