@@ -2,9 +2,31 @@
 package wallet
 
 import (
-	"math/rand"
+	"crypto/rand"
+	"encoding/binary"
 	"sort"
 )
+
+// csRandIntn returns a cryptographically secure random int in [0, n).
+// Panics if crypto/rand fails (CSPRNG failure is unrecoverable).
+func csRandIntn(n int) int {
+	if n <= 0 {
+		panic("csRandIntn: n must be > 0")
+	}
+	var buf [4]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		panic("crypto/rand unavailable: " + err.Error())
+	}
+	return int(binary.BigEndian.Uint32(buf[:]) % uint32(n))
+}
+
+// csRandShuffle shuffles a slice in place using crypto/rand (Fisher-Yates).
+func csRandShuffle[T any](s []T) {
+	for i := len(s) - 1; i > 0; i-- {
+		j := csRandIntn(i + 1)
+		s[i], s[j] = s[j], s[i]
+	}
+}
 
 // CoinSelectionAlgorithm identifies which algorithm was used.
 type CoinSelectionAlgorithm int
@@ -233,12 +255,10 @@ func selectCoinsKnapsack(utxos []*utxoWithEffValue, target int64, changeTarget i
 	var lowestLarger *utxoWithEffValue
 	var totalLower int64
 
-	// Shuffle first for randomness
+	// Shuffle first for randomness using CSPRNG (W113 BUG-6 fix).
 	shuffled := make([]*utxoWithEffValue, len(utxos))
 	copy(shuffled, utxos)
-	rand.Shuffle(len(shuffled), func(i, j int) {
-		shuffled[i], shuffled[j] = shuffled[j], shuffled[i]
-	})
+	csRandShuffle(shuffled)
 
 	for _, u := range shuffled {
 		if u.effValue == target {
@@ -364,7 +384,7 @@ func approximateBestSubset(utxos []*utxoWithEffValue, target int64) ([]int, int6
 			for i := 0; i < n; i++ {
 				// First pass: randomly include/exclude
 				// Second pass: include anything not already included
-				if (pass == 0 && rand.Intn(2) == 1) || (pass == 1 && !included[i]) {
+				if (pass == 0 && csRandIntn(2) == 1) || (pass == 1 && !included[i]) {
 					total += utxos[i].effValue
 					included[i] = true
 
