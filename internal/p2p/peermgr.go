@@ -103,6 +103,15 @@ const (
 
 	// AnchorsFilename is the file used to persist block-relay-only peer addresses.
 	AnchorsFilename = "anchors.json"
+
+	// ASMapHealthCheckInterval is how often to run the asmap health check.
+	// Bitcoin Core uses 24h (net.h ASMAP_HEALTH_CHECK_INTERVAL); we use 1h
+	// to surface stale-asmap warnings sooner on busy nodes.
+	ASMapHealthCheckInterval = 3600 * time.Second
+
+	// ASMapHealthCheckTopN is the number of top ASNs (by address count) to
+	// include in the health-check log line.
+	ASMapHealthCheckTopN = 5
 )
 
 // PeerManagerConfig configures the peer manager.
@@ -216,6 +225,134 @@ func (pm *PeerManager) GetMappedASForAddr(addr string) uint32 {
 	}
 	ip := net.ParseIP(host)
 	return GetMappedAS(pm.asmap, ip)
+}
+
+// ASMapHealthCheckResult holds the statistics produced by ASMapHealthCheck.
+type ASMapHealthCheckResult struct {
+	Total    int            // total clearnet addresses sampled
+	Mapped   int            // addresses with a non-zero ASN
+	Unmapped int            // addresses with ASN == 0 (no trie entry)
+	UniqueAS int            // distinct ASNs seen
+	TopASNs  []ASNCount     // top ASMapHealthCheckTopN ASNs by address count
+}
+
+// ASNCount pairs an ASN with its occurrence count in the sampled address set.
+type ASNCount struct {
+	ASN   uint32
+	Count int
+}
+
+// ASMapHealthCheck iterates over all AddrMan entries plus currently-connected
+// peers, maps each to an ASN via the loaded asmap trie, and logs a summary.
+// Returns nil when no asmap is loaded (noop). Mirrors Bitcoin Core's
+// NetGroupManager::ASMapHealthCheck() (netgroup.cpp:109) and
+// CConnman::ASMapHealthCheck() (net.cpp:4178).
+//
+// Extends Core by:
+//   - including currently-connected peers (not only AddrMan)
+//   - de-duplicating addresses across both sources
+//   - reporting top-N ASNs by entry count
+func (pm *PeerManager) ASMapHealthCheck() *ASMapHealthCheckResult {
+	if !pm.UsingASMap() {
+		return nil
+	}
+
+	// Collect unique IPs from AddrMan entries.
+	seen := make(map[string]struct{})
+	var ips []net.IP
+
+	for _, ka := range pm.addrBook.AllAddresses() {
+		if ka.Addr.IP == nil {
+			continue
+		}
+		key := ka.Addr.IP.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		ips = append(ips, ka.Addr.IP)
+	}
+
+	// Also include currently-connected peer IPs.
+	pm.mu.RLock()
+	for addr := range pm.peers {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			host = addr
+		}
+		ip := net.ParseIP(host)
+		if ip == nil {
+			continue
+		}
+		key := ip.String()
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		ips = append(ips, ip)
+	}
+	pm.mu.RUnlock()
+
+	// Map each IP to an ASN and tally results.
+	asnCounts := make(map[uint32]int)
+	unmapped := 0
+	for _, ip := range ips {
+		asn := GetMappedAS(pm.asmap, ip)
+		if asn == 0 {
+			unmapped++
+		} else {
+			asnCounts[asn]++
+		}
+	}
+
+	// Build sorted top-N list.
+	type kv struct {
+		asn   uint32
+		count int
+	}
+	pairs := make([]kv, 0, len(asnCounts))
+	for asn, cnt := range asnCounts {
+		pairs = append(pairs, kv{asn, cnt})
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].count != pairs[j].count {
+			return pairs[i].count > pairs[j].count
+		}
+		return pairs[i].asn < pairs[j].asn
+	})
+	topN := ASMapHealthCheckTopN
+	if len(pairs) < topN {
+		topN = len(pairs)
+	}
+	top := make([]ASNCount, topN)
+	for i := 0; i < topN; i++ {
+		top[i] = ASNCount{ASN: pairs[i].asn, Count: pairs[i].count}
+	}
+
+	res := &ASMapHealthCheckResult{
+		Total:    len(ips),
+		Mapped:   len(ips) - unmapped,
+		Unmapped: unmapped,
+		UniqueAS: len(asnCounts),
+		TopASNs:  top,
+	}
+
+	// Format top-ASN list for the log line.
+	topStr := ""
+	for i, ac := range top {
+		if i > 0 {
+			topStr += ", "
+		}
+		topStr += fmt.Sprintf("AS%d(%d)", ac.ASN, ac.Count)
+	}
+	if topStr == "" {
+		topStr = "none"
+	}
+
+	log.Printf("ASMap Health Check: %d clearnet peers mapped to %d ASNs, %d unmapped; top %d: %s",
+		res.Total, res.UniqueAS, res.Unmapped, len(top), topStr)
+
+	return res
 }
 
 // NewPeerManager creates a new peer manager.
@@ -825,6 +962,19 @@ func (pm *PeerManager) connectionHandler() {
 	banCleanupTicker := time.NewTicker(1 * time.Hour)
 	defer banCleanupTicker.Stop()
 
+	// ASMap health-check ticker — only fires when asmap is loaded.
+	// Mirrors Core's CConnman::Start() which calls ASMapHealthCheck() once at
+	// startup then schedules it every ASMAP_HEALTH_CHECK_INTERVAL (net.cpp:3572).
+	var asmapHealthTicker *time.Ticker
+	var asmapHealthC <-chan time.Time
+	if pm.UsingASMap() {
+		// Run once immediately at startup (mirrors Core net.cpp:3572 direct call).
+		pm.ASMapHealthCheck()
+		asmapHealthTicker = time.NewTicker(ASMapHealthCheckInterval)
+		defer asmapHealthTicker.Stop()
+		asmapHealthC = asmapHealthTicker.C
+	}
+
 	for {
 		select {
 		case <-ticker.C:
@@ -885,6 +1035,9 @@ func (pm *PeerManager) connectionHandler() {
 
 		case <-banCleanupTicker.C:
 			pm.cleanupBans()
+
+		case <-asmapHealthC:
+			pm.ASMapHealthCheck()
 
 		case <-pm.quit:
 			return
