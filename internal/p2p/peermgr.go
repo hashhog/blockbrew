@@ -986,38 +986,50 @@ func (pm *PeerManager) resolveDNSSeeds() {
 	log.Printf("dns seed: address book now has %d entries", pm.addrBook.Size())
 }
 
-// pickAddressWithDiversity selects an address that maintains subnet diversity.
-// For feelers, we don't care about diversity (we're just testing reachability).
+// pickAddressWithDiversity selects an address that maintains network-group
+// diversity for outbound connections.
+//
+// When asmap is loaded, uses GetGroup (AS-derived group key) to enforce
+// 1 connection per AS — mirroring Bitcoin Core's outbound_ipv46_peer_netgroups
+// set in net.cpp ThreadOpenConnections which rejects candidates whose netgroup
+// already appears among connected outbound IPv4/IPv6 peers.
+//
+// Without asmap, falls back to legacy /16 subnet diversity (MaxPeersPerSubnet=2).
+//
+// Feelers bypass diversity checks entirely (Core: FEELER connections are
+// excluded from outbound_ipv46_peer_netgroups).
 func (pm *PeerManager) pickAddressWithDiversity(connType ConnType) *KnownAddress {
-	// Feelers don't need diversity checks
+	// Feelers don't need diversity checks (Core: FEELER excluded from netgroup tracking).
 	if connType == ConnFeeler {
 		return pm.addrBook.PickAddress()
 	}
 
 	pm.mu.RLock()
-	subnetCounts := make(map[string]int)
+	// Snapshot current group counts for candidate evaluation.
+	groupCounts := make(map[string]int)
 	for k, v := range pm.subnetCounts {
-		subnetCounts[k] = v
+		groupCounts[k] = v
 	}
 	pm.mu.RUnlock()
 
-	// Try to find an address from a subnet we don't have many connections to
-	// Make up to 50 attempts to find a diverse address
+	limit := pm.maxPeersPerGroup()
+
+	// Try up to 50 attempts to find a group-diverse address.
 	for i := 0; i < 50; i++ {
 		ka := pm.addrBook.PickAddress()
 		if ka == nil {
 			return nil
 		}
 
-		subnet := getSubnet(ka.Addr.IP)
-		count := subnetCounts[subnet]
+		group := pm.getNetGroup(ka.Addr.IP)
+		count := groupCounts[group]
 
-		// Accept if we're under the per-subnet limit
-		if count < MaxPeersPerSubnet {
+		// Accept if we're under the per-group limit.
+		if count < limit {
 			return ka
 		}
 
-		// With 10% chance, accept anyway to avoid getting stuck
+		// With 10% chance, accept anyway to avoid getting stuck.
 		pm.mu.RLock()
 		r := pm.rng.Float64()
 		pm.mu.RUnlock()
@@ -1026,7 +1038,7 @@ func (pm *PeerManager) pickAddressWithDiversity(connType ConnType) *KnownAddress
 		}
 	}
 
-	// Fallback to any address
+	// Fallback to any address.
 	return pm.addrBook.PickAddress()
 }
 
@@ -1047,6 +1059,36 @@ func getSubnet(ip net.IP) string {
 	}
 
 	return "unknown"
+}
+
+// getNetGroup returns the network-group key for an IP address used for
+// eclipse-resistance diversity tracking. When an asmap is loaded, returns the
+// AS-derived group key (5-byte slice from GetGroup encoded as hex). Otherwise
+// falls back to the /16 subnet key from getSubnet.
+//
+// Mirrors Bitcoin Core's NetGroupManager::GetGroup() used in net.cpp
+// outbound_ipv46_peer_netgroups: persistent outbound IPv4/IPv6 slots must
+// belong to different netgroups (one connection per netgroup).
+func (pm *PeerManager) getNetGroup(ip net.IP) string {
+	if pm.UsingASMap() {
+		group := GetGroup(pm.asmap, ip)
+		if len(group) > 0 {
+			// Encode as hex string for use as a map key.
+			return fmt.Sprintf("%x", group)
+		}
+	}
+	return getSubnet(ip)
+}
+
+// maxPeersPerGroup returns the connection limit per network group.
+// When asmap is loaded, Core allows exactly 1 connection per AS group
+// (outbound_ipv46_peer_netgroups is a set — no duplicates allowed).
+// Without asmap, use the legacy MaxPeersPerSubnet=2 limit.
+func (pm *PeerManager) maxPeersPerGroup() int {
+	if pm.UsingASMap() {
+		return 1 // 1 per AS group — mirrors Core's set-based uniqueness
+	}
+	return MaxPeersPerSubnet
 }
 
 // connectToPeer attempts to connect to a known address (legacy, uses ConnFullRelay).
@@ -1112,12 +1154,15 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 	}
 	peer.SetBanCallback(pm.handlePeerBan)
 
-	// Create peer info
+	// Create peer info. Use getNetGroup to derive the diversity key: AS-derived
+	// when asmap is loaded, /16 subnet otherwise. This key is stored in
+	// PeerInfo.subnet and tracked in pm.subnetCounts so that pickAddressWithDiversity
+	// can enforce per-group limits (1 per AS or 2 per /16).
 	peerInfo := &PeerInfo{
 		peer:        peer,
 		connType:    connType,
 		connectedAt: time.Now(),
-		subnet:      getSubnet(ka.Addr.IP),
+		subnet:      pm.getNetGroup(ka.Addr.IP),
 	}
 
 	// Register the peer before starting
@@ -1219,9 +1264,10 @@ func (pm *PeerManager) listenHandler() {
 		peer.SetBanCallback(pm.handlePeerBan)
 		addr := peer.Address()
 
-		// Get subnet for the inbound peer
+		// Get network-group key for the inbound peer (used in eviction diversity
+		// scoring). Uses AS-level grouping when asmap is loaded, /16 otherwise.
 		remoteIP := extractIP(conn.RemoteAddr().String())
-		subnet := getSubnet(net.ParseIP(remoteIP))
+		subnet := pm.getNetGroup(net.ParseIP(remoteIP))
 
 		peerInfo := &PeerInfo{
 			peer:        peer,
