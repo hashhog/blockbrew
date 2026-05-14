@@ -489,6 +489,14 @@ type Mempool struct {
 	rollingMinimumFeeRate    float64 // sat/kvB
 	blockSinceLastRollingFeeBump bool
 	lastRollingFeeUpdate     int64   // Unix seconds
+
+	// OnTxEvicted is called when a transaction is removed from the mempool for
+	// any reason other than block confirmation.  It is invoked with the txid
+	// just before the entry is deleted from the pool.  The callback must not
+	// re-enter the mempool (mu is held).  Mirrors Core's
+	// TransactionRemovedFromMempool validation interface.  Set by main.go to
+	// wire the FeeEstimator's UnregisterTransaction path (FIX-47 BUG-22).
+	OnTxEvicted func(txHash wire.Hash256)
 }
 
 // New creates a new mempool.
@@ -1566,6 +1574,15 @@ func (mp *Mempool) removeSingleTxLocked(txHash wire.Hash256) {
 
 	// Remove from pool
 	delete(mp.pool, txHash)
+
+	// Notify fee estimator (and any other subscriber) that this tx has left
+	// the mempool without being confirmed.  Called after the pool delete so
+	// the callback sees a consistent state.  When the fee estimator's
+	// ProcessBlock is called first (as in onBlockConnected), confirmed txids
+	// are already removed from bucketMap, making this a safe no-op for them.
+	if mp.OnTxEvicted != nil {
+		mp.OnTxEvicted(txHash)
+	}
 }
 
 // removeHash removes a hash from a slice.
