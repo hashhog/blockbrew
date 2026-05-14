@@ -178,6 +178,15 @@ type Config struct {
 	// We accept boolean only; "basic" is the only filter type defined and
 	// the only one Core implements server-side.
 	BlockFilterIndex bool
+
+	// ASMap is the path to an ASMap binary file for AS-level peer bucketing
+	// and eclipse-resistance diversity. When set, blockbrew loads and
+	// validates the file (up to 8 MiB) at startup and uses the embedded
+	// trie to map peer IPs to their Autonomous System Numbers. Peer
+	// diversity is then enforced at the AS level rather than /16 subnet.
+	// Mirrors Bitcoin Core's `-asmap=<file>` flag (init.cpp).
+	// Leave empty (default) to use the legacy /16 subnet grouping.
+	ASMap string
 }
 
 // debugFlag implements flag.Value so `-debug=` may be repeated and/or
@@ -458,6 +467,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.HealthPort, "healthport", 0, "If non-zero, bind a /healthz HTTP endpoint on 127.0.0.1:<port> for liveness/readiness probes. 0 disables.")
 	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", "Load a Bitcoin Core-format UTXO snapshot (utxo\\xff magic) from <path> before starting the node. Only acted on when the chainstate is fresh (height==0); otherwise an error is logged and the snapshot is skipped. Mirrors Bitcoin Core's `-loadsnapshot=<path>`.")
 	flag.BoolVar(&cfg.BlockFilterIndex, "blockfilterindex", false, "Maintain the BIP-157/158 basic compact-block-filter index. Default OFF (matches Bitcoin Core's `-blockfilterindex=0`). When ON, blockbrew populates the index on every connected block, rewinds it on disconnect (Phase 2 reorg-aware), and exposes the resulting filters via /rest/blockfilter, /rest/blockfilterheaders, and the getblockfilter RPC.")
+	flag.StringVar(&cfg.ASMap, "asmap", "", "Path to an ASMap binary file for AS-level peer bucketing and eclipse-resistance diversity. When set, blockbrew loads the file (max 8 MiB), validates its trie, and uses it to map peer IPs to Autonomous System Numbers. Peer diversity is then enforced at the AS level rather than /16 subnet. Leave empty (default) to use legacy /16 grouping. Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp).")
 	flag.Parse()
 
 	// Apply config file (CLI > config > default). Build the set of flags
@@ -1329,6 +1339,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// BIP-157: advertise NODE_COMPACT_FILTERS when blockfilterindex is
 		// active. Mirrors Core's init.cpp g_local_services |= NODE_COMPACT_FILTERS.
 		AdvertiseCompactFilters: cfg.BlockFilterIndex,
+		ASMapFile:               cfg.ASMap,
 	})
 
 	// Wire the peer manager back into the sync manager (breaks circular dependency)

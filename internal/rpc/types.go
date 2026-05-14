@@ -297,6 +297,10 @@ type PeerInfo struct {
 	ConnectionType        string                 `json:"connection_type"`
 	TransportProtocolType string                 `json:"transport_protocol_type"`
 	SessionID             string                 `json:"session_id"`
+	// MappedAS is the Autonomous System Number for the peer's IP address,
+	// derived from the loaded asmap file (0 when asmap is disabled or the
+	// IP is not in the trie). Mirrors Core rpc/net.cpp:236 "mapped_as".
+	MappedAS              uint32                 `json:"mapped_as,omitempty"`
 }
 
 // NetworkInfo represents the result of getnetworkinfo.
