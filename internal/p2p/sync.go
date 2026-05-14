@@ -1015,6 +1015,22 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 			// We don't have a mempool, so we can't reconstruct the block from
 			// short IDs. Fall back to requesting the full block via getdata.
 			blockHash := msg.Header.BlockHash()
+
+			// MAX_CMPCTBLOCK_DEPTH guard (Bitcoin Core net_processing.cpp:2466):
+			// If the announced block is more than MaxCmpctBlockDepth below our
+			// best tip, we would not serve it as a compact block ourselves —
+			// log and request full block regardless (our current fallback).
+			if sm.headerIndex != nil {
+				tipHeight := sm.headerIndex.BestHeight()
+				if node := sm.headerIndex.GetNode(blockHash); node != nil {
+					depth := tipHeight - node.Height
+					if depth > MaxCmpctBlockDepth {
+						log.Printf("[compact] cmpctblock from %s is %d deep (limit %d), requesting full block (hash=%s)",
+							p.Address(), depth, MaxCmpctBlockDepth, blockHash)
+					}
+				}
+			}
+
 			log.Printf("[compact] Received cmpctblock from %s, falling back to full block request (hash=%s)",
 				p.Address(), blockHash)
 			inv := &MsgGetData{
@@ -1024,9 +1040,26 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 			}
 			p.SendMessage(inv)
 		},
-		OnGetBlockTxn: func(p *Peer, _ *MsgGetBlockTxn) {
+		OnGetBlockTxn: func(p *Peer, msg *MsgGetBlockTxn) {
 			// Peer requesting missing transactions for compact block reconstruction.
-			// We don't serve compact blocks yet, so ignore.
+			// MAX_BLOCKTXN_DEPTH guard (Bitcoin Core net_processing.cpp):
+			// If the requested block is more than MaxBlocktxnDepth below our best
+			// tip, fall back to sending the full block instead of serving blocktxn.
+			// We don't serve compact blocks yet, so in either case we ignore, but
+			// the depth check ensures correct behaviour once serving is implemented.
+			if sm.headerIndex != nil {
+				tipHeight := sm.headerIndex.BestHeight()
+				if node := sm.headerIndex.GetNode(msg.BlockHash); node != nil {
+					depth := tipHeight - node.Height
+					if depth > MaxBlocktxnDepth {
+						log.Printf("[compact] getblocktxn from %s for block %s is %d deep (limit %d), would fall back to full block",
+							p.Address(), msg.BlockHash, depth, MaxBlocktxnDepth)
+						// TODO(BUG-3): once OnGetBlockTxn serving is implemented,
+						// send full block via getdata here instead of blocktxn.
+						return
+					}
+				}
+			}
 			log.Printf("[compact] Received getblocktxn from %s, ignoring", p.Address())
 		},
 		OnBlockTxn: func(p *Peer, _ *MsgBlockTxn) {
