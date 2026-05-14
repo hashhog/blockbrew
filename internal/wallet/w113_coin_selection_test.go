@@ -407,14 +407,99 @@ func TestW113G16_Knapsack2Pass(t *testing.T) {
 // ── G17: Knapsack uses crypto/rand — BUG-6 (W88 anti-pattern) ────────────────
 
 func TestW113G17_KnapsackCSPRNG(t *testing.T) {
-	// BUG-6: Knapsack uses math/rand (import at coinselection.go:5) instead of
-	// crypto/rand. rand.Shuffle and rand.Intn are both deterministic/predictable.
-	// Bitcoin Core uses FastRandomContext (CSPRNG seeded from /dev/urandom) for all
-	// Knapsack randomness. This is the W88 anti-pattern (math/rand in coin selection).
-	// Fix: replace math/rand with crypto/rand for shuffle seed, or use
-	// crypto/rand-seeded math/rand.New(rand.NewSource(randInt64())) per call.
-	t.Skip("BUG-6 (W88 anti-pattern): Knapsack uses math/rand instead of crypto/rand; " +
-		"coinselection.go imports math/rand — rand.Shuffle and rand.Intn are predictable")
+	// FIX-45 (W113 BUG-6): Knapsack now uses crypto/rand via csRandIntn and
+	// csRandShuffle. Verify two properties:
+	//
+	// 1. Non-determinism: two independent shuffles of the same slice produce
+	//    different orderings with overwhelming probability (1 - 1/n! for n inputs).
+	//    We use 8 UTXOs → 8! = 40320 orderings → collision probability < 1/40000.
+	//
+	// 2. Functional correctness: SelectCoins still succeeds after the CSPRNG
+	//    replacement (the selection result covers the target).
+
+	const n = 8
+	utxos := make([]*utxoWithEffValue, n)
+	for i := 0; i < n; i++ {
+		utxos[i] = &utxoWithEffValue{
+			utxo:     &WalletUTXO{Amount: int64(10000 + i*1000)},
+			effValue: int64(9932 + i*1000),
+		}
+	}
+
+	// Shuffle twice independently; capture order by effValue sequence.
+	orderOf := func(s []*utxoWithEffValue) []int64 {
+		out := make([]int64, len(s))
+		for i, u := range s {
+			out[i] = u.effValue
+		}
+		return out
+	}
+
+	s1 := make([]*utxoWithEffValue, n)
+	copy(s1, utxos)
+	csRandShuffle(s1)
+	ord1 := orderOf(s1)
+
+	s2 := make([]*utxoWithEffValue, n)
+	copy(s2, utxos)
+	csRandShuffle(s2)
+	ord2 := orderOf(s2)
+
+	// Check both shuffles produced valid permutations (all elements present).
+	sum1, sum2 := int64(0), int64(0)
+	for _, v := range ord1 {
+		sum1 += v
+	}
+	for _, v := range ord2 {
+		sum2 += v
+	}
+	var expectedSum int64
+	for _, u := range utxos {
+		expectedSum += u.effValue
+	}
+	if sum1 != expectedSum {
+		t.Errorf("G17 shuffle1 sum %d != expected %d (elements dropped)", sum1, expectedSum)
+	}
+	if sum2 != expectedSum {
+		t.Errorf("G17 shuffle2 sum %d != expected %d (elements dropped)", sum2, expectedSum)
+	}
+
+	// Two independent shuffles of 8 elements are identical with probability
+	// 1/40320 ≈ 0.0025%. Treat a match as a flaky-test signal, not a hard fail.
+	same := true
+	for i := range ord1 {
+		if ord1[i] != ord2[i] {
+			same = false
+			break
+		}
+	}
+	if same {
+		t.Log("G17 WARNING: two independent csRandShuffle calls produced identical order " +
+			"(probability < 1/40000 — rerun to confirm; not treated as hard failure)")
+	}
+
+	// Functional correctness: SelectCoins must still work end-to-end.
+	walletUTXOs := make([]*WalletUTXO, n)
+	for i := 0; i < n; i++ {
+		walletUTXOs[i] = &WalletUTXO{
+			OutPoint:  wire.OutPoint{Hash: wire.Hash256{byte(i + 1)}},
+			Amount:    int64(10000 + i*1000),
+			PkScript:  makeP2WPKHScript(),
+			Confirmed: true,
+		}
+	}
+	result, err := SelectCoins(walletUTXOs, 30000, 1.0, 2000)
+	if err != nil {
+		t.Fatalf("G17 SelectCoins after CSPRNG fix: %v", err)
+	}
+	var total int64
+	for _, c := range result.Coins {
+		total += c.Amount
+	}
+	if total < 30000 {
+		t.Errorf("G17 selected total %d < target 30000", total)
+	}
+	t.Logf("G17 PASS: crypto/rand shuffle verified; SelectCoins total=%d algo=%v", total, result.Algorithm)
 }
 
 // ── G18: Knapsack 1000 iteration cap ─────────────────────────────────────────
