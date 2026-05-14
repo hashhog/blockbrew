@@ -151,6 +151,13 @@ type PeerManagerConfig struct {
 	// getcfheaders / getcfcheckpt messages (if handlers are wired), but will
 	// not advertise to peers that it can serve those requests proactively.
 	AdvertiseCompactFilters bool
+
+	// ASMapFile is the path to a Bitcoin Core-format asmap binary file used
+	// for AS-level peer bucketing. When non-empty, blockbrew loads and
+	// validates the file at startup and uses it to derive AS numbers for
+	// eclipse-resistance diversity. Mirrors Bitcoin Core's `-asmap=<file>`
+	// flag (init.cpp). Leave empty to use the legacy /16 subnet grouping.
+	ASMapFile string
 }
 
 // BanInfo contains information about a banned peer.
@@ -187,6 +194,28 @@ type PeerManager struct {
 	started         bool                  // Whether the manager has started
 	subnetCounts    map[string]int        // subnet -> count of outbound connections (for diversity)
 	rng             *rand.Rand            // Random number generator
+	asmap           []byte                // Loaded asmap trie bytes (nil = disabled)
+}
+
+// UsingASMap returns true when an asmap was loaded at startup. Mirrors
+// Bitcoin Core's NetGroupManager::UsingASMap() (`m_asmap.size() > 0`).
+func (pm *PeerManager) UsingASMap() bool {
+	return len(pm.asmap) > 0
+}
+
+// GetMappedASForAddr returns the ASN for the given peer address string
+// (host:port or host). Returns 0 when asmap is not loaded or the IP has
+// no entry. Mirrors Core's NetGroupManager::GetMappedAS().
+func (pm *PeerManager) GetMappedASForAddr(addr string) uint32 {
+	if !pm.UsingASMap() {
+		return 0
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	ip := net.ParseIP(host)
+	return GetMappedAS(pm.asmap, ip)
 }
 
 // NewPeerManager creates a new peer manager.
@@ -210,6 +239,18 @@ func NewPeerManager(config PeerManagerConfig) *PeerManager {
 		subnetCounts: make(map[string]int),
 		quit:         make(chan struct{}),
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+
+	// Load asmap if configured. Mirrors Core init.cpp:1603-1628.
+	if config.ASMapFile != "" {
+		data, err := LoadAsmap(config.ASMapFile)
+		if err != nil {
+			log.Printf("Warning: failed to load asmap from %s: %v — falling back to /16 subnet grouping", config.ASMapFile, err)
+		} else {
+			pm.asmap = data
+			log.Printf("Using asmap version %s (%d bytes) from %s for IP bucketing",
+				AsmapVersion(data), len(data), config.ASMapFile)
+		}
 	}
 
 	// Load ban list from disk
