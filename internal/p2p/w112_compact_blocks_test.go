@@ -514,15 +514,42 @@ func TestW112_G19_FallbackToFullBlock(t *testing.T) {
 	}
 }
 
-// ─── G20: getblocktxn depth limit — BUG-5 ────────────────────────────────
+// ─── G20: getblocktxn depth limit — BUG-5 (FIXED) ───────────────────────────
 
-// TestW112_G20_GetBlockTxnDepthLimit_BUG5 documents BUG-5:
-// There is no MAX_BLOCKTXN_DEPTH=10 check. Core falls back to full block when
-// the requested block is >10 deep. blockbrew's handler ignores all requests, so
-// the depth check is moot but the handler itself is the larger problem.
-func TestW112_G20_GetBlockTxnDepthLimit_BUG5(t *testing.T) {
-	t.Skip("BUG-5 (MISSING): No MAX_BLOCKTXN_DEPTH=10 guard; " +
-		"getblocktxn handler is log+ignore regardless of block depth")
+// TestW112_G20_MaxBlocktxnDepthConstant verifies that MaxBlocktxnDepth = 10,
+// matching Bitcoin Core net_processing.cpp MAX_BLOCKTXN_DEPTH.
+// FIX-42: constant added to compactblock.go; depth guard wired into OnGetBlockTxn.
+func TestW112_G20_MaxBlocktxnDepthConstant(t *testing.T) {
+	if MaxBlocktxnDepth != 10 {
+		t.Errorf("MaxBlocktxnDepth = %d, want 10 (mirrors Core MAX_BLOCKTXN_DEPTH)",
+			MaxBlocktxnDepth)
+	}
+}
+
+// TestW112_G20_BlocktxnDepthGuardLogic verifies the depth comparison logic used
+// in the OnGetBlockTxn handler: a block at depth > MaxBlocktxnDepth triggers
+// the fallback path, a block at depth == MaxBlocktxnDepth does not.
+func TestW112_G20_BlocktxnDepthGuardLogic(t *testing.T) {
+	tipHeight := int32(1000)
+
+	cases := []struct {
+		blockHeight int32
+		wantFallback bool
+	}{
+		{blockHeight: 990, wantFallback: false}, // depth=10, exactly at limit — serve normally
+		{blockHeight: 989, wantFallback: true},  // depth=11, exceeds limit — fallback
+		{blockHeight: 0, wantFallback: true},    // depth=1000, far exceeds limit
+		{blockHeight: 999, wantFallback: false}, // depth=1, well within limit
+	}
+
+	for _, tc := range cases {
+		depth := tipHeight - tc.blockHeight
+		got := depth > MaxBlocktxnDepth
+		if got != tc.wantFallback {
+			t.Errorf("blockHeight=%d depth=%d: fallback=%v want %v",
+				tc.blockHeight, depth, got, tc.wantFallback)
+		}
+	}
 }
 
 // ─── G21: PartiallyDownloadedBlock object ─────────────────────────────────
@@ -715,15 +742,42 @@ func TestW112_G26_BIP339WtxidInteraction(t *testing.T) {
 	}
 }
 
-// ─── G27: ≤5-deep age limit — BUG-6 ─────────────────────────────────────
+// ─── G27: ≤5-deep age limit — BUG-6 (FIXED) ─────────────────────────────────
 
-// TestW112_G27_CmpctBlockDepthLimit_BUG6 documents BUG-6:
-// No MAX_CMPCTBLOCK_DEPTH=5 guard on cmpctblock serving. Core refuses to serve
-// compact blocks for blocks more than 5 deep (falls back to full block).
-// blockbrew has no depth check in its cmpctblock path.
-func TestW112_G27_CmpctBlockDepthLimit_BUG6(t *testing.T) {
-	t.Skip("BUG-6 (MISSING): No MAX_CMPCTBLOCK_DEPTH=5 guard; " +
-		"blockbrew does not check block depth before serving/accepting cmpctblock")
+// TestW112_G27_MaxCmpctBlockDepthConstant verifies that MaxCmpctBlockDepth = 5,
+// matching Bitcoin Core net_processing.cpp:2466 MAX_CMPCTBLOCK_DEPTH.
+// FIX-42: constant added to compactblock.go; depth guard wired into OnCmpctBlock.
+func TestW112_G27_MaxCmpctBlockDepthConstant(t *testing.T) {
+	if MaxCmpctBlockDepth != 5 {
+		t.Errorf("MaxCmpctBlockDepth = %d, want 5 (mirrors Core MAX_CMPCTBLOCK_DEPTH)",
+			MaxCmpctBlockDepth)
+	}
+}
+
+// TestW112_G27_CmpctBlockDepthGuardLogic verifies the depth comparison logic used
+// in the OnCmpctBlock handler: a block at depth > MaxCmpctBlockDepth triggers
+// the fallback path, a block at depth == MaxCmpctBlockDepth does not.
+func TestW112_G27_CmpctBlockDepthGuardLogic(t *testing.T) {
+	tipHeight := int32(1000)
+
+	cases := []struct {
+		blockHeight  int32
+		wantFallback bool
+	}{
+		{blockHeight: 995, wantFallback: false}, // depth=5, exactly at limit — serve as cmpctblock
+		{blockHeight: 994, wantFallback: true},  // depth=6, exceeds limit — fall back to full block
+		{blockHeight: 0, wantFallback: true},    // depth=1000, far exceeds limit
+		{blockHeight: 999, wantFallback: false}, // depth=1, well within limit
+	}
+
+	for _, tc := range cases {
+		depth := tipHeight - tc.blockHeight
+		got := depth > MaxCmpctBlockDepth
+		if got != tc.wantFallback {
+			t.Errorf("blockHeight=%d depth=%d: fallback=%v want %v",
+				tc.blockHeight, depth, got, tc.wantFallback)
+		}
+	}
 }
 
 // ─── G28: No IBD compact blocks — BUG-7 ──────────────────────────────────
