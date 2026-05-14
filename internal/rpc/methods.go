@@ -1372,6 +1372,7 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 		if p.Inbound() {
 			connType = "inbound"
 		}
+		mappedAS := s.peerMgr.GetMappedASForAddr(p.Address())
 		result = append(result, PeerInfo{
 			ID:                    i,
 			Addr:                  p.Address(),
@@ -1409,6 +1410,7 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 			ConnectionType:        connType,
 			TransportProtocolType: "v1",
 			SessionID:             "",
+			MappedAS:              mappedAS,
 		})
 	}
 
