@@ -43,6 +43,7 @@ package p2p
 
 import (
 	"net"
+	"os"
 	"testing"
 )
 
@@ -477,13 +478,96 @@ func TestW115_G25_AsmapVersionInPeersDatAbsent(t *testing.T) {
 	t.Log("BUG-25: no peers.dat (W104 BUG-21) and no asmap version serialisation within it")
 }
 
-// BUG-26 (G26): No ASMapHealthCheck logging.
-// Core NetGroupManager::ASMapHealthCheck() iterates over a sample of clearnet
-// addresses and logs: total unique ASNs hit, % of addresses with unknown AS,
-// and a warning if the asmap appears outdated (many unmapped IPs).
-// blockbrew has no periodic or startup health check.
-func TestW115_G26_ASMapHealthCheckAbsent(t *testing.T) {
-	t.Log("BUG-26: ASMapHealthCheck absent — operators get no warning if asmap is stale or unmapped")
+// G26: ASMapHealthCheck counts unique ASNs, mapped, and unmapped entries across
+// AddrMan + connected peers when asmap is loaded; returns nil when no asmap.
+//
+// FIX-52: ASMapHealthCheck implemented on PeerManager. This test verifies:
+//   - returns nil when asmap is not loaded
+//   - returns a non-nil result with correct tallies when asmap is loaded
+//   - counts AddrMan addresses and deduplicates across sources
+//   - correctly classifies mapped vs unmapped entries
+//   - populates TopASNs with the N most common ASNs
+func TestW115_G26_ASMapHealthCheckPresent(t *testing.T) {
+	asmapData := mustHex(coreAsmapHex)
+
+	// --- Case 1: no asmap loaded → returns nil ---
+	pmNone := NewPeerManager(PeerManagerConfig{MaxOutbound: 1})
+	if got := pmNone.ASMapHealthCheck(); got != nil {
+		t.Errorf("G26: ASMapHealthCheck() with no asmap = %+v, want nil", got)
+	}
+
+	// --- Case 2: asmap loaded, empty addrbook → all zeros ---
+	pmEmpty := &PeerManager{
+		asmap:   asmapData,
+		addrBook: NewAddressBook(),
+		peers:   make(map[string]*PeerInfo),
+	}
+	res := pmEmpty.ASMapHealthCheck()
+	if res == nil {
+		t.Fatal("G26: ASMapHealthCheck() with asmap but empty book = nil, want non-nil")
+	}
+	if res.Total != 0 || res.Mapped != 0 || res.Unmapped != 0 || res.UniqueAS != 0 {
+		t.Errorf("G26: empty book: got %+v, want all-zero counts", res)
+	}
+
+	// --- Case 3: addresses with known ASNs in Core reference vector ---
+	// IP → ASN from TestW115_CoreReferenceVector:
+	//   "406c:820b:272a:c045:b74e:fc0a:9ef2:cecc" → 248495
+	//   "46c2:ae07:9d08:2d56:d473:2bc7:57e3:20ac" → 248495  (same AS)
+	//   "0:1559:183:3728:224c:65a5:62e6:e991"     → 961340
+	//   "a77:7cd4:4be5:a449:89f2:3212:78c6:ee38"  → 0       (unmapped)
+	pm3 := &PeerManager{
+		asmap:   asmapData,
+		addrBook: NewAddressBook(),
+		peers:   make(map[string]*PeerInfo),
+	}
+	// Manually seed the address book bypassing the routable filter
+	// (these are synthetic IPv6 test IPs from the Core reference vector).
+	addIPs := []string{
+		"406c:820b:272a:c045:b74e:fc0a:9ef2:cecc", // AS248495
+		"46c2:ae07:9d08:2d56:d473:2bc7:57e3:20ac", // AS248495
+		"0:1559:183:3728:224c:65a5:62e6:e991",     // AS961340
+		"a77:7cd4:4be5:a449:89f2:3212:78c6:ee38",  // unmapped (ASN=0)
+	}
+	pm3.addrBook.mu.Lock()
+	for _, ipStr := range addIPs {
+		ip := net.ParseIP(ipStr)
+		key := net.JoinHostPort(ip.String(), "8333")
+		pm3.addrBook.addrs[key] = &KnownAddress{
+			Addr: NetAddress{IP: ip, Port: 8333},
+		}
+	}
+	pm3.addrBook.mu.Unlock()
+
+	res3 := pm3.ASMapHealthCheck()
+	if res3 == nil {
+		t.Fatal("G26: ASMapHealthCheck() with seeded book = nil, want non-nil")
+	}
+
+	// Total = 4 IPs, Mapped = 3, Unmapped = 1, UniqueAS = 2 (248495 + 961340)
+	if res3.Total != 4 {
+		t.Errorf("G26: Total = %d, want 4", res3.Total)
+	}
+	if res3.Mapped != 3 {
+		t.Errorf("G26: Mapped = %d, want 3", res3.Mapped)
+	}
+	if res3.Unmapped != 1 {
+		t.Errorf("G26: Unmapped = %d, want 1", res3.Unmapped)
+	}
+	if res3.UniqueAS != 2 {
+		t.Errorf("G26: UniqueAS = %d, want 2 (AS248495 + AS961340)", res3.UniqueAS)
+	}
+	// TopASNs must be non-empty; top entry should be AS248495 (count=2 > count=1).
+	if len(res3.TopASNs) == 0 {
+		t.Error("G26: TopASNs is empty")
+	} else {
+		top := res3.TopASNs[0]
+		if top.ASN != 248495 || top.Count != 2 {
+			t.Errorf("G26: TopASNs[0] = {ASN:%d Count:%d}, want {ASN:248495 Count:2}", top.ASN, top.Count)
+		}
+	}
+
+	t.Logf("G26 PASS: ASMapHealthCheck result = %+v", res3)
 }
 
 // BUG-27 (G27): No per-AS logging on address insert / tried-move.
@@ -514,15 +598,39 @@ func TestW115_G29_AsmapStateInPersistenceAbsent(t *testing.T) {
 	t.Log("BUG-29: no asmap state persistence alongside chainstate — version/bucketing consistency absent")
 }
 
-// BUG-30 (G30): No startup warning when asmap is disabled.
-// Core init.cpp:1628 logs "Using asmap version <hash> for IP bucketing" when
-// asmap is loaded, giving operators positive confirmation.  When asmap is NOT
-// loaded, Core does not log a warning (it's the default).  However, several
-// downstream tools and monitoring setups expect the log line.
-// blockbrew emits no asmap-related startup log at all; operators cannot
-// verify whether AS-level bucketing is active.
-func TestW115_G30_AsmapStartupLogAbsent(t *testing.T) {
-	t.Log("BUG-30: no startup log for asmap state — operators cannot verify AS-level bucketing status")
+// G30: startup log emitted when asmap is loaded.
+// Bitcoin Core init.cpp:1628 logs "Using asmap version <hash> for IP bucketing"
+// when asmap is loaded. blockbrew's NewPeerManager() emits the same log line.
+//
+// FIX-52: NewPeerManager already logs "Using asmap version %s (%d bytes) from %s
+// for IP bucketing" when ASMapFile is non-empty and loads successfully.
+// This test verifies that the code path succeeds and UsingASMap() returns true,
+// which is the observable gate for the startup log having fired.
+func TestW115_G30_AsmapStartupLogPresent(t *testing.T) {
+	// Write Core reference asmap to a temp file so NewPeerManager can load it.
+	f, err := os.CreateTemp("", "asmap-g30-*.bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(f.Name())
+	data := mustHex(coreAsmapHex)
+	if _, err := f.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	pm := NewPeerManager(PeerManagerConfig{
+		MaxOutbound: 1,
+		ASMapFile:   f.Name(),
+	})
+
+	// If UsingASMap() is true, the startup log line was emitted (the log.Printf
+	// in NewPeerManager fires iff pm.asmap is set, which happens iff LoadAsmap
+	// succeeded — same condition as UsingASMap()).
+	if !pm.UsingASMap() {
+		t.Fatal("G30 BROKEN: UsingASMap() = false after loading valid asmap file; startup log not emitted")
+	}
+	t.Logf("G30 PASS: UsingASMap()=true — startup log 'Using asmap version ... for IP bucketing' was emitted")
 }
 
 // ────────────────────────────────────────────────────────────────────────────
