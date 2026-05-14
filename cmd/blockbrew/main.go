@@ -946,6 +946,14 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	} else if feeEstimator.BestHeight() > 0 {
 		log.Printf("Loaded fee estimates from disk (height %d)", feeEstimator.BestHeight())
 	}
+	// FIX-47 BUG-22: wire FeeEstimator.UnregisterTransaction into the mempool
+	// eviction callback so txs removed for non-block reasons (RBF, size
+	// eviction, expiry) are correctly removed from the estimator's tracking.
+	// The callback fires from removeSingleTxLocked after the pool delete, so
+	// it is safe to call UnregisterTransaction here (no re-entrancy risk).
+	mp.OnTxEvicted = func(txHash wire.Hash256) {
+		feeEstimator.UnregisterTransaction(txHash)
+	}
 
 	// 6c. Reload persisted mempool. Match Bitcoin Core's
 	//     DEFAULT_MEMPOOL_EXPIRY = 336 hours (2 weeks).
@@ -1007,6 +1015,16 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		if w != nil {
 			w.ScanBlock(block, height)
 		}
+		// FIX-47 BUG-10: wire FeeEstimator.ProcessBlock so confirmed txids
+		// are recorded before BlockConnected removes them from the pool.
+		// Calling ProcessBlock first means confirmed txids are gone from
+		// bucketMap before removeSingleTxLocked fires OnTxEvicted, so the
+		// UnregisterTransaction callback is a safe no-op for confirmed txs.
+		confirmedTxids := make([]wire.Hash256, 0, len(block.Transactions))
+		for _, tx := range block.Transactions {
+			confirmedTxids = append(confirmedTxids, tx.TxHash())
+		}
+		feeEstimator.ProcessBlock(height, confirmedTxids)
 		mp.BlockConnected(block)
 		// ZMQ fan-out: hashblock / rawblock / sequence(C). Cheap no-op
 		// when no -zmqpub* endpoint is configured.
@@ -1080,6 +1098,11 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		entry := mp.GetEntry(txHash)
 		if entry != nil {
 			peerMgr.RelayTransaction(txHash, wtxHash, entry.Fee, entry.Size, peer.Address())
+			// FIX-47 BUG-21: wire FeeEstimator.RegisterTransaction so the tx
+			// is tracked for fee estimation.  entry.FeeRate is in sat/vB
+			// (same unit as FeeEstimator).  entry.Height is the chain height
+			// at which the tx entered the mempool.
+			feeEstimator.RegisterTransaction(txHash, entry.FeeRate, entry.Height)
 		}
 		// ZMQ fan-out: hashtx / rawtx / sequence(A). Cheap no-op
 		// when no -zmqpub* endpoint is configured.
