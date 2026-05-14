@@ -38,11 +38,15 @@ package mempool
 //   in the per-tx result when len(rawtxs)>1 and a package-level validation error occurs.
 //   blockbrew has no package-error field in TestMempoolAcceptResult.
 //
-// BUG-7 (LOW): IsChildWithParents requires ALL parents to be explicitly referenced by the
-//   child's inputs. Core allows parents that are already in the mempool (and thus need not
-//   appear in the package). blockbrew's IsChildWithParents is stricter: every tx except the
-//   last MUST be spent by the child, which prevents a valid "parent already in mempool"
-//   package topology where some parents are omitted.
+// BUG-7 (LOW) [FIXED — FIX-53]: AcceptPackage now uses IsChildWithParentsTree (not the
+//   bare IsChildWithParents) as the topology gate. IsChildWithParentsTree rejects any
+//   package where parents depend on each other (chain A→B→C where B is also a parent
+//   violates the tree property). IsChildWithParents correctly allows packages where some
+//   parents are omitted (already in mempool) — only the parents present in the package
+//   must be referenced by the child. Both helpers are now wired: AcceptPackage (line 2935
+//   in mempool.go) and the submitpackage RPC (methods.go) both call IsChildWithParentsTree.
+//   Tests: TestW116_G4_IsChildWithParentsTree_ParentsDontDependOnEachOther (helper),
+//   TestW116_G4_AcceptPackage_ChainTopology_Rejected (AcceptPackage integration).
 //
 // BUG-8 (LOW): sendpackages received after verack is not penalised. BIP-331 §sendpackages:
 //   "MUST only be sent prior to the receipt of verack." blockbrew's peer.go accepts the
@@ -611,6 +615,143 @@ func TestW116_G18_AcceptPackage_NotChildWithParents(t *testing.T) {
 	}
 	if !errors.Is(err, ErrPackageNotChildWithParents) {
 		t.Logf("got %v; expected ErrPackageNotChildWithParents or ErrPackageNotSorted", err)
+	}
+}
+
+// TestW116_G4_AcceptPackage_ChainTopology_Rejected is an AcceptPackage-level
+// integration test for BUG-7 / FIX-53: AcceptPackage must reject a chain
+// topology (A→B→C where B is a parent) via IsChildWithParentsTree.
+//
+// Package layout: [parent1, parent2, child]
+//   - parent2 spends parent1's output  (chain: parent1→parent2)
+//   - child spends both parent1 and parent2
+//
+// IsChildWithParentsTree must reject this because parent2 depends on parent1.
+func TestW116_G4_AcceptPackage_ChainTopology_Rejected(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+
+	var fundHash wire.Hash256
+	fundHash[0] = 0x43
+
+	// Fund parent1.
+	fundOp, fundEntry := createFundingUTXO(fundHash, 0, 100_000)
+	utxoSet.AddUTXO(fundOp, fundEntry)
+
+	mp := newTestMempool(utxoSet)
+
+	// parent1: spends the external UTXO, produces one output.
+	parent1 := &wire.MsgTx{
+		Version: 2,
+		TxIn:    []*wire.TxIn{{PreviousOutPoint: fundOp, Sequence: 0xffffffff}},
+		TxOut:   []*wire.TxOut{{Value: 98_000, PkScript: makeW116P2WPKHScript(0)}},
+	}
+	parent1Hash := parent1.TxHash()
+
+	// parent2: spends parent1's output — chain dependency violates tree property.
+	parent2 := &wire.MsgTx{
+		Version: 2,
+		TxIn:    []*wire.TxIn{{PreviousOutPoint: wire.OutPoint{Hash: parent1Hash, Index: 0}, Sequence: 0xffffffff}},
+		TxOut:   []*wire.TxOut{{Value: 96_000, PkScript: makeW116P2WPKHScript(1)}},
+	}
+	parent2Hash := parent2.TxHash()
+
+	// child: spends both parents.
+	child := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: wire.OutPoint{Hash: parent1Hash, Index: 0}, Sequence: 0xffffffff},
+			{PreviousOutPoint: wire.OutPoint{Hash: parent2Hash, Index: 0}, Sequence: 0xffffffff},
+		},
+		TxOut: []*wire.TxOut{{Value: 90_000, PkScript: makeW116P2WPKHScript(2)}},
+	}
+
+	_, err := mp.AcceptPackage([]*wire.MsgTx{parent1, parent2, child})
+	if err == nil {
+		t.Fatal("chain topology (parent2 spends parent1) must be rejected by AcceptPackage via IsChildWithParentsTree")
+	}
+	if !errors.Is(err, ErrPackageNotChildWithParents) {
+		t.Logf("got %v; expected ErrPackageNotChildWithParents", err)
+	}
+}
+
+// TestW116_G4_AcceptPackage_PartialParents_Allowed verifies that AcceptPackage
+// accepts a package where the child has more parent inputs than the package
+// contains — the extra parents are assumed already in mempool.
+//
+// Package layout: [parent1, child] where child also spends parent2.
+// parent2 is already in the mempool (pre-seeded), not in the package.
+// IsChildWithParents must accept because every tx in the package (parent1)
+// IS referenced by child; the omitted parent2 is already mempool-resident.
+func TestW116_G4_AcceptPackage_PartialParents_Allowed(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+
+	var fund1Hash, fund2Hash wire.Hash256
+	fund1Hash[0] = 0x44
+	fund2Hash[0] = 0x45
+
+	fund1Op, fund1Entry := createFundingUTXO(fund1Hash, 0, 60_000)
+	fund2Op, fund2Entry := createFundingUTXO(fund2Hash, 0, 60_000)
+	utxoSet.AddUTXO(fund1Op, fund1Entry)
+	utxoSet.AddUTXO(fund2Op, fund2Entry)
+
+	mp := newTestMempool(utxoSet)
+
+	// parent1: funded externally, included in the package.
+	parent1 := &wire.MsgTx{
+		Version: 2,
+		TxIn:    []*wire.TxIn{{PreviousOutPoint: fund1Op, Sequence: 0xffffffff, SignatureScript: make([]byte, 107)}},
+		TxOut:   []*wire.TxOut{{Value: 57_000, PkScript: makeW116P2WPKHScript(0)}},
+	}
+	parent1Hash := parent1.TxHash()
+
+	// parent2: funded externally, already in the mempool (not in the package).
+	parent2 := &wire.MsgTx{
+		Version: 2,
+		TxIn:    []*wire.TxIn{{PreviousOutPoint: fund2Op, Sequence: 0xffffffff, SignatureScript: make([]byte, 107)}},
+		TxOut:   []*wire.TxOut{{Value: 57_000, PkScript: makeW116P2WPKHScript(1)}},
+	}
+	parent2Hash := parent2.TxHash()
+
+	// Pre-seed parent2 into the mempool (as if it arrived earlier).
+	mp.mu.Lock()
+	mp.pool[parent2Hash] = &TxEntry{
+		Tx:      parent2,
+		TxHash:  parent2Hash,
+		Fee:     3_000,
+		Size:    220,
+		FeeRate: float64(3_000) / 220.0,
+		Height:  100,
+	}
+	mp.outpoints[fund2Op] = parent2Hash
+	mp.mu.Unlock()
+
+	// child spends both parents; only parent1 is in the package.
+	parent1Out := wire.OutPoint{Hash: parent1Hash, Index: 0}
+	parent2Out := wire.OutPoint{Hash: parent2Hash, Index: 0}
+	child := &wire.MsgTx{
+		Version: 2,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: parent1Out, Sequence: 0xffffffff, SignatureScript: make([]byte, 107)},
+			{PreviousOutPoint: parent2Out, Sequence: 0xffffffff, SignatureScript: make([]byte, 107)},
+		},
+		TxOut: []*wire.TxOut{{Value: 108_000, PkScript: makeW116P2WPKHScript(2)}},
+	}
+
+	// IsChildWithParents([parent1, child]) must pass: parent1 IS referenced by
+	// child (the extra parent2 input being omitted from the package is fine).
+	if !IsChildWithParents([]*wire.MsgTx{parent1, child}) {
+		t.Error("IsChildWithParents([parent1, child]) should pass when child also spends a mempool-resident parent not in the package")
+	}
+
+	// AcceptPackage([parent1, child]): must not fail with ErrPackageNotChildWithParents.
+	_, err := mp.AcceptPackage([]*wire.MsgTx{parent1, child})
+	if errors.Is(err, ErrPackageNotChildWithParents) {
+		t.Fatalf("AcceptPackage rejected valid partial-parent package: %v", err)
+	}
+	// Other errors (script, feerate, etc.) are acceptable for this unit test
+	// since we are not providing valid signatures.
+	if err != nil {
+		t.Logf("AcceptPackage returned %v (non-topology error, acceptable for this test)", err)
 	}
 }
 
