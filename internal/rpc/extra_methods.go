@@ -973,16 +973,14 @@ func (s *Server) handleEstimateRawFee(params json.RawMessage) (interface{}, *RPC
 
 	maxTarget := s.feeEstimator.HighestTargetTracked()
 	if confTarget < 1 || confTarget > maxTarget {
-		// Out of range for the only horizon we track; emit empty object so
-		// callers can detect "no data" without parsing an error.
+		// Out of range; emit empty object so callers can detect "no data".
 		return out, nil
 	}
 
-	res := s.feeEstimator.EstimateRawFee(confTarget, threshold)
-	horizon := map[string]interface{}{
-		"decay": res.Decay,
-		"scale": res.Scale,
-	}
+	// BUG-30 FIX: return all horizons that cover confTarget (matching Core's
+	// ALL_FEE_ESTIMATE_HORIZONS loop in src/rpc/fees.cpp).
+	allResults := s.feeEstimator.EstimateRawFeeAllHorizons(confTarget, threshold)
+
 	bucketObj := func(b mempool.EstimationBucketStats) map[string]interface{} {
 		return map[string]interface{}{
 			"startrange":     b.StartRange,
@@ -993,18 +991,25 @@ func (s *Server) handleEstimateRawFee(params json.RawMessage) (interface{}, *RPC
 			"leftmempool":    b.LeftMempool,
 		}
 	}
-	if res.FeeRate > 0 {
-		// sat/vB → BTC/kvB to match estimatesmartfee.
-		horizon["feerate"] = res.FeeRate / satoshiPerBitcoin * 1000
-		horizon["pass"] = bucketObj(res.Pass)
-		if res.Fail.StartRange != -1 {
-			horizon["fail"] = bucketObj(res.Fail)
+
+	for horizonKey, res := range allResults {
+		horizon := map[string]interface{}{
+			"decay": res.Decay,
+			"scale": res.Scale,
 		}
-	} else {
-		horizon["fail"] = bucketObj(res.Fail)
-		horizon["errors"] = []string{"Insufficient data or no feerate found which meets threshold"}
+		if res.FeeRate > 0 {
+			// sat/vB → BTC/kvB to match estimatesmartfee.
+			horizon["feerate"] = res.FeeRate / satoshiPerBitcoin * 1000
+			horizon["pass"] = bucketObj(res.Pass)
+			if res.Fail.StartRange != -1 {
+				horizon["fail"] = bucketObj(res.Fail)
+			}
+		} else {
+			horizon["fail"] = bucketObj(res.Fail)
+			horizon["errors"] = []string{"Insufficient data or no feerate found which meets threshold"}
+		}
+		out[horizonKey] = horizon
 	}
-	out["medium"] = horizon
 	return out, nil
 }
 
