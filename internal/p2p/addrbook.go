@@ -407,6 +407,19 @@ func (ab *AddressBook) Good() []*KnownAddress {
 	return good
 }
 
+// AllAddresses returns a snapshot of all known addresses.
+// Used by ASMapHealthCheck to enumerate AddrMan entries.
+func (ab *AddressBook) AllAddresses() []*KnownAddress {
+	ab.mu.RLock()
+	defer ab.mu.RUnlock()
+
+	all := make([]*KnownAddress, 0, len(ab.addrs))
+	for _, ka := range ab.addrs {
+		all = append(all, ka)
+	}
+	return all
+}
+
 // NeedMoreAddresses returns true if we should request more addresses from peers.
 func (ab *AddressBook) NeedMoreAddresses() bool {
 	ab.mu.RLock()
