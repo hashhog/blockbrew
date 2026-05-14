@@ -24,6 +24,22 @@ const (
 	// MaxHBPeers is the maximum number of high-bandwidth peers.
 	MaxHBPeers = 3
 
+	// MaxCmpctBlockDepth is the maximum depth (blocks below tip) at which a
+	// node will serve a cmpctblock response to a getdata(MSG_CMPCT_BLOCK).
+	// When the requested block is deeper than this, the node falls back to
+	// sending the full block instead.
+	// Mirrors Bitcoin Core net_processing.cpp:2466:
+	//   static const int MAX_CMPCTBLOCK_DEPTH = 5;
+	MaxCmpctBlockDepth = 5
+
+	// MaxBlocktxnDepth is the maximum depth (blocks below tip) at which a
+	// node will serve a blocktxn response to a getblocktxn request.
+	// When the requested block is deeper than this, the node falls back to
+	// sending the full block instead via getdata.
+	// Mirrors Bitcoin Core net_processing.cpp:
+	//   static const int MAX_BLOCKTXN_DEPTH = 10;
+	MaxBlocktxnDepth = 10
+
 	// maxBlockTxCount is the upper bound on transaction count for a compact block.
 	// Mirrors Bitcoin Core blockencodings.cpp:64:
 	//   MAX_BLOCK_WEIGHT / MIN_SERIALIZABLE_TRANSACTION_WEIGHT
