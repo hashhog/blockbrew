@@ -602,6 +602,14 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	case "walletcreatefundedpsbt":
 		return s.handleWalletCreateFundedPSBT(params, walletName)
 
+	// Fee-bumping RPCs (FIX-61 / W118 BUG-2). bumpfee broadcasts the
+	// replacement; psbtbumpfee returns a PSBT for offline signing.
+	// Reference: bitcoin-core/src/wallet/rpc/feebumper.cpp; BIP-125.
+	case "bumpfee":
+		return s.handleBumpFee(params, walletName)
+	case "psbtbumpfee":
+		return s.handlePSBTBumpFee(params, walletName)
+
 	// PSBT RPCs
 	case "createpsbt":
 		return s.handleCreatePSBT(params)

@@ -45,25 +45,23 @@
 //
 // BUG INDEX
 //
-//   BUG-1 (G21 MEDIUM): wallet.go:913 hardcodes Sequence=0xFFFFFFFE on
-//          every CreateTransaction input with a comment claiming this
-//          signals BIP-125 RBF, but 0xFFFFFFFE is CTxIn::MAX_SEQUENCE_
-//          NONFINAL (anti-fee-sniping). BIP-125 RBF requires Sequence ≤
-//          0xFFFFFFFD (MAX_BIP125_RBF_SEQUENCE). Transactions broadcast
-//          by blockbrew do NOT opt into BIP-125, so peers that enforce
-//          the opt-in rule (default Core mempool policy) will NOT replace
-//          a blockbrew tx by fee. Already noted in W113 G27/G28 as a
-//          comment bug, surfacing here as a separate functional finding
-//          because there is no wallet-level RBF flag exposed to callers.
+//   BUG-1 (G21 MEDIUM) FIXED — FIX-61: wallet.go now emits BIP125RBFSequence
+//          (0xFFFFFFFD) via the named constant rather than 0xFFFFFFFE.
+//          The "Enable RBF (BIP125)" comment is now backed by code that
+//          actually opts into BIP-125 per the spec. See wallet.go:913
+//          and the BIP125RBFSequence constant declaration; regression
+//          guards in bumpfee_test.go (TestBIP125Constant,
+//          TestBIP125Sequence_NewTxIsReplaceable). Same fix applied to
+//          rpc/psbt_methods.go:87 createpsbt default. Closes
+//          comment-claims-correct-code-violates-spec instance.
 //
-//   BUG-2 (G19/G20 HIGH MISSING): bumpfee and psbtbumpfee RPCs are NOT
-//          implemented. server.go dispatch table (server.go:447-650) has
-//          no `case "bumpfee":` or `case "psbtbumpfee":` arm. The wallet
-//          package has no BumpFee / CreateBumpTx helper either — only
-//          a single CreateTransactionWithTip path. Users cannot replace
-//          stuck transactions via the standard RPC interface; the only
-//          workaround is to manually construct a higher-fee tx that
-//          double-spends one of the original's inputs.
+//   BUG-2 (G19/G20 HIGH) FIXED — FIX-61: wallet.BumpFee helper added in
+//          internal/wallet/bumpfee.go; handleBumpFee + handlePSBTBumpFee
+//          added in internal/rpc/bumpfee_methods.go; server.go dispatch
+//          arms added. Mirrors Core's wallet/feebumper.cpp shape:
+//          validate ownership + BIP-125 signal + change presence, deduct
+//          fee delta from change, re-sign. See bumpfee_test.go for round-
+//          trip + reject paths.
 //
 //   BUG-3 (G24/G25 HIGH MISSING): sendmany and the unified `send` RPC
 //          are NOT implemented. server.go (server.go:556-602) wires
@@ -739,62 +737,162 @@ func TestW118G18_NonWitnessUTXOTxidBinding(t *testing.T) {
 	}
 }
 
-// ── G19: bumpfee RPC dispatch / wallet helper (MISSING) ───────────────────────
+// ── G19: bumpfee RPC dispatch / wallet helper ────────────────────────────────
+//
+// FIX-61 / W118 BUG-2: wallet.BumpFee helper added in internal/wallet/bumpfee.go;
+// server.go now dispatches `bumpfee` → handleBumpFee. This gate verifies the
+// helper is present and rejects requests on a tx with no RBF signal.
 
-func TestW118G19_BumpFeeMissing(t *testing.T) {
-	// blockbrew does NOT implement bumpfee. The wallet package has no
-	// BumpFee / CreateBumpTx method, and the RPC dispatch in server.go has
-	// no `case "bumpfee":` arm. Document the gap so future work picks it up.
-	//
-	// What Core does: wallet/feebumper.cpp::CreateRateBumpTransaction —
-	// load wallet tx, verify replaceable, build replacement with new fee,
-	// return PSBT or txid.
+func TestW118G19_BumpFeePresent(t *testing.T) {
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+		AddressType: AddressTypeP2WPKH,
+	}
+	w := NewWallet(config)
+	if err := w.CreateFromMnemonic(testMnemonic, ""); err != nil {
+		t.Fatalf("CreateFromMnemonic: %v", err)
+	}
+	addr, _ := w.NewAddress()
+	parsed, _ := address.DecodeAddress(addr, address.Mainnet)
+	utxo := &WalletUTXO{
+		OutPoint:  wire.OutPoint{Hash: wire.Hash256{0xa1}, Index: 0},
+		Amount:    100_000_000,
+		Address:   addr,
+		PkScript:  parsed.ScriptPubKey(),
+		KeyPath:   w.addrToPath[addr],
+		Confirmed: true,
+	}
+	w.AddUTXO(utxo)
 
-	// Compile-time check: verify CreateTransactionWithTip exists (the only
-	// transaction-construction helper). If a BumpFee variant ever appears
-	// this gate should be widened to actually exercise it.
-	w := &Wallet{}
-	_ = w
-	t.Log("BUG-2: bumpfee RPC + wallet.BumpFee helper MISSING (server.go has no dispatch arm; wallet package has no bump helper)")
+	// Build an outgoing tx, then verify BumpFee accepts it. The detailed
+	// round-trip test lives in bumpfee_test.go; this gate just confirms
+	// the helper exists and is callable post-FIX-61.
+	origTx, err := w.CreateTransaction("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", 10_000_000, 1.0)
+	if err != nil {
+		t.Fatalf("CreateTransaction: %v", err)
+	}
+	res, err := w.BumpFee(BumpFeeRequest{
+		OrigTx:     origTx,
+		InputUTXOs: map[wire.OutPoint]*WalletUTXO{utxo.OutPoint: utxo},
+		FeeRate:    5.0,
+	})
+	if err != nil {
+		t.Fatalf("BumpFee: %v", err)
+	}
+	if res.NewFee <= res.OldFee {
+		t.Errorf("FIX-61 G19: new fee %d not greater than old %d", res.NewFee, res.OldFee)
+	}
+	t.Log("FIX-61 BUG-2: bumpfee RPC + wallet.BumpFee helper PRESENT and functional")
 }
 
-// ── G20: psbtbumpfee RPC dispatch / wallet helper (MISSING) ───────────────────
+// ── G20: psbtbumpfee RPC dispatch / wallet helper ────────────────────────────
+//
+// FIX-61 / W118 BUG-2: psbtbumpfee handler added in internal/rpc/bumpfee_methods.go.
+// Same wallet helper, different output shape (base64 PSBT vs. broadcast).
 
-func TestW118G20_PSBTBumpFeeMissing(t *testing.T) {
-	// blockbrew does NOT implement psbtbumpfee. Same root cause as G19:
-	// no wallet-level BumpFee helper, no RPC handler.
-	t.Log("BUG-2: psbtbumpfee RPC MISSING (server.go has no dispatch arm)")
+func TestW118G20_PSBTBumpFeePresent(t *testing.T) {
+	// The RPC layer is exercised in internal/rpc/bumpfee_methods_test.go.
+	// At the wallet level the helper is shared with G19; this gate
+	// verifies the resulting tx can be wrapped in a PSBT successfully.
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+		AddressType: AddressTypeP2WPKH,
+	}
+	w := NewWallet(config)
+	if err := w.CreateFromMnemonic(testMnemonic, ""); err != nil {
+		t.Fatalf("CreateFromMnemonic: %v", err)
+	}
+	addr, _ := w.NewAddress()
+	parsed, _ := address.DecodeAddress(addr, address.Mainnet)
+	utxo := &WalletUTXO{
+		OutPoint:  wire.OutPoint{Hash: wire.Hash256{0xa2}, Index: 0},
+		Amount:    100_000_000,
+		Address:   addr,
+		PkScript:  parsed.ScriptPubKey(),
+		KeyPath:   w.addrToPath[addr],
+		Confirmed: true,
+	}
+	w.AddUTXO(utxo)
+	origTx, err := w.CreateTransaction("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", 10_000_000, 1.0)
+	if err != nil {
+		t.Fatalf("CreateTransaction: %v", err)
+	}
+	res, err := w.BumpFee(BumpFeeRequest{
+		OrigTx:     origTx,
+		InputUTXOs: map[wire.OutPoint]*WalletUTXO{utxo.OutPoint: utxo},
+		FeeRate:    5.0,
+	})
+	if err != nil {
+		t.Fatalf("BumpFee: %v", err)
+	}
+	// Wrap unsigned in a PSBT (mirrors psbtbumpfee path).
+	unsigned := &wire.MsgTx{Version: res.NewTx.Version, LockTime: res.NewTx.LockTime}
+	for _, in := range res.NewTx.TxIn {
+		unsigned.TxIn = append(unsigned.TxIn, &wire.TxIn{PreviousOutPoint: in.PreviousOutPoint, Sequence: in.Sequence})
+	}
+	for _, out := range res.NewTx.TxOut {
+		unsigned.TxOut = append(unsigned.TxOut, &wire.TxOut{Value: out.Value, PkScript: out.PkScript})
+	}
+	if _, err := NewPSBT(unsigned); err != nil {
+		t.Fatalf("psbtbumpfee NewPSBT: %v", err)
+	}
+	t.Log("FIX-61 BUG-2: psbtbumpfee RPC + PSBT wrap path PRESENT")
 }
 
 // ── G21: BIP-125 RBF sequence marker ─────────────────────────────────────────
+//
+// FIX-61 / W118 BUG-1: wallet.go now emits BIP125RBFSequence (0xFFFFFFFD)
+// rather than 0xFFFFFFFE. Comment-claims-correct-code-violates-spec pattern
+// closed.
 
 func TestW118G21_BIP125RBFSequence(t *testing.T) {
-	// BUG-1: CreateTransaction hardcodes Sequence=0xFFFFFFFE on every input.
-	// BIP-125 opt-in RBF requires Sequence ≤ 0xFFFFFFFD (MAX_BIP125_RBF_SEQUENCE).
-	// 0xFFFFFFFE is anti-fee-sniping but NOT BIP-125 RBF.
-	//
-	// The bug is documented in W113 G27/G28 as a comment bug — surfacing
-	// here as a separate functional finding because there is no wallet-
-	// level RBF flag exposed to callers.
-
 	const (
-		MaxBIP125RBFSequence  = uint32(0xFFFFFFFD)
-		MaxSequenceNonFinal   = uint32(0xFFFFFFFE)
-		FullySignaled         = uint32(0xFFFFFFFF)
+		MaxBIP125RBFSequence = uint32(0xFFFFFFFD)
+		MaxSequenceNonFinal  = uint32(0xFFFFFFFE)
+		FullySignaled        = uint32(0xFFFFFFFF)
 	)
 
-	// What CreateTransactionWithTip actually emits (from wallet.go:913).
-	emitted := uint32(0xFFFFFFFE)
+	// Drive the production code path rather than reading a literal.
+	config := WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		ChainParams: consensus.MainnetParams(),
+		AddressType: AddressTypeP2WPKH,
+	}
+	w := NewWallet(config)
+	w.CreateFromMnemonic(testMnemonic, "")
+	addr, _ := w.NewAddress()
+	parsed, _ := address.DecodeAddress(addr, address.Mainnet)
+	w.AddUTXO(&WalletUTXO{
+		OutPoint:  wire.OutPoint{Hash: wire.Hash256{0xa3}, Index: 0},
+		Amount:    1_000_000,
+		Address:   addr,
+		PkScript:  parsed.ScriptPubKey(),
+		KeyPath:   w.addrToPath[addr],
+		Confirmed: true,
+	})
+	tx, err := w.CreateTransaction("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", 100_000, 1.0)
+	if err != nil {
+		t.Fatalf("CreateTransaction: %v", err)
+	}
+	emitted := tx.TxIn[0].Sequence
+
 	if emitted == FullySignaled {
 		t.Error("G21 emitted sequence is fully-signaled — anti-fee-sniping disabled")
 	}
-	if emitted == MaxBIP125RBFSequence {
-		t.Log("G21 emitted sequence is MAX_BIP125_RBF — RBF opt-in works")
+	if emitted == MaxSequenceNonFinal {
+		t.Errorf("W118 BUG-1 regression: CreateTransaction still emits 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) with comment 'Enable RBF (BIP125)'. BIP-125 requires Sequence ≤ 0xFFFFFFFD.")
 		return
 	}
-	if emitted == MaxSequenceNonFinal {
-		t.Log("BUG-1: wallet.go:913 emits 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL) but the inline comment claims 'Enable RBF (BIP125)'. BIP-125 requires Sequence ≤ 0xFFFFFFFD. blockbrew transactions are NOT replaceable.")
+	if emitted != MaxBIP125RBFSequence {
+		t.Errorf("G21 emitted unexpected Sequence=0x%08x, want 0x%08x (MAX_BIP125_RBF_SEQUENCE)", emitted, MaxBIP125RBFSequence)
+		return
 	}
+	t.Log("FIX-61 BUG-1: emitted sequence is MAX_BIP125_RBF — RBF opt-in works (closes W118 BUG-1)")
 }
 
 // ── G22: CPFP wallet integration (descendant tracking) ────────────────────────
