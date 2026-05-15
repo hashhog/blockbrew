@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -29,6 +30,19 @@ type RPCConfig struct {
 	Password    string // Basic auth password
 	TxIndex     bool   // Whether txindex is enabled
 	RESTEnabled bool   // Whether REST API is enabled
+
+	// TLS termination (W119 BUG / FIX-64). When both TLSCertFile and
+	// TLSKeyFile are non-empty the server uses ListenAndServeTLS so the
+	// JSON-RPC and REST endpoints are served over HTTPS instead of plain
+	// HTTP. When neither is set the legacy plaintext path is preserved
+	// (backward compat with existing operators/tools that already front
+	// blockbrew with nginx/Tor for TLS termination). Setting exactly one
+	// of the two is a startup error — see Server.Start. Closes W119
+	// universal "RPC plaintext fleet-wide" finding and is required for
+	// clearnet PayJoin per BIP-78 §"Protocol" (HTTPS endpoint mandatory
+	// outside of .onion). Reference: bitcoin-core/src/httpserver.cpp.
+	TLSCertFile string
+	TLSKeyFile  string
 }
 
 // Server is the JSON-RPC server.
@@ -238,7 +252,28 @@ func DeleteCookie(datadir string) {
 }
 
 // Start begins listening for RPC requests.
+//
+// When both RPCConfig.TLSCertFile and RPCConfig.TLSKeyFile are non-empty
+// the server is served over HTTPS via ListenAndServeTLS. When neither is
+// set the legacy plaintext HTTP path is used (backward compat). Setting
+// exactly one of the two — cert without key or vice versa — is rejected
+// here with a clear error so an operator never silently lands on plaintext
+// when they intended HTTPS. See RPCConfig docstring and W119 / FIX-64.
 func (s *Server) Start() error {
+	// Validate TLS arg pair before binding the socket so the daemon does
+	// not transiently expose plain HTTP on the configured port when the
+	// operator's intent was HTTPS but they typoed/forgot one of the two
+	// flags. Both empty is fine (HTTP); both set is fine (HTTPS); exactly
+	// one set is the misconfiguration we want to catch.
+	certSet := s.config.TLSCertFile != ""
+	keySet := s.config.TLSKeyFile != ""
+	if certSet != keySet {
+		return fmt.Errorf(
+			"rpc: TLS misconfiguration: --rpc-tls-cert and --rpc-tls-key must both be set or both empty (cert=%q key=%q)",
+			s.config.TLSCertFile, s.config.TLSKeyFile,
+		)
+	}
+
 	mux := http.NewServeMux()
 
 	// Register REST API handlers if enabled
@@ -257,13 +292,41 @@ func (s *Server) Start() error {
 		WriteTimeout: 30 * time.Second,
 	}
 
+	tlsEnabled := certSet && keySet
+	if tlsEnabled {
+		// Validate the cert/key pair eagerly so a typo in the path or a
+		// PEM-decoding failure surfaces synchronously, before Start
+		// returns. Otherwise the error would only appear in the goroutine
+		// log and the daemon would look "up" while serving nothing.
+		if _, err := tls.LoadX509KeyPair(s.config.TLSCertFile, s.config.TLSKeyFile); err != nil {
+			return fmt.Errorf("rpc: TLS keypair load failed (cert=%q key=%q): %w", s.config.TLSCertFile, s.config.TLSKeyFile, err)
+		}
+		// Modern, conservative defaults: TLS 1.2 minimum, standard cipher
+		// suites selected by the Go runtime. We don't pin a cipher list —
+		// Go's defaults track upstream changes and we want HTTPS RPC to
+		// stay current without code edits per release.
+		s.httpServer.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+	}
+
 	go func() {
-		if err := s.httpServer.ListenAndServe(); err != http.ErrServerClosed {
+		var err error
+		if tlsEnabled {
+			err = s.httpServer.ListenAndServeTLS(s.config.TLSCertFile, s.config.TLSKeyFile)
+		} else {
+			err = s.httpServer.ListenAndServe()
+		}
+		if err != http.ErrServerClosed {
 			log.Printf("RPC server error: %v", err)
 		}
 	}()
 
-	log.Printf("RPC server listening on %s", s.config.ListenAddr)
+	if tlsEnabled {
+		log.Printf("RPC server listening on https://%s (TLS cert=%s)", s.config.ListenAddr, s.config.TLSCertFile)
+	} else {
+		log.Printf("RPC server listening on %s", s.config.ListenAddr)
+	}
 	return nil
 }
 
