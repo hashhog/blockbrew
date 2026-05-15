@@ -239,7 +239,10 @@
 package wallet
 
 import (
+	"errors"
 	"testing"
+
+	"github.com/hashhog/blockbrew/internal/address"
 )
 
 // ── G1: Receiver HTTP endpoint POST /payjoin ─────────────────────────────────
@@ -405,15 +408,90 @@ func TestW119G27_SendPayjoinRequestRPC(t *testing.T) {
 }
 
 // ── G28: BIP-21 URI parser `pj=` ─────────────────────────────────────────────
+//
+// FIX-62 closure (BUG-5 — partial): wallet.ParseBIP21 now recognises and
+// percent-decodes the `pj=` PayJoin endpoint from a bitcoin: URI. The
+// receiver- and sender-side BIP-78 protocol gates (G1–G27, G30) are still
+// MISSING ENTIRELY — but the URI plumbing they would consume is now in place,
+// so a future FIX wave that wires PayJoin only has to hand a string here, not
+// implement a parser from scratch.
 
 func TestW119G28_BIP21URIParserPj(t *testing.T) {
-	t.Skip("BUG-5: no BIP-21 bitcoin: URI parser anywhere in blockbrew; grep for 'bitcoin:' returns zero non-test hits")
+	// Canonical receiver-published URI: address + amount + pj endpoint.
+	// The PJ endpoint is percent-encoded as a URI MUST be when nested in a
+	// query value (`?` and `&` would otherwise terminate parsing).
+	const addr = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+	const pjURL = "https://merchant.example.com/payjoin?session=abc123"
+	encoded := "https%3A%2F%2Fmerchant.example.com%2Fpayjoin%3Fsession%3Dabc123"
+	uri := "bitcoin:" + addr + "?amount=0.05&pj=" + encoded
+
+	parsed, err := ParseBIP21(uri, address.Mainnet)
+	if err != nil {
+		t.Fatalf("ParseBIP21(%q) error: %v", uri, err)
+	}
+	if parsed.PJ == nil {
+		t.Fatal("BUG-5 fix incomplete: PJ field is nil after parse")
+	}
+	if *parsed.PJ != pjURL {
+		t.Errorf("PJ = %q, want %q (percent-decoded)", *parsed.PJ, pjURL)
+	}
+	if parsed.Amount == nil || *parsed.Amount != 5_000_000 {
+		t.Errorf("Amount = %v, want 5_000_000 sats (0.05 BTC)", parsed.Amount)
+	}
 }
 
 // ── G29: BIP-21 URI parser `pjos=` ──────────────────────────────────────────
+//
+// FIX-62 closure: pjos=0 and pjos=1 both parse; anything else is rejected as
+// ErrMalformedQuery. The Bip21URI.PJOS pointer is nil when absent so the
+// PayJoin sender can apply BIP-78's default (output substitution allowed).
 
 func TestW119G29_BIP21URIParserPjos(t *testing.T) {
-	t.Skip("BUG-5: no BIP-21 parser means pjos= disableoutputsubstitution flag is unparseable")
+	const addr = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa"
+	const pjEnc = "https%3A%2F%2Fmerchant.example.com%2Fpayjoin"
+
+	t.Run("pjos=0 → false (substitution allowed)", func(t *testing.T) {
+		u, err := ParseBIP21("bitcoin:"+addr+"?pj="+pjEnc+"&pjos=0", address.Mainnet)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if u.PJOS == nil {
+			t.Fatal("PJOS should be set when pjos= is present")
+		}
+		if *u.PJOS != false {
+			t.Errorf("PJOS = %v, want false (pjos=0)", *u.PJOS)
+		}
+	})
+
+	t.Run("pjos=1 → true (substitution disabled)", func(t *testing.T) {
+		u, err := ParseBIP21("bitcoin:"+addr+"?pj="+pjEnc+"&pjos=1", address.Mainnet)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if u.PJOS == nil {
+			t.Fatal("PJOS should be set when pjos= is present")
+		}
+		if *u.PJOS != true {
+			t.Errorf("PJOS = %v, want true (pjos=1)", *u.PJOS)
+		}
+	})
+
+	t.Run("pjos absent → PJOS nil (caller applies default)", func(t *testing.T) {
+		u, err := ParseBIP21("bitcoin:"+addr+"?pj="+pjEnc, address.Mainnet)
+		if err != nil {
+			t.Fatalf("unexpected err: %v", err)
+		}
+		if u.PJOS != nil {
+			t.Errorf("PJOS = %v, want nil when pjos= absent", *u.PJOS)
+		}
+	})
+
+	t.Run("pjos=2 → ErrMalformedQuery (per BIP-78: only 0/1)", func(t *testing.T) {
+		_, err := ParseBIP21("bitcoin:"+addr+"?pj="+pjEnc+"&pjos=2", address.Mainnet)
+		if !errors.Is(err, ErrMalformedQuery) {
+			t.Errorf("err = %v, want ErrMalformedQuery", err)
+		}
+	})
 }
 
 // ── G30: Receiver replay protection (PSBT-id) ───────────────────────────────
