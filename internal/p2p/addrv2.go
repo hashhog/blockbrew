@@ -39,6 +39,14 @@ var (
 	ErrInvalidAddrSize    = errors.New("p2p: invalid address size for network type")
 	ErrAddrTooLarge       = errors.New("p2p: address too large")
 	ErrInvalidCJDNSPrefix = errors.New("p2p: CJDNS address must start with fc00::/8")
+	// ErrTorV2Deprecated is a sentinel returned by NetAddressV2.Deserialize
+	// when the entry's network ID is TORV2 (BIP155 §3). Tor v2 was deprecated
+	// in October 2021 and the Tor network no longer serves v2 onions; receivers
+	// MUST silently drop TORV2 entries. The Deserialize method still consumes
+	// all wire bytes for the entry (so the stream position advances to the
+	// next entry); callers (e.g. MsgAddrv2.Deserialize) should detect this
+	// sentinel and skip the entry without aborting the message.
+	ErrTorV2Deprecated = errors.New("p2p: TORV2 address silently dropped (BIP155 §3)")
 )
 
 // NetAddressV2 represents an extended network address for BIP155 ADDRv2.
@@ -221,6 +229,14 @@ func (na *NetAddressV2) Serialize(w io.Writer) error {
 }
 
 // Deserialize reads a NetAddressV2 in BIP155 ADDRv2 format.
+//
+// BIP155 §3: TORV2 entries (network ID 0x03) MUST be silently dropped — the
+// Tor v2 network was deprecated in October 2021 and the Tor network no longer
+// serves v2 onions. When a TORV2 entry is encountered this method still
+// consumes every wire byte for the entry (address bytes + port) so that the
+// stream position advances to the next entry, then returns ErrTorV2Deprecated
+// as a sentinel. Callers parsing a multi-entry message should detect this
+// sentinel and skip the entry without aborting the whole message.
 func (na *NetAddressV2) Deserialize(r io.Reader) error {
 	var err error
 
@@ -243,10 +259,23 @@ func (na *NetAddressV2) Deserialize(r io.Reader) error {
 		return err
 	}
 
-	// Read address with length prefix
+	// Read address with length prefix. We always consume the bytes from the
+	// wire even for TORV2 entries so that the stream position advances to the
+	// next entry; the BIP155 §3 silent-drop is enforced by returning a
+	// sentinel error after the entry is fully consumed.
 	na.Addr, err = wire.ReadVarBytes(r, MaxAddrV2Size)
 	if err != nil {
 		return err
+	}
+
+	// BIP155 §3: TORV2 is deprecated — consume the rest of the entry (port)
+	// then signal the silent-drop sentinel. The address-bytes have already
+	// been read above. Doing this BEFORE ValidateAddrSize means we tolerate
+	// any address length a peer claims for a TORV2 entry: we just drop it.
+	if na.NetworkID == NetTorV2 {
+		// Still read the port so the stream position is at the next entry.
+		na.Port, _ = readUint16BE(r)
+		return ErrTorV2Deprecated
 	}
 
 	// Validate address size for known network types
@@ -325,6 +354,11 @@ func (m *MsgAddrv2) Serialize(w io.Writer) error {
 }
 
 // Deserialize reads the addrv2 message from r.
+//
+// BIP155 §3: TORV2 entries are silently dropped — they are consumed from the
+// wire (so the stream stays aligned) but not added to AddrList. The rest of
+// the message continues to parse. Only fatal wire/length errors abort the
+// whole message.
 func (m *MsgAddrv2) Deserialize(r io.Reader) error {
 	// Read count
 	count, err := wire.ReadCompactSize(r)
@@ -335,12 +369,20 @@ func (m *MsgAddrv2) Deserialize(r io.Reader) error {
 		return ErrTooManyAddresses
 	}
 
-	// Read each address
-	m.AddrList = make([]NetAddressV2, count)
-	for i := range m.AddrList {
-		if err := m.AddrList[i].Deserialize(r); err != nil {
+	// Read each address. We allocate up to count entries but only append
+	// those that aren't silently dropped (per BIP155 §3 for TORV2).
+	m.AddrList = make([]NetAddressV2, 0, count)
+	for i := uint64(0); i < count; i++ {
+		var entry NetAddressV2
+		err := entry.Deserialize(r)
+		if err == ErrTorV2Deprecated {
+			// BIP155 §3: silently drop the entry, keep parsing the rest.
+			continue
+		}
+		if err != nil {
 			return err
 		}
+		m.AddrList = append(m.AddrList, entry)
 	}
 	return nil
 }
