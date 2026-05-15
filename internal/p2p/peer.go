@@ -728,14 +728,7 @@ func (p *Peer) handleMessage(msg Message) {
 		}
 	// BIP331 package-relay messages
 	case *MsgSendPackages:
-		// Per BIP-331, sendpackages MAY be sent multiple times (each with a
-		// different versions field). Combine them by OR-ing the bitfields.
-		p.mu.Lock()
-		p.packageVersions |= m.Versions
-		p.mu.Unlock()
-		if p.config.Listeners != nil && p.config.Listeners.OnSendPackages != nil {
-			p.config.Listeners.OnSendPackages(p, m)
-		}
+		p.handleSendPackages(m)
 	case *MsgGetPkgTxns:
 		if p.config.Listeners != nil && p.config.Listeners.OnGetPkgTxns != nil {
 			p.config.Listeners.OnGetPkgTxns(p, m)
@@ -859,6 +852,29 @@ func (p *Peer) handleSendTxRcncl(msg *MsgSendTxRcncl) {
 	// Call listener if set
 	if listeners != nil && listeners.OnSendTxRcncl != nil {
 		listeners.OnSendTxRcncl(p, msg)
+	}
+}
+
+// handleSendPackages processes a received sendpackages message (BIP-331).
+// This must be received before verack to enable package relay support.
+func (p *Peer) handleSendPackages(msg *MsgSendPackages) {
+	p.mu.Lock()
+	// Only accept sendpackages before handshake complete
+	if p.verAckRecvd {
+		p.mu.Unlock()
+		// BIP-331: sendpackages after verack is a protocol violation
+		p.Misbehaving(10, "sendpackages received after verack")
+		return
+	}
+	// Per BIP-331, sendpackages MAY be sent multiple times (each with a
+	// different versions field). Combine them by OR-ing the bitfields.
+	p.packageVersions |= msg.Versions
+	listeners := p.config.Listeners
+	p.mu.Unlock()
+
+	// Call listener if set
+	if listeners != nil && listeners.OnSendPackages != nil {
+		listeners.OnSendPackages(p, msg)
 	}
 }
 
