@@ -84,7 +84,13 @@ func (s *Server) handleCreatePSBT(params json.RawMessage) (interface{}, *RPCErro
 			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid txid in input %d", i)}
 		}
 
-		sequence := uint32(0xfffffffe) // Enable RBF by default
+		// BIP-125 RBF opt-in: nSequence ≤ MAX_BIP125_RBF_SEQUENCE
+		// (0xFFFFFFFD). Previously 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL,
+		// anti-fee-sniping), which does NOT signal RBF. Comment claimed
+		// "Enable RBF by default" but code was off-by-one. Fixed via
+		// FIX-61 / W118 BUG-1 ("comment-claims-correct-code-violates-spec"
+		// pattern). Reference: BIP-125; bitcoin-core/src/policy/rbf.h.
+		sequence := wallet.BIP125RBFSequence
 		if !replaceable {
 			sequence = 0xffffffff
 		}
