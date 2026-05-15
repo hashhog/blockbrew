@@ -70,6 +70,17 @@ type Config struct {
 	// production binaries (audit `_rest-api-cross-impl-audit-2026-05-06-part1.md`).
 	Rest bool
 
+	// RPCTLSCert / RPCTLSKey wire optional HTTPS termination for the
+	// RPC + REST socket (W119 BUG / FIX-64). Both empty = legacy plain
+	// HTTP (default; backward compat with operators fronting blockbrew
+	// behind nginx/Tor for TLS). Both set = HTTPS via Go crypto/tls
+	// ListenAndServeTLS. Exactly one set = startup error (refusing to
+	// silently land on plaintext when the operator intended HTTPS).
+	// Required for clearnet PayJoin per BIP-78 (HTTPS endpoint mandatory
+	// outside of .onion). Reference: bitcoin-core/src/httpserver.cpp.
+	RPCTLSCert string
+	RPCTLSKey  string
+
 	// Performance profiling
 	PprofAddr       string
 	ParallelScripts bool
@@ -440,6 +451,8 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.LogLevel, "loglevel", "info", "Log level (debug, info, warn, error)")
 	flag.BoolVar(&cfg.TxIndex, "txindex", false, "Enable transaction index")
 	flag.BoolVar(&cfg.Rest, "rest", false, "Accept public REST requests on the JSON-RPC socket (Core parity: default off). When true, handlers under `/rest/` (block, tx, headers, blockhashbyheight, chaininfo, mempool/{info,contents}, getutxos) are mounted unauthenticated; JSON-RPC POST endpoints still require auth. Mirrors Bitcoin Core's `-rest=1`.")
+	flag.StringVar(&cfg.RPCTLSCert, "rpc-tls-cert", "", "Path to a PEM-encoded x509 certificate for HTTPS-terminating the RPC + REST socket. Must be paired with -rpc-tls-key. Empty (default) = serve plain HTTP. Setting exactly one of cert/key is a startup error. Required for BIP-78 clearnet PayJoin endpoints (W119 / FIX-64).")
+	flag.StringVar(&cfg.RPCTLSKey, "rpc-tls-key", "", "Path to a PEM-encoded private key paired with -rpc-tls-cert. Empty (default) = serve plain HTTP. See -rpc-tls-cert.")
 	flag.Int64Var(&cfg.MaxMempool, "maxmempool", 300, "Maximum mempool size in MB")
 	flag.Float64Var(&cfg.MinRelayFee, "minrelayfee", 0.00001, "Minimum relay fee (BTC/kvB)")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "Print version and exit")
@@ -1398,6 +1411,11 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			// at `_rest-api-cross-impl-audit-2026-05-06-part1.md` flagged
 			// the missing CLI plumbing as RED-2 (P1 dead code).
 			RESTEnabled: cfg.Rest,
+			// Optional HTTPS termination (W119 / FIX-64). Both empty =
+			// legacy plain HTTP. Both set = HTTPS via crypto/tls. Setting
+			// exactly one of the two is rejected in Server.Start.
+			TLSCertFile: cfg.RPCTLSCert,
+			TLSKeyFile:  cfg.RPCTLSKey,
 		},
 		rpc.WithCookiePassword(cookiePassword),
 		rpc.WithChainParams(chainParams),
