@@ -75,14 +75,15 @@ import (
 // is a protocol violation and MUST be rejected / ignored.
 // ---------------------------------------------------------------------------
 
-// TestW117_G5_TorV2NotRejectedOnDeserialize verifies that a NetTorV2 address
-// received in an addrv2 message is treated as an error (BUG-1).
+// TestW117_G5_TorV2NotRejectedOnDeserialize verifies that a NetTorV2 entry
+// is silently dropped on deserialize (BUG-1, FIX-58).
 //
-// Current behaviour: Deserialize accepts NetTorV2 silently.
-// Correct behaviour: return an error or filter it out post-parse so callers
-// can misbehavior-score or discard accordingly.
+// BIP155 §3: receivers MUST silently drop TORV2 entries. The Deserialize
+// method consumes the entry's wire bytes (so the stream stays aligned) and
+// returns the ErrTorV2Deprecated sentinel so the message-level loop can skip
+// the entry without aborting the message.
 func TestW117_G5_TorV2NotRejectedOnDeserialize(t *testing.T) {
-	// Build a valid NetTorV2 address (10 bytes).
+	// Build a NetTorV2 address (10 bytes per BIP155).
 	torV2Addr := make([]byte, TorV2AddrSize) // 10 bytes
 	for i := range torV2Addr {
 		torV2Addr[i] = byte(i + 1)
@@ -104,19 +105,27 @@ func TestW117_G5_TorV2NotRejectedOnDeserialize(t *testing.T) {
 	var decoded NetAddressV2
 	err := decoded.Deserialize(&buf)
 
-	// BUG-1: blockbrew accepts NetTorV2 silently — no error returned.
-	// It SHOULD return an error (e.g. ErrInvalidNetworkID or a dedicated
-	// ErrTorV2Deprecated) so the MsgAddrv2 handler can misbehavior-score
-	// the sending peer.
-	if err == nil {
-		t.Errorf("BUG-1: Deserialize accepted NetTorV2 (0x03) without error; "+
-			"BIP155 §3 requires Tor v2 to be rejected. decoded.NetworkID=%d",
-			decoded.NetworkID)
+	// BIP155 §3 silent-drop: Deserialize must return the ErrTorV2Deprecated
+	// sentinel and consume the entry from the wire.
+	if err != ErrTorV2Deprecated {
+		t.Errorf("Deserialize(TORV2) returned %v, want ErrTorV2Deprecated "+
+			"(BIP155 §3 silent-drop)", err)
+	}
+	// Stream must be fully consumed (address-bytes + port).
+	if buf.Len() != 0 {
+		t.Errorf("Deserialize(TORV2) left %d unread bytes on the wire; "+
+			"the entry must be fully consumed so the next entry parses correctly",
+			buf.Len())
 	}
 }
 
 // TestW117_G5_TorV2RejectedInMsgAddrv2 verifies that a MsgAddrv2 containing
-// a Tor v2 address is rejected at the message level (BUG-1).
+// only a Tor v2 address parses successfully but with an empty AddrList
+// (BUG-1, FIX-58).
+//
+// BIP155 §3: TORV2 entries are silently dropped at the message-level loop.
+// The message itself is NOT a protocol violation — only the v2 entries are
+// filtered out.
 func TestW117_G5_TorV2RejectedInMsgAddrv2(t *testing.T) {
 	torV2Addr := make([]byte, TorV2AddrSize)
 
@@ -139,11 +148,120 @@ func TestW117_G5_TorV2RejectedInMsgAddrv2(t *testing.T) {
 
 	decoded := &MsgAddrv2{}
 	err := decoded.Deserialize(&buf)
+	if err != nil {
+		t.Fatalf("MsgAddrv2.Deserialize returned error %v, want nil "+
+			"(BIP155 §3: drop only the TORV2 entry, not the whole message)", err)
+	}
+	if len(decoded.AddrList) != 0 {
+		t.Errorf("MsgAddrv2 with only TORV2 entry: got %d entries, want 0 "+
+			"(BIP155 §3 silent-drop)", len(decoded.AddrList))
+	}
+}
 
-	// BUG-1: the message deserializes fine, accepting a Tor v2 entry.
-	if err == nil {
-		t.Errorf("BUG-1: MsgAddrv2.Deserialize accepted Tor v2 address (NetTorV2=0x03) "+
-			"without error; BIP155 requires Tor v2 to be rejected/ignored")
+// TestW117_G5_TorV2DroppedFromMixedAddrv2 verifies that an addrv2 message
+// containing [IPv4, TORV2, TorV3] deserializes to [IPv4, TorV3]: only the
+// TORV2 entry is silently dropped, and the remaining entries are intact
+// (BUG-1, FIX-58).
+//
+// This is the canonical BIP155 §3 test: the v2 entry MUST NOT abort the
+// message, MUST NOT shift later entries, MUST NOT corrupt the stream
+// position, and MUST NOT appear in the resulting AddrList.
+func TestW117_G5_TorV2DroppedFromMixedAddrv2(t *testing.T) {
+	ipv4Addr := []byte{203, 0, 113, 5}
+	torV2Addr := make([]byte, TorV2AddrSize)
+	for i := range torV2Addr {
+		torV2Addr[i] = byte(0xc0 + i) // synthetic v2 onion bytes
+	}
+	torV3Addr := make([]byte, TorV3AddrSize)
+	for i := range torV3Addr {
+		torV3Addr[i] = byte(i + 0x40) // synthetic ed25519 pubkey
+	}
+
+	msg := &MsgAddrv2{
+		AddrList: []NetAddressV2{
+			{
+				Time:      1700000001,
+				Services:  9,
+				NetworkID: NetIPv4,
+				Addr:      ipv4Addr,
+				Port:      8333,
+			},
+			{
+				Time:      1700000002,
+				Services:  0,
+				NetworkID: NetTorV2,
+				Addr:      torV2Addr,
+				Port:      9050,
+			},
+			{
+				Time:      1700000003,
+				Services:  1,
+				NetworkID: NetTorV3,
+				Addr:      torV3Addr,
+				Port:      9050,
+			},
+		},
+	}
+
+	var buf bytes.Buffer
+	if err := msg.Serialize(&buf); err != nil {
+		t.Fatalf("Serialize failed: %v", err)
+	}
+
+	decoded := &MsgAddrv2{}
+	if err := decoded.Deserialize(&buf); err != nil {
+		t.Fatalf("Deserialize failed: %v (must NOT abort whole message for "+
+			"a TORV2 entry; BIP155 §3 silent-drop)", err)
+	}
+
+	if len(decoded.AddrList) != 2 {
+		t.Fatalf("AddrList length: got %d, want 2 (IPv4 + TorV3 after silent-drop "+
+			"of TORV2). Decoded entries: %+v", len(decoded.AddrList), decoded.AddrList)
+	}
+
+	// Entry 0 must be the IPv4 entry, unchanged.
+	if decoded.AddrList[0].NetworkID != NetIPv4 {
+		t.Errorf("AddrList[0].NetworkID: got %d, want %d (NetIPv4)",
+			decoded.AddrList[0].NetworkID, NetIPv4)
+	}
+	if !bytes.Equal(decoded.AddrList[0].Addr, ipv4Addr) {
+		t.Errorf("AddrList[0].Addr: got %v, want %v", decoded.AddrList[0].Addr, ipv4Addr)
+	}
+	if decoded.AddrList[0].Port != 8333 {
+		t.Errorf("AddrList[0].Port: got %d, want 8333", decoded.AddrList[0].Port)
+	}
+	if decoded.AddrList[0].Time != 1700000001 {
+		t.Errorf("AddrList[0].Time: got %d, want 1700000001", decoded.AddrList[0].Time)
+	}
+
+	// Entry 1 must be the TorV3 entry — proving the TORV2 entry was
+	// fully consumed and didn't shift the stream.
+	if decoded.AddrList[1].NetworkID != NetTorV3 {
+		t.Errorf("AddrList[1].NetworkID: got %d, want %d (NetTorV3) — "+
+			"TORV2 consumption misaligned the stream",
+			decoded.AddrList[1].NetworkID, NetTorV3)
+	}
+	if !bytes.Equal(decoded.AddrList[1].Addr, torV3Addr) {
+		t.Errorf("AddrList[1].Addr mismatch — TorV3 bytes corrupted by TORV2 consumption")
+	}
+	if decoded.AddrList[1].Port != 9050 {
+		t.Errorf("AddrList[1].Port: got %d, want 9050", decoded.AddrList[1].Port)
+	}
+	if decoded.AddrList[1].Time != 1700000003 {
+		t.Errorf("AddrList[1].Time: got %d, want 1700000003", decoded.AddrList[1].Time)
+	}
+
+	// Confirm no TORV2 entry leaked into the result.
+	for i, e := range decoded.AddrList {
+		if e.NetworkID == NetTorV2 {
+			t.Errorf("AddrList[%d] is NetTorV2 (0x03) — BIP155 §3 violation: "+
+				"TORV2 leaked through silent-drop", i)
+		}
+	}
+
+	// Stream must be fully consumed.
+	if buf.Len() != 0 {
+		t.Errorf("Stream not fully consumed after Deserialize: %d bytes left", buf.Len())
 	}
 }
 
