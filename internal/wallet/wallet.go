@@ -138,6 +138,20 @@ const MaxRelockSleepSeconds int64 = 100000000
 // DefaultGapLimit is the default number of unused addresses to maintain.
 const DefaultGapLimit = 20
 
+// BIP125RBFSequence is the largest nSequence value that opts a transaction
+// in to BIP-125 replaceability. Mirrors Bitcoin Core's
+// `MAX_BIP125_RBF_SEQUENCE = 0xfffffffd` (bitcoin-core/src/policy/rbf.h:18,
+// SEQUENCE_FINAL−2). A tx signals RBF iff at least one input has
+// nSequence ≤ BIP125RBFSequence.
+//
+// W118 BUG-1: wallet previously emitted 0xFFFFFFFE here with comment
+// "Enable RBF (BIP125)". 0xFFFFFFFE is MAX_SEQUENCE_NONFINAL (anti-fee-
+// sniping); BIP-125 requires the strictly-lower 0xFFFFFFFD value. The
+// "comment-claims-correct-code-violates-spec" pattern from W118 audit.
+//
+// Reference: bitcoin-core/src/policy/rbf.h; BIP-125 § "Summary".
+const BIP125RBFSequence uint32 = 0xFFFFFFFD
+
 // NewWallet creates a new empty wallet.
 func NewWallet(config WalletConfig) *Wallet {
 	return &Wallet{
@@ -739,6 +753,15 @@ func (w *Wallet) HasOwnUTXO(outpoint wire.OutPoint) bool {
 	return ok
 }
 
+// GetUTXO returns the WalletUTXO for the given outpoint, or nil if the
+// wallet does not own it. Used by bumpfee / psbtbumpfee to reconstruct
+// the InputUTXOs map without exposing the wallet's internal mutex.
+func (w *Wallet) GetUTXO(outpoint wire.OutPoint) *WalletUTXO {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.utxos[outpoint]
+}
+
 // IsOwnAddress checks if an address belongs to this wallet.
 func (w *Wallet) IsOwnAddress(addr string) bool {
 	w.mu.RLock()
@@ -910,7 +933,11 @@ func (w *Wallet) CreateTransactionWithTip(destAddr string, amount int64, feeRate
 	for i, u := range utxos {
 		tx.TxIn = append(tx.TxIn, &wire.TxIn{
 			PreviousOutPoint: u.OutPoint,
-			Sequence:         0xFFFFFFFE, // Enable RBF (BIP125)
+			// BIP-125 RBF opt-in: nSequence ≤ MAX_BIP125_RBF_SEQUENCE
+			// (0xFFFFFFFD). Previously 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL,
+			// anti-fee-sniping), which does NOT signal RBF and made
+			// outgoing txs unbumpable. Fixed via FIX-61 / W118 BUG-1.
+			Sequence: BIP125RBFSequence,
 		})
 		inputScripts[i] = u.PkScript
 	}
