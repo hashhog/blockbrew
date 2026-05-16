@@ -257,6 +257,15 @@ type MempoolEntry struct {
 	Depends          []string `json:"depends"`
 	SpentBy          []string `json:"spentby"`
 	Unbroadcast      bool     `json:"unbroadcast"`
+	// BIP125Replaceable mirrors Core's `bip125-replaceable` field on
+	// `getmempoolentry` / `getrawmempool verbose=true`. Boolean (not the
+	// {"yes","no","unknown"} string used in wallet RPCs because the entry
+	// is by construction known-in-mempool). Computed by walking the tx +
+	// unconfirmed mempool ancestors per BIP-125 §"Signaling implementation"
+	// and short-circuiting to true when `-mempoolfullrbf=1` is in force.
+	// W120 BUG-1 / FIX-68. Reference:
+	// `bitcoin-core/src/rpc/mempool.cpp::MempoolEntryToJSON`.
+	BIP125Replaceable bool `json:"bip125-replaceable"`
 }
 
 // PeerInfo represents peer information in RPC responses.
@@ -391,6 +400,15 @@ type ListTransactionsResult struct {
 	TxID          string  `json:"txid"`
 	Time          int64   `json:"time"`
 	BlockHeight   int32   `json:"blockheight,omitempty"`
+	// BIP125Replaceable mirrors Core's `bip125-replaceable` field on
+	// `listtransactions` / `gettransaction` / `listsinceblock`. String,
+	// one of {"yes","no","unknown"} (Core uses an enum: REPLACEABLE_BIP125
+	// / NOT_REPLACEABLE / UNKNOWN — wallet/util:WalletTxToJSON converts to
+	// these three strings). "unknown" means the txid is not in our mempool
+	// (e.g. already confirmed) so we cannot walk ancestors any more. W120
+	// BUG-7 / FIX-68. Reference:
+	// `bitcoin-core/src/wallet/rpc/util.cpp::WalletTxToJSON`.
+	BIP125Replaceable string `json:"bip125-replaceable"`
 }
 
 // TxOutResult represents the result of gettxout.

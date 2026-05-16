@@ -1263,7 +1263,13 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		MinRelayTxFee:      0.00001,     // 1 sat/vB in BTC/kvB
 		IncrementalRelayFee: 0.00001,
 		UnbroadcastCount:   0,
-		FullRBF:            true,
+		// FullRBF reflects the actual `-mempoolfullrbf` policy in force at
+		// runtime, not a hardcoded constant (W120 BUG-5 / FIX-68). Core's
+		// `getmempoolinfo` field is marked DEPRECATED at
+		// `bitcoin-core/src/rpc/mempool.cpp:1085` and is always emitted as
+		// true; blockbrew honours the operator's switch so legacy
+		// `-mempoolfullrbf=0` deployments don't get a lying advertisement.
+		FullRBF:            s.mempool.FullRBF(),
 	}, nil
 }
 

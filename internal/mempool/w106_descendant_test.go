@@ -100,6 +100,11 @@ func makeTxV3(inputs []wire.OutPoint, outputValue int64, nSeq uint32) *wire.MsgT
 
 // setupFundedMempool creates a test mempool + UTXO set preloaded with `n`
 // funded outpoints.  Returns (mp, []funded outpoints).
+//
+// The mempool is constructed with `-mempoolfullrbf=true` (Core v28+ default
+// post-FIX-68). Tests that need legacy BIP-125 opt-in-only behaviour should
+// use `setupFundedMempoolOptInRBF` instead — currently only G12 (Rule 1
+// non-signaling rejection assertion) needs it.
 func setupFundedMempool(n int) (*Mempool, []wire.OutPoint) {
 	utxos := newTestUTXOSet()
 	ops := make([]wire.OutPoint, n)
@@ -110,10 +115,38 @@ func setupFundedMempool(n int) (*Mempool, []wire.OutPoint) {
 		ops[i] = op
 	}
 	mp := New(Config{
-		MaxSize:         50_000_000,
-		MinRelayFeeRate: 1000,
-		MaxOrphanTxs:    100,
-		ChainParams:     consensus.RegtestParams(),
+		MaxSize:                50_000_000,
+		MinRelayFeeRate:        1000,
+		MaxOrphanTxs:           100,
+		ChainParams:            consensus.RegtestParams(),
+		MempoolFullRBF:         true,
+		MempoolFullRBFExplicit: true,
+	}, utxos)
+	return mp, ops
+}
+
+// setupFundedMempoolOptInRBF is `setupFundedMempool` with
+// `-mempoolfullrbf=false` (legacy BIP-125 opt-in-only). Used by G12
+// (TestW106_G12_RBFRule1_NonSignalling) so its assertion that a
+// non-signaling conflict is rejected with `ErrRBFNotSignaled` keeps
+// pinning the legacy Rule 1 code path. See W120 BUG-5 / FIX-68 for the
+// runtime-default change.
+func setupFundedMempoolOptInRBF(n int) (*Mempool, []wire.OutPoint) {
+	utxos := newTestUTXOSet()
+	ops := make([]wire.OutPoint, n)
+	for i := 0; i < n; i++ {
+		h := makeHash(byte(0x10 + i))
+		op, entry := createFundingUTXO(h, 0, 10_000_000)
+		utxos.AddUTXO(op, entry)
+		ops[i] = op
+	}
+	mp := New(Config{
+		MaxSize:                50_000_000,
+		MinRelayFeeRate:        1000,
+		MaxOrphanTxs:           100,
+		ChainParams:            consensus.RegtestParams(),
+		MempoolFullRBF:         false,
+		MempoolFullRBFExplicit: true,
 	}, utxos)
 	return mp, ops
 }
@@ -609,9 +642,13 @@ func TestW106_G11b_RBFSignaling_0xFFFFFFFD_MustSignal(t *testing.T) {
 
 // TestW106_G12_RBFRule1_NonSignalling verifies that a replacement against a
 // mempool transaction that neither directly nor via ancestor signals RBF is
-// rejected with ErrRBFNotSignaled.
+// rejected with ErrRBFNotSignaled — under legacy `-mempoolfullrbf=false`.
+//
+// W120 BUG-5 / FIX-68: runtime default is now `-mempoolfullrbf=true` (Core
+// v28+) under which Rule 1 is skipped and the same replacement is accepted.
+// This test pins the legacy opt-in code path via `setupFundedMempoolOptInRBF`.
 func TestW106_G12_RBFRule1_NonSignalling(t *testing.T) {
-	mp, ops := setupFundedMempool(1)
+	mp, ops := setupFundedMempoolOptInRBF(1)
 
 	// Seed a non-RBF tx in the mempool.
 	conflictTx := makeTx([]wire.OutPoint{ops[0]}, 9_000_000, 0xffffffff) // nSeq = FINAL

@@ -157,10 +157,15 @@ func TestRBFAncestorInheritedSignaling(t *testing.T) {
 }
 
 // TestRBFNoAncestorSignaling verifies rejection when neither the conflicting tx
-// nor any of its ancestors signal RBF.
+// nor any of its ancestors signal RBF — under legacy `-mempoolfullrbf=false`.
 //
 // Topology: A → B (conflict). Neither A nor B signals RBF.
 // Replacement that conflicts with B should be rejected with ErrRBFNotSignaled.
+//
+// W120 BUG-5 / FIX-68: runtime default is now `-mempoolfullrbf=true` (Core
+// v28+), under which Rule 1 is skipped and the replacement is accepted on
+// Rules 3/4/5 alone. This test pins the legacy opt-in code path via
+// `newTestMempoolOptInRBF` so the assertion remains semantically valid.
 func TestRBFNoAncestorSignaling(t *testing.T) {
 	utxoSet := newTestUTXOSet()
 
@@ -169,7 +174,7 @@ func TestRBFNoAncestorSignaling(t *testing.T) {
 	opSeed, eSeed := createFundingUTXO(seedHash, 0, 200_000)
 	utxoSet.AddUTXO(opSeed, eSeed)
 
-	mp := newTestMempool(utxoSet)
+	mp := newTestMempoolOptInRBF(utxoSet)
 	mp.mu.Lock()
 
 	// A: does not signal RBF.

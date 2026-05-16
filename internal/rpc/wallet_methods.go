@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/wallet"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 // ============================================================================
@@ -348,10 +349,36 @@ func (s *Server) handleListTransactions(params json.RawMessage) (interface{}, *R
 			TxID:          tx.TxHash.String(),
 			Time:          tx.Timestamp,
 			BlockHeight:   tx.Height,
+			// BIP-125 replaceable bit. Mirrors Core's
+			// `wallet/rpc/util.cpp::WalletTxToJSON` emission:
+			//   "yes"      tx is in our mempool and replaceable (signals
+			//              directly, via ancestor, or fullrbf=true)
+			//   "no"       tx is in our mempool but not replaceable
+			//   "unknown"  tx is confirmed (or not in our mempool) so we
+			//              cannot walk ancestors. Confirmed txs are no
+			//              longer "replaceable" in the BIP-125 sense.
+			// W120 BUG-7 / FIX-68.
+			BIP125Replaceable: s.bip125ReplaceableForWalletTx(tx.TxHash, confs),
 		})
 	}
 
 	return result, nil
+}
+
+// bip125ReplaceableForWalletTx returns the {"yes","no","unknown"} string
+// Core's wallet RPCs ship in `bip125-replaceable`. Confirmed transactions
+// (confirmations > 0) always return "unknown" — they cannot be replaced
+// regardless of signaling. Unconfirmed transactions consult the mempool;
+// a tx that is not in our mempool also returns "unknown" because we
+// cannot walk its ancestors. W120 BUG-7 / FIX-68.
+func (s *Server) bip125ReplaceableForWalletTx(txHash wire.Hash256, confirmations int32) string {
+	if confirmations > 0 {
+		return "unknown"
+	}
+	if s.mempool == nil {
+		return "unknown"
+	}
+	return s.mempool.SignalsBIP125Replaceable(txHash)
 }
 
 func (s *Server) handleGetWalletInfo() (interface{}, *RPCError) {
