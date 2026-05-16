@@ -155,10 +155,17 @@ func (mp *Mempool) Dump(dataDir string) error {
 	}
 	snaps := make([]snap, 0, count)
 	for _, e := range mp.pool {
+		// Per-entry feeDelta is intentionally zero in the dump: blockbrew
+		// keeps prioritisetransaction deltas ephemeral (lost on restart) so
+		// operators must re-issue them on cold start. The mempool itself
+		// applies deltas at the modified-fee layer (Mempool.mapDeltas /
+		// GetModifiedFee, FIX-72) but they do not survive a savemempool
+		// round-trip. Core preserves them; blockbrew documents the
+		// divergence at internal/mempool/mempool.go::Mempool.mapDeltas.
 		snaps = append(snaps, snap{
 			tx:       e.Tx,
 			timeUnix: e.Time.Unix(),
-			feeDelta: 0, // blockbrew has no prioritisetransaction yet
+			feeDelta: 0,
 		})
 	}
 	mp.mu.RUnlock()
@@ -189,8 +196,12 @@ func (mp *Mempool) Dump(dataDir string) error {
 		}
 	}
 
-	// mapDeltas + unbroadcast_txids: empty for now (no prioritisetransaction
-	// support, no unbroadcast queue).
+	// mapDeltas + unbroadcast_txids: emitted as zero entries even though
+	// prioritisetransaction is now wired (FIX-72). Deltas are ephemeral by
+	// design — Core's behaviour is to persist, but operators of this fleet
+	// expect a clean restart and re-issue prioritisations explicitly. See
+	// Mempool.mapDeltas for the rationale + docs. The Load path tolerates
+	// either form (reads + discards any deltas Core wrote).
 	if err := wire.WriteCompactSize(xw, 0); err != nil {
 		return fmt.Errorf("mempool dump: write mapDeltas: %w", err)
 	}

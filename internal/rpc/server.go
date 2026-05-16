@@ -581,6 +581,15 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleDumpMempool(params)
 	case "loadmempool":
 		return s.handleLoadMempool(params)
+	// Prioritisation RPCs (W120 BUG-10 / FIX-72). Mirrors Core
+	// src/rpc/mining.cpp::prioritisetransaction +
+	// src/rpc/mining.cpp::getprioritisedtransactions. The mempool delta
+	// participates in RBF Rule 3 (rbf.cpp::PaysMoreThanConflicts uses
+	// GetModifiedFee) and in getmempoolentry's `modifiedfee` field.
+	case "prioritisetransaction":
+		return s.handlePrioritiseTransaction(params)
+	case "getprioritisedtransactions":
+		return s.handleGetPrioritisedTransactions(params)
 
 	// Network RPCs
 	case "getpeerinfo":

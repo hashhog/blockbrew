@@ -101,17 +101,24 @@ package mempool
 //   they look identical to gettransaction. Core:
 //   src/kernel/mempool_removal_reason.h; src/wallet/wallet.cpp::transactionRemovedFromMempool.
 //
-// BUG-10 (P2 CDIV): blockbrew has no prioritisetransaction RPC at all
-//   (confirmed by internal/mempool/persist.go:161 comment "blockbrew has
-//   no prioritisetransaction yet"). Consequently Rule 3 compares raw
-//   absolute fees instead of "modified fees" (raw fee plus per-entry
-//   delta). Core's rbf.cpp:109 says "// Rule #3 of BIP125 [...] using
-//   modified fees rather than just fees". A user who has bumped the
-//   priority of an original tx with prioritisetransaction (e.g. to win a
-//   race against an attacker) would on Core see the replacement fail
-//   Rule 3 unless it also pays the modifier; on blockbrew the modifier
-//   does not exist, so a malicious replacement can bypass the manual
-//   priority bump. Core: src/policy/rbf.cpp::PaysMoreThanConflicts.
+// BUG-10 (P2 CDIV): RESOLVED by FIX-72.
+//   Previously: no prioritisetransaction RPC, no mapDeltas, no modified-fee
+//   wiring. Rule 3 summed raw fees and a malicious replacement could
+//   bypass an operator's manual priority bump.
+//   FIX-72 adds Mempool.{PrioritiseTransaction,GetModifiedFee,GetFeeDelta,
+//   GetPrioritisedTransactions} + mapDeltas, RPC handlers
+//   handlePrioritiseTransaction + handleGetPrioritisedTransactions (matching
+//   Core mining.cpp positional shape), and threads GetModifiedFee through
+//   checkRBFLocked's Rule 3 conflict-fee sum and the getmempoolentry /
+//   getrawmempool(verbose) RPC rendering. Deltas are intentionally
+//   ephemeral (not persisted across restart) — mempool.dat still writes
+//   zero deltas (persist.go).
+//   The G26 audit test below was rewritten as
+//   `TestW120_G26_PrioritiseTransactionWired` and the full positive /
+//   negative / cancellation / RBF-defence matrix is exercised in
+//   prioritise_test.go. Reference: bitcoin-core/src/policy/rbf.cpp:109
+//   ("Rule #3 of BIP125 [...] using modified fees rather than just fees"),
+//   src/txmempool.cpp::PrioritiseTransaction, src/rpc/mining.cpp.
 //
 // BUG-11 (LOW): mempool has no aggregated stats counter for replacements.
 //   No "replaced_transactions" counter is exposed via RPC. Useful for
@@ -605,18 +612,70 @@ func TestW120_G25_OnTxEvicted_HasNoReason(t *testing.T) {
 }
 
 // ============================================================================
-// G26: prioritisetransaction → modifiedFee in Rule 3
+// G26: prioritisetransaction → modifiedFee in Rule 3 (FIX-72 — W120 BUG-10)
 // ============================================================================
 
-func TestW120_G26_PrioritiseTransaction_NotImplemented(t *testing.T) {
-	t.Skip("BUG-10: blockbrew has no prioritisetransaction RPC. " +
-		"internal/mempool/persist.go:161 self-documents " +
-		"(\"blockbrew has no prioritisetransaction yet\"). " +
-		"Consequence: checkRBFLocked's Rule 3 comparison " +
-		"`newFee < totalConflictingFee` uses raw absolute fees, not Core's " +
-		"\"modified fees\" (raw + delta). A manual priority bump on the " +
-		"original cannot raise the bar against a malicious replacement. " +
-		"Core: src/policy/rbf.cpp::PaysMoreThanConflicts uses GetModifiedFee.")
+// TestW120_G26_PrioritiseTransactionWired pins the FIX-72 contract:
+//   - PrioritiseTransaction(txid, delta) stacks deltas into mp.mapDeltas.
+//   - GetModifiedFee(entry) returns base + delta.
+//   - checkRBFLocked sums MODIFIED fees of conflicting entries for Rule 3
+//     (Core: src/policy/rbf.cpp::PaysMoreThanConflicts).
+//
+// The full end-to-end "positive delta defends original / negative delta
+// surrenders" matrix is exercised in prioritise_test.go (this file's
+// adjacent table-driven tests). This test is the one the auditor uses to
+// confirm BUG-10 is closed — it asserts the wiring exists.
+//
+// Reference: bitcoin-core/src/rpc/mining.cpp::prioritisetransaction,
+// src/txmempool.cpp::PrioritiseTransaction, src/policy/rbf.cpp:109-112.
+func TestW120_G26_PrioritiseTransactionWired(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+	var seedHash wire.Hash256
+	seedHash[0] = 0x26
+	op, e := createFundingUTXO(seedHash, 0, 100_000)
+	utxoSet.AddUTXO(op, e)
+
+	mp := newTestMempool(utxoSet)
+	tx := makeRBFTx([]wire.OutPoint{op}, 90_000)
+	h := tx.TxHash()
+	mp.mu.Lock()
+	addPoolEntry(mp, &TxEntry{TxHash: h, Tx: tx, Fee: 1000, Size: 150})
+	mp.mu.Unlock()
+
+	entry := mp.GetEntry(h)
+	if entry == nil {
+		t.Fatal("seeded entry missing")
+	}
+
+	// Pre-prioritisation: modified fee == raw fee.
+	if got, want := mp.GetModifiedFee(entry), int64(1000); got != want {
+		t.Fatalf("pre-delta GetModifiedFee = %d, want %d", got, want)
+	}
+
+	// Apply +500 sat delta → modified fee = 1500.
+	mp.PrioritiseTransaction(h, 500)
+	if got, want := mp.GetModifiedFee(entry), int64(1500); got != want {
+		t.Fatalf("post-delta GetModifiedFee = %d, want %d", got, want)
+	}
+	if got, want := mp.GetFeeDelta(h), int64(500); got != want {
+		t.Fatalf("GetFeeDelta = %d, want %d", got, want)
+	}
+
+	// Stack another +300 sat → delta = 800, modified fee = 1800.
+	mp.PrioritiseTransaction(h, 300)
+	if got, want := mp.GetModifiedFee(entry), int64(1800); got != want {
+		t.Fatalf("stacked GetModifiedFee = %d, want %d", got, want)
+	}
+
+	// Net-zero clears the entry (Core txmempool.cpp:644).
+	mp.PrioritiseTransaction(h, -800)
+	if got, want := mp.GetFeeDelta(h), int64(0); got != want {
+		t.Fatalf("post-clear GetFeeDelta = %d, want %d", got, want)
+	}
+	// Modified fee reverts to base.
+	if got, want := mp.GetModifiedFee(entry), int64(1000); got != want {
+		t.Fatalf("post-clear GetModifiedFee = %d, want %d", got, want)
+	}
 }
 
 // ============================================================================
