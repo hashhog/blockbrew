@@ -106,22 +106,46 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 	for i, sb := range entry.SpentBy {
 		spentBy[i] = sb.String()
 	}
+	// BIP-125 §"Signaling implementation": a tx is replaceable iff it (or
+	// any in-mempool ancestor) signals AND -mempoolfullrbf=false; OR
+	// -mempoolfullrbf=true (Core v28+ default, any conflict replaceable).
+	// signalsBIP125Replaceable returns one of {"yes","no","unknown"};
+	// the entry is by construction in our mempool here so the value is
+	// always "yes" or "no" — we map to the bool the JSON shape calls for.
+	// W120 BUG-1 / FIX-68.
+	replaceable := false
+	if s.mempool != nil {
+		switch s.mempool.SignalsBIP125Replaceable(entry.TxHash) {
+		case "yes":
+			replaceable = true
+		case "no":
+			replaceable = false
+		default:
+			// "unknown" can occur in a race where the entry was just
+			// evicted between the verbose-listing snapshot and the
+			// per-entry lookup. Fall back to inspecting the tx directly
+			// + the configured fullrbf bit so the JSON shape is always
+			// consistent with the rest of the response.
+			replaceable = s.mempool.FullRBF() || mempool.SignalsRBFForRPC(entry.Tx)
+		}
+	}
 	return MempoolEntry{
-		VSize:           entry.Size,
-		Weight:          entry.Size * 4,
-		Fee:             float64(entry.Fee) / satoshiPerBitcoin,
-		ModifiedFee:     float64(entry.Fee) / satoshiPerBitcoin,
-		Time:            entry.Time.Unix(),
-		Height:          entry.Height,
-		DescendantCount: len(entry.SpentBy) + 1,
-		DescendantSize:  entry.DescendantSize,
-		DescendantFees:  float64(entry.DescendantFee) / satoshiPerBitcoin,
-		AncestorCount:   len(entry.Depends) + 1,
-		AncestorSize:    entry.AncestorSize,
-		AncestorFees:    float64(entry.AncestorFee) / satoshiPerBitcoin,
-		WTxID:           entry.Tx.WTxHash().String(),
-		Depends:         depends,
-		SpentBy:         spentBy,
+		VSize:             entry.Size,
+		Weight:            entry.Size * 4,
+		Fee:               float64(entry.Fee) / satoshiPerBitcoin,
+		ModifiedFee:       float64(entry.Fee) / satoshiPerBitcoin,
+		Time:              entry.Time.Unix(),
+		Height:            entry.Height,
+		DescendantCount:   len(entry.SpentBy) + 1,
+		DescendantSize:    entry.DescendantSize,
+		DescendantFees:    float64(entry.DescendantFee) / satoshiPerBitcoin,
+		AncestorCount:     len(entry.Depends) + 1,
+		AncestorSize:      entry.AncestorSize,
+		AncestorFees:      float64(entry.AncestorFee) / satoshiPerBitcoin,
+		WTxID:             entry.Tx.WTxHash().String(),
+		Depends:           depends,
+		SpentBy:           spentBy,
+		BIP125Replaceable: replaceable,
 	}
 }
 

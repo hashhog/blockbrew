@@ -542,6 +542,10 @@ func (s *Server) handleListTransactionsWithWallet(params json.RawMessage, wallet
 			TxID:          tx.TxHash.String(),
 			Time:          tx.Timestamp,
 			BlockHeight:   tx.Height,
+			// BIP-125 replaceable bit; "unknown" for confirmed or
+			// not-in-mempool. See bip125ReplaceableForWalletTx in
+			// wallet_methods.go. W120 BUG-7 / FIX-68.
+			BIP125Replaceable: s.bip125ReplaceableForWalletTx(tx.TxHash, confs),
 		})
 	}
 
