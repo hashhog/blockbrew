@@ -17,14 +17,26 @@
 //
 // AUDIT SUMMARY (blockbrew, 2026-05-15)
 //
-// Grade: 0 / 30 PRESENT, 0 / 30 PARTIAL, 30 / 30 MISSING ENTIRELY.
-// blockbrew has zero PayJoin code. There is no /payjoin HTTP endpoint, no
+// Original grade: 0 / 30 PRESENT, 0 / 30 PARTIAL, 30 / 30 MISSING ENTIRELY.
+// blockbrew had zero PayJoin code. There was no /payjoin HTTP endpoint, no
 // PayJoin sender, no BIP-21 URI parser, no `pj=` / `pjos=` recognition, and
 // no `getpayjoinrequest` / `sendpayjoinrequest` RPC. The HTTP server in
-// internal/rpc/server.go only serves JSON-RPC at `/` and (optionally) the
-// REST API at `/rest/*` (rest.go). TLS is not configured at all — the
-// ListenAndServe call (server.go:261) is plaintext-HTTP only, so the
-// "must be HTTPS or .onion" rule cannot be honored even by accident.
+// internal/rpc/server.go only served JSON-RPC at `/` and (optionally) the
+// REST API at `/rest/*` (rest.go).
+//
+// CLOSURE STATUS (post-FIX-67, 2026-05-16):
+//   28 / 30 PRESENT, 0 / 30 PARTIAL, 2 / 30 DEFERRED (G20 UIH-1/UIH-2 coin
+//   selection; G25 Tor onion service hosting). Closed across four waves:
+//     FIX-62 — BIP-21 URI parser (G28, G29).
+//     FIX-64 — TLS termination (BUG-11; underpins G3).
+//     FIX-65 — receiver pipeline (G1, G4, G5, G7, G9, G17, G26).
+//     FIX-66 — sender pipeline + anti-snoop (G2, G10, G11, G12, G13, G14,
+//              G15, G22, G24, G27).
+//     FIX-67 — fee output + query params + session state
+//              (G3 closure, G6, G8, G16, G18, G19, G21, G23, G30).
+//
+// G20 / G25 remain explicit DEFERRED — see the per-test comments for
+// scope rationale.
 //
 // FIX-61 (BumpFee + BIP125RBFSequence + outgoing change-output detection)
 // gives this audit a starting point: the same scriptToOwnAddressLocked /
@@ -227,14 +239,15 @@
 //          string, otherwise a malicious receiver could quietly raise
 //          the fee to attack a fee-sensitive sender.
 //
-// All thirty tests below are `t.Skip("BUG-N: ...")` — the gates are
-// uniformly MISSING ENTIRELY. When PayJoin lands in blockbrew, the
-// natural fix-wave will replace each Skip with a real assertion that
-// exercises the new code path.
+// As of FIX-67 (2026-05-16) every BUG above is closed except BUG-8
+// (UIH-1/UIH-2 selection — G20) and BUG-12 (Tor onion service hosting —
+// G25), both explicitly deferred to a future fix-wave. The remaining
+// Skip()s now carry "DEFERRED" instead of "BUG-N: missing" so the audit
+// trail stays greppable without false-positive bug counts.
 //
 // Author: W119 audit sub-agent, 2026-05-15.
 //
-//nolint:revive  // Skip-only audit file; intentionally many similar tests.
+//nolint:revive  // intentionally many similar test functions for fleet parity.
 
 package wallet
 
@@ -246,6 +259,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -578,9 +592,58 @@ func TestW119G2_SenderHTTPClient(t *testing.T) {
 }
 
 // ── G3: TLS/HTTPS or .onion required ────────────────────────────────────────
+//
+// FIX-67 closure (BUG-1/BUG-11): two-pronged wiring.
+//   1. Server side: FIX-64 added TLSCertFile/TLSKeyFile config that flips
+//      server.ListenAndServe → ListenAndServeTLS (internal/rpc/server.go).
+//      Operators serving PayJoin merchants point both files at a real cert.
+//   2. Sender side: FIX-66 validatePayjoinEndpoint rejects http:// endpoints
+//      to a non-onion host (exercised by TestW119G24_HTTPSCertValidation).
+//      The wallet-side helper SendPayjoinRequest refuses to even build a
+//      POST if the endpoint scheme is plaintext.
+//
+// This test exercises the sender-side TLS gate against an httptest.NewTLSServer
+// (which signs a self-signed cert) — proves the end-to-end round-trip works
+// over real TLS without requiring a CA-signed cert at test time.
 
 func TestW119G3_TLSRequired(t *testing.T) {
-	t.Skip("BUG-1/BUG-11: server.go:261 calls ListenAndServe (plaintext); no ListenAndServeTLS, no TLSConfig, no x509 cert plumbing — BIP-78 forbids http:// endpoints")
+	// Plain http to a non-onion host MUST be rejected.
+	if _, err := validatePayjoinEndpoint("http://merchant.example.com/payjoin"); err == nil {
+		t.Error("G3: validatePayjoinEndpoint must reject plain http:// to non-onion host")
+	}
+	// https:// MUST be accepted.
+	if _, err := validatePayjoinEndpoint("https://merchant.example.com/payjoin"); err != nil {
+		t.Errorf("G3: https:// must be accepted: %v", err)
+	}
+	// http:// to a .onion host MUST be accepted (Tor v3 authenticated by addr).
+	if _, err := validatePayjoinEndpoint("http://abcdef1234567890.onion/payjoin"); err != nil {
+		t.Errorf("G3: http://*.onion must be accepted: %v", err)
+	}
+	// End-to-end TLS round-trip via httptest.NewTLSServer.
+	rxw, recvAddr := payjoinReceiverWallet(t)
+	sxw := buildPayjoinSenderWalletForG2(t)
+	original, err := sxw.BuildPayjoinOriginalPSBT(recvAddr, 50_000_000, 5.0)
+	if err != nil {
+		t.Fatalf("BuildPayjoinOriginalPSBT: %v", err)
+	}
+	tlsSrv := w119StartReceiverTLS(t, rxw)
+	defer tlsSrv.Close()
+	if !strings.HasPrefix(tlsSrv.URL, "https://") {
+		t.Fatalf("test server should be https; got %q", tlsSrv.URL)
+	}
+	res, err := sxw.SendPayjoinRequest(original, PayjoinSendOptions{
+		Endpoint:                     tlsSrv.URL + "/payjoin",
+		Version:                      "1",
+		MaxAdditionalFeeContribution: 10_000,
+		AdditionalFeeOutputIndex:     -1,
+		HTTPClient:                   tlsSrv.Client(),
+	})
+	if err != nil {
+		t.Fatalf("SendPayjoinRequest (TLS round-trip): %v", err)
+	}
+	if res.Fallback {
+		t.Errorf("G3: TLS round-trip should NOT fall back; reason=%q", res.FallbackReason)
+	}
 }
 
 // ── G4: Original PSBT v0 deserialization receiver ────────────────────────────
@@ -660,9 +723,82 @@ func TestW119G5_ReceiverValidatesPSBT(t *testing.T) {
 }
 
 // ── G6: Receiver identifies fee output ───────────────────────────────────────
+//
+// FIX-67 closure (BUG-17): payjoinResolveFeeOutput validates the sender's
+// additionalfeeoutputindex query param. We test the four documented branches:
+//   1. Index == -1 (default) → no fee bump; returns -1 nil.
+//   2. Index in-range AND != receiverOutIdx → returned verbatim.
+//   3. Index out-of-range → original-psbt-rejected.
+//   4. Index == receiverOutIdx → original-psbt-rejected.
+//
+// This is the structural counterpart to G16 (which tests the wire-level
+// parsing of the query string) — together they prove the parameter
+// round-trips from sender query string → wallet validator → proposal builder.
 
 func TestW119G6_ReceiverIdentifiesFeeOutput(t *testing.T) {
-	t.Skip("BUG-17: no helper to identify the sender's fee-bearing output (additionalfeeoutputindex param or change-output heuristic) on a foreign PSBT")
+	original := w119SyntheticOriginal(t)
+	// receiverOutIdx=0 (recv pkScript at index 0), feeOutIdx=1 (change at 1).
+
+	t.Run("default (no fee bump)", func(t *testing.T) {
+		req := &PayjoinRequest{AdditionalFeeOutputIndex: -1}
+		idx, perr := payjoinResolveFeeOutput(original, req, 0)
+		if perr != nil {
+			t.Fatalf("unexpected err: %v", perr)
+		}
+		if idx != -1 {
+			t.Errorf("idx=%d, want -1 (no bump)", idx)
+		}
+	})
+
+	t.Run("valid fee-output index", func(t *testing.T) {
+		req := &PayjoinRequest{
+			AdditionalFeeOutputIndex:     1,
+			MaxAdditionalFeeContribution: 1000,
+		}
+		idx, perr := payjoinResolveFeeOutput(original, req, 0)
+		if perr != nil {
+			t.Fatalf("unexpected err: %v", perr)
+		}
+		if idx != 1 {
+			t.Errorf("idx=%d, want 1", idx)
+		}
+	})
+
+	t.Run("out-of-range index", func(t *testing.T) {
+		req := &PayjoinRequest{
+			AdditionalFeeOutputIndex:     7,
+			MaxAdditionalFeeContribution: 1000,
+		}
+		_, perr := payjoinResolveFeeOutput(original, req, 0)
+		if perr == nil || perr.Code != PayjoinErrOriginalPSBTRejected {
+			t.Errorf("out-of-range must be original-psbt-rejected; got %v", perr)
+		}
+	})
+
+	t.Run("fee-output index == receiver-out index", func(t *testing.T) {
+		req := &PayjoinRequest{
+			AdditionalFeeOutputIndex:     0,
+			MaxAdditionalFeeContribution: 1000,
+		}
+		_, perr := payjoinResolveFeeOutput(original, req, 0)
+		if perr == nil || perr.Code != PayjoinErrOriginalPSBTRejected {
+			t.Errorf("self-overlap must be original-psbt-rejected; got %v", perr)
+		}
+	})
+
+	t.Run("index w/o budget → no bump", func(t *testing.T) {
+		req := &PayjoinRequest{
+			AdditionalFeeOutputIndex:     1,
+			MaxAdditionalFeeContribution: 0,
+		}
+		idx, perr := payjoinResolveFeeOutput(original, req, 0)
+		if perr != nil {
+			t.Fatalf("unexpected err: %v", perr)
+		}
+		if idx != -1 {
+			t.Errorf("idx=%d, want -1 (no budget == no bump)", idx)
+		}
+	})
 }
 
 // ── G7: Receiver adds own inputs (anti-fingerprinting) ───────────────────────
@@ -698,9 +834,70 @@ func TestW119G7_ReceiverAddsOwnInputs(t *testing.T) {
 }
 
 // ── G8: Receiver modifies sender output ──────────────────────────────────────
+//
+// FIX-67 closure (BUG-2 final): the proposal builder rewrites EXACTLY one
+// sender output — the receiver-paying output — to account for the added
+// receiver input value. We assert here both halves of that rewrite:
+//   (a) the receiver-paying output value grew by EXACTLY receiverUTXO.Amount,
+//   (b) every OTHER sender output is preserved byte-for-byte (no script
+//       substitution, no value drift).
+//
+// The G9 test already covers the fee-invariant arithmetic; G8 is the
+// structural complement — proof that the rewrite is surgical, not a
+// global reshuffle.
 
 func TestW119G8_ReceiverModifiesSenderOutput(t *testing.T) {
-	t.Skip("BUG-2: no proposal-PSBT builder that rewrites the sender's output amount to account for added receiver input value")
+	w, recvAddr := payjoinReceiverWallet(t)
+	body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+
+	original, err := DecodePSBTBase64(body)
+	if err != nil {
+		t.Fatalf("decode original: %v", err)
+	}
+	resp, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body,
+		Version:            "1",
+	})
+	if perr != nil {
+		t.Fatalf("ProcessPayjoinRequest: %v", perr)
+	}
+	proposal, err := DecodePSBTBase64(resp)
+	if err != nil {
+		t.Fatalf("decode proposal: %v", err)
+	}
+
+	// Outputs MUST line up 1:1 in order (proposal builder preserves index).
+	if len(proposal.UnsignedTx.TxOut) != len(original.UnsignedTx.TxOut) {
+		t.Fatalf("proposal outputs = %d, want %d", len(proposal.UnsignedTx.TxOut), len(original.UnsignedTx.TxOut))
+	}
+
+	// Find the receiver-paying output: the one that grew. There MUST be
+	// exactly one such output, with growth >0.
+	growIdx := -1
+	for i, propOut := range proposal.UnsignedTx.TxOut {
+		origOut := original.UnsignedTx.TxOut[i]
+		if !bytes.Equal(propOut.PkScript, origOut.PkScript) {
+			t.Errorf("output %d pkScript changed (proposal builder must preserve scripts)", i)
+		}
+		if propOut.Value != origOut.Value {
+			if growIdx >= 0 {
+				t.Errorf("more than one output changed value (idx %d and %d)", growIdx, i)
+			}
+			if propOut.Value <= origOut.Value {
+				t.Errorf("output %d value SHRANK (only the recv output should grow)", i)
+			}
+			growIdx = i
+		}
+	}
+	if growIdx < 0 {
+		t.Fatal("no output grew — receiver MUST grow exactly one output")
+	}
+	// And the growth must equal the receiver's added input value.
+	addedInputValue := proposal.Inputs[len(proposal.Inputs)-1].WitnessUTXO.Value
+	delta := proposal.UnsignedTx.TxOut[growIdx].Value - original.UnsignedTx.TxOut[growIdx].Value
+	if delta != addedInputValue {
+		t.Errorf("recv-output growth %d != added input value %d", delta, addedInputValue)
+	}
 }
 
 // ── G9: Receiver fee adjustment (max bound) ──────────────────────────────────
@@ -908,9 +1105,72 @@ func TestW119G15_SenderAntisnoopMinFeeRate(t *testing.T) {
 }
 
 // ── G16: BIP-78 query params parsed ──────────────────────────────────────────
+//
+// FIX-67 closure (BUG-6): the wallet-side PayjoinRequest struct now carries
+// every BIP-78 query param the sender can send. The RPC HTTP handler in
+// internal/rpc/payjoin.go parses each from the URL query string and threads
+// them into the struct — see TestPayjoinReceiver_QueryParams in
+// internal/rpc/payjoin_receiver_test.go for the wire-format coverage.
+//
+// At the wallet layer we verify the recognised parameter set produces the
+// documented effects on the proposal builder:
+//   - additionalfeeoutputindex + maxadditionalfeecontribution → fee output
+//     shrinks (proposal fee strictly above original fee),
+//   - DisableOutputSubstitution carries through the struct (sender-side
+//     anti-snoop G14 enforces it; receiver currently never substitutes).
 
 func TestW119G16_QueryParamsParsed(t *testing.T) {
-	t.Skip("BUG-6: no recognition of v / additionalfeeoutputindex / maxadditionalfeecontribution / disableoutputsubstitution / minfeerate query params on the PayJoin POST URL")
+	w, recvAddr := payjoinReceiverWallet(t)
+	body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+
+	original, err := DecodePSBTBase64(body)
+	if err != nil {
+		t.Fatalf("decode original: %v", err)
+	}
+	var origIn, origOut int64
+	for _, in := range original.Inputs {
+		origIn += in.WitnessUTXO.Value
+	}
+	for _, out := range original.UnsignedTx.TxOut {
+		origOut += out.Value
+	}
+	origFee := origIn - origOut
+
+	// Sender supplies a fee output index (1 = change) and a budget (500 sats).
+	resp, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64:           body,
+		Version:                      "1",
+		AdditionalFeeOutputIndex:     1, // change output
+		MaxAdditionalFeeContribution: 500,
+		DisableOutputSubstitution:    true,
+		MinFeeRate:                   1.0,
+	})
+	if perr != nil {
+		t.Fatalf("ProcessPayjoinRequest: %v", perr)
+	}
+	proposal, err := DecodePSBTBase64(resp)
+	if err != nil {
+		t.Fatalf("decode proposal: %v", err)
+	}
+	var propIn, propOut int64
+	for _, in := range proposal.Inputs {
+		propIn += in.WitnessUTXO.Value
+	}
+	for _, out := range proposal.UnsignedTx.TxOut {
+		propOut += out.Value
+	}
+	propFee := propIn - propOut
+
+	// G16 closure: fee delta must be exactly the cap (500 sats).
+	if delta := propFee - origFee; delta != 500 {
+		t.Errorf("fee delta = %d sats, want 500 (the maxadditionalfeecontribution cap)", delta)
+	}
+	// Sender's change output (idx=1) must have shrunk by 500.
+	origChange := original.UnsignedTx.TxOut[1].Value
+	propChange := proposal.UnsignedTx.TxOut[1].Value
+	if origChange-propChange != 500 {
+		t.Errorf("change shrunk by %d, want 500", origChange-propChange)
+	}
 }
 
 // ── G17: Receiver error responses (4 BIP-78 codes) ──────────────────────────
@@ -987,27 +1247,168 @@ func TestW119G17_ReceiverErrorResponses(t *testing.T) {
 }
 
 // ── G18: Receiver TTL on offered payjoin ────────────────────────────────────
+//
+// FIX-67 closure (BUG-10 half): payjoinSessionStore tracks each in-flight
+// offer with an expiresAt and prunes expired entries on next access. We
+// override nowFn on a fresh store so the test runs synchronously rather
+// than sleeping for the production TTL (10 minutes).
+//
+// The receiver-side cache key is sha256(Original PSBT base64); after TTL
+// elapses, the entry is dropped AND its receiver-outpoint reservation is
+// released so a future scan can re-use the same UTXO. This test asserts
+// both halves.
 
 func TestW119G18_ReceiverTTL(t *testing.T) {
-	t.Skip("BUG-10: no TTL on offered PayJoin proposals; receiver has no per-session state at all")
+	w, recvAddr := payjoinReceiverWallet(t)
+	body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+
+	// First call: lands a session in the store.
+	sessions := w.getPayjoinSessions()
+	// Shrink the TTL for the test + install a fake clock so we can age
+	// the entry without sleeping.
+	fakeNow := time.Unix(1_700_000_000, 0)
+	sessions.mu.Lock()
+	sessions.ttl = 5 * time.Second
+	sessions.nowFn = func() time.Time { return fakeNow }
+	sessions.mu.Unlock()
+
+	if _, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body,
+		Version:            "1",
+	}); perr != nil {
+		t.Fatalf("ProcessPayjoinRequest: %v", perr)
+	}
+	if got := sessions.activeSessions(); got != 1 {
+		t.Errorf("after first call: activeSessions=%d, want 1", got)
+	}
+
+	// Advance the clock past TTL — pruning happens lazily on the next access.
+	fakeNow = fakeNow.Add(1 * time.Hour)
+	if got := sessions.activeSessions(); got != 0 {
+		t.Errorf("after TTL: activeSessions=%d, want 0", got)
+	}
+	// Outpoint also released — verify by checking the reservedOutpoints map.
+	sessions.mu.Lock()
+	leftReserved := len(sessions.reservedOutpoints)
+	sessions.mu.Unlock()
+	if leftReserved != 0 {
+		t.Errorf("after TTL: reservedOutpoints=%d, want 0 (outpoint MUST be released)", leftReserved)
+	}
 }
 
 // ── G19: Receiver no-double-spending guard ──────────────────────────────────
+//
+// FIX-67 closure (BUG-9): payjoinSessionStore.reservedOutpoints holds every
+// receiver UTXO with an in-flight offer. The selection scan skips reserved
+// outpoints. With only ONE receiver UTXO available (the test fixture's
+// 1.5 BTC at outpoint 0x77/0), the second distinct Original PSBT MUST be
+// rejected with not-enough-money because no other UTXO is available — proof
+// that the first offer's outpoint reservation was honored.
 
 func TestW119G19_ReceiverNoDoubleSpending(t *testing.T) {
-	t.Skip("BUG-9: no outpoint tracker across in-flight PayJoin proposals; concurrent offers for the same UTXO set risk a self-double-spend")
+	w, recvAddr := payjoinReceiverWallet(t)
+	// Offer #1: a fresh original.
+	body1 := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+	if _, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body1,
+		Version:            "1",
+	}); perr != nil {
+		t.Fatalf("first ProcessPayjoinRequest: %v", perr)
+	}
+
+	// Offer #2: a structurally DISTINCT original (different recv amount =>
+	// different psbtID hash, so replay path doesn't kick in). Because the
+	// wallet has only ONE eligible receiver UTXO and it's now reserved,
+	// the scan MUST fail with not-enough-money.
+	body2 := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_001)
+	if body1 == body2 {
+		t.Fatal("test setup error: bodies are identical (replay path would mask G19)")
+	}
+	_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body2,
+		Version:            "1",
+	})
+	if perr == nil || perr.Code != PayjoinErrNotEnoughMoney {
+		t.Fatalf("G19: second concurrent offer must be not-enough-money; got %v", perr)
+	}
 }
 
 // ── G20: Receiver UTXO selection (UIH-1/UIH-2) ──────────────────────────────
+//
+// DEFERRED — explicit out-of-FIX-67 scope. UIH-1/UIH-2 selection (BIP-78
+// §"How to select utxos") is a heuristic that picks a receiver UTXO whose
+// addition leaves the change-vs-recipient output ordering still ambiguous —
+// preserving the privacy gain PayJoin provides. The current scan in
+// payjoinScanLocked is first-fit, which is correct on the wire but not yet
+// privacy-optimal.
+//
+// Tracking: a future fix-wave will add a UIH-aware variant to
+// internal/wallet/coinselection.go and route the PayJoin scan through it.
+// First-fit selection remains spec-conformant in the meantime.
 
 func TestW119G20_ReceiverUTXOSelection(t *testing.T) {
-	t.Skip("BUG-8: coinselection.go has no UIH-1/UIH-2 aware variant; receiver-side selection that preserves payment/change ambiguity is unimplemented")
+	t.Skip("DEFERRED to future fix-wave: UIH-1/UIH-2 aware coin selection variant is a privacy enhancement, not a spec-conformance fix; first-fit selection is currently in use")
 }
 
 // ── G21: Receiver PSBT v=1 header param ─────────────────────────────────────
+//
+// FIX-67 closure (BUG-14): ProcessPayjoinRequest enforces v=1 per BIP-78
+// §"Receive payjoin". Per spec: missing (empty) v means "1" for legacy
+// Joinmarket compatibility; v="1" is accepted; everything else is rejected
+// with version-unsupported.
+//
+// G17 already partially covers v="2" — G21 makes the wire-level contract
+// explicit and exhaustive.
 
 func TestW119G21_PSBTVersionHeaderParam(t *testing.T) {
-	t.Skip("BUG-14: receiver lacks the v=1 query-param enforcement and the version-unsupported error path for v!=1")
+	w, recvAddr := payjoinReceiverWallet(t)
+	body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+
+	// Helper: a fresh proposal request for each subtest (replay cache
+	// would otherwise short-circuit subsequent v != "1" checks because
+	// the FIRST happy call below caches the proposal).
+	t.Run("v=1 accepted", func(t *testing.T) {
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: body,
+			Version:            "1",
+		})
+		if perr != nil {
+			t.Errorf("v=1 must be accepted: %v", perr)
+		}
+	})
+
+	t.Run("v=2 rejected with version-unsupported", func(t *testing.T) {
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: body,
+			Version:            "2",
+		})
+		if perr == nil || perr.Code != PayjoinErrVersionUnsupported {
+			t.Errorf("v=2 must be version-unsupported; got %v", perr)
+		}
+	})
+
+	t.Run("v missing (legacy) treated as v=1", func(t *testing.T) {
+		// Empty version: should NOT be rejected with version-unsupported.
+		// (May still hit replay since body identical to v=1 call above;
+		// we only assert the error CODE, not full success.)
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: body,
+			Version:            "",
+		})
+		if perr != nil && perr.Code == PayjoinErrVersionUnsupported {
+			t.Errorf("empty v must NOT be version-unsupported (BIP-78 legacy carve-out)")
+		}
+	})
+
+	t.Run("v=abc (garbage) rejected", func(t *testing.T) {
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: body,
+			Version:            "abc",
+		})
+		if perr == nil || perr.Code != PayjoinErrVersionUnsupported {
+			t.Errorf("garbage v must be version-unsupported; got %v", perr)
+		}
+	})
 }
 
 // ── G22: Sender retry / fallback to original ────────────────────────────────
@@ -1049,9 +1450,65 @@ func TestW119G22_SenderRetryFallback(t *testing.T) {
 }
 
 // ── G23: Receiver request validation (Content-Type, Length) ─────────────────
+//
+// FIX-67 closure (BUG-13): the wallet layer enforces a Content-Length cap
+// (PayjoinMaxBodyBytes) via the ProcessPayjoinRequest entry; the RPC layer
+// in internal/rpc/payjoin.go enforces Content-Type ∈ {text/plain,
+// application/octet-stream} and rejects everything else with 415.
+//
+// At the wallet layer the body-size check is observable directly: a body
+// >PayjoinMaxBodyBytes (8 KiB) gets original-psbt-rejected before any decode
+// attempt. The rpc package has separate Content-Type tests; we keep this
+// test wallet-local to avoid an import cycle.
 
 func TestW119G23_ReceiverRequestValidation(t *testing.T) {
-	t.Skip("BUG-13: no Content-Type / Content-Length validation for inbound PayJoin POST bodies")
+	w, _ := payjoinReceiverWallet(t)
+
+	t.Run("oversize body rejected", func(t *testing.T) {
+		// Build a base64 body that exceeds PayjoinMaxBodyBytes. The contents
+		// don't have to be a valid PSBT — the size check fires before decode.
+		oversize := strings.Repeat("A", PayjoinMaxBodyBytes+1)
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: oversize,
+			Version:            "1",
+		})
+		if perr == nil || perr.Code != PayjoinErrOriginalPSBTRejected {
+			t.Fatalf("oversize body must be original-psbt-rejected; got %v", perr)
+		}
+		if !strings.Contains(perr.Message, "too large") {
+			t.Errorf("oversize error message %q should mention 'too large'", perr.Message)
+		}
+	})
+
+	t.Run("empty body rejected", func(t *testing.T) {
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: "",
+			Version:            "1",
+		})
+		if perr == nil || perr.Code != PayjoinErrOriginalPSBTRejected {
+			t.Fatalf("empty body must be original-psbt-rejected; got %v", perr)
+		}
+	})
+
+	t.Run("body at exact cap accepted-or-rejected on content", func(t *testing.T) {
+		// Body length == PayjoinMaxBodyBytes must NOT be rejected by the
+		// size gate; it'll fail at decode (invalid base64) and surface
+		// as original-psbt-rejected with a decode message, not a size one.
+		atCap := strings.Repeat("A", PayjoinMaxBodyBytes)
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: atCap,
+			Version:            "1",
+		})
+		if perr == nil {
+			t.Fatal("at-cap garbage body must fail (decode); got nil error")
+		}
+		if perr.Code != PayjoinErrOriginalPSBTRejected {
+			t.Errorf("at-cap rejection code = %v, want original-psbt-rejected", perr.Code)
+		}
+		if strings.Contains(perr.Message, "too large") {
+			t.Errorf("at-cap body must NOT trip the size gate; got %q", perr.Message)
+		}
+	})
 }
 
 // ── G24: HTTPS cert validation (sender) ─────────────────────────────────────
@@ -1081,9 +1538,20 @@ func TestW119G24_HTTPSCertValidation(t *testing.T) {
 }
 
 // ── G25: Tor onion service support ──────────────────────────────────────────
+//
+// DEFERRED — explicitly out of FIX-67 scope. Closing G25 requires a SOCKS5
+// client for outgoing connections (sender side) and ADD_ONION Tor control
+// protocol wiring (receiver side, to publish the `pj=` URI on a hidden
+// service). Both are non-trivial new subsystems. Sender-side .onion endpoint
+// SCHEMA validation (G24 carve-out for http://*.onion) already lives in
+// validatePayjoinEndpoint — see TestW119G24_HTTPSCertValidation.
+//
+// Tracking: this test will be flipped to assert SOCKS5 dial + onion publish
+// in a future fix-wave that adds Tor support fleet-wide (similar to W117's
+// BIP-155 wiring for p2p).
 
 func TestW119G25_TorOnionServiceSupport(t *testing.T) {
-	t.Skip("BUG-12: blockbrew has p2p-side Tor v3 awareness (addrv2.go) but no inbound hidden-service hosting for the PayJoin endpoint")
+	t.Skip("DEFERRED to future fix-wave: full Tor SOCKS5/ADD_ONION stack out of FIX-67 scope; .onion endpoint schema validation already covered by G24")
 }
 
 // ── G26: getpayjoinrequest RPC ──────────────────────────────────────────────
@@ -1227,7 +1695,61 @@ func TestW119G29_BIP21URIParserPjos(t *testing.T) {
 }
 
 // ── G30: Receiver replay protection (PSBT-id) ───────────────────────────────
+//
+// FIX-67 closure (BUG-10 other half): a duplicate POST of the same Original
+// PSBT MUST return the EXACT SAME proposal bytes. Otherwise the sender's
+// anti-snoop validator would see two distinct proposals signing the same
+// sender inputs — a self-double-spend hazard.
+//
+// We hit ProcessPayjoinRequest twice with byte-identical input and assert
+// (a) both succeed, (b) the returned base64 strings are byte-equal.
 
 func TestW119G30_ReceiverReplayProtection(t *testing.T) {
-	t.Skip("BUG-10: no replay cache keyed on sha256(Original PSBT bytes); receiver cannot detect a sender retry vs a fresh proposal")
+	w, recvAddr := payjoinReceiverWallet(t)
+	body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+
+	first, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body,
+		Version:            "1",
+	})
+	if perr != nil {
+		t.Fatalf("first call: %v", perr)
+	}
+	if first == "" {
+		t.Fatal("first call returned empty proposal")
+	}
+
+	second, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body,
+		Version:            "1",
+	})
+	if perr != nil {
+		t.Fatalf("replay call: %v", perr)
+	}
+	if first != second {
+		t.Errorf("G30: replayed proposal bytes differ from first call (replay cache not enforced)")
+	}
+
+	// And a structurally distinct body MUST get a distinct proposal — the
+	// replay cache shouldn't fire across different inputs.
+	bodyDifferent := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_001)
+	if body == bodyDifferent {
+		t.Fatal("test setup: bodies are identical; cannot distinguish replay from re-issue")
+	}
+	// Distinct body lands on a distinct UTXO; since the test wallet only has
+	// one UTXO and it's now reserved, this call may legitimately fail with
+	// not-enough-money — both outcomes prove the cache is keyed correctly
+	// (no spurious replay hit). Assert NOT-equality-to-first if it succeeds.
+	third, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: bodyDifferent,
+		Version:            "1",
+	})
+	if perr != nil {
+		// Acceptable — outpoint already reserved.
+		if perr.Code != PayjoinErrNotEnoughMoney {
+			t.Errorf("distinct body must succeed OR be not-enough-money; got %v", perr)
+		}
+	} else if third == first {
+		t.Error("distinct body returned the same proposal — replay cache key is wrong")
+	}
 }

@@ -73,6 +73,15 @@ type Wallet struct {
 	encrypted       bool
 	encryptedMaster []byte      // salt||nonce||ciphertext (output of encryptMasterKey)
 	relockTimer     *time.Timer // auto-relock for walletpassphrase timeout
+
+	// payjoinSessions tracks PayJoin offers per BIP-78 §"Receiver's
+	// per-session state" — TTL on offered proposals (G18), in-flight
+	// outpoint reservations (G19), and replay-cache by sha256 of the
+	// Original PSBT bytes (G30). One instance per Wallet; survives
+	// across ProcessPayjoinRequest calls (it's the point of the cache).
+	// Initialised lazily on first access via getPayjoinSessions so old
+	// wallets constructed without going through NewWallet still work.
+	payjoinSessions *payjoinSessionStore
 }
 
 // WalletUTXO is a UTXO owned by the wallet.
@@ -170,6 +179,7 @@ func NewWallet(config WalletConfig) *Wallet {
 			AddressTypeP2SH_P2WPKH: {External: 0, Internal: 0},
 			AddressTypeP2TR:        {External: 0, Internal: 0},
 		},
+		payjoinSessions: newPayjoinSessionStore(),
 	}
 }
 

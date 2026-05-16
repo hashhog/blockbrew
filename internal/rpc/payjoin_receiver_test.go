@@ -422,3 +422,97 @@ func TestPayjoinReceiverMethodNotAllowed(t *testing.T) {
 		t.Errorf("status = %d, want 405", rr.Code)
 	}
 }
+
+// ── TestPayjoinReceiverQueryParams — FIX-67 G16 wire-level parsing ───────
+//
+// Exercises the BIP-78 query-param parsing in the RPC layer:
+//   - v= recognised (already covered by TestPayjoinReceiverVersionUnsupported)
+//   - additionalfeeoutputindex + maxadditionalfeecontribution → proposal
+//     fee strictly above original (the receiver shrunk the sender's change
+//     output by the cap).
+//
+// The wallet-side counterpart is TestW119G16_QueryParamsParsed in
+// internal/wallet/w119_payjoin_test.go — together they prove the full
+// round-trip from query-string parsing to proposal arithmetic.
+
+func TestPayjoinReceiverQueryParams(t *testing.T) {
+	server, w, recvAddr := newPayjoinTestServer(t)
+
+	sender := newSenderUTXO(t)
+	body := buildOriginalPSBT(t, sender, recvAddr, w.Network(), 50_000_000)
+
+	// Decode original to compute the baseline fee.
+	original, err := wallet.DecodePSBTBase64(body)
+	if err != nil {
+		t.Fatalf("decode original: %v", err)
+	}
+	var origIn, origOut int64
+	for _, in := range original.Inputs {
+		origIn += in.WitnessUTXO.Value
+	}
+	for _, out := range original.UnsignedTx.TxOut {
+		origOut += out.Value
+	}
+	origFee := origIn - origOut
+
+	// Query params: sender designates output 1 (change) as fee-source
+	// with a 500 sat cap.
+	rr := postPayjoin(t, server, body,
+		"v=1&additionalfeeoutputindex=1&maxadditionalfeecontribution=500",
+		"text/plain")
+	if rr.Code != http.StatusOK {
+		raw, _ := io.ReadAll(rr.Body)
+		t.Fatalf("status = %d, want 200; body=%s", rr.Code, string(raw))
+	}
+	respBody, _ := io.ReadAll(rr.Body)
+	proposal, err := wallet.DecodePSBTBase64(strings.TrimSpace(string(respBody)))
+	if err != nil {
+		t.Fatalf("decode proposal: %v", err)
+	}
+
+	// Net proposal fee must be exactly 500 sats above original.
+	var propIn, propOut int64
+	for _, in := range proposal.Inputs {
+		propIn += in.WitnessUTXO.Value
+	}
+	for _, out := range proposal.UnsignedTx.TxOut {
+		propOut += out.Value
+	}
+	propFee := propIn - propOut
+	if delta := propFee - origFee; delta != 500 {
+		t.Errorf("fee delta = %d, want 500 (the cap honored)", delta)
+	}
+}
+
+// ── TestPayjoinReceiverInvalidContentType — FIX-67 G23 strict CT ─────────
+//
+// FIX-67 hardened Content-Type validation: an EMPTY Content-Type header
+// (which was previously accepted) is now rejected with 415 + the
+// version-unsupported error code. application/json is also rejected
+// (wrong wire format).
+
+func TestPayjoinReceiverInvalidContentType(t *testing.T) {
+	server, w, recvAddr := newPayjoinTestServer(t)
+	sender := newSenderUTXO(t)
+	body := buildOriginalPSBT(t, sender, recvAddr, w.Network(), 50_000_000)
+
+	for _, tc := range []struct {
+		name string
+		ct   string
+	}{
+		{"empty", ""},
+		{"application/json", "application/json"},
+		{"image/png", "image/png"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := postPayjoin(t, server, body, "v=1", tc.ct)
+			if rr.Code != http.StatusUnsupportedMediaType {
+				t.Errorf("status = %d, want 415", rr.Code)
+			}
+			eb := readPayjoinError(t, rr)
+			if eb.ErrorCode != "version-unsupported" {
+				t.Errorf("errorCode = %q, want version-unsupported", eb.ErrorCode)
+			}
+		})
+	}
+}
