@@ -534,6 +534,27 @@ type Mempool struct {
 	// TransactionRemovedFromMempool validation interface.  Set by main.go to
 	// wire the FeeEstimator's UnregisterTransaction path (FIX-47 BUG-22).
 	OnTxEvicted func(txHash wire.Hash256)
+
+	// mapDeltas holds operator-applied fee deltas keyed by txid. Mirrors
+	// Bitcoin Core's CTxMemPool::mapDeltas (txmempool.h). Populated by
+	// PrioritiseTransaction; consulted by GetModifiedFee everywhere a
+	// "modified fee" is required (RBF Rule 3 in particular —
+	// src/policy/rbf.cpp::PaysMoreThanConflicts uses GetModifiedFee, not
+	// the raw fee, so a manual operator bump can defend an original tx
+	// against a malicious replacement that just barely beats raw fee).
+	//
+	// Deltas are stored per-txid even when the tx is not in the pool, so
+	// that a prioritisation issued before broadcast still applies when the
+	// tx later arrives. This matches Core's behaviour at
+	// txmempool.cpp::PrioritiseTransaction.
+	//
+	// NOT persisted across restart. Core's mempool.dat carries mapDeltas in
+	// the post-mempool tx-list payload, but the dump format we emit here
+	// writes 0 entries (persist.go:194) and Core also discards in-memory
+	// state if the operator did not call savemempool — the consensus shape
+	// is "ephemeral" by spec, which BIP / Core do not guarantee a survival
+	// invariant for. Tests pin this explicitly (W120 BUG-10 / FIX-72).
+	mapDeltas map[wire.Hash256]int64
 }
 
 // New creates a new mempool.
@@ -573,7 +594,135 @@ func New(config Config, utxoSet consensus.UTXOView) *Mempool {
 		utxoSet:              utxoSet,
 		clusters:             NewClusterManager(),
 		lastRollingFeeUpdate: time.Now().Unix(),
+		mapDeltas:            make(map[wire.Hash256]int64),
 	}
+}
+
+// PrioritiseTransaction stacks a fee delta (in satoshis) onto the per-txid
+// entry in mapDeltas. Mirrors `bitcoin-core/src/txmempool.cpp::PrioritiseTransaction`:
+//   - the new delta is ADDED to any existing delta (deltas stack).
+//   - a zero net delta clears the entry from the map.
+//   - the entry need NOT be in the pool — a prioritisation issued before
+//     broadcast applies when the tx later arrives.
+//
+// Modified fees (raw + delta) are consulted by GetModifiedFee at every
+// site where Core uses CTxMemPoolEntry::GetModifiedFee, in particular BIP-125
+// Rule 3 (rbf.cpp:109-112: "Rule #3 of BIP125 [...] using modified fees
+// rather than just fees"). Without this support, an operator's manual
+// priority bump on an at-risk tx could be bypassed by a malicious
+// replacement that just barely beats the raw fee — see W120 BUG-10.
+//
+// Not persisted across restart (Core parity — operators must re-issue
+// prioritisations on cold start).
+func (mp *Mempool) PrioritiseTransaction(txid wire.Hash256, deltaSats int64) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	mp.prioritiseTransactionLocked(txid, deltaSats)
+}
+
+// prioritiseTransactionLocked is the mu-held form. Used by the lock-already-held
+// callers (none today; provided for future package admission hooks).
+func (mp *Mempool) prioritiseTransactionLocked(txid wire.Hash256, deltaSats int64) {
+	existing := mp.mapDeltas[txid]
+	newDelta := saturatingAddInt64(existing, deltaSats)
+	if newDelta == 0 {
+		delete(mp.mapDeltas, txid)
+		return
+	}
+	mp.mapDeltas[txid] = newDelta
+}
+
+// saturatingAddInt64 mirrors Core's util/check.h SaturatingAdd: clamps on
+// overflow rather than wrapping. Without this an operator who repeatedly
+// stacks +MaxInt64 deltas would silently flip to negative.
+func saturatingAddInt64(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
+	}
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
+}
+
+// GetFeeDelta returns the operator-applied fee delta (in satoshis) for the
+// given txid, or zero if no delta has been set. Mirrors the semantics of
+// `bitcoin-core/src/txmempool.cpp::ApplyDelta` (an additive lookup against
+// a default-zero base).
+//
+// Callers SHOULD prefer GetModifiedFee when they have an entry in hand;
+// GetFeeDelta is useful when serializing prioritisetransaction RPC output
+// (getprioritisedtransactions) where the consumer wants the raw delta, not
+// the modified fee.
+func (mp *Mempool) GetFeeDelta(txid wire.Hash256) int64 {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.mapDeltas[txid]
+}
+
+// GetModifiedFee returns the modified fee for a mempool entry: the raw fee
+// plus any operator-applied delta from mapDeltas. Mirrors
+// `bitcoin-core/src/kernel/mempool_entry.h::CTxMemPoolEntry::GetModifiedFee`.
+//
+// `entry` MAY be nil — the modified fee is zero in that case (Core's
+// ApplyDelta lookup is purely additive against a default-zero base, but
+// the entry-method form returns base + delta and dereferences only the
+// entry's fee; we preserve that semantics).
+func (mp *Mempool) GetModifiedFee(entry *TxEntry) int64 {
+	if entry == nil {
+		return 0
+	}
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.getModifiedFeeLocked(entry)
+}
+
+// getModifiedFeeLocked is the mu-held form. Used by checkRBFLocked and any
+// other hot path that already holds mp.mu.
+func (mp *Mempool) getModifiedFeeLocked(entry *TxEntry) int64 {
+	if entry == nil {
+		return 0
+	}
+	return saturatingAddInt64(entry.Fee, mp.mapDeltas[entry.TxHash])
+}
+
+// PrioritisedDeltaInfo is a single record returned by GetPrioritisedTransactions.
+// Mirrors Core's CTxMemPool::delta_info (txmempool.h).
+type PrioritisedDeltaInfo struct {
+	// TxID is the prioritised transaction id.
+	TxID wire.Hash256
+
+	// FeeDelta is the cumulative operator delta in satoshis.
+	FeeDelta int64
+
+	// InMempool is true iff the txid resolves to a current pool entry.
+	InMempool bool
+
+	// ModifiedFee is the entry's modified fee (raw + delta) in satoshis,
+	// valid only when InMempool is true. Zero otherwise.
+	ModifiedFee int64
+}
+
+// GetPrioritisedTransactions returns a snapshot of every entry in mapDeltas.
+// Mirrors `bitcoin-core/src/txmempool.cpp::GetPrioritisedTransactions`, used
+// by the getprioritisedtransactions RPC.
+func (mp *Mempool) GetPrioritisedTransactions() []PrioritisedDeltaInfo {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	out := make([]PrioritisedDeltaInfo, 0, len(mp.mapDeltas))
+	for txid, delta := range mp.mapDeltas {
+		entry, ok := mp.pool[txid]
+		info := PrioritisedDeltaInfo{
+			TxID:      txid,
+			FeeDelta:  delta,
+			InMempool: ok,
+		}
+		if ok {
+			info.ModifiedFee = saturatingAddInt64(entry.Fee, delta)
+		}
+		out = append(out, info)
+	}
+	return out
 }
 
 // SignalsBIP125Replaceable returns the string Core's
@@ -2538,6 +2687,14 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 	}
 
 	// Collect all transactions that would be evicted (conflicts + their descendants).
+	//
+	// Sum MODIFIED fees (raw + operator prioritisetransaction delta), not raw
+	// fees — matches `bitcoin-core/src/policy/rbf.cpp::PaysMoreThanConflicts`
+	// which uses CTxMemPoolEntry::GetModifiedFee. Without this an operator
+	// who has bumped the priority of an at-risk tx via prioritisetransaction
+	// cannot raise the bar for replacement — a malicious replacement that
+	// just barely beats the RAW fee would slip past Rule 3.  W120 BUG-10 /
+	// FIX-72.
 	var totalConflictingFee int64
 	var totalEvicted int
 
@@ -2546,15 +2703,17 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 		if !ok {
 			continue
 		}
-		totalConflictingFee += entry.Fee
+		totalConflictingFee += mp.getModifiedFeeLocked(entry)
 		totalEvicted++
 
-		// Include descendants in fee sum and eviction count.
+		// Include descendants in fee sum and eviction count. Each descendant's
+		// modified fee participates (descendant operator deltas defend their
+		// own slot the same way the conflict's delta defends C).
 		visited := make(map[wire.Hash256]bool)
 		descendants := mp.collectDescendantsLocked(txHash, visited)
 		for _, descHash := range descendants {
 			if descEntry, ok := mp.pool[descHash]; ok {
-				totalConflictingFee += descEntry.Fee
+				totalConflictingFee += mp.getModifiedFeeLocked(descEntry)
 				totalEvicted++
 			}
 		}
@@ -2576,10 +2735,12 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 	}
 	newFee := totalInputValue - totalOutputValue
 
-	// Gate 6a: BIP-125 Rule #3 — replacement_fees >= original_fees.
-	// Core: rbf.cpp:109-112. Note: equal fees must PASS Rule 3 (the fee bump
-	// to cover relay is enforced by Rule 4 below). Pre-fix blockbrew used
-	// `<=` which incorrectly rejected equal-fee replacements.
+	// Gate 6a: BIP-125 Rule #3 — replacement_fees >= original_modified_fees.
+	// Core: rbf.cpp:109-112 — "using modified fees rather than just fees".
+	// Note: equal fees must PASS Rule 3 (the fee bump to cover relay is
+	// enforced by Rule 4 below). Pre-fix blockbrew used `<=` which
+	// incorrectly rejected equal-fee replacements; pre-FIX-72 it also used
+	// raw conflict fees instead of modified fees (W120 BUG-10).
 	if newFee < totalConflictingFee {
 		return fmt.Errorf("%w: rejecting replacement, less fees than conflicting txs; %d < %d",
 			ErrRBFInsufficientFee, newFee, totalConflictingFee)

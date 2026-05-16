@@ -770,19 +770,21 @@ func TestW108_G29_GetMiningInfoNetworkHashPSField(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// G30 – prioritisetransaction absent from dispatch table.
+// G30 – prioritisetransaction dispatch wiring.
 // Core: "prioritisetransaction", "getprioritisedtransactions", "submitheader".
-// blockbrew: none of these are registered.
+// blockbrew (post-FIX-72): prioritisetransaction + getprioritisedtransactions
+// REGISTERED in internal/rpc/server.go. submitheader still missing.
+// Cross-package coverage: internal/rpc/prioritise_test.go +
+// internal/mempool/prioritise_test.go.
 // ---------------------------------------------------------------------------
 func TestW108_G30_PrioritiseTransactionMissing(t *testing.T) {
 	// Cannot inspect the dispatch table from the mining package.
-	// Document: blockbrew's server.go switch statement has no case for
-	// "prioritisetransaction", "getprioritisedtransactions", or "submitheader".
-	// This can be verified by searching server.go for these method names.
-	t.Log("G30 BUG: 'prioritisetransaction' RPC not in dispatch table. " +
-		"Core mining.cpp: prioritisetransaction → mempool.PrioritiseTransaction(txid, nAmount). " +
-		"Also missing: 'getprioritisedtransactions' and 'submitheader'. " +
-		"Impact: mining pools cannot adjust tx priorities; submitheader unusable.")
+	t.Log("G30: prioritisetransaction + getprioritisedtransactions are " +
+		"REGISTERED in internal/rpc/server.go (FIX-72). The mempool delta is " +
+		"wired into RBF Rule 3 (Mempool.checkRBFLocked uses GetModifiedFee) " +
+		"and into the modifiedfee field of getmempoolentry / " +
+		"getrawmempool(verbose). Outstanding: submitheader RPC is still " +
+		"absent from server.go (mining-side, distinct from this fix).")
 }
 
 // ---------------------------------------------------------------------------

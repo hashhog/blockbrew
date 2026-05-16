@@ -1320,11 +1320,16 @@ func (s *Server) handleGetRawMempool(params json.RawMessage) (interface{}, *RPCE
 			spentBy[i] = sb.String()
 		}
 
+		// `modifiedfee` is base fee + operator delta from
+		// prioritisetransaction (FIX-72). Identical to the path in
+		// extra_methods.go::mempoolEntryFromTxEntry so getrawmempool
+		// verbose and getmempoolentry agree on the value.
+		modifiedFee := s.mempool.GetModifiedFee(entry)
 		result[h.String()] = MempoolEntry{
 			VSize:           entry.Size,
 			Weight:          entry.Size * 4, // Simplified
 			Fee:             float64(entry.Fee) / satoshiPerBitcoin,
-			ModifiedFee:     float64(entry.Fee) / satoshiPerBitcoin,
+			ModifiedFee:     float64(modifiedFee) / satoshiPerBitcoin,
 			Time:            entry.Time.Unix(),
 			Height:          entry.Height,
 			DescendantCount: len(entry.SpentBy) + 1,
