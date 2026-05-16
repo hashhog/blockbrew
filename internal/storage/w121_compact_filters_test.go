@@ -16,11 +16,15 @@
 //   G26-G30  RPCs (getblockfilter), REST (/rest/blockfilter,
 //            /rest/blockfilterheaders), -blockfilterindex flag.
 //
-// Finding summary (12 bugs identified):
+// Finding summary (12 bugs identified; FIX-74 closed BUG-6/7/8/10):
 //
-//   PASS    : G1, G2, G3, G7, G9, G10, G21, G22, G24, G25,
+//   PASS    : G1, G2, G3, G7, G9, G10, G12, G21, G22, G24, G25,
 //             G26 (constructor), G27 (RPC), G28 (REST filter), G29 (REST headers),
-//             G30 (-blockfilterindex flag)
+//             G30 (-blockfilterindex flag),
+//             G11 (FIX-74 BUG-10 — getcfilters Misbehaving + Disconnect on bad request),
+//             G14 (FIX-74 BUG-6 — stop-hash-anchored GetAncestor walk; no signed-but-lying),
+//             G18 (FIX-74 BUG-7 — getcfcheckpt heights are 1000, 2000, ... not 999, 1999, ...),
+//             G19 (FIX-74 BUG-8 — cfheaders prev_filter_header via stop_index.GetAncestor(start-1))
 //   PARTIAL : G4 (BUG-3 — fastRange64 hand-rolled instead of math/bits.Mul64),
 //             G5 (BUG-2 — golombRiceEncode q==64 path may lose high bits when
 //                 numBits>0),
@@ -28,22 +32,9 @@
 //                 then sort-by-HASH; not a correctness bug but a divergence),
 //             G8 (BUG-1 — filter siphash key check confirmed but
 //                 BIP-158 vectors don't byte-match; documented in existing test),
-//             G12 (BUG-5 — getcfilters unknown filtertype returns silently
-//                  instead of disconnect-peer),
-//             G14 (BUG-6 — getcfilters stop_hash on abandoned fork serves
-//                  WRONG filters from active-chain block at same height
-//                  — no BlockRequestAllowed check),
-//             G18 (BUG-7 — getcfcheckpt heights off-by-N at 999/1999/...
-//                  instead of Core's 1000/2000/...),
-//             G19 (BUG-8 — getcfheaders prev_filter_header lookup uses
-//                  raw height instead of stop_index->GetAncestor(start-1)),
 //             G23 (BUG-9 — MsgCFilter Filter varbytes capped at 1MB
 //                  vs Core's 4MB MAX_PROTOCOL_MESSAGE_LENGTH),
-//   BUG     : G11 (BUG-10 — getcfilters does NOT disconnect peer on
-//                  invalid request — Core sets node.fDisconnect=true on
-//                  unknown filter_type, start>stop, too-many-requested,
-//                  unknown stop_hash; blockbrew silently returns),
-//             G13 (BUG-11 — peerMgr created TWICE in main.go cmd/blockbrew/
+//   BUG     : G13 (BUG-11 — peerMgr created TWICE in main.go cmd/blockbrew/
 //                  main.go:1013 + :1331; first instance discarded with
 //                  AdvertiseCompactFilters set but no listeners — minor
 //                  code quality but resource leak),
@@ -59,6 +50,20 @@
 //                  beyond the per-request count caps — Core also lacks this
 //                  but operators rely on connection-slot saturation as a
 //                  proxy; documented as informational divergence not bug).
+//
+// FIX-74 (commit landing this update) closes BUG-6/7/8/10 by extracting the
+// inline handlers in cmd/blockbrew/main.go into testable helpers at
+// internal/p2p/cfilter_handlers.go. The new code resolves stop_hash →
+// stopNode, validates the range against MaxCFiltersPerRequest /
+// MaxCFHeadersPerRequest, walks stopNode.GetAncestor(h) for each requested
+// height, verifies the stored filter row's BlockHash matches the ancestor's
+// hash before serving, and Misbehaves + Disconnects on malformed requests.
+// Matches Bitcoin Core's PrepareBlockFilterRequest +
+// ProcessGetCFilters/Headers/CheckPt in src/net_processing.cpp.
+//
+// Behavioral tests pinning the fix live in internal/p2p/cfilter_handlers_test.go
+// (orphan stop_hash, unknown stop_hash, range invalid, range too large,
+// unsupported filter type, getcfcheckpt heights at 1000/2000, etc.).
 //
 // Reference: Bitcoin Core src/blockfilter.{h,cpp}, src/util/golombrice.h,
 // src/index/blockfilterindex.{h,cpp}, src/net_processing.cpp,
@@ -364,19 +369,27 @@ func TestW121_G10_BlockFilterPrefixNoCollision(t *testing.T) {
 // G11: getcfilters peer-misbehavior on invalid filter_type
 // ============================================================================
 
-// G11 / BUG-10 — PARTIAL: Blockbrew's OnGetCFilters handler silently
-// returns when msg.FilterType != FilterTypeBasic. Core's
-// PrepareBlockFilterRequest sets node.fDisconnect = true on unknown filter
-// type, start > stop, too-many-requested, or unknown stop_hash
-// (net_processing.cpp:3268-3309). Blockbrew does not call peer.Disconnect()
-// or any equivalent — so a misbehaving peer can probe blockbrew's compact
-// filter handler with garbage filter types indefinitely without consequence.
+// G11 / BUG-10 — FIXED (FIX-74): Blockbrew's HandleGetCFilters /
+// HandleGetCFHeaders / HandleGetCFCheckpt now call peer.Misbehaving +
+// peer.Disconnect on unknown filter type, unknown stop_hash, start > stop,
+// or too-many-requested. Matches Core's PrepareBlockFilterRequest
+// node.fDisconnect = true behavior (net_processing.cpp:3262-3312).
+//
+// Cross-package behavioral coverage in internal/p2p/cfilter_handlers_test.go:
+//
+//   - TestFIX74_GetCFilters_UnknownStopHashDisconnects
+//   - TestFIX74_GetCFilters_StartGreaterThanStopDisconnects
+//   - TestFIX74_GetCFilters_TooManyRequestedDisconnects
+//   - TestFIX74_GetCFilters_UnsupportedFilterTypeDisconnects
+//   - TestFIX74_PrepareBlockFilterRequest_AllDisconnectPaths (table test)
 //
 // Reference: Core net_processing.cpp:3268-3309 PrepareBlockFilterRequest.
 func TestW121_G11_GetCFiltersDisconnectsOnInvalidType(t *testing.T) {
-	t.Skip("BUG-10: getcfilters handler in cmd/blockbrew/main.go:1227-1228 " +
-		"silently returns on unknown filter_type instead of disconnecting peer. " +
-		"Core sets node.fDisconnect=true (net_processing.cpp:3274). PARTIAL.")
+	t.Log("G11 / BUG-10 FIXED (FIX-74): PrepareBlockFilterRequest + " +
+		"HandleGetCFilters / HandleGetCFHeaders / HandleGetCFCheckpt in " +
+		"internal/p2p/cfilter_handlers.go disconnect malformed-request peers. " +
+		"Behavioral coverage: internal/p2p/cfilter_handlers_test.go " +
+		"TestFIX74_PrepareBlockFilterRequest_AllDisconnectPaths.")
 }
 
 // ============================================================================
@@ -423,27 +436,39 @@ func TestW121_G13_PeerMgrDoubleAllocation(t *testing.T) {
 // G14: getcfilters/getcfheaders chain-containment check
 // ============================================================================
 
-// G14 / BUG-6 — PARTIAL P1-CDIV: When peer requests filters for a stop_hash
-// from a fork that is NOT in the active chain, blockbrew finds the header
-// in headerIndex.GetNode(msg.StopHash), uses its height, then loops
-// blockFilterIndex.GetFilter(h) which returns the *active-chain* block's
-// filter at that height. The peer gets a filter for the WRONG block.
+// G14 / BUG-6 — FIXED (FIX-74) / W121 #3 NEW UNIVERSAL "active-chain walk
+// vs stop-hash ancestor": HandleGetCFilters now walks stopNode.GetAncestor(h)
+// for each requested height and verifies the stored filter row's BlockHash
+// matches the ancestor's hash before serving. When blockbrew's height-only
+// filter index lacks the fork's filters (active chain has overwritten that
+// height), the handler returns early without sending any cfilter messages
+// — matching Core's behavior in spirit (Core falls back to a hash-index;
+// blockbrew lacks one, so the only correct option is don't-respond).
 //
-// Core's PrepareBlockFilterRequest gates this via BlockRequestAllowed
-// (net_processing.cpp:3283), which requires either active-chain
-// containment OR a recent-but-stale block (within STALE_RELAY_AGE_LIMIT
-// AND chainwork close to tip). Peers requesting a fork's filters get
-// fDisconnect = true.
+// CRITICAL: the fix does NOT gate on chainMgr.IsInMainChain() — Core
+// deliberately serves stale-fork filters when the peer provides an orphan
+// stop_hash, because compact filters are indexed by block hash. The
+// initial audit framing was wrong on this point (corrected per the
+// FIX-74 brief). Core net_processing.cpp:3262 PrepareBlockFilterRequest
+// only validates the stop_hash exists in m_blockman.LookupBlockIndex,
+// not its main-chain membership.
 //
-// Reference: Core net_processing.cpp:1951-1957 BlockRequestAllowed,
-// :3283 stop_hash gate.
+// Same fix applies to HandleGetCFHeaders + HandleGetCFCheckpt
+// (BUG-7 and BUG-8 are companion bugs closed by the same patch).
+//
+// Cross-package behavioral coverage in internal/p2p/cfilter_handlers_test.go:
+//
+//   - TestFIX74_GetCFilters_OrphanStopHashDoesNotLie
+//   - TestFIX74_GetCFilters_OrphanStopHashSharedAncestors
+//   - TestFIX74_LookupFilterRange_RejectsBlockHashMismatch
+//
+// Reference: Core net_processing.cpp:3262 PrepareBlockFilterRequest,
+// src/chain.h CBlockIndex::GetAncestor.
 func TestW121_G14_ChainContainmentCheckMissing(t *testing.T) {
-	t.Skip("BUG-6: cmd/blockbrew/main.go:1230-1232 — OnGetCFilters checks " +
-		"headerIndex.GetNode(stop_hash) != nil but NOT chainMgr.IsInMainChain(). " +
-		"Filter index returns active-chain filter at the same height, sending " +
-		"the peer a filter for a DIFFERENT block than they asked about. " +
-		"Same bug in OnGetCFHeaders (main.go:1264) + OnGetCFCheckpt (main.go:1310). " +
-		"PARTIAL P1-CDIV.")
+	t.Log("G14 / BUG-6 FIXED (FIX-74): stop-hash-anchored GetAncestor walk in " +
+		"internal/p2p/cfilter_handlers.go. No active-chain leak on orphan stop_hash. " +
+		"Behavioral coverage: internal/p2p/cfilter_handlers_test.go " +
+		"TestFIX74_GetCFilters_OrphanStopHashDoesNotLie.")
 }
 
 // ============================================================================
@@ -529,35 +554,56 @@ func TestW121_G17_CFHeadersPrevFilterHeader_GenesisSentinel(t *testing.T) {
 //
 // Reference: Core net_processing.cpp:3403-3409, blockfilterindex.cpp:372.
 func TestW121_G18_GetCFCheckptHeightsAreMultiplesOf1000(t *testing.T) {
-	// Demonstrate the divergence with arithmetic:
-	// At stop_height = 1000:
-	//   Core: headers.size = 1000/1000 = 1; height = (0+1)*1000 = 1000.
-	//   blockbrew: h starts at 999, h <= 1000 → emits h=999 (then h+=1000=1999, stops).
-	// At stop_height = 2000:
-	//   Core: size=2; heights = 1000, 2000.
-	//   blockbrew: 999, 1999 (NOT 1000, 2000).
-	t.Skip("BUG-7: cmd/blockbrew/main.go:1316 — getcfcheckpt loop starts at " +
-		"CFCheckptInterval-1=999 instead of CFCheckptInterval=1000. Every checkpoint " +
-		"header sent is one block earlier than Core's spec. Wire-incompatible with " +
-		"Bitcoin Core and any compliant BIP-157 implementation. P0-CDIV.")
+	// Pre-FIX-74 divergence (now closed):
+	//   At stop_height = 1000:
+	//     Core: headers.size = 1000/1000 = 1; height = (0+1)*1000 = 1000.
+	//     blockbrew: h started at 999, h <= 1000 → emitted h=999.
+	//   At stop_height = 2000:
+	//     Core: size=2; heights = 1000, 2000.
+	//     blockbrew: 999, 1999.
+	//
+	// FIX-74 (HandleGetCFCheckpt in internal/p2p/cfilter_handlers.go) now
+	// matches Core's reverse-iteration loop:
+	//   numCheckpoints = stop_height / CFCheckptInterval
+	//   for i in [numCheckpoints-1 .. 0]:
+	//       height = (i + 1) * CFCheckptInterval
+	//       block_index = stop_index.GetAncestor(height)
+	//
+	// Behavioral coverage in internal/p2p/cfilter_handlers_test.go:
+	//
+	//   - TestFIX74_GetCFCheckpt_HeightsAreMultiplesOfInterval (stop=2500,
+	//     verifies heights 1000+2000 and that 999/1999 are NEVER queried)
+	//   - TestFIX74_GetCFCheckpt_AtIntervalBoundary
+	//   - TestFIX74_GetCFCheckpt_BelowIntervalEmptyResponse
+	t.Log("G18 / BUG-7 FIXED (FIX-74): cfcheckpt heights at multiples of " +
+		"CFCheckptInterval (1000, 2000, ...) via stop_index.GetAncestor walk. " +
+		"Behavioral coverage: internal/p2p/cfilter_handlers_test.go " +
+		"TestFIX74_GetCFCheckpt_HeightsAreMultiplesOfInterval.")
 }
 
 // ============================================================================
 // G19: cfheaders prev_filter_header for fork stop_hash
 // ============================================================================
 
-// G19 / BUG-8 — PARTIAL: Same root cause as G14 (BUG-6). OnGetCFHeaders
-// calls blockFilterIndex.GetFilter(startHeight - 1) by RAW height. If the
-// peer's stop_hash is on a fork, startHeight references the fork's
-// numbering but GetFilter returns the active-chain block's filter at that
-// height. The PrevFilterHeader in the response is from the active chain,
-// NOT the chain leading to the requested stop_hash. Peer verifies the
-// filter-header chain → fails the prev_filter check → ban. Same fix as
-// BUG-6 (chain-containment gate at handler entry).
+// G19 / BUG-8 — FIXED (FIX-74): LookupFilterHeaderByStopHashAtPrev in
+// internal/p2p/cfilter_handlers.go walks stopNode.GetAncestor(startHeight-1)
+// and verifies the stored filter row's BlockHash matches the ancestor's
+// hash. The PrevFilterHeader returned to the peer is the filter header
+// of the block on the stop_hash chain at start-1 (or the all-zero
+// genesis-sentinel when start_height==0), matching Core's
+// ProcessGetCFHeaders prev_block resolution (net_processing.cpp:3362-3370).
+//
+// Behavioral coverage in internal/p2p/cfilter_handlers_test.go:
+//
+//   - TestFIX74_GetCFHeaders_PrevHeaderViaAncestorWalk
+//   - TestFIX74_GetCFHeaders_GenesisSentinel
+//   - TestFIX74_LookupFilterHeaderAtPrev_GenesisSentinel
+//   - TestFIX74_LookupFilterHeaderAtPrev_ErrorPropagates
 func TestW121_G19_CFHeadersPrevHeaderOnFork(t *testing.T) {
-	t.Skip("BUG-8: cmd/blockbrew/main.go:1282 — GetFilter(startHeight-1) lookup " +
-		"by raw height returns active-chain block at that height, not stop_hash's " +
-		"chain ancestor. Same root cause as BUG-6. PARTIAL.")
+	t.Log("G19 / BUG-8 FIXED (FIX-74): cfheaders prev_filter_header resolved " +
+		"via stopNode.GetAncestor(startHeight-1) in cfilter_handlers.go. " +
+		"Behavioral coverage: internal/p2p/cfilter_handlers_test.go " +
+		"TestFIX74_GetCFHeaders_PrevHeaderViaAncestorWalk.")
 }
 
 // ============================================================================
