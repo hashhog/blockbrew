@@ -49,6 +49,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/hashhog/blockbrew/internal/wallet"
@@ -104,18 +105,18 @@ func (s *Server) handlePayjoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── (1) Content-Type — BIP-78 specifies text/plain ──────────────────
-	// We accept text/plain (the spec) and also accept
-	// application/octet-stream (some early implementations used it). Any
-	// other content-type is rejected as version-unsupported (415) per the
-	// HTTP semantics convention that 415 means "I don't accept this media
-	// type". Be lenient with charset suffix: text/plain;charset=utf-8.
+	// ── (1) Content-Type — BIP-78 §"Receive payjoin": text/plain ────────
+	// G23 closure: strict validation. We accept text/plain (the spec) and
+	// also accept application/octet-stream (some early implementations
+	// used it). An empty Content-Type is REJECTED (FIX-67 hardening —
+	// previously we silently accepted it). Be lenient with charset
+	// suffix: "text/plain; charset=utf-8" parses as text/plain.
 	ct := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Type")))
 	// strip optional ";..." parameters
 	if i := strings.Index(ct, ";"); i >= 0 {
 		ct = strings.TrimSpace(ct[:i])
 	}
-	if ct != "text/plain" && ct != "application/octet-stream" && ct != "" {
+	if ct != "text/plain" && ct != "application/octet-stream" {
 		s.writePayjoinError(w, http.StatusUnsupportedMediaType, payjoinErrorBody{
 			ErrorCode: string(wallet.PayjoinErrVersionUnsupported),
 			Message:   "Content-Type must be text/plain (got " + ct + ")",
@@ -124,9 +125,12 @@ func (s *Server) handlePayjoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ── (1) Content-Length cap ──────────────────────────────────────────
-	// We don't trust Content-Length alone (it can lie), so we wrap r.Body
-	// in a LimitReader below. But if the header is set and obviously too
-	// large, reject upfront so we don't even read N MB of body bytes.
+	// G23 hardening: we treat NEGATIVE / UNSET ContentLength (-1) as a
+	// hint to read defensively (the body LimitReader below still caps it
+	// at PayjoinMaxBodyBytes). A POSITIVE ContentLength larger than the
+	// cap is rejected upfront so we don't read N MB before noticing.
+	// chunked-transfer-encoded requests have ContentLength=-1 and are
+	// permitted as long as the actual body fits under the LimitReader.
 	if r.ContentLength > wallet.PayjoinMaxBodyBytes {
 		s.writePayjoinError(w, http.StatusBadRequest, payjoinErrorBody{
 			ErrorCode: string(wallet.PayjoinErrOriginalPSBTRejected),
@@ -135,15 +139,17 @@ func (s *Server) handlePayjoin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ── (2) Query params: only v= is enforced in FIX-65 ─────────────────
-	// The other BIP-78 query params (additionalfeeoutputindex,
-	// maxadditionalfeecontribution, disableoutputsubstitution, minfeerate)
-	// are parsed in a later fix-wave once the proposal logic supports
-	// real fee adjustment; FIX-65's receiver leaves the sender's fee
-	// untouched and grows the receiver output by the full added input,
-	// so those params are no-ops here.
+	// ── (2) Query params: G16 / BIP-78 §"Send payjoin" ──────────────────
+	// All optional params recognised; defaults match the BIP. v= is the
+	// only one enforced at this layer (rejected with version-unsupported
+	// when != "1"). The rest are forwarded to ProcessPayjoinRequest where
+	// they shape the proposal builder.
 	q := r.URL.Query()
 	version := q.Get("v")
+	addFeeIdx := payjoinParseIntQuery(q, "additionalfeeoutputindex", -1)
+	maxAddFee := payjoinParseInt64Query(q, "maxadditionalfeecontribution", 0)
+	disableSub := payjoinParseBoolQuery(q, "disableoutputsubstitution")
+	minFeeRate := payjoinParseFloatQuery(q, "minfeerate", 0)
 
 	// ── (3) Read body ───────────────────────────────────────────────────
 	// LimitReader caps at PayjoinMaxBodyBytes+1 so we can detect overflow
@@ -184,8 +190,12 @@ func (s *Server) handlePayjoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp, perr := wlt.ProcessPayjoinRequest(&wallet.PayjoinRequest{
-		OriginalPSBTBase64: body,
-		Version:            version,
+		OriginalPSBTBase64:           body,
+		Version:                      version,
+		AdditionalFeeOutputIndex:     addFeeIdx,
+		MaxAdditionalFeeContribution: maxAddFee,
+		DisableOutputSubstitution:    disableSub,
+		MinFeeRate:                   minFeeRate,
 	})
 	if perr != nil {
 		// Map the BIP-78 errorCode to the HTTP status. The mapping table
@@ -244,6 +254,63 @@ func (s *Server) writePayjoinError(w http.ResponseWriter, status int, body payjo
 	if err := json.NewEncoder(w).Encode(body); err != nil {
 		log.Printf("PayJoin: failed to encode error body: %v", err)
 	}
+}
+
+// payjoinParseIntQuery extracts a signed integer query param. Missing /
+// invalid → defaultVal. Used for `additionalfeeoutputindex` whose
+// default is -1 ("not specified").
+func payjoinParseIntQuery(q map[string][]string, name string, defaultVal int) int {
+	vs, ok := q[name]
+	if !ok || len(vs) == 0 || vs[0] == "" {
+		return defaultVal
+	}
+	n, err := strconv.Atoi(vs[0])
+	if err != nil {
+		return defaultVal
+	}
+	return n
+}
+
+// payjoinParseInt64Query is the int64 variant for sat-denominated
+// quantities like `maxadditionalfeecontribution`. Missing / invalid →
+// defaultVal (typically 0).
+func payjoinParseInt64Query(q map[string][]string, name string, defaultVal int64) int64 {
+	vs, ok := q[name]
+	if !ok || len(vs) == 0 || vs[0] == "" {
+		return defaultVal
+	}
+	n, err := strconv.ParseInt(vs[0], 10, 64)
+	if err != nil {
+		return defaultVal
+	}
+	return n
+}
+
+// payjoinParseBoolQuery parses a query param into a boolean. BIP-78 is
+// ambiguous about the exact spelling — we accept "true", "1", "yes" as
+// true; everything else (including "0", "false", "no", "") as false.
+// This mirrors payjoin.org's reference behavior.
+func payjoinParseBoolQuery(q map[string][]string, name string) bool {
+	vs, ok := q[name]
+	if !ok || len(vs) == 0 {
+		return false
+	}
+	v := strings.ToLower(strings.TrimSpace(vs[0]))
+	return v == "true" || v == "1" || v == "yes"
+}
+
+// payjoinParseFloatQuery parses a query param into a float (sat/vB for
+// `minfeerate`). Missing / invalid → defaultVal.
+func payjoinParseFloatQuery(q map[string][]string, name string, defaultVal float64) float64 {
+	vs, ok := q[name]
+	if !ok || len(vs) == 0 || vs[0] == "" {
+		return defaultVal
+	}
+	f, err := strconv.ParseFloat(vs[0], 64)
+	if err != nil {
+		return defaultVal
+	}
+	return f
 }
 
 // ProcessPayjoin is a typed wrapper around wallet.ProcessPayjoinRequest
