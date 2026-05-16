@@ -132,6 +132,51 @@ type PayjoinRequest struct {
 	// currently defined value. Empty / absent => v=1 default for
 	// legacy clients (the spec is permissive here).
 	Version string
+
+	// G16 — BIP-78 query parameters. All are optional from the sender's
+	// perspective; the receiver enforces them when present and defaults
+	// per spec when absent. Zero-values denote "not supplied" so a
+	// caller using a struct-literal without these fields gets the same
+	// behaviour as a sender omitting the query params.
+	//
+	// AdditionalFeeOutputIndex (BIP-78 §"Send payjoin"): the index in
+	// the Original PSBT that carries the sender's fee-bearing change.
+	// If non-negative, the receiver MAY shrink THIS output (and only
+	// this output) up to MaxAdditionalFeeContribution to fund any new
+	// fee. -1 means "unspecified" — the receiver MUST NOT raise the fee.
+	AdditionalFeeOutputIndex int
+
+	// MaxAdditionalFeeContribution caps in satoshis how much the receiver
+	// may shrink the AdditionalFeeOutputIndex output. Zero means "not
+	// supplied" — equivalent to no fee bump permitted.
+	MaxAdditionalFeeContribution int64
+
+	// DisableOutputSubstitution mirrors the sender's `pjos` flag. When
+	// true the receiver MUST NOT substitute any output script (the
+	// receiver-paying output's pkScript stays exactly as the sender
+	// drew it). FIX-65 receiver pipeline already preserves all scripts
+	// — this flag only matters in the sender-side anti-snoop validator.
+	DisableOutputSubstitution bool
+
+	// MinFeeRate is the minimum effective feerate (sat/vB) the proposal
+	// must clear. Sender-side check; tracked here so the receiver can
+	// echo it back in the query string if we ever build a proposal that
+	// would fall below.
+	MinFeeRate float64
+}
+
+// PayjoinReceiverPolicy is the recipient operator's per-merchant policy.
+//
+// Currently unused by ProcessPayjoinRequest; reserved for a future
+// fix-wave that adds operator-tunable knobs (e.g. min-confirmations on
+// receiver UTXOs, list of allowed sender CIDRs, ...). Defined here so
+// the wire types are stable.
+type PayjoinReceiverPolicy struct {
+	// MinConfirmations is the minimum confirmation depth a receiver
+	// UTXO must have to be eligible as a PayJoin contribution. Zero
+	// means "any confirmed UTXO" (the spec default — confirmed means
+	// height>0 in our model).
+	MinConfirmations int32
 }
 
 // ProcessPayjoinRequest is the receiver-side entry point: it validates
@@ -184,6 +229,21 @@ func (w *Wallet) ProcessPayjoinRequest(req *PayjoinRequest) (string, *PayjoinErr
 			len(req.OriginalPSBTBase64), PayjoinMaxBodyBytes)
 	}
 
+	// ── G30: replay check ───────────────────────────────────────────────
+	// Per BIP-78 §"Receiver's per-session state", a sender retrying the
+	// SAME Original PSBT (e.g. after a transport hiccup) MUST receive
+	// the EXACT SAME proposal bytes back. Otherwise the sender's
+	// anti-snoop validator would have two distinct proposals to choose
+	// from, both signing the same sender inputs — a self-double-spend
+	// hazard for the receiver. Compute the PSBT-id BEFORE any other
+	// validation so a duplicate retry of an INVALID PSBT (rare but
+	// possible) doesn't waste cycles re-validating.
+	sessions := w.getPayjoinSessions()
+	psbtID := payjoinPSBTID(req.OriginalPSBTBase64)
+	if cached, ok := sessions.lookupReplay(psbtID); ok {
+		return cached, nil
+	}
+
 	original, err := DecodePSBTBase64(req.OriginalPSBTBase64)
 	if err != nil {
 		return "", newPayjoinErr(PayjoinErrOriginalPSBTRejected,
@@ -228,8 +288,20 @@ func (w *Wallet) ProcessPayjoinRequest(req *PayjoinRequest) (string, *PayjoinErr
 	//
 	// Read snapshot under RLock: receiver-paying output index, candidate
 	// UTXO. We then release before calling the signer (which takes its
-	// own locks).
-	receiverOutIdx, receiverUTXO, perr := w.payjoinScanLocked(original)
+	// own locks). G19: the scan skips outpoints already held by another
+	// in-flight session (double-spend guard).
+	receiverOutIdx, receiverUTXO, perr := w.payjoinScanLocked(original, sessions)
+	if perr != nil {
+		return "", perr
+	}
+
+	// ── G6 / G16: identify the sender's fee output (additionalfeeoutputindex) ──
+	// Per BIP-78 §"Send payjoin", the sender MAY designate ONE output
+	// (typically their change output) that the receiver may shrink up to
+	// MaxAdditionalFeeContribution to fund any new fee. We validate the
+	// index here; the actual shrink happens in the proposal builder
+	// below. -1 (default) means "no fee bump allowed".
+	feeOutIdx, perr := payjoinResolveFeeOutput(original, req, receiverOutIdx)
 	if perr != nil {
 		return "", perr
 	}
@@ -266,15 +338,34 @@ func (w *Wallet) ProcessPayjoinRequest(req *PayjoinRequest) (string, *PayjoinErr
 		Sequence:         original.UnsignedTx.TxIn[0].Sequence,
 	})
 
-	// Outputs: clone, grow receiver output by added input amount.
+	// Outputs: clone, grow receiver output by added input amount. When the
+	// sender supplied `additionalfeeoutputindex` with a budget, ALSO shrink
+	// that output by up to `maxadditionalfeecontribution` so the proposal
+	// pays a strictly higher fee than the original — useful when the
+	// receiver's added input needs its own fee budget (P2WPKH spend is
+	// ~68 vbytes, which at 10 sat/vB is ~680 sats).
+	//
+	// Net arithmetic per BIP-78 §"Receiver's payjoin proposal PSBT":
+	//   - receiver-paying output grows by receiverUTXO.Amount (FULL value)
+	//   - additionalfeeoutputindex output shrinks by feeBumpSats
+	//   - fee delta = +feeBumpSats (inputs up by X, outputs up by X-feeBump)
+	//
+	// feeBumpSats is bounded by both the sender's cap and the output's
+	// existing value (we never produce a negative-value output, nor one
+	// below the dust threshold — payjoinComputeFeeBump enforces both).
+	feeBumpSats := payjoinComputeFeeBump(receiverUTXO, req, feeOutIdx, original)
 	for i, out := range original.UnsignedTx.TxOut {
 		value := out.Value
-		if i == receiverOutIdx {
-			// G9 / BUG-18 readiness: at this point we COULD optionally
-			// adjust the fee per `maxadditionalfeecontribution`; since
-			// this initial wiring leaves the fee unchanged, we just
-			// pass the full added input value to the receiver output.
+		switch i {
+		case receiverOutIdx:
+			// G9 / G6: grow the receiver-paying output by the FULL added
+			// input amount. The fee bump comes from feeOutIdx below.
 			value = out.Value + receiverUTXO.Amount
+		case feeOutIdx:
+			// G6 / BUG-17 / BUG-18: shrink the sender's designated fee
+			// output by feeBumpSats. Together with the recv-output grow
+			// above this raises the net fee by exactly feeBumpSats.
+			value = out.Value - feeBumpSats
 		}
 		proposalTx.TxOut = append(proposalTx.TxOut, &wire.TxOut{
 			Value:    value,
@@ -345,7 +436,80 @@ func (w *Wallet) ProcessPayjoinRequest(req *PayjoinRequest) (string, *PayjoinErr
 		return "", newPayjoinErr(PayjoinErrUnavailable,
 			"failed to encode proposal PSBT: %v", encErr)
 	}
+
+	// ── G18 / G19 / G30: persist in the session store ───────────────────
+	// Reserve the receiver UTXO outpoint and cache the EXACT proposal
+	// bytes we're about to return. A retry of this same Original PSBT
+	// will hit the replay branch at the top of this function and get
+	// back THESE bytes verbatim, so the sender's anti-snoop validators
+	// see byte-stable input. The reservation prevents a concurrent
+	// distinct Original PSBT from picking the same UTXO.
+	//
+	// storeSession returns false if any of the outpoints we want to
+	// reserve was claimed by another in-flight session between the
+	// scan above and this call (TOCTOU). On collision we report
+	// not-enough-money — the sender can retry with a different input
+	// shape or backoff. This is rare in practice but matters for
+	// correctness under heavy concurrency.
+	if !sessions.storeSession(psbtID, []wire.OutPoint{receiverUTXO.OutPoint}, out) {
+		return "", newPayjoinErr(PayjoinErrNotEnoughMoney,
+			"receiver UTXO was claimed by a concurrent session; retry")
+	}
 	return out, nil
+}
+
+// payjoinComputeFeeBump returns the number of satoshis to subtract from
+// the sender's designated additionalfeeoutputindex output. Returns 0
+// when no fee bump is appropriate.
+//
+// Bounds:
+//   - 0 if feeOutIdx < 0 (no sender-supplied fee-output index).
+//   - 0 if MaxAdditionalFeeContribution ≤ 0 (sender forbade the bump).
+//   - capped at MaxAdditionalFeeContribution.
+//   - capped at the receiver-added input value (don't shrink the fee
+//     output past the point where the receiver effectively pays for
+//     the entire added input — that would be a privacy leak).
+//   - capped at out.Value - payjoinDustThreshold so we never produce
+//     an output below the dust limit. If the cap would force a value
+//     below dust, return 0 (skip the bump entirely).
+//
+// The choice to NOT use the full budget is deliberate: the receiver
+// only needs enough to cover the marginal vsize of their own added
+// input. We estimate that as inputVSize * 1 sat/vB (a conservative
+// floor). For P2WPKH this is ~68 sats; for P2TR ~58 sats. Operators
+// who want to charge more can override per-merchant in a future
+// fix-wave.
+func payjoinComputeFeeBump(
+	receiverUTXO *WalletUTXO,
+	req *PayjoinRequest,
+	feeOutIdx int,
+	original *PSBT,
+) int64 {
+	if feeOutIdx < 0 || req == nil || req.MaxAdditionalFeeContribution <= 0 {
+		return 0
+	}
+	bump := req.MaxAdditionalFeeContribution
+	// Cap at receiverUTXO.Amount (never shrink the fee output past the
+	// added input value — net fee delta would exceed receiver's
+	// contribution which is nonsensical).
+	if bump > receiverUTXO.Amount {
+		bump = receiverUTXO.Amount
+	}
+	// Cap at out.Value - dust. If the cap would force below dust, set
+	// the bump to (out.Value - dust). If that's ≤0, skip entirely.
+	const dust = int64(546)
+	feeOutVal := original.UnsignedTx.TxOut[feeOutIdx].Value
+	maxByDust := feeOutVal - dust
+	if maxByDust < 0 {
+		return 0
+	}
+	if bump > maxByDust {
+		bump = maxByDust
+	}
+	if bump < 0 {
+		return 0
+	}
+	return bump
 }
 
 // payjoinScanLocked performs the receiver-output + UTXO-selection scan
@@ -356,10 +520,19 @@ func (w *Wallet) ProcessPayjoinRequest(req *PayjoinRequest) (string, *PayjoinErr
 //   - the index of the receiver-paying output (G5 / G6),
 //   - a candidate UTXO to add as the receiver input (G7 / G8 / G20).
 //
+// G19: when sessions is non-nil, any outpoint reserved by another
+// in-flight PayJoin offer is skipped so two concurrent senders never
+// receive proposals that reference the same receiver UTXO. Reserving
+// happens in ProcessPayjoinRequest after this scan returns so the
+// reservation is atomic with the proposal-byte cache (G30).
+//
 // Returns a *PayjoinError that the caller propagates verbatim — wraps the
 // two failure modes (no receiver output, no usable UTXO) with the right
 // BIP-78 error code.
-func (w *Wallet) payjoinScanLocked(original *PSBT) (int, *WalletUTXO, *PayjoinError) {
+func (w *Wallet) payjoinScanLocked(
+	original *PSBT,
+	sessions *payjoinSessionStore,
+) (int, *WalletUTXO, *PayjoinError) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
@@ -395,7 +568,9 @@ func (w *Wallet) payjoinScanLocked(original *PSBT) (int, *WalletUTXO, *PayjoinEr
 	//     might refuse anyway via standard 0-conf policy),
 	//   - is not already in the sender's input set (would be a no-op
 	//     and would also be a self-double-spend hazard),
-	//   - is not operator-locked (lockedCoins set via lockunspent RPC).
+	//   - is not operator-locked (lockedCoins set via lockunspent RPC),
+	//   - is not currently reserved by another in-flight PayJoin offer
+	//     (G19 — payjoinSessionStore double-spend guard).
 	senderOutpoints := make(map[wire.OutPoint]struct{}, len(original.UnsignedTx.TxIn))
 	for _, in := range original.UnsignedTx.TxIn {
 		senderOutpoints[in.PreviousOutPoint] = struct{}{}
@@ -412,6 +587,9 @@ func (w *Wallet) payjoinScanLocked(original *PSBT) (int, *WalletUTXO, *PayjoinEr
 		if _, locked := w.lockedCoins[u.OutPoint]; locked {
 			continue
 		}
+		if sessions != nil && sessions.isReserved(u.OutPoint) {
+			continue
+		}
 		receiverUTXO = u
 		break
 	}
@@ -421,6 +599,60 @@ func (w *Wallet) payjoinScanLocked(original *PSBT) (int, *WalletUTXO, *PayjoinEr
 	}
 
 	return receiverOutIdx, receiverUTXO, nil
+}
+
+// payjoinResolveFeeOutput validates the additionalfeeoutputindex query
+// param against the Original PSBT and returns the resolved index (or
+// -1 if no fee bump is permitted). Per BIP-78 §"Send payjoin":
+//
+//   - If the index is omitted / negative, the receiver MUST NOT raise
+//     the fee. We return -1 so the proposal builder leaves the fee
+//     identical to the original.
+//
+//   - If the index is non-negative, it MUST point at an output whose
+//     pkScript belongs to the SENDER (i.e. not the receiver-paying
+//     output). The receiver-paying output is the one we GROW; using
+//     the same output for both grow AND shrink would be nonsensical.
+//
+//   - The index MUST be in-bounds. Out-of-range is original-psbt-rejected
+//     per spec convention (the sender constructed a malformed request).
+//
+// Returns the resolved fee-output index, or -1 to signal "no fee bump".
+func payjoinResolveFeeOutput(
+	original *PSBT,
+	req *PayjoinRequest,
+	receiverOutIdx int,
+) (int, *PayjoinError) {
+	// IMPORTANT: a zero AdditionalFeeOutputIndex is AMBIGUOUS in Go's
+	// zero-value model — a caller may have explicitly set 0 (a valid
+	// index for a 2-output tx) OR may have left the field at its
+	// default. To disambiguate, we treat the case "index>=0 AND budget==0"
+	// as "no fee bump requested": the only meaningful case where the
+	// sender asked for a fee bump is when MaxAdditionalFeeContribution > 0.
+	// The query-param parser in internal/rpc/payjoin.go pairs the two
+	// together at the wire (both come from the same URL).
+	if req == nil || req.AdditionalFeeOutputIndex < 0 {
+		return -1, nil
+	}
+	if req.MaxAdditionalFeeContribution <= 0 {
+		// Sender specified an index but no budget — equivalent to no
+		// fee bump. Don't return an error: the spec lets the receiver
+		// silently choose not to bump if maxadditionalfeecontribution
+		// is missing or zero. This is ALSO the Go-zero-value path
+		// (struct-literal callers that left both fields unset).
+		return -1, nil
+	}
+	if req.AdditionalFeeOutputIndex >= len(original.UnsignedTx.TxOut) {
+		return -1, newPayjoinErr(PayjoinErrOriginalPSBTRejected,
+			"additionalfeeoutputindex %d out of range (%d outputs)",
+			req.AdditionalFeeOutputIndex, len(original.UnsignedTx.TxOut))
+	}
+	if req.AdditionalFeeOutputIndex == receiverOutIdx {
+		return -1, newPayjoinErr(PayjoinErrOriginalPSBTRejected,
+			"additionalfeeoutputindex %d points at the receiver-paying output",
+			req.AdditionalFeeOutputIndex)
+	}
+	return req.AdditionalFeeOutputIndex, nil
 }
 
 // payjoinAttachBIP32Locked attaches the master fingerprint + derivation
