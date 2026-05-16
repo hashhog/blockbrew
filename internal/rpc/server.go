@@ -682,6 +682,15 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	case "psbtbumpfee":
 		return s.handlePSBTBumpFee(params, walletName)
 
+	// PayJoin sender RPCs (FIX-66 / W119 BUG-4). getpayjoinrequest builds
+	// + signs the Original PSBT (caller drives transport); sendpayjoinrequest
+	// runs the full sender flow including G10-G15 anti-snoop + G22 fallback.
+	// Reference: bips/bip-0078.mediawiki; internal/wallet/payjoin_sender.go.
+	case "getpayjoinrequest":
+		return s.handleGetPayjoinRequest(params, walletName)
+	case "sendpayjoinrequest":
+		return s.handleSendPayjoinRequest(params, walletName)
+
 	// PSBT RPCs
 	case "createpsbt":
 		return s.handleCreatePSBT(params)
