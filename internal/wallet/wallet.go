@@ -770,6 +770,26 @@ func (w *Wallet) IsOwnAddress(addr string) bool {
 	return exists
 }
 
+// IsOwnScript reports whether the wallet recognises a scriptPubKey as one of
+// its own. Mirrors Bitcoin Core's CWallet::IsMine in spirit (the BIP-78 G12
+// anti-snoop check needs to detect a fingerprinting receiver that inserts
+// one of the sender's own UTXOs as a "contribution"). Returns true iff the
+// pkScript decodes to an address that this wallet derived; returns false for
+// foreign scripts and unrecognised script types.
+//
+// This is the only addrToPath sweep we expose to outside-the-package callers.
+// The bumpfee-side scriptToOwnAddressLocked path remains unexported because
+// it must be called under w.mu (read or write) by the surrounding wallet
+// operation; this exported variant takes the lock itself so RPC handlers
+// (e.g. PayJoin sender anti-snoop) can call it without re-entering the
+// wallet's locking discipline.
+func (w *Wallet) IsOwnScript(pkScript []byte) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	_, ok := w.scriptToOwnAddressLocked(pkScript)
+	return ok
+}
+
 // SetLabel sets a label for an address.
 // If the label is empty, the label is removed.
 func (w *Wallet) SetLabel(addr, label string) error {
