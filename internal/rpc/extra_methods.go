@@ -129,11 +129,20 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 			replaceable = s.mempool.FullRBF() || mempool.SignalsRBFForRPC(entry.Tx)
 		}
 	}
+	// `modifiedfee` is the entry's raw fee PLUS any operator delta applied
+	// via the prioritisetransaction RPC. Mirrors Core's
+	// `CTxMemPoolEntry::GetModifiedFee` (kernel/mempool_entry.h). Prior to
+	// FIX-72 this field always equalled Fee (no prioritisetransaction
+	// support, W120 BUG-10).
+	modifiedFee := entry.Fee
+	if s.mempool != nil {
+		modifiedFee = s.mempool.GetModifiedFee(entry)
+	}
 	return MempoolEntry{
 		VSize:             entry.Size,
 		Weight:            entry.Size * 4,
 		Fee:               float64(entry.Fee) / satoshiPerBitcoin,
-		ModifiedFee:       float64(entry.Fee) / satoshiPerBitcoin,
+		ModifiedFee:       float64(modifiedFee) / satoshiPerBitcoin,
 		Time:              entry.Time.Unix(),
 		Height:            entry.Height,
 		DescendantCount:   len(entry.SpentBy) + 1,
@@ -326,6 +335,114 @@ func (s *Server) handleLoadMempool(_ json.RawMessage) (interface{}, *RPCError) {
 		"failed":   res.Failed,
 		"expired":  res.Expired,
 	}, nil
+}
+
+// ============================================================================
+// Prioritisation RPCs (W120 BUG-10 / FIX-72)
+// ============================================================================
+
+// handlePrioritiseTransaction implements Core's prioritisetransaction RPC:
+//
+//	prioritisetransaction "txid" ( dummy_fee_delta_btc ) fee_delta_sats
+//
+// Positional args (positional only — no named-args plumbing yet):
+//
+//	args[0] string  txid          (hex, REQUIRED)
+//	args[1] number  dummy         (must be 0 or null — Core API-compat shim;
+//	                              the historical "priority" was removed in 0.14.0)
+//	args[2] number  fee_delta     (satoshis; can be negative; REQUIRED)
+//
+// Behaviour:
+//   - Adds `fee_delta` to mp.mapDeltas[txid]. Deltas STACK across calls.
+//   - A net-zero delta clears the entry from the map (Core txmempool.cpp:644).
+//   - The txid does NOT need to be in the pool (Core same).
+//   - Returns the JSON boolean `true` on success — matches Core mining.cpp:542.
+//
+// Error mapping (mirrors Core):
+//   - dummy != 0 → RPC_INVALID_PARAMETER ("Priority is no longer supported...").
+//
+// References:
+//   - bitcoin-core/src/rpc/mining.cpp::prioritisetransaction
+//   - bitcoin-core/src/txmempool.cpp::PrioritiseTransaction
+func (s *Server) handlePrioritiseTransaction(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 3 {
+		return nil, &RPCError{Code: RPCErrInvalidParams,
+			Message: "prioritisetransaction requires 3 arguments: txid, dummy, fee_delta"}
+	}
+	txidStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "txid must be a string"}
+	}
+	txid, err := wire.NewHash256FromHex(txidStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey,
+			Message: fmt.Sprintf("Invalid txid: %v", err)}
+	}
+
+	// dummy must be 0 or null. Core throws RPC_INVALID_PARAMETER on non-zero.
+	// JSON null comes through as `nil` after json.Unmarshal into []interface{}.
+	switch v := args[1].(type) {
+	case nil:
+		// OK: omitted.
+	case float64:
+		if v != 0 {
+			return nil, &RPCError{Code: RPCErrInvalidParameter,
+				Message: "Priority is no longer supported, dummy argument to prioritisetransaction must be 0."}
+		}
+	default:
+		return nil, &RPCError{Code: RPCErrInvalidParameter,
+			Message: "dummy argument must be a number (0) or null"}
+	}
+
+	// fee_delta is in satoshis. Accept integer-valued floats (JSON has no
+	// integer type) and reject fractional values — a sub-satoshi delta has
+	// no defined semantics.
+	deltaFloat, ok := args[2].(float64)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams,
+			Message: "fee_delta must be a number (satoshis)"}
+	}
+	if deltaFloat != float64(int64(deltaFloat)) {
+		return nil, &RPCError{Code: RPCErrInvalidParameter,
+			Message: "fee_delta must be an integer number of satoshis"}
+	}
+	deltaSats := int64(deltaFloat)
+
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
+	}
+	s.mempool.PrioritiseTransaction(txid, deltaSats)
+	return true, nil
+}
+
+// handleGetPrioritisedTransactions implements Core's getprioritisedtransactions
+// RPC. Returns a map keyed by txid of `{fee_delta, in_mempool, modified_fee?}`.
+// modified_fee is omitted when in_mempool is false (Core mining.cpp:558:
+// "Only returned if in_mempool=true").
+//
+// Reference: bitcoin-core/src/rpc/mining.cpp::getprioritisedtransactions
+// (function below prioritisetransaction in the same file).
+func (s *Server) handleGetPrioritisedTransactions(_ json.RawMessage) (interface{}, *RPCError) {
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
+	}
+	infos := s.mempool.GetPrioritisedTransactions()
+	out := make(map[string]map[string]interface{}, len(infos))
+	for _, info := range infos {
+		entry := map[string]interface{}{
+			"fee_delta":  info.FeeDelta,
+			"in_mempool": info.InMempool,
+		}
+		if info.InMempool {
+			entry["modified_fee"] = info.ModifiedFee
+		}
+		out[info.TxID.String()] = entry
+	}
+	return out, nil
 }
 
 // ============================================================================
