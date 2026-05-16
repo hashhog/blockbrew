@@ -457,6 +457,70 @@ type orphanEntry struct {
 	missingOut []wire.OutPoint // Missing parent outpoints
 }
 
+// MemPoolRemovalReason mirrors Core's `enum class MemPoolRemovalReason`
+// (bitcoin-core/src/kernel/mempool_removal_reason.h). It is passed to the
+// OnTxEvicted callback so that downstream subscribers (wallet, ZMQ, fee
+// estimator, indexers) can classify why a tx left the mempool.
+//
+// Values match Core's ordering and semantics:
+//
+//	EXPIRY     — entry exceeded -mempoolexpiry (default 336h).
+//	SIZELIMIT  — TrimToSize evicted entry to keep mempool ≤ -maxmempool.
+//	REORG      — chain reorg invalidated entry (non-final / immature coinbase).
+//	BLOCK      — entry was included in a connected block (CONFIRMED).
+//	CONFLICT   — entry conflicts with a tx in a freshly-connected block.
+//	REPLACED   — entry was evicted by an RBF replacement (BIP-125 / full-RBF).
+//
+// Wallet code MUST treat REPLACED differently from CONFLICT / EXPIRY /
+// SIZELIMIT — a replaced tx is conceptually superseded (the replacement may
+// confirm), whereas an expired tx is simply forgotten and may be
+// re-broadcast. Conflating these is the W120 BUG-9 wallet-correctness
+// failure mode (FIX-73). The ZMQ "pubrawtx" "R" prefix is reserved
+// specifically for REPLACED.
+type MemPoolRemovalReason int
+
+const (
+	// MempoolRemovalReasonUnknown is the zero value. A callback that sees
+	// this should treat the eviction as "no information" — Core never emits
+	// this; it exists only so an uninitialised reason variable is detectable
+	// in tests.
+	MempoolRemovalReasonUnknown MemPoolRemovalReason = iota
+	// MempoolRemovalReasonExpiry — entry aged past -mempoolexpiry.
+	MempoolRemovalReasonExpiry
+	// MempoolRemovalReasonSizeLimit — TrimToSize / maxmempool eviction.
+	MempoolRemovalReasonSizeLimit
+	// MempoolRemovalReasonReorg — chain reorg invalidated entry.
+	MempoolRemovalReasonReorg
+	// MempoolRemovalReasonBlock — entry was confirmed in a connected block.
+	MempoolRemovalReasonBlock
+	// MempoolRemovalReasonConflict — entry conflicts with a tx in the
+	// just-connected block (double-spend resolved by chain).
+	MempoolRemovalReasonConflict
+	// MempoolRemovalReasonReplaced — entry was evicted by an RBF replacement.
+	MempoolRemovalReasonReplaced
+)
+
+// String returns the lowercase Core-canonical reason name.
+// Mirrors src/kernel/mempool_removal_reason.cpp::RemovalReasonToString.
+func (r MemPoolRemovalReason) String() string {
+	switch r {
+	case MempoolRemovalReasonExpiry:
+		return "expiry"
+	case MempoolRemovalReasonSizeLimit:
+		return "sizelimit"
+	case MempoolRemovalReasonReorg:
+		return "reorg"
+	case MempoolRemovalReasonBlock:
+		return "block"
+	case MempoolRemovalReasonConflict:
+		return "conflict"
+	case MempoolRemovalReasonReplaced:
+		return "replaced"
+	default:
+		return "unknown"
+	}
+}
+
 // PackageResult holds the result of a package acceptance attempt.
 type PackageResult struct {
 	// PackageFeerate is the aggregate feerate of the package (sat/vB).
@@ -528,12 +592,23 @@ type Mempool struct {
 	lastRollingFeeUpdate     int64   // Unix seconds
 
 	// OnTxEvicted is called when a transaction is removed from the mempool for
-	// any reason other than block confirmation.  It is invoked with the txid
-	// just before the entry is deleted from the pool.  The callback must not
-	// re-enter the mempool (mu is held).  Mirrors Core's
-	// TransactionRemovedFromMempool validation interface.  Set by main.go to
-	// wire the FeeEstimator's UnregisterTransaction path (FIX-47 BUG-22).
-	OnTxEvicted func(txHash wire.Hash256)
+	// ANY reason — including block confirmation (Core fires
+	// TransactionRemovedFromMempool unconditionally with the right reason).
+	// It is invoked with the txid AND a MemPoolRemovalReason just before the
+	// entry is deleted from the pool.  The callback must not re-enter the
+	// mempool (mu is held).  Mirrors Core's TransactionRemovedFromMempool
+	// validation interface (src/validationinterface.h /
+	// kernel/mempool_removal_reason.h).  Set by main.go to wire the
+	// FeeEstimator's UnregisterTransaction path (FIX-47 BUG-22) and any
+	// wallet that needs to distinguish replaced-vs-abandoned-vs-confirmed
+	// (FIX-73 W120 BUG-9).
+	//
+	// Wallet semantics (Core src/wallet/wallet.cpp:1407
+	// CWallet::transactionRemovedFromMempool):
+	//   - REPLACED → wallet marks tx as replaced-by-fee (still possibly mined)
+	//   - CONFLICT / BLOCK → wallet typically waits for block-disconnect to undo
+	//   - EXPIRY / SIZELIMIT / REORG → wallet may abandon or re-broadcast
+	OnTxEvicted func(txHash wire.Hash256, reason MemPoolRemovalReason)
 
 	// mapDeltas holds operator-applied fee deltas keyed by txid. Mirrors
 	// Bitcoin Core's CTxMemPool::mapDeltas (txmempool.h). Populated by
@@ -1255,10 +1330,14 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	mp.updateAncestorStateLocked(entry)
 	mp.updateDescendantStateLocked(entry)
 
-	// Execute RBF replacements if any
+	// Execute RBF replacements if any. FIX-73: each conflict (and its
+	// in-mempool descendants) is evicted with REPLACED so wallet
+	// subscribers can mark the txs as superseded rather than abandoned.
+	// Mirrors Core's RBF call site at validation.cpp::Finalize where
+	// RemoveStaged is invoked with MemPoolRemovalReason::REPLACED.
 	if len(conflictingTxs) > 0 {
 		for conflictHash := range conflictingTxs {
-			mp.removeWithDescendantsLocked(conflictHash)
+			mp.removeWithDescendantsLocked(conflictHash, MempoolRemovalReasonReplaced)
 		}
 	}
 
@@ -1273,8 +1352,12 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 	parentTxids := entry.Depends
 	_, clusterErr := mp.clusters.AddTransaction(txHash, fee, int32(vsize), parentTxids)
 	if clusterErr != nil {
-		// Cluster too large - remove the transaction we just added
-		mp.removeSingleTxLocked(txHash)
+		// Cluster too large - remove the transaction we just added.
+		// SIZELIMIT classifies the bookkeeping unwind for subscribers (Core
+		// equivalent: ATMP rejecting on TooLargeCluster never reaches the
+		// global pool, but our two-phase add means we briefly inserted the
+		// entry and now have to tell subscribers we yanked it).
+		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonSizeLimit)
 		return clusterErr
 	}
 
@@ -1763,32 +1846,59 @@ func (mp *Mempool) checkChainLimitsWithSizeLocked(tx *wire.MsgTx, candidateVSize
 	return nil
 }
 
-// RemoveTransaction removes a transaction and all its descendants from the mempool.
+// RemoveTransaction removes a transaction and all its descendants from the
+// mempool. The reason classifies the removal for OnTxEvicted subscribers
+// (FIX-73). External callers from RPC paths (e.g. sendrawtransaction
+// max-fee-rate rejection where the tx briefly entered the pool and is then
+// pulled back) should pass MempoolRemovalReasonUnknown; the more specific
+// reasons are reserved for internal eviction sites where the cause is
+// authoritatively known (block-connect, reorg, expiry, size-limit, RBF
+// replacement, in-block conflict).
 func (mp *Mempool) RemoveTransaction(txHash wire.Hash256) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
-	mp.removeWithDescendantsLocked(txHash)
+	mp.removeWithDescendantsLocked(txHash, MempoolRemovalReasonUnknown)
+}
+
+// RemoveTransactionWithReason is the explicit-reason form of
+// RemoveTransaction. Used by callers (FIX-73 wallet wiring, ZMQ
+// publishers) that already know the removal cause.
+func (mp *Mempool) RemoveTransactionWithReason(txHash wire.Hash256, reason MemPoolRemovalReason) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	mp.removeWithDescendantsLocked(txHash, reason)
 }
 
 // removeWithDescendantsLocked removes a transaction and all descendants.
-// Must be called with mu held.
-func (mp *Mempool) removeWithDescendantsLocked(txHash wire.Hash256) {
+// Must be called with mu held. The reason is threaded through to every
+// removeSingleTxLocked call so a single replacement that takes down a
+// 25-deep CPFP chain still surfaces REPLACED to the wallet for every
+// affected entry (matches Core's stage-walker behaviour at
+// txmempool.cpp::RemoveStaged).
+func (mp *Mempool) removeWithDescendantsLocked(txHash wire.Hash256, reason MemPoolRemovalReason) {
 	visited := make(map[wire.Hash256]bool)
 	descendants := mp.collectDescendantsLocked(txHash, visited)
 
 	// Remove descendants first (children before parents for proper cleanup)
 	// Reverse order to remove children first
 	for i := len(descendants) - 1; i >= 0; i-- {
-		mp.removeSingleTxLocked(descendants[i])
+		mp.removeSingleTxLocked(descendants[i], reason)
 	}
 
 	// Remove the transaction itself
-	mp.removeSingleTxLocked(txHash)
+	mp.removeSingleTxLocked(txHash, reason)
 }
 
 // removeSingleTxLocked removes a single transaction without touching descendants.
 // Must be called with mu held.
-func (mp *Mempool) removeSingleTxLocked(txHash wire.Hash256) {
+//
+// FIX-73 (W120 BUG-9): the second parameter carries a MemPoolRemovalReason
+// to the OnTxEvicted callback, mirroring Core's
+// CTxMemPool::TransactionRemovedFromMempool signal. Wallet / fee-estimator /
+// ZMQ subscribers can then classify the removal (REPLACED vs EXPIRY vs
+// CONFLICT vs BLOCK vs REORG vs SIZELIMIT). The reason parameter has no
+// effect on internal pool bookkeeping — it only fans out to subscribers.
+func (mp *Mempool) removeSingleTxLocked(txHash wire.Hash256, reason MemPoolRemovalReason) {
 	entry, ok := mp.pool[txHash]
 	if !ok {
 		return
@@ -1832,12 +1942,17 @@ func (mp *Mempool) removeSingleTxLocked(txHash wire.Hash256) {
 	delete(mp.pool, txHash)
 
 	// Notify fee estimator (and any other subscriber) that this tx has left
-	// the mempool without being confirmed.  Called after the pool delete so
-	// the callback sees a consistent state.  When the fee estimator's
-	// ProcessBlock is called first (as in onBlockConnected), confirmed txids
-	// are already removed from bucketMap, making this a safe no-op for them.
+	// the mempool.  Called after the pool delete so the callback sees a
+	// consistent state.  When the fee estimator's ProcessBlock is called
+	// first (as in onBlockConnected), confirmed txids are already removed
+	// from bucketMap, making this a safe no-op for them.
+	//
+	// FIX-73: reason classifies the removal — wallet code distinguishes
+	// REPLACED (RBF supersession) from EXPIRY / CONFLICT / BLOCK / REORG /
+	// SIZELIMIT so it can correctly mark the affected wallet tx as replaced
+	// vs abandoned vs confirmed.
 	if mp.OnTxEvicted != nil {
-		mp.OnTxEvicted(txHash)
+		mp.OnTxEvicted(txHash, reason)
 	}
 }
 
@@ -2117,7 +2232,8 @@ func (mp *Mempool) maybeEvictLocked() {
 			removedRateKvB := worst.DescendantFeeRate() * 1000
 			mp.trackPackageRemovedLocked(removedRateKvB + float64(mp.config.IncrementalRelayFee))
 
-			mp.removeWithDescendantsLocked(worst.TxHash)
+			// FIX-73: TrimToSize → SIZELIMIT reason.
+			mp.removeWithDescendantsLocked(worst.TxHash, MempoolRemovalReasonSizeLimit)
 			continue
 		}
 
@@ -2145,10 +2261,11 @@ func (mp *Mempool) maybeEvictLocked() {
 			mp.trackPackageRemovedLocked(chunkRateKvB + float64(mp.config.IncrementalRelayFee))
 		}
 
-		// Remove all transactions in the worst chunk
+		// Remove all transactions in the worst chunk.
+		// FIX-73: cluster-eviction is SIZELIMIT (Core: TrimToSize).
 		for _, idx := range worstChunk.Txs {
 			if txHash, ok := idxToHash[idx]; ok {
-				mp.removeWithDescendantsLocked(txHash)
+				mp.removeWithDescendantsLocked(txHash, MempoolRemovalReasonSizeLimit)
 			}
 		}
 	}
@@ -2276,15 +2393,21 @@ func (mp *Mempool) BlockConnected(block *wire.MsgBlock) {
 	// Increment chain height
 	mp.chainHeight++
 
-	// Remove confirmed transactions
+	// Remove confirmed transactions.
+	// FIX-73: distinguish BLOCK (the confirmed tx itself) from CONFLICT
+	// (any in-mempool tx whose input was spent by a tx in this block, i.e.
+	// double-spend resolved by the chain). Mirrors Core's two-arm
+	// removeForBlock:
+	//   txmempool.cpp::removeForBlock — confirmed:  REASON::BLOCK
+	//   txmempool.cpp::removeConflicts — conflicts:  REASON::CONFLICT
 	for _, tx := range block.Transactions {
 		txHash := tx.TxHash()
-		mp.removeSingleTxLocked(txHash)
+		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonBlock)
 
 		// Also remove conflicting transactions (double spends)
 		for _, in := range tx.TxIn {
 			if spendingTx, ok := mp.outpoints[in.PreviousOutPoint]; ok {
-				mp.removeWithDescendantsLocked(spendingTx)
+				mp.removeWithDescendantsLocked(spendingTx, MempoolRemovalReasonConflict)
 			}
 		}
 	}
@@ -2344,8 +2467,9 @@ func (mp *Mempool) Expire(cutoff time.Time) int {
 	}
 
 	// Remove collected transactions.
+	// FIX-73: Expire → EXPIRY reason.
 	for _, txHash := range stage {
-		mp.removeSingleTxLocked(txHash)
+		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonExpiry)
 	}
 	return len(stage)
 }
@@ -2392,8 +2516,9 @@ func (mp *Mempool) RemoveForReorg() int {
 		}
 	}
 
+	// FIX-73: RemoveForReorg → REORG reason.
 	for _, txHash := range stage {
-		mp.removeSingleTxLocked(txHash)
+		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonReorg)
 	}
 	return len(stage)
 }
@@ -3281,6 +3406,26 @@ func (mp *Mempool) acceptSingleTxPackage(tx *wire.MsgTx, result *PackageResult) 
 		return result, nil
 	}
 
+	// FIX-73 (W120 BUG-9): capture REPLACED evictions during AddTransaction
+	// so they surface in submitpackage / sendrawtransaction responses as
+	// `replaced-transactions`. Wallet front-ends key off this list to mark
+	// their own pending txs as replaced rather than abandoned.
+	//
+	// We chain the existing OnTxEvicted subscriber (FIX-47 fee-estimator
+	// path) by wrapping it for the duration of this call. The wrapper is
+	// reverted before return so external subscribers continue to receive
+	// callbacks unchanged afterwards.
+	prevCb := mp.OnTxEvicted
+	mp.OnTxEvicted = func(h wire.Hash256, reason MemPoolRemovalReason) {
+		if reason == MempoolRemovalReasonReplaced {
+			result.ReplacedTxs = append(result.ReplacedTxs, h)
+		}
+		if prevCb != nil {
+			prevCb(h, reason)
+		}
+	}
+	defer func() { mp.OnTxEvicted = prevCb }()
+
 	// Try to add the transaction
 	if err := mp.AddTransaction(tx); err != nil {
 		txResult.Error = err
@@ -3306,6 +3451,22 @@ func (mp *Mempool) acceptSingleTxPackage(tx *wire.MsgTx, result *PackageResult) 
 func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResult) (*PackageResult, error) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
+
+	// FIX-73 (W120 BUG-9): same pattern as acceptSingleTxPackage —
+	// intercept REPLACED evictions so they show up in
+	// result.ReplacedTxs / SubmitPackageResult.ReplacedTransactions.
+	// The wrapper is reverted on return so unrelated callbacks (fee
+	// estimator, future wallet, ZMQ) keep firing afterwards.
+	prevCb := mp.OnTxEvicted
+	mp.OnTxEvicted = func(h wire.Hash256, reason MemPoolRemovalReason) {
+		if reason == MempoolRemovalReasonReplaced {
+			result.ReplacedTxs = append(result.ReplacedTxs, h)
+		}
+		if prevCb != nil {
+			prevCb(h, reason)
+		}
+	}
+	defer func() { mp.OnTxEvicted = prevCb }()
 
 	// Track transactions that need package evaluation
 	var toEvaluate []*wire.MsgTx
@@ -3594,11 +3755,17 @@ func (mp *Mempool) addTransactionLocked(tx *wire.MsgTx, fee, vsize int64) error 
 
 // rollbackPackageLocked removes transactions that were added as part of a failed package.
 // Must be called with mu held.
+//
+// FIX-73: a partial-package failure is fundamentally a SIZELIMIT/policy
+// unwind — the package never reached the consensus chain, so REORG / BLOCK /
+// REPLACED are all wrong; EXPIRY is wrong (it didn't age out). SIZELIMIT is
+// the closest reason in Core's enum (the rollback restores the size-cap
+// invariant we just broke by partially admitting).
 func (mp *Mempool) rollbackPackageLocked(txns []*wire.MsgTx) {
 	// Remove in reverse order (children before parents)
 	for i := len(txns) - 1; i >= 0; i-- {
 		txHash := txns[i].TxHash()
-		mp.removeSingleTxLocked(txHash)
+		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonSizeLimit)
 	}
 }
 

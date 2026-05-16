@@ -993,7 +993,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// eviction, expiry) are correctly removed from the estimator's tracking.
 	// The callback fires from removeSingleTxLocked after the pool delete, so
 	// it is safe to call UnregisterTransaction here (no re-entrancy risk).
-	mp.OnTxEvicted = func(txHash wire.Hash256) {
+	//
+	// FIX-73 (W120 BUG-9): callback now carries a MemPoolRemovalReason.
+	// The fee estimator does not yet differentiate reasons (Core's
+	// CBlockPolicyEstimator::removeTx ignores the reason flag too — it just
+	// drops the entry from bucketMap regardless), so we pass through here.
+	// Future wallet wiring + ZMQ pubrawtx "R" prefix will read the reason.
+	mp.OnTxEvicted = func(txHash wire.Hash256, _ mempool.MemPoolRemovalReason) {
 		feeEstimator.UnregisterTransaction(txHash)
 	}
 

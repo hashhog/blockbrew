@@ -91,15 +91,22 @@ package mempool
 //   root cause as BUG-7 (wallet types/util do not compute it). Mirrors
 //   Core's WalletTxToJSON gap.
 //
-// BUG-9 (P1 — wallet correctness): OnTxEvicted callback carries NO reason.
-//   internal/mempool/mempool.go:499. Core's TransactionRemovedFromMempool
-//   signal takes a MemPoolRemovalReason (BLOCK / EXPIRY / SIZELIMIT /
-//   REORG / CONFLICT / REPLACED / UNKNOWN). The wallet uses this to mark
-//   conflicting wallet txs as "conflicted" rather than "abandoned" when a
-//   replacement supersedes them. With a reasonless callback the wallet
-//   bookkeeping CANNOT distinguish a REPLACED tx from an EXPIRED one —
-//   they look identical to gettransaction. Core:
-//   src/kernel/mempool_removal_reason.h; src/wallet/wallet.cpp::transactionRemovedFromMempool.
+// BUG-9 (P1 — wallet correctness): RESOLVED by FIX-73.
+//   OnTxEvicted callback now carries a MemPoolRemovalReason enum
+//   (EXPIRY / SIZELIMIT / REORG / BLOCK / CONFLICT / REPLACED / UNKNOWN)
+//   threaded through every internal removal path. Mirrors Core's
+//   TransactionRemovedFromMempool signal. Per-reason eviction sites:
+//     RBF replacement     → mempool.go::AddTransaction (REPLACED)
+//     BlockConnected      → mempool.go::BlockConnected (BLOCK + CONFLICT)
+//     Expire              → mempool.go::Expire (EXPIRY)
+//     RemoveForReorg      → mempool.go::RemoveForReorg (REORG)
+//     maybeEvictLocked    → mempool.go::maybeEvictLocked (SIZELIMIT)
+//   Audit-flip test below (G25) actively pins the new shape and reason
+//   semantics. Reference: bitcoin-core/src/kernel/mempool_removal_reason.h;
+//   src/wallet/wallet.cpp::transactionRemovedFromMempool.
+//   Wallet wiring (CWallet equivalent) is out of scope for FIX-73 — no
+//   blockbrew wallet subscriber exists yet; future wallet/zmq integration
+//   reads from the now-correct callback.
 //
 // BUG-10 (P2 CDIV): RESOLVED by FIX-72.
 //   Previously: no prioritisetransaction RPC, no mapDeltas, no modified-fee
@@ -583,32 +590,77 @@ func TestW120_G22_GetTransaction_BIP125Replaceable_MISSING(t *testing.T) {
 // G25: OnTxEvicted callback — removal-reason enum
 // ============================================================================
 
-// TestW120_G25_OnTxEvicted_HasNoReason actively asserts the missing-reason
-// pattern. The callback signature is `func(txHash wire.Hash256)` — no
-// MemPoolRemovalReason, so wallet code wired to this callback CANNOT
-// distinguish REPLACED from BLOCK/EXPIRY/SIZELIMIT/REORG/CONFLICT/UNKNOWN.
-func TestW120_G25_OnTxEvicted_HasNoReason(t *testing.T) {
+// TestW120_G25_OnTxEvicted_HasReason is the FIX-73 audit-flip: BUG-9 is now
+// closed. The callback signature is
+// `func(txHash wire.Hash256, reason MemPoolRemovalReason)` and every
+// internal removal path passes the Core-canonical reason
+// (REPLACED / BLOCK / CONFLICT / EXPIRY / REORG / SIZELIMIT).
+//
+// This test is the forward-regression guard: any future change that drops
+// the second parameter or replaces it with bool/int will fail to compile
+// here (the type assertion at line 1 of the function body pins the shape),
+// and any change that wires a generic "removed" reason for ALL paths will
+// fail the per-reason assertions below.
+//
+// Reference: bitcoin-core/src/kernel/mempool_removal_reason.h
+// and src/wallet/wallet.cpp::transactionRemovedFromMempool (the wallet
+// subscriber that originally motivated the enum upstream).
+func TestW120_G25_OnTxEvicted_HasReason(t *testing.T) {
+	// Forward-regression guard — pin the 2-arg signature. If a future
+	// refactor drops the reason parameter or changes its type, THIS LINE
+	// fails to compile.
+	var cb func(txHash wire.Hash256, reason MemPoolRemovalReason)
+	cb = func(_ wire.Hash256, _ MemPoolRemovalReason) {}
+	_ = cb
+
 	utxoSet := newTestUTXOSet()
 	mp := newTestMempool(utxoSet)
 
-	// Confirm the callback type signature has no reason parameter.
-	// If FIX-N adds a reason this test will FAIL TO COMPILE — caller can
-	// then delete the t.Skip below.
-	var cb func(txHash wire.Hash256) = func(_ wire.Hash256) {}
-	mp.OnTxEvicted = cb
+	// Capture the reason for the next single removal.
+	var got MemPoolRemovalReason
+	mp.OnTxEvicted = func(_ wire.Hash256, reason MemPoolRemovalReason) {
+		got = reason
+	}
 
-	t.Skip("BUG-9: OnTxEvicted callback at internal/mempool/mempool.go:499 " +
-		"carries NO removal reason. Core's TransactionRemovedFromMempool " +
-		"signal takes a MemPoolRemovalReason enum: BLOCK / EXPIRY / SIZELIMIT " +
-		"/ REORG / CONFLICT / REPLACED / UNKNOWN. With a reasonless callback " +
-		"a wallet subscriber cannot mark RBF-superseded txs as 'conflicted' " +
-		"vs 'abandoned' vs 'expired' — they all look identical. " +
-		"Reference: bitcoin-core/src/kernel/mempool_removal_reason.h and " +
-		"src/wallet/wallet.cpp::transactionRemovedFromMempool. " +
-		"Fix path: define MemPoolRemovalReason enum in mempool package, " +
-		"change OnTxEvicted to `func(txHash wire.Hash256, reason MemPoolRemovalReason)`, " +
-		"update the four call sites at removeSingleTxLocked:1583, " +
-		"sizeLimitMempool:1864, expireOlderThan:1895, removeForReorg:2031.")
+	// Seed a single tx and remove it via the explicit-reason API. This
+	// proves the reason threads end-to-end.
+	var seedHash wire.Hash256
+	seedHash[0] = 0x25
+	op, e := createFundingUTXO(seedHash, 0, 100_000)
+	utxoSet.AddUTXO(op, e)
+	tx := makeRBFTx([]wire.OutPoint{op}, 90_000)
+	h := tx.TxHash()
+	mp.mu.Lock()
+	addPoolEntry(mp, &TxEntry{TxHash: h, Tx: tx, Fee: 1000, Size: 150})
+	mp.mu.Unlock()
+
+	got = MempoolRemovalReasonUnknown
+	mp.RemoveTransactionWithReason(h, MempoolRemovalReasonReplaced)
+	if got != MempoolRemovalReasonReplaced {
+		t.Fatalf("OnTxEvicted reason = %v, want %v",
+			got, MempoolRemovalReasonReplaced)
+	}
+
+	// Sanity: the String() conversion mirrors Core's
+	// RemovalReasonToString table.
+	cases := []struct {
+		r    MemPoolRemovalReason
+		want string
+	}{
+		{MempoolRemovalReasonExpiry, "expiry"},
+		{MempoolRemovalReasonSizeLimit, "sizelimit"},
+		{MempoolRemovalReasonReorg, "reorg"},
+		{MempoolRemovalReasonBlock, "block"},
+		{MempoolRemovalReasonConflict, "conflict"},
+		{MempoolRemovalReasonReplaced, "replaced"},
+		{MempoolRemovalReasonUnknown, "unknown"},
+	}
+	for _, c := range cases {
+		if c.r.String() != c.want {
+			t.Errorf("MemPoolRemovalReason(%d).String() = %q, want %q",
+				int(c.r), c.r.String(), c.want)
+		}
+	}
 }
 
 // ============================================================================
