@@ -239,16 +239,127 @@
 package wallet
 
 import (
+	"bytes"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/address"
+	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// ── FIX-65 receiver-side test helpers ────────────────────────────────────
+//
+// These helpers anchor the W119 receiver-side gate tests (G1/G4/G5/G7/G9/G17)
+// to the real wallet.ProcessPayjoinRequest implementation that FIX-65
+// landed. They're kept local to this file to keep the audit-file/closure
+// pairing greppable: someone reading the W119 audit can scroll directly
+// to the same file to see what fixture / assertion replaced each Skip.
+
+// payjoinReceiverWallet creates a wallet with one confirmed 1.5 BTC UTXO
+// and returns the wallet + the address the sender will pay.
+func payjoinReceiverWallet(t *testing.T) (*Wallet, string) {
+	t.Helper()
+	w := NewWallet(WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Regtest,
+		ChainParams: consensus.RegtestParams(),
+		AddressType: AddressTypeP2WPKH,
+	})
+	if err := w.CreateFromMnemonic(
+		"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+		"",
+	); err != nil {
+		t.Fatalf("CreateFromMnemonic: %v", err)
+	}
+
+	recvAddr, err := w.NewAddress()
+	if err != nil {
+		t.Fatalf("NewAddress: %v", err)
+	}
+
+	// Fund a DIFFERENT address (so the receiver scan doesn't accidentally
+	// pick the funding pkScript as a "payment to the receiver").
+	fundAddr, err := w.NewAddress()
+	if err != nil {
+		t.Fatalf("NewAddress(fund): %v", err)
+	}
+	fundParsed, err := address.DecodeAddress(fundAddr, w.Network())
+	if err != nil {
+		t.Fatalf("DecodeAddress: %v", err)
+	}
+	w.AddUTXO(&WalletUTXO{
+		OutPoint:  wire.OutPoint{Hash: wire.Hash256{0x77}, Index: 0},
+		Amount:    150_000_000,
+		PkScript:  fundParsed.ScriptPubKey(),
+		Address:   fundAddr,
+		Height:    100,
+		Confirmed: true,
+	})
+	return w, recvAddr
+}
+
+// payjoinReceiverOriginalPSBT builds a minimal Original PSBT that pays
+// `recvAddr` `recvAmount` sats; the sender input is synthetic (we never
+// sign or broadcast). `extraOut` lets a caller append a second output
+// for variants like G8 (mismatched amounts).
+func payjoinReceiverOriginalPSBT(t *testing.T, w *Wallet, recvAddr string, recvAmount int64) string {
+	t.Helper()
+	recvParsed, err := address.DecodeAddress(recvAddr, w.Network())
+	if err != nil {
+		t.Fatalf("DecodeAddress: %v", err)
+	}
+	senderPk := append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0xAB}, 20)...)
+	changePk := append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0xEE}, 20)...)
+
+	tx := &wire.MsgTx{Version: 2, LockTime: 0}
+	tx.TxIn = append(tx.TxIn, &wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0xCC}, Index: 0},
+		Sequence:         BIP125RBFSequence,
+	})
+	tx.TxOut = append(tx.TxOut,
+		&wire.TxOut{Value: recvAmount, PkScript: recvParsed.ScriptPubKey()},
+		&wire.TxOut{Value: 200_000_000 - recvAmount - 1_000, PkScript: changePk},
+	)
+
+	psbt, err := NewPSBT(tx)
+	if err != nil {
+		t.Fatalf("NewPSBT: %v", err)
+	}
+	psbt.Inputs[0].WitnessUTXO = &wire.TxOut{
+		Value:    200_000_000,
+		PkScript: senderPk,
+	}
+	b64, err := psbt.EncodeBase64()
+	if err != nil {
+		t.Fatalf("EncodeBase64: %v", err)
+	}
+	return b64
+}
+
 // ── G1: Receiver HTTP endpoint POST /payjoin ─────────────────────────────────
+//
+// FIX-65 closure: ProcessPayjoinRequest is the wallet-side core that the
+// rpc.Server.handlePayjoin /payjoin handler dispatches to. Exercising the
+// core here proves the wallet layer is wired even without spinning up an
+// httptest server; the rpc/payjoin_receiver_test.go suite covers the
+// transport-layer assertions in parallel.
 
 func TestW119G1_ReceiverHTTPEndpoint(t *testing.T) {
-	t.Skip("BUG-2: receiver-side PayJoin handler missing entirely; no /payjoin route in internal/rpc/server.go (mux only registers JSON-RPC at / and REST at /rest/*)")
+	w, recvAddr := payjoinReceiverWallet(t)
+	body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+
+	resp, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body,
+		Version:            "1",
+	})
+	if perr != nil {
+		t.Fatalf("ProcessPayjoinRequest failed: %v", perr)
+	}
+	if resp == "" {
+		t.Fatal("expected base64 proposal PSBT, got empty string")
+	}
 }
 
 // ── G2: Sender HTTP client POSTs Original PSBT ───────────────────────────────
@@ -264,15 +375,79 @@ func TestW119G3_TLSRequired(t *testing.T) {
 }
 
 // ── G4: Original PSBT v0 deserialization receiver ────────────────────────────
+//
+// FIX-65 closure: garbage base64 → original-psbt-rejected. Empty body →
+// original-psbt-rejected (separate failure-mode message but same code).
+// Together they prove the receiver actually decodes the body rather than
+// silently accepting anything.
 
 func TestW119G4_OriginalPSBTDeserialize(t *testing.T) {
-	t.Skip("BUG-2: DecodePSBT exists in psbt.go but is not called from any /payjoin handler; receiver path absent")
+	w, _ := payjoinReceiverWallet(t)
+
+	t.Run("garbage base64", func(t *testing.T) {
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: "not-a-real-psbt",
+			Version:            "1",
+		})
+		if perr == nil || perr.Code != PayjoinErrOriginalPSBTRejected {
+			t.Fatalf("expected original-psbt-rejected, got %v", perr)
+		}
+	})
+	t.Run("empty body", func(t *testing.T) {
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: "",
+			Version:            "1",
+		})
+		if perr == nil || perr.Code != PayjoinErrOriginalPSBTRejected {
+			t.Fatalf("expected original-psbt-rejected, got %v", perr)
+		}
+	})
 }
 
 // ── G5: Receiver validates Original PSBT ────────────────────────────────────
+//
+// FIX-65 closure: a PSBT that decodes but doesn't pay any receiver-owned
+// EXTERNAL address triggers original-psbt-rejected per BIP-78 §"Receiver's
+// original PSBT validation".
 
 func TestW119G5_ReceiverValidatesPSBT(t *testing.T) {
-	t.Skip("BUG-2: validatePSBTInput exists (psbt.go:1327) but no receiver-side caller enforces BIP-78 'Original PSBT' rules (finalized non-receiver inputs, unsigned receiver inputs, sane fee, sender change identified)")
+	w, _ := payjoinReceiverWallet(t)
+
+	// Build a PSBT that pays a stranger (not the receiver) — recv-output
+	// scan finds nothing and we reject.
+	strangerPk := append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0xDD}, 20)...)
+	senderPk := append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0xAB}, 20)...)
+	tx := &wire.MsgTx{Version: 2, LockTime: 0}
+	tx.TxIn = append(tx.TxIn, &wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0xCC}, Index: 0},
+		Sequence:         BIP125RBFSequence,
+	})
+	tx.TxOut = append(tx.TxOut, &wire.TxOut{Value: 100_000_000, PkScript: strangerPk})
+
+	psbt, err := NewPSBT(tx)
+	if err != nil {
+		t.Fatalf("NewPSBT: %v", err)
+	}
+	psbt.Inputs[0].WitnessUTXO = &wire.TxOut{
+		Value:    200_000_000,
+		PkScript: senderPk,
+	}
+	body, err := psbt.EncodeBase64()
+	if err != nil {
+		t.Fatalf("EncodeBase64: %v", err)
+	}
+
+	_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body,
+		Version:            "1",
+	})
+	if perr == nil || perr.Code != PayjoinErrOriginalPSBTRejected {
+		t.Fatalf("expected original-psbt-rejected (no recv-output match), got %v", perr)
+	}
+	// Sanity check that the message identifies the validation failure.
+	if !strings.Contains(perr.Message, "external") {
+		t.Errorf("error message %q should explain the recv-output check failed", perr.Message)
+	}
 }
 
 // ── G6: Receiver identifies fee output ───────────────────────────────────────
@@ -282,9 +457,35 @@ func TestW119G6_ReceiverIdentifiesFeeOutput(t *testing.T) {
 }
 
 // ── G7: Receiver adds own inputs (anti-fingerprinting) ───────────────────────
+//
+// FIX-65 closure: the proposal MUST contain exactly len(original.TxIn)+1
+// inputs — the receiver's added contribution. Full UIH-1/UIH-2 selection
+// is still deferred (G20 stays Skip), but the "adds an input at all" gate
+// is closed here.
 
 func TestW119G7_ReceiverAddsOwnInputs(t *testing.T) {
-	t.Skip("BUG-8: no UIH-1 / UIH-2 aware UTXO selector on receiver side; coinselection.go targets standard sends only")
+	w, recvAddr := payjoinReceiverWallet(t)
+	body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+
+	resp, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body,
+		Version:            "1",
+	})
+	if perr != nil {
+		t.Fatalf("ProcessPayjoinRequest: %v", perr)
+	}
+
+	proposal, err := DecodePSBTBase64(resp)
+	if err != nil {
+		t.Fatalf("DecodePSBTBase64: %v", err)
+	}
+	if got, want := len(proposal.UnsignedTx.TxIn), 2; got != want {
+		t.Errorf("proposal inputs = %d, want %d (1 sender + 1 receiver-added)", got, want)
+	}
+	// The receiver's added input is signed: PartialSigs non-empty.
+	if got := len(proposal.Inputs[1].PartialSigs); got == 0 {
+		t.Errorf("receiver input has no PartialSigs — anti-fingerprinting contribution unsigned")
+	}
 }
 
 // ── G8: Receiver modifies sender output ──────────────────────────────────────
@@ -294,9 +495,61 @@ func TestW119G8_ReceiverModifiesSenderOutput(t *testing.T) {
 }
 
 // ── G9: Receiver fee adjustment (max bound) ──────────────────────────────────
+//
+// FIX-65 closure (partial): the receiver MUST grow the receiver-paying
+// output by EXACTLY the added input value, so the fee stays unchanged.
+// The maxadditionalfeecontribution clamp (BUG-18) is still deferred —
+// FIX-65 only opens the structural door — but the "fee is invariant"
+// half is closed here.
 
 func TestW119G9_ReceiverFeeAdjustment(t *testing.T) {
-	t.Skip("BUG-18: no clamp at maxadditionalfeecontribution; receiver must not silently raise fee past sender's bound")
+	w, recvAddr := payjoinReceiverWallet(t)
+	const recvAmount = int64(50_000_000)
+	body := payjoinReceiverOriginalPSBT(t, w, recvAddr, recvAmount)
+
+	// Compute original-fee for the comparison.
+	original, err := DecodePSBTBase64(body)
+	if err != nil {
+		t.Fatalf("decode original: %v", err)
+	}
+	var origIn, origOut int64
+	for _, in := range original.Inputs {
+		origIn += in.WitnessUTXO.Value
+	}
+	for _, out := range original.UnsignedTx.TxOut {
+		origOut += out.Value
+	}
+	origFee := origIn - origOut
+
+	resp, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+		OriginalPSBTBase64: body,
+		Version:            "1",
+	})
+	if perr != nil {
+		t.Fatalf("ProcessPayjoinRequest: %v", perr)
+	}
+	proposal, err := DecodePSBTBase64(resp)
+	if err != nil {
+		t.Fatalf("decode proposal: %v", err)
+	}
+
+	// Sum proposal inputs/outputs and verify the fee is identical to the
+	// original (receiver added input value == receiver output growth).
+	var propIn, propOut int64
+	for _, in := range proposal.Inputs {
+		if in.WitnessUTXO == nil {
+			t.Fatalf("proposal input missing WitnessUTXO; cannot sum")
+		}
+		propIn += in.WitnessUTXO.Value
+	}
+	for _, out := range proposal.UnsignedTx.TxOut {
+		propOut += out.Value
+	}
+	propFee := propIn - propOut
+	if propFee != origFee {
+		t.Errorf("proposal fee = %d, want %d (receiver MUST grow recv output by exactly the added input — fee invariant)",
+			propFee, origFee)
+	}
 }
 
 // ── G10: Sender anti-snoop: outputs preserved ───────────────────────────────
@@ -342,9 +595,76 @@ func TestW119G16_QueryParamsParsed(t *testing.T) {
 }
 
 // ── G17: Receiver error responses (4 BIP-78 codes) ──────────────────────────
+//
+// FIX-65 closure: all four BIP-78 errorCodes are emittable from the
+// wallet-side ProcessPayjoinRequest. The HTTP-status mapping is covered
+// by rpc/payjoin_receiver_test.go (TestPayjoinReceiver*); this test
+// proves the wallet layer drives each branch correctly.
 
 func TestW119G17_ReceiverErrorResponses(t *testing.T) {
-	t.Skip("BUG-7: no JSON {errorCode, message} body emitter; the four BIP-78 codes (unavailable, not-enough-money, version-unsupported, original-psbt-rejected) are unmapped")
+	t.Run("version-unsupported", func(t *testing.T) {
+		w, recvAddr := payjoinReceiverWallet(t)
+		body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: body,
+			Version:            "2",
+		})
+		if perr == nil || perr.Code != PayjoinErrVersionUnsupported {
+			t.Fatalf("expected version-unsupported, got %v", perr)
+		}
+	})
+	t.Run("original-psbt-rejected", func(t *testing.T) {
+		w, _ := payjoinReceiverWallet(t)
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: "garbage",
+			Version:            "1",
+		})
+		if perr == nil || perr.Code != PayjoinErrOriginalPSBTRejected {
+			t.Fatalf("expected original-psbt-rejected, got %v", perr)
+		}
+	})
+	t.Run("not-enough-money", func(t *testing.T) {
+		// Build wallet with NO UTXOs.
+		w := NewWallet(WalletConfig{
+			DataDir:     t.TempDir(),
+			Network:     address.Regtest,
+			ChainParams: consensus.RegtestParams(),
+			AddressType: AddressTypeP2WPKH,
+		})
+		if err := w.CreateFromMnemonic(
+			"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+			"",
+		); err != nil {
+			t.Fatalf("CreateFromMnemonic: %v", err)
+		}
+		recvAddr, err := w.NewAddress()
+		if err != nil {
+			t.Fatalf("NewAddress: %v", err)
+		}
+		body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: body,
+			Version:            "1",
+		})
+		if perr == nil || perr.Code != PayjoinErrNotEnoughMoney {
+			t.Fatalf("expected not-enough-money, got %v", perr)
+		}
+	})
+	t.Run("unavailable (wallet locked)", func(t *testing.T) {
+		w, recvAddr := payjoinReceiverWallet(t)
+		// Encrypt + lock so the wallet is in the unavailable state.
+		if err := w.EncryptWallet("test-passphrase"); err != nil {
+			t.Fatalf("EncryptWallet: %v", err)
+		}
+		body := payjoinReceiverOriginalPSBT(t, w, recvAddr, 50_000_000)
+		_, perr := w.ProcessPayjoinRequest(&PayjoinRequest{
+			OriginalPSBTBase64: body,
+			Version:            "1",
+		})
+		if perr == nil || perr.Code != PayjoinErrUnavailable {
+			t.Fatalf("expected unavailable (wallet locked), got %v", perr)
+		}
+	})
 }
 
 // ── G18: Receiver TTL on offered payjoin ────────────────────────────────────

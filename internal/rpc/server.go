@@ -282,7 +282,16 @@ func (s *Server) Start() error {
 		log.Printf("REST API enabled")
 	}
 
-	// Register JSON-RPC handler (must be after REST to not override /rest/ paths)
+	// Register BIP-78 PayJoin receiver route (W119 BUG-2 / FIX-65). The
+	// route is always registered so a remote sender hitting /payjoin gets
+	// a proper BIP-78 JSON error body when the receiver isn't ready
+	// (e.g. no wallet loaded) rather than the JSON-RPC `Method not found`
+	// envelope. Must be registered BEFORE the catch-all "/" so the more
+	// specific path wins.
+	mux.HandleFunc(payjoinPath, s.handlePayjoin)
+
+	// Register JSON-RPC handler (must be after REST and PayJoin to not
+	// override their explicit paths).
 	mux.HandleFunc("/", s.handleRPC)
 
 	s.httpServer = &http.Server{
