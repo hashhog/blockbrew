@@ -389,6 +389,62 @@ func TestGetMempoolInfo(t *testing.T) {
 	if size, ok := result["size"].(float64); !ok || size != 0 {
 		t.Errorf("expected empty mempool, got size %v", size)
 	}
+
+	// W120 BUG-5 / FIX-68: getmempoolinfo.fullrbf reflects the actual
+	// mp.FullRBF() value, not a hardcoded constant. DefaultConfig() turns
+	// on fullrbf to mirror Core DEFAULT_MEMPOOL_FULL_RBF=true.
+	if fullRBF, ok := result["fullrbf"].(bool); !ok || !fullRBF {
+		t.Errorf("getmempoolinfo.fullrbf: got %v, want true "+
+			"(DefaultConfig uses MempoolFullRBF=true, mirrors Core "+
+			"DEFAULT_MEMPOOL_FULL_RBF since v28; W120 BUG-5 / FIX-68)",
+			result["fullrbf"])
+	}
+}
+
+// TestGetMempoolInfo_FullRBFReflectsConfig is the positive form of the W120
+// BUG-5 / FIX-68 test: the RPC `fullrbf` field MUST match the mempool's
+// actual `-mempoolfullrbf` setting. Pre-fix the field was a hardcoded
+// `true` while `checkRBFLocked` ignored the setting and always enforced
+// Rule 1 — the "comment-as-confession" form. Post-fix the field is wired
+// through `mp.FullRBF()` and changes when the operator sets the flag.
+func TestGetMempoolInfo_FullRBFReflectsConfig(t *testing.T) {
+	cases := []struct {
+		name           string
+		mempoolFullRBF bool
+	}{
+		{"fullrbf_on_matches_v28_default", true},
+		{"fullrbf_off_matches_legacy_bip125", false},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			mp := mempool.New(mempool.Config{
+				MaxSize:                10_000_000,
+				MinRelayFeeRate:        1000,
+				MempoolFullRBF:         tc.mempoolFullRBF,
+				MempoolFullRBFExplicit: true,
+			}, nil)
+			server := NewServer(
+				RPCConfig{ListenAddr: "127.0.0.1:0"},
+				WithMempool(mp),
+			)
+			resp := testRPCRequest(t, server.handleRPC, "getmempoolinfo", []interface{}{}, "", "")
+			if resp.Error != nil {
+				t.Fatalf("unexpected error: %v", resp.Error)
+			}
+			result := resp.Result.(map[string]interface{})
+			fullRBF, _ := result["fullrbf"].(bool)
+			if fullRBF != tc.mempoolFullRBF {
+				t.Errorf("getmempoolinfo.fullrbf=%v but mempool.FullRBF()=%v "+
+					"— the RPC must mirror runtime policy, not lie "+
+					"(W120 BUG-5 / FIX-68)", fullRBF, tc.mempoolFullRBF)
+			}
+			// Cross-check via the Mempool getter directly.
+			if mp.FullRBF() != tc.mempoolFullRBF {
+				t.Errorf("mp.FullRBF()=%v, want %v", mp.FullRBF(), tc.mempoolFullRBF)
+			}
+		})
+	}
 }
 
 func TestGetRawMempool(t *testing.T) {
@@ -413,6 +469,108 @@ func TestGetRawMempool(t *testing.T) {
 
 	if len(result) != 0 {
 		t.Errorf("expected empty mempool, got %d transactions", len(result))
+	}
+}
+
+// TestMempoolEntryBIP125Replaceable asserts that the W120 BUG-1 / FIX-68
+// `bip125-replaceable` JSON field on `MempoolEntry` is wired through
+// `mempoolEntryFromTxEntry` and computes from the mempool's fullrbf state
+// plus the tx's signaling behaviour.
+//
+// Reference: bitcoin-core/src/rpc/mempool.cpp::MempoolEntryToJSON;
+// BIP-125 §"Signaling implementation"; Core v28+ DEFAULT_MEMPOOL_FULL_RBF.
+func TestMempoolEntryBIP125Replaceable(t *testing.T) {
+	cases := []struct {
+		name           string
+		mempoolFullRBF bool
+		txSequence     uint32
+		want           bool
+	}{
+		{
+			name:           "signaling_under_fullrbf_true_yes",
+			mempoolFullRBF: true,
+			txSequence:     0xFFFFFFFD, // signals RBF
+			want:           true,
+		},
+		{
+			name:           "non_signaling_under_fullrbf_true_yes",
+			mempoolFullRBF: true,
+			txSequence:     0xFFFFFFFE, // anti-fee-snipe, no RBF intent
+			want:           true,
+		},
+		{
+			name:           "non_signaling_under_fullrbf_false_no",
+			mempoolFullRBF: false,
+			txSequence:     0xFFFFFFFE, // anti-fee-snipe
+			want:           false,
+		},
+		{
+			name:           "signaling_under_fullrbf_false_yes",
+			mempoolFullRBF: false,
+			txSequence:     0xFFFFFFFD,
+			want:           true,
+		},
+		{
+			name:           "all_final_under_fullrbf_false_no",
+			mempoolFullRBF: false,
+			txSequence:     0xFFFFFFFF, // SEQUENCE_FINAL
+			want:           false,
+		},
+		{
+			name:           "all_final_under_fullrbf_true_yes",
+			mempoolFullRBF: true,
+			txSequence:     0xFFFFFFFF,
+			want:           true,
+		},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			mp := mempool.New(mempool.Config{
+				MaxSize:                10_000_000,
+				MinRelayFeeRate:        1000,
+				MempoolFullRBF:         tc.mempoolFullRBF,
+				MempoolFullRBFExplicit: true,
+			}, nil)
+			server := NewServer(
+				RPCConfig{ListenAddr: "127.0.0.1:0"},
+				WithMempool(mp),
+			)
+
+			// Build a minimal mempool TxEntry — we don't actually need
+			// to drive AcceptToMemoryPool; we drive the rendering path
+			// directly via mempoolEntryFromTxEntry. The TxEntry's tx is
+			// the only thing the signaling walker inspects.
+			var seedHash wire.Hash256
+			seedHash[0] = 0xAB
+			tx := &wire.MsgTx{Version: 2}
+			tx.TxIn = []*wire.TxIn{{
+				PreviousOutPoint: wire.OutPoint{Hash: seedHash, Index: 0},
+				Sequence:         tc.txSequence,
+			}}
+			tx.TxOut = []*wire.TxOut{{
+				Value:    100_000,
+				PkScript: []byte{0x00, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20},
+			}}
+			txHash := tx.TxHash()
+			entry := &mempool.TxEntry{
+				Tx:      tx,
+				TxHash:  txHash,
+				Fee:     1000,
+				Size:    150,
+				FeeRate: 6.66,
+				Time:    time.Now(),
+			}
+			mempool.InjectTestEntry(mp, entry)
+
+			rendered := server.mempoolEntryFromTxEntry(entry)
+			if rendered.BIP125Replaceable != tc.want {
+				t.Errorf("MempoolEntry.BIP125Replaceable=%v, want %v "+
+					"(fullrbf=%v, seq=0x%08x)",
+					rendered.BIP125Replaceable, tc.want,
+					tc.mempoolFullRBF, tc.txSequence)
+			}
+		})
 	}
 }
 

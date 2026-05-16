@@ -55,6 +55,17 @@ type Config struct {
 	MinRelayFee  float64
 	PrintVersion bool
 
+	// MempoolFullRBF mirrors Bitcoin Core's `-mempoolfullrbf` switch (init.cpp).
+	// True (the default; matches Core's DEFAULT_MEMPOOL_FULL_RBF=true since
+	// v28) makes mempool replacement skip BIP-125 Rule 1 (opt-in signaling)
+	// — every conflict is replaceable subject to Rules 3/4/5 and
+	// ImprovesFeerateDiagram. False reinstates the legacy BIP-125 behaviour
+	// that requires at least one conflicting tx (or any in-mempool ancestor)
+	// to signal RBF. Surfaced through `getmempoolinfo.fullrbf` so the RPC
+	// truth value reflects the runtime policy. W120 BUG-5 / FIX-68.
+	MempoolFullRBF         bool
+	MempoolFullRBFExplicit bool // true when the operator set -mempoolfullrbf= on the CLI/conf
+
 	// Rest enables Bitcoin Core's REST HTTP surface
 	// (`/rest/block/...`, `/rest/tx/...`, `/rest/chaininfo.json`, etc.) on
 	// the same socket as the JSON-RPC server. Default false, matching
@@ -455,6 +466,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.RPCTLSKey, "rpc-tls-key", "", "Path to a PEM-encoded private key paired with -rpc-tls-cert. Empty (default) = serve plain HTTP. See -rpc-tls-cert.")
 	flag.Int64Var(&cfg.MaxMempool, "maxmempool", 300, "Maximum mempool size in MB")
 	flag.Float64Var(&cfg.MinRelayFee, "minrelayfee", 0.00001, "Minimum relay fee (BTC/kvB)")
+	flag.BoolVar(&cfg.MempoolFullRBF, "mempoolfullrbf", true, "Accept mempool replacements without BIP-125 opt-in signaling (Core v28+ default; DEFAULT_MEMPOOL_FULL_RBF=true). When true, Rule 1 is skipped — every conflict is replaceable subject to Rules 3/4/5 + ImprovesFeerateDiagram. When false (legacy), conflicts must signal (directly or via in-mempool ancestor) to be replaceable. The `getmempoolinfo.fullrbf` field reflects this setting. W120 BUG-5 / FIX-68.")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "Print version and exit")
 	flag.StringVar(&cfg.PprofAddr, "pprof", "", "pprof HTTP server address (e.g., localhost:6060)")
 	flag.BoolVar(&cfg.ParallelScripts, "parallelscripts", true, "Enable parallel script validation")
@@ -805,8 +817,15 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		MaxOrphanTxs:    100,
 		ChainParams:     chainParams,
 		ChainState:      newChainStateAdapter(chainMgr),
+		// W120 BUG-5 / FIX-68: wire -mempoolfullrbf through to the mempool
+		// so BIP-125 Rule 1 is conditional on the operator's switch instead
+		// of unconditionally enforced. Default-true at the CLI matches Core
+		// DEFAULT_MEMPOOL_FULL_RBF; Explicit=true so mempool.New does not
+		// overwrite the flag with its own default.
+		MempoolFullRBF:         cfg.MempoolFullRBF,
+		MempoolFullRBFExplicit: true,
 	}, utxoSet)
-	log.Printf("Mempool initialized (max %d MB)", cfg.MaxMempool)
+	log.Printf("Mempool initialized (max %d MB, fullrbf=%v)", cfg.MaxMempool, cfg.MempoolFullRBF)
 
 	// 6a. Optional secondary indexes. Constructed before the chain → index
 	// hooks below so the OnBlockConnected / OnBlockDisconnected fan-out can

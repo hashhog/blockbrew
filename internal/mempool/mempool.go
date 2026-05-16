@@ -208,6 +208,21 @@ const (
 	// nSequence = 0xfffffffe (anti-fee-snipe locktime, no RBF intent)
 	// must NOT be marked replaceable.
 	MaxBIP125RBFSequence uint32 = 0xFFFFFFFD
+
+	// DefaultMempoolFullRBF is the default value of the -mempoolfullrbf
+	// configuration switch. Mirrors Bitcoin Core's
+	// `DEFAULT_MEMPOOL_FULL_RBF = true` (`src/policy/policy.h`, since v28).
+	//
+	// When true (the default): mempool replacement skips BIP-125 Rule 1
+	// (opt-in signaling) and replaces any conflicting transaction that
+	// satisfies the remaining policy gates (Rules 3/4/5 + ImprovesFeerateDiagram).
+	// Core v28+ in fact hard-coded the Rule 1 short-circuit out of
+	// validation.cpp::ReplacementChecks; the `fullrbf` field in
+	// getmempoolinfo is marked DEPRECATED and always reports true. blockbrew
+	// keeps the policy switch (and the RPC truth value) plumbed so operators
+	// who need legacy opt-in-only mempool acceptance can still set
+	// `-mempoolfullrbf=0` without recompiling.
+	DefaultMempoolFullRBF = true
 )
 
 // Standard transaction policy constants (mirrors policy/policy.h).
@@ -346,16 +361,38 @@ type Config struct {
 	// DescendantSizeLimitKvB overrides DefaultDescendantSizeLimitKvB when > 0.
 	// Set to math.MaxInt to disable the descendant size check.
 	DescendantSizeLimitKvB int
+
+	// MempoolFullRBF mirrors Bitcoin Core's `-mempoolfullrbf` flag
+	// (`src/init.cpp`; default `DEFAULT_MEMPOOL_FULL_RBF=true` since v28).
+	// When true, mempool acceptance skips BIP-125 Rule 1 (opt-in signaling
+	// check) and replacements proceed solely on Rules 3/4/5 +
+	// ImprovesFeerateDiagram. When false, replacements MUST signal (directly
+	// or via an in-mempool ancestor) to be accepted — the legacy BIP-125
+	// behaviour.
+	//
+	// The zero value `false` is intentionally NOT the runtime default;
+	// `mempool.New` rewrites a zero-value Config field to
+	// `DefaultMempoolFullRBF` so test callers and `mempool.DefaultConfig`
+	// both land on full RBF unless they explicitly opt out.
+	//
+	// MempoolFullRBFExplicit is the "user intentionally set this" sentinel
+	// used by `New` to distinguish "operator set -mempoolfullrbf=false" from
+	// "zero-valued Config struct" (which should default to true). Wire the
+	// flag through to here when constructing the mempool from CLI options.
+	MempoolFullRBF         bool
+	MempoolFullRBFExplicit bool
 }
 
 // DefaultConfig returns a mempool config with sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		MaxSize:             300_000_000, // 300 MB
-		MinRelayFeeRate:     1000,        // 1 sat/vB
-		IncrementalRelayFee: 1000,        // 1 sat/vB
-		MaxOrphanTxs:        100,
-		ChainParams:         consensus.MainnetParams(),
+		MaxSize:                300_000_000, // 300 MB
+		MinRelayFeeRate:        1000,        // 1 sat/vB
+		IncrementalRelayFee:    1000,        // 1 sat/vB
+		MaxOrphanTxs:           100,
+		ChainParams:            consensus.MainnetParams(),
+		MempoolFullRBF:         DefaultMempoolFullRBF,
+		MempoolFullRBFExplicit: true,
 	}
 }
 
@@ -517,6 +554,16 @@ func New(config Config, utxoSet consensus.UTXOView) *Mempool {
 	if config.ChainParams == nil {
 		config.ChainParams = consensus.MainnetParams()
 	}
+	if !config.MempoolFullRBFExplicit {
+		// Operator (or test caller) did not explicitly set MempoolFullRBF.
+		// Apply Core's `DEFAULT_MEMPOOL_FULL_RBF` so the zero-value Config
+		// struct does NOT silently fall back to legacy opt-in-only RBF.
+		// This was the W120 BUG-5 "comment-as-confession" failure mode:
+		// `getmempoolinfo` advertised `fullrbf:true` while
+		// `checkRBFLocked` unconditionally required signaling.
+		config.MempoolFullRBF = DefaultMempoolFullRBF
+		config.MempoolFullRBFExplicit = true
+	}
 
 	return &Mempool{
 		config:               config,
@@ -527,6 +574,66 @@ func New(config Config, utxoSet consensus.UTXOView) *Mempool {
 		clusters:             NewClusterManager(),
 		lastRollingFeeUpdate: time.Now().Unix(),
 	}
+}
+
+// SignalsBIP125Replaceable returns the string Core's
+// `src/rpc/mempool.cpp::MempoolEntryToJSON` and
+// `src/wallet/rpc/util.cpp::WalletTxToJSON` ship in their
+// `bip125-replaceable` JSON field:
+//
+//	"yes" - the transaction (or any of its in-mempool ancestors) signals
+//	         BIP-125 opt-in, OR -mempoolfullrbf is enabled so every conflict
+//	         is replaceable regardless of signaling.
+//	"no"  - the transaction is in our mempool and neither it nor any of its
+//	         in-mempool ancestors signal RBF, AND -mempoolfullrbf is off.
+//	"unknown" - the transaction is NOT in our mempool (caller passed a txid
+//	         we have no entry for). Mirrors Core's RBFTransactionState::UNKNOWN.
+//
+// Walking unconfirmed ancestors matches BIP-125 §"Signaling implementation":
+// a tx inherits its parents' opt-in status. Reference: Bitcoin Core
+// `src/policy/rbf.cpp::IsRBFOptIn` (the walker) and
+// `MempoolEntryToJSON`'s "bip125-replaceable" emission for the string form.
+func (mp *Mempool) SignalsBIP125Replaceable(txHash wire.Hash256) string {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.signalsBIP125ReplaceableLocked(txHash)
+}
+
+// signalsBIP125ReplaceableLocked is the lock-held form of
+// SignalsBIP125Replaceable. Callers that already hold mp.mu (e.g. the RPC
+// verbose-listing loops) use this to avoid re-acquiring the lock per entry.
+func (mp *Mempool) signalsBIP125ReplaceableLocked(txHash wire.Hash256) string {
+	entry, ok := mp.pool[txHash]
+	if !ok {
+		return "unknown"
+	}
+	// Full RBF disables the signaling requirement entirely — every
+	// in-mempool tx is replaceable.
+	if mp.config.MempoolFullRBF {
+		return "yes"
+	}
+	if signalsRBF(entry.Tx) {
+		return "yes"
+	}
+	visited := make(map[wire.Hash256]bool)
+	for _, ancHash := range mp.collectAncestorsLocked(txHash, visited) {
+		if ancEntry, ok := mp.pool[ancHash]; ok && signalsRBF(ancEntry.Tx) {
+			return "yes"
+		}
+	}
+	return "no"
+}
+
+// FullRBF reports the mempool's currently configured -mempoolfullrbf policy.
+// True = Rule 1 (opt-in signaling) is SKIPPED on every replacement (Core
+// v28+ default). False = legacy BIP-125 behaviour requiring at least one
+// conflicting tx (or any in-mempool ancestor) to signal RBF.
+//
+// Consumed by `internal/rpc`'s getmempoolinfo handler so the advertised
+// `fullrbf` field reflects actual runtime policy. Lock-free read on an
+// immutable config field; safe to call from any goroutine.
+func (mp *Mempool) FullRBF() bool {
+	return mp.config.MempoolFullRBF
 }
 
 // SetChainHeight updates the chain height (called when blocks are connected/disconnected).
@@ -2365,25 +2472,34 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 	//   (b) any of its in-mempool ancestors signals.
 	// Mirrors Bitcoin Core IsRBFOptIn (rbf.cpp:24-50) which checks the tx
 	// itself first, then walks mempool ancestors via CalculateMemPoolAncestors.
-	for txHash := range conflicting {
-		entry, ok := mp.pool[txHash]
-		if !ok {
-			continue
-		}
-		if !signalsRBF(entry.Tx) {
-			// Check if any in-mempool ancestor signals RBF (inherited opt-in).
-			// Core rbf.cpp:39-48.
-			ancestorSignals := false
-			visited := make(map[wire.Hash256]bool)
-			for _, ancHash := range mp.collectAncestorsLocked(txHash, visited) {
-				if ancEntry, ok := mp.pool[ancHash]; ok && signalsRBF(ancEntry.Tx) {
-					ancestorSignals = true
-					break
-				}
+	//
+	// SKIPPED when `-mempoolfullrbf=1` (the runtime default; matches Core's
+	// DEFAULT_MEMPOOL_FULL_RBF=true since v28). Core v28+ in fact removed
+	// the Rule 1 short-circuit entirely from validation.cpp::ReplacementChecks
+	// — every conflict is considered replaceable. We retain the legacy
+	// signaling path so operators who explicitly run `-mempoolfullrbf=0` get
+	// pre-v28 behaviour without a recompile (W120 BUG-5 / FIX-68).
+	if !mp.config.MempoolFullRBF {
+		for txHash := range conflicting {
+			entry, ok := mp.pool[txHash]
+			if !ok {
+				continue
 			}
-			if !ancestorSignals {
-				return fmt.Errorf("%w: tx %s does not signal RBF (neither directly nor via ancestor)",
-					ErrRBFNotSignaled, txHash)
+			if !signalsRBF(entry.Tx) {
+				// Check if any in-mempool ancestor signals RBF (inherited opt-in).
+				// Core rbf.cpp:39-48.
+				ancestorSignals := false
+				visited := make(map[wire.Hash256]bool)
+				for _, ancHash := range mp.collectAncestorsLocked(txHash, visited) {
+					if ancEntry, ok := mp.pool[ancHash]; ok && signalsRBF(ancEntry.Tx) {
+						ancestorSignals = true
+						break
+					}
+				}
+				if !ancestorSignals {
+					return fmt.Errorf("%w: tx %s does not signal RBF (neither directly nor via ancestor)",
+						ErrRBFNotSignaled, txHash)
+				}
 			}
 		}
 	}
@@ -2516,6 +2632,40 @@ func signalsRBF(tx *wire.MsgTx) bool {
 		}
 	}
 	return false
+}
+
+// SignalsRBFForRPC is the exported wrapper around `signalsRBF`. The RPC
+// layer needs to render the BIP-125 replaceable bit on objects (mempool
+// entries, wallet transactions) without acquiring the mempool lock for an
+// ancestor walk — e.g. when the tx in question is NOT in our mempool. This
+// returns only the direct-signaling bit; callers that need the BIP-125
+// "tx OR any unconfirmed ancestor" semantics should use
+// `Mempool.SignalsBIP125Replaceable` instead.
+//
+// Mirrors Bitcoin Core's `bitcoin-core/src/util/rbf.cpp::SignalsOptInRBF`
+// (the per-tx form, distinct from `policy/rbf.cpp::IsRBFOptIn` which walks
+// ancestors). Renamed to ForRPC to make the intentional looseness obvious
+// at call sites.
+func SignalsRBFForRPC(tx *wire.MsgTx) bool {
+	return signalsRBF(tx)
+}
+
+// InjectTestEntry inserts a TxEntry into the mempool's pool map without
+// running validation. EXPORTED FOR TEST USE ONLY by the RPC package's
+// `bip125-replaceable` field rendering test (which needs an in-pool entry
+// without driving the full AcceptToMemoryPool path; the cross-package test
+// has no access to the unexported `addPoolEntry` test helper).
+//
+// Do NOT call from production code. Wires outpoints and bumps the
+// totalSize counter to keep mempool invariants minimally satisfied.
+func InjectTestEntry(mp *Mempool, entry *TxEntry) {
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	mp.pool[entry.TxHash] = entry
+	for _, in := range entry.Tx.TxIn {
+		mp.outpoints[in.PreviousOutPoint] = entry.TxHash
+	}
+	mp.totalSize += entry.Size
 }
 
 // checkRBFNoNewUnconfirmedInputsLocked enforces BIP-125 Rule 2: every
@@ -3162,10 +3312,15 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 	var missingInputs []wire.OutPoint
 
 	for _, in := range tx.TxIn {
-		// Check for double-spend in mempool
+		// Check for double-spend in mempool. Under -mempoolfullrbf=true
+		// (Core v28+ default) every conflict is replaceable regardless of
+		// signaling — the Rule 1 short-circuit here is bypassed and the
+		// final accept/reject decision is deferred to the full
+		// `checkRBFLocked` walker (Rules 3/4/5 + ImprovesFeerateDiagram).
+		// W120 BUG-5 / FIX-68.
 		if existingTxHash, ok := mp.outpoints[in.PreviousOutPoint]; ok {
 			existingEntry := mp.pool[existingTxHash]
-			if existingEntry != nil && !signalsRBF(existingEntry.Tx) {
+			if existingEntry != nil && !mp.config.MempoolFullRBF && !signalsRBF(existingEntry.Tx) {
 				return 0, 0, ErrRBFNotSignaled
 			}
 		}
