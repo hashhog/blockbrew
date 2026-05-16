@@ -59,15 +59,20 @@ package mempool
 //   A caller cannot distinguish a missing-input from an RBF-rule violation
 //   without parsing the message text. internal/rpc/methods.go:988.
 //
-// BUG-5 (P1 CDIV — comment-as-confession): getmempoolinfo hardcodes
-//   FullRBF: true (internal/rpc/methods.go:1266) BUT the actual mempool
-//   policy code unconditionally requires opt-in signaling
-//   (checkRBFLocked:2368-2389). There is no `-mempoolfullrbf` config flag
-//   wired anywhere. The struct field
-//   (internal/rpc/types.go:239) is decorative. This is "comment-as-
-//   confession": the RPC advertises a policy the code does not implement.
-//   Reference: bitcoin-core/src/policy/policy.h DEFAULT_MEMPOOL_FULL_RBF,
-//   src/init.cpp:687-689 (-mempoolfullrbf).
+// BUG-5 (P1 CDIV — comment-as-confession): RESOLVED by FIX-68.
+//   Previously: getmempoolinfo hardcoded FullRBF: true while
+//   checkRBFLocked unconditionally required opt-in signaling, with no
+//   `-mempoolfullrbf` config flag plumbed.
+//   FIX-68 adds Config.MempoolFullRBF (default true to mirror Core
+//   DEFAULT_MEMPOOL_FULL_RBF since v28), gates the Rule 1 check on the
+//   flag in checkRBFLocked + the validateTransactionLocked double-spend
+//   path, plumbs a CLI flag (-mempoolfullrbf), and changes
+//   handleGetMempoolInfo to read mp.FullRBF() instead of a constant.
+//   The G18 audit test below was rewritten as
+//   `TestW120_G18_FullRBFFlag_Wired` to assert the new conditional
+//   behaviour. Reference: bitcoin-core/src/policy/policy.h
+//   DEFAULT_MEMPOOL_FULL_RBF, src/rpc/mempool.cpp:1058 (fullrbf hard-true
+//   + marked DEPRECATED in v28+ cluster mempool).
 //
 // BUG-6 (P2 CDIV): MempoolInfo RPC type is missing fields shipped by Core
 //   28+: feehistogram, networkactive (sometimes peer-side, but reported in
@@ -125,6 +130,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -281,11 +287,33 @@ func TestW120_G9_DescendantFeesIncludedInRule3(t *testing.T) {
 // G13: getmempoolentry — `bip125-replaceable` field
 // ============================================================================
 
-func TestW120_G13_MempoolEntry_BIP125Replaceable_MISSING(t *testing.T) {
-	t.Skip("BUG-1: MempoolEntry has no `bip125-replaceable` field. " +
-		"Core: src/rpc/mempool.cpp::MempoolEntryToJSON emits it on every entry. " +
-		"Fix path: add string field to internal/rpc/types.go MempoolEntry, " +
-		"compute via signalsRBF(entry.Tx) || any-ancestor-signals.")
+// TestW120_G13_MempoolEntry_BIP125Replaceable_Wired asserts the W120 BUG-1
+// fix (FIX-68): the MempoolEntry RPC type now carries a `bip125-replaceable`
+// JSON bool, computed from the mempool's fullrbf bit + the tx's signaling
+// behaviour + an in-mempool-ancestor walk. The full rendering matrix is
+// exercised in internal/rpc/server_test.go::TestMempoolEntryBIP125Replaceable
+// (cross-package because the field is computed inside
+// internal/rpc/extra_methods.go::mempoolEntryFromTxEntry); here we just
+// pin the underlying mempool walker.
+//
+// Reference: bitcoin-core/src/rpc/mempool.cpp::MempoolEntryToJSON.
+func TestW120_G13_MempoolEntry_BIP125Replaceable_Wired(t *testing.T) {
+	utxoSet := newTestUTXOSet()
+	var seedHash wire.Hash256
+	seedHash[0] = 0x13
+	op, e := createFundingUTXO(seedHash, 0, 100_000)
+	utxoSet.AddUTXO(op, e)
+
+	// fullrbf=false + RBF-signaling tx → "yes".
+	mp := newTestMempoolOptInRBF(utxoSet)
+	tx := makeRBFTx([]wire.OutPoint{op}, 90_000)
+	h := tx.TxHash()
+	mp.mu.Lock()
+	addPoolEntry(mp, &TxEntry{TxHash: h, Tx: tx, Fee: 1000, Size: 150})
+	mp.mu.Unlock()
+	if got := mp.SignalsBIP125Replaceable(h); got != "yes" {
+		t.Errorf("SignalsBIP125Replaceable(signaling, fullrbf=false): got %q, want %q", got, "yes")
+	}
 }
 
 // ============================================================================
@@ -349,59 +377,145 @@ func TestW120_G17_RPCErrorCodeMapping_MISSING(t *testing.T) {
 // G18 / G19: -mempoolfullrbf flag and getmempoolinfo.fullrbf correctness
 // ============================================================================
 
-// TestW120_G18_FullRBFFlag_HardcodedNotWired demonstrates BUG-5: the RPC
-// claims fullrbf=true but the policy is opt-in only. A caller reading the
-// RPC and deciding to broadcast a non-signaling tx replacement (under the
-// impression the node will accept it) will be silently mis-served. This is
-// the *active failing assertion* form of the bug.
-func TestW120_G18_FullRBFFlag_HardcodedNotWired(t *testing.T) {
-	// We can't easily call handleGetMempoolInfo from this package without
-	// pulling in the rpc package's full Server type. Instead we assert at
-	// the *behavioural* level that checkRBFLocked unconditionally requires
-	// opt-in. If fullrbf were truly wired, a non-signaling conflict
-	// would be replaceable.
-	utxoSet := newTestUTXOSet()
-	var seedHash wire.Hash256
-	seedHash[0] = 0xFB
-	opSeed, eSeed := createFundingUTXO(seedHash, 0, 300_000)
-	utxoSet.AddUTXO(opSeed, eSeed)
+// TestW120_G18_FullRBFFlag_Wired is the post-FIX-68 form of the W120 BUG-5
+// audit test. It asserts the runtime fix:
+//
+//   1. The mempool now exposes a `-mempoolfullrbf` switch via `Config.MempoolFullRBF`,
+//      defaulted to true (mirrors Core `DEFAULT_MEMPOOL_FULL_RBF` since v28).
+//   2. With `MempoolFullRBF=true`, `checkRBFLocked` SKIPS the Rule 1 (opt-in
+//      signaling) check entirely — every conflict is replaceable subject to
+//      Rules 3/4/5 + ImprovesFeerateDiagram.
+//   3. With `MempoolFullRBF=false`, the legacy BIP-125 opt-in path is taken
+//      and a non-signaling conflict is rejected with `ErrRBFNotSignaled`.
+//   4. `mp.FullRBF()` returns the configured value so the RPC `getmempoolinfo.fullrbf`
+//      field can render the truth instead of a hardcoded `true`.
+//
+// W120 BUG-5 was the "comment-as-confession" form: `getmempoolinfo` returned
+// `FullRBF: true` while `checkRBFLocked` unconditionally rejected non-signaling
+// conflicts. FIX-68 wired the switch end-to-end. Reference:
+// `bitcoin-core/src/policy/policy.h DEFAULT_MEMPOOL_FULL_RBF`,
+// `bitcoin-core/src/validation.cpp::ReplacementChecks` (Rule 1 removed in v28
+// cluster mempool), `bitcoin-core/src/rpc/mempool.cpp:1058` (`fullrbf` hard-true
+// + marked DEPRECATED).
+func TestW120_G18_FullRBFFlag_Wired(t *testing.T) {
+	// Sub-test 1: with fullrbf=true (the new default), a non-signaling
+	// conflict IS replaceable. Rule 1 is bypassed; the fee bump on the
+	// replacement determines acceptance.
+	t.Run("fullrbf_true_skips_rule1", func(t *testing.T) {
+		utxoSet := newTestUTXOSet()
+		var seedHash wire.Hash256
+		seedHash[0] = 0xFB
+		opSeed, eSeed := createFundingUTXO(seedHash, 0, 300_000)
+		utxoSet.AddUTXO(opSeed, eSeed)
 
-	mp := newTestMempool(utxoSet)
+		mp := newTestMempool(utxoSet) // fullrbf=true (default)
+		if !mp.FullRBF() {
+			t.Fatalf("newTestMempool: FullRBF()=false, want true (Core DEFAULT_MEMPOOL_FULL_RBF)")
+		}
 
-	// Seed a NON-signaling conflict C.
-	cTx := makeFinalTx([]wire.OutPoint{opSeed}, 200_000)
-	cHash := cTx.TxHash()
-	mp.mu.Lock()
-	addPoolEntry(mp, &TxEntry{TxHash: cHash, Tx: cTx, Fee: 1000, Size: 150})
-	mp.mu.Unlock()
+		// Seed a NON-signaling conflict C.
+		cTx := makeFinalTx([]wire.OutPoint{opSeed}, 200_000)
+		cHash := cTx.TxHash()
+		mp.mu.Lock()
+		addPoolEntry(mp, &TxEntry{TxHash: cHash, Tx: cTx, Fee: 1000, Size: 150})
+		mp.mu.Unlock()
 
-	// Replacement R signals RBF and pays more.
-	rTx := makeRBFTx([]wire.OutPoint{opSeed}, 199_000)
-	conflicting := map[wire.Hash256]bool{cHash: true}
+		// Replacement R signals RBF and pays MORE (input value 300k - output
+		// 199k = 101k fee on ~150 vsize ≈ way over the incremental relay
+		// bump, so the only thing that could reject is Rule 1).
+		rTx := makeRBFTx([]wire.OutPoint{opSeed}, 199_000)
+		conflicting := map[wire.Hash256]bool{cHash: true}
 
-	mp.mu.Lock()
-	err := mp.checkRBFLocked(rTx, conflicting, int64(300_000))
-	mp.mu.Unlock()
+		mp.mu.Lock()
+		err := mp.checkRBFLocked(rTx, conflicting, int64(300_000))
+		mp.mu.Unlock()
 
-	// Under TRUE fullrbf the replacement would be accepted (no Rule 1).
-	// Under blockbrew's actual policy it is REJECTED. This proves the RPC
-	// claim diverges from runtime policy.
-	if !errors.Is(err, ErrRBFNotSignaled) {
-		t.Skip("BUG-5 (G18/G19): if this test starts FAILING because err is " +
-			"nil, the policy may have been silently wired to fullrbf — " +
-			"verify intentionally. Currently the RPC advertises FullRBF: true " +
-			"(internal/rpc/methods.go:1266) but the policy code at " +
-			"checkRBFLocked:2384 unconditionally rejects non-signaling " +
-			"conflicts. This is the comment-as-confession pattern: " +
-			"advertise a feature the code does not implement. Fix path: " +
-			"either (a) add a -mempoolfullrbf config flag and wire it into " +
-			"checkRBFLocked's Rule 1 gate, or (b) set FullRBF: false in " +
-			"handleGetMempoolInfo until (a) lands.")
-	}
-	// The expected-current behaviour is rejection, so an err of
-	// ErrRBFNotSignaled confirms the policy is opt-in. The Skip above
-	// emits the BUG-5 narrative so the gate is visible in test output.
-	_ = err
+		if errors.Is(err, ErrRBFNotSignaled) {
+			t.Fatalf("fullrbf=true: Rule 1 should be skipped, but got ErrRBFNotSignaled: %v", err)
+		}
+		// Any other error is fine here (Rules 3/4/5 / diagram) — the point is
+		// the Rule 1 short-circuit no longer rejects on signaling alone.
+	})
+
+	// Sub-test 2: with fullrbf=false (legacy), the same non-signaling
+	// conflict is REJECTED with ErrRBFNotSignaled. Pins the opt-in code path.
+	t.Run("fullrbf_false_enforces_rule1", func(t *testing.T) {
+		utxoSet := newTestUTXOSet()
+		var seedHash wire.Hash256
+		seedHash[0] = 0xFC
+		opSeed, eSeed := createFundingUTXO(seedHash, 0, 300_000)
+		utxoSet.AddUTXO(opSeed, eSeed)
+
+		mp := newTestMempoolOptInRBF(utxoSet)
+		if mp.FullRBF() {
+			t.Fatalf("newTestMempoolOptInRBF: FullRBF()=true, want false")
+		}
+
+		cTx := makeFinalTx([]wire.OutPoint{opSeed}, 200_000)
+		cHash := cTx.TxHash()
+		mp.mu.Lock()
+		addPoolEntry(mp, &TxEntry{TxHash: cHash, Tx: cTx, Fee: 1000, Size: 150})
+		mp.mu.Unlock()
+
+		rTx := makeRBFTx([]wire.OutPoint{opSeed}, 199_000)
+		conflicting := map[wire.Hash256]bool{cHash: true}
+
+		mp.mu.Lock()
+		err := mp.checkRBFLocked(rTx, conflicting, int64(300_000))
+		mp.mu.Unlock()
+
+		if !errors.Is(err, ErrRBFNotSignaled) {
+			t.Fatalf("fullrbf=false: want ErrRBFNotSignaled (Rule 1 enforced), got %v", err)
+		}
+	})
+
+	// Sub-test 3: SignalsBIP125Replaceable returns "yes"/"no"/"unknown"
+	// consistently with the fullrbf state and tx sequence values.
+	t.Run("signals_bip125_replaceable_string", func(t *testing.T) {
+		utxoSet := newTestUTXOSet()
+		var seedHash wire.Hash256
+		seedHash[0] = 0xFD
+		op0, e0 := createFundingUTXO(seedHash, 0, 300_000)
+		op1 := wire.OutPoint{Hash: seedHash, Index: 1}
+		e1 := &consensus.UTXOEntry{Amount: 300_000, PkScript: make([]byte, 22), Height: 1}
+		utxoSet.AddUTXO(op0, e0)
+		utxoSet.AddUTXO(op1, e1)
+
+		// fullrbf=false path: signaling-direct → yes; non-signaling → no.
+		mp := newTestMempoolOptInRBF(utxoSet)
+		rbfTx := makeRBFTx([]wire.OutPoint{op0}, 200_000)
+		rbfHash := rbfTx.TxHash()
+		finalTx := makeFinalTx([]wire.OutPoint{op1}, 200_000)
+		finalHash := finalTx.TxHash()
+		mp.mu.Lock()
+		addPoolEntry(mp, &TxEntry{TxHash: rbfHash, Tx: rbfTx, Fee: 1000, Size: 150})
+		addPoolEntry(mp, &TxEntry{TxHash: finalHash, Tx: finalTx, Fee: 1000, Size: 150})
+		mp.mu.Unlock()
+
+		if got := mp.SignalsBIP125Replaceable(rbfHash); got != "yes" {
+			t.Errorf("signaling tx under fullrbf=false: got %q, want %q", got, "yes")
+		}
+		if got := mp.SignalsBIP125Replaceable(finalHash); got != "no" {
+			t.Errorf("non-signaling tx under fullrbf=false: got %q, want %q", got, "no")
+		}
+
+		// Unknown txid is "unknown" regardless of fullrbf.
+		var unknown wire.Hash256
+		unknown[0] = 0xEE
+		if got := mp.SignalsBIP125Replaceable(unknown); got != "unknown" {
+			t.Errorf("not-in-mempool tx: got %q, want %q", got, "unknown")
+		}
+
+		// fullrbf=true: every in-mempool tx (regardless of nSeq) is "yes".
+		mp2 := newTestMempool(utxoSet)
+		mp2.mu.Lock()
+		addPoolEntry(mp2, &TxEntry{TxHash: finalHash, Tx: finalTx, Fee: 1000, Size: 150})
+		mp2.mu.Unlock()
+		if got := mp2.SignalsBIP125Replaceable(finalHash); got != "yes" {
+			t.Errorf("non-signaling tx under fullrbf=true: got %q, want %q "+
+				"(fullrbf bypasses Rule 1 — every conflict replaceable)", got, "yes")
+		}
+	})
 }
 
 // ============================================================================
@@ -423,11 +537,29 @@ func TestW120_G20_TestMempoolAccept_RBFRejectReason_PARTIAL(t *testing.T) {
 // G21: listtransactions — `bip125-replaceable`
 // ============================================================================
 
-func TestW120_G21_ListTransactions_BIP125Replaceable_MISSING(t *testing.T) {
-	t.Skip("BUG-7: ListTransactionsResult (internal/rpc/types.go:384) has no " +
-		"`bip125-replaceable` field. Core's listtransactions returns it as " +
-		"{\"yes\",\"no\",\"unknown\"}. " +
-		"Reference: bitcoin-core/src/wallet/rpc/util.cpp::WalletTxToJSON.")
+// TestW120_G21_ListTransactions_BIP125Replaceable_Wired asserts the W120
+// BUG-7 fix (FIX-68): ListTransactionsResult now carries a string
+// `bip125-replaceable` field. The wallet-side population logic is wired in
+// internal/rpc/wallet_methods.go::bip125ReplaceableForWalletTx (confirmed
+// → "unknown", otherwise consults the mempool). Only the JSON struct
+// shape is asserted here; the population logic is covered by the RPC
+// integration tests.
+//
+// Reference: bitcoin-core/src/wallet/rpc/util.cpp::WalletTxToJSON.
+func TestW120_G21_ListTransactions_BIP125Replaceable_Wired(t *testing.T) {
+	// We can't reach the rpc package's ListTransactionsResult type from
+	// here without an import cycle, so just pin the underlying mempool
+	// walker's "unknown" branch which is what the wallet handler maps to
+	// for confirmed / not-in-mempool txs.
+	utxoSet := newTestUTXOSet()
+	mp := newTestMempool(utxoSet)
+	var unknown wire.Hash256
+	unknown[0] = 0xEA
+	if got := mp.SignalsBIP125Replaceable(unknown); got != "unknown" {
+		t.Errorf("SignalsBIP125Replaceable on not-in-mempool tx: got %q, want %q "+
+			"(wallet bip125-replaceable maps this to \"unknown\")",
+			got, "unknown")
+	}
 }
 
 // ============================================================================
@@ -506,6 +638,12 @@ func TestW120_G28_ReplacedTransactionsCounter_MISSING(t *testing.T) {
 // from checkRBFLocked include the failing txid and the numeric quantities
 // (fees / counts) so operators can grep logs after a failed broadcast.
 // This asserts the message format is stable (regression guard).
+//
+// W120 BUG-5 / FIX-68: the runtime default is now `-mempoolfullrbf=true` so
+// the Rule 1 path is skipped at the top of `checkRBFLocked`. This test pins
+// the legacy `-mempoolfullrbf=false` path explicitly via
+// `newTestMempoolOptInRBF` so the "does not signal RBF" log idiom remains
+// covered.
 func TestW120_G29_ReplacementLogging_Wired(t *testing.T) {
 	utxoSet := newTestUTXOSet()
 	var seedHash wire.Hash256
@@ -513,7 +651,7 @@ func TestW120_G29_ReplacementLogging_Wired(t *testing.T) {
 	opSeed, eSeed := createFundingUTXO(seedHash, 0, 300_000)
 	utxoSet.AddUTXO(opSeed, eSeed)
 
-	mp := newTestMempool(utxoSet)
+	mp := newTestMempoolOptInRBF(utxoSet)
 	cTx := makeFinalTx([]wire.OutPoint{opSeed}, 200_000)
 	cHash := cTx.TxHash()
 	mp.mu.Lock()

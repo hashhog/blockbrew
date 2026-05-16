@@ -87,12 +87,37 @@ type mockMempool struct {
 
 // newTestMempool creates a mempool suitable for testing.
 // It uses a custom config that doesn't require real signatures.
+//
+// Default: -mempoolfullrbf=true (Core v28+; the runtime default after the
+// W120 BUG-5 / FIX-68 fix). Test cases that need legacy-BIP-125 opt-in-only
+// behaviour to exercise Rule 1 enforcement should use `newTestMempoolOptInRBF`
+// (the rbf_w73 / w106 / w120 G29 tests do this so their pre-fix assertions
+// continue to pin the legacy code path).
 func newTestMempool(utxoSet consensus.UTXOView) *Mempool {
 	config := Config{
-		MaxSize:         10_000_000, // 10 MB for testing
-		MinRelayFeeRate: 1000,       // 1 sat/vB
-		MaxOrphanTxs:    100,
-		ChainParams:     consensus.RegtestParams(), // Regtest for easier testing
+		MaxSize:                10_000_000, // 10 MB for testing
+		MinRelayFeeRate:        1000,       // 1 sat/vB
+		MaxOrphanTxs:           100,
+		ChainParams:            consensus.RegtestParams(), // Regtest for easier testing
+		MempoolFullRBF:         true,
+		MempoolFullRBFExplicit: true,
+	}
+	return New(config, utxoSet)
+}
+
+// newTestMempoolOptInRBF returns a mempool with `-mempoolfullrbf=false`
+// (legacy BIP-125 opt-in-only behaviour). Used by tests that explicitly
+// assert Rule 1 (signaling required for replacement) — without this, the
+// fullrbf=true default short-circuits Rule 1 and the replacement is accepted
+// purely on Rules 3/4/5 + ImprovesFeerateDiagram.
+func newTestMempoolOptInRBF(utxoSet consensus.UTXOView) *Mempool {
+	config := Config{
+		MaxSize:                10_000_000,
+		MinRelayFeeRate:        1000,
+		MaxOrphanTxs:           100,
+		ChainParams:            consensus.RegtestParams(),
+		MempoolFullRBF:         false,
+		MempoolFullRBFExplicit: true,
 	}
 	return New(config, utxoSet)
 }
@@ -221,7 +246,14 @@ func TestDoubleSpendRejection(t *testing.T) {
 	outpoint, entry := createFundingUTXO(fundingTxHash, 0, 100_000)
 	utxoSet.AddUTXO(outpoint, entry)
 
-	mp := newTestMempool(utxoSet)
+	// W120 BUG-5 / FIX-68: this test pins the legacy `-mempoolfullrbf=false`
+	// path where a non-signaling conflict is rejected up-front. With the
+	// post-FIX-68 runtime default `-mempoolfullrbf=true` the same input is
+	// accepted as replaceable and the call proceeds to Rules 3/4 fee
+	// checks (which then reject for a different reason). Switch to the
+	// legacy-mode mempool so the original assertion (`already spent` OR
+	// `does not signal RBF` message) keeps matching.
+	mp := newTestMempoolOptInRBF(utxoSet)
 
 	// Add first transaction to the pool manually
 	tx1 := createTestTransaction([]wire.OutPoint{outpoint}, 99_000, 1)
