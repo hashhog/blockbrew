@@ -22,11 +22,15 @@ const (
 	MaxCFCheckptPerRequest = 1000
 
 	// CFCheckptInterval is the spacing between compact filter header checkpoints
-	// (in blocks). Core: CFCHECKPT_INTERVAL = 1000 (net_processing.cpp:178).
-	// getcfcheckpt returns one filter header per CFCheckptInterval blocks up
-	// to the stop hash, at heights CFCheckptInterval-1, 2*CFCheckptInterval-1,
-	// etc. (i.e. at every height that is 0 mod CFCheckptInterval after the
-	// genesis offset). This matches BIP-157 §getcfcheckpt.
+	// (in blocks). Core: CFCHECKPT_INTERVAL = 1000 (blockfilterindex.h:31,
+	// net_processing.cpp:178). getcfcheckpt returns one filter header per
+	// CFCheckptInterval blocks up to the stop hash, at heights
+	// 1*CFCheckptInterval, 2*CFCheckptInterval, ... (i.e. heights divisible
+	// by CFCheckptInterval). Core's blockfilterindex.cpp:372 uses the check
+	// `is_checkpoint{block_index->nHeight % CFCHECKPT_INTERVAL == 0}` to
+	// flag checkpoint heights, confirming the multiples-of-1000 layout.
+	// Pre-FIX-74 blockbrew started the loop at CFCheckptInterval-1 (W121
+	// BUG-7 P0-CDIV); fixed in HandleGetCFCheckpt in cfilter_handlers.go.
 	CFCheckptInterval = 1000
 )
 
