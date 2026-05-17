@@ -623,12 +623,13 @@ type Mempool struct {
 	// tx later arrives. This matches Core's behaviour at
 	// txmempool.cpp::PrioritiseTransaction.
 	//
-	// NOT persisted across restart. Core's mempool.dat carries mapDeltas in
-	// the post-mempool tx-list payload, but the dump format we emit here
-	// writes 0 entries (persist.go:194) and Core also discards in-memory
-	// state if the operator did not call savemempool — the consensus shape
-	// is "ephemeral" by spec, which BIP / Core do not guarantee a survival
-	// invariant for. Tests pin this explicitly (W120 BUG-10 / FIX-72).
+	// Persisted via mempool.dat tail block — Core mempool_persist.cpp:166-203.
+	// Two channels: deltas for txids that resolve to a current pool entry
+	// ride along in the per-entry nFeeDelta slot; deltas for txids NOT in
+	// the pool are emitted in the standalone tail block (num_deltas + per-
+	// delta records). On load the tail block is fed back through
+	// PrioritiseTransaction so the same shape is restored. See
+	// persist.go::Dump / Load and the FIX-76 tests for the round-trip.
 	mapDeltas map[wire.Hash256]int64
 }
 
@@ -687,8 +688,11 @@ func New(config Config, utxoSet consensus.UTXOView) *Mempool {
 // priority bump on an at-risk tx could be bypassed by a malicious
 // replacement that just barely beats the raw fee — see W120 BUG-10.
 //
-// Not persisted across restart (Core parity — operators must re-issue
-// prioritisations on cold start).
+// Persisted via mempool.dat (FIX-76): per-entry deltas ride along in the
+// per-tx nFeeDelta slot; absent-txid deltas are written into the standalone
+// tail block (mempool_persist.cpp:166-203 — Core LoadMempool's ApplyDelta
+// loop). On load the tail block is fed back through this method so the
+// same shape is restored.
 func (mp *Mempool) PrioritiseTransaction(txid wire.Hash256, deltaSats int64) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()

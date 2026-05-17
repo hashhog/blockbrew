@@ -331,8 +331,14 @@ func TestFIX72_DeltaCancellation(t *testing.T) {
 // must be updated alongside the persist.go change and the
 // Mempool.mapDeltas / persist.go comments.
 
-func TestFIX72_DeltasNotPersistedAcrossRestart(t *testing.T) {
-	dir, err := os.MkdirTemp("", "fix72-persist-*")
+// FIX-76 (was: FIX-72 "DeltasNotPersistedAcrossRestart"). The original
+// FIX-72 commit dc8e1a0 claimed deltas were intentionally ephemeral; that
+// claim was wrong (Core persists per mempool_persist.cpp:101+166-203).
+// FIX-76 flips the assertion: a delta on an in-pool tx must survive a
+// dump/load round-trip via the per-entry nFeeDelta slot. See FIX76 tests
+// for the standalone-tail-block path (deltas on absent txids).
+func TestFIX76_InPoolDeltaSurvivesRestart(t *testing.T) {
+	dir, err := os.MkdirTemp("", "fix76-persist-*")
 	if err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
@@ -365,10 +371,11 @@ func TestFIX72_DeltasNotPersistedAcrossRestart(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 
-	if got := mpB.GetFeeDelta(h); got != 0 {
-		t.Errorf("delta survived restart: got %d, want 0 (blockbrew "+
-			"intentionally emits zero deltas in mempool.dat — see "+
-			"persist.go + Mempool.mapDeltas docs)", got)
+	if got := mpB.GetFeeDelta(h); got != 7777 {
+		t.Errorf("FIX-76: in-pool delta should survive dump/load via "+
+			"per-entry nFeeDelta slot (Core mempool_persist.cpp:199 "+
+			"writes, :100-102 reads via PrioritiseTransaction). "+
+			"got %d, want 7777", got)
 	}
 }
 
