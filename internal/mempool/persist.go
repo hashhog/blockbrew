@@ -15,6 +15,28 @@
 //
 // For maximum compatibility with peers loading the file we always emit a
 // zero key (obfuscation off). Reading tolerates either form.
+//
+// mapDeltas persistence (FIX-76 — closes the brief-error in FIX-72 dc8e1a0,
+// where the original commit message claimed "delta lost on restart matches
+// Core". Core actually persists per
+// bitcoin-core/src/node/mempool_persist.cpp:101 (DumpMempool's
+// `file << mapDeltas` after the per-entry loop) and :128-132 (LoadMempool's
+// `PrioritiseTransaction(txid, delta)` over the tail block). Mirror:
+//
+//   - Dump: per-entry feeDelta is the entry's `mapDeltas[hash]` value (zero
+//     if no delta is set). After the per-entry loop, txids in `mapDeltas`
+//     that are NOT also in `pool` are emitted in the standalone tail block.
+//     This matches Core's `mapDeltas.erase(i.tx->GetHash())` step at
+//     mempool_persist.cpp:200 so a single delta is never double-counted.
+//   - Load: read the tail block, feed each (txid, amount) into
+//     PrioritiseTransaction. Per-entry feeDelta also rides back through
+//     PrioritiseTransaction so the same `mapDeltas` shape is restored.
+//
+// Backward-compat: a v2 file with no tail block (truncated, or written by
+// an older blockbrew) loads cleanly — EOF when reading the deltaCount
+// compact-size is treated as zero deltas. This is intentional symmetry
+// with Core's LoadMempool which catches the deserialize exception and
+// returns success on partial files (mempool_persist.cpp:144-147).
 
 package mempool
 
@@ -145,7 +167,13 @@ func (mp *Mempool) Dump(dataDir string) error {
 		return fmt.Errorf("mempool dump: write key: %w", err)
 	}
 
-	// Snapshot the pool under the lock, then release before writing tx data.
+	// Snapshot the pool + mapDeltas under the lock, then release before
+	// writing tx data. Per-entry feeDelta is the entry's `mapDeltas[hash]`
+	// value (zero if no delta is set) — this matches Core's per-tx
+	// `nFeeDelta` write at mempool_persist.cpp:199. Deltas for txids NOT
+	// in the pool are tracked separately and emitted in the standalone
+	// tail block below; Core does the same via the `mapDeltas.erase()`
+	// step at mempool_persist.cpp:200.
 	mp.mu.RLock()
 	count := uint64(len(mp.pool))
 	type snap struct {
@@ -155,20 +183,34 @@ func (mp *Mempool) Dump(dataDir string) error {
 	}
 	snaps := make([]snap, 0, count)
 	for _, e := range mp.pool {
-		// Per-entry feeDelta is intentionally zero in the dump: blockbrew
-		// keeps prioritisetransaction deltas ephemeral (lost on restart) so
-		// operators must re-issue them on cold start. The mempool itself
-		// applies deltas at the modified-fee layer (Mempool.mapDeltas /
-		// GetModifiedFee, FIX-72) but they do not survive a savemempool
-		// round-trip. Core preserves them; blockbrew documents the
-		// divergence at internal/mempool/mempool.go::Mempool.mapDeltas.
 		snaps = append(snaps, snap{
 			tx:       e.Tx,
 			timeUnix: e.Time.Unix(),
-			feeDelta: 0,
+			feeDelta: mp.mapDeltas[e.TxHash],
 		})
 	}
+	// Standalone tail block: copy mapDeltas entries whose txid is NOT in
+	// the pool. These are operator prioritisations issued before broadcast,
+	// or for txids that have been evicted but whose delta the operator
+	// wants to apply if they ever return. Mirrors Core's mapDeltas
+	// post-erase set (mempool_persist.cpp:200-203).
+	type tailDelta struct {
+		txid   wire.Hash256
+		amount int64
+	}
+	tailDeltas := make([]tailDelta, 0)
+	for txid, amount := range mp.mapDeltas {
+		if _, inPool := mp.pool[txid]; inPool {
+			continue
+		}
+		tailDeltas = append(tailDeltas, tailDelta{txid: txid, amount: amount})
+	}
 	mp.mu.RUnlock()
+
+	// Stable order for the tail-block deltas eases regression diffs.
+	sort.Slice(tailDeltas, func(i, j int) bool {
+		return bytes.Compare(tailDeltas[i].txid[:], tailDeltas[j].txid[:]) < 0
+	})
 
 	// Stable order eases regression diffs and matches how Core's infoAll
 	// produces a deterministic-ish list (insertion order).
@@ -196,15 +238,23 @@ func (mp *Mempool) Dump(dataDir string) error {
 		}
 	}
 
-	// mapDeltas + unbroadcast_txids: emitted as zero entries even though
-	// prioritisetransaction is now wired (FIX-72). Deltas are ephemeral by
-	// design — Core's behaviour is to persist, but operators of this fleet
-	// expect a clean restart and re-issue prioritisations explicitly. See
-	// Mempool.mapDeltas for the rationale + docs. The Load path tolerates
-	// either form (reads + discards any deltas Core wrote).
-	if err := wire.WriteCompactSize(xw, 0); err != nil {
-		return fmt.Errorf("mempool dump: write mapDeltas: %w", err)
+	// mapDeltas tail block: emit (txid, amount) for every delta whose txid
+	// is NOT in the per-entry list above (those rode along in the per-entry
+	// nFeeDelta slot). Mirrors mempool_persist.cpp:203 `file << mapDeltas`.
+	if err := wire.WriteCompactSize(xw, uint64(len(tailDeltas))); err != nil {
+		return fmt.Errorf("mempool dump: write mapDeltas count: %w", err)
 	}
+	for _, d := range tailDeltas {
+		td := d.txid // local copy: Serialize takes a pointer
+		if err := td.Serialize(xw); err != nil {
+			return fmt.Errorf("mempool dump: write mapDeltas txid: %w", err)
+		}
+		if err := wire.WriteInt64LE(xw, d.amount); err != nil {
+			return fmt.Errorf("mempool dump: write mapDeltas amount: %w", err)
+		}
+	}
+	// Unbroadcast set: still zero — blockbrew does not yet track an
+	// unbroadcast set (out of scope for FIX-76).
 	if err := wire.WriteCompactSize(xw, 0); err != nil {
 		return fmt.Errorf("mempool dump: write unbroadcast: %w", err)
 	}
@@ -304,9 +354,8 @@ func (mp *Mempool) Load(dataDir string, opts LoadOptions) (*LoadResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("mempool load: tx %d time: %w", i, err)
 		}
-		// Skip nFeeDelta — blockbrew has no prioritisetransaction. Read it so
-		// the stream stays aligned.
-		if _, err := wire.ReadInt64LE(xr); err != nil {
+		nFeeDelta, err := wire.ReadInt64LE(xr)
+		if err != nil {
 			return nil, fmt.Errorf("mempool load: tx %d feeDelta: %w", i, err)
 		}
 		res.Read++
@@ -318,6 +367,16 @@ func (mp *Mempool) Load(dataDir string, opts LoadOptions) (*LoadResult, error) {
 				continue
 			}
 		}
+		// Re-prioritise BEFORE attempting acceptance so the delta is
+		// present at admission time (matching Core's
+		// `apply_fee_delta_priority` ordering at mempool_persist.cpp:100-
+		// 102 — PrioritiseTransaction runs before AcceptToMemoryPool for
+		// the same entry). If acceptance later fails the delta still
+		// sits in mapDeltas waiting for the tx to arrive via another
+		// path; Core has the same property.
+		if nFeeDelta != 0 {
+			mp.PrioritiseTransaction(tx.TxHash(), nFeeDelta)
+		}
 		if err := mp.AcceptToMemoryPool(tx); err != nil {
 			res.Failed++
 			continue
@@ -325,11 +384,15 @@ func (mp *Mempool) Load(dataDir string, opts LoadOptions) (*LoadResult, error) {
 		res.Accepted++
 	}
 
-	// mapDeltas + unbroadcast_txids — read so we don't reject otherwise valid
-	// files written by Core (blockbrew has no place to put them yet).
+	// mapDeltas tail block — txids that had a delta applied but were NOT
+	// in the per-entry list. Feed each back through PrioritiseTransaction
+	// (Core's path: mempool_persist.cpp:128-132 ApplyDelta loop).
 	deltaCount, err := wire.ReadCompactSize(xr)
 	if err != nil {
-		// EOF here is OK on partial files; the txs we already accepted stand.
+		// EOF here is OK on partial files / pre-FIX-76 dumps — the txs we
+		// already accepted stand, and there are simply no standalone
+		// deltas to restore. Mirrors Core's catch-block tolerance at
+		// mempool_persist.cpp:144-147.
 		if errors.Is(err, io.EOF) {
 			return res, nil
 		}
@@ -340,8 +403,12 @@ func (mp *Mempool) Load(dataDir string, opts LoadOptions) (*LoadResult, error) {
 		if err := txid.Deserialize(xr); err != nil {
 			return res, fmt.Errorf("mempool load: mapDeltas[%d] txid: %w", i, err)
 		}
-		if _, err := wire.ReadInt64LE(xr); err != nil {
+		amount, err := wire.ReadInt64LE(xr)
+		if err != nil {
 			return res, fmt.Errorf("mempool load: mapDeltas[%d] amount: %w", i, err)
+		}
+		if amount != 0 {
+			mp.PrioritiseTransaction(txid, amount)
 		}
 	}
 	unbroadcastCount, err := wire.ReadCompactSize(xr)
@@ -359,4 +426,3 @@ func (mp *Mempool) Load(dataDir string, opts LoadOptions) (*LoadResult, error) {
 	}
 	return res, nil
 }
-
