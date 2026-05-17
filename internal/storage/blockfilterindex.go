@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"log"
 	"sort"
 
 	"github.com/hashhog/blockbrew/internal/crypto"
@@ -32,6 +33,24 @@ var (
 	// BlockFilterStateKey stores the index state.
 	BlockFilterStateKey = []byte("blockfilter_state")
 )
+
+// BlockFilterIndexFormatVersion tags the on-disk format of the BIP-158 GCS
+// filter bytes. Bumped from 0 → 1 in FIX-83 when the GCS bit-stream codec
+// was rewritten to be MSB-first (Bitcoin Core compatible). Old (version 0)
+// filter bytes were LSB-first within each byte and byte-incompatible with
+// Bitcoin Core's BlockFilter::GetEncoded() (W122 BUG-2).
+//
+// On Init(), if the state row carries an older version (or no version, the
+// pre-FIX-83 layout) we log a loud notice and reset the index to height=-1
+// so the IndexManager rebuilds every row from genesis with the new codec.
+// The stale (orphan) filter rows under BlockFilterPrefix are overwritten as
+// the rebuild progresses; operators who want to reclaim disk eagerly can
+// delete <datadir>/<network>/chaindata and let the full chainstate +
+// blockfilterindex rebuild together. Since the index is opt-in
+// (`-blockfilterindex` flag, default OFF — see cmd/blockbrew/main.go:494),
+// this auto-rebuild is the least surprising migration: an operator that
+// already opted in gets correct bytes silently after the upgrade.
+const BlockFilterIndexFormatVersion uint8 = 1
 
 // BlockFilterData stores a compact block filter and its header.
 type BlockFilterData struct {
@@ -97,6 +116,15 @@ func NewBlockFilterIndex(db DB) *BlockFilterIndex {
 }
 
 // Init initializes the blockfilterindex by loading state from the database.
+//
+// FIX-83 / W122 migration: if the state row carries no
+// BlockFilterIndexFormatVersion (i.e. it was written by a pre-FIX-83
+// blockbrew using the broken LSB-first GCS codec), reset the index to
+// height=-1 so the IndexManager rebuilds every filter row with the new
+// MSB-first / Core-compatible codec. Stale filter rows on disk are
+// overwritten as the rebuild progresses. Operators who notice their
+// blockfilterindex restarting from genesis after the upgrade are
+// experiencing this migration and need take no action.
 func (idx *BlockFilterIndex) Init() error {
 	data, err := idx.db.Get(BlockFilterStateKey)
 	if err != nil {
@@ -110,11 +138,65 @@ func (idx *BlockFilterIndex) Init() error {
 
 	state, err := DeserializeBlockFilterState(data)
 	if err != nil {
-		return err
+		// Could be old (pre-FIX-83) layout that doesn't carry a version
+		// byte. Treat as obsolete and force a rebuild from genesis.
+		log.Printf("blockfilterindex: pre-FIX-83 state-row layout detected (no version byte); "+
+			"resetting to height=-1 to rebuild with MSB-first Core-compatible codec (W122 BUG-2 fix). "+
+			"Filter index will repopulate as blocks are connected.")
+		if err := idx.wipeStaleFilterRows(); err != nil {
+			log.Printf("blockfilterindex: warning — stale-row cleanup failed: %v (rebuild will overwrite as it advances)", err)
+		}
+		idx.bestHeight = -1
+		return nil
+	}
+	if state.FormatVersion != BlockFilterIndexFormatVersion {
+		// Old codec format → reset, rebuild on next IndexManager pass.
+		log.Printf("blockfilterindex: on-disk FormatVersion=%d but code expects %d; "+
+			"resetting to height=-1 to rebuild with current GCS codec.",
+			state.FormatVersion, BlockFilterIndexFormatVersion)
+		if err := idx.wipeStaleFilterRows(); err != nil {
+			log.Printf("blockfilterindex: warning — stale-row cleanup failed: %v (rebuild will overwrite as it advances)", err)
+		}
+		idx.bestHeight = -1
+		return nil
 	}
 	idx.bestHeight = state.BestHeight
 	idx.bestHash = state.BestHash
 	idx.prevFilterHeader = state.PrevFilterHeader
+	return nil
+}
+
+// wipeStaleFilterRows deletes every key under BlockFilterPrefix in a single
+// batch. Called by Init when the on-disk format version doesn't match the
+// running code — keeping stale rows would waste disk; overwriting them via
+// the rebuild path is functionally correct but operators expect a clean
+// rebuild to actually reclaim space promptly. The state-row is left alone;
+// Init's caller will write a fresh state-row on the first WriteBlock.
+//
+// Best-effort: errors are logged at the call site, not fatal — even with
+// stale rows, the IndexManager's rebuild path will overwrite each height
+// with the new codec's bytes as it progresses.
+func (idx *BlockFilterIndex) wipeStaleFilterRows() error {
+	iter := idx.db.NewIterator(BlockFilterPrefix)
+	defer iter.Release()
+	batch := idx.db.NewBatch()
+	count := 0
+	for iter.Next() {
+		// Copy because Pebble's Key() bytes are only valid until Next().
+		k := append([]byte(nil), iter.Key()...)
+		batch.Delete(k)
+		count++
+	}
+	if err := iter.Error(); err != nil {
+		return err
+	}
+	if count == 0 {
+		return nil
+	}
+	if err := batch.Write(); err != nil {
+		return err
+	}
+	log.Printf("blockfilterindex: wiped %d stale filter row(s) during FIX-83 / W122 codec migration", count)
 	return nil
 }
 
@@ -182,8 +264,11 @@ func (idx *BlockFilterIndex) WriteBlockBatch(batch Batch, block *wire.MsgBlock, 
 	}
 	batch.Put(MakeBlockFilterKey(height), filterData.Serialize())
 
-	// State entry pointing at the new tip.
+	// State entry pointing at the new tip. FormatVersion is stamped by
+	// Serialize() if zero, so we get FIX-83 / W122 MSB-first tagging on
+	// every fresh write — no risk of writing back the pre-FIX-83 layout.
 	state := &BlockFilterState{
+		FormatVersion:    BlockFilterIndexFormatVersion,
 		BestHeight:       height,
 		BestHash:         blockHash,
 		PrevFilterHeader: filterHeader,
@@ -303,8 +388,9 @@ func (idx *BlockFilterIndex) RevertBlockBatch(batch Batch, block *wire.MsgBlock,
 	batch.Delete(MakeBlockFilterKey(height))
 
 	// Queue the state-row write so post-commit the index points at the
-	// pre-disconnect parent.
+	// pre-disconnect parent. FormatVersion is FIX-83 / W122 v1.
 	state := &BlockFilterState{
+		FormatVersion:    BlockFilterIndexFormatVersion,
 		BestHeight:       prevHeight,
 		BestHash:         prevHash,
 		PrevFilterHeader: prevFilterHeader,
@@ -555,29 +641,100 @@ func rotl64(x uint64, b uint) uint64 {
 }
 
 // bitStreamWriter writes bits to a byte buffer.
+//
+// Packing is MSB-first within each byte, mirroring Bitcoin Core's
+// BitStreamWriter (bitcoin-core/src/streams.h:303-358). The first bit
+// written to an empty byte lands in bit 7 (the most-significant bit);
+// subsequent bits fill leftward → rightward within the same byte. This
+// is byte-exactly compatible with Core's `BlockFilter::GetEncoded()` and
+// with the BIP-158 test vectors in `bitcoin-core/src/test/data/
+// blockfilters.json` — verified by TestW122_GenesisFilterByteExact
+// (height-0: 019dfca8 = Core's exact bytes).
+//
+// History — FIX-83 (2026-05-17) replaced the prior LSB-first chunked-
+// uint64 implementation that had two compounding P0-CDIV bugs:
+//
+//   - BUG-1: `accumBits |= v << numBits` silently truncated the top
+//     `numBits` bits of v when v<<numBits overflowed the uint64
+//     accumulator, dropping bits from golombRiceEncode's 64-ones unary
+//     chunk whenever a prior element left numBits > 0.
+//   - BUG-2: bytes were emitted LSB-first within each byte, so every
+//     filter blockbrew produced was byte-incompatible with Core. The
+//     existing TestBIP158Vectors deliberately opted out of byte-exact
+//     comparison; that opt-out is now removed.
+//
+// The new MSB-first per-byte chunked Write closes both bugs in one
+// rewrite — the per-iteration `bits = min(8 - offset, n)` clamp prevents
+// any shift-width-overflow boundary.
 type bitStreamWriter struct {
-	bytes     []byte
-	accumBits uint64
-	numBits   uint
+	bytes  []byte
+	buffer uint8 // partial byte; high `offset` bits are written, low bits are 0
+	offset uint  // number of bits already in `buffer`, 0..7
 }
 
-// writeBits writes the lowest n bits of v to the stream.
+// writeBits writes the n least-significant bits of v to the stream,
+// MSB-first within each byte (matching Bitcoin Core's BitStreamWriter).
+//
+// Core reference (bitcoin-core/src/streams.h:329-344):
+//
+//	while (nbits > 0) {
+//	    int bits = std::min(8 - m_offset, nbits);
+//	    m_buffer |= (data << (64 - nbits)) >> (64 - 8 + m_offset);
+//	    m_offset += bits;
+//	    nbits -= bits;
+//	    if (m_offset == 8) { Flush(); }
+//	}
+//
+// The per-iteration `bits = min(8 - offset, nbits)` clamp guarantees we
+// never shift by 64 (or wider). The (64 - nbits) shift would underflow
+// only if nbits > 64, which we reject up-front to match Core's
+// std::out_of_range throw.
 func (w *bitStreamWriter) writeBits(v uint64, n uint) {
-	w.accumBits |= v << w.numBits
-	w.numBits += n
-
-	for w.numBits >= 8 {
-		w.bytes = append(w.bytes, byte(w.accumBits))
-		w.accumBits >>= 8
-		w.numBits -= 8
+	if n > 64 {
+		// Defensive: Core throws std::out_of_range; we panic so callers
+		// learn at the call site (golombRiceEncode never exceeds 64).
+		panic("bitStreamWriter.writeBits: n must be 0..64")
+	}
+	remaining := n
+	for remaining > 0 {
+		bits := 8 - w.offset
+		if bits > remaining {
+			bits = remaining
+		}
+		// Core: m_buffer |= (data << (64 - nbits)) >> (64 - 8 + m_offset)
+		// The `data << (64 - remaining)` puts the next bit we want to
+		// consume into bit 63 of a uint64, then we shift right by
+		// `64 - 8 + offset` to land it at bit `7 - offset` of buffer.
+		var shifted uint64
+		if remaining == 64 {
+			// data << 0 — preserve all 64 bits intact (no shift overflow).
+			shifted = v
+		} else {
+			shifted = v << (64 - remaining)
+		}
+		shifted >>= 64 - 8 + w.offset
+		w.buffer |= uint8(shifted)
+		w.offset += bits
+		remaining -= bits
+		if w.offset == 8 {
+			w.bytes = append(w.bytes, w.buffer)
+			w.buffer = 0
+			w.offset = 0
+		}
 	}
 }
 
-// flush writes any remaining bits.
+// flush writes any remaining bits, padding the final byte with zeros to
+// the next byte boundary (per BIP-158 — the unused low bits are 0).
+//
+// Core reference (bitcoin-core/src/streams.h:349-357): same shape.
 func (w *bitStreamWriter) flush() {
-	if w.numBits > 0 {
-		w.bytes = append(w.bytes, byte(w.accumBits))
+	if w.offset == 0 {
+		return
 	}
+	w.bytes = append(w.bytes, w.buffer)
+	w.buffer = 0
+	w.offset = 0
 }
 
 // golombRiceEncode encodes a value using Golomb-Rice coding.
@@ -586,13 +743,38 @@ func golombRiceEncode(w *bitStreamWriter, p uint, value uint64) {
 	q := value >> p
 	r := value & ((1 << p) - 1)
 
-	// Write q ones followed by a zero
+	// Write q ones followed by a zero.
+	//
+	// Mirrors bitcoin-core/src/util/golombrice.h GolombRiceEncode:
+	//
+	//   while (q > 0) {
+	//       int n = std::min<uint64_t>(q, 64);
+	//       bitwriter.Write(
+	//         std::bitset<64>(~uint64_t(0) << (64 - n)).to_ullong(), n);
+	//       q -= n;
+	//   }
+	//   bitwriter.Write(0, 1);
+	//   bitwriter.Write(r, p);
+	//
+	// Core's `bitset<64>(~0ULL << (64-n)).to_ullong()` produces a value
+	// whose top n bits are 1 and bottom 64-n are 0, then BitStreamWriter
+	// pulls "the n least-significant bits" — but with `to_ullong` the
+	// high bits move down. The net effect is "n ones in the low n bits"
+	// which is exactly `(1<<n)-1` for n<64, and `0xFFFFFFFFFFFFFFFF` for
+	// n==64. We split the n==64 case explicitly so this code is correct
+	// under Go's defined-but-tricky `1 << 64 == 0` shift semantics.
 	for q > 0 {
 		count := q
 		if count > 64 {
 			count = 64
 		}
-		w.writeBits((1<<count)-1, uint(count))
+		var ones uint64
+		if count == 64 {
+			ones = ^uint64(0)
+		} else {
+			ones = (uint64(1) << count) - 1
+		}
+		w.writeBits(ones, uint(count))
 		q -= count
 	}
 	w.writeBits(0, 1)
@@ -602,7 +784,18 @@ func golombRiceEncode(w *bitStreamWriter, p uint, value uint64) {
 }
 
 // BlockFilterState stores the state of the block filter index.
+//
+// On-disk layout (current = FormatVersion 1, FIX-83 / W122):
+//
+//	1 byte   FormatVersion (== BlockFilterIndexFormatVersion)
+//	4 bytes  BestHeight (int32 LE)
+//	32 bytes BestHash (LE wire.Hash256)
+//	32 bytes PrevFilterHeader (LE wire.Hash256)
+//
+// Pre-FIX-83 layout had no version byte (was 68 bytes total). Init()
+// detects that case by length and forces a rebuild from genesis.
 type BlockFilterState struct {
+	FormatVersion    uint8
 	BestHeight       int32
 	BestHash         wire.Hash256
 	PrevFilterHeader wire.Hash256
@@ -611,6 +804,12 @@ type BlockFilterState struct {
 // Serialize writes the state to bytes.
 func (s *BlockFilterState) Serialize() []byte {
 	buf := new(bytes.Buffer)
+	// FIX-83 / W122: emit FormatVersion byte first so future migrations
+	// can detect obsolete on-disk filter encodings cleanly.
+	if s.FormatVersion == 0 {
+		s.FormatVersion = BlockFilterIndexFormatVersion
+	}
+	buf.WriteByte(s.FormatVersion)
 	wire.WriteInt32LE(buf, s.BestHeight)
 	s.BestHash.Serialize(buf)
 	s.PrevFilterHeader.Serialize(buf)
@@ -619,14 +818,21 @@ func (s *BlockFilterState) Serialize() []byte {
 
 // DeserializeBlockFilterState reads a state from bytes.
 func DeserializeBlockFilterState(data []byte) (*BlockFilterState, error) {
-	if len(data) < 68 { // 4 + 32 + 32
+	if len(data) < 69 { // 1 + 4 + 32 + 32
+		// Either truncated or pre-FIX-83 layout (68 bytes, no version).
+		// Caller (Init) treats this as obsolete and triggers a rebuild.
 		return nil, errors.New("block filter state data too short")
 	}
 
 	r := bytes.NewReader(data)
 	s := &BlockFilterState{}
 
-	var err error
+	ver, err := r.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	s.FormatVersion = ver
+
 	s.BestHeight, err = wire.ReadInt32LE(r)
 	if err != nil {
 		return nil, err
@@ -717,31 +923,67 @@ func matchGCS(filter []byte, blockHash wire.Hash256, scripts [][]byte) (bool, er
 }
 
 // bitStreamReader reads bits from a byte stream.
+//
+// Reads MSB-first within each byte, mirroring Bitcoin Core's
+// BitStreamReader (bitcoin-core/src/streams.h:260-301). The first bit
+// returned from a freshly-pulled byte is bit 7 (the most-significant
+// bit). FIX-83 (2026-05-17) replaced the prior LSB-first reader to
+// match the corresponding bitStreamWriter rewrite.
 type bitStreamReader struct {
-	r         *bytes.Reader
-	accumBits uint64
-	numBits   uint
+	r      *bytes.Reader
+	buffer uint8 // current byte being unpacked
+	offset uint  // number of bits already returned from `buffer`, 0..8
 }
 
 func newBitStreamReader(r *bytes.Reader) bitStreamReader {
-	return bitStreamReader{r: r}
+	// offset=8 means "no byte buffered yet; read one on next readBits".
+	return bitStreamReader{r: r, offset: 8}
 }
 
-// readBits reads n bits from the stream.
+// readBits reads n bits from the stream, MSB-first within each byte,
+// returning them in the low n bits of the result.
+//
+// Core reference (bitcoin-core/src/streams.h:281-300):
+//
+//	uint64_t data = 0;
+//	while (nbits > 0) {
+//	    if (m_offset == 8) { m_istream >> m_buffer; m_offset = 0; }
+//	    int bits = std::min(8 - m_offset, nbits);
+//	    data <<= bits;
+//	    data |= static_cast<uint8_t>(m_buffer << m_offset) >> (8 - bits);
+//	    m_offset += bits;
+//	    nbits -= bits;
+//	}
+//	return data;
 func (br *bitStreamReader) readBits(n uint) (uint64, error) {
-	for br.numBits < n {
-		b, err := br.r.ReadByte()
-		if err != nil {
-			return 0, err
-		}
-		br.accumBits |= uint64(b) << br.numBits
-		br.numBits += 8
+	if n > 64 {
+		return 0, errors.New("bitStreamReader.readBits: n must be 0..64")
 	}
-
-	val := br.accumBits & ((1 << n) - 1)
-	br.accumBits >>= n
-	br.numBits -= n
-	return val, nil
+	var data uint64
+	remaining := n
+	for remaining > 0 {
+		if br.offset == 8 {
+			b, err := br.r.ReadByte()
+			if err != nil {
+				return 0, err
+			}
+			br.buffer = b
+			br.offset = 0
+		}
+		bits := 8 - br.offset
+		if bits > remaining {
+			bits = remaining
+		}
+		data <<= bits
+		// `buffer << offset` shifts the already-consumed bits off the
+		// top, leaving the next bit at bit 7. Then `>> (8 - bits)`
+		// lands those `bits` bits into the low `bits` slots.
+		shifted := uint8(br.buffer<<br.offset) >> (8 - bits)
+		data |= uint64(shifted)
+		br.offset += bits
+		remaining -= bits
+	}
+	return data, nil
 }
 
 // golombRiceDecode decodes a Golomb-Rice encoded value.
