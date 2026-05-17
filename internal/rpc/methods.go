@@ -438,6 +438,33 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 	}, nil
 }
 
+// handleGetBlockHash implements the `getblockhash <height>` RPC.
+//
+// Mirrors Bitcoin Core rpc/blockchain.cpp::getblockhash, which walks the
+// in-memory active chain (`chainman.ActiveChain()[height]`), not on-disk
+// state.  An on-disk-only lookup (the pre-FIX-80 behaviour) is unsafe in
+// two real scenarios that the daily consensus-diff harness exposed on
+// the live mainnet node:
+//
+//  1. Assume-valid IBD: ConnectBlock writes the height->hash mapping in
+//     the *forward* direction starting at the launched-from tip; the
+//     historical heights *below* that tip are never written to chainDB.
+//     The header index still has every BlockNode from genesis to tip
+//     because headers were synced from peers, so the in-memory walk
+//     yields the correct hash where the disk lookup fails.
+//
+//  2. UTXO snapshot bootstrap (loadtxoutset / assumeutxo): the node
+//     starts at a snapshot height with the UTXO set materialised but
+//     no historical block data on disk.  Again, headers are filled in
+//     by P2P sync, so the in-memory chain is complete even though the
+//     chaindata is sparse.
+//
+// We therefore prefer the in-memory active chain (Core's behaviour),
+// falling back to chainDB only when the chain manager has not yet been
+// initialised (early startup, or unit tests that wire chainDB without
+// a chain manager).  Out-of-range heights now return Core's
+// "Block height out of range" with RPC_INVALID_PARAMETER (-8), matching
+// rpc/blockchain.cpp:589-591.
 func (s *Server) handleGetBlockHash(params json.RawMessage) (interface{}, *RPCError) {
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
@@ -448,18 +475,39 @@ func (s *Server) handleGetBlockHash(params json.RawMessage) (interface{}, *RPCEr
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing height parameter"}
 	}
 
-	height, ok := args[0].(float64)
+	heightF, ok := args[0].(float64)
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid height"}
 	}
+	height := int32(heightF)
 
-	if s.chainDB == nil {
-		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+	// Primary path: walk the in-memory active chain from tip to ancestor
+	// at `height`.  Matches Core's `active_chain[nHeight]` semantics.
+	if s.chainMgr != nil {
+		tipNode := s.chainMgr.BestBlockNode()
+		if tipNode != nil {
+			if height < 0 || height > tipNode.Height {
+				return nil, &RPCError{
+					Code:    RPCErrInvalidParameter,
+					Message: "Block height out of range",
+				}
+			}
+			if anc := tipNode.GetAncestor(height); anc != nil {
+				return anc.Hash.String(), nil
+			}
+		}
 	}
 
-	hash, err := s.chainDB.GetBlockHashByHeight(int32(height))
+	// Fallback: chainDB lookup.  This is reached only when no chain
+	// manager is wired (early startup before NewChainManager, or unit
+	// tests that exercise the storage path directly).
+	if s.chainDB == nil {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Block height out of range"}
+	}
+
+	hash, err := s.chainDB.GetBlockHashByHeight(height)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Block height out of range"}
 	}
 
 	return hash.String(), nil
