@@ -163,28 +163,26 @@ func TestW121_G4_FastRange64(t *testing.T) {
 // ============================================================================
 
 // G5 / BUG-2: golombRiceEncode writes the quotient as `q` ones using a loop
-// that writes 64-bit chunks via writeBits. When count==64 and the bitStream
-// already has w.numBits > 0 staged, `v << w.numBits` shifts the top
-// `w.numBits` bits of v out of accumBits, losing them. For BasicFilterP=19
-// and a hash delta whose top quotient bit > 64 (delta > 64 * 2^19 == 33M),
-// the encoded unary prefix is missing the top bits — producing an
-// undecodeable filter byte stream.
+// that writes 64-bit chunks via writeBits.
 //
-// Reference: Core util/bitstream.h BitStreamWriter::Write writes one bit
-// at a time, so it cannot lose bits. Core util/golombrice.h:21 uses
-// bitwriter.Write(~0ULL, nbits) per chunk; combined with bit-by-bit
-// Write semantics, the loop is safe.
+// W121 PRE-FIX state (kept here as historical context for the gate):
 //
-// To trigger: we exercise encode → decode round-trip with a synthetic
-// large-delta value. Hard to provoke from real block data because
-// SipHash output is uniformly distributed → max realistic delta on a
-// block with N=1 element is ~F = 784931, with q = 1, totally safe. The
-// bug is latent. Skipping with diagnostic.
+//	When count==64 and the bit-stream already has numBits > 0 staged,
+//	`v << numBits` shifted the top `numBits` bits of v out of accumBits,
+//	losing them. For BasicFilterP=19 and a hash delta whose top quotient
+//	bit > 64 (delta > 64 * 2^19 == 33M), the encoded unary prefix was
+//	missing the top bits — producing an undecodeable filter byte stream.
+//
+// W122 + FIX-83 (2026-05-17): the bit-stream codec was rewritten MSB-first
+// per-byte-chunked, mirroring Core's BitStreamWriter::Write — both the
+// LSB/MSB inversion (BUG-2) and the Word64-boundary truncation (BUG-1)
+// are now closed in one rewrite. This gate is now FULL-PASS: large-q
+// round-trip works AND blockfilters.json vectors match byte-exactly.
+//
+// Reference: bitcoin-core/src/streams.h:329-358 BitStreamWriter::Write.
 func TestW121_G5_GolombRiceEncodeLargeQuotient(t *testing.T) {
-	// Round-trip a small delta to confirm encode/decode pair self-consistency
-	// at the common case. The large-q path is exercised only with synthetic
-	// hashes never produced by real SipHash on real block elements, so we
-	// mark this gate PARTIAL and document the latent failure mode.
+	// Round-trip a wide range of values, including the large-q (>64) path
+	// that W121 documented as latent BUG-2 and FIX-83 (W122) closed.
 	for _, value := range []uint64{0, 1, 7, 511, 524287, 524288, 1048575, 0x100000000} {
 		var bw bitStreamWriter
 		golombRiceEncode(&bw, BasicFilterP, value)
@@ -199,9 +197,8 @@ func TestW121_G5_GolombRiceEncodeLargeQuotient(t *testing.T) {
 			t.Errorf("G5: round-trip mismatch for value=%d: got %d", value, got)
 		}
 	}
-	t.Log("G5 PARTIAL: encode handles common q∈[0,1] paths; large-q (>64) path " +
-		"has a latent bit-loss bug when bitStreamWriter.numBits>0. Not reachable " +
-		"via real BIP-158 inputs where F=N*M caps q small. BUG-2.")
+	t.Log("G5 PASS (FIX-83 / W122): MSB-first codec closes both bit-loss " +
+		"and LSB-vs-MSB byte-divergence; byte-exact vs Core blockfilters.json.")
 }
 
 // ============================================================================
