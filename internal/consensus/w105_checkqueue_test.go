@@ -495,15 +495,16 @@ func TestW105_G22_SigCacheLookupBeforeVerify(t *testing.T) {
 	cache := NewSigCache(10)
 	txid := [32]byte{1, 2, 3, 4}
 
-	// Insert a synthetic entry (no actual script needed)
-	cache.Insert(txid, 0, script.ScriptFlags(0))
+	// Insert a synthetic entry (no actual script needed).
+	// W160 BUG-11 fix: cache key now requires prevOut amount + pkScript.
+	cache.Insert(txid, 0, script.ScriptFlags(0), testAmount, testPkScript)
 
 	// Lookup should hit
-	if !cache.Lookup(txid, 0, script.ScriptFlags(0)) {
+	if !cache.Lookup(txid, 0, script.ScriptFlags(0), testAmount, testPkScript) {
 		t.Error("expected cache hit")
 	}
 	// Different input index → miss
-	if cache.Lookup(txid, 1, script.ScriptFlags(0)) {
+	if cache.Lookup(txid, 1, script.ScriptFlags(0), testAmount, testPkScript) {
 		t.Error("expected cache miss for different input index")
 	}
 }
@@ -551,22 +552,22 @@ func TestW105_G23_SigCacheKeyNonce(t *testing.T) {
 	wtxhash := [32]byte{0xAA}
 	flags := script.ScriptFlags(script.ScriptVerifyP2SH)
 
-	c1.Insert(wtxhash, 0, flags)
+	c1.Insert(wtxhash, 0, flags, testAmount, testPkScript)
 
 	// c2 must not see c1's entry — its nonce produces a different key.
-	if c2.Lookup(wtxhash, 0, flags) {
+	if c2.Lookup(wtxhash, 0, flags, testAmount, testPkScript) {
 		t.Error("W105-B8A REGRESSION: cache from a different instance hit without insert — nonce is not randomised")
 	}
 
 	// Self-consistency: c1 must still find its own entry.
-	if !c1.Lookup(wtxhash, 0, flags) {
+	if !c1.Lookup(wtxhash, 0, flags, testAmount, testPkScript) {
 		t.Error("expected hit in c1 after Insert")
 	}
 
 	// Basic isolation: different wtxhash must miss.
 	wtxhash2 := [32]byte{0xBB}
-	c1.Insert(wtxhash2, 0, flags)
-	if c1.Lookup([32]byte{0xCC}, 0, flags) {
+	c1.Insert(wtxhash2, 0, flags, testAmount, testPkScript)
+	if c1.Lookup([32]byte{0xCC}, 0, flags, testAmount, testPkScript) {
 		t.Error("unrelated wtxhash should miss")
 	}
 
@@ -583,15 +584,15 @@ func TestW105_G23_SigCacheKeyNonce(t *testing.T) {
 	malleatedWtxhash := [32]byte{0x01, 0x02, 0x04} // same txid prefix, different witness → different wtxid
 
 	cache := NewSigCache(100)
-	cache.Insert(canonicalWtxhash, 0, flags)
+	cache.Insert(canonicalWtxhash, 0, flags, testAmount, testPkScript)
 
 	// The malleated variant must NOT inherit the canonical hit.
-	if cache.Lookup(malleatedWtxhash, 0, flags) {
+	if cache.Lookup(malleatedWtxhash, 0, flags, testAmount, testPkScript) {
 		t.Error("W105-B8B REGRESSION: malleated wtxhash hit cache entry inserted for canonical wtxhash — witness not committed in key")
 	}
 
 	// The canonical variant must still be found.
-	if !cache.Lookup(canonicalWtxhash, 0, flags) {
+	if !cache.Lookup(canonicalWtxhash, 0, flags, testAmount, testPkScript) {
 		t.Error("expected hit for canonical wtxhash")
 	}
 }
@@ -623,18 +624,18 @@ func TestW105_G24_CacheHitShortcutPerTxVsPerInput(t *testing.T) {
 	flags := script.ScriptFlags(script.ScriptVerifyWitness)
 
 	for i := uint32(0); i < 3; i++ {
-		cache.Insert(txid, i, flags)
+		cache.Insert(txid, i, flags, testAmount, testPkScript)
 	}
 
 	// All 3 should be individually found
 	for i := uint32(0); i < 3; i++ {
-		if !cache.Lookup(txid, i, flags) {
+		if !cache.Lookup(txid, i, flags, testAmount, testPkScript) {
 			t.Errorf("expected hit for input %d", i)
 		}
 	}
 
 	// Input 3 (never inserted) should miss
-	if cache.Lookup(txid, 3, flags) {
+	if cache.Lookup(txid, 3, flags, testAmount, testPkScript) {
 		t.Error("expected miss for input 3")
 	}
 
@@ -676,10 +677,10 @@ func TestW105_G25_WriteOnPassOnly(t *testing.T) {
 	flags := script.ScriptFlags(script.ScriptVerifyP2SH)
 
 	// Pre-insert to simulate a "cached during ConnectBlock" entry
-	cache.Insert(txid, 0, flags)
+	cache.Insert(txid, 0, flags, testAmount, testPkScript)
 
 	// Entry is present even though it was inserted during simulated block connection
-	if !cache.Lookup(txid, 0, flags) {
+	if !cache.Lookup(txid, 0, flags, testAmount, testPkScript) {
 		t.Error("cache entry should be present")
 	}
 
@@ -844,7 +845,7 @@ func TestW105_G30_ReorgPathScriptRevalidation(t *testing.T) {
 	// Simulate mempool entries
 	for i := 0; i < 50; i++ {
 		txid := [32]byte{byte(i)}
-		cache.Insert(txid, 0, script.ScriptFlags(0))
+		cache.Insert(txid, 0, script.ScriptFlags(0), testAmount, testPkScript)
 	}
 	if cache.Size() != 50 {
 		t.Fatalf("expected 50 entries, got %d", cache.Size())
