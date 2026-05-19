@@ -16,10 +16,21 @@ const DefaultSigCacheSize = 50000
 // When a transaction is validated for the mempool and later included in a block,
 // the cache allows skipping the expensive script verification on block connection.
 //
-// Key derivation mirrors Bitcoin Core's script execution cache
-// (validation.cpp / script/sigcache.h): each entry is keyed on
+// Key derivation mirrors Bitcoin Core's signature cache
+// (src/script/sigcache.cpp::ComputeEntryECDSA / ComputeEntrySchnorr): the
+// per-input key must commit to ALL inputs to script evaluation, not merely
+// the (wtxid, inputIdx, flags) script-evaluation CONTEXT. Specifically the
+// key includes the prevOut pkScript and amount so that the cache hit
+// guarantees the **sighash, pubkey, sig** material that the verifier saw
+// would also be identical (W160 BUG-11: "sigcache-omits-sighash"). Without
+// committing to pkScript + amount, a cache PASS keyed on (wtxhash, inputIdx,
+// flags) is necessary-but-not-sufficient for "this exact script-evaluation
+// passed" — a tx whose pkScript-input changes across reorgs (e.g. via
+// OP_CODESEPARATOR producing different sighashes per branch) could replay
+// a stale PASS.
 //
-//	SHA256(nonce[32] || wtxhash[32] || inputIndex[4] || flags[4])
+//	key = SHA256(nonce[32] || wtxhash[32] || inputIndex[4] || flags[4] ||
+//	             amount[8] || pkScriptLen[4] || pkScript)
 //
 // where nonce is a random 32-byte value drawn from crypto/rand at construction.
 // Using the witness transaction hash (wtxhash / wtxid) rather than the
@@ -57,17 +68,39 @@ func NewSigCache(maxSize int) *SigCache {
 	return sc
 }
 
-// computeKey derives the cache entry key for the given witness transaction
-// hash, input index, and script flags.
+// computeKey derives the cache entry key. It commits to:
+//   - nonce (random salt, anti-probing)
+//   - wtxhash (witness txid: full witness + tx structure)
+//   - inputIndex (which input within the tx)
+//   - flags (script verify flags)
+//   - amount + pkScript (prevOut: closes W160 BUG-11 "sigcache-omits-sighash"
+//     by committing to the only script-eval inputs not already covered by wtxhash)
 //
-//	key = SHA256(nonce || wtxhash || inputIndex_le32 || flags_le32)[0:16]
-func (sc *SigCache) computeKey(wtxhash [32]byte, inputIndex uint32, flags script.ScriptFlags) [16]byte {
-	var buf [32 + 32 + 4 + 4]byte
-	copy(buf[0:32], sc.nonce[:])
-	copy(buf[32:64], wtxhash[:])
-	binary.LittleEndian.PutUint32(buf[64:68], inputIndex)
-	binary.LittleEndian.PutUint32(buf[68:72], uint32(flags))
-	h := sha256.Sum256(buf[:])
+//	key = SHA256(nonce[32] || wtxhash[32] || inputIndex_le32 || flags_le32 ||
+//	             amount_le64 || pkScriptLen_le32 || pkScript)[0:16]
+//
+// pkScript + amount are the inputs to sighash computation that come from the
+// UTXO being spent, not from the spending tx. Without them, an evaluation
+// against a different prevOut (e.g. on reorg replay where the UTXO was
+// recomputed) could replay a stale PASS. Core's
+// `ComputeEntryECDSA(entry, sighash, sig, pubkey)` commits to the actual
+// sighash; this Go-level analog commits to the inputs that uniquely determine
+// every sighash that the script will compute.
+func (sc *SigCache) computeKey(wtxhash [32]byte, inputIndex uint32, flags script.ScriptFlags, amount int64, pkScript []byte) [16]byte {
+	buf := make([]byte, 0, 32+32+4+4+8+4+len(pkScript))
+	buf = append(buf, sc.nonce[:]...)
+	buf = append(buf, wtxhash[:]...)
+	var tmp [8]byte
+	binary.LittleEndian.PutUint32(tmp[:4], inputIndex)
+	buf = append(buf, tmp[:4]...)
+	binary.LittleEndian.PutUint32(tmp[:4], uint32(flags))
+	buf = append(buf, tmp[:4]...)
+	binary.LittleEndian.PutUint64(tmp[:8], uint64(amount))
+	buf = append(buf, tmp[:8]...)
+	binary.LittleEndian.PutUint32(tmp[:4], uint32(len(pkScript)))
+	buf = append(buf, tmp[:4]...)
+	buf = append(buf, pkScript...)
+	h := sha256.Sum256(buf)
 	var key [16]byte
 	copy(key[:], h[:16])
 	return key
@@ -75,10 +108,12 @@ func (sc *SigCache) computeKey(wtxhash [32]byte, inputIndex uint32, flags script
 
 // Lookup checks if a script validation result is cached.
 // wtxhash must be the witness transaction hash (wtxid), not the stripped txid.
-// Returns true if the validation was previously successful with the same
-// (wtxhash, inputIndex, flags) triple under this cache's nonce.
-func (sc *SigCache) Lookup(wtxhash [32]byte, inputIndex uint32, flags script.ScriptFlags) bool {
-	key := sc.computeKey(wtxhash, inputIndex, flags)
+// amount and pkScript are the prevOut being spent — these MUST commit to the
+// script-evaluation inputs that determine the sighash (W160 BUG-11). Returns
+// true if the validation was previously successful with the same
+// (wtxhash, inputIndex, flags, amount, pkScript) tuple under this cache's nonce.
+func (sc *SigCache) Lookup(wtxhash [32]byte, inputIndex uint32, flags script.ScriptFlags, amount int64, pkScript []byte) bool {
+	key := sc.computeKey(wtxhash, inputIndex, flags, amount, pkScript)
 	sc.mu.RLock()
 	_, found := sc.entries[key]
 	sc.mu.RUnlock()
@@ -87,9 +122,11 @@ func (sc *SigCache) Lookup(wtxhash [32]byte, inputIndex uint32, flags script.Scr
 
 // Insert adds a successful script validation result to the cache.
 // wtxhash must be the witness transaction hash (wtxid), not the stripped txid.
+// amount and pkScript are the prevOut being spent — these MUST commit to the
+// script-evaluation inputs that determine the sighash (W160 BUG-11).
 // If the cache is at capacity, a random entry is evicted first.
-func (sc *SigCache) Insert(wtxhash [32]byte, inputIndex uint32, flags script.ScriptFlags) {
-	key := sc.computeKey(wtxhash, inputIndex, flags)
+func (sc *SigCache) Insert(wtxhash [32]byte, inputIndex uint32, flags script.ScriptFlags, amount int64, pkScript []byte) {
+	key := sc.computeKey(wtxhash, inputIndex, flags, amount, pkScript)
 
 	sc.mu.Lock()
 	defer sc.mu.Unlock()

@@ -753,8 +753,11 @@ func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, fla
 			// same txid but different witnesses map to distinct cache entries
 			// (fix for W105-B8B).
 			wtxhash := job.tx.WTxHash()
-			// Check cache first
-			if cache != nil && cache.Lookup(wtxhash, uint32(job.inputIdx), flags) {
+			// Also commit to prevOut amount + pkScript so the cache key
+			// uniquely identifies every input to script evaluation, including
+			// the sighash material that comes from the UTXO rather than the
+			// spending tx (W160 BUG-11 "sigcache-omits-sighash").
+			if cache != nil && cache.Lookup(wtxhash, uint32(job.inputIdx), flags, job.prevOut.Amount, job.prevOut.PkScript) {
 				continue
 			}
 
@@ -773,7 +776,7 @@ func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, fla
 
 			// Cache successful verification
 			if cache != nil {
-				cache.Insert(wtxhash, uint32(job.inputIdx), flags)
+				cache.Insert(wtxhash, uint32(job.inputIdx), flags, job.prevOut.Amount, job.prevOut.PkScript)
 			}
 		}
 		return nil
@@ -802,8 +805,11 @@ func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, fla
 			// same txid but different witnesses map to distinct cache entries
 			// (fix for W105-B8B).
 			wtxhash := j.tx.WTxHash()
-			// Check cache first
-			if cache != nil && cache.Lookup(wtxhash, uint32(j.inputIdx), flags) {
+			// Also commit to prevOut amount + pkScript so the cache key
+			// uniquely identifies every input to script evaluation, including
+			// the sighash material that comes from the UTXO rather than the
+			// spending tx (W160 BUG-11 "sigcache-omits-sighash").
+			if cache != nil && cache.Lookup(wtxhash, uint32(j.inputIdx), flags, j.prevOut.Amount, j.prevOut.PkScript) {
 				return
 			}
 
@@ -825,7 +831,7 @@ func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, fla
 
 			// Cache successful verification
 			if cache != nil {
-				cache.Insert(wtxhash, uint32(j.inputIdx), flags)
+				cache.Insert(wtxhash, uint32(j.inputIdx), flags, j.prevOut.Amount, j.prevOut.PkScript)
 			}
 		}(job)
 	}
