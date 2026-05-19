@@ -12,14 +12,30 @@ package crypto
 //  * only needs VERIFY but is fine with both.  Mirrors haskoin's
 //  * cbits/secp256k1_compat.c::get_ellswift_ctx and ouroboros's reuse
 //  * of coincurve._libsecp256k1.lib.secp256k1_context_no_precomp.
+//  *
+//  * The context is seeded with 32 bytes of caller-supplied entropy via
+//  * secp256k1_context_randomize at initialisation.  Per
+//  * secp256k1.h:820-841 + Core key.cpp:572-587, this provides
+//  * side-channel-blinding for the secret-scalar / base-point
+//  * multiplication that backs secp256k1_ellswift_create.  See W159
+//  * BUG-3 ("side-channel-blinding-disabled" fleet pattern).
 //  */
 // static secp256k1_context *bb_ellswift_ctx = NULL;
 //
-// static secp256k1_context *bb_get_ctx(void) {
+// /* Create the context and seed it with 32 bytes of entropy.  Returns 1
+//  * on success, 0 on failure (context_create or context_randomize
+//  * failed).  Must be called exactly once before bb_get_ctx().  Idempotent:
+//  * subsequent calls re-randomize the existing context (defence in depth). */
+// static int bb_init_ctx(const unsigned char *seed32) {
 //     if (bb_ellswift_ctx == NULL) {
 //         bb_ellswift_ctx = secp256k1_context_create(
 //             SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
+//         if (bb_ellswift_ctx == NULL) return 0;
 //     }
+//     return secp256k1_context_randomize(bb_ellswift_ctx, seed32);
+// }
+//
+// static secp256k1_context *bb_get_ctx(void) {
 //     return bb_ellswift_ctx;
 // }
 //
@@ -82,10 +98,47 @@ import "C"
 import (
 	"crypto/rand"
 	"errors"
+	"sync"
 	"unsafe"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
+
+// ErrEllSwiftCtxInit is returned when libsecp256k1 fails to initialise
+// the ellswift context — either secp256k1_context_create returned NULL
+// or secp256k1_context_randomize returned 0.  Both are vanishingly rare
+// (the randomize seed comes from crypto/rand and is non-NULL); a
+// non-nil error here typically means OOM or a libsecp256k1 ABI break.
+var ErrEllSwiftCtxInit = errors.New("ellswift: libsecp256k1 context init / randomize failed")
+
+// ctxInitOnce + ctxInitErr lazily initialise the cgo ellswift context
+// exactly once per process with 32 bytes of fresh entropy from
+// crypto/rand, then call secp256k1_context_randomize to enable
+// side-channel-blinding on the secret-scalar / base-point multiplication
+// (Core key.cpp:572-587 ; W159 BUG-3).
+var (
+	ctxInitOnce sync.Once
+	ctxInitErr  error
+)
+
+// ensureCtx initialises (once) the lazily-allocated ellswift context
+// and seeds it with secp256k1_context_randomize.  Returns the cached
+// init error on subsequent calls.  Cheap on the hot path (one
+// sync.Once.Do indirection after the first call).
+func ensureCtx() error {
+	ctxInitOnce.Do(func() {
+		var seed [32]byte
+		if _, err := rand.Read(seed[:]); err != nil {
+			ctxInitErr = err
+			return
+		}
+		rc := C.bb_init_ctx((*C.uchar)(unsafe.Pointer(&seed[0])))
+		if rc != 1 {
+			ctxInitErr = ErrEllSwiftCtxInit
+		}
+	})
+	return ctxInitErr
+}
 
 // ErrEllSwiftCreate is returned when libsecp256k1 fails to encode a public
 // key with ElligatorSwift.  In practice this only happens for an invalid
@@ -193,6 +246,9 @@ func ellswiftCreate(seckey32, entropy32 []byte) (EllSwiftPubKey, error) {
 	if len(seckey32) != 32 || len(entropy32) != 32 {
 		return out, errors.New("ellswift: seckey and entropy must be 32 bytes")
 	}
+	if err := ensureCtx(); err != nil {
+		return out, err
+	}
 	rc := C.bb_ellswift_create(
 		(*C.uchar)(unsafe.Pointer(&seckey32[0])),
 		(*C.uchar)(unsafe.Pointer(&entropy32[0])),
@@ -208,6 +264,9 @@ func ellswiftCreate(seckey32, entropy32 []byte) (EllSwiftPubKey, error) {
 // public key.  Backend: libsecp256k1 secp256k1_ellswift_decode +
 // secp256k1_ec_pubkey_serialize (uncompressed).
 func DecodeToPubKey(encoded EllSwiftPubKey) (*PublicKey, error) {
+	if err := ensureCtx(); err != nil {
+		return nil, err
+	}
 	var xy [64]byte
 	rc := C.bb_ellswift_decode(
 		(*C.uchar)(unsafe.Pointer(&encoded[0])),
@@ -235,6 +294,14 @@ func DecodeToPubKey(encoded EllSwiftPubKey) (*PublicKey, error) {
 // see identical ell_a64 / ell_b64 input but flip the seckey + party flag, so
 // the returned 32-byte secret matches.
 func (k *EllSwiftPrivKey) ComputeBIP324ECDHSecret(theirEllSwift EllSwiftPubKey, initiator bool) [32]byte {
+	if err := ensureCtx(); err != nil {
+		// Same constant-time-ish sentinel as the rc != 1 path below:
+		// returning zeros causes the BIP-324 handshake to fail at the
+		// version-packet AEAD step, the desired behaviour for any
+		// context-init failure (OOM / libsecp256k1 ABI break).
+		var zero [32]byte
+		return zero
+	}
 	var ellA, ellB EllSwiftPubKey
 	var party C.int
 	if initiator {
