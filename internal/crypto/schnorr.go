@@ -2,9 +2,16 @@ package crypto
 
 import (
 	"crypto/sha256"
+	"errors"
 
 	"github.com/decred/dcrd/dcrec/secp256k1/v4"
 )
+
+// errSchnorrZeroNonce is returned by SignSchnorr when BIP-340 RFC-6979 nonce
+// derivation yields k' = 0.  BIP-340 mandates failure in this case; the prior
+// silent fallback to k = 1 produced fixed-nonce signatures that leak the
+// private key as d = (s − 1) · e^(−1) mod n.  W159 BUG-10 / W160 BUG-6.
+var errSchnorrZeroNonce = errors.New("schnorr: BIP-340 nonce derivation yielded zero")
 
 // W95 — BIP-340 Schnorr + tagged-hash audit (vs. Bitcoin Core's
 // secp256k1/src/modules/schnorrsig/main_impl.h).
@@ -180,9 +187,14 @@ func SignSchnorr(privKey *PrivateKey, hash [32]byte) ([]byte, error) {
 	var kScalar secp256k1.ModNScalar
 	kScalar.SetByteSlice(kHash[:])
 	if kScalar.IsZero() {
-		// Astronomically unlikely; BIP-340 says "fail" but for callers that
-		// can't surface errors we keep the old fallback behaviour.
-		kScalar.SetInt(1)
+		// BIP-340 mandates "Fail if k' = 0".  The prior fallback
+		// (kScalar.SetInt(1)) was catastrophic: with k=1, R = 1·G is a
+		// fixed point and s = 1 + e·d trivially reveals
+		// d = (s − 1) · e^(−1) mod n to any observer of the signature.
+		// libsecp256k1 (Bitcoin Core reference: secp256k1/src/modules/
+		// schnorrsig/main_impl.h) also returns 0 (failure) in this case.
+		// W159 BUG-10 / W160 BUG-6.
+		return nil, errSchnorrZeroNonce
 	}
 
 	// R = k*G
