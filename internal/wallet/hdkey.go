@@ -48,6 +48,7 @@ var (
 	ErrInvalidExtendedKey   = errors.New("invalid extended key format")
 	ErrInvalidChecksum      = errors.New("invalid extended key checksum")
 	ErrUnusableSeed         = errors.New("seed produces invalid master key")
+	ErrMaxDepth             = errors.New("hd: max derivation depth (255) reached")
 )
 
 // HDKey represents a BIP32 extended key.
@@ -118,6 +119,15 @@ func isValidSecretKey(key []byte) bool {
 // DeriveChild derives a child key at the given index.
 // For hardened derivation, add HardenedKeyStart to the index.
 func (k *HDKey) DeriveChild(index uint32) (*HDKey, error) {
+	// BIP-32 depth is a single byte (0..255). Refuse to derive past depth
+	// 255 instead of silently wrapping `k.Depth + 1` from 255 to 0, which
+	// would produce a "depth-0 master-like" child with non-zero parent_fp
+	// and non-zero index — violating the master-key invariant and diverging
+	// from Bitcoin Core (key.cpp:483 + pubkey.cpp:416: nDepth==0xFF -> false).
+	if k.Depth == 0xFF {
+		return nil, ErrMaxDepth
+	}
+
 	isHardened := index >= HardenedKeyStart
 
 	// Cannot derive hardened child from public key

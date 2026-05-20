@@ -387,6 +387,73 @@ func TestInvalidSeed(t *testing.T) {
 	}
 }
 
+// TestDeriveChildDepthOverflow guards against BIP-32 depth-byte overflow
+// (W161 BUG-5). BIP-32 depth is a single byte; Bitcoin Core refuses to
+// derive past depth 255 (key.cpp:483 + pubkey.cpp:416). Without an
+// explicit guard, `k.Depth + 1` in Go silently wraps from 255 -> 0,
+// producing a "depth-0 master-like" child with non-zero parent_fp and
+// non-zero index — a master-key invariant violation that Core's
+// CExtKey::Decode rejects but blockbrew previously treated as valid.
+func TestDeriveChildDepthOverflow(t *testing.T) {
+	seedHex := "000102030405060708090a0b0c0d0e0f"
+	seed, _ := hex.DecodeString(seedHex)
+	masterKey, err := NewMasterKey(seed)
+	if err != nil {
+		t.Fatalf("NewMasterKey failed: %v", err)
+	}
+
+	// Depth 254 is the last legal parent depth — DeriveChild must succeed
+	// and produce a child with depth=255.
+	parent254 := &HDKey{
+		Key:       masterKey.Key,
+		ChainCode: masterKey.ChainCode,
+		Depth:     254,
+		ParentFP:  [4]byte{0xDE, 0xAD, 0xBE, 0xEF},
+		Index:     7,
+		IsPrivate: true,
+	}
+	child255, err := parent254.DeriveChild(0)
+	if err != nil {
+		t.Fatalf("DeriveChild at depth 254 should succeed, got %v", err)
+	}
+	if child255.Depth != 255 {
+		t.Errorf("Child depth = %d, want 255", child255.Depth)
+	}
+
+	// Depth 255 is the overflow boundary — DeriveChild must reject with
+	// ErrMaxDepth rather than silently wrap to depth=0.
+	parent255 := &HDKey{
+		Key:       masterKey.Key,
+		ChainCode: masterKey.ChainCode,
+		Depth:     255,
+		ParentFP:  [4]byte{0xDE, 0xAD, 0xBE, 0xEF},
+		Index:     7,
+		IsPrivate: true,
+	}
+	wrapped, err := parent255.DeriveChild(0)
+	if err != ErrMaxDepth {
+		t.Errorf("DeriveChild at depth 255 should return ErrMaxDepth, got err=%v key=%+v", err, wrapped)
+	}
+	if wrapped != nil {
+		t.Errorf("DeriveChild at depth 255 should return nil key on overflow, got %+v", wrapped)
+	}
+
+	// Same guard must apply on the public-key path (Core enforces it in
+	// both CExtKey::Derive and CExtPubKey::Derive; blockbrew funnels both
+	// through this single DeriveChild entry point).
+	pubAtMax := &HDKey{
+		Key:       masterKey.PublicKey().Key,
+		ChainCode: masterKey.ChainCode,
+		Depth:     255,
+		ParentFP:  [4]byte{0xDE, 0xAD, 0xBE, 0xEF},
+		Index:     7,
+		IsPrivate: false,
+	}
+	if _, err := pubAtMax.DeriveChild(0); err != ErrMaxDepth {
+		t.Errorf("Public DeriveChild at depth 255 should return ErrMaxDepth, got %v", err)
+	}
+}
+
 func BenchmarkDerivePath(b *testing.B) {
 	seedHex := "000102030405060708090a0b0c0d0e0f"
 	seed, _ := hex.DecodeString(seedHex)
