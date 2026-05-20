@@ -25,6 +25,7 @@ package script
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -335,22 +336,76 @@ func TestW94_InitialStackElementSizeRejected(t *testing.T) {
 	}
 }
 
-func TestW94_WitnessV0_InitialElementSizeRejected(t *testing.T) {
-	// Witness v0 P2WSH must reject a stack item > 520 bytes before script
-	// execution (Core 1858-1861 applies to BOTH v0 and tapscript).
+func TestW94_WitnessV0_InitialDataElementSizeRejected(t *testing.T) {
+	// Witness v0 P2WSH must reject an oversized *input data item* (> 520
+	// bytes) before script execution (Core ExecuteWitnessScript
+	// interpreter.cpp:1858-1861).  Core applies this check to the post-pop
+	// stack — i.e. the witness script has already been removed by
+	// SpanPopBack — so only the data items are bounded.
+	//
+	// The witness script here is `OP_DROP OP_TRUE`: it drops one input data
+	// item and leaves OP_TRUE on the stack.  The data item is 521 bytes,
+	// which must be rejected up-front.
 	tx := dummyTx()
-	// scriptPubKey = OP_0 <sha256(witscript)>; we don't need it to match —
-	// the size check fires first.
-	scriptPubKey := append([]byte{OP_0, 0x20}, make([]byte, 32)...)
+	witScript := []byte{OP_DROP, OP_TRUE}
+	scriptHash := sha256.Sum256(witScript)
+	scriptPubKey := append([]byte{OP_0, 0x20}, scriptHash[:]...)
 	prevOuts := []*wire.TxOut{{Value: 0, PkScript: scriptPubKey}}
 	eng, err := NewEngine(scriptPubKey, tx, 0, ScriptVerifyWitness, 0, prevOuts)
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
 	oversized := make([]byte, MaxScriptElementSize+1)
-	err = eng.executeWitnessV0(scriptPubKey[2:], [][]byte{oversized, {OP_TRUE}})
-	if err == nil {
-		t.Errorf("expected rejection for >520-byte witness v0 item, got nil")
+	// executeWitnessV0 receives the wire witness reversed, so index 0 is the
+	// witness script and index 1+ are the data items.
+	err = eng.executeWitnessV0(scriptPubKey[2:], [][]byte{witScript, oversized})
+	if !errors.Is(err, ErrInitialPushSize) {
+		t.Errorf("expected ErrInitialPushSize for >520-byte witness v0 data item, got %v", err)
+	}
+}
+
+// TestW94_WitnessV0_LargeWitnessScriptAccepted is the regression test for the
+// mainnet block 950156 IBD wedge.  A P2WSH witness script LARGER than 520
+// bytes is fully consensus-valid (it is bounded by MAX_SCRIPT_SIZE = 10000,
+// not MAX_SCRIPT_ELEMENT_SIZE = 520).  Core's 520-byte witness-stack-element
+// limit applies to the post-pop stack only, so the witness script itself is
+// exempt.  The earlier blockbrew code checked the whole reversed witness
+// slice, including index 0 (the witness script), and so falsely rejected
+// every block carrying a >520-byte P2WSH witness script — wedging mainnet
+// IBD permanently at height 950156 (tx 44 input 0).
+func TestW94_WitnessV0_LargeWitnessScriptAccepted(t *testing.T) {
+	tx := dummyTx()
+	// Build a ~1265-byte witness script that is well over the 520-byte
+	// element limit but well under the 10000-byte MAX_SCRIPT_SIZE: five
+	// 250-byte data pushes (each push <= 520, so per-opcode push checks
+	// pass), each immediately dropped, then OP_TRUE.  Only 5 counted
+	// opcodes (the OP_DROPs), comfortably under MAX_OPS_PER_SCRIPT.
+	var witScript []byte
+	for i := 0; i < 5; i++ {
+		witScript = append(witScript, OP_PUSHDATA1, 250)
+		witScript = append(witScript, make([]byte, 250)...)
+		witScript = append(witScript, OP_DROP)
+	}
+	witScript = append(witScript, OP_TRUE)
+	if len(witScript) <= MaxScriptElementSize {
+		t.Fatalf("test setup: witness script must exceed %d bytes, got %d",
+			MaxScriptElementSize, len(witScript))
+	}
+	if len(witScript) > MaxScriptSize {
+		t.Fatalf("test setup: witness script must not exceed %d bytes, got %d",
+			MaxScriptSize, len(witScript))
+	}
+	scriptHash := sha256.Sum256(witScript)
+	scriptPubKey := append([]byte{OP_0, 0x20}, scriptHash[:]...)
+	prevOuts := []*wire.TxOut{{Value: 0, PkScript: scriptPubKey}}
+	eng, err := NewEngine(scriptPubKey, tx, 0, ScriptVerifyWitness, 0, prevOuts)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	// P2WSH wire witness is just [<witnessScript>]; executeWitnessV0 receives
+	// it reversed (still a single item).
+	if err := eng.executeWitnessV0(scriptPubKey[2:], [][]byte{witScript}); err != nil {
+		t.Errorf("a >520-byte P2WSH witness script must be accepted, got %v", err)
 	}
 }
 
