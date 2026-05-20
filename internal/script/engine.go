@@ -344,25 +344,30 @@ func (e *Engine) verifyWitnessCleanStack() error {
 }
 
 // executeWitnessV0 executes a segwit v0 program.
+//
+// `witness` is the wire witness stack reversed by executeWitnessProgram, so
+// for P2WSH index 0 is the witness script (the last wire item) and indices
+// 1..n-1 are the input data items.
 func (e *Engine) executeWitnessV0(program []byte, witness [][]byte) error {
 	e.sigVersion = SigVersionWitnessV0
-
-	// Core ExecuteWitnessScript interpreter.cpp:1858-1861 rejects any witness
-	// stack element > MAX_SCRIPT_ELEMENT_SIZE before EvalScript runs.  This
-	// applies to *both* witness v0 and tapscript paths.  Previously blockbrew
-	// only relied on per-opcode push-size checks, missing oversized witness
-	// stack items that were never pushed via PUSHDATA.
-	for _, item := range witness {
-		if len(item) > MaxScriptElementSize {
-			return ErrInitialPushSize
-		}
-	}
 
 	if len(program) == 20 {
 		// P2WPKH
 		if len(witness) != 2 {
 			return ErrWitnessMismatch
 		}
+
+		// Core ExecuteWitnessScript interpreter.cpp:1858-1861 rejects any
+		// witness stack element > MAX_SCRIPT_ELEMENT_SIZE before EvalScript
+		// runs.  For P2WPKH there is no popped witness script (Core builds an
+		// implied P2PKH script), so the limit applies to the full 2-item
+		// stack [signature, pubkey].
+		for _, item := range witness {
+			if len(item) > MaxScriptElementSize {
+				return ErrInitialPushSize
+			}
+		}
+
 		// Construct equivalent P2PKH script: OP_DUP OP_HASH160 <hash> OP_EQUALVERIFY OP_CHECKSIG
 		script := make([]byte, 25)
 		script[0] = OP_DUP
@@ -399,6 +404,26 @@ func (e *Engine) executeWitnessV0(program []byte, witness [][]byte) error {
 		hash := crypto.SHA256Hash(witnessScript)
 		if !bytes.Equal(hash[:], program) {
 			return ErrWitnessMismatch
+		}
+
+		// Core ExecuteWitnessScript interpreter.cpp:1858-1861 rejects any
+		// witness stack element > MAX_SCRIPT_ELEMENT_SIZE before EvalScript
+		// runs.  Critically, Core applies this check to the *post-pop* stack
+		// — VerifyWitnessProgram does SpanPopBack(stack) to remove the
+		// witness script (interpreter.cpp:1929) BEFORE calling
+		// ExecuteWitnessScript, so the witness script itself is NOT subject
+		// to the 520-byte element limit.  A P2WSH witness script can be far
+		// larger than 520 bytes (up to MAX_SCRIPT_SIZE = 10000, enforced by
+		// executeScript below); only the input data items are bounded here.
+		//
+		// The earlier blockbrew code checked the entire `witness` slice,
+		// including index 0 (the witness script), and so falsely rejected
+		// any block with a >520-byte P2WSH witness script — e.g. mainnet
+		// block 950156 tx 44 input 0, which wedged IBD permanently.
+		for i := 1; i < len(witness); i++ {
+			if len(witness[i]) > MaxScriptElementSize {
+				return ErrInitialPushSize
+			}
 		}
 
 		// Set up stack with remaining witness items (indices 1 through len-1)
