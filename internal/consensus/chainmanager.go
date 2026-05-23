@@ -962,10 +962,16 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		node.Status |= StatusHaveUndo
 	}
 
-	// Exit IBD mode when close to current time
-	if cm.isIBD && cm.tipHeight == cm.assumeValidHeight {
+	// Exit IBD mode once the tip is recent — mirrors Core's
+	// IsInitialBlockDownload max-tip-age check (validation.cpp). The old
+	// condition (cm.tipHeight == cm.assumeValidHeight) was an exact equality
+	// that any height skip — notably an assumeUTXO snapshot import — jumps
+	// clean past, leaving the node stuck in IBD mode permanently. isIBD is
+	// latched: once false, nothing here sets it true again.
+	const maxTipAgeSecs = 24 * 60 * 60 // Core DEFAULT_MAX_TIP_AGE
+	if cm.isIBD && int64(cm.tipNode.Header.Timestamp) >= time.Now().Unix()-maxTipAgeSecs {
 		cm.isIBD = false
-		log.Printf("chainmgr: exiting IBD mode at height %d", cm.tipHeight)
+		log.Printf("chainmgr: exiting IBD mode at height %d (tip is recent)", cm.tipHeight)
 	}
 
 	// Periodic UTXO flush during IBD
