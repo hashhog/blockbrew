@@ -906,8 +906,13 @@ func (cm *ClusterManager) AddTransaction(txHash wire.Hash256, fee int64, size in
 
 	for _, parentTxid := range parentTxids {
 		if clusterID, ok := cm.txToCluster[parentTxid]; ok {
-			parentClusters[clusterID] = true
 			cluster := cm.clusters[clusterID]
+			if cluster == nil {
+				// Stale txToCluster entry: the cluster was removed/merged
+				// without this mapping being updated. Skip — never deref nil.
+				continue
+			}
+			parentClusters[clusterID] = true
 			if idx, ok := cluster.Transactions[parentTxid]; ok {
 				parentIndices[clusterID] = append(parentIndices[clusterID], idx)
 			}
@@ -1001,6 +1006,11 @@ func (cm *ClusterManager) mergeClusters(clusterIDs map[uint64]bool) *Cluster {
 			idx, _ := targetCluster.AddTransaction(txHash, fr, parentIndices)
 			if idx >= 0 {
 				cm.txToCluster[txHash] = targetCluster.ID
+			} else {
+				// Tx did not fit into the target cluster — drop its stale
+				// mapping so it does not dangle when the source cluster is
+				// deleted below (a dangling entry nil-derefs AddTransaction).
+				delete(cm.txToCluster, txHash)
 			}
 		}
 

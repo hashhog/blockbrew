@@ -2496,12 +2496,33 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 		// Update stale tip tracker — our chain tip just advanced
 		sm.mu.Lock()
 		sm.lastTipUpdate = time.Now()
+		sm.removeFromQueue(bwr.req.Hash)
 		sm.mu.Unlock()
 
-		// Remove from queue and advance nextHeight
-		nextHeight++
+		// Invariant: a successful ConnectBlock advances the validated tip to
+		// exactly this height. Anchor nextHeight to the real chain tip rather
+		// than a blind ++ — if the two ever disagree, the connect cursor has
+		// desynced from the chainstate. That desync is the layer-A assumeUTXO
+		// forward-sync thrash: nextHeight runs ahead of the tip, every block
+		// then fails "does not connect", and the gap-handler churns the cursor
+		// back and forth for hours. Halt loudly on the anomaly instead.
+		if sm.chainMgr != nil {
+			_, tipH := sm.chainMgr.BestBlock()
+			if tipH != nextHeight {
+				log.Printf("[IBD-DESYNC] sync: ConnectBlock(%d) succeeded but the "+
+					"chain tip is %d — connect cursor desynced from the chainstate; "+
+					"halting the connect loop (layer-A forward-sync thrash)",
+					nextHeight, tipH)
+				sm.mu.Lock()
+				sm.nextHeight = tipH + 1
+				sm.mu.Unlock()
+				break
+			}
+			nextHeight = tipH + 1
+		} else {
+			nextHeight++
+		}
 		sm.mu.Lock()
-		sm.removeFromQueue(bwr.req.Hash)
 		sm.nextHeight = nextHeight
 		sm.mu.Unlock()
 	}
