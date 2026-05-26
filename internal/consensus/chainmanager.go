@@ -952,7 +952,23 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// also set earlier (in sync.go after StoreBlockAt) so that side-branch
 	// nodes whose body was stored but not yet connected are also visible to
 	// the filter.
-	node.Status |= StatusFullyValid | StatusDataStored
+	//
+	// Defense-in-depth (#122 follow-up to #115): GATE StatusDataStored on an
+	// actual chainDB.HasBlock probe. The pre-#115 P0 IMPL-STATE-CORRUPT bug
+	// was that the unsolicited-block arm in sync.go skipped StoreBlockAt
+	// before this point; ConnectBlock then set StatusDataStored
+	// unconditionally and lied about the on-disk state. With #115 the body
+	// SHOULD always be on disk by the time we reach here. If some future
+	// code path advances ConnectBlock without StoreBlockAt (or if chainDB
+	// had a write failure that wasn't fatal), we no longer silently lie —
+	// recalculateBestTipLocked sees the truth and can reorg to a body-
+	// present branch.
+	node.Status |= StatusFullyValid
+	if cm.chainDB == nil || cm.chainDB.HasBlock(node.Hash) {
+		node.Status |= StatusDataStored
+	} else {
+		log.Printf("chainmgr: WARN tip advanced but chainDB.HasBlock=false for %s — StatusDataStored NOT set (defense-in-depth from #122)", node.Hash.String()[:16])
+	}
 	// FIX-33 (W109 G14/G15): set StatusHaveUndo when undo data will be written
 	// to disk as part of this block connection. Mirrors Bitcoin Core's
 	// blockstorage.cpp:1029 (block.nStatus |= BLOCK_HAVE_UNDO after CBlockUndo
