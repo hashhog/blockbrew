@@ -1845,6 +1845,25 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 					return
 				}
 			}
+			// Persist body before handing off to validation. ConnectBlock does
+			// NOT store the body itself; the inflight/queued arms below call
+			// StoreBlockAt at the post-mu.Unlock() site, and the unsolicited
+			// arm must do the same — otherwise ConnectBlock advances the
+			// validated tip to a hash whose body chainDB doesn't have, fooling
+			// every getblock/getrawtransaction/RPC consumer and
+			// StatusDataStored-based chain-selection guards. Mirrors Bitcoin
+			// Core validation.cpp:ReceivedBlockTransactions which sets
+			// BLOCK_HAVE_DATA after the body lands on disk. Fixes the P0
+			// IMPL-STATE-CORRUPT finding from Phase B fleet-replay 2026-05-24
+			// (CORE-PARITY-AUDIT/_bug-reports/blockbrew-chain-state-
+			// inconsistency-2026-05-24.md).
+			if sm.chainDB != nil {
+				if err := sm.chainDB.StoreBlockAt(hash, msg.Block, nh); err != nil {
+					log.Printf("sync: failed to store unsolicited block %s: %v", hash.String()[:16], err)
+					return
+				}
+				sm.headerIndex.MarkDataStored(hash)
+			}
 			// Now pass to validation
 			select {
 			case sm.validationChan <- &blockWithRequest{
