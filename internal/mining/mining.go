@@ -663,8 +663,26 @@ func (m *BlockMiner) GenerateBlock(coinbaseScript []byte, txs []*wire.MsgTx, max
 		return wire.Hash256{}, err
 	}
 
-	// Store and connect the block
-	if m.chainDB != nil {
+	// Connect the block. Mining builds atop the active tip (the template
+	// generator anchors at tip), so this is normally the active-tip path:
+	// ConnectBlock (#126, 2026-05-27) now stages chainDB.StoreBlockAtBatch
+	// in its atomic batch alongside undo + height map + chainstate, so the
+	// standalone StoreBlock pre-store is redundant there.
+	//
+	// Discriminate defensively in case a P2P block raced in between template
+	// generation and ConnectBlock: that would make our just-mined block a
+	// side branch which ConnectBlock dispatches to ReorgTo, which calls
+	// chainDB.GetBlock per connect node — the body must be on disk for that
+	// replay. Mirrors the active-tip-vs-side-branch split in the submitblock
+	// RPC handlers, the P2P arm split closed in #126 (sync.go:1848), and
+	// haskoin f768a01.
+	isActiveTip := false
+	if m.chainMgr != nil {
+		tipHash, _ := m.chainMgr.BestBlock()
+		isActiveTip = block.Header.PrevBlock == tipHash
+	}
+
+	if !isActiveTip && m.chainDB != nil {
 		if err := m.chainDB.StoreBlock(hash, block); err != nil {
 			return wire.Hash256{}, err
 		}
