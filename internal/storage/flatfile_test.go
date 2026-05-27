@@ -644,3 +644,189 @@ func TestBlockStoreNoDB(t *testing.T) {
 		t.Error("HasBlock should return false without DB")
 	}
 }
+
+// TestWriteAndIndexBlockBatch verifies the #126 batch-aware variant:
+// the block bytes hit blk*.dat immediately (fsync), but the position
+// index PUT is staged on the provided batch and only becomes durable
+// when batch.Write() lands. Mirrors the contract ConnectBlock relies on
+// when folding the body store into its atomic Pebble batch.
+func TestWriteAndIndexBlockBatch(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	db := NewMemDB()
+	defer db.Close()
+
+	bs, err := NewBlockStore(tmpDir, testMagic, db)
+	if err != nil {
+		t.Fatalf("NewBlockStore failed: %v", err)
+	}
+	defer bs.Close()
+
+	hash := wire.DoubleHashB([]byte("batched block"))
+	blockData := []byte("body for the batched flow")
+
+	t.Run("BodyOnDiskImmediately_IndexDeferred", func(t *testing.T) {
+		batch := db.NewBatch()
+		pos, err := bs.WriteAndIndexBlockBatch(batch, hash, blockData, 1, 1609459200)
+		if err != nil {
+			t.Fatalf("WriteAndIndexBlockBatch: %v", err)
+		}
+
+		// Body bytes are on disk now (WriteBlock fsyncs).
+		got, err := bs.ReadBlock(pos)
+		if err != nil {
+			t.Fatalf("ReadBlock by pos before batch.Write: %v", err)
+		}
+		if !bytes.Equal(got, blockData) {
+			t.Errorf("body bytes mismatch before batch.Write")
+		}
+
+		// But the position index is NOT yet visible (batch unwritten).
+		if bs.HasBlock(hash) {
+			t.Errorf("HasBlock returned true before batch.Write — position index leaked outside batch")
+		}
+
+		// Commit the batch.
+		if err := batch.Write(); err != nil {
+			t.Fatalf("batch.Write: %v", err)
+		}
+
+		// Now the position index is durable; HasBlock + ReadBlockByHash work.
+		if !bs.HasBlock(hash) {
+			t.Errorf("HasBlock returned false after batch.Write")
+		}
+		readBack, err := bs.ReadBlockByHash(hash)
+		if err != nil {
+			t.Fatalf("ReadBlockByHash after batch.Write: %v", err)
+		}
+		if !bytes.Equal(readBack, blockData) {
+			t.Errorf("ReadBlockByHash returned wrong bytes after batch.Write")
+		}
+	})
+
+	t.Run("IdempotentSecondCall", func(t *testing.T) {
+		// First call landed above; a second call with the same hash must
+		// short-circuit on HasBlock and return the existing position
+		// without re-appending to blk*.dat.
+		batch := db.NewBatch()
+		pos2, err := bs.WriteAndIndexBlockBatch(batch, hash, blockData, 1, 1609459200)
+		if err != nil {
+			t.Fatalf("WriteAndIndexBlockBatch (second call): %v", err)
+		}
+		expected, err := bs.GetBlockPos(hash)
+		if err != nil {
+			t.Fatalf("GetBlockPos: %v", err)
+		}
+		if pos2 != expected {
+			t.Errorf("second WriteAndIndexBlockBatch returned new position: got %v want %v (would mean re-append)",
+				pos2, expected)
+		}
+		if batch.Len() != 0 {
+			t.Errorf("second WriteAndIndexBlockBatch staged batch ops: want 0, got %d (would mean re-PUT on idempotent path)",
+				batch.Len())
+		}
+	})
+}
+
+// TestChainDBStoreBlockAtBatch_Legacy verifies the legacy "B"-prefix
+// path (no flat-file store attached) writes the body bytes via the batch
+// instead of via a separate non-batched PUT.
+func TestChainDBStoreBlockAtBatch_Legacy(t *testing.T) {
+	db := NewMemDB()
+	defer db.Close()
+
+	chainDB := NewChainDB(db)
+	// Deliberately no SetBlockStore — exercise the legacy "B"-prefix path.
+
+	hash := wire.DoubleHashB([]byte("legacy block"))
+	block := makeTestMsgBlock()
+
+	batch := db.NewBatch()
+	if err := chainDB.StoreBlockAtBatch(batch, hash, block, 1); err != nil {
+		t.Fatalf("StoreBlockAtBatch: %v", err)
+	}
+
+	// Before batch.Write, body should NOT be visible.
+	if chainDB.HasBlock(hash) {
+		t.Errorf("HasBlock returned true before batch.Write — legacy path leaked outside batch")
+	}
+
+	if err := batch.Write(); err != nil {
+		t.Fatalf("batch.Write: %v", err)
+	}
+
+	if !chainDB.HasBlock(hash) {
+		t.Errorf("HasBlock false after batch.Write — legacy path did not commit body")
+	}
+
+	got, err := chainDB.GetBlock(hash)
+	if err != nil {
+		t.Fatalf("GetBlock after legacy batch path: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetBlock returned nil block")
+	}
+}
+
+// TestChainDBStoreBlockAtBatch_Idempotent verifies the ChainDB-level
+// idempotency: a second StoreBlockAtBatch call after a successful first
+// commit is a no-op (HasBlock fast-path) and leaves the batch empty.
+func TestChainDBStoreBlockAtBatch_Idempotent(t *testing.T) {
+	db := NewMemDB()
+	defer db.Close()
+
+	chainDB := NewChainDB(db)
+	hash := wire.DoubleHashB([]byte("idempotent block"))
+	block := makeTestMsgBlock()
+
+	// First call: stage + commit.
+	batch1 := db.NewBatch()
+	if err := chainDB.StoreBlockAtBatch(batch1, hash, block, 1); err != nil {
+		t.Fatalf("first StoreBlockAtBatch: %v", err)
+	}
+	if err := batch1.Write(); err != nil {
+		t.Fatalf("first batch.Write: %v", err)
+	}
+
+	// Second call: should NOT stage anything new.
+	batch2 := db.NewBatch()
+	if err := chainDB.StoreBlockAtBatch(batch2, hash, block, 1); err != nil {
+		t.Fatalf("second StoreBlockAtBatch: %v", err)
+	}
+	if batch2.Len() != 0 {
+		t.Errorf("second StoreBlockAtBatch staged %d ops, want 0 (HasBlock fast-path should short-circuit)",
+			batch2.Len())
+	}
+}
+
+// makeTestMsgBlock returns a minimal valid-shape MsgBlock for the legacy
+// "B"-prefix tests. We don't care about consensus validity here — only
+// that Serialize / Deserialize round-trip cleanly through the storage
+// path.
+func makeTestMsgBlock() *wire.MsgBlock {
+	return &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version:    1,
+			PrevBlock:  wire.Hash256{},
+			MerkleRoot: wire.Hash256{},
+			Timestamp:  1609459200,
+			Bits:       0x207fffff,
+			Nonce:      0,
+		},
+		Transactions: []*wire.MsgTx{
+			{
+				Version: 1,
+				TxIn: []*wire.TxIn{
+					{
+						PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+						SignatureScript:  []byte{0x01, 0x01},
+						Sequence:         0xFFFFFFFF,
+					},
+				},
+				TxOut: []*wire.TxOut{
+					{Value: 5000000000, PkScript: []byte{0x51}},
+				},
+			},
+		},
+	}
+}

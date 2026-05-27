@@ -713,6 +713,38 @@ func (bs *BlockStore) IndexBlock(hash wire.Hash256, pos FlatFilePos) error {
 	return bs.db.Put(key, buf.Bytes())
 }
 
+// IndexBlockBatch appends a block-position index PUT to an existing batch.
+//
+// Companion to IndexBlock for the atomic-batch ConnectBlock path (#126,
+// 2026-05-27): folding the position-index write into the same Pebble batch
+// as the undo data + height map + UTXO set + chainstate closes the crash
+// window where the body could be written to blk*.dat but the position
+// index PUT (a separate non-batched Pebble PUT) might not yet be durable.
+// With this method, ConnectBlock can stage the position index alongside
+// chainstate so a single batch.Write commits both — body bytes + every
+// Pebble key that references them.
+//
+// No-op (no batch.Put) if bs.db is nil (in-memory / disabled-index modes).
+// Returns the serialization error from pos.Serialize on the rare path where
+// FlatFilePos cannot be encoded.
+func (bs *BlockStore) IndexBlockBatch(batch Batch, hash wire.Hash256, pos FlatFilePos) error {
+	if bs.db == nil {
+		return nil
+	}
+
+	key := MakeBlockPosKey(hash)
+	var buf bytes.Buffer
+	if err := pos.Serialize(&buf); err != nil {
+		return err
+	}
+	// Copy the serialized value because batch.Put borrows the slice and
+	// buf goes out of scope when this function returns.
+	val := make([]byte, buf.Len())
+	copy(val, buf.Bytes())
+	batch.Put(key, val)
+	return nil
+}
+
 // IndexUndo stores the undo position in the index.
 func (bs *BlockStore) IndexUndo(hash wire.Hash256, pos FlatFilePos) error {
 	if bs.db == nil {
@@ -790,6 +822,46 @@ func (bs *BlockStore) WriteAndIndexBlock(hash wire.Hash256, blockData []byte, he
 	}
 
 	if err := bs.IndexBlock(hash, pos); err != nil {
+		return FlatFilePos{FileNum: -1}, err
+	}
+
+	return pos, nil
+}
+
+// WriteAndIndexBlockBatch writes a block to blk*.dat (fsynced) and stages
+// the position-index PUT on the provided batch. The block bytes land on
+// disk immediately (flat-file fsync), but the Pebble key that lets readers
+// find them is deferred to batch.Write — letting ConnectBlock commit the
+// body's position index in the same atomic batch as the undo data, height
+// map, UTXO set, and chainstate.
+//
+// Idempotent under the same conditions as WriteAndIndexBlock: if HasBlock
+// returns true, the existing position is returned and the batch is left
+// untouched. Crash-safety profile:
+//
+//   - Crash before batch.Write: orphaned bytes in blk*.dat; no Pebble keys
+//     reference them; on retry HasBlock is false (no position index) and
+//     the block is rewritten. Identical to the WriteAndIndexBlock failure
+//     mode (and the same "orphaned bytes accumulate until a manual prune"
+//     trade-off — see the WriteAndIndexBlock comment above).
+//   - Crash after batch.Write: body + position index + every other key in
+//     the batch are all durable together. Cannot leave a "position index
+//     PUT lands, body never made it" state.
+//
+// Companion to IndexBlockBatch; introduced for task #126 (2026-05-27) so
+// the body store can fold into ConnectBlock's atomic batch and mirror the
+// equivalent haskoin f768a01 refactor.
+func (bs *BlockStore) WriteAndIndexBlockBatch(batch Batch, hash wire.Hash256, blockData []byte, height uint32, blockTime uint64) (FlatFilePos, error) {
+	if bs.HasBlock(hash) {
+		return bs.GetBlockPos(hash)
+	}
+
+	pos, err := bs.WriteBlock(blockData, height, blockTime)
+	if err != nil {
+		return FlatFilePos{FileNum: -1}, err
+	}
+
+	if err := bs.IndexBlockBatch(batch, hash, pos); err != nil {
 		return FlatFilePos{FileNum: -1}, err
 	}
 
