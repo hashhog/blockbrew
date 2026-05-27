@@ -581,6 +581,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		node.Status |= StatusFullyValid | StatusDataStored
 		if cm.chainDB != nil {
 			batch := cm.chainDB.NewBatch()
+			// #126 (2026-05-27): fold the block body into the genesis batch
+			// so that on a brand-new datadir the genesis body + undo +
+			// height map + chainstate commit atomically. Callers (genesis
+			// init in testutil + main.go bootstrap) used to invoke a
+			// separate chainDB.StoreBlock first; ConnectBlock now owns
+			// the body persistence end-to-end via StoreBlockAtBatch. The
+			// call is idempotent (HasBlock fast-path), so any caller still
+			// pre-storing the genesis body sees a no-op here.
+			if err := cm.chainDB.StoreBlockAtBatch(batch, hash, block, node.Height); err != nil {
+				return fmt.Errorf("failed to stage genesis block body: %w", err)
+			}
 			emptyUndo := &storage.BlockUndo{}
 			cm.chainDB.WriteBlockUndoBatch(batch, hash, emptyUndo)
 			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
@@ -946,37 +957,20 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	cm.tipNode = node
 	cm.tipHeight = node.Height
 	cm.updateTipCache(node.Hash, node.Height)
-	// G1/G3 fix (W101): set StatusDataStored so recalculateBestTipLocked can
-	// filter data-absent nodes. Mirrors Bitcoin Core's BLOCK_HAVE_DATA flag
-	// set in ReceivedBlockTransactions (validation.cpp). StatusDataStored is
-	// also set earlier (in sync.go after StoreBlockAt) so that side-branch
-	// nodes whose body was stored but not yet connected are also visible to
-	// the filter.
-	//
-	// Defense-in-depth (#122 follow-up to #115): GATE StatusDataStored on an
-	// actual chainDB.HasBlock probe. The pre-#115 P0 IMPL-STATE-CORRUPT bug
-	// was that the unsolicited-block arm in sync.go skipped StoreBlockAt
-	// before this point; ConnectBlock then set StatusDataStored
-	// unconditionally and lied about the on-disk state. With #115 the body
-	// SHOULD always be on disk by the time we reach here. If some future
-	// code path advances ConnectBlock without StoreBlockAt (or if chainDB
-	// had a write failure that wasn't fatal), we no longer silently lie —
-	// recalculateBestTipLocked sees the truth and can reorg to a body-
-	// present branch.
+	// G1/G3 fix (W101): set StatusFullyValid so recalculateBestTipLocked can
+	// filter invalid-marked nodes. StatusDataStored is set further down,
+	// AFTER batch.Write succeeds — see the persistence block below for why.
 	node.Status |= StatusFullyValid
-	if cm.chainDB == nil || cm.chainDB.HasBlock(node.Hash) {
-		node.Status |= StatusDataStored
-	} else {
-		log.Printf("chainmgr: WARN tip advanced but chainDB.HasBlock=false for %s — StatusDataStored NOT set (defense-in-depth from #122)", node.Hash.String()[:16])
-	}
 	// FIX-33 (W109 G14/G15): set StatusHaveUndo when undo data will be written
 	// to disk as part of this block connection. Mirrors Bitcoin Core's
 	// blockstorage.cpp:1029 (block.nStatus |= BLOCK_HAVE_UNDO after CBlockUndo
 	// is written to rev*.dat). When generateUndo is false (assume-valid IBD),
 	// no undo data is generated so the flag stays clear.
-	if generateUndo {
-		node.Status |= StatusHaveUndo
-	}
+	//
+	// #126: like StatusDataStored, this flag now sets on the post-batch.Write
+	// path so the in-memory headerindex never advertises HAVE_UNDO before
+	// the undo bytes are durable on disk.
+	// (Set below, gated on batch.Write success.)
 
 	// Exit IBD mode once the tip is recent — mirrors Core's
 	// IsInitialBlockDownload max-tip-age check (validation.cpp). The old
@@ -996,9 +990,33 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 
 	_phasePersistStart = time.Now() // W76: script-validation → persistence boundary
 
-	// Persist block data atomically: undo data, block height, UTXO set, and
-	// chain state are written in a single batch so a crash can never leave the
-	// chain tip ahead of (or behind) the UTXO set.
+	// Persist block data atomically: block body, undo data, block height,
+	// UTXO set, and chain state are written in a single batch so a crash
+	// can never leave the chain tip ahead of (or behind) the UTXO set, and
+	// can never leave the chainstate pointing at a hash whose body the
+	// position-index lookup cannot resolve.
+	//
+	// #126 (2026-05-27): the block body (StoreBlockAtBatch) is now folded
+	// into every batch below. Pre-#126 the body was written by sync.go's
+	// HandleBlock arm at a separate non-batched callsite (StoreBlockAt),
+	// and the flat-file position-index PUT was a separate non-batched
+	// Pebble PUT (PebbleDB.Put runs with pebble.NoSync, so it was not
+	// durable until a later batch.Write triggered a Sync). A crash between
+	// those writes and ConnectBlock's chainstate batch could leave the
+	// position-index PUT un-fsynced while the chainstate advanced — the
+	// "tip advanced but chainDB.HasBlock=false" condition that #122
+	// gated against. Folding the body into this batch closes that crash
+	// window: body bytes hit blk*.dat (with fsync) immediately, and the
+	// Pebble keys that let readers find them commit together with the
+	// rest of the chainstate. StoreBlockAtBatch is idempotent (HasBlock
+	// short-circuit), so the sync.go pre-store remains a no-op cost on
+	// the hot path while still acting as side-branch staging for the
+	// out-of-order-P2P-fork case that ReorgTo's GetBlock relies on.
+	//
+	// Mirrors haskoin f768a01 which folded PrefixBlockData into
+	// connectBlockAt's WriteBatch. blockbrew's flat-file architecture
+	// means the actual block bytes go to blk*.dat (not a Pebble key),
+	// but every Pebble key that references those bytes is in this batch.
 	//
 	// Pattern D (multi-block reorg atomicity, 2026-05-05): when cm.reorgBatch
 	// is set (we are inside ReorgTo), we APPEND every persistence write to
@@ -1012,6 +1030,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// Reorg-batched path: append to the union batch ReorgTo opened.
 			// UTXO flush is done ONCE at the end of ReorgTo (not per-block)
 			// so the FRESH-bit dedup across the whole reorg span still works.
+			//
+			// #126: fold the body into the reorg union batch too. ReorgTo
+			// resolves block bodies via cm.chainDB.GetBlock before each
+			// inner ConnectBlock — those bodies are already on disk from
+			// earlier sync.go pre-stores, so StoreBlockAtBatch is a no-op
+			// here under normal operation. If a reorg replays an older
+			// branch whose body was orphaned (HasBlock = false), the body
+			// is restored as part of the union batch.
+			if err := cm.chainDB.StoreBlockAtBatch(cm.reorgBatch, hash, block, node.Height); err != nil {
+				return fmt.Errorf("failed to stage block body on reorg batch: %w", err)
+			}
 			if generateUndo {
 				cm.chainDB.WriteBlockUndoBatch(cm.reorgBatch, hash, blockUndo)
 			}
@@ -1020,64 +1049,100 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				BestHash:   hash,
 				BestHeight: node.Height,
 			})
+			// #126: set HAVE_DATA + HAVE_UNDO on the in-memory headerindex.
+			// The actual on-disk commit happens later (ReorgTo's batch.Write),
+			// but the reorg-as-a-whole is atomic — if it fails, the entire
+			// in-memory chain state is rolled back via reorgInMemoryFallback
+			// semantics (per-block disconnects + connects). Setting the bits
+			// here keeps the reorg path symmetric with the regular path.
+			node.Status |= StatusDataStored
+			if generateUndo {
+				node.Status |= StatusHaveUndo
+			}
 		} else {
 			writeChainState := !cm.isIBD || shouldFlush
 
-			if writeChainState || generateUndo {
-				// Use NoSync for non-flush IBD batches — only the flush batch
-				// (which persists chain state) needs durability.
-				var batch storage.Batch
-				if cm.isIBD && !shouldFlush {
-					batch = cm.chainDB.NewBatchNoSync()
-				} else {
-					batch = cm.chainDB.NewBatch()
-				}
-
-				// Undo data keyed by block hash (not height, since heights can change during reorgs)
-				if generateUndo {
-					cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
-				}
-
-				// Height -> hash mapping
-				cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
-
-				// UTXO flush into the same batch when it's time
-				if shouldFlush {
-					type batchFlusher interface {
-						FlushBatch(storage.Batch) error
-					}
-					if f, ok := cm.utxoSet.(batchFlusher); ok {
-						if err := f.FlushBatch(batch); err != nil {
-							return fmt.Errorf("failed to flush UTXOs to batch: %w", err)
-						}
-					}
-				}
-
-				// Chain state (tip hash + height) in the same atomic batch
-				if writeChainState {
-					cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
-						BestHash:   hash,
-						BestHeight: node.Height,
-					})
-				}
-
-				if err := batch.Write(); err != nil {
-					return fmt.Errorf("failed to write atomic block batch: %w", err)
-				}
-
-				if shouldFlush {
-					log.Printf("chainmgr: UTXO flush at height %d (atomic)", cm.tipHeight)
-				}
+			// #126: open a batch for every connect, not just when there is
+			// chainstate / undo work, so the body store can ride a batch
+			// even between IBD flush intervals. Without this, blocks
+			// reaching the "legacy non-batch" else-arm below (assume-valid
+			// IBD between flushes, generateUndo = false) would skip the
+			// atomic body-store guarantee — and a sync.go pre-store crash
+			// could leave the body in flat-file but no Pebble key
+			// referencing it until the next flush.
+			//
+			// Use NoSync for non-flush IBD batches — only the flush batch
+			// (which persists chain state) needs durability.
+			var batch storage.Batch
+			if cm.isIBD && !shouldFlush {
+				batch = cm.chainDB.NewBatchNoSync()
 			} else {
-				// During IBD between flushes, still persist height mapping
-				cm.chainDB.SetBlockHeight(node.Height, hash)
-				// Write undo data individually between flush intervals
-				if generateUndo {
-					if err := cm.chainDB.WriteBlockUndo(hash, blockUndo); err != nil {
-						return fmt.Errorf("failed to write undo data: %w", err)
+				batch = cm.chainDB.NewBatch()
+			}
+
+			// Block body (idempotent: skipped if HasBlock(hash) already).
+			if err := cm.chainDB.StoreBlockAtBatch(batch, hash, block, node.Height); err != nil {
+				return fmt.Errorf("failed to stage block body: %w", err)
+			}
+
+			// Undo data keyed by block hash (not height, since heights can change during reorgs)
+			if generateUndo {
+				cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
+			}
+
+			// Height -> hash mapping
+			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
+
+			// UTXO flush into the same batch when it's time
+			if shouldFlush {
+				type batchFlusher interface {
+					FlushBatch(storage.Batch) error
+				}
+				if f, ok := cm.utxoSet.(batchFlusher); ok {
+					if err := f.FlushBatch(batch); err != nil {
+						return fmt.Errorf("failed to flush UTXOs to batch: %w", err)
 					}
 				}
 			}
+
+			// Chain state (tip hash + height) in the same atomic batch
+			if writeChainState {
+				cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+					BestHash:   hash,
+					BestHeight: node.Height,
+				})
+			}
+
+			if err := batch.Write(); err != nil {
+				return fmt.Errorf("failed to write atomic block batch: %w", err)
+			}
+
+			// #126: now that body + position index + undo + height + UTXO +
+			// chainstate are atomically durable, set the in-memory
+			// HAVE_DATA + HAVE_UNDO flags. Previously these were set BEFORE
+			// the batch.Write, which left a window where a write failure
+			// returned an error but the in-memory headerindex already
+			// advertised data presence. Mirrors Bitcoin Core's
+			// ReceivedBlockTransactions + blockstorage.cpp:1029 ordering:
+			// the in-memory flag transition follows the durable on-disk
+			// write.
+			node.Status |= StatusDataStored
+			if generateUndo {
+				node.Status |= StatusHaveUndo
+			}
+
+			if shouldFlush {
+				log.Printf("chainmgr: UTXO flush at height %d (atomic)", cm.tipHeight)
+			}
+		}
+	} else {
+		// No chainDB attached (some unit tests): the body is in memory only,
+		// but downstream callers that probe StatusDataStored treat "nil
+		// chainDB" as "always durable" (see the pre-#126 HasBlock guard).
+		// Preserve that behavior so the test paths don't regress.
+		node.Status |= StatusDataStored
+		if generateUndo {
+			node.Status |= StatusHaveUndo
 		}
 	}
 
