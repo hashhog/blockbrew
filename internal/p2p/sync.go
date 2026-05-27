@@ -1845,26 +1845,32 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 					return
 				}
 			}
-			// Persist body before handing off to validation. ConnectBlock does
-			// NOT store the body itself; the inflight/queued arms below call
-			// StoreBlockAt at the post-mu.Unlock() site, and the unsolicited
-			// arm must do the same — otherwise ConnectBlock advances the
-			// validated tip to a hash whose body chainDB doesn't have, fooling
-			// every getblock/getrawtransaction/RPC consumer and
-			// StatusDataStored-based chain-selection guards. Mirrors Bitcoin
-			// Core validation.cpp:ReceivedBlockTransactions which sets
-			// BLOCK_HAVE_DATA after the body lands on disk. Fixes the P0
-			// IMPL-STATE-CORRUPT finding from Phase B fleet-replay 2026-05-24
-			// (CORE-PARITY-AUDIT/_bug-reports/blockbrew-chain-state-
-			// inconsistency-2026-05-24.md).
-			if sm.chainDB != nil {
-				if err := sm.chainDB.StoreBlockAt(hash, msg.Block, nh); err != nil {
-					log.Printf("sync: failed to store unsolicited block %s: %v", hash.String()[:16], err)
-					return
-				}
-				sm.headerIndex.MarkDataStored(hash)
-			}
-			// Now pass to validation
+			// #126 (2026-05-27): hand the block straight to validation. The
+			// body persistence is folded into ConnectBlock's atomic batch
+			// (chainmanager.go: every persistence arm now calls
+			// chainDB.StoreBlockAtBatch in the same batch as undo data +
+			// height map + UTXO set + chainstate). Pre-#126 the unsolicited
+			// arm had to call StoreBlockAt + MarkDataStored ahead of the
+			// channel send (the #115 fix); that pre-store is now redundant
+			// for the active-tip path because ConnectBlock owns body
+			// persistence end-to-end and a crash mid-write can no longer
+			// leave the chainstate ahead of the body. The
+			// inflight/queued arm below KEEPS its pre-store: those bodies
+			// are downloaded along the headers-first projected best chain
+			// and may belong to a side branch whose ancestors must be on
+			// disk before ReorgTo's GetBlock can replay them. An unsolicited
+			// block is by definition a single miner-announced inv whose
+			// only role is to extend the active tip, so there is no
+			// side-branch-ancestor that must be pre-staged.
+			//
+			// If ConnectBlock fails (e.g., heavier side branch triggers a
+			// reorg, but the side branch's other body is missing from disk
+			// because no queue download ran), the failure is loud and the
+			// block can be re-requested.
+			//
+			// Mirrors haskoin f768a01 which removed the active-tip
+			// putBlock from submitBlock once connectBlockAt's WriteBatch
+			// folded in the body store.
 			select {
 			case sm.validationChan <- &blockWithRequest{
 				block: msg.Block,
@@ -1897,6 +1903,20 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 
 	// Store block to database. Use StoreBlockAt so the flat-file
 	// BlockFileInfo metadata records the chain height for this block.
+	//
+	// #126 (2026-05-27): this pre-store is RETAINED (not removed like the
+	// unsolicited arm above) because the inflight/queued arm sees blocks
+	// downloaded along the headers-first projected best chain — including
+	// blocks that may belong to a side branch whose ancestors must be
+	// resident on disk before ReorgTo's GetBlock can replay them. The
+	// ConnectBlock atomic batch now ALSO stages the body via
+	// StoreBlockAtBatch (chainmanager.go), so this pre-store is a no-op
+	// on the hot path (HasBlock short-circuit) and acts purely as
+	// side-branch staging for the out-of-order-P2P-fork case.
+	//
+	// MarkDataStored stays because side-branch nodes that have a body on
+	// disk but have not yet been ConnectBlock'd need the in-memory flag
+	// so recalculateBestTipLocked treats them as candidate tips.
 	if sm.chainDB != nil {
 		if err := sm.chainDB.StoreBlockAt(hash, msg.Block, req.Height); err != nil {
 			log.Printf("sync: failed to store block %s: %v", hash.String()[:16], err)

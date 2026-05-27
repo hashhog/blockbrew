@@ -163,6 +163,63 @@ func (c *ChainDB) StoreBlockAt(hash wire.Hash256, block *wire.MsgBlock, height i
 	return c.db.Put(key, buf.Bytes())
 }
 
+// StoreBlockAtBatch persists a block body and stages every Pebble write
+// that references it on the provided batch. Used by ConnectBlock so the
+// body's position index (flat-file path) or inline blob (legacy "B"-prefix
+// path) lands atomically with the undo data, height map, UTXO set, and
+// chainstate (#126, 2026-05-27).
+//
+// Flat-file path: WriteAndIndexBlockBatch fsyncs the body bytes immediately
+// to blk*.dat, but stages the position-index PUT on the batch. A crash
+// before batch.Write leaves orphaned bytes in blk*.dat that no Pebble key
+// references (same failure mode as the older WriteAndIndexBlock; on retry
+// the block is rewritten because HasBlock returns false).
+//
+// Legacy "B"-prefix path (MemDB-backed tests / pre-flatfile datadirs):
+// the entire serialized block goes through batch.Put. Body + chainstate
+// are perfectly atomic on commit.
+//
+// Idempotent: if HasBlock(hash) returns true (block already on disk),
+// the batch is not modified and nil is returned. This lets callers
+// (sync.go pre-store + ConnectBlock self-heal) invoke this twice without
+// double-writing.
+//
+// Mirrors haskoin f768a01 (which folded PrefixBlockData into connectBlockAt's
+// WriteBatch). See `Verified: ...` footer on the commit message for the
+// pre/post behavior diff.
+func (c *ChainDB) StoreBlockAtBatch(batch Batch, hash wire.Hash256, block *wire.MsgBlock, height int32) error {
+	// Idempotent fast-path: skip serialisation entirely if the body is
+	// already persisted. WriteAndIndexBlockBatch has the same check, but
+	// short-circuiting before serialisation also avoids the legacy-path
+	// re-PUT below.
+	if c.HasBlock(hash) {
+		return nil
+	}
+
+	buf := new(bytes.Buffer)
+	if err := block.Serialize(buf); err != nil {
+		return err
+	}
+
+	if c.blockStore != nil {
+		h := uint32(0)
+		if height > 0 {
+			h = uint32(height)
+		}
+		_, err := c.blockStore.WriteAndIndexBlockBatch(batch, hash, buf.Bytes(), h, uint64(block.Header.Timestamp))
+		return err
+	}
+
+	// Legacy path: inline the block under the "B" prefix via the batch.
+	// Copy the bytes because batch.Put borrows the slice and buf goes out
+	// of scope when this function returns.
+	key := MakeBlockDataKey(hash)
+	val := make([]byte, buf.Len())
+	copy(val, buf.Bytes())
+	batch.Put(key, val)
+	return nil
+}
+
 // HasBlock returns true if the block data is already persisted, either in
 // the flat-file store (W87) or in the legacy "B"-prefix Pebble blob. Does
 // not read or deserialize the block body.
