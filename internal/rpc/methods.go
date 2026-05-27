@@ -1963,8 +1963,34 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		return bip22ResultString(err), nil
 	}
 
-	// Store block
-	if s.chainDB != nil {
+	// Active-tip vs side-branch discrimination (mirrors the P2P
+	// unsolicited-vs-inflight split closed in #126 / sync.go:1848).
+	//
+	// #126 (2026-05-27 — folded body store into ConnectBlock's atomic batch)
+	// turned the standalone chainDB.StoreBlock into a no-op on the active-tip
+	// path: ConnectBlock now stages StoreBlockAtBatch alongside undo + height
+	// map + chainstate. The pre-store remains useful only for the
+	// side-branch case (ProcessSubmittedBlock → ReorgTo loads each connect
+	// node via chainDB.GetBlock, so the just-submitted side-branch body must
+	// already be on disk).
+	//
+	// Discriminate here on parent==tip so the active-tip arm skips the
+	// redundant write. Mirrors haskoin commit f768a01 which removed
+	// putBlock from submitBlock's active-tip arm but retained it inside
+	// submitBlockSideBranch.
+	isActiveTip := false
+	if s.chainMgr != nil {
+		tipHash, _ := s.chainMgr.BestBlock()
+		isActiveTip = block.Header.PrevBlock == tipHash
+	}
+
+	// Side-branch pre-store (NOT removed): if the parent is not the active
+	// tip, ProcessSubmittedBlock will route through ReorgTo (if heavier) or
+	// store the block as a side-branch (if lighter). Both arms need the body
+	// resident on disk — ReorgTo replays the block via chainDB.GetBlock, and
+	// the side-branch-stored arm needs the body durable for a future reorg
+	// dispatch when a sibling extends this branch past tip work.
+	if !isActiveTip && s.chainDB != nil {
 		if err := s.chainDB.StoreBlock(hash, block); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to store block: %v", err)}
 		}
@@ -2081,7 +2107,20 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interfac
 			continue
 		}
 
-		if s.chainDB != nil {
+		// Active-tip vs side-branch discrimination — same logic as
+		// handleSubmitBlock above. ConnectBlock now stages the body via
+		// StoreBlockAtBatch on the active-tip path (#126), so the standalone
+		// pre-store is redundant there. The side-branch path (ConnectBlock
+		// post-IBD dispatching ReorgTo on heavier-work mismatch) STILL needs
+		// the body on disk because ReorgTo calls chainDB.GetBlock per connect
+		// node. Mirrors haskoin f768a01 + the P2P arm split closed in #126.
+		isActiveTipBatch := false
+		if s.chainMgr != nil {
+			tipHash, _ := s.chainMgr.BestBlock()
+			isActiveTipBatch = block.Header.PrevBlock == tipHash
+		}
+
+		if !isActiveTipBatch && s.chainDB != nil {
 			if err := s.chainDB.StoreBlock(hash, block); err != nil {
 				results[i] = fmt.Sprintf("failed to store block: %v", err)
 				continue
@@ -3305,8 +3344,22 @@ func (s *Server) handleGenerateBlock(params json.RawMessage) (interface{}, *RPCE
 		return result, nil
 	}
 
-	// Submit the block
-	if s.chainDB != nil {
+	// Submit the block. Mining builds atop the active tip (template was
+	// fetched from templateGen, which anchors at tip), so this is normally
+	// the active-tip path. Discriminate defensively in case a P2P block
+	// raced in between template generation and submission — that would make
+	// our just-mined block a side branch which ConnectBlock would dispatch
+	// to ReorgTo, requiring the body on disk for the GetBlock replay.
+	// Mirrors the active-tip-vs-side-branch split in handleSubmitBlock /
+	// handleSubmitBlockBatch above, the P2P arm split closed in #126
+	// (sync.go:1848), and haskoin f768a01.
+	isActiveTipMine := false
+	if s.chainMgr != nil {
+		tipHash, _ := s.chainMgr.BestBlock()
+		isActiveTipMine = block.Header.PrevBlock == tipHash
+	}
+
+	if !isActiveTipMine && s.chainDB != nil {
 		if err := s.chainDB.StoreBlock(blockHash, block); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to store block: %v", err)}
 		}

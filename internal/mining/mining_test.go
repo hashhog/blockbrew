@@ -705,10 +705,21 @@ func TestBlockPassesSanity(t *testing.T) {
 }
 
 // mockBlockConnector implements BlockConnector for testing.
+//
+// Post-#126 / W126-follow-up: in production ConnectBlock stages the block
+// body via chainDB.StoreBlockAtBatch as part of its atomic Pebble batch
+// (chainmanager.go), so the miner no longer pre-stores on the active-tip
+// path. The mock mirrors that contract by writing through to a configured
+// 'storage' on Connect so the assertions in TestRegtestMining /
+// TestGenerateBlockWithTxs can still read the block back by hash.
 type mockBlockConnector struct {
 	tipHash   wire.Hash256
 	tipHeight int32
 	blocks    []*wire.MsgBlock
+	// storage, when non-nil, receives StoreBlock(hash, block) at the moment
+	// ConnectBlock fires — modelling the post-#126 production contract where
+	// the body lands as part of the connect batch (not as a separate pre-store).
+	storage *mockBlockStorage
 }
 
 func (m *mockBlockConnector) BestBlock() (wire.Hash256, int32) {
@@ -716,9 +727,15 @@ func (m *mockBlockConnector) BestBlock() (wire.Hash256, int32) {
 }
 
 func (m *mockBlockConnector) ConnectBlock(block *wire.MsgBlock) error {
+	hash := block.Header.BlockHash()
 	m.blocks = append(m.blocks, block)
-	m.tipHash = block.Header.BlockHash()
+	m.tipHash = hash
 	m.tipHeight++
+	// Mirror the production post-#126 behaviour: ConnectBlock stages the
+	// body in the same atomic batch as undo + height map + chainstate.
+	if m.storage != nil {
+		_ = m.storage.StoreBlock(hash, block)
+	}
 	return nil
 }
 
@@ -763,11 +780,12 @@ func TestRegtestMining(t *testing.T) {
 	tg := NewTemplateGenerator(params, chainState, mp, headerIndex)
 
 	t.Run("mine single block", func(t *testing.T) {
+		storage := &mockBlockStorage{}
 		connector := &mockBlockConnector{
 			tipHash:   genesisHash,
 			tipHeight: 0,
+			storage:   storage,
 		}
-		storage := &mockBlockStorage{}
 
 		miner := NewBlockMiner(tg, connector, storage, headerIndex, params)
 
@@ -803,11 +821,12 @@ func TestRegtestMining(t *testing.T) {
 	})
 
 	t.Run("mine multiple blocks", func(t *testing.T) {
+		storage := &mockBlockStorage{}
 		connector := &mockBlockConnector{
 			tipHash:   genesisHash,
 			tipHeight: 0,
+			storage:   storage,
 		}
-		storage := &mockBlockStorage{}
 
 		miner := NewBlockMiner(tg, connector, storage, headerIndex, params)
 
@@ -838,11 +857,12 @@ func TestRegtestMining(t *testing.T) {
 	t.Run("regtest difficulty never adjusts", func(t *testing.T) {
 		// On regtest, PowNoRetargeting is true, so bits should always be
 		// the genesis difficulty (0x207fffff)
+		storage := &mockBlockStorage{}
 		connector := &mockBlockConnector{
 			tipHash:   genesisHash,
 			tipHeight: 0,
+			storage:   storage,
 		}
-		storage := &mockBlockStorage{}
 
 		miner := NewBlockMiner(tg, connector, storage, headerIndex, params)
 
@@ -950,11 +970,12 @@ func TestGenerateBlockWithTxs(t *testing.T) {
 
 	tg := NewTemplateGenerator(params, chainState, mp, headerIndex)
 
+	storage := &mockBlockStorage{}
 	connector := &mockBlockConnector{
 		tipHash:   genesisHash,
 		tipHeight: 0,
+		storage:   storage,
 	}
-	storage := &mockBlockStorage{}
 
 	miner := NewBlockMiner(tg, connector, storage, headerIndex, params)
 
