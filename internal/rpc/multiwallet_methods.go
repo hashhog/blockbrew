@@ -62,6 +62,17 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 			opts.LoadOnStartup = &val
 		}
 	}
+	// args[7] is external_signer (Core arg; not supported in blockbrew — ignored)
+	// args[8] is BIP-39 seed passphrase ("25th word"). Non-Core extension
+	// — distinct from args[3] which is the wallet-file encryption passphrase.
+	// W161 BUG-16 fix: previously dropped before PBKDF2; now plumbed through
+	// CreateWalletOpts.SeedPassphrase into MnemonicToSeed. See
+	// CORE-PARITY-AUDIT/w161-bip32-bip39-bip43-bip44-hd-derivation.md.
+	if len(args) >= 9 {
+		if val, ok := args[8].(string); ok {
+			opts.SeedPassphrase = val
+		}
+	}
 
 	w, err := s.walletMgr.CreateWallet(name, opts)
 	if err != nil {
