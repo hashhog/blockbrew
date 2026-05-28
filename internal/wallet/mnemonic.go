@@ -119,8 +119,16 @@ func extract11Bits(entropy, checksum []byte, bitPos int) int {
 
 // ValidateMnemonic checks if a mnemonic is valid.
 // It verifies word count, word validity, and checksum.
+//
+// The mnemonic is NFKD-normalised before word lookup per BIP-39
+// §"Generating the mnemonic": "the mnemonic sentence and passphrase MUST be
+// encoded in UTF-8 NFKD". Without this, an NFC-encoded sentence (e.g. a
+// French/Spanish wallet copy-pasted from a HTML form, or any pre-NFKD input)
+// would pass `MnemonicToSeed` but fail validation — the W161 BUG-11
+// two-pipeline-within-one-file asymmetry. Fixed in lockstep with W161 BUG-16
+// passphrase wiring.
 func ValidateMnemonic(mnemonic string) bool {
-	words := strings.Fields(mnemonic)
+	words := strings.Fields(norm.NFKD.String(mnemonic))
 
 	// Valid word counts: 12, 15, 18, 21, 24
 	wordCount := len(words)
@@ -190,8 +198,11 @@ func MnemonicToSeed(mnemonic, passphrase string) []byte {
 }
 
 // MnemonicToEntropy converts a mnemonic back to entropy bytes.
+//
+// NFKD-normalises the input before word lookup (W161 BUG-11 fix — see
+// ValidateMnemonic above for rationale).
 func MnemonicToEntropy(mnemonic string) ([]byte, error) {
-	words := strings.Fields(mnemonic)
+	words := strings.Fields(norm.NFKD.String(mnemonic))
 
 	wordCount := len(words)
 	if wordCount != 12 && wordCount != 15 && wordCount != 18 && wordCount != 21 && wordCount != 24 {

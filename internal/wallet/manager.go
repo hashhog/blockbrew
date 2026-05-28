@@ -29,10 +29,31 @@ var (
 const MaxLoadedWallets = 100
 
 // CreateWalletOpts contains options for creating a new wallet.
+//
+// Two passphrases exist and are semantically distinct (W161 BUG-16
+// "passphrase-confusion" fix):
+//
+//   - `Passphrase` is the WALLET-FILE encryption passphrase. It feeds into
+//     scrypt → AES-256-GCM and encrypts the master xprv on disk. Maps to
+//     Bitcoin Core's `createwallet` arg `passphrase`.
+//
+//   - `SeedPassphrase` is the BIP-39 "25th word" passphrase. It feeds into
+//     PBKDF2-HMAC-SHA512 alongside the mnemonic to derive a different BIP-32
+//     seed (BIP-39 §"From mnemonic to seed"). A non-empty value yields a
+//     COMPLETELY DIFFERENT wallet for the same mnemonic — this is the
+//     plausible-deniability feature used by Trezor / Ledger / Coldcard /
+//     Sparrow. Core does not natively expose this (Core uses descriptor
+//     wallets), so it is a blockbrew extension carried in `_options` /
+//     positional arg 7 of `createwallet`.
+//
+// Previously `Manager.CreateWallet` hardcoded the BIP-39 passphrase to "" at
+// `manager.go:209`, silently dropping plausible-deniability. See
+// `CORE-PARITY-AUDIT/w161-bip32-bip39-bip43-bip44-hd-derivation.md` BUG-16.
 type CreateWalletOpts struct {
 	DisablePrivateKeys bool   // Create watch-only wallet
 	Blank              bool   // Create without keys
-	Passphrase         string // Wallet encryption passphrase
+	Passphrase         string // Wallet-file encryption passphrase (scrypt+AES-GCM)
+	SeedPassphrase     string // BIP-39 "25th word" passphrase (PBKDF2 input)
 	AvoidReuse         bool   // Track coin reuse (NYI)
 	LoadOnStartup      *bool  // Save to auto-load list
 }
@@ -206,7 +227,13 @@ func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, err
 		if err != nil {
 			return nil, err
 		}
-		if err := w.CreateFromMnemonic(mnemonic, ""); err != nil {
+		// W161 BUG-16 fix: pass the BIP-39 seed passphrase (NOT the wallet-
+		// file passphrase) through to PBKDF2. opts.SeedPassphrase=="" matches
+		// the legacy behaviour (no plausible-deniability passphrase); a
+		// non-empty value derives a completely different seed per BIP-39
+		// §"From mnemonic to seed", giving Trezor/Ledger-style "25th word"
+		// support. NFKD-normalisation is applied inside MnemonicToSeed.
+		if err := w.CreateFromMnemonic(mnemonic, opts.SeedPassphrase); err != nil {
 			return nil, err
 		}
 	}
