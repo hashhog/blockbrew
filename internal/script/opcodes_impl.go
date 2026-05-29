@@ -1139,8 +1139,14 @@ func (e *Engine) opCheckSequenceVerify() error {
 		return nil
 	}
 
-	// Transaction version must be >= 2 for CSV
-	if e.tx.Version < 2 {
+	// Transaction version must be >= 2 for CSV.
+	// Core compares the version as an unsigned 32-bit integer
+	// (CTransaction::version is uint32_t; interpreter.cpp:1790
+	// `if (txTo->version < 2) return false;`). MsgTx.Version is a
+	// signed int32 here, so cast to uint32 before the comparison —
+	// otherwise a version with the high bit set (e.g. 0x80000000)
+	// reads as negative and would wrongly fail the BIP-68 version gate.
+	if uint32(e.tx.Version) < 2 {
 		return ErrCSVFailed
 	}
 
