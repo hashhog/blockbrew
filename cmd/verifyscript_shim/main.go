@@ -46,6 +46,22 @@
 //	response: {"valid":true}                   (all inputs verify)
 //	          {"valid":false,"reason":"..."}   (>=1 input failed)
 //	          {"error":"..."}                  (could not evaluate / map miss)
+//
+// Third op `checktx` (CheckTransaction-level, context-free structural
+// validation): mirrors bitcoin-core/src/consensus/tx_check.cpp::
+// CheckTransaction. These are the structural checks `verifytx` (per-input
+// VerifyScript only) cannot catch — empty vin/vout, serialized size /
+// weight limit, output value range and running total, duplicate inputs,
+// coinbase scriptSig length, and null prevout in a non-coinbase. We
+// deserialize tx_hex and call blockbrew's OWN
+// consensus.CheckTransactionSanity (internal/consensus/txvalidation.go:58),
+// so a divergence here is a real blockbrew consensus bug, not a
+// reimplementation in the shim. No UTXO / chain state is needed.
+//
+//	request:  {"op":"checktx","tx_hex":"..."}
+//	response: {"valid":true}                   (structurally valid)
+//	          {"valid":false,"reason":"..."}   (CheckTransaction rejected)
+//	          {"error":"..."}                  (could not deserialize)
 package main
 
 import (
@@ -56,6 +72,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -213,9 +230,40 @@ func process(line []byte) string {
 		return processVerifyScript(&req)
 	case "verifytx":
 		return processVerifyTx(&req)
+	case "checktx":
+		return processCheckTx(&req)
 	default:
 		return fmt.Sprintf(`{"error":%s}`, jsonString("unknown op: "+req.Op))
 	}
+}
+
+// processCheckTx mirrors bitcoin-core/src/consensus/tx_check.cpp::
+// CheckTransaction (the context-free structural checks). It deserializes
+// tx_hex with blockbrew's OWN wire deserializer, then delegates to
+// blockbrew's REAL consensus.CheckTransactionSanity
+// (internal/consensus/txvalidation.go:58) — empty vin/vout, serialized
+// weight limit, per-output value range + running total, duplicate inputs,
+// coinbase scriptSig length, non-coinbase null prevout. No UTXO / chain
+// state is consulted. Valid iff CheckTransactionSanity returns nil.
+//
+// A tx that fails to deserialize is reported as {"error"} so the driver
+// SKIPS it rather than fake-passing; the driver itself treats a deserialize
+// error on a BADTX row as a reject decision.
+func processCheckTx(req *request) string {
+	txBytes, err := hex.DecodeString(req.TxHex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("tx_hex: "+err.Error()))
+	}
+
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("tx deserialize: "+err.Error()))
+	}
+
+	if verr := consensus.CheckTransactionSanity(&tx); verr != nil {
+		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(verr.Error()))
+	}
+	return `{"valid":true}`
 }
 
 // processVerifyScript handles the original verifyscript op: rebuild
