@@ -233,6 +233,15 @@ func (e *Engine) Execute() error {
 			if err := e.executeWitnessProgram(witnessVersion, witnessProgram, txIn.Witness); err != nil {
 				return err
 			}
+			// Mirror Core VerifyScript (interpreter.cpp:2090-2092): after a
+			// successful (P2SH-wrapped) VerifyWitnessProgram, "Bypass the
+			// cleanstack check at the end. The actual stack is obviously not
+			// clean for witness programs." Core does stack.resize(1) then
+			// checks CLEANSTACK as size()==1; blockbrew pops the bare-script
+			// success element (engine.go:210/248), so its clean predicate is
+			// size()==0. Reset the main stack to empty so the CLEANSTACK check
+			// below passes for the genuinely-not-clean witness-execution stack.
+			e.stack = NewStack()
 		} else {
 			// Regular P2SH
 			e.stack = savedStack
@@ -258,6 +267,17 @@ func (e *Engine) Execute() error {
 		if err := e.executeWitnessProgram(witnessVersion, witnessProgram, txIn.Witness); err != nil {
 			return err
 		}
+		// Mirror Core VerifyScript (interpreter.cpp:2045-2047): after a
+		// successful bare VerifyWitnessProgram, "Bypass the cleanstack check
+		// at the end. The actual stack is obviously not clean for witness
+		// programs." Core does stack.resize(1) then checks CLEANSTACK as
+		// size()==1; blockbrew pops the bare-script success element
+		// (engine.go:210), so its clean predicate is size()==0. Reset the main
+		// stack to empty so the CLEANSTACK check below passes for the
+		// genuinely-not-clean witness-execution stack. This is the
+		// cleanstack-after-witness fix: native / P2SH / unknown-version
+		// witness spends were falsely rejected when CLEANSTACK was set.
+		e.stack = NewStack()
 	}
 
 	// Clean stack check
