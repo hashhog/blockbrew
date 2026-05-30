@@ -209,6 +209,48 @@ type Config struct {
 	// Mirrors Bitcoin Core's `-asmap=<file>` flag (init.cpp).
 	// Leave empty (default) to use the legacy /16 subnet grouping.
 	ASMap string
+
+	// Connect pins the node to ONLY the listed <ip:port> peers and, while
+	// non-empty, disables DNS-seed resolution AND the addrman/auto-outbound
+	// dialing maintenance loop (full-relay, block-relay-only, feeler, and
+	// the DNS-refresh trigger). Repeatable, mirroring Bitcoin Core's
+	// `-connect=<ip:port>` (init.cpp: -connect implies -dnsseed=0 and turns
+	// the automatic outbound connections off — the node connects to ONLY
+	// the given peers). clearbit's reference is peer.zig:7009 (dedicated
+	// connect branch skips dnsSeeds()) + peer.zig:7050 (outbound-fill gated
+	// on connect_address==null). The pinned peers are dialed as manual
+	// connections (capacity-cap-exempt, never auto-banned) and re-dialed if
+	// they drop. Empty (default) = normal addrman + DNS-seed discovery.
+	Connect connectFlag
+
+	// NoDNSSeed independently suppresses DNS-seed resolution without
+	// changing any other discovery behaviour (addrman/auto-outbound dialing
+	// still runs and fixed seeds / gossip are still used). Mirrors Bitcoin
+	// Core's `-dnsseed=0` / `-nodnsseed`, and clearbit's `--nodnsseed`
+	// (sets dns_seed=false). Implied automatically when -connect is set.
+	NoDNSSeed bool
+}
+
+// connectFlag implements flag.Value so `-connect=<ip:port>` may be repeated
+// (and/or comma-separated), mirroring Bitcoin Core's repeatable `-connect`.
+type connectFlag []string
+
+func (c *connectFlag) String() string {
+	if c == nil {
+		return ""
+	}
+	return strings.Join(*c, ",")
+}
+
+func (c *connectFlag) Set(v string) error {
+	// Accept comma-separated values in a single occurrence too.
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			*c = append(*c, part)
+		}
+	}
+	return nil
 }
 
 // debugFlag implements flag.Value so `-debug=` may be repeated and/or
@@ -493,6 +535,8 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", "Load a Bitcoin Core-format UTXO snapshot (utxo\\xff magic) from <path> before starting the node. Only acted on when the chainstate is fresh (height==0); otherwise an error is logged and the snapshot is skipped. Mirrors Bitcoin Core's `-loadsnapshot=<path>`.")
 	flag.BoolVar(&cfg.BlockFilterIndex, "blockfilterindex", false, "Maintain the BIP-157/158 basic compact-block-filter index. Default OFF (matches Bitcoin Core's `-blockfilterindex=0`). When ON, blockbrew populates the index on every connected block, rewinds it on disconnect (Phase 2 reorg-aware), and exposes the resulting filters via /rest/blockfilter, /rest/blockfilterheaders, and the getblockfilter RPC.")
 	flag.StringVar(&cfg.ASMap, "asmap", "", "Path to an ASMap binary file for AS-level peer bucketing and eclipse-resistance diversity. When set, blockbrew loads the file (max 8 MiB), validates its trie, and uses it to map peer IPs to Autonomous System Numbers. Peer diversity is then enforced at the AS level rather than /16 subnet. Leave empty (default) to use legacy /16 grouping. Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp).")
+	flag.Var(&cfg.Connect, "connect", "Connect ONLY to the specified <ip:port> peer(s) and disable both DNS-seed resolution and addrman/auto-outbound dialing. Repeatable / comma-separated. Mirrors Bitcoin Core's `-connect=<ip:port>` (implies -dnsseed=0 and turns off automatic outbound connections). The pinned peers are dialed as manual connections and re-dialed if they drop. Empty (default) = normal peer discovery.")
+	flag.BoolVar(&cfg.NoDNSSeed, "nodnsseed", false, "Disable DNS-seed resolution without otherwise changing peer discovery (addrman/auto-outbound dialing still runs). Mirrors Bitcoin Core's `-dnsseed=0` / `-nodnsseed`. Implied automatically when -connect is set.")
 	flag.Parse()
 
 	// Apply config file (CLI > config > default). Build the set of flags
@@ -1301,6 +1345,12 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// active. Mirrors Core's init.cpp g_local_services |= NODE_COMPACT_FILTERS.
 		AdvertiseCompactFilters: cfg.BlockFilterIndex,
 		ASMapFile:               cfg.ASMap,
+		// -connect=<ip:port> peer-pinning (Core parity). When non-empty the
+		// peer manager dials ONLY these peers and skips DNS-seed resolution
+		// + the auto-outbound maintenance loop. -nodnsseed (or an implied
+		// dnsseed=0 from -connect) suppresses DNS-seed resolution.
+		ConnectPeers: cfg.Connect,
+		NoDNSSeed:    cfg.NoDNSSeed,
 	})
 
 	// Wire the peer manager back into the sync manager (breaks circular dependency)
