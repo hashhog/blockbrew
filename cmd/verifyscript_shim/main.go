@@ -96,6 +96,9 @@ type request struct {
 	BlockTime int64        `json:"block_time"`
 	Last      *nextworkHdr `json:"last"`
 	First     *nextworkHdr `json:"first"`
+
+	// merkleroot op fields.
+	Txids []string `json:"txids"`
 }
 
 // nextworkHdr is one block-header context entry for the nextwork op: a height
@@ -251,6 +254,8 @@ func process(line []byte) string {
 		return processCheckTx(&req)
 	case "nextwork":
 		return processNextWork(&req)
+	case "merkleroot":
+		return processMerkleRoot(&req)
 	default:
 		return fmt.Sprintf(`{"error":%s}`, jsonString("unknown op: "+req.Op))
 	}
@@ -383,6 +388,40 @@ func processNextWork(req *request) string {
 
 	bits := consensus.GetNextWorkRequired(params, req.Height, req.BlockTime, lastNode, provider)
 	return fmt.Sprintf(`{"nbits":%s}`, jsonString(fmt.Sprintf("%08x", bits)))
+}
+
+// processMerkleRoot drives blockbrew's REAL merkle primitive
+// consensus.CalcMerkleRootMutation (internal/consensus/merkle.go:34), which
+// returns (root, mutated) where `mutated` is blockbrew's OWN CVE-2012-2459
+// detection (adjacent-pair-equal at every tree level, mirroring Core
+// consensus/merkle.cpp:46-63). The shim does NOT re-implement that check; it
+// reports whatever CalcMerkleRootMutation concludes, so a cve2459 row that
+// comes back mutated=false would be a genuine blockbrew false-accept.
+//
+// Input txids are DISPLAY order (Core getblock big-endian). We reverse each to
+// internal byte order via wire.NewHash256FromHex (the same reversal the
+// verifytx op uses on prevout txids), feed the internal hashes to the merkle
+// code, then reverse the computed internal root back to display order via
+// Hash256.String() so it matches Core's header merkleroot.
+//
+// A bad/empty txid list is reported as {"error"} so the driver SKIPS the row.
+func processMerkleRoot(req *request) string {
+	if len(req.Txids) == 0 {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("merkleroot: empty txids"))
+	}
+
+	hashes := make([]wire.Hash256, len(req.Txids))
+	for i, t := range req.Txids {
+		h, err := wire.NewHash256FromHex(t)
+		if err != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString(fmt.Sprintf("txid %d: %s", i, err.Error())))
+		}
+		hashes[i] = h
+	}
+
+	root, mutated := consensus.CalcMerkleRootMutation(hashes)
+	// root.String() reverses internal byte order back to display order.
+	return fmt.Sprintf(`{"root":%s,"mutated":%t}`, jsonString(root.String()), mutated)
 }
 
 // processVerifyScript handles the original verifyscript op: rebuild
