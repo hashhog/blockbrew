@@ -71,6 +71,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/script"
@@ -88,6 +89,22 @@ type request struct {
 	// verifytx op fields.
 	TxHex    string        `json:"tx_hex"`
 	Prevouts []prevoutSpec `json:"prevouts"`
+
+	// nextwork op fields.
+	Network   string       `json:"network"`
+	Height    int32        `json:"height"`
+	BlockTime int64        `json:"block_time"`
+	Last      *nextworkHdr `json:"last"`
+	First     *nextworkHdr `json:"first"`
+}
+
+// nextworkHdr is one block-header context entry for the nextwork op: a height
+// plus its compact bits (8-lowercase-hex, Core getblockheader format) and unix
+// timestamp. "first" is present only on retarget-boundary rows (H%2016==0).
+type nextworkHdr struct {
+	Height int32  `json:"height"`
+	Bits   string `json:"bits"`
+	Time   uint32 `json:"time"`
 }
 
 // prevoutSpec is one entry of the verifytx "prevouts" array: a spent
@@ -232,6 +249,8 @@ func process(line []byte) string {
 		return processVerifyTx(&req)
 	case "checktx":
 		return processCheckTx(&req)
+	case "nextwork":
+		return processNextWork(&req)
 	default:
 		return fmt.Sprintf(`{"error":%s}`, jsonString("unknown op: "+req.Op))
 	}
@@ -264,6 +283,106 @@ func processCheckTx(req *request) string {
 		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(verr.Error()))
 	}
 	return `{"valid":true}`
+}
+
+// stubBlockProvider is a minimal consensus.BlockProvider backed by a
+// height->BlockNode map plus parent pointers. For the mainnet retarget case
+// blockbrew's CalculateNextWorkRequired only calls GetHeaderByHeight(H-2016)
+// (= "first"); GetPrevHeader is used by the testnet min-difficulty walk-back.
+// A 2-node chain (last -> first) is sufficient for the mainnet boundary case.
+type stubBlockProvider struct {
+	byHeight map[int32]*consensus.BlockNode
+}
+
+func (p *stubBlockProvider) GetHeaderByHeight(height int32) *consensus.BlockNode {
+	return p.byHeight[height]
+}
+
+func (p *stubBlockProvider) GetPrevHeader(node *consensus.BlockNode) *consensus.BlockNode {
+	if node == nil {
+		return nil
+	}
+	return node.Parent
+}
+
+// paramsForNetwork returns the ChainParams for the named network, or an error
+// (so the driver SKIPS) for an unknown name.
+func paramsForNetwork(name string) (*consensus.ChainParams, error) {
+	switch name {
+	case "mainnet":
+		return consensus.MainnetParams(), nil
+	case "testnet", "testnet3":
+		return consensus.TestnetParams(), nil
+	case "testnet4":
+		return consensus.Testnet4Params(), nil
+	case "signet":
+		return consensus.SignetParams(), nil
+	case "regtest":
+		return consensus.RegtestParams(), nil
+	default:
+		return nil, fmt.Errorf("unknown network: %s", name)
+	}
+}
+
+// nodeFromHdr builds a BlockNode from a nextworkHdr (parsing the 8-hex bits).
+func nodeFromHdr(h *nextworkHdr) (*consensus.BlockNode, error) {
+	bits, err := strconv.ParseUint(h.Bits, 16, 32)
+	if err != nil {
+		return nil, fmt.Errorf("bits %q: %w", h.Bits, err)
+	}
+	return &consensus.BlockNode{
+		Height: h.Height,
+		Header: wire.BlockHeader{
+			Timestamp: h.Time,
+			Bits:      uint32(bits),
+		},
+	}, nil
+}
+
+// processNextWork drives blockbrew's REAL GetNextWorkRequired
+// (internal/consensus/difficulty.go:263), the BlockIndex/chain-generic
+// entrypoint that does the retarget + off-by-one + [÷4,×4] clamp + powLimit +
+// BIP94 selection. We rebuild the minimal header context the algorithm reads:
+// a "last" node (= pindexLast, the tip the solver builds on) and, on a retarget
+// boundary (H%2016==0), a "first" node at height H-2016 wired as last.Parent so
+// the provider's GetHeaderByHeight(H-2016) lands on it. The result is formatted
+// back to 8-lowercase-hex (Core getblockheader format).
+//
+// A missing/garbled context or unknown network is reported as {"error"} so the
+// driver SKIPS the row rather than faking a value.
+func processNextWork(req *request) string {
+	params, err := paramsForNetwork(req.Network)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString(err.Error()))
+	}
+	if req.Last == nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("nextwork: missing last"))
+	}
+
+	lastNode, err := nodeFromHdr(req.Last)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("nextwork last: "+err.Error()))
+	}
+
+	provider := &stubBlockProvider{byHeight: map[int32]*consensus.BlockNode{
+		lastNode.Height: lastNode,
+	}}
+
+	// On a retarget boundary, "first" is the block at H-2016; wire it as the
+	// tip's parent AND register it by height so GetHeaderByHeight(H-2016) finds
+	// it. (Off a boundary "first" is absent and the algorithm returns last.bits
+	// for mainnet — the passthrough path.)
+	if req.First != nil {
+		firstNode, err := nodeFromHdr(req.First)
+		if err != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("nextwork first: "+err.Error()))
+		}
+		lastNode.Parent = firstNode
+		provider.byHeight[firstNode.Height] = firstNode
+	}
+
+	bits := consensus.GetNextWorkRequired(params, req.Height, req.BlockTime, lastNode, provider)
+	return fmt.Sprintf(`{"nbits":%s}`, jsonString(fmt.Sprintf("%08x", bits)))
 }
 
 // processVerifyScript handles the original verifyscript op: rebuild
