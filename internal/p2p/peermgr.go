@@ -167,6 +167,23 @@ type PeerManagerConfig struct {
 	// eclipse-resistance diversity. Mirrors Bitcoin Core's `-asmap=<file>`
 	// flag (init.cpp). Leave empty to use the legacy /16 subnet grouping.
 	ASMapFile string
+
+	// ConnectPeers, when non-empty, pins the node to ONLY these <ip:port>
+	// peers: the connection manager dials each one as a manual connection,
+	// re-dials any that drop, and skips BOTH DNS-seed resolution AND the
+	// addrman/auto-outbound maintenance loop (full-relay, block-relay-only,
+	// feeler, and the DNS-refresh trigger). Mirrors Bitcoin Core's
+	// `-connect=<ip:port>` (init.cpp: implies -dnsseed=0 + turns off
+	// automatic outbound connections) and clearbit's connect_address branch
+	// (peer.zig:7009 skips dnsSeeds(); peer.zig:7050 gates outbound-fill on
+	// connect_address==null). Empty (default) = normal peer discovery.
+	ConnectPeers []string
+
+	// NoDNSSeed suppresses DNS-seed resolution without otherwise changing
+	// peer discovery (addrman/auto-outbound dialing still runs). Mirrors
+	// Bitcoin Core's `-dnsseed=0` / `-nodnsseed` and clearbit's
+	// `--nodnsseed` (dns_seed=false). Implied when ConnectPeers is set.
+	NoDNSSeed bool
 }
 
 // BanInfo contains information about a banned peer.
@@ -936,12 +953,83 @@ func (ct ConnType) String() string {
 	}
 }
 
+// connectMode reports whether the operator pinned the node to a fixed set of
+// peers via -connect. In connect mode the connection manager dials ONLY those
+// peers and skips DNS-seed resolution + the addrman/auto-outbound maintenance
+// loop. Mirrors Bitcoin Core's -connect and clearbit's connect_address branch.
+func (pm *PeerManager) connectMode() bool {
+	return len(pm.config.ConnectPeers) > 0
+}
+
+// dnsSeedingDisabled reports whether DNS-seed resolution must be skipped.
+// True when -nodnsseed (-dnsseed=0) is set OR -connect pinned the peer set
+// (Core: -connect implies -dnsseed=0).
+func (pm *PeerManager) dnsSeedingDisabled() bool {
+	return pm.config.NoDNSSeed || pm.connectMode()
+}
+
+// maybeResolveDNSSeeds calls resolveDNSSeeds() unless DNS seeding is disabled
+// by -nodnsseed or -connect. Single choke point so every DNS-refresh path
+// (startup + periodic) honours the suppression.
+func (pm *PeerManager) maybeResolveDNSSeeds() {
+	if pm.dnsSeedingDisabled() {
+		return
+	}
+	pm.resolveDNSSeeds()
+}
+
+// dialConnectPeers (re-)dials every -connect-pinned peer that is not currently
+// connected, as a capacity-cap-exempt manual connection. Called once at
+// startup and on every connection-attempt tick so a dropped pinned peer is
+// retried (matching clearbit's maintainManualConnections, peer.zig:7046).
+func (pm *PeerManager) dialConnectPeers() {
+	for _, addr := range pm.config.ConnectPeers {
+		tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+		if err != nil {
+			log.Printf("connect: invalid -connect address %q: %v", addr, err)
+			continue
+		}
+		na := NetAddress{
+			Services: 0,
+			IP:       tcpAddr.IP,
+			Port:     uint16(tcpAddr.Port),
+		}
+		ka := &KnownAddress{
+			Addr:     na,
+			Source:   "connect",
+			LastSeen: time.Now(),
+		}
+
+		// Skip if already connected (dialing is async; the registry is the
+		// source of truth for "currently connected"). connectToPeerWithType
+		// also re-checks under the lock, so this is just an early-out.
+		pm.mu.RLock()
+		_, connected := pm.peers[ka.Key()]
+		pm.mu.RUnlock()
+		if connected {
+			continue
+		}
+
+		go pm.connectToPeerWithType(ka, ConnManual)
+	}
+}
+
 // connectionHandler manages outbound connection attempts.
 func (pm *PeerManager) connectionHandler() {
 	defer pm.wg.Done()
 
-	// Initial DNS seed resolution
-	pm.resolveDNSSeeds()
+	// -connect peer-pinning (Core parity / clearbit peer.zig:7009). When the
+	// operator pinned a fixed peer set we dial ONLY those peers and skip both
+	// DNS-seed resolution and the addrman/auto-outbound maintenance loop. The
+	// pinned peers are dialed up front and re-dialed on every tick below.
+	if pm.connectMode() {
+		log.Printf("P2P: -connect set (%d peer(s)) — DNS seeds and auto-outbound dialing disabled; pinning to %s",
+			len(pm.config.ConnectPeers), strings.Join(pm.config.ConnectPeers, ", "))
+		pm.dialConnectPeers()
+	} else {
+		// Initial DNS seed resolution (skipped when -nodnsseed / -dnsseed=0).
+		pm.maybeResolveDNSSeeds()
+	}
 
 	// Random start offset for feeler timer to avoid synchronization
 	feelerDelay := time.Duration(pm.rng.Int63n(int64(FeelerInterval)))
@@ -978,6 +1066,13 @@ func (pm *PeerManager) connectionHandler() {
 	for {
 		select {
 		case <-ticker.C:
+			// -connect mode: re-dial pinned peers only; never fill outbound
+			// slots from the addrman (Core parity / clearbit peer.zig:7050).
+			if pm.connectMode() {
+				pm.dialConnectPeers()
+				continue
+			}
+
 			pm.mu.RLock()
 			needFullRelay := pm.outbound < pm.config.MaxOutbound
 			needBlockRelay := pm.blockRelayOnly < pm.config.MaxBlockRelayOnly
@@ -1000,6 +1095,11 @@ func (pm *PeerManager) connectionHandler() {
 			}
 
 		case <-feelerTicker.C:
+			// In -connect mode we make no feeler or extra block-relay
+			// connections — the addrman is intentionally unused.
+			if pm.connectMode() {
+				continue
+			}
 			now := time.Now()
 			if now.After(nextFeeler) {
 				// Schedule next feeler with exponential distribution
@@ -1030,7 +1130,9 @@ func (pm *PeerManager) connectionHandler() {
 			// every gossip entry and never replenish the pool.
 			if pm.addrBook.Size() < MinAddressesBeforeRefresh ||
 				len(pm.addrBook.Good()) < MinGoodAddrsBeforeRefresh {
-				pm.resolveDNSSeeds()
+				// Honours -nodnsseed / -dnsseed=0 and -connect (no-op when
+				// DNS seeding is disabled).
+				pm.maybeResolveDNSSeeds()
 			}
 
 		case <-banCleanupTicker.C:
