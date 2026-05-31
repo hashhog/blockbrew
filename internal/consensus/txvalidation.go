@@ -254,6 +254,18 @@ func (v *InMemoryUTXOView) HasUTXO(outpoint wire.OutPoint) bool {
 	return ok
 }
 
+// ForEach invokes fn for every (outpoint, entry) currently in the view, in
+// unspecified order. Read-only iteration accessor — it makes no consensus
+// decision; it exists so a caller (e.g. the Phase B reorg differential shim)
+// can snapshot or canonically digest the coins-view without exporting the
+// internal map. The entry pointer is the live entry; do not retain it past the
+// callback if the view may be mutated afterwards.
+func (v *InMemoryUTXOView) ForEach(fn func(outpoint wire.OutPoint, entry *UTXOEntry)) {
+	for op, e := range v.utxos {
+		fn(op, e)
+	}
+}
+
 // SpendUTXOWithCoin removes a UTXO and returns the coin, or (nil, false) if
 // the outpoint was not present. The returned entry is a snapshot (the
 // PkScript is cloned so the caller can mutate it freely). Mirrors Core

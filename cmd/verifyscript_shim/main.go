@@ -90,12 +90,15 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math/big"
 	"os"
+	"sort"
 	"strconv"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -135,6 +138,44 @@ type request struct {
 
 	// merkleroot op fields.
 	Txids []string `json:"txids"`
+
+	// reorg op fields. fork_utxo is the WORKING coins-view (pre-disconnect view
+	// for disconnect-vectors, fork-point view otherwise), seeded EXACTLY like
+	// connecttx/checkblock prevouts. disconnect = old-branch blocks tip-first
+	// (0+), connect = ordered side-branch blocks. Work hexes are 32-byte BE.
+	ForkUTXO       []prevoutSpec  `json:"fork_utxo"`
+	Disconnect     []disconnectBk `json:"disconnect"`
+	Connect        []connectBk    `json:"connect"`
+	OldTipWorkHex  string         `json:"old_tip_work_hex"`
+	NewTipWorkHex  string         `json:"new_tip_work_hex"`
+}
+
+// disconnectBk is one old-branch block to undo: its final bytes, the height it
+// occupied, and the per-non-coinbase-tx undo coins (one `vin` list per tx,
+// keyed by tx_index within the block). It mirrors Core's per-block CBlockUndo
+// (vtxundo[i] holds the spent coins for vtx[i+1]).
+type disconnectBk struct {
+	BlockHex string     `json:"block_hex"`
+	Height   int32      `json:"height"`
+	Undo     []txUndoBk `json:"undo"`
+}
+
+// txUndoBk is the undo record for one non-coinbase tx in a disconnect block:
+// the tx's index within the block and the coins its inputs spent (ordered by
+// input). Mirrors Core's CTxUndo (one Coin per CTxIn).
+type txUndoBk struct {
+	TxIndex int           `json:"tx_index"`
+	Vin     []prevoutSpec `json:"vin"`
+}
+
+// connectBk is one ordered side-branch block to connect: its final bytes, the
+// height it occupies (flags + economics derive from THIS height), and the MTP
+// of its parent for BIP-68 time-based sequence locks (0 when unavailable —
+// height-based locks are still enforced).
+type connectBk struct {
+	BlockHex string `json:"block_hex"`
+	Height   int32  `json:"height"`
+	PrevMTP  uint32 `json:"prev_mtp"`
 }
 
 // nextworkHdr is one block-header context entry for the nextwork op: a height
@@ -299,6 +340,8 @@ func process(line []byte) string {
 		return processConnectTx(&req)
 	case "checkblock":
 		return processCheckBlock(&req)
+	case "reorg":
+		return processReorg(&req)
 	case "nextwork":
 		return processNextWork(&req)
 	case "merkleroot":
@@ -545,32 +588,88 @@ func processCheckBlock(req *request) string {
 		})
 	}
 
-	// (1) Context-free sanity (PoW gated by skip_pow; merkle/weight/coinbase
-	// structure enforced AS-IS over the FINAL bytes).
-	if verr := consensus.CheckBlockSanity(&block, maxPowLimit, req.SkipPOW); verr != nil {
-		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(verr.Error()))
+	// Gates (1)-(3) run via the shared connect-block driver. checkblock uses the
+	// MAINNET halving interval (its corpus computes coinbase amounts on the
+	// mainnet schedule) and MTP omitted (no MTP-dependent corpus mutant).
+	res := runConnectBlockGates(&block, view, scriptView, params, height,
+		consensus.SubsidyHalvingInterval, 0, req.SkipPOW, req.SkipScripts)
+	if !res.ok {
+		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(res.reason))
+	}
+	return `{"valid":true}`
+}
+
+// connectGateResult is the verdict of runConnectBlockGates: ok=true means every
+// gate passed; on a reject, reason carries the canonical token and fee carries
+// the accumulated fees of the txs that passed before the failure (0 on a
+// pre-loop sanity/context reject).
+type connectGateResult struct {
+	ok     bool
+	reason string
+	fee    int64
+}
+
+// runConnectBlockGates drives blockbrew's REAL block-validation gates over an
+// EXTERNALLY-supplied, mutable coins-view in ConnectBlock order — the single
+// shared engine behind both the checkblock op (fresh per-tx prevout seeding)
+// and the reorg op's CONNECT phase (a working view threaded across side-branch
+// blocks). It mirrors Bitcoin Core CheckBlock -> ContextualCheckBlock ->
+// ConnectBlock (validation.cpp). Gates in order:
+//
+//	(1) CheckBlockSanity(block, maxPowLimit, skipPow): coinbase-first /
+//	    single-coinbase / per-tx sanity / merkle-root match / weight. PoW gated
+//	    by skipPow (the FINAL crafted/mutated hash no longer meets bits).
+//	(2) CheckBlockContext(block, synthPrevHeader, height, params, prevMTP):
+//	    BIP34/66/65 + segwit commitment + final-tx. prevMTP feeds the block's
+//	    median-time-past context (0 = unavailable; height-based locks still run).
+//	(3) ConnectBlock economic + sigop + script + coinbase-value gates over the
+//	    seeded `view`: per non-coinbase tx CheckTransactionInputs accumulating
+//	    fees; block-wide sigop cost cap; ParallelScriptValidationCached at
+//	    GetBlockScriptFlags(height,params,hash) unless skipScripts; finally
+//	    coinbaseValue <= CalcBlockSubsidyForInterval(height,halvingInterval)+fees.
+//
+// `view` is the SPEND-TRACKING connect view (inputs removed as each tx is
+// processed, outputs added, so an intra-block re-spend / duplicate fails the
+// next GetUTXO — CVE-2018-17144). `scriptView` is a NON-spending snapshot that
+// must already hold every external prevout the script pass will resolve; this
+// fn adds each tx's outputs to BOTH so an intra-block child's scriptPubKey is
+// available to the post-loop ParallelScriptValidationCached. The reorg connect
+// loop carries `view` to the next block (real ReorgTo semantics) and rebuilds a
+// fresh scriptView snapshot per block. This fn does NOT re-implement any rule —
+// it calls blockbrew's real CheckBlockSanity / CheckBlockContext /
+// CheckTransactionInputs / sigop counters / ParallelScriptValidationCached /
+// CalcBlockSubsidyForInterval and reports their verdict.
+func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMemoryUTXOView,
+	params *consensus.ChainParams, height int32, halvingInterval int32, prevMTP uint32,
+	skipPow, skipScripts bool) connectGateResult {
+
+	// (1) Context-free sanity (PoW gated by skipPow).
+	if verr := consensus.CheckBlockSanity(block, maxPowLimit, skipPow); verr != nil {
+		return connectGateResult{reason: verr.Error()}
 	}
 
 	// (2) Contextual checks at this height. A synthetic prevHeader (its only use
-	// would be a difficulty recheck that CheckBlockContext skips). MTP omitted
-	// (zero variadic) — no chain history; no MTP-dependent corpus mutant.
+	// would be a difficulty recheck that CheckBlockContext skips). prevMTP feeds
+	// the block's median-time-past context for time-based locks.
 	synthPrevHeader := &wire.BlockHeader{
 		Version:   block.Header.Version,
 		PrevBlock: block.Header.PrevBlock,
 		Bits:      block.Header.Bits,
 		Timestamp: block.Header.Timestamp,
 	}
-	if verr := consensus.CheckBlockContext(&block, synthPrevHeader, height, params); verr != nil {
-		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(verr.Error()))
+	if prevMTP != 0 {
+		if verr := consensus.CheckBlockContext(block, synthPrevHeader, height, params, prevMTP); verr != nil {
+			return connectGateResult{reason: verr.Error()}
+		}
+	} else if verr := consensus.CheckBlockContext(block, synthPrevHeader, height, params); verr != nil {
+		return connectGateResult{reason: verr.Error()}
 	}
 
-	// (3) ConnectBlock economic + sigop + script + coinbase-value gates, in
-	// Core order over the seeded view.
+	// (3) ConnectBlock economic + sigop + script + coinbase-value gates, in Core
+	// order over the seeded view.
 	var totalFees int64
 	var nSigOpsCost int
 
-	// Coinbase sigops (legacy only; CountP2SH/CountWitness short-circuit to 0
-	// for the coinbase). Mirrors ConnectBlock's i==0 branch.
 	coinbase := block.Transactions[0]
 	for _, txIn := range coinbase.TxIn {
 		nSigOpsCost += consensus.CountSigOpsInaccurate(txIn.SignatureScript) * consensus.WitnessScaleFactor
@@ -579,20 +678,9 @@ func processCheckBlock(req *request) string {
 		nSigOpsCost += consensus.CountSigOpsInaccurate(txOut.PkScript) * consensus.WitnessScaleFactor
 	}
 
-	// Intra-block spends + intra-block double-spend/duplicate detection. A later
-	// tx may spend an output created by an EARLIER tx in the SAME block; Core's
-	// ConnectBlock adds each tx's outputs to the coins view (AddCoins) and
-	// removes each spent input (SpendCoins) as it processes that tx, so a tx
-	// re-spending an already-spent outpoint fails the next GetUTXO. The corpus
-	// deliberately drops in-block prevouts from the external prevout set (epoch
-	// metadata: n_intra_dropped), so without modelling AddCoins the real block's
-	// in-block-spending txs false-reject (bad-txns-inputs-missingorspent), and
-	// without modelling SpendCoins the bad-txns-duplicate mutant (two identical
-	// txs spending the same input) false-ACCEPTS. We add the coinbase outputs
-	// first (ConnectBlock i==0, before the i>=1 loop), then per non-coinbase tx:
+	// Add coinbase outputs first (ConnectBlock i==0), then per non-coinbase tx:
 	// check inputs -> count sigops (prevouts still present) -> SPEND inputs ->
-	// ADD outputs. The non-spending scriptView mirrors the AddCoins side ONLY
-	// (used by the post-loop script pass, which must still see every prevout).
+	// ADD outputs. scriptView only AddCoins (never spends).
 	view.AddTxOutputs(coinbase, height)
 	scriptView.AddTxOutputs(coinbase, height)
 
@@ -601,16 +689,13 @@ func processCheckBlock(req *request) string {
 
 		fee, verr := consensus.CheckTransactionInputs(tx, height, view)
 		if verr != nil {
-			return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(connectTxReason(verr)))
+			return connectGateResult{reason: connectTxReason(verr), fee: totalFees}
 		}
 		totalFees += fee
 		if totalFees > consensus.MaxMoney {
-			return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString("bad-txns-accumulated-fee-outofrange"))
+			return connectGateResult{reason: "bad-txns-accumulated-fee-outofrange", fee: totalFees}
 		}
 
-		// Block-wide sigop COST (BIP-141), counted while prevouts are still in
-		// the view. Inaccurate legacy counting (CHECKMULTISIG=20), matching
-		// Core's GetLegacySigOpCount.
 		for _, txIn := range tx.TxIn {
 			nSigOpsCost += consensus.CountSigOpsInaccurate(txIn.SignatureScript) * consensus.WitnessScaleFactor
 		}
@@ -620,44 +705,45 @@ func processCheckBlock(req *request) string {
 		nSigOpsCost += consensus.CountP2SHSigOps(tx, view)
 		nSigOpsCost += consensus.CountWitnessSigOps(tx, view)
 		if nSigOpsCost > consensus.MaxBlockSigOpsCost {
-			return fmt.Sprintf(`{"valid":false,"reason":%s}`,
-				jsonString(fmt.Sprintf("bad-blk-sigops: %d > %d", nSigOpsCost, consensus.MaxBlockSigOpsCost)))
+			return connectGateResult{
+				reason: fmt.Sprintf("bad-blk-sigops: %d > %d", nSigOpsCost, consensus.MaxBlockSigOpsCost),
+				fee:    totalFees,
+			}
 		}
 
-		// Spend this tx's inputs (so a later in-block re-spend / duplicate tx is
-		// rejected) THEN add its outputs (so a later in-block child can spend
-		// them). Both AFTER the checks above so a tx cannot spend its own
-		// outputs. scriptView only AddCoins (never spends) — see seeding note.
 		view.SpendTxInputs(tx)
 		view.AddTxOutputs(tx, height)
 		scriptView.AddTxOutputs(tx, height)
 	}
 
 	// Script validation over the NON-spending scriptView (skipped iff
-	// skip_scripts) — it retains every external + intra-block prevout the
-	// per-input VerifyScript needs.
-	if !req.SkipScripts {
+	// skipScripts) — it retains every external + intra-block prevout.
+	if !skipScripts {
 		blockHash := block.Header.BlockHash()
 		flags := consensus.GetBlockScriptFlags(height, params, blockHash)
 		sigCache := consensus.NewSigCache(0)
-		if verr := consensus.ParallelScriptValidationCached(&block, scriptView, flags, sigCache); verr != nil {
-			return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString("block-script-verify: "+verr.Error()))
+		if verr := consensus.ParallelScriptValidationCached(block, scriptView, flags, sigCache); verr != nil {
+			return connectGateResult{reason: "block-script-verify-flag-failed", fee: totalFees}
 		}
 	}
 
-	// Coinbase value cap: coinbaseValue <= subsidy + totalFees.
-	subsidy := consensus.CalcBlockSubsidy(height)
+	// Coinbase value cap: coinbaseValue <= subsidy + totalFees. Network-aware
+	// subsidy via the supplied halving interval (Core GetBlockSubsidy reads
+	// consensusParams.nSubsidyHalvingInterval; regtest halves every 150).
+	subsidy := consensus.CalcBlockSubsidyForInterval(height, halvingInterval)
 	var coinbaseValue int64
 	for _, out := range coinbase.TxOut {
 		coinbaseValue += out.Value
 	}
 	if coinbaseValue > subsidy+totalFees {
-		return fmt.Sprintf(`{"valid":false,"reason":%s}`,
-			jsonString(fmt.Sprintf("bad-cb-amount: %d > %d (subsidy %d + fees %d)",
-				coinbaseValue, subsidy+totalFees, subsidy, totalFees)))
+		return connectGateResult{
+			reason: fmt.Sprintf("bad-cb-amount: %d > %d (subsidy %d + fees %d)",
+				coinbaseValue, subsidy+totalFees, subsidy, totalFees),
+			fee: totalFees,
+		}
 	}
 
-	return `{"valid":true}`
+	return connectGateResult{ok: true, fee: totalFees}
 }
 
 // stubBlockProvider is a minimal consensus.BlockProvider backed by a
@@ -925,6 +1011,393 @@ func processVerifyTx(req *request) string {
 	}
 
 	return `{"valid":true}`
+}
+
+// reorgMaxDepth mirrors blockbrew's production reorg-span cap
+// consensus.MaxReorgDepth (chainmanager.go:32) used by ReorgTo
+// (chainmanager.go:1740) — a reorg whose disconnect span exceeds this returns
+// ErrReorgTooDeep. The corpus's R10 (101 disconnect blocks) trips it.
+const reorgMaxDepth = consensus.MaxReorgDepth
+
+// disconnectResult mirrors Core's DisconnectResult: ok < unclean < failed
+// (worst-of across a multi-block disconnect span).
+type disconnectResult int
+
+const (
+	dcOK disconnectResult = iota
+	dcUnclean
+	dcFailed
+)
+
+func (d disconnectResult) String() string {
+	switch d {
+	case dcUnclean:
+		return "unclean"
+	case dcFailed:
+		return "failed"
+	default:
+		return "ok"
+	}
+}
+
+// seedView seeds a fresh InMemoryUTXOView from a list of coin specs (the same
+// display->wire txid reversal + one-coin-per-entry plumbing connecttx/checkblock
+// use). Shared by the reorg op's fork_utxo seeding.
+func seedView(coins []prevoutSpec) (*consensus.InMemoryUTXOView, error) {
+	view := consensus.NewInMemoryUTXOView()
+	for _, p := range coins {
+		h, err := wire.NewHash256FromHex(p.Txid)
+		if err != nil {
+			return nil, fmt.Errorf("coin txid: %w", err)
+		}
+		spk, err := hex.DecodeString(p.ScriptPubKeyHex)
+		if err != nil {
+			return nil, fmt.Errorf("coin scriptPubKey_hex: %w", err)
+		}
+		view.AddUTXO(wire.OutPoint{Hash: h, Index: p.Vout}, &consensus.UTXOEntry{
+			Amount:     p.ValueSats,
+			PkScript:   spk,
+			Height:     p.Height,
+			IsCoinbase: p.IsCoinbase,
+		})
+	}
+	return view, nil
+}
+
+// snapshotView returns a deep copy of every coin currently in `src` (cloning
+// each PkScript) — the non-spending script-resolution view for one connect
+// block's ParallelScriptValidationCached pass.
+func snapshotView(src *consensus.InMemoryUTXOView) *consensus.InMemoryUTXOView {
+	dst := consensus.NewInMemoryUTXOView()
+	src.ForEach(func(op wire.OutPoint, e *consensus.UTXOEntry) {
+		dst.AddUTXO(op, &consensus.UTXOEntry{
+			Amount:     e.Amount,
+			PkScript:   bytes.Clone(e.PkScript),
+			Height:     e.Height,
+			IsCoinbase: e.IsCoinbase,
+		})
+	})
+	return dst
+}
+
+// viewDigest is the canonical coins-view digest the cross-impl reorg corpus
+// agrees on (matches rustoshi ShimUtxo.digest + the python view_digest): sort
+// entries by (txid wire-bytes, vout), then per coin emit (all little-endian)
+//
+//	txid[32] || vout u32 || height u32 || is_coinbase u8 || value u64 ||
+//	spk_len u32 || spk
+//
+// then sha256. The golden digests in R4/R8 are computed this exact way.
+func viewDigest(view *consensus.InMemoryUTXOView) string {
+	type entry struct {
+		op wire.OutPoint
+		e  *consensus.UTXOEntry
+	}
+	var entries []entry
+	view.ForEach(func(op wire.OutPoint, e *consensus.UTXOEntry) {
+		entries = append(entries, entry{op, e})
+	})
+	sort.Slice(entries, func(i, j int) bool {
+		c := bytes.Compare(entries[i].op.Hash[:], entries[j].op.Hash[:])
+		if c != 0 {
+			return c < 0
+		}
+		return entries[i].op.Index < entries[j].op.Index
+	})
+	var buf bytes.Buffer
+	var u32 [4]byte
+	var u64 [8]byte
+	for _, en := range entries {
+		buf.Write(en.op.Hash[:])
+		binary.LittleEndian.PutUint32(u32[:], en.op.Index)
+		buf.Write(u32[:])
+		binary.LittleEndian.PutUint32(u32[:], uint32(en.e.Height))
+		buf.Write(u32[:])
+		if en.e.IsCoinbase {
+			buf.WriteByte(1)
+		} else {
+			buf.WriteByte(0)
+		}
+		binary.LittleEndian.PutUint64(u64[:], uint64(en.e.Amount))
+		buf.Write(u64[:])
+		binary.LittleEndian.PutUint32(u32[:], uint32(len(en.e.PkScript)))
+		buf.Write(u32[:])
+		buf.Write(en.e.PkScript)
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	return hex.EncodeToString(sum[:])
+}
+
+// driveDisconnect re-expresses blockbrew's REAL DisconnectBlock undo walk
+// (chainmanager.go:1517-1602) over an EXPLICIT coins-view instead of the
+// disk-backed (chainDB.GetBlock + ReadBlockUndo + tip-node) production path —
+// the same accommodation processCheckBlock makes for ConnectBlock. It calls
+// blockbrew's REAL primitives (view.SpendUTXOWithCoin, view.ApplyTxInUndo,
+// consensus.IsUnspendable, consensus.IsBIP30Unspendable); it does NOT
+// re-implement the undo rule.
+//
+// Per Core validation.cpp:2205-2242 / blockbrew DisconnectBlock:
+//   - walk txs in REVERSE order;
+//   - for each tx, SpendUTXOWithCoin its outputs and 4-field identity-check
+//     (value + script + height + coinbase) the removed coin against the block
+//     output; a mismatch (or missing output) sets UNCLEAN unless this is a
+//     BIP-30-exempt coinbase (IsBIP30Unspendable keyed by height AND hash);
+//   - for non-coinbase txs, ApplyTxInUndo each spent input in REVERSE from the
+//     per-tx undo coins (overwrite => UNCLEAN; sibling-recovery exhausted =>
+//     FAILED).
+//
+// undoTxs maps tx_index -> ordered spent coins. The undo count must match the
+// non-coinbase tx count (Core validation.cpp:2190).
+func driveDisconnect(block *wire.MsgBlock, height int32, undoTxs map[int][]prevoutSpec,
+	view *consensus.InMemoryUTXOView) (disconnectResult, error) {
+
+	blockHash := block.Header.BlockHash()
+	nonCoinbase := len(block.Transactions) - 1
+	if nonCoinbase < 0 {
+		nonCoinbase = 0
+	}
+	if len(undoTxs) != nonCoinbase {
+		return dcFailed, fmt.Errorf("undo data mismatch: %d TxUndos but %d non-coinbase transactions",
+			len(undoTxs), nonCoinbase)
+	}
+
+	// BIP-30 exemption is keyed by BOTH height AND the crafted block hash.
+	enforceBIP30 := !consensus.IsBIP30Unspendable(height, blockHash)
+	fClean := true
+
+	for i := len(block.Transactions) - 1; i >= 0; i-- {
+		tx := block.Transactions[i]
+		txHash := tx.TxHash()
+		isCoinbase := i == 0
+		isBIP30Exception := isCoinbase && !enforceBIP30
+
+		// Remove + 4-field identity-check each of this tx's outputs.
+		for idx, out := range tx.TxOut {
+			if consensus.IsUnspendable(out.PkScript) {
+				continue
+			}
+			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
+			coin, isSpent := view.SpendUTXOWithCoin(outpoint)
+			if !isSpent || coin == nil {
+				if !isBIP30Exception {
+					fClean = false
+				}
+				continue
+			}
+			if coin.Amount != out.Value ||
+				!bytes.Equal(coin.PkScript, out.PkScript) ||
+				coin.Height != height ||
+				coin.IsCoinbase != isCoinbase {
+				if !isBIP30Exception {
+					fClean = false
+				}
+			}
+		}
+
+		// Restore spent inputs for non-coinbase txs.
+		if i > 0 {
+			spent, ok := undoTxs[i]
+			if !ok {
+				return dcFailed, fmt.Errorf("missing undo for tx_index %d", i)
+			}
+			if len(spent) != len(tx.TxIn) {
+				return dcFailed, fmt.Errorf("tx %d undo mismatch: %d spent coins but %d inputs",
+					i, len(spent), len(tx.TxIn))
+			}
+			// REVERSE iteration over inputs (Core validation.cpp:2233-2239).
+			for j := len(tx.TxIn); j > 0; j-- {
+				idx := j - 1
+				sc := spent[idx]
+				spk, err := hex.DecodeString(sc.ScriptPubKeyHex)
+				if err != nil {
+					return dcFailed, fmt.Errorf("undo coin scriptPubKey_hex: %w", err)
+				}
+				outpoint := tx.TxIn[idx].PreviousOutPoint
+				undoEntry := &consensus.UTXOEntry{
+					Amount:     sc.ValueSats,
+					PkScript:   bytes.Clone(spk),
+					Height:     sc.Height,
+					IsCoinbase: sc.IsCoinbase,
+				}
+				clean, okUndo := view.ApplyTxInUndo(undoEntry, outpoint)
+				if !okUndo {
+					return dcFailed, nil
+				}
+				if !clean {
+					fClean = false
+				}
+			}
+		}
+	}
+
+	if !fClean {
+		return dcUnclean, nil
+	}
+	return dcOK, nil
+}
+
+// processReorg drives blockbrew's REAL deterministic reorg as a PURE function of
+// explicit data (most-work DECISION + fork-point COINS-VIEW + per-block UNDO),
+// eliminating the live-tip / first-seen / nSequenceId race that made the
+// submitblock path SUSPECT for the invalid-block-on-higher-work case. The
+// phases mirror ChainManager.ReorgTo (chainmanager.go:1705) / ProcessSubmitted
+// Block (chainmanager.go:1286):
+//
+//	(0) DEPTH CAP: len(disconnect) > consensus.MaxReorgDepth(100) ->
+//	    reorg-too-deep (ReorgTo's span bound, chainmanager.go:1740). Core has
+//	    no fixed cap — EXPECTED-DIVERGENCE.
+//	(1) WORK COMPARE: STRICT new>old via *big.Int.Cmp (the EXACT comparator
+//	    ReorgTo's trigger uses, node.TotalWork.Cmp(tip.TotalWork) > 0,
+//	    chainmanager.go:505/1314). big.Int.SetBytes reads the 32-byte work hex
+//	    big-endian. Not strictly greater -> no-reorg-equal-or-less-work, view
+//	    UNTOUCHED.
+//	(2) DISCONNECT: per disconnect block tip-first, driveDisconnect (blockbrew's
+//	    REAL DisconnectBlock undo over the explicit view). disconnect_result =
+//	    worst-of across the span.
+//	(3) CONNECT: per side-branch block in order, runConnectBlockGates (the SAME
+//	    real ConnectBlock gates checkblock drives) at THAT block's own height,
+//	    threading the working view forward, stopping at the FIRST reject
+//	    (connected_count = blocks that passed before it; R9 MUST NOT skip ahead).
+//
+// PoW is gated off (skip_pow) — the crafted blocks' headers don't meet bits;
+// disabling PoW does NOT touch any consensus rule under test. Falsification
+// hook REORG_NEUTER_SCRIPTS=1 forces skip_scripts on every connect block so the
+// flagship R1 WRONGLY flips to reorg-applied, proving the per-input script
+// re-validation is the LIVE gate preventing the false-accept.
+func processReorg(req *request) string {
+	params, err := paramsForNetwork(req.Network)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString(err.Error()))
+	}
+
+	// (0) DEPTH CAP — refuse before touching the view (the view stays the seeded
+	// fork view; report its digest).
+	if len(req.Disconnect) > reorgMaxDepth {
+		view, verr := seedView(req.ForkUTXO)
+		if verr != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString(verr.Error()))
+		}
+		return fmt.Sprintf(
+			`{"outcome":"reorg-too-deep","disconnect_result":"ok","connected_count":0,"fork_utxo_digest":%s}`,
+			jsonString(viewDigest(view)))
+	}
+
+	// (1) WORK COMPARE — STRICT new>old, the production reorg trigger.
+	oldW, err := parseWork(req.OldTipWorkHex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("old_tip_work_hex: "+err.Error()))
+	}
+	newW, err := parseWork(req.NewTipWorkHex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("new_tip_work_hex: "+err.Error()))
+	}
+	if newW.Cmp(oldW) <= 0 {
+		// No reorg: the (possibly invalid) connect blocks are NEVER evaluated;
+		// the view is the seeded fork view, untouched.
+		view, verr := seedView(req.ForkUTXO)
+		if verr != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString(verr.Error()))
+		}
+		return fmt.Sprintf(
+			`{"outcome":"no-reorg-equal-or-less-work","disconnect_result":"ok","connected_count":0,"fork_utxo_digest":%s}`,
+			jsonString(viewDigest(view)))
+	}
+
+	// Seed the working view from fork_utxo.
+	view, err := seedView(req.ForkUTXO)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString(err.Error()))
+	}
+
+	// (2) DISCONNECT phase — drive REAL undo per block tip-first; worst-of.
+	worst := dcOK
+	for _, d := range req.Disconnect {
+		blockBytes, derr := hex.DecodeString(d.BlockHex)
+		if derr != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("disconnect.block_hex: "+derr.Error()))
+		}
+		var block wire.MsgBlock
+		if derr := block.Deserialize(bytes.NewReader(blockBytes)); derr != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("disconnect block deserialize: "+derr.Error()))
+		}
+		undoTxs := make(map[int][]prevoutSpec, len(d.Undo))
+		for _, ut := range d.Undo {
+			undoTxs[ut.TxIndex] = ut.Vin
+		}
+		res, derr := driveDisconnect(&block, d.Height, undoTxs, view)
+		if derr != nil {
+			// Input-shape / undo-count error — surface as a failed disconnect +
+			// rejected reorg (decision-first: the reorg cannot be applied).
+			return fmt.Sprintf(
+				`{"outcome":"reorg-rejected","disconnect_result":"failed","connected_count":0,"reject_reason":%s,"fork_utxo_digest":%s}`,
+				jsonString(derr.Error()), jsonString(viewDigest(view)))
+		}
+		if res > worst {
+			worst = res
+		}
+	}
+
+	// Falsification hook: neuter the per-input script re-validation on EVERY
+	// connect block. R1 must then WRONGLY flip to reorg-applied.
+	neuterScripts := os.Getenv("REORG_NEUTER_SCRIPTS") == "1"
+
+	// (3) CONNECT phase — drive REAL ConnectBlock gates in order; stop at first
+	// reject; thread the working view forward.
+	connectedCount := 0
+	for _, c := range req.Connect {
+		blockBytes, cerr := hex.DecodeString(c.BlockHex)
+		if cerr != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("connect.block_hex: "+cerr.Error()))
+		}
+		var block wire.MsgBlock
+		if cerr := block.Deserialize(bytes.NewReader(blockBytes)); cerr != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("connect block deserialize: "+cerr.Error()))
+		}
+		if len(block.Transactions) == 0 {
+			return reorgRejected(connectedCount, "bad-blk-length-no-tx", worst, view)
+		}
+		// Fresh non-spending snapshot of the CURRENT working view for this
+		// block's script pass (it must see every external prevout still unspent
+		// after the prior connect blocks' net effect).
+		scriptView := snapshotView(view)
+		res := runConnectBlockGates(&block, view, scriptView, params, c.Height,
+			params.SubsidyHalvingInterval, c.PrevMTP, true /*skipPow*/, neuterScripts)
+		if !res.ok {
+			// STOP at the first reject (R9: MUST NOT skip ahead to a later valid
+			// block). The view carries every block connected so far + this
+			// block's partially-applied txs; decision-first scores outcome +
+			// connected_count, not digest, on reject vectors.
+			return reorgRejected(connectedCount, res.reason, worst, view)
+		}
+		connectedCount++
+	}
+
+	// All connect blocks passed -> reorg adopted.
+	return fmt.Sprintf(
+		`{"outcome":"reorg-applied","disconnect_result":%s,"connected_count":%d,"fork_utxo_digest":%s}`,
+		jsonString(worst.String()), connectedCount, jsonString(viewDigest(view)))
+}
+
+// reorgRejected builds the reorg-rejected response with the current view digest.
+func reorgRejected(connectedCount int, reason string, worst disconnectResult,
+	view *consensus.InMemoryUTXOView) string {
+	return fmt.Sprintf(
+		`{"outcome":"reorg-rejected","disconnect_result":%s,"connected_count":%d,"reject_reason":%s,"fork_utxo_digest":%s}`,
+		jsonString(worst.String()), connectedCount, jsonString(reason), jsonString(viewDigest(view)))
+}
+
+// parseWork parses a 32-byte big-endian work hex into a *big.Int (the same
+// magnitude representation blockbrew's BlockNode.TotalWork uses, so .Cmp is the
+// identical strict-greater comparator the production reorg trigger applies).
+func parseWork(s string) (*big.Int, error) {
+	b, err := hex.DecodeString(s)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) != 32 {
+		return nil, fmt.Errorf("work hex not 32 bytes: %d", len(b))
+	}
+	return new(big.Int).SetBytes(b), nil
 }
 
 func main() {

@@ -81,11 +81,28 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int, skipPOW ...bool) 
 		}
 	}
 
-	// 2. Block timestamp is not more than 2 hours in the future
-	maxTime := time.Now().Unix() + MaxTimeAdjustment
-	if int64(block.Header.Timestamp) > maxTime {
-		return fmt.Errorf("%w: block time %d, max allowed %d",
-			ErrTimestampTooFar, block.Header.Timestamp, maxTime)
+	// 2. Block timestamp is not more than 2 hours in the future.
+	//
+	// In Bitcoin Core this "time-too-new" check is NOT part of CheckBlock (the
+	// body sanity); it lives in ContextualCheckBlockHeader (validation.cpp:4108,
+	// `block.Time() > NodeClock::now() + MAX_FUTURE_BLOCK_TIME`) — a HEADER-
+	// acceptance check run against wall-clock-now when a header is first
+	// received, and NOT re-run during ConnectBlock re-validation on a reorg.
+	// blockbrew folds it into CheckBlockSanity for convenience. Because it reads
+	// time.Now() it is the one non-deterministic, wall-clock-dependent gate
+	// here. The same `skip` flag that gates PoW (set true ONLY by the validate-
+	// only differential shim, which feeds crafted/mutated blocks that were
+	// already header-accepted on the live path) therefore also skips this
+	// header-receipt time gate: a deterministic body re-validation must not
+	// depend on wall-clock-now, and Core's ConnectBlock does not re-check it.
+	// Default-preserving: every production caller passes skipPOW=false, so the
+	// future-time gate stays fully active in real validation.
+	if !skip {
+		maxTime := time.Now().Unix() + MaxTimeAdjustment
+		if int64(block.Header.Timestamp) > maxTime {
+			return fmt.Errorf("%w: block time %d, max allowed %d",
+				ErrTimestampTooFar, block.Header.Timestamp, maxTime)
+		}
 	}
 
 	// 8. Block must have at least one transaction
