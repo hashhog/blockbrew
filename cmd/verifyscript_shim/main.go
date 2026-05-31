@@ -94,6 +94,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/big"
 	"os"
 	"strconv"
 
@@ -115,8 +116,15 @@ type request struct {
 	Prevouts []prevoutSpec `json:"prevouts"`
 
 	// connecttx op field: nSpendHeight, the height the tx is being
-	// connected at (drives coinbase-maturity confirmations).
+	// connected at (drives coinbase-maturity confirmations). Reused by
+	// checkblock as the height the FULL block is being connected at.
 	SpendHeight int32 `json:"spend_height"`
+
+	// checkblock op fields. The FINAL (already-mutated) block bytes are
+	// validated AS-IS — the shim does NOT recompute the merkle root.
+	BlockHex    string `json:"block_hex"`
+	SkipPOW     bool   `json:"skip_pow"`
+	SkipScripts bool   `json:"skip_scripts"`
 
 	// nextwork op fields.
 	Network   string       `json:"network"`
@@ -289,6 +297,8 @@ func process(line []byte) string {
 		return processCheckTx(&req)
 	case "connecttx":
 		return processConnectTx(&req)
+	case "checkblock":
+		return processCheckBlock(&req)
 	case "nextwork":
 		return processNextWork(&req)
 	case "merkleroot":
@@ -418,6 +428,187 @@ func processConnectTx(req *request) string {
 		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(connectTxReason(verr)))
 	}
 	return fmt.Sprintf(`{"valid":true,"fee_sats":%d}`, fee)
+}
+
+// maxPowLimit is an all-0xFF 256-bit target — the maximum representable PoW
+// ceiling. It is handed to CheckBlockSanity so the `target > powLimit` branch
+// of CheckProofOfWork can never trip for the differential checkblock op. (PoW
+// is additionally fully gated off via skip_pow; see processCheckBlock.)
+var maxPowLimit = func() *big.Int {
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = 0xff
+	}
+	return new(big.Int).SetBytes(b)
+}()
+
+// processCheckBlock drives blockbrew's REAL block-validation gates over a FINAL
+// (already-mutated) block, validate-only, in ConnectBlock order — the
+// decision-level generalization of connecttx from one tx to a full block. It
+// mirrors Bitcoin Core's CheckBlock -> ContextualCheckBlock -> ConnectBlock
+// pipeline (validation.cpp). The block bytes are validated AS-IS: the shim does
+// NOT recompute the header merkle root, so a corrupted-merkle mutant reaches
+// blockbrew's OWN merkle gate in CheckBlockSanity.
+//
+//	(1) CheckBlockSanity(block, maxPowLimit, skip_pow):
+//	    coinbase-first / single-coinbase / per-tx sanity / merkle-root match
+//	    (CVE-2012-2459 mutation) / block weight. PoW is gated off by skip_pow
+//	    (Core CheckBlock fCheckPOW=false) because the FINAL mutated hash no
+//	    longer satisfies the unchanged bits target — without the gate every
+//	    header-mutating mutant would dead-gate on high-hash before its real
+//	    body gate ran.
+//	(2) CheckBlockContext(block, &synthPrevHeader, spend_height, MainnetParams):
+//	    BIP34/66/65 version gates + BIP34 coinbase-height + segwit witness
+//	    commitment/malleation + final-tx. MTP is left at the zero variadic
+//	    default (skipped) — no chain history is available in the shim and the
+//	    corpus carries no MTP-dependent mutant. A synthetic prevHeader is passed
+//	    (its only consensus use here would be a difficulty re-check, which
+//	    CheckBlockContext deliberately skips — see its comment).
+//	(3) ConnectBlock gates RE-EXPRESSED in Core order over the seeded view:
+//	    per non-coinbase tx CheckTransactionInputs(tx, spend_height, view)
+//	    accumulating totalFees; per-tx nSigOpsCost =
+//	    CountSigOpsInaccurate(scriptSig+pkScript)*WitnessScaleFactor +
+//	    CountP2SHSigOps + CountWitnessSigOps, reject > MaxBlockSigOpsCost;
+//	    ParallelScriptValidationCached(block, view, GetBlockScriptFlags(height,
+//	    MainnetParams, blockHash), sigCache) unless skip_scripts; finally
+//	    coinbaseValue <= CalcBlockSubsidy(height)+totalFees (ErrBadCoinbaseValue).
+//
+// MAINNET params throughout (NOT regtest — regtest's subsidy schedule breaks
+// bad-cb-amount and its deployment heights are wrong). spend_height 709742 is
+// post-Taproot so every mainnet deployment is active. The UTXO view is seeded
+// from prevouts with the SAME display->wire txid reversal + one-coin-per-prevout
+// plumbing as processConnectTx; an omitted prevout naturally models a missing
+// input (GetUTXO -> nil).
+//
+// valid iff every gate passes. The reason TOKEN is advisory; the driver scores
+// only the valid bool. A block that fails to deserialize is reported as
+// {"error"} so the driver treats it as a reject decision without fake-passing.
+func processCheckBlock(req *request) string {
+	blockBytes, err := hex.DecodeString(req.BlockHex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("block_hex: "+err.Error()))
+	}
+
+	var block wire.MsgBlock
+	if err := block.Deserialize(bytes.NewReader(blockBytes)); err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("block deserialize: "+err.Error()))
+	}
+
+	if len(block.Transactions) == 0 {
+		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString("bad-blk-length-no-tx"))
+	}
+
+	params := consensus.MainnetParams()
+	height := req.SpendHeight
+
+	// Seed the in-memory UTXO view: one coin per prevout (reusing the exact
+	// connecttx seeding — display-order txid reversed to wire order via
+	// wire.NewHash256FromHex; an OMITTED prevout is never added so GetUTXO
+	// returns nil -> missing input).
+	view := consensus.NewInMemoryUTXOView()
+	for _, p := range req.Prevouts {
+		h, err := wire.NewHash256FromHex(p.Txid)
+		if err != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("prevout txid: "+err.Error()))
+		}
+		spk, err := hex.DecodeString(p.ScriptPubKeyHex)
+		if err != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("prevout scriptPubKey_hex: "+err.Error()))
+		}
+		view.AddUTXO(wire.OutPoint{Hash: h, Index: p.Vout}, &consensus.UTXOEntry{
+			Amount:     p.ValueSats,
+			PkScript:   spk,
+			Height:     p.Height,
+			IsCoinbase: p.IsCoinbase,
+		})
+	}
+
+	// (1) Context-free sanity (PoW gated by skip_pow; merkle/weight/coinbase
+	// structure enforced AS-IS over the FINAL bytes).
+	if verr := consensus.CheckBlockSanity(&block, maxPowLimit, req.SkipPOW); verr != nil {
+		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(verr.Error()))
+	}
+
+	// (2) Contextual checks at this height. A synthetic prevHeader (its only use
+	// would be a difficulty recheck that CheckBlockContext skips). MTP omitted
+	// (zero variadic) — no chain history; no MTP-dependent corpus mutant.
+	synthPrevHeader := &wire.BlockHeader{
+		Version:   block.Header.Version,
+		PrevBlock: block.Header.PrevBlock,
+		Bits:      block.Header.Bits,
+		Timestamp: block.Header.Timestamp,
+	}
+	if verr := consensus.CheckBlockContext(&block, synthPrevHeader, height, params); verr != nil {
+		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(verr.Error()))
+	}
+
+	// (3) ConnectBlock economic + sigop + script + coinbase-value gates, in
+	// Core order over the seeded view.
+	var totalFees int64
+	var nSigOpsCost int
+
+	// Coinbase sigops (legacy only; CountP2SH/CountWitness short-circuit to 0
+	// for the coinbase). Mirrors ConnectBlock's i==0 branch.
+	coinbase := block.Transactions[0]
+	for _, txIn := range coinbase.TxIn {
+		nSigOpsCost += consensus.CountSigOpsInaccurate(txIn.SignatureScript) * consensus.WitnessScaleFactor
+	}
+	for _, txOut := range coinbase.TxOut {
+		nSigOpsCost += consensus.CountSigOpsInaccurate(txOut.PkScript) * consensus.WitnessScaleFactor
+	}
+
+	for i := 1; i < len(block.Transactions); i++ {
+		tx := block.Transactions[i]
+
+		fee, verr := consensus.CheckTransactionInputs(tx, height, view)
+		if verr != nil {
+			return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(connectTxReason(verr)))
+		}
+		totalFees += fee
+		if totalFees > consensus.MaxMoney {
+			return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString("bad-txns-accumulated-fee-outofrange"))
+		}
+
+		// Block-wide sigop COST (BIP-141), counted while prevouts are still in
+		// the view. Inaccurate legacy counting (CHECKMULTISIG=20), matching
+		// Core's GetLegacySigOpCount.
+		for _, txIn := range tx.TxIn {
+			nSigOpsCost += consensus.CountSigOpsInaccurate(txIn.SignatureScript) * consensus.WitnessScaleFactor
+		}
+		for _, txOut := range tx.TxOut {
+			nSigOpsCost += consensus.CountSigOpsInaccurate(txOut.PkScript) * consensus.WitnessScaleFactor
+		}
+		nSigOpsCost += consensus.CountP2SHSigOps(tx, view)
+		nSigOpsCost += consensus.CountWitnessSigOps(tx, view)
+		if nSigOpsCost > consensus.MaxBlockSigOpsCost {
+			return fmt.Sprintf(`{"valid":false,"reason":%s}`,
+				jsonString(fmt.Sprintf("bad-blk-sigops: %d > %d", nSigOpsCost, consensus.MaxBlockSigOpsCost)))
+		}
+	}
+
+	// Script validation over the seeded view (skipped iff skip_scripts).
+	if !req.SkipScripts {
+		blockHash := block.Header.BlockHash()
+		flags := consensus.GetBlockScriptFlags(height, params, blockHash)
+		sigCache := consensus.NewSigCache(0)
+		if verr := consensus.ParallelScriptValidationCached(&block, view, flags, sigCache); verr != nil {
+			return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString("block-script-verify: "+verr.Error()))
+		}
+	}
+
+	// Coinbase value cap: coinbaseValue <= subsidy + totalFees.
+	subsidy := consensus.CalcBlockSubsidy(height)
+	var coinbaseValue int64
+	for _, out := range coinbase.TxOut {
+		coinbaseValue += out.Value
+	}
+	if coinbaseValue > subsidy+totalFees {
+		return fmt.Sprintf(`{"valid":false,"reason":%s}`,
+			jsonString(fmt.Sprintf("bad-cb-amount: %d > %d (subsidy %d + fees %d)",
+				coinbaseValue, subsidy+totalFees, subsidy, totalFees)))
+	}
+
+	return `{"valid":true}`
 }
 
 // stubBlockProvider is a minimal consensus.BlockProvider backed by a

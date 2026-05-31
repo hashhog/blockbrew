@@ -57,11 +57,28 @@ var WitnessCommitmentMagic = []byte{0xaa, 0x21, 0xa9, 0xed}
 
 // CheckBlockSanity performs context-free checks on a block.
 // powLimit is the maximum allowed proof of work target.
-func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int) error {
+//
+// The optional variadic skipPOW arg (default false) gates ONLY the
+// CheckProofOfWork call, mirroring Bitcoin Core's CheckBlock(..., fCheckPOW)
+// (validation.cpp CheckBlock signature, where the caller passes fCheckPOW=false
+// for already-validated / differentially-mutated blocks). It defaults to false
+// so every existing caller — CheckBlockSanity(block, powLimit) — is byte-for-byte
+// unaffected and PoW is still enforced. It is set true ONLY by the validate-only
+// differential checkblock shim, which feeds FINAL mutated block bytes whose hash
+// no longer satisfies the (unchanged) bits target; without this gate a body
+// mutation that recomputes nothing would be silently rejected on high-hash/PoW
+// before its real body gate ever runs (a dead-gate). Max-powLimit alone does NOT
+// bypass PoW because CheckProofOfWork also enforces hash <= target(bits), and
+// target is derived from the block's OWN bits, not from powLimit.
+func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int, skipPOW ...bool) error {
+	skip := len(skipPOW) > 0 && skipPOW[0]
+
 	// 1. Block header proof of work is valid (hash <= target from bits)
-	blockHash := block.Header.BlockHash()
-	if err := CheckProofOfWork(blockHash, block.Header.Bits, powLimit); err != nil {
-		return err
+	if !skip {
+		blockHash := block.Header.BlockHash()
+		if err := CheckProofOfWork(blockHash, block.Header.Bits, powLimit); err != nil {
+			return err
+		}
 	}
 
 	// 2. Block timestamp is not more than 2 hours in the future
