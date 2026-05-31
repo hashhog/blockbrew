@@ -505,7 +505,22 @@ func processCheckBlock(req *request) string {
 	// connecttx seeding — display-order txid reversed to wire order via
 	// wire.NewHash256FromHex; an OMITTED prevout is never added so GetUTXO
 	// returns nil -> missing input).
+	//
+	// `view` is the SPEND-TRACKING connect-loop view: inputs are removed as each
+	// tx is processed so a later tx that re-spends an already-spent outpoint
+	// (e.g. the bad-txns-duplicate mutant, two identical txs) is rejected with
+	// bad-txns-inputs-missingorspent — mirroring Core ConnectBlock's UpdateCoins
+	// + the CVE-2018-17144 duplicate-input semantics.
+	//
+	// `scriptView` is a NON-spending snapshot holding every prevout (external +
+	// all intra-block-created outputs). ParallelScriptValidationCached runs
+	// AFTER the connect loop and resolves each input's scriptPubKey via the
+	// view; if we ran it over the spend-tracking `view` the inputs would already
+	// be gone. Core keeps the prevouts available to its script-check pass the
+	// same way (the CCoinsViewCache retains spent coins until flush). Both views
+	// are seeded identically from the external prevouts.
 	view := consensus.NewInMemoryUTXOView()
+	scriptView := consensus.NewInMemoryUTXOView()
 	for _, p := range req.Prevouts {
 		h, err := wire.NewHash256FromHex(p.Txid)
 		if err != nil {
@@ -515,9 +530,16 @@ func processCheckBlock(req *request) string {
 		if err != nil {
 			return fmt.Sprintf(`{"error":%s}`, jsonString("prevout scriptPubKey_hex: "+err.Error()))
 		}
-		view.AddUTXO(wire.OutPoint{Hash: h, Index: p.Vout}, &consensus.UTXOEntry{
+		op := wire.OutPoint{Hash: h, Index: p.Vout}
+		view.AddUTXO(op, &consensus.UTXOEntry{
 			Amount:     p.ValueSats,
 			PkScript:   spk,
+			Height:     p.Height,
+			IsCoinbase: p.IsCoinbase,
+		})
+		scriptView.AddUTXO(op, &consensus.UTXOEntry{
+			Amount:     p.ValueSats,
+			PkScript:   bytes.Clone(spk),
 			Height:     p.Height,
 			IsCoinbase: p.IsCoinbase,
 		})
@@ -557,6 +579,23 @@ func processCheckBlock(req *request) string {
 		nSigOpsCost += consensus.CountSigOpsInaccurate(txOut.PkScript) * consensus.WitnessScaleFactor
 	}
 
+	// Intra-block spends + intra-block double-spend/duplicate detection. A later
+	// tx may spend an output created by an EARLIER tx in the SAME block; Core's
+	// ConnectBlock adds each tx's outputs to the coins view (AddCoins) and
+	// removes each spent input (SpendCoins) as it processes that tx, so a tx
+	// re-spending an already-spent outpoint fails the next GetUTXO. The corpus
+	// deliberately drops in-block prevouts from the external prevout set (epoch
+	// metadata: n_intra_dropped), so without modelling AddCoins the real block's
+	// in-block-spending txs false-reject (bad-txns-inputs-missingorspent), and
+	// without modelling SpendCoins the bad-txns-duplicate mutant (two identical
+	// txs spending the same input) false-ACCEPTS. We add the coinbase outputs
+	// first (ConnectBlock i==0, before the i>=1 loop), then per non-coinbase tx:
+	// check inputs -> count sigops (prevouts still present) -> SPEND inputs ->
+	// ADD outputs. The non-spending scriptView mirrors the AddCoins side ONLY
+	// (used by the post-loop script pass, which must still see every prevout).
+	view.AddTxOutputs(coinbase, height)
+	scriptView.AddTxOutputs(coinbase, height)
+
 	for i := 1; i < len(block.Transactions); i++ {
 		tx := block.Transactions[i]
 
@@ -584,14 +623,24 @@ func processCheckBlock(req *request) string {
 			return fmt.Sprintf(`{"valid":false,"reason":%s}`,
 				jsonString(fmt.Sprintf("bad-blk-sigops: %d > %d", nSigOpsCost, consensus.MaxBlockSigOpsCost)))
 		}
+
+		// Spend this tx's inputs (so a later in-block re-spend / duplicate tx is
+		// rejected) THEN add its outputs (so a later in-block child can spend
+		// them). Both AFTER the checks above so a tx cannot spend its own
+		// outputs. scriptView only AddCoins (never spends) — see seeding note.
+		view.SpendTxInputs(tx)
+		view.AddTxOutputs(tx, height)
+		scriptView.AddTxOutputs(tx, height)
 	}
 
-	// Script validation over the seeded view (skipped iff skip_scripts).
+	// Script validation over the NON-spending scriptView (skipped iff
+	// skip_scripts) — it retains every external + intra-block prevout the
+	// per-input VerifyScript needs.
 	if !req.SkipScripts {
 		blockHash := block.Header.BlockHash()
 		flags := consensus.GetBlockScriptFlags(height, params, blockHash)
 		sigCache := consensus.NewSigCache(0)
-		if verr := consensus.ParallelScriptValidationCached(&block, view, flags, sigCache); verr != nil {
+		if verr := consensus.ParallelScriptValidationCached(&block, scriptView, flags, sigCache); verr != nil {
 			return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString("block-script-verify: "+verr.Error()))
 		}
 	}
