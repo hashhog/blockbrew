@@ -256,6 +256,8 @@ func process(line []byte) string {
 		return processNextWork(&req)
 	case "merkleroot":
 		return processMerkleRoot(&req)
+	case "subsidy":
+		return processSubsidy(&req)
 	default:
 		return fmt.Sprintf(`{"error":%s}`, jsonString("unknown op: "+req.Op))
 	}
@@ -422,6 +424,16 @@ func processMerkleRoot(req *request) string {
 	root, mutated := consensus.CalcMerkleRootMutation(hashes)
 	// root.String() reverses internal byte order back to display order.
 	return fmt.Sprintf(`{"root":%s,"mutated":%t}`, jsonString(root.String()), mutated)
+}
+
+// processSubsidy drives blockbrew's REAL block-subsidy function
+// consensus.CalcBlockSubsidy (internal/consensus/difficulty.go:162), the
+// coinbase-cap value ConnectBlock uses. It reads the package-level
+// SubsidyHalvingInterval (= 210000, mainnet) and InitialSubsidy (50 BTC),
+// so a halving-boundary off-by-one or a missing >=64 zero-guard in that fn
+// surfaces here rather than being re-implemented in the shim.
+func processSubsidy(req *request) string {
+	return fmt.Sprintf(`{"subsidy_sats":%d}`, consensus.CalcBlockSubsidy(req.Height))
 }
 
 // processVerifyScript handles the original verifyscript op: rebuild
