@@ -738,6 +738,51 @@ func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMe
 			return connectGateResult{reason: "bad-txns-accumulated-fee-outofrange", fee: totalFees}
 		}
 
+		// BIP-68 relative sequence-locks, enforced after CSV activation — the
+		// exact gate blockbrew's production ConnectBlock applies
+		// (chainmanager.go:774-798) right after CheckTransactionInputs and before
+		// the sigop count, mirroring Bitcoin Core ConnectBlock
+		// (validation.cpp:2549-2561: CalculateSequenceLocks +
+		// SequenceLocks/EvaluateSequenceLocks -> reject "bad-txns-nonfinal"). It
+		// was OMITTED from runConnectBlockGates (the same shape as the previously
+		// fixed BIP-30 omission), so checkblock/reorg never reached it and a
+		// not-yet-mature relative-height lock false-ACCEPTED. We delegate to
+		// blockbrew's OWN consensus.CalculateSequenceLocks /
+		// consensus.EvaluateSequenceLocks (the same fns the live node + mempool
+		// call) — a divergence here is a real blockbrew consensus bug, not a shim
+		// re-expression.
+		//
+		// fEnforceBIP68 in Core is tx.version>=2 && CSV-active; CalculateSequenceLocks
+		// already short-circuits tx.Version<2 (returns the no-lock {-1,-1} lock), so
+		// gating on height>=CSVHeight here reproduces both halves: pre-CSV blocks skip
+		// the gate entirely, and a v1 tx at/after CSV evaluates a no-op lock that
+		// always satisfies. prevHeights are the coin heights read from the SAME
+		// spend-tracking view CheckTransactionInputs just validated against (inputs
+		// not yet spent below), so a coin missing from the view would already have
+		// been rejected as bad-txns-inputs-missingorspent above.
+		if height >= params.CSVHeight {
+			prevHeights := make([]int32, len(tx.TxIn))
+			for j, in := range tx.TxIn {
+				if utxo := view.GetUTXO(in.PreviousOutPoint); utxo != nil {
+					prevHeights[j] = utxo.Height
+				}
+			}
+			// MTP lookup for TIME-based locks (bit-22). This corpus is HEIGHT-based
+			// only, so the height-type branch never reads getMTP; the supplied
+			// prevMTP (block median-time-past; 0 when unavailable) is passed to
+			// EvaluateSequenceLocks as the block MTP exactly as production does
+			// (chainmanager.go:794 uses int64(mtp)). For a height-only lock
+			// lock.MinTime == -1, so the MTP comparison can never trip — time-based
+			// enforcement is a SEPARATE deferred gate, intentionally not exercised here.
+			getMTP := func(int32) int64 { return int64(prevMTP) }
+			seqLock := consensus.CalculateSequenceLocks(tx, prevHeights, getMTP)
+			if !consensus.EvaluateSequenceLocks(seqLock, height, int64(prevMTP)) {
+				// Core maps ErrSequenceLockNotMet -> "bad-txns-nonfinal"
+				// (validation.cpp:2558; blockbrew rpc/methods.go:1849-1851).
+				return connectGateResult{reason: "bad-txns-nonfinal", fee: totalFees}
+			}
+		}
+
 		for _, txIn := range tx.TxIn {
 			nSigOpsCost += consensus.CountSigOpsInaccurate(txIn.SignatureScript) * consensus.WitnessScaleFactor
 		}
