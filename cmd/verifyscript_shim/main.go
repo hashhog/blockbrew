@@ -8,12 +8,12 @@
 //
 // The driver hands us PRE-ASSEMBLED hex scripts (it does the Core ParseScript
 // assembly itself), so this shim only needs to:
-//   1. map the 22 Core flag tokens to blockbrew's ScriptFlags bitmask,
-//   2. rebuild Core's crediting + spending tx pair using blockbrew's OWN
-//      wire.MsgTx serialization + TxHash so the sighash matches byte-for-byte
-//      (mirrors cmd/script_test/main.go makeCreditingTx/makeSpendingTx, which
-//      in turn mirrors bitcoin-core test/util/transaction_utils.cpp),
-//   3. call VerifyScript and report the accept/reject decision.
+//  1. map the 22 Core flag tokens to blockbrew's ScriptFlags bitmask,
+//  2. rebuild Core's crediting + spending tx pair using blockbrew's OWN
+//     wire.MsgTx serialization + TxHash so the sighash matches byte-for-byte
+//     (mirrors cmd/script_test/main.go makeCreditingTx/makeSpendingTx, which
+//     in turn mirrors bitcoin-core test/util/transaction_utils.cpp),
+//  3. call VerifyScript and report the accept/reject decision.
 //
 // Protocol (one JSON object per line on stdin, one per line on stdout):
 //
@@ -136,6 +136,17 @@ type request struct {
 	Last      *nextworkHdr `json:"last"`
 	First     *nextworkHdr `json:"first"`
 
+	// checkheader op fields. HeaderHex is the 80-byte header under test; Prev is
+	// the parent-block context (bits/time/hash); MTP is the median-time-past of
+	// the parent's 11 ancestors (drives time-too-old); CurrentTime is the
+	// injected wall clock (0 = disable time-too-new); ExpectedBits optionally
+	// overrides the GetNextWorkRequired result to isolate a non-difficulty gate.
+	HeaderHex    string        `json:"header_hex"`
+	Prev         *checkHdrPrev `json:"prev"`
+	MTP          int64         `json:"mtp"`
+	CurrentTime  int64         `json:"current_time"`
+	ExpectedBits string        `json:"expected_bits"`
+
 	// merkleroot op fields.
 	Txids []string `json:"txids"`
 
@@ -143,11 +154,11 @@ type request struct {
 	// for disconnect-vectors, fork-point view otherwise), seeded EXACTLY like
 	// connecttx/checkblock prevouts. disconnect = old-branch blocks tip-first
 	// (0+), connect = ordered side-branch blocks. Work hexes are 32-byte BE.
-	ForkUTXO       []prevoutSpec  `json:"fork_utxo"`
-	Disconnect     []disconnectBk `json:"disconnect"`
-	Connect        []connectBk    `json:"connect"`
-	OldTipWorkHex  string         `json:"old_tip_work_hex"`
-	NewTipWorkHex  string         `json:"new_tip_work_hex"`
+	ForkUTXO      []prevoutSpec  `json:"fork_utxo"`
+	Disconnect    []disconnectBk `json:"disconnect"`
+	Connect       []connectBk    `json:"connect"`
+	OldTipWorkHex string         `json:"old_tip_work_hex"`
+	NewTipWorkHex string         `json:"new_tip_work_hex"`
 }
 
 // disconnectBk is one old-branch block to undo: its final bytes, the height it
@@ -185,6 +196,17 @@ type nextworkHdr struct {
 	Height int32  `json:"height"`
 	Bits   string `json:"bits"`
 	Time   uint32 `json:"time"`
+}
+
+// checkHdrPrev is the parent-block context for the checkheader op: the parent's
+// compact bits (8-hex), its unix timestamp, and its display-order hash. bits +
+// time drive GetNextWorkRequired (bad-diffbits) and the BIP-94 timewarp floor;
+// hash is the value ContextualCheckBlockHeader would read as the header's
+// PrevBlock (informational here — the parent node is synthesized directly).
+type checkHdrPrev struct {
+	Bits string `json:"bits"`
+	Time uint32 `json:"time"`
+	Hash string `json:"hash"`
 }
 
 // prevoutSpec is one entry of the verifytx / connecttx "prevouts" array: a
@@ -340,6 +362,8 @@ func process(line []byte) string {
 		return processConnectTx(&req)
 	case "checkblock":
 		return processCheckBlock(&req)
+	case "checkheader":
+		return processCheckHeader(&req)
 	case "reorg":
 		return processReorg(&req)
 	case "nextwork":
@@ -609,6 +633,172 @@ func processCheckBlock(req *request) string {
 		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(res.reason))
 	}
 	return `{"valid":true}`
+}
+
+// checkHeaderReason maps a blockbrew header-validation error to the Core bip22
+// reject token the checkheader corpus scores on. The DECISION (accept bool) is
+// what's scored primarily; this normalizes the sentinel for the divergence log
+// and is NOT a re-implementation of any rule — the verdict already came from
+// CheckProofOfWork / ContextualCheckBlockHeader. The bad-version token carries
+// the offending version in Core's `bad-version(0x%08x)` format (validation.cpp:
+// 4112-4124 strprintf), matching the rustoshi reference corpus's expected token.
+func checkHeaderReason(err error, version int32) string {
+	switch {
+	case errors.Is(err, consensus.ErrNegativeTarget),
+		errors.Is(err, consensus.ErrTargetTooHigh),
+		errors.Is(err, consensus.ErrDifficultyTooLow):
+		// CheckProofOfWork: hash>target, target>powLimit, negative/overflow —
+		// Core folds all into the single CheckBlockHeader "high-hash" token.
+		return "high-hash"
+	case errors.Is(err, consensus.ErrBadDifficulty):
+		return "bad-diffbits"
+	case errors.Is(err, consensus.ErrTimestampTooEarly):
+		return "time-too-old"
+	case errors.Is(err, consensus.ErrTimeWarpAttack):
+		return "time-timewarp-attack"
+	case errors.Is(err, consensus.ErrTimestampTooFarFuture):
+		return "time-too-new"
+	case errors.Is(err, consensus.ErrBlockVersionTooLow):
+		return fmt.Sprintf("bad-version(0x%08x)", uint32(version))
+	default:
+		return err.Error()
+	}
+}
+
+// processCheckHeader drives blockbrew's REAL header-level reject gates over an
+// EXPLICIT (header, prev-context) tuple — never a live tip/clock — mirroring
+// Bitcoin Core's CheckBlockHeader (PoW) -> ContextualCheckBlockHeader
+// (validation.cpp:4080-4124) split. It is the header-only differential the
+// checkblock op cannot reach: checkblock's CheckBlockContext covers only
+// BIP34-height + witness commitment, never the difficulty / time / version
+// header gates.
+//
+// It calls the two REAL consensus functions:
+//
+//   - consensus.CheckProofOfWork(hash, bits, powLimit) for the high-hash class
+//     when skip_pow=false (the STRICT path enforcing target<=powLimit — folds
+//     hash>target AND nBits-malformed/target>powLimit into one "high-hash"
+//     token, exactly as CheckBlockHeader does);
+//
+//   - (*HeaderIndex).ContextualCheckBlockHeader(header, parent, height, mtp,
+//     current_time, expectedBitsOverride, checkVersion=true) for bad-diffbits /
+//     time-too-old / timewarp / time-too-new / bad-version. The expected nBits
+//     is computed by blockbrew's OWN GetNextWorkRequired over the prev context
+//     (NOT the header's claimed bits) unless an explicit expected_bits override
+//     isolates a later gate at a retarget boundary. current_time is injected
+//     (0 = disable time-too-new); mtp is injected directly.
+//
+//     request:  {"op":"checkheader","network":"...",
+//     "header_hex":"<80-byte header>","height":<int>,
+//     "prev":{"bits":"<hex>","time":<u32>,"hash":"<display-hex>"},
+//     "first":{height,bits,time}  // opt; retarget-boundary recompute,
+//     "mtp":<int64>,"current_time":<int64; 0=disable>,
+//     "skip_pow":<bool; default false>,"expected_bits":"<hex>"  // opt}
+//     response: {"accept":true} | {"accept":false,"reason":"<bip22 token>"}
+func processCheckHeader(req *request) string {
+	params, err := paramsForNetwork(req.Network)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString(err.Error()))
+	}
+	if req.Prev == nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("checkheader: missing prev"))
+	}
+
+	headerBytes, err := hex.DecodeString(req.HeaderHex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("header_hex: "+err.Error()))
+	}
+	if len(headerBytes) != 80 {
+		return fmt.Sprintf(`{"error":%s}`, jsonString(fmt.Sprintf("header_hex not 80 bytes: %d", len(headerBytes))))
+	}
+	var header wire.BlockHeader
+	if err := header.Deserialize(bytes.NewReader(headerBytes)); err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("header deserialize: "+err.Error()))
+	}
+
+	height := req.Height
+
+	prevBits, err := strconv.ParseUint(req.Prev.Bits, 16, 32)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("prev.bits: "+err.Error()))
+	}
+
+	// ---- Stage 1: high-hash (CheckProofOfWork, strict path) ----
+	// Mirrors Core CheckBlockHeader (validation.cpp): the single high-hash token
+	// covers hash>target AND nBits malformed/target>powLimit (DeriveTarget).
+	// skip_pow defaults FALSE for checkheader (the whole point is to exercise the
+	// strict PoW over a crafted header), unlike checkblock whose mutated body no
+	// longer meets target.
+	if !req.SkipPOW {
+		if perr := consensus.CheckProofOfWork(header.BlockHash(), header.Bits, params.PowLimit); perr != nil {
+			return fmt.Sprintf(`{"accept":false,"reason":%s}`, jsonString(checkHeaderReason(perr, header.Version)))
+		}
+	}
+
+	// ---- Build the synthetic parent BlockNode (pindexPrev) ----
+	// height-1, prev.bits, prev.time. prev.hash becomes the node hash so a
+	// retarget-boundary "first" (if supplied) wires as parent.Parent for the
+	// real GetNextWorkRequired recompute; off-boundary corpus rows never reach
+	// the provider's ancestor lookup.
+	parent := &consensus.BlockNode{
+		Height: height - 1,
+		Header: wire.BlockHeader{
+			Timestamp: req.Prev.Time,
+			Bits:      uint32(prevBits),
+		},
+		TotalWork: big.NewInt(0),
+	}
+	if req.Prev.Hash != "" {
+		if h, herr := wire.NewHash256FromHex(req.Prev.Hash); herr == nil {
+			parent.Hash = h
+		}
+	}
+
+	// Real header index as the BlockProvider for GetNextWorkRequired's ancestor
+	// lookups (only exercised on a no-override retarget boundary).
+	idx := consensus.NewHeaderIndex(params)
+
+	// Optional retarget-boundary "first" block (height H-2016): wire as
+	// parent.Parent so getTestnetNonMinDiffBits / CalculateNextWorkRequired can
+	// walk to it via GetPrevHeader, matching the rustoshi reference. The corpus's
+	// boundary rows instead supply expected_bits, so this path is defensive.
+	if req.First != nil {
+		fbits, ferr := strconv.ParseUint(req.First.Bits, 16, 32)
+		if ferr != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("first.bits: "+ferr.Error()))
+		}
+		parent.Parent = &consensus.BlockNode{
+			Height: req.First.Height,
+			Header: wire.BlockHeader{
+				Timestamp: req.First.Time,
+				Bits:      uint32(fbits),
+			},
+			TotalWork: big.NewInt(0),
+		}
+	}
+
+	// ---- expected_bits override (isolates a non-difficulty gate) ----
+	var expectedBitsOverride *uint32
+	if req.ExpectedBits != "" {
+		eb, eerr := strconv.ParseUint(req.ExpectedBits, 16, 32)
+		if eerr != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("expected_bits: "+eerr.Error()))
+		}
+		v := uint32(eb)
+		expectedBitsOverride = &v
+	}
+
+	// ---- Stage 2: ContextualCheckBlockHeader (bad-diffbits / time / version) ----
+	// checkVersion=true for full Core-parity header validation (production leaves
+	// the version gate to CheckBlockContext; the differential exercises it here).
+	if cerr := idx.ContextualCheckBlockHeader(
+		header, parent, height,
+		req.MTP, req.CurrentTime, expectedBitsOverride, true,
+	); cerr != nil {
+		return fmt.Sprintf(`{"accept":false,"reason":%s}`, jsonString(checkHeaderReason(cerr, header.Version)))
+	}
+
+	return `{"accept":true}`
 }
 
 // connectGateResult is the verdict of runConnectBlockGates: ok=true means every
