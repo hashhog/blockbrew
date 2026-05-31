@@ -27,7 +27,7 @@ var (
 	// MinimumChainWork threshold.  Mirrors Bitcoin Core validation.cpp:4229:
 	//   if (!min_pow_checked)
 	//       return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
-	ErrTooLittleChainwork    = errors.New("too-little-chainwork")
+	ErrTooLittleChainwork = errors.New("too-little-chainwork")
 )
 
 // headerNowUnix returns the current wall-clock time in seconds since epoch.
@@ -58,11 +58,11 @@ type BlockNode struct {
 	Header     wire.BlockHeader
 	Height     int32
 	Parent     *BlockNode
-	Skip       *BlockNode    // Skip-list pointer for O(log N) ancestor lookup (Bitcoin Core's pskip)
-	TotalWork  *big.Int      // Cumulative chain work up to this block
-	Status     BlockStatus   // Validation state
-	Children   []*BlockNode  // Potential forks
-	SequenceID int32         // Sequence ID for precious block ordering (lower = more precious)
+	Skip       *BlockNode   // Skip-list pointer for O(log N) ancestor lookup (Bitcoin Core's pskip)
+	TotalWork  *big.Int     // Cumulative chain work up to this block
+	Status     BlockStatus  // Validation state
+	Children   []*BlockNode // Potential forks
+	SequenceID int32        // Sequence ID for precious block ordering (lower = more precious)
 }
 
 // invertLowestOne clears the lowest set bit of n. Helper for getSkipHeight.
@@ -239,20 +239,19 @@ func FindFork(a, b *BlockNode) *BlockNode {
 	return a
 }
 
-
 // HeaderIndex maintains the tree of block headers.
 type HeaderIndex struct {
-	mu              sync.RWMutex
-	nodes           map[wire.Hash256]*BlockNode // All known block nodes
-	bestTip         *BlockNode                  // Tip of the best (most work) chain
-	genesis         *BlockNode                  // The genesis block node
-	params          *ChainParams                // Chain parameters
-	checkpointData  *CheckpointData             // Checkpoint verification data
+	mu             sync.RWMutex
+	nodes          map[wire.Hash256]*BlockNode // All known block nodes
+	bestTip        *BlockNode                  // Tip of the best (most work) chain
+	genesis        *BlockNode                  // The genesis block node
+	params         *ChainParams                // Chain parameters
+	checkpointData *CheckpointData             // Checkpoint verification data
 
 	// Precious block tracking
-	preciousBlock       *BlockNode // The block designated as precious (ephemeral)
-	lastPreciousWork    *big.Int   // Chainwork when last precious call was made
-	blockSequenceID     int32      // Sequence counter for precious block tie-breaking
+	preciousBlock    *BlockNode // The block designated as precious (ephemeral)
+	lastPreciousWork *big.Int   // Chainwork when last precious call was made
+	blockSequenceID  int32      // Sequence counter for precious block tie-breaking
 
 	// Lock-free best height cache for RPC reads (updated atomically when best tip changes).
 	// This avoids RLock contention with header validation during rapid header sync in IBD.
@@ -417,39 +416,20 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader, minPowChecked bool) (
 		return nil, ErrInvalidPoW
 	}
 
-	// Check timestamp > median time past (validation.cpp:4092-4093, "time-too-old").
-	mtp := parent.GetMedianTimePast()
-	if int64(header.Timestamp) <= mtp {
-		return nil, ErrTimestampTooEarly
-	}
-
-	// BIP-94 timewarp check (validation.cpp:4097-4104, "time-timewarp-attack").
-	// Testnet4 and regtest (when EnforceBIP94 is set): at every difficulty
-	// adjustment boundary (height % 2016 == 0, skipping genesis at height 0),
-	// the new block's timestamp must not be more than MaxTimewarp seconds
-	// (600s) behind the immediately preceding block's timestamp.
-	//
-	// Core: if (nHeight % DifficultyAdjustmentInterval() == 0)
-	//           if (block.GetBlockTime() < pindexPrev->GetBlockTime() - MAX_TIMEWARP)
-	//               reject "time-timewarp-attack"
-	if idx.params.EnforceBIP94 && height%int32(idx.params.DifficultyAdjInterval) == 0 {
-		if int64(header.Timestamp) < int64(parent.Header.Timestamp)-MaxTimewarp {
-			return nil, ErrTimeWarpAttack
-		}
-	}
-
-	// Future-time check at header acceptance (Bitcoin Core's
-	// ContextualCheckBlockHeader: validation.cpp).  Reject headers whose
-	// timestamp is more than MaxTimeAdjustment (7200s) ahead of current
-	// wall-clock time.  Without this gate, an adversarial peer can grow the
-	// in-memory header index with far-future headers that only fail when the
-	// full block arrives — wasting memory and CPU on PoW checks.
-	if int64(header.Timestamp) > headerNowUnix()+MaxTimeAdjustment {
-		return nil, ErrTimestampTooFarFuture
-	}
-
-	// Validate difficulty at adjustment boundaries
-	if err := idx.validateDifficulty(header, parent, height); err != nil {
+	// Header-contextual gates (difficulty / time-too-old / BIP-94 timewarp /
+	// time-too-new), in Bitcoin Core's ContextualCheckBlockHeader order. The
+	// production path injects the LIVE values it has always used — the parent's
+	// median-time-past and the wall clock (headerNowUnix) — and DISABLES the
+	// header-level version gate (checkVersion=false) so block-version
+	// enforcement stays exactly where blockbrew has always enforced it, in
+	// CheckBlockContext at block-connect time. Behavior here is byte-identical
+	// to the inlined checks this replaces; ContextualCheckBlockHeader is the
+	// single source of truth the header differential drives with injected
+	// MTP / current-time / expected-bits.
+	if err := idx.ContextualCheckBlockHeader(
+		header, parent, height,
+		parent.GetMedianTimePast(), headerNowUnix(), nil, false,
+	); err != nil {
 		return nil, err
 	}
 
@@ -518,6 +498,97 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader, minPowChecked bool) (
 	return node, nil
 }
 
+// ContextualCheckBlockHeader runs the header-contextual consensus gates Bitcoin
+// Core applies in ContextualCheckBlockHeader (validation.cpp:4080-4124), in
+// Core's exact order, over an EXPLICIT (header, parent, height) tuple with the
+// time-sensitive inputs INJECTED rather than read from live state. It is the
+// single source of truth for these gates: the production header path (AddHeader)
+// calls it with the parent's median-time-past + the wall clock, and the
+// header-level differential calls it with corpus-supplied values, so a
+// divergence is one real consensus bug, not a parallel re-implementation.
+//
+// Inputs (Core ref in parentheses):
+//   - mtp          — median-time-past of the parent's 11 ancestors. In production
+//     this is parent.GetMedianTimePast(); the differential injects
+//     it directly (validation.cpp:4092 "time-too-old").
+//   - currentTime  — the wall-clock "adjusted time" the time-too-new gate compares
+//     against (validation.cpp:4108). Production passes
+//     headerNowUnix(); the differential injects it. A value of 0 is
+//     a sentinel that DISABLES the time-too-new gate (used by the
+//     differential's determinism control), matching the fact that
+//     Core's check is the only wall-clock-dependent gate.
+//   - expectedBitsOverride — when non-nil, the mandated nBits is taken from here
+//     instead of recomputed via GetNextWorkRequired. Used by the
+//     differential to ISOLATE a non-difficulty gate (e.g. the
+//     timewarp floor) at a retarget boundary where reconstructing
+//     the full 2016-block retarget context is not the gate under
+//     test. Production always passes nil (real recompute).
+//   - checkVersion — when true, also enforce the BIP34/66/65 mandatory-version
+//     gate (validation.cpp:4112, "bad-version"). Production passes
+//     FALSE so block-version enforcement stays in CheckBlockContext
+//     exactly where blockbrew has always applied it (default-
+//     preserving); the differential passes TRUE for full Core-parity
+//     header validation.
+//
+// PoW (the high-hash gate, validation.cpp CheckBlockHeader/CheckProofOfWork) is
+// NOT done here — AddHeader runs it before calling this, and the differential
+// runs CheckProofOfWork directly — matching Core's split between CheckBlockHeader
+// and ContextualCheckBlockHeader.
+func (idx *HeaderIndex) ContextualCheckBlockHeader(
+	header wire.BlockHeader, parent *BlockNode, height int32,
+	mtp int64, currentTime int64, expectedBitsOverride *uint32, checkVersion bool,
+) error {
+	// (1) bad-diffbits — FIRST contextual gate (validation.cpp:4088). The
+	// expected nBits comes from blockbrew's REAL GetNextWorkRequired over the
+	// parent context (regtest no-retarget -> parent.bits; mainnet off-boundary
+	// -> parent.bits; retarget boundary -> full recompute) unless an explicit
+	// override isolates a later gate.
+	var expectedBits uint32
+	if expectedBitsOverride != nil {
+		expectedBits = *expectedBitsOverride
+	} else {
+		expectedBits = GetNextWorkRequired(idx.params, height, int64(header.Timestamp), parent, idx)
+	}
+	if header.Bits != expectedBits {
+		return ErrBadDifficulty
+	}
+
+	// (2) time-too-old (validation.cpp:4092-4093): timestamp must be STRICTLY
+	// greater than the median-time-past (equal is rejected).
+	if int64(header.Timestamp) <= mtp {
+		return ErrTimestampTooEarly
+	}
+
+	// (3) BIP-94 timewarp (validation.cpp:4097-4104, "time-timewarp-attack"):
+	// when enforced (testnet4 / regtest with EnforceBIP94) at every difficulty
+	// adjustment boundary (height % 2016 == 0), the new block's timestamp must
+	// not be more than MaxTimewarp (600s) behind the immediately preceding
+	// block's timestamp.
+	if idx.params.EnforceBIP94 && height%int32(idx.params.DifficultyAdjInterval) == 0 {
+		if int64(header.Timestamp) < int64(parent.Header.Timestamp)-MaxTimewarp {
+			return ErrTimeWarpAttack
+		}
+	}
+
+	// (4) time-too-new (validation.cpp:4108): reject headers whose timestamp is
+	// more than MaxTimeAdjustment (7200s) ahead of the adjusted wall-clock time.
+	// currentTime==0 is the differential's sentinel disabling this single wall-
+	// clock-dependent gate (production never passes 0).
+	if currentTime != 0 && int64(header.Timestamp) > currentTime+MaxTimeAdjustment {
+		return ErrTimestampTooFarFuture
+	}
+
+	// (5) bad-version (validation.cpp:4112) — only when requested (see doc). The
+	// production header path leaves this to CheckBlockContext at block-connect.
+	if checkVersion {
+		if err := CheckBlockHeaderVersion(header.Version, height, idx.params); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 // validateDifficulty checks that the header has the correct difficulty target.
 //
 // Mirrors Bitcoin Core's ContextualCheckBlockHeader (validation.cpp): compute
@@ -533,7 +604,6 @@ func (idx *HeaderIndex) validateDifficulty(header wire.BlockHeader, parent *Bloc
 	}
 	return nil
 }
-
 
 // GetNode returns the BlockNode for a hash, or nil if unknown.
 func (idx *HeaderIndex) GetNode(hash wire.Hash256) *BlockNode {
