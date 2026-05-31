@@ -156,11 +156,37 @@ func CalcNextRequiredDifficulty(params *ChainParams, prevBits uint32, firstTimes
 	return BigToCompact(newTarget)
 }
 
-// CalcBlockSubsidy returns the subsidy for a block at the given height.
-// The subsidy halves every SubsidyHalvingInterval blocks (210,000 on mainnet).
-// After 64 halvings, the subsidy is zero.
+// CalcBlockSubsidy returns the subsidy for a block at the given height using
+// the MAINNET halving interval (210,000). The subsidy halves every
+// SubsidyHalvingInterval blocks; after 64 halvings, the subsidy is zero.
+//
+// This is the historical (network-agnostic) entrypoint, preserved byte-for-byte
+// for every existing caller. For per-network correctness (regtest halves every
+// 150 blocks, kernel/chainparams.cpp:535) use CalcBlockSubsidyForInterval,
+// which mirrors Bitcoin Core's GetBlockSubsidy(nHeight, consensusParams)
+// reading consensusParams.nSubsidyHalvingInterval (validation.cpp:1839-1841).
 func CalcBlockSubsidy(height int32) int64 {
-	halvings := height / SubsidyHalvingInterval
+	return CalcBlockSubsidyForInterval(height, SubsidyHalvingInterval)
+}
+
+// CalcBlockSubsidyForInterval returns the block subsidy at the given height for
+// an arbitrary halving interval, the network-aware form of CalcBlockSubsidy.
+// Faithful port of Bitcoin Core validation.cpp:1839-1851
+// GetBlockSubsidy(nHeight, consensusParams):
+//
+//	int halvings = nHeight / consensusParams.nSubsidyHalvingInterval;
+//	if (halvings >= 64) return 0;
+//	CAmount nSubsidy = 50 * COIN;
+//	nSubsidy >>= halvings;
+//
+// Default-preserving: passing SubsidyHalvingInterval (210,000) is identical to
+// the original CalcBlockSubsidy. A zero/negative interval is guarded to the
+// mainnet interval so a malformed params value cannot divide-by-zero.
+func CalcBlockSubsidyForInterval(height int32, halvingInterval int32) int64 {
+	if halvingInterval <= 0 {
+		halvingInterval = SubsidyHalvingInterval
+	}
+	halvings := height / halvingInterval
 	if halvings >= 64 {
 		return 0
 	}
