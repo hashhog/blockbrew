@@ -16,10 +16,10 @@ import (
 
 // Block validation errors.
 var (
-	ErrNoTransactions          = errors.New("block has no transactions")
-	ErrFirstTxNotCoinbase      = errors.New("first transaction is not coinbase")
-	ErrMultipleCoinbase        = errors.New("block has multiple coinbase transactions")
-	ErrBadMerkleRoot           = errors.New("merkle root mismatch")
+	ErrNoTransactions     = errors.New("block has no transactions")
+	ErrFirstTxNotCoinbase = errors.New("first transaction is not coinbase")
+	ErrMultipleCoinbase   = errors.New("block has multiple coinbase transactions")
+	ErrBadMerkleRoot      = errors.New("merkle root mismatch")
 	// ErrBlockMutated signals CVE-2012-2459: the merkle tree contains a
 	// duplicated adjacent pair, so a different transaction list could
 	// produce the same merkle root. Treat as TRANSIENT — the block must
@@ -27,14 +27,14 @@ var (
 	// the legitimate (un-mutated) form has the same block hash and is
 	// still potentially valid. Bitcoin Core uses BLOCK_MUTATED for this
 	// (validation.cpp:3850-3858, "bad-txns-duplicate").
-	ErrBlockMutated            = errors.New("block merkle tree mutated (CVE-2012-2459)")
-	ErrBlockWeightTooHigh      = errors.New("block weight exceeds maximum")
-	ErrTimestampTooFar         = errors.New("block timestamp too far in the future")
-	ErrBlockVersionTooLow      = errors.New("block version too low for height")
-	ErrTimestampBeforeMTP      = errors.New("block timestamp before median time past")
-	ErrBadBIP34Height          = errors.New("coinbase does not contain valid block height")
+	ErrBlockMutated             = errors.New("block merkle tree mutated (CVE-2012-2459)")
+	ErrBlockWeightTooHigh       = errors.New("block weight exceeds maximum")
+	ErrTimestampTooFar          = errors.New("block timestamp too far in the future")
+	ErrBlockVersionTooLow       = errors.New("block version too low for height")
+	ErrTimestampBeforeMTP       = errors.New("block timestamp before median time past")
+	ErrBadBIP34Height           = errors.New("coinbase does not contain valid block height")
 	ErrMissingWitnessCommitment = errors.New("segwit block missing witness commitment")
-	ErrBadWitnessCommitment    = errors.New("witness commitment mismatch")
+	ErrBadWitnessCommitment     = errors.New("witness commitment mismatch")
 	// ErrBadWitnessNonceSize signals that the coinbase scriptWitness does not
 	// contain exactly one 32-byte element. Bitcoin Core: "bad-witness-nonce-size"
 	// (validation.cpp:3880-3885, CheckWitnessMalleation).
@@ -160,21 +160,36 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int, skipPOW ...bool) 
 	return nil
 }
 
+// CheckBlockHeaderVersion enforces the BIP34/66/65 mandatory-version-bump
+// gates Bitcoin Core applies in ContextualCheckBlockHeader (validation.cpp:4112-
+// 4124): once each soft-fork's activation height is reached, headers carrying an
+// older version are rejected ("bad-version"). It is the single source of truth
+// shared by CheckBlockContext (the block-level pipeline) and the header-level
+// ContextualCheckBlockHeader differential, so a divergence is one real bug, not
+// two parallel re-implementations. Production behavior is byte-identical to the
+// inlined checks it replaces.
+func CheckBlockHeaderVersion(version int32, height int32, params *ChainParams) error {
+	if height >= params.BIP34Height && version < 2 {
+		return fmt.Errorf("%w: version %d, need >= 2 for BIP34",
+			ErrBlockVersionTooLow, version)
+	}
+	if height >= params.BIP66Height && version < 3 {
+		return fmt.Errorf("%w: version %d, need >= 3 for BIP66",
+			ErrBlockVersionTooLow, version)
+	}
+	if height >= params.BIP65Height && version < 4 {
+		return fmt.Errorf("%w: version %d, need >= 4 for BIP65",
+			ErrBlockVersionTooLow, version)
+	}
+	return nil
+}
+
 // CheckBlockContext performs context-dependent checks (requires chain state).
 // medianTimePast is the MTP of the previous 11 blocks (0 to skip MTP check).
 func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, height int32, params *ChainParams, medianTimePast ...uint32) error {
 	// 1-3. Block version checks based on BIP34/66/65 activation
-	if height >= params.BIP34Height && block.Header.Version < 2 {
-		return fmt.Errorf("%w: version %d, need >= 2 for BIP34",
-			ErrBlockVersionTooLow, block.Header.Version)
-	}
-	if height >= params.BIP66Height && block.Header.Version < 3 {
-		return fmt.Errorf("%w: version %d, need >= 3 for BIP66",
-			ErrBlockVersionTooLow, block.Header.Version)
-	}
-	if height >= params.BIP65Height && block.Header.Version < 4 {
-		return fmt.Errorf("%w: version %d, need >= 4 for BIP65",
-			ErrBlockVersionTooLow, block.Header.Version)
+	if err := CheckBlockHeaderVersion(block.Header.Version, height, params); err != nil {
+		return err
 	}
 
 	// 4. Block timestamp must be greater than median time past (MTP)
@@ -537,7 +552,6 @@ func CheckBlockTimestamp(blockTimestamp uint32, medianTimePast uint32) error {
 	return nil
 }
 
-
 // IsBlockMutated returns true if the block's merkle root or witness commitment
 // is inconsistent with its transactions, indicating a possible short-ID collision
 // or block malleation.
@@ -725,7 +739,6 @@ func ParallelScriptValidation(block *wire.MsgBlock, utxoView UTXOView, flags scr
 	}
 	return nil
 }
-
 
 // ParallelScriptValidationCached validates scripts with signature cache support.
 // Cached entries are looked up before expensive script verification, and successful
