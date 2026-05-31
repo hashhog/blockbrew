@@ -62,6 +62,29 @@
 //	response: {"valid":true}                   (structurally valid)
 //	          {"valid":false,"reason":"..."}   (CheckTransaction rejected)
 //	          {"error":"..."}                  (could not deserialize)
+//
+// Fourth op `connecttx` (connect-time economic check): mirrors
+// bitcoin-core/src/consensus/tx_verify.cpp:164-214
+// Consensus::CheckTxInputs — the no-inflation rule (value-in >= value-out,
+// bad-txns-in-belowout), per-input + running-sum MoneyRange
+// (bad-txns-inputvalues-outofrange), coinbase maturity of 100 confirmations
+// (bad-txns-premature-spend-of-coinbase), and missing/spent inputs
+// (bad-txns-inputs-missingorspent). We seed an in-memory UTXO view with one
+// coin per prevout (value / height / is_coinbase) and call blockbrew's REAL
+// consensus.CheckTransactionInputs(tx, spend_height, view); an OMITTED prevout
+// models a missing/spent input. SCRIPT verification is intentionally NOT run
+// (this op isolates the ECONOMIC verdict). The shim does NOT re-implement any
+// of these rules — it seeds the view and reports CheckTransactionInputs's
+// verdict, mapping the sentinel error to the Core bad-txns-* token.
+//
+//	request:  {"op":"connecttx","tx_hex":"...",
+//	           "prevouts":[{"txid":"<display-hex>","vout":N,
+//	                        "scriptPubKey_hex":"...","value_sats":0,
+//	                        "height":0,"is_coinbase":false},...],
+//	           "spend_height":0}
+//	response: {"valid":true,"fee_sats":0}      (inputs satisfy CheckTxInputs)
+//	          {"valid":false,"reason":"..."}   (bad-txns-* economic reject)
+//	          {"error":"..."}                  (could not deserialize)
 package main
 
 import (
@@ -69,6 +92,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -86,9 +110,13 @@ type request struct {
 	AmountSats      int64    `json:"amount_sats"`
 	Flags           []string `json:"flags"`
 
-	// verifytx op fields.
+	// verifytx / connecttx op fields.
 	TxHex    string        `json:"tx_hex"`
 	Prevouts []prevoutSpec `json:"prevouts"`
+
+	// connecttx op field: nSpendHeight, the height the tx is being
+	// connected at (drives coinbase-maturity confirmations).
+	SpendHeight int32 `json:"spend_height"`
 
 	// nextwork op fields.
 	Network   string       `json:"network"`
@@ -110,13 +138,20 @@ type nextworkHdr struct {
 	Time   uint32 `json:"time"`
 }
 
-// prevoutSpec is one entry of the verifytx "prevouts" array: a spent
-// output keyed by (txid display-hex, vout) with its scriptPubKey + amount.
+// prevoutSpec is one entry of the verifytx / connecttx "prevouts" array: a
+// spent output keyed by (txid display-hex, vout) with its scriptPubKey +
+// amount. verifytx reads AmountSats; connecttx reads ValueSats + Height +
+// IsCoinbase (the coin's nValue / nHeight / fCoinBase as in Core's Coin).
 type prevoutSpec struct {
 	Txid            string `json:"txid"`
 	Vout            uint32 `json:"vout"`
 	ScriptPubKeyHex string `json:"scriptPubKey_hex"`
 	AmountSats      int64  `json:"amount_sats"`
+
+	// connecttx coin fields.
+	ValueSats  int64 `json:"value_sats"`
+	Height     int32 `json:"height"`
+	IsCoinbase bool  `json:"is_coinbase"`
 }
 
 // buildFlags maps the 22 Core flag tokens (interpreter.cpp:2168
@@ -252,6 +287,8 @@ func process(line []byte) string {
 		return processVerifyTx(&req)
 	case "checktx":
 		return processCheckTx(&req)
+	case "connecttx":
+		return processConnectTx(&req)
 	case "nextwork":
 		return processNextWork(&req)
 	case "merkleroot":
@@ -290,6 +327,97 @@ func processCheckTx(req *request) string {
 		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(verr.Error()))
 	}
 	return `{"valid":true}`
+}
+
+// connectTxReason maps blockbrew's CheckTransactionInputs error to the Core
+// bad-txns-* token the corpus uses. The DECISION (valid) is what's scored;
+// the token is informational, normalized here to Core's
+// consensus/tx_verify.cpp wording. This is NOT a re-implementation of the
+// rule — the verdict already came from CheckTransactionInputs; we only
+// rename the sentinel error for readability of the divergence log.
+func connectTxReason(err error) string {
+	switch {
+	case errors.Is(err, consensus.ErrMissingInput):
+		// Core: "bad-txns-inputs-missingorspent" (CheckTxInputs HaveInputs).
+		return "bad-txns-inputs-missingorspent"
+	case errors.Is(err, consensus.ErrImmatureCoinbase):
+		// Core: "bad-txns-premature-spend-of-coinbase".
+		return "bad-txns-premature-spend-of-coinbase"
+	case errors.Is(err, consensus.ErrInputTooLarge),
+		errors.Is(err, consensus.ErrTotalInputTooLarge):
+		// Core: "bad-txns-inputvalues-outofrange" (per-input + running-sum
+		// MoneyRange).
+		return "bad-txns-inputvalues-outofrange"
+	case errors.Is(err, consensus.ErrInsufficientFunds):
+		// Core: "bad-txns-in-belowout" (no-inflation: value-in >= value-out).
+		return "bad-txns-in-belowout"
+	default:
+		// Includes the fee-out-of-range guard ("bad-txns-fee-outofrange"),
+		// which CheckTransactionInputs already names with the Core token, and
+		// any future sentinel. Pass the raw message through.
+		return err.Error()
+	}
+}
+
+// processConnectTx drives blockbrew's REAL connect-time economic check
+// consensus.CheckTransactionInputs (internal/consensus/txvalidation.go:132),
+// the exact mirror of Core's Consensus::CheckTxInputs (tx_verify.cpp:164-214):
+//   - no-inflation:        sum(value-in) >= sum(value-out)  (bad-txns-in-belowout)
+//   - per-input MoneyRange + running-sum MoneyRange         (bad-txns-inputvalues-outofrange)
+//   - coinbase maturity:   COINBASE_MATURITY (100) confs     (bad-txns-premature-spend-of-coinbase)
+//   - missing/spent input: prevout absent from the view      (bad-txns-inputs-missingorspent)
+//
+// We seed an in-memory UTXO VIEW (consensus.NewInMemoryUTXOView) with one coin
+// per prevout entry carrying its value / nHeight / fCoinBase, then call
+// CheckTransactionInputs(tx, spend_height, view). An OMITTED prevout naturally
+// models a missing/spent input because GetUTXO returns nil for it. SCRIPT
+// verification is intentionally NOT run here — this op isolates the ECONOMIC
+// verdict, so a (separately tested) script failure cannot mask the economic
+// decision. The shim does NOT re-implement value-in>=value-out / maturity /
+// missing; it only seeds the view and reports CheckTransactionInputs's verdict.
+//
+// A tx that fails to deserialize is reported as {"error"} so the driver SKIPS
+// it rather than fake-passing.
+func processConnectTx(req *request) string {
+	txBytes, err := hex.DecodeString(req.TxHex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("tx_hex: "+err.Error()))
+	}
+
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("tx deserialize: "+err.Error()))
+	}
+
+	// Seed the in-memory UTXO view: one coin per prevout entry. The request
+	// txid is DISPLAY-ORDER hex; wire.NewHash256FromHex reverses it to wire
+	// order so the outpoint key matches the deserialized tx's prevout hashes
+	// byte-for-byte (same reversal the verifytx op uses). An OMITTED prevout
+	// is simply never added, so GetUTXO returns nil -> ErrMissingInput.
+	view := consensus.NewInMemoryUTXOView()
+	for _, p := range req.Prevouts {
+		h, err := wire.NewHash256FromHex(p.Txid)
+		if err != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("prevout txid: "+err.Error()))
+		}
+		spk, err := hex.DecodeString(p.ScriptPubKeyHex)
+		if err != nil {
+			return fmt.Sprintf(`{"error":%s}`, jsonString("prevout scriptPubKey_hex: "+err.Error()))
+		}
+		view.AddUTXO(wire.OutPoint{Hash: h, Index: p.Vout}, &consensus.UTXOEntry{
+			Amount:     p.ValueSats,
+			PkScript:   spk,
+			Height:     p.Height,
+			IsCoinbase: p.IsCoinbase,
+		})
+	}
+
+	// Drive the REAL connect-time economic check. No script verification.
+	fee, verr := consensus.CheckTransactionInputs(&tx, req.SpendHeight, view)
+	if verr != nil {
+		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(connectTxReason(verr)))
+	}
+	return fmt.Sprintf(`{"valid":true,"fee_sats":%d}`, fee)
 }
 
 // stubBlockProvider is a minimal consensus.BlockProvider backed by a
