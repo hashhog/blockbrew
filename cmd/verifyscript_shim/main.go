@@ -412,6 +412,18 @@ func connectTxReason(err error) string {
 	}
 }
 
+// bip30Reason maps blockbrew's CheckBIP30 error (ErrDuplicateTx /
+// ErrDuplicateCoinbase, blockvalidation.go:49-50) to the Core token the corpus
+// scores on, "bad-txns-BIP30" (validation.cpp:2474). The DECISION (reject) is
+// what's scored; this only normalizes the sentinel for the divergence log and
+// is NOT a re-implementation of the rule — the verdict came from CheckBIP30.
+func bip30Reason(err error) string {
+	if errors.Is(err, consensus.ErrDuplicateTx) || errors.Is(err, consensus.ErrDuplicateCoinbase) {
+		return "bad-txns-BIP30"
+	}
+	return err.Error()
+}
+
 // processConnectTx drives blockbrew's REAL connect-time economic check
 // consensus.CheckTransactionInputs (internal/consensus/txvalidation.go:132),
 // the exact mirror of Core's Consensus::CheckTxInputs (tx_verify.cpp:164-214):
@@ -663,6 +675,36 @@ func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMe
 		}
 	} else if verr := consensus.CheckBlockContext(block, synthPrevHeader, height, params); verr != nil {
 		return connectGateResult{reason: verr.Error()}
+	}
+
+	// (3a) BIP-30 (CVE-2012-1909 duplicate-txid / coin-overwrite): reject if any
+	// output (txid,o) of any block tx ALREADY has an unspent coin in the view —
+	// the tx would overwrite it. Runs at the TOP of ConnectBlock, over the PARENT
+	// view (before this block's coinbase/tx outputs are added below), exactly as
+	// Core does (validation.cpp:2467-2475) and exactly where blockbrew's
+	// production ConnectBlock calls it (chainmanager.go:619). We delegate to
+	// blockbrew's OWN consensus.CheckBIP30 — the same fn the live node uses — so a
+	// divergence here is a real blockbrew consensus bug, NOT a shim re-expression.
+	//
+	// The BIP34 short-circuit (Core: skip the HaveCoin scan once BIP34 is active
+	// on this chain, i.e. height>params.BIP34Height and the block at BIP34Height
+	// matches params.BIP34Hash, unless height>=BIP34_IMPLIES_BIP30_LIMIT) is
+	// driven by the ancestorHashAt callback. The shim has no chain history, so we
+	// model a node that IS on the canonical mainnet chain: a query for the
+	// BIP34Height ancestor returns params.BIP34Hash (the only height CheckBIP30
+	// ever queries). This is the faithful answer GetAncestorHashAtHeight returns
+	// for any block descending from the real BIP34 block — so pre-BIP34 heights
+	// (91000: height<=BIP34Height, branch skipped) still ENFORCE the scan, while
+	// post-BIP34 heights (400000) SHORT-CIRCUIT, matching Core.
+	blockHashBIP30 := block.Header.BlockHash()
+	bip30Ancestor := func(h int32) (wire.Hash256, bool) {
+		if h == params.BIP34Height {
+			return params.BIP34Hash, true
+		}
+		return wire.Hash256{}, false
+	}
+	if verr := consensus.CheckBIP30(block, height, blockHashBIP30, params, view, bip30Ancestor); verr != nil {
+		return connectGateResult{reason: bip30Reason(verr)}
 	}
 
 	// (3) ConnectBlock economic + sigop + script + coinbase-value gates, in Core
