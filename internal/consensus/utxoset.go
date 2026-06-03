@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"sync"
 
@@ -493,6 +494,59 @@ func (u *UTXOSet) Size() int {
 	u.mu.RLock()
 	defer u.mu.RUnlock()
 	return len(u.cache)
+}
+
+// ScanUTXOs iterates the entire current UTXO set, invoking visit for every
+// unspent output. It returns the total number of UTXOs scanned.
+//
+// To present a complete and consistent view of the set, it first flushes the
+// in-memory cache (dirty creations + deletions) to the backing database, then
+// walks the database by UTXOPrefix. After the flush the database is the
+// authoritative copy of the whole set, so a pure prefix scan visits every
+// live coin exactly once with no need to overlay the cache. This mirrors the
+// approach Bitcoin Core's scantxoutset takes — ForceFlushStateToDisk followed
+// by a CoinsDB cursor walk (rpc/blockchain.cpp::scantxoutset).
+//
+// If visit returns false the scan stops early (count reflects only the coins
+// visited so far). A nil database (e.g. a memory-only set used in tests with
+// no db) makes this a no-op returning 0.
+func (u *UTXOSet) ScanUTXOs(visit func(outpoint wire.OutPoint, entry *UTXOEntry) bool) (uint64, error) {
+	if u.db == nil {
+		return 0, nil
+	}
+
+	// Flush so the database holds the complete, current set.
+	if err := u.Flush(); err != nil {
+		return 0, err
+	}
+
+	it := u.db.DB().NewIterator(storage.UTXOPrefix)
+	defer it.Release()
+
+	var count uint64
+	for it.Next() {
+		key := it.Key()
+		// Key layout: "U" + 32-byte txid + 4-byte big-endian vout index.
+		if len(key) != 1+32+4 {
+			continue
+		}
+		var outpoint wire.OutPoint
+		copy(outpoint.Hash[:], key[1:33])
+		outpoint.Index = binary.BigEndian.Uint32(key[33:37])
+
+		entry, err := DeserializeUTXOEntry(it.Value())
+		if err != nil {
+			return count, err
+		}
+		count++
+		if !visit(outpoint, entry) {
+			break
+		}
+	}
+	if err := it.Error(); err != nil {
+		return count, err
+	}
+	return count, nil
 }
 
 // maybeFlush flushes if cache exceeds the maximum size.
