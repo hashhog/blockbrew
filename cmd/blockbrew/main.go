@@ -1381,6 +1381,17 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		log.Printf("No wallet file found, starting with empty wallet")
 	}
 
+	// 10a. Initialize the multi-wallet manager.
+	//
+	// Without this the RPC server's s.walletMgr stays nil and every
+	// wallet-management RPC (createwallet / loadwallet / getnewaddress /
+	// ...) short-circuits with -32603 "Wallet manager not available"
+	// (createwallet) or falls through to the empty legacy wallet and
+	// fails with "wallet is locked" (getnewaddress). The manager stores
+	// wallets under <datadir>/wallets/<name>/ (Core's multi-wallet
+	// layout) and is the path getWalletForRPC prefers when non-nil.
+	walletMgr := wallet.NewManager(cfg.DataDir, networkToAddressNetwork(chainParams), chainParams)
+
 	// 11. Initialize RPC server
 	// Generate a cookie file so local tools can authenticate without an
 	// explicit password (mirrors Bitcoin Core's .cookie mechanism).
@@ -1426,6 +1437,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		rpc.WithSyncManager(syncMgr),
 		rpc.WithTemplateGenerator(templateGen),
 		rpc.WithWallet(w),
+		rpc.WithWalletManager(walletMgr),
 		rpc.WithPruner(pruner),
 		rpc.WithDataDir(cfg.DataDir),
 		// IndexManager carries optional secondary indexes (BIP-157
