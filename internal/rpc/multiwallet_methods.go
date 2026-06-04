@@ -309,8 +309,20 @@ func (s *Server) handleGetBalanceWithWallet(walletName string) (interface{}, *RP
 		return nil, rpcErr
 	}
 
-	confirmed, _ := w.GetBalance()
-	return float64(confirmed) / satoshiPerBitcoin, nil
+	// Bitcoin Core's `getbalance` returns m_mine_trusted (wallet/rpc/coins.cpp:
+	// `return ValueFromAmount(bal.m_mine_trusted)`), which is the confirmed
+	// balance EXCLUDING immature coinbase outputs. Use the maturity-aware
+	// spendable balance at the current tip rather than Wallet.GetBalance (which
+	// sums every confirmed UTXO including not-yet-mature coinbase). Without the
+	// tip height the wallet cannot tell mature from immature coinbase, so a
+	// freshly mined chain would report the full subsidy instead of only the
+	// spendable portion.
+	tipHeight := int32(0)
+	if s.chainMgr != nil {
+		_, tipHeight = s.chainMgr.BestBlock()
+	}
+	spendable, _ := w.GetSpendableBalance(tipHeight)
+	return float64(spendable) / satoshiPerBitcoin, nil
 }
 
 func (s *Server) handleListUnspentWithWallet(walletName string) (interface{}, *RPCError) {
