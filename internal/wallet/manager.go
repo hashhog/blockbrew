@@ -357,6 +357,18 @@ func (m *Manager) ScanBlock(block *wire.MsgBlock, height int32) {
 	}
 }
 
+// UnscanBlock reverses the credits of a block across all loaded wallets when
+// that block leaves the active chain (reorg disconnect). Symmetric counterpart
+// to ScanBlock; see Wallet.UnscanBlock for the best-effort semantics.
+func (m *Manager) UnscanBlock(block *wire.MsgBlock, height int32) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	for _, w := range m.wallets {
+		w.UnscanBlock(block, height)
+	}
+}
+
 // SaveAll saves all loaded wallets to disk.
 func (m *Manager) SaveAll() error {
 	m.mu.RLock()
