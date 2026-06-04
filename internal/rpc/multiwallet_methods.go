@@ -73,6 +73,16 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 			opts.SeedPassphrase = val
 		}
 	}
+	// args[9] is a BIP-39 mnemonic to RESTORE from. Non-Core extension
+	// (Core uses createwallet(blank=true)+sethdseed); blockbrew exposes
+	// seed-only recovery directly on createwallet so the same words always
+	// re-derive byte-identical keys+addresses. Mirrors ouroboros's
+	// createwallet `mnemonic` param. Empty/absent → fresh random wallet.
+	if len(args) >= 10 {
+		if val, ok := args[9].(string); ok {
+			opts.Mnemonic = val
+		}
+	}
 
 	w, err := s.walletMgr.CreateWallet(name, opts)
 	if err != nil {
