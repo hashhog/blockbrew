@@ -2031,6 +2031,33 @@ func (w *Wallet) ScanBlock(block *wire.MsgBlock, height int32) {
 	}
 }
 
+// UnscanBlock reverses the credits ScanBlock applied for the given block when
+// that block leaves the active chain (a reorg disconnect). It is the symmetric
+// counterpart to ScanBlock and mirrors Bitcoin Core's CWallet::blockDisconnected.
+//
+// Best-effort by design: it removes wallet UTXOs that were CREATED by this
+// block (so the ledger does not over-count coins that no longer exist on the
+// active chain), but it does NOT resurrect UTXOs this block SPENT — doing so
+// reliably needs the block's undo data, which the wallet does not retain. The
+// authoritative recovery for a wallet that drifts across a deep reorg is a
+// rescan / scantxoutset against the new active chain. The connect-side scan of
+// the replacement chain re-credits everything still owned, so the only residual
+// risk is a transient under-count of a spent-then-reorged-away coin, which the
+// next rescan corrects. Crucially we never OVER-count, which is the only error
+// that could let the wallet build a double-spend.
+func (w *Wallet) UnscanBlock(block *wire.MsgBlock, height int32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for _, tx := range block.Transactions {
+		txHash := tx.TxHash()
+		for idx := range tx.TxOut {
+			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
+			delete(w.utxos, outpoint)
+		}
+	}
+}
+
 // scriptToAddress converts a scriptPubKey to an address string.
 func (w *Wallet) scriptToAddress(pkScript []byte) string {
 	// P2WPKH: OP_0 <20-byte-hash>

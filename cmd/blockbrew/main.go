@@ -853,6 +853,25 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	})
 	log.Printf("Chain manager initialized (parallel scripts: %v)", cfg.ParallelScripts)
 
+	// Forward-declared so the chain → wallet connect/disconnect hooks
+	// (installed below, before section 10a) can close over the multi-wallet
+	// manager by reference. It is constructed later at section 10a; until then
+	// the closures see nil and skip the wallet scan (no block connects before
+	// the RPC server + manager are up). The legacy single-wallet `w` is also
+	// declared up here for the same reason.
+	//
+	// feeEstimator and zmqPub are likewise forward-declared so the SINGLE
+	// block-connect fan-out (the chainMgr.SetOnBlockConnected hook below) can
+	// drive the full set of per-connect notifications — wallet scan, fee
+	// estimator, mempool removal, ZMQ, prune — for EVERY connect path (locally
+	// mined AND P2P), exactly once per block. They are assigned at their
+	// original init sites further down; the hook closure reads them by
+	// reference (nil-safe before assignment, but no block connects that early).
+	var walletMgr *wallet.Manager
+	var w *wallet.Wallet
+	var feeEstimator *mempool.FeeEstimator
+	var zmqPub *zmqPublisher
+
 	// 6. Initialize mempool
 	minRelayFeeRate := int64(cfg.MinRelayFee * 100_000_000 / 1000) // BTC/kvB to sat/kvB
 	mp := mempool.New(mempool.Config{
@@ -922,6 +941,17 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// BaseIndex::BlockDisconnected → CustomRemove fan-out — Core also
 	// composes the deletion + state-row write into a single CDBBatch.
 	chainMgr.SetOnBlockDisconnected(func(block *wire.MsgBlock, height int32) {
+		// Wallet UTXO ledger: reverse this block's credits so a reorg cannot
+		// leave the ledger over-counting coins that no longer exist on the
+		// active chain. Symmetric to the ScanBlock credit on the connect hook
+		// above. Best-effort (see Wallet.UnscanBlock) — the connect-side scan
+		// of the replacement chain re-credits everything still owned.
+		if walletMgr != nil {
+			walletMgr.UnscanBlock(block, height)
+		}
+		if w != nil {
+			w.UnscanBlock(block, height)
+		}
 		mp.BlockDisconnected(block)
 		if cfg.TxIndex && chainDB != nil {
 			for _, tx := range block.Transactions {
@@ -995,38 +1025,102 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// rides cm.reorgBatch so the post-fork-replay filters land
 	// atomically with the consensus rewrite; outside reorg it commits a
 	// private batch.
-	if cfg.TxIndex || blockFilterIndex != nil {
-		chainMgr.SetOnBlockConnected(func(block *wire.MsgBlock, height int32) {
-			blockHash := block.Header.BlockHash()
-			if cfg.TxIndex && chainDB != nil {
-				for _, tx := range block.Transactions {
-					txid := tx.TxHash()
-					if err := chainDB.WriteTxIndex(txid, blockHash); err != nil {
-						log.Printf("txindex: write %s @ height=%d failed: %v",
-							txid.String()[:16], height, err)
-					}
+	// This connect hook is ALWAYS registered (not gated on -txindex /
+	// -blockfilterindex) because it now ALSO drives the wallet UTXO ledger.
+	// ChainManager.ConnectBlock fires it for EVERY block connected to the
+	// active tip — locally mined (generatetoaddress → miner.GenerateBlocks →
+	// chainMgr.ConnectBlock) AND P2P-received (SyncManager → chainMgr.
+	// ConnectBlock), and once per replayed block inside ReorgTo. This is the
+	// single choke point Bitcoin Core models as the BlockConnected
+	// notification fan-out (validationinterface.cpp): wallet scan + txindex +
+	// blockfilterindex all hang off it.
+	//
+	// Wallet wiring (this commit): the wallet had a complete UTXO ledger
+	// (Wallet.ScanBlock credits wallet-script outputs + debits spent inputs,
+	// maturity-aware GetBalance/ListUnspent/CreateTransactionWithTip, signer,
+	// AcceptToMemoryPool), but ScanBlock was only ever called from the
+	// SyncManager's own post-connect callback — NEVER from the mining /
+	// ConnectBlock path. So generatetoaddress credited nothing, getbalance /
+	// listunspent stayed 0 / [], and sendtoaddress failed "insufficient
+	// funds". Scanning here closes that gap for every connect path. Scanning
+	// the multi-wallet manager covers createwallet-loaded wallets (the path
+	// getWalletForRPC / getbalance / listunspent / sendtoaddress resolve);
+	// scanning the legacy single wallet covers the -wallet=<file> path.
+	// Mirrors Core's CWallet::blockConnected.
+	chainMgr.SetOnBlockConnected(func(block *wire.MsgBlock, height int32) {
+		blockHash := block.Header.BlockHash()
+
+		// Wallet UTXO ledger — scan BEFORE the index writes so a failing
+		// index write cannot skip the wallet credit (the wallet scan is a
+		// pure in-memory map mutation and cannot fail). Idempotent: re-adding
+		// the same outpoint overwrites with identical data and deleting an
+		// already-spent input is a no-op, so a double-scan (defensive) is
+		// harmless.
+		if walletMgr != nil {
+			walletMgr.ScanBlock(block, height)
+		}
+		if w != nil {
+			w.ScanBlock(block, height)
+		}
+
+		// Per-connect notification fan-out, moved here from the SyncManager's
+		// own onBlockConnected callback so it fires on EVERY connect path —
+		// crucially the locally mined (generatetoaddress) path, which never
+		// reaches the SyncManager. This is what clears confirmed txs from the
+		// mempool after a locally mined block (the pre-fix bug: a wallet-native
+		// sendtoaddress tx stayed in getrawmempool forever once mined locally,
+		// because mp.BlockConnected was only on the P2P path). Placed BEFORE the
+		// index writes because the blockfilterindex arm can early-return.
+		//
+		// FIX-47 BUG-10 ordering preserved: FeeEstimator.ProcessBlock records
+		// confirmed txids BEFORE mp.BlockConnected removes them, so the
+		// OnTxEvicted → UnregisterTransaction callback is a safe no-op for
+		// confirmed txs.
+		if feeEstimator != nil {
+			confirmedTxids := make([]wire.Hash256, 0, len(block.Transactions))
+			for _, tx := range block.Transactions {
+				confirmedTxids = append(confirmedTxids, tx.TxHash())
+			}
+			feeEstimator.ProcessBlock(height, confirmedTxids)
+		}
+		mp.BlockConnected(block)
+		if zmqPub != nil {
+			zmqPub.PublishBlockConnected(block, height)
+		}
+		if pruner.IsEnabled() {
+			if _, err := pruner.MaybePrune(height); err != nil {
+				log.Printf("prune: %v", err)
+			}
+		}
+
+		if cfg.TxIndex && chainDB != nil {
+			for _, tx := range block.Transactions {
+				txid := tx.TxHash()
+				if err := chainDB.WriteTxIndex(txid, blockHash); err != nil {
+					log.Printf("txindex: write %s @ height=%d failed: %v",
+						txid.String()[:16], height, err)
 				}
 			}
-			if blockFilterIndex != nil {
-				if reorgBatch := chainMgr.CurrentReorgBatch(); reorgBatch != nil {
-					if err := blockFilterIndex.WriteBlockBatch(reorgBatch, block, height, blockHash, nil); err != nil {
-						log.Printf("blockfilterindex: write (batched) %s @ height=%d failed: %v",
-							blockHash.String()[:16], height, err)
-						return
-					}
-					blockFilterIndex.CommitWriteState(height, blockHash)
-				} else {
-					if err := blockFilterIndex.WriteBlock(block, height, blockHash, nil); err != nil {
-						log.Printf("blockfilterindex: write %s @ height=%d failed: %v",
-							blockHash.String()[:16], height, err)
-					}
+		}
+		if blockFilterIndex != nil {
+			if reorgBatch := chainMgr.CurrentReorgBatch(); reorgBatch != nil {
+				if err := blockFilterIndex.WriteBlockBatch(reorgBatch, block, height, blockHash, nil); err != nil {
+					log.Printf("blockfilterindex: write (batched) %s @ height=%d failed: %v",
+						blockHash.String()[:16], height, err)
+					return
+				}
+				blockFilterIndex.CommitWriteState(height, blockHash)
+			} else {
+				if err := blockFilterIndex.WriteBlock(block, height, blockHash, nil); err != nil {
+					log.Printf("blockfilterindex: write %s @ height=%d failed: %v",
+						blockHash.String()[:16], height, err)
 				}
 			}
-		})
-	}
+		}
+	})
 
 	// 6b. Initialize fee estimator
-	feeEstimator := mempool.NewFeeEstimator()
+	feeEstimator = mempool.NewFeeEstimator()
 	if err := feeEstimator.Load(cfg.DataDir); err != nil {
 		log.Printf("Warning: could not load fee estimates: %v", err)
 	} else if feeEstimator.BestHeight() > 0 {
@@ -1060,7 +1154,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// Core's `-zmqpub<topic>` flags.  Failures here are downgraded to
 	// warnings: a misconfigured ZMQ socket must not stop the node from
 	// validating consensus.
-	zmqPub := newZMQPublisher(zmqPublisherConfig{
+	zmqPub = newZMQPublisher(zmqPublisherConfig{
 		HashBlock: cfg.ZMQPubHashBlock,
 		HashTx:    cfg.ZMQPubHashTx,
 		RawBlock:  cfg.ZMQPubRawBlock,
@@ -1097,40 +1191,28 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	})
 
 	// 8. Initialize wallet early so sync callbacks can reference it
-	var w *wallet.Wallet
+	// (`w` is forward-declared near the chain manager init above so the
+	// chain → wallet block-connect hook can close over it).
 
 	// 9. Initialize sync manager (we use a pointer indirection to handle the circular reference)
 	var syncMgr *p2p.SyncManager
 
-	// Create the sync manager with callbacks that reference it via the variable
+	// Create the sync manager with callbacks that reference it via the variable.
+	//
+	// The per-connect notification fan-out (wallet scan + FeeEstimator.Process
+	// + mp.BlockConnected + ZMQ + prune) USED to live here, but that meant it
+	// only fired for P2P-downloaded blocks — locally mined blocks
+	// (generatetoaddress → miner.GenerateBlocks → chainMgr.ConnectBlock) never
+	// reach this SyncManager callback. The entire fan-out has been moved into
+	// the single chainMgr.SetOnBlockConnected hook above, which fires for
+	// EVERY connect path exactly once per block (Core's BlockConnected
+	// notification model). The SyncManager invokes chainMgr.ConnectBlock for
+	// each downloaded block, so that hook covers the P2P path too — leaving
+	// this callback empty avoids double-firing (e.g. a double mp.chainHeight++
+	// or double-credited wallet txHistory).
 	onBlockConnected := func(block *wire.MsgBlock, height int32) {
-		if w != nil {
-			w.ScanBlock(block, height)
-		}
-		// FIX-47 BUG-10: wire FeeEstimator.ProcessBlock so confirmed txids
-		// are recorded before BlockConnected removes them from the pool.
-		// Calling ProcessBlock first means confirmed txids are gone from
-		// bucketMap before removeSingleTxLocked fires OnTxEvicted, so the
-		// UnregisterTransaction callback is a safe no-op for confirmed txs.
-		confirmedTxids := make([]wire.Hash256, 0, len(block.Transactions))
-		for _, tx := range block.Transactions {
-			confirmedTxids = append(confirmedTxids, tx.TxHash())
-		}
-		feeEstimator.ProcessBlock(height, confirmedTxids)
-		mp.BlockConnected(block)
-		// ZMQ fan-out: hashblock / rawblock / sequence(C). Cheap no-op
-		// when no -zmqpub* endpoint is configured.
-		zmqPub.PublishBlockConnected(block, height)
-		// Auto-prune: cheap no-op when -prune=0 (the default). When
-		// enabled, this fires per-block but only does work once usage
-		// crosses the configured target. Errors are logged and not
-		// propagated — a transient failure (e.g. EBUSY on rev?????.dat)
-		// must not stall block connection.
-		if pruner.IsEnabled() {
-			if _, err := pruner.MaybePrune(height); err != nil {
-				log.Printf("prune: %v", err)
-			}
-		}
+		_ = block
+		_ = height
 	}
 	syncMgr = p2p.NewSyncManager(p2p.SyncManagerConfig{
 		ChainParams:  chainParams,
@@ -1390,7 +1472,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// fails with "wallet is locked" (getnewaddress). The manager stores
 	// wallets under <datadir>/wallets/<name>/ (Core's multi-wallet
 	// layout) and is the path getWalletForRPC prefers when non-nil.
-	walletMgr := wallet.NewManager(cfg.DataDir, networkToAddressNetwork(chainParams), chainParams)
+	walletMgr = wallet.NewManager(cfg.DataDir, networkToAddressNetwork(chainParams), chainParams)
 
 	// 11. Initialize RPC server
 	// Generate a cookie file so local tools can authenticate without an
