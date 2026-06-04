@@ -164,6 +164,142 @@ func TestSyncManagerHandleHeaders(t *testing.T) {
 	}
 }
 
+// drainGetHeaders non-blockingly collects all MsgGetHeaders queued on a mock
+// peer's sendQueue. Used by the periodic-discovery regression tests.
+func drainGetHeaders(peer *Peer) []*MsgGetHeaders {
+	var out []*MsgGetHeaders
+	for {
+		select {
+		case msg := <-peer.sendQueue:
+			if gh, ok := msg.(*MsgGetHeaders); ok {
+				out = append(out, gh)
+			}
+		default:
+			return out
+		}
+	}
+}
+
+// TestSyncManagerPeriodicGetHeadersFanout is the regression test for the
+// mainnet block-download / header-advance stall.
+//
+// Symptom: a running, already-synced blockbrew node fell behind the network
+// tip (e.g. after an OOM-restart that left it ~40 blocks back) and never bulk-
+// recovered the gap. It logged "no blocks to download, already at height N"
+// in a tight loop and only inched its header tip forward one block per freshly
+// mined block via the inv path.
+//
+// Root cause: in the synced steady state, the only proactive header-discovery
+// mechanism (sendPeriodicGetHeaders) sent getheaders to ONE uniformly-random
+// peer using a degenerate single-hash locator. A random peer that was at or
+// behind our tip (block-relay-only / feeler / laggard) answered empty, so we
+// made no progress; ahead peers were never reliably solicited.
+//
+// Fix: the periodic getheaders is broadcast to EVERY connected peer using a
+// full exponential block locator built from the best header tip. This test
+// asserts both invariants: (1) every connected peer is solicited, and (2) the
+// locator is a full multi-hash locator, not a single hash.
+func TestSyncManagerPeriodicGetHeadersFanout(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	// Build a real header chain to height 50 so BuildLocator produces a
+	// multi-hash exponential locator (genesis + ~11+ back-pointers).
+	prevNode := idx.Genesis()
+	for i := 1; i <= 50; i++ {
+		header := createTestBlockHeader(prevNode.Hash, prevNode.Header.Timestamp+600, uint32(i))
+		node, err := idx.AddHeader(header, true)
+		if err != nil {
+			t.Fatalf("failed to add header %d: %v", i, err)
+		}
+		prevNode = node
+	}
+
+	pm := &PeerManager{peers: make(map[string]*PeerInfo)}
+	// Two peers: one "ahead" (height 80), one "behind" (height 40). The
+	// pre-fix code would have hit at most one of them per tick.
+	peerAhead := createMockPeer("1.1.1.1:8333", 80)
+	peerBehind := createMockPeer("2.2.2.2:8333", 40)
+	pm.peers[peerAhead.Address()] = &PeerInfo{peer: peerAhead, connType: ConnFullRelay}
+	pm.peers[peerBehind.Address()] = &PeerInfo{peer: peerBehind, connType: ConnFullRelay}
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+		PeerManager: pm,
+		ChainManager: &mockChainConnector{
+			tipHash:   prevNode.Hash,
+			tipHeight: 50,
+		},
+	})
+	// Simulate the synced steady state.
+	sm.mu.Lock()
+	sm.headersSynced = true
+	sm.mu.Unlock()
+
+	sm.sendPeriodicGetHeaders()
+
+	for _, p := range []*Peer{peerAhead, peerBehind} {
+		msgs := drainGetHeaders(p)
+		if len(msgs) == 0 {
+			t.Fatalf("peer %s received no getheaders; periodic discovery must "+
+				"solicit every connected peer (pre-fix only hit one random peer)", p.Address())
+		}
+		gh := msgs[0]
+		if len(gh.BlockLocators) < 2 {
+			t.Errorf("peer %s got a degenerate %d-hash locator; expected a full "+
+				"exponential block locator (single-hash locators fail fork-point "+
+				"discovery against peers not on our exact tip)",
+				p.Address(), len(gh.BlockLocators))
+		}
+		// The locator must start at our best header tip.
+		if gh.BlockLocators[0] != prevNode.Hash {
+			t.Errorf("peer %s locator[0]=%s, want best header tip %s",
+				p.Address(), gh.BlockLocators[0], prevNode.Hash)
+		}
+	}
+}
+
+// TestSyncManagerGetHeadersToUsesFullLocator verifies sendGetHeadersTo (used by
+// HandleInv and checkStaleTip) builds a full exponential locator from the
+// header-index tip rather than a single chain-tip hash. A single-hash locator
+// only matches if the peer's active chain contains exactly that block; a full
+// locator lets the peer walk back to the real fork point.
+func TestSyncManagerGetHeadersToUsesFullLocator(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	prevNode := idx.Genesis()
+	for i := 1; i <= 50; i++ {
+		header := createTestBlockHeader(prevNode.Hash, prevNode.Header.Timestamp+600, uint32(i))
+		node, err := idx.AddHeader(header, true)
+		if err != nil {
+			t.Fatalf("failed to add header %d: %v", i, err)
+		}
+		prevNode = node
+	}
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:  params,
+		HeaderIndex:  idx,
+		ChainManager: &mockChainConnector{tipHash: prevNode.Hash, tipHeight: 50},
+	})
+
+	peer := createMockPeer("3.3.3.3:8333", 80)
+	sm.sendGetHeadersTo(peer)
+
+	msgs := drainGetHeaders(peer)
+	if len(msgs) != 1 {
+		t.Fatalf("expected exactly one getheaders, got %d", len(msgs))
+	}
+	if len(msgs[0].BlockLocators) < 2 {
+		t.Errorf("sendGetHeadersTo built a degenerate %d-hash locator; want a "+
+			"full exponential block locator", len(msgs[0].BlockLocators))
+	}
+	if msgs[0].BlockLocators[0] != prevNode.Hash {
+		t.Errorf("locator[0]=%s, want header tip %s", msgs[0].BlockLocators[0], prevNode.Hash)
+	}
+}
+
 func TestSyncManagerContinuesOnFullBatch(t *testing.T) {
 	params := consensus.RegtestParams()
 	idx := consensus.NewHeaderIndex(params)
