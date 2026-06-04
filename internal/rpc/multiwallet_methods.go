@@ -6,8 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/wallet"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
+
+// walletCoinbaseMaturity is the confirmation threshold below which a coinbase
+// credit renders as "immature" rather than "generate" in listtransactions /
+// gettransaction, matching the wallet's spendability rule
+// (GetSpendableBalance) and Core's IsTxImmatureCoinBase.
+const walletCoinbaseMaturity = consensus.CoinbaseMaturity
 
 // ============================================================================
 // Wallet Management RPCs
@@ -545,44 +553,195 @@ func (s *Server) handleListTransactionsWithWallet(params json.RawMessage, wallet
 		_, tipHeight = s.chainMgr.BestBlock()
 	}
 
+	skip := 0
+	if params != nil {
+		var args []interface{}
+		if err := json.Unmarshal(params, &args); err == nil {
+			if len(args) >= 3 {
+				if sk, ok := args[2].(float64); ok && sk > 0 {
+					skip = int(sk)
+				}
+			}
+		}
+	}
+
 	history := w.GetHistory()
 
-	start := len(history) - count
+	// Flatten history (oldest→newest) into per-detail entries, then apply
+	// skip/count over the most-recent window, matching Core's
+	// listtransactions ordering (oldest first, then the last `count` after
+	// skipping `skip` from the tail). Reference:
+	// bitcoin-core/src/wallet/rpc/transactions.cpp::listtransactions.
+	all := make([]ListTransactionsResult, 0, len(history))
+	for _, tx := range history {
+		all = append(all, s.walletTxToListEntries(tx, tipHeight)...)
+	}
+
+	// Select the window: Core returns entries [nFrom, nFrom+nCount) counting
+	// from the END (most recent). We keep oldest→newest order within the page.
+	n := len(all)
+	end := n - skip
+	if end < 0 {
+		end = 0
+	}
+	start := end - count
 	if start < 0 {
 		start = 0
 	}
+	page := all[start:end]
 
-	result := make([]ListTransactionsResult, 0, count)
-	for i := len(history) - 1; i >= start; i-- {
-		tx := history[i]
+	result := make([]ListTransactionsResult, len(page))
+	copy(result, page)
+	return result, nil
+}
 
-		category := "receive"
-		if tx.Amount < 0 {
-			category = "send"
+// walletTxToListEntries renders a wallet transaction into zero or more
+// listtransactions entries — one per credit/debit detail — applying Core's
+// sign conventions and the coinbase generate/immature/orphan split using the
+// live tip height. Reference: bitcoin-core/src/wallet/rpc/transactions.cpp::
+// ListTransactions + WalletTxToJSON.
+func (s *Server) walletTxToListEntries(tx *wallet.WalletTx, tipHeight int32) []ListTransactionsResult {
+	confs := int32(0)
+	if tx.Height > 0 {
+		confs = tipHeight - tx.Height + 1
+	}
+	txid := tx.TxHash.String()
+	blockHash := ""
+	if !tx.BlockHash.IsZero() {
+		blockHash = tx.BlockHash.String()
+	}
+	bip125 := s.bip125ReplaceableForWalletTx(tx.TxHash, confs)
+
+	out := make([]ListTransactionsResult, 0, len(tx.Details))
+	for _, d := range tx.Details {
+		entry := ListTransactionsResult{
+			Address:           d.Address,
+			Vout:              d.Vout,
+			Confirmations:     confs,
+			TxID:              txid,
+			Time:              tx.Timestamp,
+			BlockHeight:       tx.Height,
+			BlockHash:         blockHash,
+			BlockTime:         tx.Timestamp,
+			BIP125Replaceable: bip125,
 		}
-
-		confs := int32(0)
-		if tx.Height > 0 {
-			confs = tipHeight - tx.Height + 1
+		switch d.Category {
+		case "send":
+			entry.Category = "send"
+			entry.Amount = -float64(d.Amount) / satoshiPerBitcoin // negative
+			entry.Fee = -float64(tx.Fee) / satoshiPerBitcoin       // negative
+		default: // receive / generate / immature
+			entry.Category = coinbaseCategory(d, confs)
+			entry.Amount = float64(d.Amount) / satoshiPerBitcoin // positive
+			if d.IsCoinbase {
+				entry.Generated = true
+			}
 		}
+		out = append(out, entry)
+	}
+	return out
+}
 
-		result = append(result, ListTransactionsResult{
-			Address:       tx.Address,
-			Category:      category,
-			Amount:        float64(tx.Amount) / satoshiPerBitcoin,
-			Fee:           float64(tx.Fee) / satoshiPerBitcoin,
-			Confirmations: confs,
-			TxID:          tx.TxHash.String(),
-			Time:          tx.Timestamp,
-			BlockHeight:   tx.Height,
-			// BIP-125 replaceable bit; "unknown" for confirmed or
-			// not-in-mempool. See bip125ReplaceableForWalletTx in
-			// wallet_methods.go. W120 BUG-7 / FIX-68.
-			BIP125Replaceable: s.bip125ReplaceableForWalletTx(tx.TxHash, confs),
+// coinbaseCategory resolves the receive/generate/immature/orphan category for a
+// detail given its confirmation count, mirroring Core's ListTransactions:
+// non-coinbase → "receive"; coinbase with <1 conf → "orphan"; coinbase still
+// immature (< CoinbaseMaturity confs) → "immature"; otherwise → "generate".
+func coinbaseCategory(d wallet.WalletTxDetail, confs int32) string {
+	if !d.IsCoinbase {
+		return "receive"
+	}
+	if confs < 1 {
+		return "orphan"
+	}
+	if confs < walletCoinbaseMaturity {
+		return "immature"
+	}
+	return "generate"
+}
+
+// handleGetTransactionWithWallet implements `gettransaction <txid>`, returning
+// the wallet's view of one transaction it sent or received. Shape mirrors
+// Bitcoin Core's src/wallet/rpc/transactions.cpp::gettransaction: top-level
+// amount = nNet - nFee (negative for a spend), fee present (negative) only for
+// from-me txs, plus a per-output details[] array and the raw hex.
+func (s *Server) handleGetTransactionWithWallet(params json.RawMessage, walletName string) (interface{}, *RPCError) {
+	w, rpcErr := s.getWalletForRPC(walletName)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "txid required"}
+	}
+	txidStr, ok := args[0].(string)
+	if !ok || len(txidStr) != 64 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid"}
+	}
+	txid, err := wire.NewHash256FromHex(txidStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid"}
+	}
+
+	tx := w.GetTransaction(txid)
+	if tx == nil {
+		// Match Core's error for an unknown wallet tx.
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid or non-wallet transaction id"}
+	}
+
+	_, tipHeight := int32(0), int32(0)
+	if s.chainMgr != nil {
+		_, tipHeight = s.chainMgr.BestBlock()
+	}
+	confs := int32(0)
+	if tx.Height > 0 {
+		confs = tipHeight - tx.Height + 1
+	}
+
+	// Top-level amount mirrors Core gettransaction: amount = nNet - nFee,
+	// where Core's gettransaction nFee = GetValueOut() - nDebit (i.e. the
+	// NEGATIVE of the real fee). Our tx.Fee is the positive real fee
+	// (Debit - ValueOut), so amount = tx.Net - (-tx.Fee) = tx.Net + tx.Fee.
+	// For a 10 BTC send with change this yields exactly -10.0 (the value that
+	// left the wallet, NOT including the fee, which is reported separately).
+	// For a receive tx.Fee == 0 so amount == net (positive credit).
+	netSats := tx.Net + tx.Fee
+	res := &GetTransactionResult{
+		Amount:        float64(netSats) / satoshiPerBitcoin,
+		Confirmations: confs,
+		TxID:          tx.TxHash.String(),
+		Time:          tx.Timestamp,
+		TimeReceived:  tx.Timestamp,
+		BlockHeight:   tx.Height,
+		Hex:           tx.RawHex,
+	}
+	if tx.IsFromMe {
+		res.Fee = -float64(tx.Fee) / satoshiPerBitcoin // negative, Core convention
+	}
+	if tx.IsCoinbase {
+		res.Generated = true
+	}
+	if !tx.BlockHash.IsZero() {
+		res.BlockHash = tx.BlockHash.String()
+		res.BlockTime = tx.Timestamp
+	}
+
+	// details[] is the same per-output breakdown listtransactions emits,
+	// rendered with gettransaction's narrower field set (Core calls
+	// ListTransactions with fLong=false).
+	entries := s.walletTxToListEntries(tx, tipHeight)
+	res.Details = make([]GetTransactionDetail, 0, len(entries))
+	for _, e := range entries {
+		res.Details = append(res.Details, GetTransactionDetail{
+			Address:  e.Address,
+			Category: e.Category,
+			Amount:   e.Amount,
+			Vout:     e.Vout,
+			Fee:      e.Fee,
 		})
 	}
 
-	return result, nil
+	return res, nil
 }
 
 func (s *Server) handleGetWalletInfoWithWallet(walletName string) (interface{}, *RPCError) {

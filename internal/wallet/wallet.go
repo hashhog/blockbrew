@@ -2,9 +2,12 @@
 package wallet
 
 import (
+	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -96,14 +99,61 @@ type WalletUTXO struct {
 	Confirmed  bool
 }
 
-// WalletTx is a transaction relevant to the wallet.
+// WalletTx is a transaction relevant to the wallet (one entry per
+// wallet-relevant on-chain transaction). It is the blockbrew analogue of
+// Bitcoin Core's CWalletTx and backs both `listtransactions` and
+// `gettransaction`. The amount/fee sign conventions mirror Core's
+// CachedTxGetAmounts (src/wallet/receive.cpp):
+//
+//   - IsFromMe (we own at least one input): Debit is the sum of our owned
+//     input values, Net = Credit - Debit (negative for a real spend), and
+//     Fee = Debit - ValueOut (positive). Core's gettransaction "amount" is
+//     Net - Fee; listtransactions emits one "send" detail per non-change
+//     output with amount = -outputvalue plus the negative fee.
+//   - Receive-only (coinbase or an external party paid us): Debit == 0,
+//     Net == Credit (positive), Fee == 0, and each owned output is a
+//     "receive"/"generate"/"immature" detail.
 type WalletTx struct {
 	TxHash    wire.Hash256
-	Height    int32
-	Amount    int64 // Positive for received, negative for sent
-	Fee       int64
-	Timestamp int64
-	Address   string
+	Height    int32 // 0 == unconfirmed (not used on the connect path)
+	BlockHash wire.Hash256
+	// Net is Credit - Debit in satoshis (Core nNet). Negative for a spend.
+	Net int64
+	// Debit is the summed value of inputs the wallet owns (0 if not from us).
+	Debit int64
+	// Credit is the summed value of outputs the wallet owns, INCLUDING change.
+	Credit int64
+	// Fee is Debit - ValueOut (positive), only meaningful when IsFromMe.
+	Fee        int64
+	Timestamp  int64
+	IsCoinbase bool
+	IsFromMe   bool
+	// Details is the per-output breakdown (Core's COutputEntry list) used to
+	// render listtransactions entries and gettransaction.details[].
+	Details []WalletTxDetail
+	// RawHex is the BIP-144 wire serialization of the transaction (hex).
+	RawHex string
+	// Address is retained for backward compatibility with older readers; it
+	// is the primary detail's address.
+	Address string
+	// Amount is retained for backward compatibility; it equals Net.
+	Amount int64
+}
+
+// WalletTxDetail is one credit/debit line of a wallet transaction, mirroring
+// Bitcoin Core's COutputEntry as rendered by ListTransactions. Category is one
+// of "send" / "receive" / "generate" / "immature".
+type WalletTxDetail struct {
+	Address  string
+	Category string
+	// Amount is the gross value of this output in satoshis (always positive
+	// here; the RPC layer negates it for the "send" category, matching Core's
+	// `entry.pushKV("amount", ValueFromAmount(-s.amount))`).
+	Amount int64
+	Vout   uint32
+	// IsCoinbase marks a coinbase receive (drives the generate/immature split
+	// at render time using the live tip height).
+	IsCoinbase bool
 }
 
 // Account represents a BIP44 account.
@@ -1963,72 +2013,171 @@ func (w *Wallet) findKeyForUTXO(utxo *WalletUTXO) (*bbcrypto.PrivateKey, error) 
 	return w.getKeyForPath(path)
 }
 
-// ScanBlock checks a block for transactions relevant to the wallet.
+// ScanBlock checks a block for transactions relevant to the wallet. For each
+// wallet-relevant transaction it (a) updates the UTXO ledger (credit owned
+// outputs, debit spent owned inputs) and (b) records ONE WalletTx history entry
+// with Core-shaped amount/fee/category bookkeeping, surfaced by
+// listtransactions / gettransaction.
+//
+// The per-tx aggregation mirrors Bitcoin Core's CachedTxGetAmounts: a debit
+// (the wallet owns ≥1 input) makes the tx "from me" with Fee = Debit -
+// ValueOut and one "send" detail per non-change output; owned outputs are
+// "receive"/"generate"/"immature" credits (change is excluded from a from-me
+// tx, matching Core's OutputIsChange filter). The credit/debit ordering is
+// independent of position in the block — inputs are evaluated against the UTXO
+// set BEFORE the same block's later credits, exactly as the live UTXO scan did.
 func (w *Wallet) ScanBlock(block *wire.MsgBlock, height int32) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	blockHash := block.Header.BlockHash()
+	blockTime := int64(block.Header.Timestamp)
+
 	isCoinbase := true
 	for _, tx := range block.Transactions {
+		thisCoinbase := isCoinbase
+		isCoinbase = false
+
 		txHash := tx.TxHash()
 
-		// Check outputs - received funds
-		for idx, out := range tx.TxOut {
-			addr := w.scriptToAddress(out.PkScript)
-			if addr == "" {
-				continue
-			}
-
-			path, isOurs := w.addrToPath[addr]
-			if !isOurs {
-				continue
-			}
-
-			// Add UTXO
-			outpoint := wire.OutPoint{
-				Hash:  txHash,
-				Index: uint32(idx),
-			}
-			w.utxos[outpoint] = &WalletUTXO{
-				OutPoint:   outpoint,
-				Amount:     out.Value,
-				PkScript:   out.PkScript,
-				Address:    addr,
-				Height:     height,
-				IsCoinbase: isCoinbase,
-				KeyPath:    path,
-				Confirmed:  true,
-			}
-
-			// Add to history
-			w.txHistory = append(w.txHistory, &WalletTx{
-				TxHash:    txHash,
-				Height:    height,
-				Amount:    out.Value,
-				Timestamp: int64(block.Header.Timestamp),
-				Address:   addr,
-			})
-		}
-
-		// Check inputs - spent funds
+		// ── Debit: sum of inputs this tx spends that the wallet owns. The
+		// wallet does not retain spent-input scripts, so it can only count
+		// inputs that are still live UTXOs at this point — which is exactly
+		// CachedTxGetDebit's domain (our coins on the active chain). ──
+		var debit int64
+		spentOutpoints := make([]wire.OutPoint, 0, len(tx.TxIn))
 		for _, in := range tx.TxIn {
 			if utxo, exists := w.utxos[in.PreviousOutPoint]; exists {
-				// Record spend in history
-				w.txHistory = append(w.txHistory, &WalletTx{
-					TxHash:    txHash,
-					Height:    height,
-					Amount:    -utxo.Amount,
-					Timestamp: int64(block.Header.Timestamp),
-					Address:   utxo.Address,
-				})
+				debit += utxo.Amount
+				spentOutpoints = append(spentOutpoints, in.PreviousOutPoint)
+			}
+		}
+		isFromMe := debit > 0
 
-				// Remove spent UTXO
-				delete(w.utxos, in.PreviousOutPoint)
+		// ── Walk outputs: credit owned outputs into the UTXO ledger and
+		// build the per-output detail list (Core's listSent/listReceived). ──
+		var credit int64
+		var valueOut int64
+		details := make([]WalletTxDetail, 0, len(tx.TxOut))
+		primaryAddr := ""
+		for idx, out := range tx.TxOut {
+			valueOut += out.Value
+			addr := w.scriptToAddress(out.PkScript)
+			path, isOurs := "", false
+			if addr != "" {
+				path, isOurs = w.addrToPath[addr]
+			}
+
+			if isOurs {
+				credit += out.Value
+				outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
+				w.utxos[outpoint] = &WalletUTXO{
+					OutPoint:   outpoint,
+					Amount:     out.Value,
+					PkScript:   out.PkScript,
+					Address:    addr,
+					Height:     height,
+					IsCoinbase: thisCoinbase,
+					KeyPath:    path,
+					Confirmed:  true,
+				}
+			}
+
+			isChange := isOurs && pathIsChange(path)
+
+			// Core CachedTxGetAmounts: when we sent (debit>0), every non-change
+			// output is a "send" line; otherwise only owned outputs matter and
+			// are "receive" (or generate/immature for coinbase).
+			if isFromMe {
+				if isChange {
+					continue // change is excluded from both lists
+				}
+				if primaryAddr == "" {
+					primaryAddr = addr
+				}
+				details = append(details, WalletTxDetail{
+					Address:  addr,
+					Category: "send",
+					Amount:   out.Value,
+					Vout:     uint32(idx),
+				})
+			} else if isOurs {
+				if primaryAddr == "" {
+					primaryAddr = addr
+				}
+				cat := "receive"
+				if thisCoinbase {
+					cat = "generate" // generate/immature split is decided at render time
+				}
+				details = append(details, WalletTxDetail{
+					Address:    addr,
+					Category:   cat,
+					Amount:     out.Value,
+					Vout:       uint32(idx),
+					IsCoinbase: thisCoinbase,
+				})
 			}
 		}
 
-		isCoinbase = false
+		// Remove spent owned UTXOs now that outputs are credited.
+		for _, op := range spentOutpoints {
+			delete(w.utxos, op)
+		}
+
+		// Not relevant to the wallet at all → no history entry.
+		if !isFromMe && credit == 0 {
+			continue
+		}
+
+		var fee int64
+		if isFromMe {
+			fee = debit - valueOut // Core nFee = nDebit - nValueOut (≥0)
+		}
+		net := credit - debit
+
+		w.txHistory = append(w.txHistory, &WalletTx{
+			TxHash:     txHash,
+			Height:     height,
+			BlockHash:  blockHash,
+			Net:        net,
+			Debit:      debit,
+			Credit:     credit,
+			Fee:        fee,
+			Timestamp:  blockTime,
+			IsCoinbase: thisCoinbase,
+			IsFromMe:   isFromMe,
+			Details:    details,
+			RawHex:     serializeTxHex(tx),
+			Address:    primaryAddr,
+			Amount:     net,
+		})
 	}
+}
+
+// pathIsChange reports whether a BIP-32 derivation path is on the internal
+// (change) chain — the second-to-last component is the change leg
+// (m/purpose'/coin'/account'/CHANGE/index), 1 for change, 0 for receive.
+// Mirrors Bitcoin Core's OutputIsChange (change goes to the internal chain).
+func pathIsChange(path string) bool {
+	if path == "" {
+		return false
+	}
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 {
+		return false
+	}
+	return parts[len(parts)-2] == "1"
+}
+
+// serializeTxHex returns the BIP-144 wire serialization of tx as a lowercase
+// hex string (the `hex` field of gettransaction). Best-effort: returns "" on
+// the (practically impossible, in-memory) serialization error.
+func serializeTxHex(tx *wire.MsgTx) string {
+	var buf bytes.Buffer
+	if err := tx.Serialize(&buf); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(buf.Bytes())
 }
 
 // UnscanBlock reverses the credits ScanBlock applied for the given block when
@@ -2049,13 +2198,49 @@ func (w *Wallet) UnscanBlock(block *wire.MsgBlock, height int32) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Collect the txids this block introduced so we can drop their history
+	// entries symmetrically with the UTXO removal — otherwise a reorg would
+	// leave listtransactions/gettransaction reporting txs that no longer exist
+	// on the active chain. Mirrors Core's CWallet::blockDisconnected, which
+	// marks the wallet txs as no-longer-confirmed.
+	removed := make(map[wire.Hash256]struct{}, len(block.Transactions))
 	for _, tx := range block.Transactions {
 		txHash := tx.TxHash()
+		removed[txHash] = struct{}{}
 		for idx := range tx.TxOut {
 			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
 			delete(w.utxos, outpoint)
 		}
 	}
+
+	if len(w.txHistory) > 0 {
+		kept := w.txHistory[:0]
+		for _, h := range w.txHistory {
+			if _, gone := removed[h.TxHash]; gone && h.Height == height {
+				continue
+			}
+			kept = append(kept, h)
+		}
+		w.txHistory = kept
+	}
+}
+
+// GetTransaction returns the wallet's history entry for txid, or nil if the
+// wallet does not know the transaction. The returned pointer is a copy so the
+// caller can read it without holding the wallet lock.
+func (w *Wallet) GetTransaction(txid wire.Hash256) *WalletTx {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	// Most-recent-first: a later block (e.g. a re-confirm after reorg) wins.
+	for i := len(w.txHistory) - 1; i >= 0; i-- {
+		if w.txHistory[i].TxHash == txid {
+			cp := *w.txHistory[i]
+			cp.Details = append([]WalletTxDetail(nil), w.txHistory[i].Details...)
+			return &cp
+		}
+	}
+	return nil
 }
 
 // scriptToAddress converts a scriptPubKey to an address string.

@@ -664,6 +664,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleWalletLockWithWallet(walletName)
 	case "listtransactions":
 		return s.handleListTransactionsWithWallet(params, walletName)
+	case "gettransaction":
+		return s.handleGetTransactionWithWallet(params, walletName)
 	case "getwalletinfo":
 		return s.handleGetWalletInfoWithWallet(walletName)
 	case "setlabel":
