@@ -846,21 +846,35 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 		locator := sm.headerIndex.BestTip().BuildLocator()
 		sm.sendGetHeaders(peer, locator)
 	} else {
-		// Sync complete (received fewer than max headers)
+		// Sync complete (received fewer than max headers).
+		//
+		// In the at-tip steady state the periodic getheaders broadcast
+		// (sendPeriodicGetHeaders) delivers a short — usually empty — headers
+		// message from every peer every few seconds.  Re-running the
+		// completion side-effects (log line + onSyncComplete →
+		// StartBlockDownload) on each of those is what produced the ~920k-line
+		// "header sync complete" / "no blocks to download" log spam observed on
+		// the mainnet node.  Only fire the completion path when this batch
+		// actually advanced our header tip OR is the first transition into the
+		// synced state; an empty/duplicate batch leaves nothing new to download.
+		firstCompletion := !sm.headersSynced
 		sm.headersSynced = true
 		sm.syncPeer = nil
-		log.Printf("sync: header sync complete at height %d", newHeight)
 
-		// Persist the best header tip
-		if sm.chainDB != nil {
-			sm.persistHeaderTip()
-		}
+		if headersAdded > 0 || firstCompletion {
+			log.Printf("sync: header sync complete at height %d", newHeight)
 
-		if sm.onSyncComplete != nil {
-			// Run callback in a goroutine to avoid deadlock:
-			// HandleHeaders holds sm.mu, and StartBlockDownload
-			// also needs sm.mu
-			go sm.onSyncComplete()
+			// Persist the best header tip
+			if sm.chainDB != nil {
+				sm.persistHeaderTip()
+			}
+
+			if sm.onSyncComplete != nil {
+				// Run callback in a goroutine to avoid deadlock:
+				// HandleHeaders holds sm.mu, and StartBlockDownload
+				// also needs sm.mu
+				go sm.onSyncComplete()
+			}
 		}
 	}
 }
@@ -1094,13 +1108,49 @@ func (sm *SyncManager) HandleInv(peer *Peer, msg *MsgInv) {
 	sm.sendGetHeadersTo(peer)
 }
 
-// sendPeriodicGetHeaders sends getheaders to a random peer to discover
-// new blocks.  Called periodically after IBD completes.
+// sendPeriodicGetHeaders sends getheaders to connected peers to discover new
+// blocks.  Called periodically after IBD completes.
+//
+// Previously this picked ONE uniformly-random peer and sent a single-hash
+// locator.  On mainnet that is fragile: if the chosen peer is at-or-behind our
+// tip (block-relay-only, feeler, or a laggard fleet node) it answers with an
+// empty headers message and we make no progress.  When a running node falls
+// behind the network tip and no fresh inv covers the gap (e.g. after an
+// OOM-restart that left the chain a few dozen blocks back, or after the peers
+// that were announcing churn out), the gap could persist for many minutes —
+// the node only inched forward one header per freshly-mined block via the inv
+// path and never bulk-recovered the gap.  Observed on the mainnet blockbrew
+// node: header index pinned at 952342 while the network was at 952389,
+// "no blocks to download, already at height 952342" looping every 5 s.
+//
+// Fix: broadcast getheaders to every connected peer using a FULL block locator
+// (BuildLocator) from our best header tip.  Any peer that is ahead returns the
+// gap (up to MaxHeadersPerRequest in one batch); peers that are not ahead reply
+// empty and cost one cheap round-trip.  This mirrors Bitcoin Core's periodic
+// header fetch in PeerManagerImpl::SendMessages, which solicits headers from
+// peers rather than relying solely on inv announcements.
 func (sm *SyncManager) sendPeriodicGetHeaders() {
 	sm.mu.RLock()
 	pm := sm.peerMgr
+	// Build the locator once from the best header tip so we ask for everything
+	// above our highest known header (not just above the connected chain tip).
+	var locator []wire.Hash256
+	if sm.headerIndex != nil {
+		if tip := sm.headerIndex.BestTip(); tip != nil {
+			locator = tip.BuildLocator()
+		}
+	}
 	sm.mu.RUnlock()
 	if pm == nil {
+		return
+	}
+	if len(locator) == 0 {
+		// Fall back to the chain-tip single-hash locator if the header index
+		// has no usable tip yet.
+		peers := pm.ConnectedPeers()
+		if len(peers) > 0 {
+			sm.sendGetHeadersTo(peers[0])
+		}
 		return
 	}
 
@@ -1108,9 +1158,12 @@ func (sm *SyncManager) sendPeriodicGetHeaders() {
 	if len(peers) == 0 {
 		return
 	}
-	// Pick a random peer
-	peer := peers[time.Now().UnixNano()%int64(len(peers))]
-	sm.sendGetHeadersTo(peer)
+	for _, peer := range peers {
+		if !peer.IsConnected() {
+			continue
+		}
+		sm.sendGetHeaders(peer, locator)
+	}
 }
 
 // tipMayBeStale checks if our chain tip hasn't advanced in StaleTipThreshold.
@@ -1210,14 +1263,33 @@ func (sm *SyncManager) checkStaleTip() {
 	}
 }
 
-// sendGetHeadersTo sends a getheaders message to a specific peer using
-// our current chain tip as the locator.
+// sendGetHeadersTo sends a getheaders message to a specific peer using a full
+// exponential block locator built from our best header tip.
+//
+// A degenerate single-hash locator ([chainTip]) only works when the peer's
+// active chain contains exactly that block; if the peer is on a slightly
+// different view (transient reorg, or it indexed our tip on a stale branch) it
+// cannot find a common ancestor and replies empty.  A full locator (Core's
+// CBlockLocator / GetLocator) lets the peer walk back to the real fork point
+// and always return the headers above it.  We anchor on the header-index tip
+// (not the connected chain tip) so that, when headers are ahead of the
+// connected chain, we still solicit everything above our highest known header.
 func (sm *SyncManager) sendGetHeadersTo(peer *Peer) {
-	if sm.chainMgr == nil {
-		return
+	var locator []wire.Hash256
+	if sm.headerIndex != nil {
+		if tip := sm.headerIndex.BestTip(); tip != nil {
+			locator = tip.BuildLocator()
+		}
 	}
-	bestHash, _ := sm.chainMgr.BestBlock()
-	sm.sendGetHeaders(peer, []wire.Hash256{bestHash})
+	if len(locator) == 0 {
+		// Fall back to the connected chain tip if the header index is empty.
+		if sm.chainMgr == nil {
+			return
+		}
+		bestHash, _ := sm.chainMgr.BestBlock()
+		locator = []wire.Hash256{bestHash}
+	}
+	sm.sendGetHeaders(peer, locator)
 }
 
 // HandleNotFound processes a notfound message from a peer.
