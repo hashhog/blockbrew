@@ -1112,17 +1112,30 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 		} else {
 			// Coinbase maturity (Gap B3): a confirmed coinbase output must
 			// have at least CoinbaseMaturity (100) confirmations before it
-			// can be spent in the mempool.
-			// Mirrors Bitcoin Core MemPoolAccept::PreChecks / CheckTxInputs
-			// (consensus/tx_verify.cpp).
+			// can be spent.
+			//
+			// The mempool holds txs for the NEXT block, so the spend height
+			// is tipHeight+1 — exactly what Bitcoin Core passes to
+			// CheckTxInputs (validation.cpp:892 hands it
+			// `m_chain.Height() + 1`, and tx_verify.cpp:179 rejects when
+			// `nSpendHeight - coin.nHeight < COINBASE_MATURITY`). Using the
+			// bare tipHeight here was off by one: it required the coinbase to
+			// be one block DEEPER than consensus does, so the mempool would
+			// false-reject a coinbase the connect-side validator
+			// (CheckTransactionInputs, which already uses the block's own
+			// height as the spend height) accepts. That one-block disagreement
+			// made wallet spends of a just-matured coinbase flaky. Aligning on
+			// the spend height (tip+1) restores Core parity and matches the
+			// wallet's own coin-selection maturity rule
+			// (confirmations = tip - height + 1 >= COINBASE_MATURITY).
 			if utxo.IsCoinbase {
 				spendsCoinbase = true
 				if mp.config.ChainState != nil {
-					tipHeight := mp.config.ChainState.TipHeight()
-					age := tipHeight - utxo.Height
-					if age < consensus.CoinbaseMaturity {
+					spendHeight := mp.config.ChainState.TipHeight() + 1
+					depth := spendHeight - utxo.Height
+					if depth < consensus.CoinbaseMaturity {
 						return fmt.Errorf("%w: age %d < %d required",
-							ErrImmatureCoinbaseSpend, age, consensus.CoinbaseMaturity)
+							ErrImmatureCoinbaseSpend, depth, consensus.CoinbaseMaturity)
 					}
 				}
 			}
