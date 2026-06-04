@@ -685,6 +685,19 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	case "walletcreatefundedpsbt":
 		return s.handleWalletCreateFundedPSBT(params, walletName)
 
+	// Wallet rescan + key import. rescanblockchain rebuilds the wallet's UTXO
+	// ledger + history from existing chain blocks (the wallet half of recovery,
+	// distinct from the chain-level scantxoutset); importprivkey adds a foreign
+	// key + rescans to credit its funds.
+	// Reference: bitcoin-core/src/wallet/rpc/transactions.cpp::rescanblockchain,
+	// bitcoin-core/src/wallet/rpc/backup.cpp::importprivkey.
+	case "rescanblockchain":
+		return s.handleRescanBlockchain(params, walletName)
+	case "importprivkey":
+		return s.handleImportPrivKey(params, walletName)
+	case "dumpprivkey":
+		return s.handleDumpPrivKey(params, walletName)
+
 	// Fee-bumping RPCs (FIX-61 / W118 BUG-2). bumpfee broadcasts the
 	// replacement; psbtbumpfee returns a PSBT for offline signing.
 	// Reference: bitcoin-core/src/wallet/rpc/feebumper.cpp; BIP-125.

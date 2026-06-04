@@ -57,6 +57,13 @@ type Wallet struct {
 	addrToPath map[string]string            // maps address to derivation path
 	addrToType map[string]WalletAddressType // maps address to address type
 	addrLabels map[string]string            // maps address to label
+	// importedKeys holds raw (non-HD) private keys added via importprivkey,
+	// keyed by every address they own. Mirrors Bitcoin Core's legacy
+	// CWallet::AddKeyPubKey path: the key is owned by the wallet but has no
+	// BIP-32 derivation path, so it is looked up directly here rather than
+	// re-derived from the master key. signing resolves these via
+	// importedKeys before falling back to addrToPath/DerivePath.
+	importedKeys map[string]*bbcrypto.PrivateKey
 	// lockedCoins is the in-memory set of UTXOs that the user has marked
 	// unspendable via `lockunspent`. Mirrors CWallet::setLockedCoins. The
 	// value distinguishes a persistent (true) from in-memory-only (false)
@@ -219,10 +226,11 @@ func NewWallet(config WalletConfig) *Wallet {
 		txHistory:   make([]*WalletTx, 0),
 		gapLimit:    DefaultGapLimit,
 		locked:      true,
-		addrToPath:  make(map[string]string),
-		addrToType:  make(map[string]WalletAddressType),
-		addrLabels:  make(map[string]string),
-		lockedCoins: make(map[wire.OutPoint]bool),
+		addrToPath:   make(map[string]string),
+		addrToType:   make(map[string]WalletAddressType),
+		addrLabels:   make(map[string]string),
+		importedKeys: make(map[string]*bbcrypto.PrivateKey),
+		lockedCoins:  make(map[wire.OutPoint]bool),
 		nextIdx: map[WalletAddressType]*addressIndices{
 			AddressTypeP2WPKH:      {External: 0, Internal: 0},
 			AddressTypeP2PKH:       {External: 0, Internal: 0},
@@ -826,8 +834,11 @@ func (w *Wallet) GetUTXO(outpoint wire.OutPoint) *WalletUTXO {
 func (w *Wallet) IsOwnAddress(addr string) bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	_, exists := w.addrToPath[addr]
-	return exists
+	if _, exists := w.addrToPath[addr]; exists {
+		return true
+	}
+	_, imported := w.importedKeys[addr]
+	return imported
 }
 
 // IsOwnScript reports whether the wallet recognises a scriptPubKey as one of
@@ -912,9 +923,15 @@ func (w *Wallet) GetAddressesByLabel(label string) []string {
 func (w *Wallet) GetKeyForAddress(addr string) (*bbcrypto.PrivateKey, error) {
 	w.mu.RLock()
 	path, exists := w.addrToPath[addr]
+	imported, isImported := w.importedKeys[addr]
 	masterKey := w.masterKey
 	locked := w.locked
 	w.mu.RUnlock()
+
+	// Imported (non-HD) keys are held directly; they have no derivation path.
+	if isImported {
+		return imported, nil
+	}
 
 	if !exists {
 		return nil, ErrInvalidAddress
@@ -2223,6 +2240,468 @@ func (w *Wallet) UnscanBlock(block *wire.MsgBlock, height int32) {
 		}
 		w.txHistory = kept
 	}
+}
+
+// rescanAddrTypes is the set of HD script templates a rescan derives and
+// matches against. blockbrew funds new wallets at P2WPKH by default, but a
+// rescan must rediscover any output paying a script the wallet could have
+// produced — so we cover all four standard templates on both the external
+// (receive) and internal (change) chains. Mirrors the spirit of Bitcoin
+// Core's CWallet::ScanForWalletTransactions, which tests every output against
+// every active ScriptPubKeyMan (legacy/segwit/taproot, receive+change).
+var rescanAddrTypes = []WalletAddressType{
+	AddressTypeP2WPKH,
+	AddressTypeP2PKH,
+	AddressTypeP2SH_P2WPKH,
+	AddressTypeP2TR,
+}
+
+// rescanGapLimit is how many consecutive unused indices a rescan derives past
+// the highest USED index on each (type, chain) leg before giving up. Matches
+// the wallet's DefaultGapLimit (Bitcoin Core's keypool/gap-limit semantics:
+// the scanner keeps a look-ahead window of unused keys and extends it whenever
+// a hit lands inside the window).
+const rescanGapLimit = DefaultGapLimit
+
+// deriveAddrPathLocked derives the address + derivation path for a given
+// (addrType, change, index) WITHOUT mutating the wallet's next-index counters
+// or address registry. Caller must hold w.mu and the wallet must be unlocked.
+func (w *Wallet) deriveAddrPathLocked(addrType WalletAddressType, change, index uint32) (addr, path string, err error) {
+	if w.masterKey == nil {
+		return "", "", ErrNoMasterKey
+	}
+	coinType := w.coinType()
+	switch addrType {
+	case AddressTypeP2PKH:
+		path = BIP44Path(coinType, 0, change, index)
+	case AddressTypeP2SH_P2WPKH:
+		path = BIP49Path(coinType, 0, change, index)
+	case AddressTypeP2WPKH:
+		path = BIP84Path(coinType, 0, change, index)
+	case AddressTypeP2TR:
+		path = BIP86Path(coinType, 0, change, index)
+	default:
+		path = BIP84Path(coinType, 0, change, index)
+	}
+
+	key, err := w.masterKey.DerivePath(path)
+	if err != nil {
+		return "", "", err
+	}
+
+	switch addrType {
+	case AddressTypeP2PKH:
+		addr, err = w.pubKeyToP2PKHAddress(key)
+	case AddressTypeP2SH_P2WPKH:
+		addr, err = w.pubKeyToP2SH_P2WPKHAddress(key)
+	case AddressTypeP2WPKH:
+		addr, err = w.pubKeyToP2WPKHAddress(key)
+	case AddressTypeP2TR:
+		addr, err = w.pubKeyToP2TRAddress(key)
+	default:
+		addr, err = w.pubKeyToP2WPKHAddress(key)
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return addr, path, nil
+}
+
+// registerDerivedLocked records a derived address into the wallet's ownership
+// registry (addrToPath/addrToType) if not already present, and advances the
+// matching next-index counter so future getnewaddress/getchangeaddress calls
+// don't re-hand a discovered address. Returns the highest index now covered
+// for the (addrType, change) leg. Caller must hold w.mu.
+func (w *Wallet) registerDerivedLocked(addrType WalletAddressType, change, index uint32, addr, path string) {
+	if _, ok := w.addrToPath[addr]; !ok {
+		w.addrToPath[addr] = path
+		w.addrToType[addr] = addrType
+		if len(w.accounts) > 0 {
+			w.accounts[0].Addresses = append(w.accounts[0].Addresses, addr)
+		}
+	}
+	indices := w.nextIdx[addrType]
+	if indices == nil {
+		indices = &addressIndices{}
+		w.nextIdx[addrType] = indices
+	}
+	if change == 1 {
+		if index+1 > indices.Internal {
+			indices.Internal = index + 1
+		}
+		if index+1 > w.nextIntIdx {
+			w.nextIntIdx = index + 1
+		}
+	} else {
+		if index+1 > indices.External {
+			indices.External = index + 1
+		}
+		if index+1 > w.nextExtIdx {
+			w.nextExtIdx = index + 1
+		}
+	}
+}
+
+// ownedScriptIndex builds, for every standard template/chain leg, the set of
+// scriptPubKeys the wallet would produce for indices [0, frontier+gap). It
+// returns a map from scriptPubKey-as-string to the WalletUTXO metadata
+// (address, path) and the per-leg highest index covered. Caller must hold
+// w.mu. The window starts wide (gap from index 0) and the caller may extend
+// it as hits are found, exactly like Core's look-ahead keypool.
+type derivedScript struct {
+	addr    string
+	path    string
+	addrTyp WalletAddressType
+	change  uint32
+	index   uint32
+}
+
+// buildRescanIndexLocked derives [0, limit) for every (type, chain) leg and
+// returns a script->derivedScript map. Each derived address is also registered
+// into the ownership registry so subsequent scans and getnewaddress see it.
+// Caller must hold w.mu and the wallet must be unlocked.
+func (w *Wallet) buildRescanIndexLocked(limit uint32) (map[string]derivedScript, error) {
+	index := make(map[string]derivedScript)
+	for _, at := range rescanAddrTypes {
+		for _, change := range []uint32{0, 1} {
+			for i := uint32(0); i < limit; i++ {
+				addr, path, err := w.deriveAddrPathLocked(at, change, i)
+				if err != nil {
+					return nil, err
+				}
+				parsed, derr := address.DecodeAddress(addr, w.config.Network)
+				if derr != nil {
+					continue
+				}
+				spk := parsed.ScriptPubKey()
+				index[string(spk)] = derivedScript{
+					addr:    addr,
+					path:    path,
+					addrTyp: at,
+					change:  change,
+					index:   i,
+				}
+			}
+		}
+	}
+	return index, nil
+}
+
+// RescanBlock scans a single already-validated block for outputs paying any
+// script the wallet owns (HD-derived within the gap window OR imported), and
+// for inputs that spend the wallet's tracked UTXOs. It credits/debits the
+// UTXO ledger and appends Core-shaped history entries exactly as the
+// block-connect ScanBlock does, but it is driven over an EXISTING height range
+// by rescanblockchain rather than fired on new tips.
+//
+// derivedIdx is the precomputed script->derivedScript look-ahead index (built
+// once per rescan by buildRescanIndexLocked and shared across the height
+// range). maxSeen tracks the highest USED index per (type,chain) so the caller
+// can extend the window when a hit lands near the frontier.
+//
+// This is the BACKWARD counterpart of ScanBlock; the two share the same credit
+// and history-construction logic. Reference: Bitcoin Core
+// CWallet::ScanForWalletTransactions / AddToWalletIfInvolvingMe.
+func (w *Wallet) RescanBlock(block *wire.MsgBlock, height int32, derivedIdx map[string]derivedScript, maxSeen map[string]uint32) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.rescanBlockLocked(block, height, derivedIdx, maxSeen)
+}
+
+// rescanBlockLocked is the lock-held body of RescanBlock. Caller must hold w.mu.
+func (w *Wallet) rescanBlockLocked(block *wire.MsgBlock, height int32, derivedIdx map[string]derivedScript, maxSeen map[string]uint32) {
+	blockHash := block.Header.BlockHash()
+	blockTime := int64(block.Header.Timestamp)
+
+	isCoinbase := true
+	for _, tx := range block.Transactions {
+		thisCoinbase := isCoinbase
+		isCoinbase = false
+
+		txHash := tx.TxHash()
+
+		// Debit: inputs this tx spends that the wallet currently tracks.
+		var debit int64
+		spentOutpoints := make([]wire.OutPoint, 0, len(tx.TxIn))
+		for _, in := range tx.TxIn {
+			if utxo, exists := w.utxos[in.PreviousOutPoint]; exists {
+				debit += utxo.Amount
+				spentOutpoints = append(spentOutpoints, in.PreviousOutPoint)
+			}
+		}
+		isFromMe := debit > 0
+
+		var credit int64
+		var valueOut int64
+		details := make([]WalletTxDetail, 0, len(tx.TxOut))
+		primaryAddr := ""
+		for idx, out := range tx.TxOut {
+			valueOut += out.Value
+			addr, path, isOurs := w.resolveOwnedOutputLocked(out.PkScript, derivedIdx, maxSeen)
+
+			if isOurs {
+				credit += out.Value
+				outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
+				// Re-credit idempotently: a repeated rescan over the same range
+				// must converge, not double-count. The map keys on outpoint so
+				// an overwrite is a no-op for balance.
+				w.utxos[outpoint] = &WalletUTXO{
+					OutPoint:   outpoint,
+					Amount:     out.Value,
+					PkScript:   out.PkScript,
+					Address:    addr,
+					Height:     height,
+					IsCoinbase: thisCoinbase,
+					KeyPath:    path,
+					Confirmed:  true,
+				}
+			}
+
+			isChange := isOurs && pathIsChange(path)
+
+			if isFromMe {
+				if isChange {
+					continue
+				}
+				if primaryAddr == "" {
+					primaryAddr = addr
+				}
+				details = append(details, WalletTxDetail{
+					Address:  addr,
+					Category: "send",
+					Amount:   out.Value,
+					Vout:     uint32(idx),
+				})
+			} else if isOurs {
+				if primaryAddr == "" {
+					primaryAddr = addr
+				}
+				cat := "receive"
+				if thisCoinbase {
+					cat = "generate"
+				}
+				details = append(details, WalletTxDetail{
+					Address:    addr,
+					Category:   cat,
+					Amount:     out.Value,
+					Vout:       uint32(idx),
+					IsCoinbase: thisCoinbase,
+				})
+			}
+		}
+
+		for _, op := range spentOutpoints {
+			delete(w.utxos, op)
+		}
+
+		if !isFromMe && credit == 0 {
+			continue
+		}
+
+		// Idempotency for history: drop any prior entry for this txid at this
+		// height before re-appending, so a repeated rescan does not duplicate
+		// listtransactions rows.
+		if len(w.txHistory) > 0 {
+			kept := w.txHistory[:0]
+			for _, h := range w.txHistory {
+				if h.TxHash == txHash && h.Height == height {
+					continue
+				}
+				kept = append(kept, h)
+			}
+			w.txHistory = kept
+		}
+
+		var fee int64
+		if isFromMe {
+			fee = debit - valueOut
+		}
+		net := credit - debit
+
+		w.txHistory = append(w.txHistory, &WalletTx{
+			TxHash:     txHash,
+			Height:     height,
+			BlockHash:  blockHash,
+			Net:        net,
+			Debit:      debit,
+			Credit:     credit,
+			Fee:        fee,
+			Timestamp:  blockTime,
+			IsCoinbase: thisCoinbase,
+			IsFromMe:   isFromMe,
+			Details:    details,
+			RawHex:     serializeTxHex(tx),
+			Address:    primaryAddr,
+			Amount:     net,
+		})
+	}
+}
+
+// resolveOwnedOutputLocked decides whether the wallet owns a scriptPubKey,
+// returning its address + derivation path ("" for imported keys). It checks,
+// in order: already-registered addresses (addrToPath), the HD look-ahead index
+// (derivedIdx — registering the address + advancing maxSeen on a hit), and
+// imported keys. Caller must hold w.mu.
+func (w *Wallet) resolveOwnedOutputLocked(pkScript []byte, derivedIdx map[string]derivedScript, maxSeen map[string]uint32) (addr, path string, owned bool) {
+	// Fast path: a script whose address is already in the registry.
+	if a := w.scriptToAddress(pkScript); a != "" {
+		if p, ok := w.addrToPath[a]; ok {
+			return a, p, true
+		}
+		// Imported key (registered as owned but with no derivation path).
+		if _, ok := w.importedKeys[a]; ok {
+			return a, "", true
+		}
+		// HD look-ahead hit.
+		if derivedIdx != nil {
+			if d, ok := derivedIdx[string(pkScript)]; ok {
+				w.registerDerivedLocked(d.addrTyp, d.change, d.index, d.addr, d.path)
+				if maxSeen != nil {
+					legKey := fmt.Sprintf("%d/%d", d.addrTyp, d.change)
+					if d.index+1 > maxSeen[legKey] {
+						maxSeen[legKey] = d.index + 1
+					}
+				}
+				return d.addr, d.path, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// Rescan rediscovers the wallet's on-chain funds over the height range
+// [startHeight, stopHeight] (inclusive), using getBlock(height) to fetch each
+// already-validated block. It is the wallet half of the rescanblockchain RPC:
+// the RPC layer supplies the block fetcher (so the wallet stays free of any
+// chain/storage dependency) and the height range; the wallet rebuilds its UTXO
+// ledger + history from those blocks.
+//
+// The scan walks blocks low→high so that a coin created then spent within the
+// range nets out correctly (credit, then debit). It uses a gap-limit
+// look-ahead over all four standard templates on both chains, extending the
+// window whenever a hit lands near the frontier — matching Bitcoin Core's
+// CWallet::ScanForWalletTransactions keypool top-up behaviour.
+//
+// getBlock returns (block, ok); ok=false stops the scan early at that height
+// (e.g. a pruned or missing body). Returns the highest height actually scanned.
+func (w *Wallet) Rescan(startHeight, stopHeight int32, getBlock func(height int32) (*wire.MsgBlock, bool)) (scannedTo int32, err error) {
+	w.mu.Lock()
+	if w.masterKey == nil && len(w.importedKeys) == 0 {
+		w.mu.Unlock()
+		return startHeight - 1, ErrNoMasterKey
+	}
+
+	// Build the initial look-ahead index. If the wallet has a master key we
+	// derive a generous window; otherwise (import-only / watch wallet) the
+	// imported keys carry ownership directly and derivedIdx may be empty.
+	var derivedIdx map[string]derivedScript
+	if w.masterKey != nil {
+		// Start the window from the current frontier across all legs so a
+		// wallet that already handed out addresses keeps covering them.
+		limit := uint32(rescanGapLimit)
+		for _, at := range rescanAddrTypes {
+			if ix := w.nextIdx[at]; ix != nil {
+				if ix.External+rescanGapLimit > limit {
+					limit = ix.External + rescanGapLimit
+				}
+				if ix.Internal+rescanGapLimit > limit {
+					limit = ix.Internal + rescanGapLimit
+				}
+			}
+		}
+		var berr error
+		derivedIdx, berr = w.buildRescanIndexLocked(limit)
+		if berr != nil {
+			w.mu.Unlock()
+			return startHeight - 1, berr
+		}
+	}
+	w.mu.Unlock()
+
+	maxSeen := make(map[string]uint32)
+	scannedTo = startHeight - 1
+	for h := startHeight; h <= stopHeight; h++ {
+		block, ok := getBlock(h)
+		if !ok {
+			break
+		}
+		w.mu.Lock()
+		w.rescanBlockLocked(block, h, derivedIdx, maxSeen)
+
+		// Look-ahead top-up: if any leg's highest-seen index pushed within
+		// rescanGapLimit of the derived window, widen the window so a long
+		// run of funded addresses is still fully discovered. We rebuild the
+		// index up to the new limit (cheap: pure key derivation, bounded).
+		if w.masterKey != nil && len(maxSeen) > 0 {
+			need := uint32(0)
+			for _, seen := range maxSeen {
+				if seen+rescanGapLimit > need {
+					need = seen + rescanGapLimit
+				}
+			}
+			if need > uint32(len(derivedIdx)/(len(rescanAddrTypes)*2)) {
+				if newIdx, berr := w.buildRescanIndexLocked(need); berr == nil {
+					derivedIdx = newIdx
+				}
+			}
+		}
+		w.mu.Unlock()
+		scannedTo = h
+	}
+	return scannedTo, nil
+}
+
+// ImportPrivKey adds a raw (non-HD) private key to the wallet, registering the
+// standard address templates it can spend (P2WPKH, P2PKH, P2SH-P2WPKH) as
+// wallet-owned so a subsequent rescan credits that key's on-chain funds. The
+// returned addresses are every address now owned by the key. Mirrors the
+// effect of Bitcoin Core's importprivkey (wallet/rpc/backup.cpp): the key is
+// added to the keystore and its scriptPubKeys become IsMine.
+//
+// Taproot (P2TR/BIP-86 key tweak) is intentionally NOT registered here: a bare
+// imported key has no BIP-341 output-key relationship the wallet can later sign
+// for via the simple keystore path, and Core's importprivkey likewise only adds
+// the legacy + segwit-v0 templates.
+func (w *Wallet) ImportPrivKey(privKey *bbcrypto.PrivateKey, label string) ([]string, error) {
+	if privKey == nil {
+		return nil, errors.New("nil private key")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	pub := privKey.PubKey()
+	h160 := bbcrypto.Hash160(pub.SerializeCompressed())
+
+	addrs := make([]string, 0, 3)
+
+	// P2WPKH (native segwit, bech32)
+	p2wpkh, err := address.NewP2WPKHAddress(h160, w.config.Network).Encode()
+	if err == nil {
+		addrs = append(addrs, p2wpkh)
+	}
+	// P2PKH (legacy)
+	p2pkh, err := address.NewP2PKHAddress(h160, w.config.Network).Encode()
+	if err == nil {
+		addrs = append(addrs, p2pkh)
+	}
+	// P2SH-P2WPKH (nested segwit)
+	witnessProgram := make([]byte, 22)
+	witnessProgram[0] = 0x00
+	witnessProgram[1] = 0x14
+	copy(witnessProgram[2:], h160[:])
+	scriptHash := bbcrypto.Hash160(witnessProgram)
+	p2sh, err := address.NewP2SHAddress(scriptHash, w.config.Network).Encode()
+	if err == nil {
+		addrs = append(addrs, p2sh)
+	}
+
+	for _, a := range addrs {
+		w.importedKeys[a] = privKey
+		if label != "" {
+			w.addrLabels[a] = label
+		}
+	}
+	return addrs, nil
 }
 
 // GetTransaction returns the wallet's history entry for txid, or nil if the

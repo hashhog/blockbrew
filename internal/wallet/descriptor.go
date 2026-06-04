@@ -1602,6 +1602,12 @@ func decodeWIF(wif string, net address.Network) (*bbcrypto.PrivateKey, error) {
 	return bbcrypto.PrivateKeyFromBytes(keyBytes), nil
 }
 
+// DecodeWIF decodes a WIF-encoded private key (exported wrapper around the
+// package-internal decodeWIF, for the importprivkey RPC handler).
+func DecodeWIF(wif string, net address.Network) (*bbcrypto.PrivateKey, error) {
+	return decodeWIF(wif, net)
+}
+
 // EncodeWIF encodes a private key as WIF.
 func EncodeWIF(privKey *bbcrypto.PrivateKey, net address.Network, compressed bool) string {
 	var version byte
