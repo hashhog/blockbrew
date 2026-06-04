@@ -54,6 +54,7 @@ type CreateWalletOpts struct {
 	Blank              bool   // Create without keys
 	Passphrase         string // Wallet-file encryption passphrase (scrypt+AES-GCM)
 	SeedPassphrase     string // BIP-39 "25th word" passphrase (PBKDF2 input)
+	Mnemonic           string // BIP-39 mnemonic to RESTORE from (empty = generate fresh)
 	AvoidReuse         bool   // Track coin reuse (NYI)
 	LoadOnStartup      *bool  // Save to auto-load list
 }
@@ -222,10 +223,19 @@ func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, err
 
 	// Initialize with keys unless blank wallet requested
 	if !opts.Blank && !opts.DisablePrivateKeys {
-		// Generate new mnemonic and initialize wallet
-		mnemonic, err := GenerateMnemonic()
-		if err != nil {
-			return nil, err
+		// Either RESTORE from a caller-supplied BIP-39 mnemonic (deterministic
+		// seed-only recovery — same words always re-derive byte-identical keys
+		// and addresses, mirroring Bitcoin Core's createwallet+sethdseed restore
+		// flow), or generate a fresh random mnemonic when none was supplied.
+		// CreateFromMnemonic validates the words+checksum and returns
+		// ErrInvalidMnemonic on a bad phrase.
+		mnemonic := opts.Mnemonic
+		if mnemonic == "" {
+			var err error
+			mnemonic, err = GenerateMnemonic()
+			if err != nil {
+				return nil, err
+			}
 		}
 		// W161 BUG-16 fix: pass the BIP-39 seed passphrase (NOT the wallet-
 		// file passphrase) through to PBKDF2. opts.SeedPassphrase=="" matches
