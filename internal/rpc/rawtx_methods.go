@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 
@@ -204,6 +205,40 @@ type FeeInfo struct {
 	Base float64 `json:"base"`
 }
 
+// classifyRBFReject maps a checkRBFLocked error sentinel onto the Bitcoin Core
+// reject-reason token that testmempoolaccept (and sendrawtransaction) would
+// report for the same condition. The categories here are exactly the ones the
+// RBF differential harness normalises against:
+//
+//   - Rule 3 (lower absolute fee) AND Rule 4 (insufficient fee bump) both
+//     surface as "insufficient fee" in Core (rbf.cpp:109-123 → the
+//     ReplacementChecks "insufficient fee" state in validation.cpp). blockbrew
+//     folds both into ErrRBFInsufficientFee, as does the feerate-diagram gate.
+//   - A non-signaling conflict with full-RBF disabled is Core
+//     "txn-mempool-conflict" (validation.cpp PreChecks).
+//   - Rule 2 (new unconfirmed input) → "replacement-adds-unconfirmed".
+//   - Rule 5 (too many candidates) → "too many potential replacements".
+//   - Spending a conflicting tx → "bad-txns-spends-conflicting-tx".
+func classifyRBFReject(err error) string {
+	switch {
+	case errors.Is(err, mempool.ErrRBFInsufficientFee),
+		errors.Is(err, mempool.ErrRBFFeerateDiagram):
+		return "insufficient fee"
+	case errors.Is(err, mempool.ErrRBFNotSignaled):
+		return "txn-mempool-conflict"
+	case errors.Is(err, mempool.ErrRBFNewUnconfirmedInput):
+		return "replacement-adds-unconfirmed"
+	case errors.Is(err, mempool.ErrRBFTooManyConflicts):
+		return "too many potential replacements"
+	case errors.Is(err, mempool.ErrRBFAncestorConflict):
+		return "bad-txns-spends-conflicting-tx"
+	default:
+		// Any other conflict condition (e.g. unresolved inputs) — report the
+		// generic conflict token rather than an opaque error string.
+		return "txn-mempool-conflict"
+	}
+}
+
 func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *RPCError) {
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
@@ -380,6 +415,29 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if int64(feeRate) < minFeeRate {
 			result.Allowed = false
 			result.RejectReason = "min-fee-not-met"
+			results = append(results, result)
+			continue
+		}
+
+		// BIP-125 / full-RBF replacement gate (mempool conflict handling).
+		//
+		// Bitcoin Core's testmempoolaccept runs the FULL MemPoolAccept,
+		// including ReplacementChecks (validation.cpp:1290-1380): a tx that
+		// spends an outpoint already spent by a mempool tx is a "conflict",
+		// and is only admissible if it qualifies as a replacement under
+		// BIP-125 (signaling + Rules 3/4/5 + feerate diagram) or full-RBF.
+		// Before this, blockbrew's testmempoolaccept dry-run never inspected
+		// mempool conflicts, so a replacement that violates Rule 3 (lower
+		// absolute fee) or Rule 4 (insufficient fee bump) was falsely reported
+		// `allowed: true` — a divergence from Core that this cell closes.
+		//
+		// TestReplacement is the read-only twin of the AddTransaction conflict
+		// branch: it reuses the identical checkRBFLocked gate without mutating
+		// the mempool. We map its Core-shaped error sentinels onto the same
+		// reject-reason CATEGORY tokens Core emits.
+		if conflicts, rbfErr := s.mempool.TestReplacement(tx); conflicts && rbfErr != nil {
+			result.Allowed = false
+			result.RejectReason = classifyRBFReject(rbfErr)
 			results = append(results, result)
 			continue
 		}
