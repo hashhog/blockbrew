@@ -717,19 +717,101 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 // Index RPCs
 // ============================================================================
 
-func (s *Server) handleGetIndexInfo() (interface{}, *RPCError) {
-	result := make(map[string]interface{})
+// indexSummary mirrors Bitcoin Core's getindexinfo value object
+// (rpc/node.cpp::SummaryToJSON). EXACTLY two fields, in this order:
+// "synced" then "best_block_height". Core NEVER emits best_block_hash or
+// the index name inside the value object — only the outer map is keyed by
+// name. The struct (not a map) preserves the synced→best_block_height
+// field order on the wire to match Core byte-for-byte.
+type indexSummary struct {
+	Synced          bool  `json:"synced"`
+	BestBlockHeight int32 `json:"best_block_height"`
+}
 
-	if s.indexManager == nil {
-		return result, nil
+// handleGetIndexInfo implements `getindexinfo ( "index_name" )` with the
+// exact Bitcoin Core shape (rpc/node.cpp:363-410, SummaryToJSON:351-361).
+//
+// Returns a dynamic JSON object keyed by the running index's Core GetName()
+// string. For each enabled index one entry is pushed whose value has
+// EXACTLY {synced, best_block_height}. An index appears ONLY if it is
+// running (Core guards each with `if (g_txindex)` etc). The optional
+// positional arg filters to a single index by name; a non-matching name
+// yields {} (an empty object, NOT an error). Empty/omitted = all running.
+//
+// blockbrew runs at most two of Core's index family:
+//   - "txindex"                   when -txindex is set. It is not a
+//     registered Index (it is driven directly off the chain connect/
+//     disconnect hooks into chainDB), so it is summarised from the chain
+//     tip: it advances in lockstep with the active chain.
+//   - "basic block filter index"  when -blockfilterindex=basic is set.
+//     Registered in the IndexManager under the internal name
+//     "blockfilterindex"; emitted under Core's GetName() string
+//     ("basic block filter index", blockfilterindex.cpp:78).
+//
+// coinstatsindex / txospenderindex are not wired in blockbrew, so they are
+// never emitted — Core only lists indexes that are actually running.
+func (s *Server) handleGetIndexInfo(params json.RawMessage) (interface{}, *RPCError) {
+	// Optional positional arg 0: index_name filter (default = all).
+	indexName := ""
+	if len(params) > 0 {
+		var args []interface{}
+		if err := json.Unmarshal(params, &args); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+		}
+		if len(args) >= 1 && args[0] != nil {
+			name, ok := args[0].(string)
+			if !ok {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "index_name must be a string"}
+			}
+			indexName = name
+		}
 	}
 
-	for _, idx := range s.indexManager.AllIndexes() {
-		status := idx.Status()
-		result[status.Name] = map[string]interface{}{
-			"synced":      status.Synced,
-			"best_height": status.BestHeight,
-			"best_hash":   status.BestHash.String(),
+	result := make(map[string]interface{})
+
+	// Active chain tip height; the synced predicate compares each index's
+	// best height against it (Core's m_synced = caught up to tip).
+	tipHeight := int32(0)
+	if s.chainMgr != nil {
+		_, tipHeight = s.chainMgr.BestBlock()
+	}
+
+	// clampHeight mirrors GetSummary: best_block_height is the height the
+	// index reached, or 0 when it has no best block yet (Core's else-arm).
+	clampHeight := func(h int32) int32 {
+		if h < 0 {
+			return 0
+		}
+		return h
+	}
+
+	// push adds one entry, honoring the index_name filter exactly
+	// (SummaryToJSON drops the entry when index_name is non-empty and
+	// != the index's name).
+	push := func(name string, best int32, synced bool) {
+		if indexName != "" && indexName != name {
+			return
+		}
+		result[name] = indexSummary{
+			Synced:          synced,
+			BestBlockHeight: clampHeight(best),
+		}
+	}
+
+	// txindex: runs when -txindex is set. Driven off the chain hooks, so
+	// its best block == the active chain tip and it is synced whenever the
+	// chain is at tip (which, off-IBD, it always is).
+	if s.config.TxIndex {
+		push("txindex", tipHeight, tipHeight >= 0)
+	}
+
+	// basic block filter index: runs when -blockfilterindex=basic is set.
+	// Registered under the internal name "blockfilterindex"; emit under
+	// Core's GetName() string. synced = caught up to the chain tip.
+	if s.indexManager != nil {
+		if idx := s.indexManager.GetIndex("blockfilterindex"); idx != nil {
+			best := idx.BestHeight()
+			push("basic block filter index", best, best >= tipHeight)
 		}
 	}
 
