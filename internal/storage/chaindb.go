@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -428,4 +429,37 @@ func (c *ChainDB) GetTxIndex(txid wire.Hash256) (*TxIndexEntry, error) {
 func (c *ChainDB) DeleteTxIndex(txid wire.Hash256) error {
 	key := MakeTxIndexKey(txid)
 	return c.db.Delete(key)
+}
+
+// GetChainTxCount returns the persisted cumulative transaction count from
+// genesis up to and including the given main-chain height (Bitcoin Core's
+// CBlockIndex::m_chain_tx_count analogue), and a bool reporting whether a
+// value was present. This is a pure read; the getchaintxstats handler is
+// responsible for lazily populating + self-healing the map.
+func (c *ChainDB) GetChainTxCount(height int32) (uint64, bool, error) {
+	if height < 0 {
+		return 0, false, nil
+	}
+	key := MakeChainTxCountKey(height)
+	data, err := c.db.Get(key)
+	if err != nil {
+		return 0, false, err
+	}
+	if data == nil {
+		return 0, false, nil
+	}
+	if len(data) < 8 {
+		return 0, false, errors.New("invalid chain-tx-count entry")
+	}
+	return binary.BigEndian.Uint64(data[:8]), true, nil
+}
+
+// PutChainTxCount persists the cumulative transaction count for a height.
+func (c *ChainDB) PutChainTxCount(height int32, count uint64) error {
+	if height < 0 {
+		return nil
+	}
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], count)
+	return c.db.Put(MakeChainTxCountKey(height), buf[:])
 }
