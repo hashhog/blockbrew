@@ -872,8 +872,19 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	var feeEstimator *mempool.FeeEstimator
 	var zmqPub *zmqPublisher
 
-	// 6. Initialize mempool
-	minRelayFeeRate := int64(cfg.MinRelayFee * 100_000_000 / 1000) // BTC/kvB to sat/kvB
+	// 6. Initialize mempool.
+	//
+	// -minrelayfee is a fee RATE in BTC/kvB; the mempool stores it as sat/kvB
+	// (the unit every downstream consumer uses: the min-relay gate
+	// `fee/vsize*1000`, and the dust threshold `spendingSize*MinRelayFeeRate/1000`
+	// — see mempool.go:isDust / validateTransactionLocked). The conversion is
+	// therefore BTC/kvB * COIN = sat/kvB. The default 0.00001 BTC/kvB maps to
+	// 1000 sat/kvB, exactly Bitcoin Core's DEFAULT_MIN_RELAY_TX_FEE
+	// (policy/policy.h). A stray extra `/1000` here previously produced 1
+	// sat/kvB, collapsing the dust threshold to 0 (68*1/1000 == 0) so NO output
+	// was ever dust — testmempoolaccept then accepted dust txns that default
+	// Core rejects. Removing the `/1000` restores the genuine relay-policy floor.
+	minRelayFeeRate := int64(cfg.MinRelayFee * 100_000_000) // BTC/kvB to sat/kvB
 	mp := mempool.New(mempool.Config{
 		MaxSize:         cfg.MaxMempool * 1_000_000,
 		MinRelayFeeRate: minRelayFeeRate,

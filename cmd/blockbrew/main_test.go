@@ -218,13 +218,16 @@ func TestConfigValidation(t *testing.T) {
 }
 
 func TestMinRelayFeeConversion(t *testing.T) {
-	// Test the conversion from BTC/kvB to sat/kvB
+	// Test the conversion from BTC/kvB to sat/kvB (the unit the mempool stores).
 	btcPerKvB := 0.00001
-	satPerKvB := int64(btcPerKvB * 100_000_000 / 1000)
+	satPerKvB := int64(btcPerKvB * 100_000_000)
 
-	// 0.00001 BTC = 1000 satoshis
-	// 1000 satoshis / 1000 = 1 sat/vB (which is the base unit)
-	expected := int64(1)
+	// 0.00001 BTC/kvB * 100_000_000 sat/BTC = 1000 sat/kvB, exactly Bitcoin
+	// Core's DEFAULT_MIN_RELAY_TX_FEE (policy/policy.h). This is the rate the
+	// mempool consumes directly in the min-relay gate (fee/vsize*1000) and the
+	// dust threshold (spendingSize*MinRelayFeeRate/1000); a previous stray
+	// extra `/1000` produced 1 sat/kvB and zeroed the dust threshold.
+	expected := int64(1000)
 	if satPerKvB != expected {
 		t.Errorf("MinRelayFee conversion: got %d sat/kvB, want %d", satPerKvB, expected)
 	}
