@@ -610,6 +610,10 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleSetBan(params)
 	case "clearbanned":
 		return s.handleClearBanned()
+	case "getnodeaddresses":
+		return s.handleGetNodeAddresses(params)
+	case "addpeeraddress":
+		return s.handleAddPeerAddress(params)
 
 	// Mining RPCs
 	case "getblocktemplate":
