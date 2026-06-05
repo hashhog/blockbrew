@@ -832,6 +832,21 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid format"}
 	}
 
+	// Special exception for the genesis block coinbase transaction.
+	// Bitcoin Core (rpc/rawtransaction.cpp:290-293) rejects it because the
+	// genesis coinbase output is not part of the UTXO set and cannot be
+	// retrieved as an ordinary transaction. The genesis coinbase txid equals
+	// the genesis block's merkle root (single-tx block).
+	if s.chainParams != nil && s.chainParams.GenesisBlock != nil &&
+		len(s.chainParams.GenesisBlock.Transactions) > 0 {
+		if txid == s.chainParams.GenesisBlock.Transactions[0].TxHash() {
+			return nil, &RPCError{
+				Code:    RPCErrInvalidAddressOrKey,
+				Message: "The genesis block coinbase is not considered an ordinary transaction and cannot be retrieved",
+			}
+		}
+	}
+
 	var tx *wire.MsgTx
 	var blockHash wire.Hash256
 	var blockTime uint32
@@ -847,7 +862,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 
 		block, err := s.chainDB.GetBlock(*blockHashParam)
 		if err != nil {
-			return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
+			return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block hash not found"}
 		}
 
 		// Search for transaction in block
@@ -952,9 +967,15 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 
 	// Add in_active_chain when a blockhash was explicitly provided (Core:
 	// result.pushKV("in_active_chain", chainman.ActiveChain().Contains(blockindex))
-	// before TxToJSON call).
+	// before TxToJSON call). Reflect actual active-chain membership rather than
+	// hard-coding true, so a tx looked up via a stale/side-chain block hash
+	// reports in_active_chain=false like Core.
 	if blockHashParam != nil {
-		result["in_active_chain"] = true
+		inActive := true
+		if s.chainMgr != nil {
+			inActive = s.chainMgr.IsInMainChain(*blockHashParam)
+		}
+		result["in_active_chain"] = inActive
 	}
 
 	// Add block-context fields (blockhash, confirmations, time, blocktime)
