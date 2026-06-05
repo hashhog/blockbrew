@@ -560,7 +560,9 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 
 	node := s.headerIndex.GetNode(hash)
 	if node == nil {
-		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block header not found"}
+		// Mirror Bitcoin Core's exact error: JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+		// "Block not found") — see bitcoin-core/src/rpc/blockchain.cpp:654-656.
+		return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
 	}
 
 	// Non-verbose: return hex-encoded header
