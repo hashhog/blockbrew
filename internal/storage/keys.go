@@ -30,6 +30,14 @@ var (
 	// UndoBlockPrefix is the prefix for undo block data. Key: "R" + block_hash
 	UndoBlockPrefix = []byte("R")
 
+	// ChainTxCountPrefix maps a main-chain height to the cumulative number of
+	// transactions from genesis up to and including that height (Bitcoin Core's
+	// CBlockIndex::m_chain_tx_count analogue). Key: "Q" + big-endian uint32
+	// height, value: big-endian uint64. Populated lazily + self-healing by the
+	// getchaintxstats RPC handler (see ChainDB.GetChainTxCount / PutChainTxCount);
+	// not part of the consensus block-connect path.
+	ChainTxCountPrefix = []byte("Q")
+
 	// ChainStateKey stores the current chain tip hash and height.
 	ChainStateKey = []byte("chainstate")
 
@@ -83,5 +91,14 @@ func MakeUndoBlockKey(hash wire.Hash256) []byte {
 	key := make([]byte, 1+32)
 	key[0] = UndoBlockPrefix[0]
 	copy(key[1:], hash[:])
+	return key
+}
+
+// MakeChainTxCountKey creates a key for the cumulative-tx-count-by-height map
+// (the m_chain_tx_count analogue). Key: "Q" + big-endian uint32 height.
+func MakeChainTxCountKey(height int32) []byte {
+	key := make([]byte, 1+4)
+	key[0] = ChainTxCountPrefix[0]
+	binary.BigEndian.PutUint32(key[1:], uint32(height))
 	return key
 }
