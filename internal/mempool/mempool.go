@@ -2928,6 +2928,82 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 	return nil
 }
 
+// TestReplacement is the read-only, NON-mutating dry-run analogue of the
+// conflict-handling branch in AddTransaction. It answers the question
+// "if this tx were submitted, would it conflict with the mempool, and if so
+// would BIP-125/full-RBF replacement be allowed?" WITHOUT inserting the tx or
+// evicting anything.
+//
+// It exists so the `testmempoolaccept` RPC can surface the exact same
+// RBF reject reasons that `sendrawtransaction` (which goes through
+// AddTransaction → checkRBFLocked) produces. Before this method,
+// testmempoolaccept reimplemented a thin subset of the policy gate that never
+// looked at mempool conflicts, so a replacement that violates BIP-125 Rule 3
+// or Rule 4 was falsely reported as `allowed: true` (a divergence from Bitcoin
+// Core, whose testmempoolaccept runs the full MemPoolAccept including
+// ReplacementChecks — validation.cpp:1290-1380).
+//
+// Return contract:
+//   - (false, nil)        the tx does NOT conflict with any mempool tx — caller
+//                         proceeds with its normal accept path (no RBF involved).
+//   - (true,  nil)        the tx conflicts AND the replacement is permitted
+//                         (Rules 1-5 + feerate-diagram all pass) — caller may
+//                         report allowed.
+//   - (true,  err)        the tx conflicts but the replacement is NOT permitted;
+//                         err is the SAME Core-shaped error checkRBFLocked
+//                         returns (ErrRBFInsufficientFee, ErrRBFNotSignaled,
+//                         ErrRBFTooManyConflicts, …) so the caller can classify
+//                         the reject-reason exactly as the submission path does.
+//
+// Inputs that are missing from both the UTXO set and the mempool are reported
+// via ErrMissingInputs so the caller can fall back to its own missing-inputs
+// handling (Core: TX_MISSING_INPUTS). This mirrors the AddTransaction guard
+// that refuses RBF when any input is unresolved (mempool.go:1167-1172).
+func (mp *Mempool) TestReplacement(tx *wire.MsgTx) (conflicts bool, err error) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	var conflictingTxs map[wire.Hash256]bool
+	var totalInputValue int64
+	var missingInputs int
+
+	for _, in := range tx.TxIn {
+		if existingTxHash, ok := mp.outpoints[in.PreviousOutPoint]; ok {
+			if conflictingTxs == nil {
+				conflictingTxs = make(map[wire.Hash256]bool)
+			}
+			conflictingTxs[existingTxHash] = true
+		}
+		utxo := mp.lookupOutputLocked(in.PreviousOutPoint)
+		if utxo == nil {
+			missingInputs++
+		} else {
+			totalInputValue += utxo.Amount
+		}
+	}
+
+	if len(conflictingTxs) == 0 {
+		// No mempool conflict — nothing for RBF to decide.
+		return false, nil
+	}
+
+	if missingInputs > 0 {
+		// Cannot evaluate RBF with unresolved inputs (mirrors the
+		// AddTransaction guard at mempool.go:1167). Caller falls back to its
+		// own missing-inputs handling.
+		return true, fmt.Errorf("%w: %d inputs unresolved", ErrMissingInputs, missingInputs)
+	}
+
+	// Run the identical Rule 1-5 + feerate-diagram gate the submission path
+	// uses. checkRBFLocked is purely a read over mp.pool / mp.outpoints and
+	// returns an error on any rule violation; it performs no eviction or
+	// insertion, so it is safe under the read lock.
+	if rbfErr := mp.checkRBFLocked(tx, conflictingTxs, totalInputValue); rbfErr != nil {
+		return true, rbfErr
+	}
+	return true, nil
+}
+
 // signalsRBF returns true if the transaction signals BIP125 replaceability.
 //
 // A transaction opts in to RBF iff at least one input has
