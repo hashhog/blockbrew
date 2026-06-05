@@ -143,6 +143,86 @@ func ComputeHashSerialized(utxoSet *UTXOSet) (wire.Hash256, uint64, error) {
 	return out, uint64(len(coins)), nil
 }
 
+// GetBogoSize returns Core's "database-independent, meaningless metric"
+// for a single coin (kernel/coinstats.cpp::GetBogoSize):
+//
+//	32 (txid) + 4 (vout) + 4 (height+coinbase) + 8 (amount) + 2 (script len) +
+//	len(scriptPubKey).
+func GetBogoSize(pkScript []byte) uint64 {
+	return 32 + 4 + 4 + 8 + 2 + uint64(len(pkScript))
+}
+
+// UTXOSetInfo holds the statistics reported by gettxoutsetinfo for the base
+// chainstate (no coinstatsindex). It mirrors the per-coin accounting in
+// kernel/coinstats.cpp::ApplyStats + the hash kernels in ComputeUTXOStats.
+type UTXOSetInfo struct {
+	TxOuts           uint64      // # unspent outputs (coins)
+	Transactions     uint64      // # txids with at least one unspent output
+	BogoSize         uint64      // sum of GetBogoSize over all coins
+	TotalAmount      int64       // sum of all unspent output values (satoshis)
+	HashSerialized3  wire.Hash256 // Core hash_serialized_3 (SHA256d, cursor order)
+	MuHash           wire.Hash256 // Core muhash (MuHash3072, order-independent)
+}
+
+// ComputeUTXOSetInfo walks the ENTIRE current UTXO set (cache flushed to disk,
+// then a full DB cursor walk via UTXOSet.ScanUTXOs) and computes every base
+// gettxoutsetinfo statistic in a single pass, including BOTH set hashes.
+//
+// This is the faithful analogue of kernel/coinstats.cpp::ComputeUTXOStats:
+// after ForceFlushStateToDisk, Core iterates the CoinsDB cursor in key order
+// (txid ascending, then vout ascending) and streams every coin through
+// HashWriter (hash_serialized_3 = SHA256d) and/or MuHash3072. blockbrew's DB
+// key is "U" + txid(32) + vout(big-endian uint32), so ScanUTXOs yields coins
+// in exactly that order — identical to Core's cursor grouping (consecutive
+// same-txid coins, vouts ascending). The straight streaming digest therefore
+// matches Core byte-for-byte.
+//
+// We compute both hash flavors unconditionally (cheap relative to the disk
+// walk) so the RPC dispatch arm can pick the one the caller requested without
+// re-walking the set.
+func ComputeUTXOSetInfo(utxoSet *UTXOSet) (UTXOSetInfo, error) {
+	var info UTXOSetInfo
+
+	h := sha256.New()
+	mh := crypto.NewMuHash3072()
+
+	// transactions = number of distinct txids; the cursor groups coins by
+	// txid, so a count of txid transitions (plus one for the first) is exact.
+	var haveTx bool
+	var prevTxid wire.Hash256
+
+	_, err := utxoSet.ScanUTXOs(func(op wire.OutPoint, entry *UTXOEntry) bool {
+		// Per-coin accounting (ApplyStats).
+		info.TxOuts++
+		info.TotalAmount += entry.Amount
+		info.BogoSize += GetBogoSize(entry.PkScript)
+		if !haveTx || op.Hash != prevTxid {
+			info.Transactions++
+			prevTxid = op.Hash
+			haveTx = true
+		}
+
+		// hash_serialized_3: stream the per-coin record (cursor order).
+		_ = WriteTxOutSer(h, op, entry)
+		// muhash: insert the same per-coin record (order-independent).
+		mh.Insert(txOutSerBytes(op, entry))
+		return true
+	})
+	if err != nil {
+		return UTXOSetInfo{}, err
+	}
+
+	// HashWriter::GetHash() == SHA256d.
+	first := h.Sum(nil)
+	second := sha256.Sum256(first)
+	copy(info.HashSerialized3[:], second[:])
+
+	digest := mh.Finalize()
+	copy(info.MuHash[:], digest[:])
+
+	return info, nil
+}
+
 // ComputeMuHashUTXO computes Core's MUHASH3072 over the given UTXOSet's cache.
 // Since MuHash is order-invariant we don't strictly need to sort, but we keep
 // the sort for parity with ComputeHashSerialized — makes test reproductions

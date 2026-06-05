@@ -23,37 +23,104 @@ import (
 // gettxoutsetinfo
 // ============================================================================
 
-func (s *Server) handleGetTxOutSetInfo(_ json.RawMessage) (interface{}, *RPCError) {
+// handleGetTxOutSetInfo implements `gettxoutsetinfo ( "hash_type" hash_or_height
+// use_index )` for the base chainstate at the tip (no coinstatsindex).
+//
+// Reference: bitcoin-core/src/rpc/blockchain.cpp::gettxoutsetinfo +
+// src/kernel/coinstats.cpp::ComputeUTXOStats. We walk the entire UTXO set
+// (flush-then-cursor, via consensus.ComputeUTXOSetInfo) and report
+// height/bestblock/txouts/total_amount + the requested set hash.
+//
+// hash_type defaults to "hash_serialized_3" (Core's legacy SHA256d digest over
+// the coin cursor) and also accepts "muhash" (MuHash3072) and "none". The
+// hash_or_height argument requires coinstatsindex, which blockbrew does not run
+// here; per Core, hash_serialized_3 with a specific block is rejected with
+// RPC_INVALID_PARAMETER (-8). An unrecognized hash_type is likewise -8.
+func (s *Server) handleGetTxOutSetInfo(params json.RawMessage) (interface{}, *RPCError) {
 	if s.chainMgr == nil {
 		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
 	}
 
-	tipHash, tipHeight := s.chainMgr.BestBlock()
+	// Parse positional args: [hash_type, hash_or_height, use_index].
+	var args []json.RawMessage
+	if len(params) > 0 {
+		_ = json.Unmarshal(params, &args)
+	}
 
-	// Use ComputeHashSerialized to get coin count (iterates in-memory cache).
-	utxoSet := s.chainMgr.UTXOSet()
-	var txouts uint64
-	var hashSerialized string
-	if utxoSet != nil {
-		if us, ok := utxoSet.(*consensus.UTXOSet); ok {
-			h, count, err := consensus.ComputeHashSerialized(us)
-			if err == nil {
-				txouts = count
-				hashSerialized = h.String()
-			}
+	hashType := "hash_serialized_3"
+	if len(args) >= 1 {
+		var ht string
+		if err := json.Unmarshal(args[0], &ht); err == nil && ht != "" {
+			hashType = ht
 		}
 	}
 
-	return map[string]interface{}{
-		"height":            tipHeight,
-		"bestblock":         tipHash.String(),
-		"txouts":            txouts,
-		"bogosize":          0,
-		"hash_serialized_3": hashSerialized,
-		"muhash":            "",
-		"total_amount":      0.0,
-		"disk_size":         0,
-	}, nil
+	// ParseHashType: validate the hash_type up front (Core blockchain.cpp:967).
+	switch hashType {
+	case "hash_serialized_3", "muhash", "none":
+	default:
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParameter,
+			Message: fmt.Sprintf("'%s' is not a valid hash_type", hashType),
+		}
+	}
+
+	// hash_or_height present (non-null) => coinstatsindex territory. blockbrew's
+	// base chainstate only knows the tip, so mirror Core's specific-block
+	// rejections.
+	specificBlock := false
+	if len(args) >= 2 {
+		var raw interface{}
+		if err := json.Unmarshal(args[1], &raw); err == nil && raw != nil {
+			specificBlock = true
+		}
+	}
+	if specificBlock {
+		// Core checks the coinstatsindex requirement first (blockchain.cpp:1086):
+		// without g_coin_stats_index, ANY specific-block query is rejected with
+		// "Querying specific block heights requires coinstatsindex" before the
+		// hash_serialized_3-specific guard is reached. blockbrew has no
+		// coinstatsindex in the base chainstate, so it mirrors that path. Both
+		// arms use RPC_INVALID_PARAMETER (-8).
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParameter,
+			Message: "Querying specific block heights requires coinstatsindex",
+		}
+	}
+
+	tipHash, tipHeight := s.chainMgr.BestBlock()
+
+	utxoSet := s.chainMgr.UTXOSet()
+	us, ok := utxoSet.(*consensus.UTXOSet)
+	if !ok || us == nil {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to read UTXO set"}
+	}
+
+	info, err := consensus.ComputeUTXOSetInfo(us)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to read UTXO set"}
+	}
+
+	// disk_size: impl-specific estimate. Bogosize bytes are a reasonable
+	// database-independent proxy; Core uses CoinsDB::EstimateSize().
+	diskSize := info.BogoSize
+
+	ret := map[string]interface{}{
+		"height":       tipHeight,
+		"bestblock":    tipHash.String(),
+		"txouts":       info.TxOuts,
+		"bogosize":     info.BogoSize,
+		"transactions": info.Transactions,
+		"disk_size":    diskSize,
+		"total_amount": btcAmount(info.TotalAmount),
+	}
+	switch hashType {
+	case "hash_serialized_3":
+		ret["hash_serialized_3"] = info.HashSerialized3.String()
+	case "muhash":
+		ret["muhash"] = info.MuHash.String()
+	}
+	return ret, nil
 }
 
 // ============================================================================
