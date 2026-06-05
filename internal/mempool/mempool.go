@@ -1479,6 +1479,15 @@ func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 	return txOut.Value < dustThreshold
 }
 
+// IsDust is the exported, read-only accessor for the dust-output standardness
+// check. It delegates to the same isDust the AddTransaction gate uses (Core's
+// IsDust, policy/policy.cpp:66), so the testmempoolaccept RPC dry-run applies
+// the IDENTICAL dust threshold as real mempool submission. Pure function of the
+// output + the configured MinRelayFeeRate — does not mutate or lock the pool.
+func (mp *Mempool) IsDust(txOut *wire.TxOut) bool {
+	return mp.isDust(txOut)
+}
+
 // isStandardOutputScript returns true if pkScript is a known-standard output
 // type that blockbrew's mempool policy accepts.  Mirrors Bitcoin Core's
 // IsStandard (policy/policy.cpp:80) output classification:

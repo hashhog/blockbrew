@@ -9,6 +9,7 @@ import (
 
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/mempool"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -288,6 +289,20 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			continue
 		}
 
+		// Transaction version range check (standardness). Mirrors Bitcoin
+		// Core IsStandardTx (policy/policy.cpp:102-104): a version outside
+		// [TX_MIN_STANDARD_VERSION, TX_MAX_STANDARD_VERSION] is non-standard
+		// and rejected with reason "version". This is part of the genuine
+		// relay-policy floor (rejected by default Core, not a strict-flag-only
+		// gate), so the testmempoolaccept dry-run must enforce it exactly as
+		// the AddTransaction submission path (mempool.go:935) already does.
+		if tx.Version < mempool.TxMinStandardVersion || tx.Version > mempool.TxMaxStandardVersion {
+			result.Allowed = false
+			result.RejectReason = "version"
+			results = append(results, result)
+			continue
+		}
+
 		// Calculate vsize
 		weight := consensus.CalcTxWeight(tx)
 		vsize := (weight + 3) / 4
@@ -330,8 +345,25 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		}
 
 		var totalOutputValue int64
+		dustOutput := false
 		for _, txOut := range tx.TxOut {
 			totalOutputValue += txOut.Value
+			// Dust-output standardness check. Mirrors Bitcoin Core IsStandardTx
+			// (policy/policy.cpp:74-76,159-161 -> reason "dust"): an output
+			// whose value is below its dust threshold is non-standard. Reuse the
+			// mempool's own IsDust so the threshold is byte-identical to the
+			// AddTransaction submission path (mempool.go:3700). Part of the
+			// genuine relay-policy floor — rejected by default Core, so the
+			// testmempoolaccept dry-run must enforce it too.
+			if s.mempool.IsDust(txOut) {
+				dustOutput = true
+			}
+		}
+		if dustOutput {
+			result.Allowed = false
+			result.RejectReason = "dust"
+			results = append(results, result)
+			continue
 		}
 
 		fee := totalInputValue - totalOutputValue
