@@ -919,6 +919,18 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		if err := indexManager.RegisterIndex(blockFilterIndex); err != nil {
 			return fmt.Errorf("blockfilterindex: register: %w", err)
 		}
+		// BIP-157/158: index the genesis block (height 0) on a fresh index.
+		// Core's BaseIndex indexes every connected block starting at genesis;
+		// the genesis filter header chains from the all-zero parent header.
+		// blockbrew's connect hook skips height 0 (unspendable coinbase), so
+		// without this the genesis filter row would be missing and the
+		// height-1 filter header would chain from all-zero instead of from
+		// the genesis filter header — making every BIP-157 header diverge
+		// from Core. WriteGenesis is a no-op once the index is past genesis.
+		genesisHash := chainParams.GenesisBlock.Header.BlockHash()
+		if err := blockFilterIndex.WriteGenesis(chainParams.GenesisBlock, genesisHash); err != nil {
+			return fmt.Errorf("blockfilterindex: write genesis filter: %w", err)
+		}
 		log.Printf("BIP-157/158 blockfilterindex enabled (best_height=%d)", blockFilterIndex.BestHeight())
 	}
 

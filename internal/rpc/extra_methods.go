@@ -841,23 +841,29 @@ func (s *Server) handleGetBlockFilter(params json.RawMessage) (interface{}, *RPC
 		}
 	}
 
+	// Unknown filtertype → RPC_INVALID_ADDRESS_OR_KEY (-5) "Unknown filtertype"
+	// (bitcoin-core/src/rpc/blockchain.cpp:2981-2983 — BlockFilterTypeByName
+	// fails). blockbrew supports only the "basic" (0x00) type.
 	if filterType != "basic" {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Unknown filtertype"}
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Unknown filtertype"}
 	}
 
-	// Get the block filter index
+	// Filter index not enabled → RPC_MISC_ERROR (-1)
+	// "Index is not enabled for filtertype basic"
+	// (bitcoin-core/src/rpc/blockchain.cpp:2985-2988 — GetBlockFilterIndex
+	// returns null when -blockfilterindex was not set).
 	if s.indexManager == nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: "No indexes available"}
+		return nil, &RPCError{Code: RPCErrMisc, Message: fmt.Sprintf("Index is not enabled for filtertype %s", filterType)}
 	}
 
 	idx := s.indexManager.GetIndex("blockfilterindex")
 	if idx == nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: "Block filter index not available. Enable with -blockfilterindex"}
+		return nil, &RPCError{Code: RPCErrMisc, Message: fmt.Sprintf("Index is not enabled for filtertype %s", filterType)}
 	}
 
 	bfi, ok := idx.(*storage.BlockFilterIndex)
 	if !ok {
-		return nil, &RPCError{Code: RPCErrInternal, Message: "Block filter index not properly initialized"}
+		return nil, &RPCError{Code: RPCErrMisc, Message: fmt.Sprintf("Index is not enabled for filtertype %s", filterType)}
 	}
 
 	// Parse the block hash

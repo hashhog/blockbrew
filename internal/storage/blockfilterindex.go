@@ -294,6 +294,46 @@ func (idx *BlockFilterIndex) WriteBlockBatch(batch Batch, block *wire.MsgBlock, 
 	return nil
 }
 
+// WriteGenesis writes the BIP-158 basic filter row for the genesis block
+// (height 0) when the index is fresh (best height still -1). Bitcoin Core's
+// BaseIndex indexes EVERY connected block starting at the genesis block
+// (index/base.cpp::Init seeds m_best_block_index from the genesis block, and
+// the genesis filter is computed by BlockFilterIndex::CustomAppend like any
+// other). The genesis filter header chains from the all-zero previous header
+// (there is no parent), exactly as Core does — see
+// bitcoin-core/src/index/blockfilterindex.cpp and BlockFilter::ComputeHeader,
+// which is called with the all-zero prev for the first indexed block.
+//
+// blockbrew's connect hook is intentionally skipped for height 0 (the genesis
+// coinbase is unspendable, so the txindex/UTXO hooks have nothing to do), so
+// the filter index would otherwise never get a genesis row. That omission is
+// not benign: without the genesis filter header on disk, the height-1 filter
+// header would chain from all-zero instead of from the genesis filter header,
+// making EVERY filter header byte-incompatible with Core from height 1 onward
+// (the filter bytes themselves are unaffected; only the BIP-157 header chain
+// breaks). This helper closes that gap.
+//
+// Idempotent + safe: it only acts when bestHeight is still -1 (a freshly
+// initialised or migration-reset index). If the index already advanced past
+// genesis it returns nil without touching anything.
+//
+// genesisBlock must be the network's genesis block; genesisHash its block hash.
+// The genesis block has no spends, so undo data is nil (BasicFilterElements
+// over the genesis is just its coinbase output scriptPubKey).
+func (idx *BlockFilterIndex) WriteGenesis(genesisBlock *wire.MsgBlock, genesisHash wire.Hash256) error {
+	if idx.BestHeight() >= 0 {
+		// Already indexed at/past genesis; nothing to do.
+		return nil
+	}
+	// At a fresh index the in-memory prevFilterHeader is the zero value
+	// (all-zero), which is exactly the BIP-157 genesis-parent header. The
+	// shared WriteBlock path computes the genesis filter, chains its header
+	// off that all-zero prev, stores the row at height 0, advances
+	// prevFilterHeader to the genesis filter header, and publishes
+	// bestHeight=0 — so the height-1 connect chains correctly off genesis.
+	return idx.WriteBlock(genesisBlock, 0, genesisHash, nil)
+}
+
 // commitWriteState publishes the post-Write best-height/best-hash on the
 // in-memory index. Must be called only after the batch containing the
 // WriteBlockBatch entries has been committed to disk.
