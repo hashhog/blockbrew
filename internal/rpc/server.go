@@ -538,7 +538,7 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	case "gettxout":
 		return s.handleGetTxOut(params)
 	case "getindexinfo":
-		return s.handleGetIndexInfo()
+		return s.handleGetIndexInfo(params)
 	case "getblockfilter":
 		return s.handleGetBlockFilter(params)
 
