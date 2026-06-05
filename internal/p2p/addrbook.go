@@ -59,6 +59,14 @@ func isRoutableIP(ip net.IP) bool {
 	return true
 }
 
+// IsRoutableIP reports whether ip is publicly routable, mirroring Bitcoin
+// Core's CNetAddr::IsRoutable(). Exported so other packages (e.g. the RPC
+// getnodeaddresses network-class mapping) can classify a stored address
+// without duplicating the RFC range logic.
+func IsRoutableIP(ip net.IP) bool {
+	return isRoutableIP(ip)
+}
+
 // nonRoutableCIDRs contains IPv4/IPv6 ranges that Core rejects but that Go's
 // stdlib helpers do not cover:
 //   - 198.18.0.0/15   RFC2544 benchmarking
