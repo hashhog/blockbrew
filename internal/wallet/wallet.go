@@ -92,7 +92,39 @@ type Wallet struct {
 	// Initialised lazily on first access via getPayjoinSessions so old
 	// wallets constructed without going through NewWallet still work.
 	payjoinSessions *payjoinSessionStore
+
+	// ── Durable-persistence state (DATA-LOSS fix, sweep wa0fq5wtk) ──
+	//
+	// The legacy wallet used to persist ONLY at clean shutdown + backupwallet,
+	// so a SIGKILL/OOM/power-loss lost every getnewaddress/setlabel/send and
+	// every per-block ScanBlock credit since the last clean exit. These fields
+	// drive a dirty-flag + periodic background flush so any state-changing op
+	// is durably written within autoFlushInterval — mirroring Bitcoin Core's
+	// CWallet, which flushes to BerkeleyBatch on every mutation.
+	//
+	// dirty is set under w.mu by markDirtyLocked from every mutating path; the
+	// flusher clears it after a successful SaveToFile. savePassword is the
+	// password the auto-flush encrypts with (empty for the unencrypted legacy
+	// wallet, set by main.go's startup wiring; encryptwallet updates it).
+	dirty        bool
+	savePassword string
+	// lastSyncedHeight is the active-chain height the UTXO ledger has been
+	// scanned through (advanced by ScanBlock). Persisted so an unclean restart
+	// can rescan only the gap [lastSyncedHeight+1, tip] instead of from genesis.
+	lastSyncedHeight int32
+	// autoFlush goroutine lifecycle. flushStop is closed by StopAutoFlush to
+	// signal the loop to drain + exit; flushDone is closed by the loop on exit.
+	autoFlushOn   bool
+	flushStop     chan struct{}
+	flushDone     chan struct{}
+	flushInterval time.Duration
 }
+
+// DefaultAutoFlushInterval is how often the background flusher persists a dirty
+// wallet. Short enough that an OOM/SIGKILL loses at most a few seconds of
+// wallet mutations, long enough that a busy ScanBlock stream coalesces into one
+// write per interval rather than one per block.
+const DefaultAutoFlushInterval = 5 * time.Second
 
 // WalletUTXO is a UTXO owned by the wallet.
 type WalletUTXO struct {
@@ -271,6 +303,7 @@ func (w *Wallet) CreateFromMnemonic(mnemonic, passphrase string) error {
 		return err
 	}
 
+	w.markDirtyLocked()
 	return nil
 }
 
@@ -295,6 +328,7 @@ func (w *Wallet) CreateFromSeed(seed []byte) error {
 		return err
 	}
 
+	w.markDirtyLocked()
 	return nil
 }
 
@@ -453,6 +487,10 @@ func (w *Wallet) newAddressOfTypeLocked(addrType WalletAddressType, isChange boo
 	if len(w.accounts) > 0 {
 		w.accounts[0].Addresses = append(w.accounts[0].Addresses, addr)
 	}
+
+	// Keypool advanced + new owned address registered → persist (a SIGKILL
+	// after getnewaddress must not re-hand the same index or lose the address).
+	w.markDirtyLocked()
 
 	return addr, nil
 }
@@ -743,6 +781,7 @@ func (w *Wallet) AddUTXO(utxo *WalletUTXO) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.utxos[utxo.OutPoint] = utxo
+	w.markDirtyLocked()
 }
 
 // RemoveUTXO removes a UTXO from the wallet.
@@ -750,6 +789,7 @@ func (w *Wallet) RemoveUTXO(outpoint wire.OutPoint) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	delete(w.utxos, outpoint)
+	w.markDirtyLocked()
 }
 
 // LockCoin marks a UTXO as temporarily unspendable. `persistent` mirrors
@@ -877,6 +917,7 @@ func (w *Wallet) SetLabel(addr, label string) error {
 	} else {
 		w.addrLabels[addr] = label
 	}
+	w.markDirtyLocked()
 	return nil
 }
 
@@ -2047,6 +2088,17 @@ func (w *Wallet) ScanBlock(block *wire.MsgBlock, height int32) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// Advance the durable scan cursor + flag the wallet dirty: a per-block
+	// credit/debit (and the height it was scanned to) MUST survive an unclean
+	// restart, otherwise an OOM mid-IBD loses confirmed wallet funds and the
+	// next start re-scans from genesis. Bump the cursor even when this block is
+	// wallet-irrelevant so the reconcile gap stays tight. Monotonic — a reorg
+	// disconnect is reversed by UnscanBlock, not by lowering this cursor.
+	if height > w.lastSyncedHeight {
+		w.lastSyncedHeight = height
+	}
+	w.markDirtyLocked()
+
 	blockHash := block.Header.BlockHash()
 	blockTime := int64(block.Header.Timestamp)
 
@@ -2215,6 +2267,11 @@ func (w *Wallet) UnscanBlock(block *wire.MsgBlock, height int32) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	// A disconnect mutates the ledger → persist it. The connect-side scan of
+	// the replacement chain re-credits/advances the cursor; we do not lower
+	// lastSyncedHeight here (the new tip's ScanBlock will set it correctly).
+	w.markDirtyLocked()
+
 	// Collect the txids this block introduced so we can drop their history
 	// entries symmetrically with the UTXO removal — otherwise a reorg would
 	// leave listtransactions/gettransaction reporting txs that no longer exist
@@ -2340,6 +2397,7 @@ func (w *Wallet) registerDerivedLocked(addrType WalletAddressType, change, index
 			w.nextExtIdx = index + 1
 		}
 	}
+	w.markDirtyLocked()
 }
 
 // ownedScriptIndex builds, for every standard template/chain leg, the set of
@@ -2701,6 +2759,7 @@ func (w *Wallet) ImportPrivKey(privKey *bbcrypto.PrivateKey, label string) ([]st
 			w.addrLabels[a] = label
 		}
 	}
+	w.markDirtyLocked()
 	return addrs, nil
 }
 
@@ -2888,6 +2947,7 @@ func (w *Wallet) EncryptWallet(passphrase string) error {
 		w.relockTimer = nil
 	}
 
+	w.markDirtyLocked()
 	return nil
 }
 

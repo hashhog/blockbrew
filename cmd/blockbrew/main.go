@@ -1512,18 +1512,84 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		ChainParams: chainParams,
 	}
 	if _, err := os.Stat(walletPath); err == nil {
-		// Load existing wallet
-		loaded, loadErr := wallet.LoadFromFile(walletPath, "", walletCfg)
+		// Load existing wallet.
+		//
+		// NOTE: LoadFromFile takes the DATA DIR (it joins "wallet.dat" itself).
+		// The previous code passed walletPath (<datadir>/wallet.dat), which made
+		// LoadFromFile look for <datadir>/wallet.dat/wallet.dat — a path that
+		// never exists — so EVERY restart silently "failed to load" and fell
+		// through to an empty wallet, discarding all prior wallet state. That is
+		// itself a restart-persistence data-loss bug; pass cfg.DataDir so the
+		// on-disk wallet actually loads. LoadFromFile is now fault-tolerant: a
+		// corrupt/partial primary file transparently recovers from wallet.dat.bak
+		// and never aborts startup.
+		loaded, loadErr := wallet.LoadFromFile(cfg.DataDir, "", walletCfg)
 		if loadErr != nil {
 			log.Printf("Warning: failed to load wallet from %s: %v (starting with empty wallet)", walletPath, loadErr)
 			w = wallet.NewWallet(walletCfg)
 		} else {
 			w = loaded
-			log.Printf("Wallet loaded from %s", walletPath)
+			log.Printf("Wallet loaded from %s (last synced height %d)", walletPath, w.LastSyncedHeight())
 		}
 	} else {
 		w = wallet.NewWallet(walletCfg)
 		log.Printf("No wallet file found, starting with empty wallet")
+	}
+
+	// Wallet reconcile + durable-flush wiring (DATA-LOSS fix, sweep wa0fq5wtk).
+	//
+	// (a) RECONCILE on startup: bring the wallet UTXO ledger up to the chain
+	//     tip by scanning the gap [last_synced_height+1, tip]. After an unclean
+	//     restart the persisted ledger may trail the chainstate (the last few
+	//     auto-flushed blocks, or — for a wallet that lost its in-memory state
+	//     to a SIGKILL — a larger gap). Rescanning the gap re-credits/-debits
+	//     any blocks the wallet missed so getbalance/listunspent match the chain
+	//     before the live connect loop takes over. Mirrors Bitcoin Core's
+	//     CWallet startup ScanForWalletTransactions from m_last_block_processed.
+	// (b) AUTO-FLUSH: a background goroutine durably persists the wallet a few
+	//     seconds after any mutation (getnewaddress / setlabel / send / per-block
+	//     ScanBlock credit), so a SIGKILL/OOM/power-loss can no longer wipe every
+	//     mutation since the last clean shutdown. StopAutoFlush (in the shutdown
+	//     path below) does a final synchronous flush.
+	if w != nil {
+		_, tipHeight := chainMgr.BestBlock()
+		startH := w.LastSyncedHeight() + 1
+		if startH < 1 {
+			startH = 1
+		}
+		if tipHeight >= startH {
+			getBlock := func(height int32) (*wire.MsgBlock, bool) {
+				hash, herr := chainDB.GetBlockHashByHeight(height)
+				if herr != nil {
+					return nil, false
+				}
+				blk, berr := chainDB.GetBlock(hash)
+				if berr != nil || blk == nil {
+					return nil, false
+				}
+				return blk, true
+			}
+			log.Printf("wallet reconcile: scanning gap [%d, %d] to chain tip", startH, tipHeight)
+			scannedTo, rerr := w.Rescan(startH, tipHeight, getBlock)
+			if rerr != nil {
+				// ErrNoMasterKey simply means there's nothing to scan for (empty
+				// wallet) — not fatal. Any other error is logged; the live
+				// connect loop will still keep the wallet current going forward.
+				log.Printf("wallet reconcile: %v (scanned to %d)", rerr, scannedTo)
+			} else if scannedTo >= startH {
+				log.Printf("wallet reconcile: ledger brought up to height %d", scannedTo)
+			}
+			if scannedTo > w.LastSyncedHeight() {
+				w.SetLastSyncedHeight(scannedTo)
+			} else {
+				// Even an empty/master-less wallet should record that it has
+				// observed the chain up to the tip so the next restart's gap
+				// stays bounded.
+				w.SetLastSyncedHeight(tipHeight)
+			}
+		}
+		w.StartAutoFlush(wallet.DefaultAutoFlushInterval)
+		log.Printf("wallet auto-flush started (interval %s)", wallet.DefaultAutoFlushInterval)
 	}
 
 	// 10a. Initialize the multi-wallet manager.
@@ -1808,6 +1874,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("mempool.dat saved (%d txs)", mp.Count())
 		}
 		if w != nil {
+			// Stop the auto-flusher (does a final synchronous flush of any
+			// pending mutations) then force one more durable save so the clean
+			// shutdown is guaranteed persisted even if nothing was dirty.
+			w.StopAutoFlush()
 			if err := w.SaveToFile(""); err != nil {
 				log.Printf("Warning: wallet save failed: %v", err)
 			} else {
