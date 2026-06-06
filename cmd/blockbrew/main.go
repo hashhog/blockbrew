@@ -952,6 +952,28 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		log.Printf("BIP-157/158 blockfilterindex enabled (best_height=%d)", blockFilterIndex.BestHeight())
 	}
 
+	// 6a-bis. Secondary-index startup catch-up. Mirrors Bitcoin Core's
+	// BaseIndex::Sync / Rewind (index/base.cpp): on startup each enabled index
+	// must be walked forward from its persisted best block to the active chain
+	// tip — and rewound if it is ahead of the tip after an unclean exit.
+	// blockbrew's live OnBlockConnected fan-out only fires for blocks connected
+	// AFTER startup, so an index that fell behind the chainstate (a crash
+	// between the chainstate flush and the index batch commit, or an index
+	// enabled on an already-synced node) was never brought current. Run this
+	// AFTER the chainstate + header-index load (NewChainManager above) and
+	// BEFORE the P2P sync manager starts connecting new blocks, so the index
+	// is consistent with the tip before live connects resume.
+	if cfg.BlockFilterIndex {
+		_, tipHeight := chainMgr.BestBlock()
+		if err := indexManager.CatchUp(tipHeight, chainDB.GetBlockHashByHeight); err != nil {
+			// Non-fatal, matching the live index hooks' posture: log loudly
+			// and continue. A half-synced index will be advanced by the live
+			// connect hook as new blocks arrive; the next restart re-runs this
+			// catch-up from wherever it got to.
+			log.Printf("WARNING: index catch-up did not complete: %v", err)
+		}
+	}
+
 	// Pattern B closure (2026-05-05) — wire chain → mempool refill on
 	// disconnect. ChainManager's DisconnectBlock fires this for every block
 	// popped off the active tip (including each peel inside ReorgTo). The
