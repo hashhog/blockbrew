@@ -455,6 +455,12 @@ type orphanEntry struct {
 	txHash     wire.Hash256
 	addedTime  time.Time
 	missingOut []wire.OutPoint // Missing parent outpoints
+	// fromPeer is the address of the peer that announced this orphan to us
+	// (empty for locally-originated / RPC txs and for orphans re-added from a
+	// disconnected block during a reorg). Used by RemoveOrphansForPeer to evict
+	// a disconnecting peer's contributed orphans — mirrors Bitcoin Core's
+	// TxOrphanage::EraseForPeer (txorphanage.cpp), driven from FinalizeNode.
+	fromPeer string
 }
 
 // MemPoolRemovalReason mirrors Core's `enum class MemPoolRemovalReason`
@@ -884,11 +890,31 @@ func (mp *Mempool) ChainHeight() int32 {
 // script verification, and cluster mempool limits.
 // Returns nil if accepted, error with reason if rejected.
 func (mp *Mempool) AcceptToMemoryPool(tx *wire.MsgTx) error {
-	return mp.AddTransaction(tx)
+	return mp.AddTransactionFrom(tx, "")
+}
+
+// AcceptToMemoryPoolFrom is AcceptToMemoryPool with peer attribution. fromPeer
+// is the address of the peer that announced the tx (empty for locally-originated
+// / RPC txs). When the tx is parked in the orphan pool, fromPeer is recorded so
+// the orphan can later be evicted by RemoveOrphansForPeer on peer disconnect
+// (mirrors Bitcoin Core's TxOrphanage::EraseForPeer).
+func (mp *Mempool) AcceptToMemoryPoolFrom(tx *wire.MsgTx, fromPeer string) error {
+	return mp.AddTransactionFrom(tx, fromPeer)
 }
 
 // AddTransaction validates and adds a transaction to the mempool.
-// Returns nil if accepted, error with reason if rejected.
+// Returns nil if accepted, error with reason if rejected. The tx is treated as
+// locally-originated for orphan peer-attribution purposes (fromPeer="");
+// P2P callers that know the announcing peer should use AddTransactionFrom.
+func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
+	return mp.AddTransactionFrom(tx, "")
+}
+
+// AddTransactionFrom is AddTransaction with peer attribution. fromPeer is the
+// address of the peer that announced the tx (empty for locally-originated / RPC
+// txs and for txs re-added from a disconnected block during a reorg). It is only
+// consulted if the tx is parked in the orphan pool, where it is recorded on the
+// orphan entry so RemoveOrphansForPeer can evict it on peer disconnect.
 //
 // Pipeline mirrors Bitcoin Core MemPoolAccept::PreChecks → ReplacementChecks
 // → PolicyScriptChecks → ConsensusScriptChecks (validation.cpp:782-1190).
@@ -896,7 +922,7 @@ func (mp *Mempool) AcceptToMemoryPool(tx *wire.MsgTx) error {
 // checks first (sanity, coinbase, IsStandardTx, MIN_STANDARD_TX_NONWITNESS_SIZE,
 // IsFinalTx), then sigops + chain-context (BIP-68 + CheckTxInputs), then
 // expensive script verification last.
-func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
+func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
 	txHash := tx.TxHash()
 	wtxid := tx.WTxHash()
 
@@ -1190,7 +1216,7 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 
 	// If we have missing inputs, treat as orphan
 	if len(missingInputs) > 0 {
-		mp.addOrphanLocked(txHash, tx, missingInputs)
+		mp.addOrphanLocked(txHash, tx, missingInputs, fromPeer)
 		return fmt.Errorf("%w: added as orphan with %d missing inputs", ErrMissingInputs, len(missingInputs))
 	}
 
@@ -2299,9 +2325,12 @@ func (mp *Mempool) maybeEvictLocked() {
 
 // Orphan pool management
 
-// addOrphanLocked adds a transaction to the orphan pool.
+// addOrphanLocked adds a transaction to the orphan pool. fromPeer is the address
+// of the peer that announced it (empty for locally-originated / RPC / reorg
+// re-add); it is recorded so RemoveOrphansForPeer can evict the orphan when that
+// peer disconnects (Bitcoin Core txorphanage.cpp::AddTx records m_announcers).
 // Must be called with mu held.
-func (mp *Mempool) addOrphanLocked(txHash wire.Hash256, tx *wire.MsgTx, missingOuts []wire.OutPoint) {
+func (mp *Mempool) addOrphanLocked(txHash wire.Hash256, tx *wire.MsgTx, missingOuts []wire.OutPoint, fromPeer string) {
 	// Check if already in orphan pool
 	if _, ok := mp.orphans[txHash]; ok {
 		return
@@ -2317,6 +2346,7 @@ func (mp *Mempool) addOrphanLocked(txHash wire.Hash256, tx *wire.MsgTx, missingO
 		txHash:     txHash,
 		addedTime:  time.Now(),
 		missingOut: missingOuts,
+		fromPeer:   fromPeer,
 	}
 }
 
@@ -2396,6 +2426,38 @@ func (mp *Mempool) ExpireOrphans() {
 			delete(mp.orphans, hash)
 		}
 	}
+}
+
+// RemoveOrphansForPeer evicts every orphan announced by the given peer address
+// and returns the number removed. Called when a peer disconnects so its
+// contributed orphans do not linger in the pool until natural TTL/eviction.
+//
+// Mirrors Bitcoin Core's TxOrphanage::EraseForPeer (txorphanage.cpp), invoked
+// from net_processing.cpp::FinalizeNode on peer disconnect. blockbrew records a
+// single announcer per orphan (the peer that first parked it), so erase is an
+// exact fromPeer match. Locally-originated / RPC / reorg-re-added orphans carry
+// fromPeer=="" and are never matched by a real peer address, so they survive.
+//
+// Takes the same mu as the other orphan ops (addOrphanLocked / ExpireOrphans /
+// processOrphansLocked) — safe to call from any goroutine.
+func (mp *Mempool) RemoveOrphansForPeer(peerAddr string) int {
+	// An empty address would erase all locally-originated orphans; refuse it so
+	// a missing/blank peer address can never wipe the orphan pool.
+	if peerAddr == "" {
+		return 0
+	}
+
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+
+	removed := 0
+	for hash, orphan := range mp.orphans {
+		if orphan.fromPeer == peerAddr {
+			delete(mp.orphans, hash)
+			removed++
+		}
+	}
+	return removed
 }
 
 // OrphanCount returns the number of orphan transactions.

@@ -1326,7 +1326,11 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// Wire mempool tx relay: accept incoming transactions via AcceptToMemoryPool
 	// and relay them to peers on success.
 	syncListeners.OnTx = func(peer *p2p.Peer, msg *p2p.MsgTx) {
-		if err := mp.AcceptToMemoryPool(msg.Tx); err != nil {
+		// Attribute the tx to its announcing peer so that, if it is parked in
+		// the orphan pool (missing parents), it can be evicted by
+		// RemoveOrphansForPeer when this peer disconnects (orphan-pool DoS
+		// hardening — mirrors Core txorphanage EraseForPeer attribution).
+		if err := mp.AcceptToMemoryPoolFrom(msg.Tx, peer.Address()); err != nil {
 			log.Printf("[mempool] Rejected tx from %s: %v", peer.Address(), err)
 			return
 		}
@@ -1482,6 +1486,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		},
 		OnPeerDisconnected: func(p *p2p.Peer) {
 			syncMgr.HandlePeerDisconnected(p)
+			// Orphan-pool DoS hardening: evict any orphans this peer parked so
+			// a disconnected peer's contributions don't linger until TTL/random
+			// eviction. Mirrors Bitcoin Core net_processing.cpp::FinalizeNode →
+			// TxOrphanage::EraseForPeer.
+			if n := mp.RemoveOrphansForPeer(p.Address()); n > 0 {
+				log.Printf("[mempool] Evicted %d orphan(s) for disconnected peer %s", n, p.Address())
+			}
 		},
 		PreferV2:                    cfg.BIP324V2,
 		AdvertiseNodeBloom:          cfg.PeerBloomFilters,

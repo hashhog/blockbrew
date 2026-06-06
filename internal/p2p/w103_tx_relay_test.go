@@ -39,6 +39,10 @@ package p2p
 import (
 	"testing"
 	"time"
+
+	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/mempool"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -646,26 +650,115 @@ func TestW103_G23_OrphanKeyedByTxidNotWtxid(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BUG-24 (P1) G24: EraseOrphansForPeer absent.
-// Bitcoin Core txorphanage: EraseForPeer(NodeId peer) — removes all orphans
-// announced by a disconnecting peer. blockbrew orphanEntry struct has no
-// fromPeer/announcer field. When a peer disconnects, their contributed orphans
-// remain in the pool indefinitely (until natural expiry or eviction).
+// G24 (FIXED — W103 BUG-24): EraseOrphansForPeer is wired into the live node.
 //
-// Test: verify orphanEntry has no peer tracking field (documents absence).
+// Bitcoin Core txorphanage::EraseForPeer (txorphanage.cpp), driven from
+// net_processing.cpp::FinalizeNode, removes all orphans announced by a
+// disconnecting peer so the orphan pool cannot be polluted by a peer that
+// connects, spams orphans, and disconnects.
+//
+// blockbrew fix:
+//   - orphanEntry now carries a fromPeer field (the announcing peer address);
+//   - addOrphanLocked records it; AddTransactionFrom / AcceptToMemoryPoolFrom
+//     plumb the announcing peer down from the P2P tx-message handler
+//     (cmd/blockbrew/main.go OnTx → peer.Address()); locally-originated / RPC
+//     txs pass "";
+//   - Mempool.RemoveOrphansForPeer(addr) erases exactly that peer's orphans
+//     under the same lock the other orphan ops use;
+//   - OnPeerDisconnected (cmd/blockbrew/main.go) calls it on every disconnect.
+//
+// This test FLIPS the former absence-assertion: it drives a real Mempool,
+// parks orphans attributed to two distinct peers, and asserts that
+// RemoveOrphansForPeer erases the disconnected peer's orphans while RETAINING
+// the other peer's. The mempool-package white-box counterpart is
+// internal/mempool/orphan_eraseforpeer_test.go.
 // ─────────────────────────────────────────────────────────────────────────────
-func TestW103_G24_EraseOrphansForPeerAbsent(t *testing.T) {
-	// BUG-24: orphanEntry (mempool.go:400) has no fromPeer/announcer field.
-	// Core TxOrphanage::EraseForPeer removes all orphans where peer is the sole
-	// announcer. blockbrew cannot do this because orphans are not linked to peers.
-	//
-	// Impact: disconnecting a peer that contributed many orphans leaves the orphan
-	// pool polluted. Core limits per-peer orphan memory via ReservedPeerUsage().
-	//
-	// Test indirectly: verify InvTypeTx is available (orphan parent fetch type)
-	// and document the structural absence.
-	_ = InvTypeTx
-	t.Log("G24: orphanEntry has no fromPeer field — EraseOrphansForPeer cannot be implemented (BUG-24)")
+
+// nilUTXOView is a UTXOView whose every lookup misses, so any tx fed to the
+// mempool has "missing inputs" and is parked as an orphan (orphan branch runs
+// before any script validation).
+type nilUTXOView struct{}
+
+func (nilUTXOView) GetUTXO(wire.OutPoint) *consensus.UTXOEntry { return nil }
+
+// makeOrphanTx builds a minimal standard tx (one input spending the given
+// missing outpoint, one P2WPKH output) that survives the mempool pre-checks and
+// lands in the orphan pool. Mirrors mempool_test.go::createTestTransaction.
+func makeOrphanTx(seed byte) *wire.MsgTx {
+	var missingHash wire.Hash256
+	missingHash[0] = seed
+	tx := &wire.MsgTx{Version: 2, LockTime: 0}
+	tx.TxIn = append(tx.TxIn, &wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: missingHash, Index: 0},
+		SignatureScript:  make([]byte, 107), // all-zero = push-only (OP_0…)
+		Sequence:         0xffffffff,
+	})
+	pkScript := make([]byte, 22)
+	pkScript[0] = 0x00 // OP_0
+	pkScript[1] = 0x14 // push 20 bytes
+	tx.TxOut = append(tx.TxOut, &wire.TxOut{Value: 99_000, PkScript: pkScript})
+	return tx
+}
+
+func TestW103_G24_EraseOrphansForPeer(t *testing.T) {
+	// Orphan parent fetches still use MSG_TX regardless of wtxidrelay
+	// (Core net_processing.cpp:4057) — keep this gate-relevant assertion.
+	if InvTypeTx != 1 {
+		t.Errorf("G24: InvTypeTx = %d, want 1 (orphan parent requests use MSG_TX)", InvTypeTx)
+	}
+
+	mp := mempool.New(mempool.Config{
+		MaxSize:                10_000_000,
+		MinRelayFeeRate:        1000,
+		MaxOrphanTxs:           100,
+		ChainParams:            consensus.RegtestParams(),
+		MempoolFullRBF:         true,
+		MempoolFullRBFExplicit: true,
+	}, nilUTXOView{})
+
+	const peerA = "10.0.0.1:8333"
+	const peerB = "10.0.0.2:8333"
+
+	// Two orphans announced by peerA, one by peerB. AddTransactionFrom parks each
+	// because its single input is missing from the (nil) UTXO view.
+	a1 := makeOrphanTx(0x21)
+	a2 := makeOrphanTx(0x22)
+	b1 := makeOrphanTx(0x23)
+	for _, tc := range []struct {
+		tx       *wire.MsgTx
+		fromPeer string
+	}{{a1, peerA}, {a2, peerA}, {b1, peerB}} {
+		if err := mp.AcceptToMemoryPoolFrom(tc.tx, tc.fromPeer); err == nil {
+			t.Fatalf("G24: expected missing-inputs error (orphan parked) for peer %s", tc.fromPeer)
+		}
+	}
+	if got := mp.OrphanCount(); got != 3 {
+		t.Fatalf("G24: setup expected 3 orphans, got %d", got)
+	}
+
+	// peerA disconnects → exactly peerA's two orphans erased, peerB's retained.
+	if removed := mp.RemoveOrphansForPeer(peerA); removed != 2 {
+		t.Fatalf("G24: RemoveOrphansForPeer(peerA) = %d, want 2", removed)
+	}
+	// peerB's single orphan must be the one retained (peerA contributed exactly
+	// the other two, just erased). Exact orphan-identity retention is asserted in
+	// the mempool-package white-box test orphan_eraseforpeer_test.go.
+	if got := mp.OrphanCount(); got != 1 {
+		t.Fatalf("G24: after peerA disconnect expected 1 orphan retained (peerB's), got %d", got)
+	}
+
+	// Idempotent: disconnecting peerA again removes nothing.
+	if removed := mp.RemoveOrphansForPeer(peerA); removed != 0 {
+		t.Errorf("G24: second RemoveOrphansForPeer(peerA) = %d, want 0", removed)
+	}
+
+	// peerB disconnects → pool drains.
+	if removed := mp.RemoveOrphansForPeer(peerB); removed != 1 {
+		t.Fatalf("G24: RemoveOrphansForPeer(peerB) = %d, want 1", removed)
+	}
+	if got := mp.OrphanCount(); got != 0 {
+		t.Fatalf("G24: after peerB disconnect expected 0 orphans, got %d", got)
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
