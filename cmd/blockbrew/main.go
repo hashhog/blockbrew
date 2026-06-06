@@ -814,6 +814,24 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		}
 	}
 
+	// 3b. Rehydrate the header index from disk so a restart resumes from the
+	// saved tip immediately, instead of re-downloading ~every header from peers
+	// before ChainManager.loadChainState can restore the tip (the ~15-minute
+	// "deferring recovery until headers are re-synced" penalty seen on every
+	// restart). Must run BEFORE NewChainManager (which calls loadChainState).
+	// No-op on a fresh or snapshot-only chainstate: no persisted height index
+	// to walk, so it loads 0 headers and the node falls back to network sync.
+	if chainState != nil && chainState.BestHeight > 0 {
+		hStart := time.Now()
+		loaded, herr := headerIndex.HydrateFromDB(chainDB, chainState.BestHeight)
+		if herr != nil {
+			log.Printf("Header index hydration stopped early after %d headers: %v "+
+				"(falling back to network header sync for the remainder)", loaded, herr)
+		}
+		log.Printf("Header index hydrated from disk: %d headers, tip now at height %d (%s)",
+			loaded, headerIndex.BestHeight(), time.Since(hStart).Round(time.Millisecond))
+	}
+
 	// 4. Initialize UTXO set with the configured cache budget.
 	utxoSet := consensus.NewUTXOSetWithMaxCache(chainDB, utxoCacheBytes)
 	log.Printf("UTXO set initialized (cache_max=%d MiB)", utxoCacheBytes>>20)
