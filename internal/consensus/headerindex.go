@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"errors"
+	"fmt"
 	"math/big"
 	"sort"
 	"sync"
@@ -657,6 +658,63 @@ func (idx *HeaderIndex) Genesis() *BlockNode {
 	idx.mu.RLock()
 	defer idx.mu.RUnlock()
 	return idx.genesis
+}
+
+// PersistedHeaderSource supplies the connected header chain from disk so the
+// in-memory header index can be rehydrated on startup. Satisfied by
+// *storage.ChainDB.
+type PersistedHeaderSource interface {
+	GetBlockHashByHeight(height int32) (wire.Hash256, error)
+	GetBlockHeader(hash wire.Hash256) (*wire.BlockHeader, error)
+}
+
+// HydrateFromDB rebuilds the in-memory header index from headers already
+// persisted in the chain DB, walking the connected chain from height 1 up to
+// uptoHeight (the saved chainstate tip).
+//
+// Without this, a restart begins with only genesis in the index, so
+// ChainManager.loadChainState cannot resolve the saved best-block and marks the
+// node pendingRecovery — it then re-downloads ~every header from peers before it
+// can restore the tip and resume block download (the "deferring recovery until
+// headers are re-synced" path, a ~15-minute penalty on every restart, observed
+// acutely on the 2026-06-06 blockbrew snapshot restore). After hydration the
+// saved tip is present in the index, so loadChainState restores it immediately
+// and block download resumes from the real tip. Mirrors how Bitcoin Core loads
+// the block index from disk at startup rather than re-fetching it.
+//
+// Each header is re-validated through AddHeader (PoW + contextual checks) — cheap
+// and CPU-local relative to a network re-download, and it doubles as an
+// integrity check. Walking stops cleanly at the first missing height
+// (ErrNotFound); headers beyond the connected tip are not in the height index
+// and are re-fetched by normal header sync. Returns the number of headers
+// loaded. A header that fails revalidation (corruption / param mismatch) stops
+// hydration and returns the error so the caller can log it; the node then falls
+// back to network header sync for the remainder (graceful degradation — the
+// caller must NOT treat this as fatal).
+func (idx *HeaderIndex) HydrateFromDB(src PersistedHeaderSource, uptoHeight int32) (int, error) {
+	loaded := 0
+	for h := int32(1); h <= uptoHeight; h++ {
+		hash, err := src.GetBlockHashByHeight(h)
+		if err != nil {
+			// Gap in the height index: nothing more to load contiguously.
+			break
+		}
+		hdr, err := src.GetBlockHeader(hash)
+		if err != nil {
+			// Height mapping exists but the header bytes are missing — stop
+			// and let network header sync fill the rest.
+			break
+		}
+		if _, err := idx.AddHeader(*hdr, true); err != nil {
+			if errors.Is(err, ErrDuplicateHeader) {
+				continue
+			}
+			return loaded, fmt.Errorf("hydrate header at height %d (%s): %w",
+				h, hash.String()[:16], err)
+		}
+		loaded++
+	}
+	return loaded, nil
 }
 
 // HasHeader checks if a header with the given hash exists.
