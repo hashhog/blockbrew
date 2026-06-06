@@ -1093,8 +1093,31 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// Height -> hash mapping
 			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
 
-			// UTXO flush into the same batch when it's time
-			if shouldFlush {
+			// UTXO flush into the same atomic batch.
+			//
+			// DURABILITY (2026-06-06): flush the UTXO delta in the SAME synced
+			// batch whenever we advance the on-disk tip pointer
+			// (writeChainState), not only on the flushInterval (2000-block)
+			// shouldFlush cadence. At tip (isIBD=false) writeChainState is true
+			// every block, so the persisted ChainState tip used to run up to
+			// flushInterval blocks AHEAD of the persisted UTXO set; an unclean
+			// exit (OOM/SIGKILL, no final flush) then left the tip pointing past
+			// coins that only existed in the in-memory cache, and the next block
+			// failed "transaction input references missing UTXO" and wedged
+			// (the recurring [CHAINSTATE-CORRUPTION] banner — h=952343 on
+			// 2026-06-06, and 950146/950155/950304/952342 before it).
+			//
+			// writeChainState ⊇ shouldFlush (writeChainState = !isIBD ||
+			// shouldFlush) and writeChainState ⟹ a Sync batch (the NoSync arm
+			// above is gated on isIBD && !shouldFlush), so the UTXO delta always
+			// rides a durable batch together with the tip. FlushBatch is
+			// incremental (writes only the dirty set, then clears it), so at tip
+			// this costs one block's coins per ~10 min; during IBD writeChainState
+			// only fires on shouldFlush, so the 2000-block cadence is unchanged.
+			// Mirrors Bitcoin Core's invariant that CoinsTip's best-block is
+			// flushed atomically with the coins and never trails the active tip
+			// on disk (validation.cpp FlushStateToDisk).
+			if writeChainState {
 				type batchFlusher interface {
 					FlushBatch(storage.Batch) error
 				}
