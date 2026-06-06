@@ -979,9 +979,16 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// clean past, leaving the node stuck in IBD mode permanently. isIBD is
 	// latched: once false, nothing here sets it true again.
 	const maxTipAgeSecs = 24 * 60 * 60 // Core DEFAULT_MAX_TIP_AGE
-	if cm.isIBD && int64(cm.tipNode.Header.Timestamp) >= time.Now().Unix()-maxTipAgeSecs {
+	tipRecent := int64(cm.tipNode.Header.Timestamp) >= time.Now().Unix()-maxTipAgeSecs
+	// G22 (W101): height-based assume-valid exit uses >= (Core semantics), not ==.
+	// An exact equality is jumped clean past by any height skip (e.g. an
+	// assumeUTXO snapshot import or a multi-block connect), leaving the node
+	// stuck in IBD permanently. Mirrors Core's IsInitialBlockDownload, which
+	// exits once the threshold is crossed (>=), never on an exact match.
+	pastAssumeValid := cm.assumeValidHeight > 0 && cm.tipHeight >= cm.assumeValidHeight
+	if cm.isIBD && (tipRecent || pastAssumeValid) {
 		cm.isIBD = false
-		log.Printf("chainmgr: exiting IBD mode at height %d (tip is recent)", cm.tipHeight)
+		log.Printf("chainmgr: exiting IBD mode at height %d (tip recent=%v, past-assume-valid=%v)", cm.tipHeight, tipRecent, pastAssumeValid)
 	}
 
 	// Periodic UTXO flush during IBD
