@@ -660,17 +660,17 @@ func (idx *HeaderIndex) Genesis() *BlockNode {
 	return idx.genesis
 }
 
-// PersistedHeaderSource supplies the connected header chain from disk so the
-// in-memory header index can be rehydrated on startup. Satisfied by
-// *storage.ChainDB.
+// PersistedHeaderSource supplies persisted headers (by hash) so the in-memory
+// header index can be rehydrated on startup. Satisfied by *storage.ChainDB.
 type PersistedHeaderSource interface {
-	GetBlockHashByHeight(height int32) (wire.Hash256, error)
 	GetBlockHeader(hash wire.Hash256) (*wire.BlockHeader, error)
 }
 
 // HydrateFromDB rebuilds the in-memory header index from headers already
-// persisted in the chain DB, walking the connected chain from height 1 up to
-// uptoHeight (the saved chainstate tip).
+// persisted in the chain DB, walking the chain BACKWARD from the saved best
+// block (bestHash) by following each header's PrevBlock pointer until it reaches
+// genesis (or a header already in the index), then adding the collected headers
+// in ascending order.
 //
 // Without this, a restart begins with only genesis in the index, so
 // ChainManager.loadChainState cannot resolve the saved best-block and marks the
@@ -682,35 +682,58 @@ type PersistedHeaderSource interface {
 // and block download resumes from the real tip. Mirrors how Bitcoin Core loads
 // the block index from disk at startup rather than re-fetching it.
 //
+// We follow header-by-hash (PrevBlock) rather than the height->hash index
+// precisely because a snapshot-bootstrapped chaindata has a GAP in the height
+// index below the snapshot base (only blocks connected since the snapshot have a
+// height->hash entry), whereas header sync re-downloads and persists the full
+// header chain from genesis. If the on-disk chain cannot be walked all the way
+// back to a header already in the index (a missing header, or a walk longer than
+// maxHeight), hydration loads NOTHING and returns (0, nil): a partial chain that
+// does not connect to the index would only orphan, so we degrade gracefully to
+// network header sync. maxHeight (the saved chainstate height) bounds the walk.
+//
 // Each header is re-validated through AddHeader (PoW + contextual checks) — cheap
 // and CPU-local relative to a network re-download, and it doubles as an
-// integrity check. Walking stops cleanly at the first missing height
-// (ErrNotFound); headers beyond the connected tip are not in the height index
-// and are re-fetched by normal header sync. Returns the number of headers
-// loaded. A header that fails revalidation (corruption / param mismatch) stops
-// hydration and returns the error so the caller can log it; the node then falls
-// back to network header sync for the remainder (graceful degradation — the
-// caller must NOT treat this as fatal).
-func (idx *HeaderIndex) HydrateFromDB(src PersistedHeaderSource, uptoHeight int32) (int, error) {
+// integrity check. Returns the number of headers loaded; a header that fails
+// revalidation (corruption / param mismatch) returns the error so the caller can
+// log it non-fatally.
+func (idx *HeaderIndex) HydrateFromDB(src PersistedHeaderSource, bestHash wire.Hash256, maxHeight int32) (int, error) {
+	genesisHash := idx.Genesis().Hash
+	if bestHash == genesisHash || idx.HasHeader(bestHash) {
+		return 0, nil // nothing above what the index already holds
+	}
+
+	// Walk best -> ... -> genesis, collecting headers (best-first).
+	chain := make([]*wire.BlockHeader, 0, maxHeight+1)
+	h := bestHash
+	for {
+		if h == genesisHash || idx.HasHeader(h) {
+			break // the collected chain connects to a header already in the index
+		}
+		if int32(len(chain)) > maxHeight+1 {
+			// Longer than the saved height allows — corrupt/cyclic header store.
+			// Bail; network header sync will rebuild from scratch.
+			return 0, nil
+		}
+		hdr, err := src.GetBlockHeader(h)
+		if err != nil {
+			// Missing header: the on-disk chain doesn't reach the index, so any
+			// partial add would orphan. Degrade to network header sync.
+			return 0, nil
+		}
+		chain = append(chain, hdr)
+		h = hdr.PrevBlock
+	}
+
+	// Add in ascending order (chain is best-first, so iterate in reverse).
 	loaded := 0
-	for h := int32(1); h <= uptoHeight; h++ {
-		hash, err := src.GetBlockHashByHeight(h)
-		if err != nil {
-			// Gap in the height index: nothing more to load contiguously.
-			break
-		}
-		hdr, err := src.GetBlockHeader(hash)
-		if err != nil {
-			// Height mapping exists but the header bytes are missing — stop
-			// and let network header sync fill the rest.
-			break
-		}
-		if _, err := idx.AddHeader(*hdr, true); err != nil {
+	for i := len(chain) - 1; i >= 0; i-- {
+		if _, err := idx.AddHeader(*chain[i], true); err != nil {
 			if errors.Is(err, ErrDuplicateHeader) {
 				continue
 			}
-			return loaded, fmt.Errorf("hydrate header at height %d (%s): %w",
-				h, hash.String()[:16], err)
+			return loaded, fmt.Errorf("hydrate header (%s): %w",
+				chain[i].BlockHash().String()[:16], err)
 		}
 		loaded++
 	}

@@ -823,7 +823,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// to walk, so it loads 0 headers and the node falls back to network sync.
 	if chainState != nil && chainState.BestHeight > 0 {
 		hStart := time.Now()
-		loaded, herr := headerIndex.HydrateFromDB(chainDB, chainState.BestHeight)
+		loaded, herr := headerIndex.HydrateFromDB(chainDB, chainState.BestHash, chainState.BestHeight)
 		if herr != nil {
 			log.Printf("Header index hydration stopped early after %d headers: %v "+
 				"(falling back to network header sync for the remainder)", loaded, herr)
