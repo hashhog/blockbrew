@@ -1574,13 +1574,40 @@ func (sm *SyncManager) blockDownloadLoop() {
 		// Check if IBD is complete
 		sm.mu.RLock()
 		done := len(sm.blockQueue) == 0 && len(sm.inflight) == 0
+		var connectedH, headerH int32
+		if done && sm.chainMgr != nil {
+			_, connectedH = sm.chainMgr.BestBlock()
+			headerH = sm.headerIndex.BestHeight()
+		}
 		sm.mu.RUnlock()
 
 		if done {
-			// Block queue drained: run the IBD status check.  This should
-			// latch ibdActive to false now that we have a recent tip, but
-			// also handles the edge case where the queue was empty from the
-			// start (e.g., already synced before StartBlockDownload ran).
+			// The block queue is a SNAPSHOT of the header tip taken when
+			// StartBlockDownload built it (line ~1456). Header sync runs
+			// concurrently, so headers can advance AFTER the queue is built:
+			// late header batches that arrive while this loop is still draining
+			// hit StartBlockDownload's "already populated" short-circuit and are
+			// dropped, and once sm.headersSynced is set the HandleHeaders
+			// kickoff (gated on !headersSynced) stops firing on the periodic
+			// empty batches. If we simply returned here, the loop would
+			// terminate at that intermediate height and never resume — the node
+			// wedges with a full header chain but blocks stuck short of the tip
+			// (the 946000 stall on the 2026-06-06 blockbrew snapshot restore:
+			// blocks=946000, headers=952612, queue=0, inflight=0). So when the
+			// queue drains but headers still extend past the connected tip,
+			// rebuild the queue from the current header tip and hand off to a
+			// fresh loop instead of exiting.
+			if headerH > connectedH {
+				log.Printf("sync: block queue drained at height %d but headers extend to %d — rebuilding block queue",
+					connectedH, headerH)
+				sm.StartBlockDownload() // rebuilds queue (empty now) + launches a fresh blockDownloadLoop
+				return
+			}
+			// Block queue drained AND the connected tip has reached the header
+			// tip. Run the IBD status check (latches ibdActive to false once we
+			// have a recent tip); also handles the empty-from-the-start case.
+			// Steady-state tip-following past this point is driven by new header
+			// announcements (HandleHeaders -> onSyncComplete -> StartBlockDownload).
 			sm.updateIBDStatus()
 			if sm.ibdActive.Load() {
 				log.Printf("sync: block queue empty but tip is not yet recent — IBD remains active")
