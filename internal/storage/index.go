@@ -213,6 +213,117 @@ func (m *IndexManager) BlockDisconnected(block *wire.MsgBlock, height int32, has
 	return nil
 }
 
+// CatchUp brings every registered index up to the active chain tip after a
+// restart. It mirrors Bitcoin Core's BaseIndex::Sync / BaseIndex::Rewind
+// (bitcoin-core/src/index/base.cpp): on startup Core spawns a per-index
+// ThreadSync that walks from the index's persisted best block forward to the
+// chain tip (Sync) and, if the index is ahead of the tip after an unclean
+// exit, walks it back down to the common point (Rewind). blockbrew previously
+// had no such loop — the live OnBlockConnected fan-out only fires for blocks
+// connected *after* startup, so an index that fell behind the chainstate (a
+// crash between the chainstate flush and the index batch commit, or simply a
+// freshly enabled index on an already-synced node) was never brought current.
+//
+// tipHeight is the height of the active chain tip (chainMgr.BestBlock()).
+// hashAt resolves a main-chain height to its block hash — pass
+// chainDB.GetBlockHashByHeight; it is injected so the storage package does not
+// need to import the consensus package (the IndexManager only holds chainDB).
+//
+// For each index:
+//   - if best < tip: read each missing main-chain block by height and replay
+//     it through idx.WriteBlock (the same entry point the live connect hook
+//     uses), advancing the index to the tip.
+//   - if best > tip: the index is AHEAD of the tip (only possible after an
+//     unclean exit where the index committed past a chainstate that was then
+//     rolled back). Walk the index back down to the tip via idx.RevertBlock,
+//     reading each over-shot block by its on-disk hash and following
+//     PrevBlock, exactly as Core's Rewind follows pprev.
+//
+// Errors are returned (not logged-and-swallowed) so the caller can decide
+// whether a half-synced index is fatal; the caller currently logs and
+// continues, matching the non-fatal posture of the live index hooks.
+func (m *IndexManager) CatchUp(tipHeight int32, hashAt func(int32) (wire.Hash256, error)) error {
+	m.mu.RLock()
+	indexes := make([]Index, 0, len(m.indexes))
+	for _, idx := range m.indexes {
+		indexes = append(indexes, idx)
+	}
+	m.mu.RUnlock()
+
+	for _, idx := range indexes {
+		if err := m.catchUpOne(idx, tipHeight, hashAt); err != nil {
+			return fmt.Errorf("index %s catch-up: %w", idx.Name(), err)
+		}
+	}
+	return nil
+}
+
+// catchUpOne synchronises a single index to tipHeight. See CatchUp.
+func (m *IndexManager) catchUpOne(idx Index, tipHeight int32, hashAt func(int32) (wire.Hash256, error)) error {
+	best := idx.BestHeight()
+
+	// AHEAD: index committed past the current chainstate tip (unclean exit).
+	// Rewind it down to the tip, peeling one block at a time. We read each
+	// over-shot block by the index's currently-recorded best hash and then
+	// follow the block's PrevBlock pointer downward — the height->hash map
+	// may no longer have entries above the chainstate tip, so we cannot rely
+	// on hashAt here.
+	if best > tipHeight {
+		log.Printf("index: %s is ahead of chain tip (index=%d tip=%d); rewinding",
+			idx.Name(), best, tipHeight)
+		curHash := idx.BestHash()
+		for h := best; h > tipHeight; h-- {
+			block, err := m.chainDB.GetBlock(curHash)
+			if err != nil {
+				return fmt.Errorf("rewind: read block %s at height %d: %w",
+					curHash.String(), h, err)
+			}
+			// nil undo to mirror the live OnBlockDisconnected hook (see the
+			// forward path above for the filter-byte rationale).
+			if err := idx.RevertBlock(block, h, curHash, nil); err != nil {
+				return fmt.Errorf("rewind: revert block %s at height %d: %w",
+					curHash.String(), h, err)
+			}
+			curHash = block.Header.PrevBlock
+		}
+		log.Printf("index: %s rewound to height %d", idx.Name(), idx.BestHeight())
+		return nil
+	}
+
+	if best >= tipHeight {
+		return nil // already caught up
+	}
+
+	// BEHIND: walk forward from best+1 to the chain tip, replaying each
+	// main-chain block through the same WriteBlock entry point the live
+	// connect hook uses.
+	start := best + 1
+	log.Printf("index: %s is behind chain tip (index=%d tip=%d); catching up from height %d",
+		idx.Name(), best, tipHeight, start)
+	for h := start; h <= tipHeight; h++ {
+		hash, err := hashAt(h)
+		if err != nil {
+			return fmt.Errorf("resolve hash at height %d: %w", h, err)
+		}
+		block, err := m.chainDB.GetBlock(hash)
+		if err != nil {
+			return fmt.Errorf("read block %s at height %d: %w", hash.String(), h, err)
+		}
+		// Pass nil undo to mirror the live OnBlockConnected hook in
+		// cmd/blockbrew/main.go exactly (it calls WriteBlock/WriteBlockBatch
+		// with a nil undo). Feeding real undo data here would change the
+		// blockfilterindex output for catch-up blocks (BIP-158 basic filters
+		// include spent-input scriptPubKeys when undo is present), making
+		// catch-up filters diverge from live-connected filters and breaking
+		// the BIP-157 filter-header chain continuity. Keep them identical.
+		if err := idx.WriteBlock(block, h, hash, nil); err != nil {
+			return fmt.Errorf("write block %s at height %d: %w", hash.String(), h, err)
+		}
+	}
+	log.Printf("index: %s caught up to height %d", idx.Name(), idx.BestHeight())
+	return nil
+}
+
 // GetIndexInfo returns status information for all indexes.
 func (m *IndexManager) GetIndexInfo() []IndexStatus {
 	m.mu.RLock()
