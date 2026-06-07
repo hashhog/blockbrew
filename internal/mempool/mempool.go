@@ -2479,6 +2479,52 @@ func (mp *Mempool) OrphanCount() int {
 	return len(mp.orphans)
 }
 
+// OrphanTxInfo is a read-only snapshot of a single orphan-pool entry, used by
+// the getorphantxs RPC. It mirrors the externally-observable fields of Bitcoin
+// Core's node::TxOrphanage::OrphanInfo (txorphanage.h): the orphan transaction
+// plus the set of peers that announced it. blockbrew records a single announcer
+// per orphan (the peer that first parked it — txorphanage.cpp::AddTx records
+// m_announcers; blockbrew records one fromPeer), so Announcers has at most one
+// element. AddedTime + the package-level OrphanTxExpireTime TTL let the RPC
+// derive the eviction deadline (Core's ExpireOrphans / ORPHAN_TX_EXPIRE_TIME).
+type OrphanTxInfo struct {
+	// Tx is the orphan transaction itself.
+	Tx *wire.MsgTx
+	// Announcers is the set of peers that announced this orphan, as recorded by
+	// AddTransactionFrom. Empty for locally-originated / RPC / reorg-re-added
+	// orphans (fromPeer==""). At most one element in blockbrew (single-announcer
+	// tracking), as a peer address string rather than a numeric peer id.
+	Announcers []string
+	// AddedTime is when the orphan was parked. AddedTime.Add(OrphanTxExpireTime)
+	// is the eviction deadline driven by ExpireOrphans.
+	AddedTime time.Time
+}
+
+// GetOrphanTransactions returns a snapshot of every entry currently in the
+// orphan pool, for the getorphantxs RPC. Mirrors Bitcoin Core
+// PeerManager::GetOrphanTransactions -> TxOrphanage::GetOrphanTransactions
+// (txorphanage.cpp): enumerate the orphanage and emit one OrphanInfo per unique
+// orphan with its announcer set. Order is map-iteration order (unspecified),
+// matching Core's "no guaranteed order" contract for this experimental call.
+func (mp *Mempool) GetOrphanTransactions() []OrphanTxInfo {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+
+	result := make([]OrphanTxInfo, 0, len(mp.orphans))
+	for _, orphan := range mp.orphans {
+		var announcers []string
+		if orphan.fromPeer != "" {
+			announcers = []string{orphan.fromPeer}
+		}
+		result = append(result, OrphanTxInfo{
+			Tx:         orphan.tx,
+			Announcers: announcers,
+			AddedTime:  orphan.addedTime,
+		})
+	}
+	return result
+}
+
 // Block connection/disconnection
 
 // BlockConnected removes transactions that were included in a new block.
