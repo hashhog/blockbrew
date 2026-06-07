@@ -207,7 +207,7 @@ func TestW133_G22_GetTxOutSetInfoConsultsCoinStatsIndex_BUG11(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestW133_G23_GetIndexInfoIncludesTxIndex_BUG2(t *testing.T) {
-	t.Skip("W133 G23 — PARTIAL / BUG-2 cascade: extra_methods.go:720-737 iterates indexManager.AllIndexes(). Since BUG-2 means no *TxIndex / *CoinStatsIndex is ever registered with IndexManager, getindexinfo returns ONLY blockfilterindex (when enabled). txindex is absent from the response even when -txindex=true. See audit BUG-2.")
+	t.Skip("W133 G23 — RESOLVED post-da28707: getindexinfo no longer walks AllIndexes()/Status() (which carried best_height/best_hash). handleGetIndexInfo now summarises txindex off the chain tip when -txindex is set and emits blockfilterindex under Core's GetName() string, with the exact Core {synced, best_block_height} value shape. Live coverage moved to the rpc package: internal/rpc/getindexinfo_methods_test.go (TestGetIndexInfo_Shape / _BlockFilterIndexKey / _DisabledEmpty). This stub is retained only as a pointer.")
 }
 
 // ---------------------------------------------------------------------------
