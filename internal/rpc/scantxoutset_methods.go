@@ -33,14 +33,22 @@ import (
 )
 
 // scanTxOutUnspent is one matched UTXO in the scantxoutset result.
+//
+// Field order mirrors Bitcoin Core's pushKV order in
+// src/rpc/blockchain.cpp::scantxoutset (txid, vout, scriptPubKey, desc,
+// amount, coinbase, height, blockhash, confirmations) so the JSON shape is
+// byte-for-byte comparable. blockhash is the hash of the block at the coin's
+// height (big-endian display hex); confirmations is tip_height - coin_height + 1.
 type scanTxOutUnspent struct {
-	TxID         string    `json:"txid"`
-	Vout         uint32    `json:"vout"`
-	ScriptPubKey string    `json:"scriptPubKey"`
-	Desc         string    `json:"desc"`
-	Amount       btcAmount `json:"amount"`
-	Coinbase     bool      `json:"coinbase"`
-	Height       int32     `json:"height"`
+	TxID          string    `json:"txid"`
+	Vout          uint32    `json:"vout"`
+	ScriptPubKey  string    `json:"scriptPubKey"`
+	Desc          string    `json:"desc"`
+	Amount        btcAmount `json:"amount"`
+	Coinbase      bool      `json:"coinbase"`
+	Height        int32     `json:"height"`
+	BlockHash     string    `json:"blockhash"`
+	Confirmations int32     `json:"confirmations"`
 }
 
 // scanTxOutSetResult is the result of scantxoutset "start".
@@ -122,6 +130,25 @@ func (s *Server) scanTxOutSetStart(args []json.RawMessage) (interface{}, *RPCErr
 	}
 
 	tipHash, tipHeight := s.chainMgr.BestBlock()
+	tipNode := s.chainMgr.BestBlockNode()
+
+	// blockHashAtHeight resolves the display-hex hash of the block at `height`
+	// on the active chain. Mirrors Core's tip->GetAncestor(coin.nHeight) walk
+	// (src/rpc/blockchain.cpp), with a chainDB fallback for the rare case the
+	// in-memory header index is not wired (early startup / direct-storage tests).
+	blockHashAtHeight := func(height int32) string {
+		if tipNode != nil {
+			if anc := tipNode.GetAncestor(height); anc != nil {
+				return anc.Hash.String()
+			}
+		}
+		if s.chainDB != nil {
+			if h, err := s.chainDB.GetBlockHashByHeight(height); err == nil {
+				return h.String()
+			}
+		}
+		return ""
+	}
 
 	result := &scanTxOutSetResult{
 		Success:   true,
@@ -138,13 +165,15 @@ func (s *Server) scanTxOutSetStart(args []json.RawMessage) (interface{}, *RPCErr
 			return true
 		}
 		result.Unspents = append(result.Unspents, scanTxOutUnspent{
-			TxID:         outpoint.Hash.String(),
-			Vout:         outpoint.Index,
-			ScriptPubKey: spkHex,
-			Desc:         desc,
-			Amount:       btcAmount(entry.Amount),
-			Coinbase:     entry.IsCoinbase,
-			Height:       entry.Height,
+			TxID:          outpoint.Hash.String(),
+			Vout:          outpoint.Index,
+			ScriptPubKey:  spkHex,
+			Desc:          desc,
+			Amount:        btcAmount(entry.Amount),
+			Coinbase:      entry.IsCoinbase,
+			Height:        entry.Height,
+			BlockHash:     blockHashAtHeight(entry.Height),
+			Confirmations: tipHeight - entry.Height + 1,
 		})
 		total += entry.Amount
 		return true
