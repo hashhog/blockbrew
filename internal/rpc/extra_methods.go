@@ -928,6 +928,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"getblockcount",
 		"getblockhash height",
 		"getblockheader \"blockhash\" ( verbose )",
+		"getblockstats hash_or_height ( stats )",
 		"getchaintips",
 		"getdifficulty",
 		"getsyncstate",
