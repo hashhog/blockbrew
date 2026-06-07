@@ -945,6 +945,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"getmempooldescendants \"txid\" ( verbose )",
 		"getmempoolentry \"txid\"",
 		"getmempoolinfo",
+		"getorphantxs ( verbosity )",
 		"getrawmempool ( verbose )",
 		"loadmempool",
 		"savemempool",
@@ -1313,6 +1314,8 @@ func getMethodHelp(method string) string {
 		return "getnewaddress\nReturns a new Bitcoin address for receiving payments."
 	case "getbalance":
 		return "getbalance\nReturns the total available balance."
+	case "getorphantxs":
+		return "getorphantxs ( verbosity )\nEXPERIMENTAL: shows transactions in the tx orphanage.\nverbosity: 0=array of txids, 1=array of objects with tx details (txid, wtxid, bytes, vsize, weight, from), 2=details from (1) plus the tx hex."
 	case "help":
 		return "help ( \"command\" )\nList all commands, or get help for a specified command."
 	default:
