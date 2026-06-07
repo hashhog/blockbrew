@@ -956,12 +956,13 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
 		return ErrCoinbaseNotAllowed
 	}
 
-	// 3a. Transaction version range check (Core IsStandardTx line 102,
-	// policy.h TX_MIN_STANDARD_VERSION=1 / TX_MAX_STANDARD_VERSION=3).
-	// Rejects version 0 and any version > 3 as non-standard.
-	if tx.Version < TxMinStandardVersion || tx.Version > TxMaxStandardVersion {
-		return fmt.Errorf("%w: got %d, want [%d, %d]",
-			ErrTxVersion, tx.Version, TxMinStandardVersion, TxMaxStandardVersion)
+	// 3a. Context-free IsStandardTx gates (version range, MIN_STANDARD_TX_
+	// NONWITNESS_SIZE, scriptSig size + push-only, output script standardness +
+	// OP_RETURN datacarrier budget). Shared with the package-member path
+	// (validateTransactionLocked) via checkStandardnessLocked so submitpackage /
+	// 1p1c relay applies the SAME standardness policy as single-tx admission.
+	if err := mp.checkStandardnessLocked(tx); err != nil {
+		return err
 	}
 
 	// 4. Check transaction weight (max standard tx weight: 400,000 WU)
@@ -970,61 +971,8 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
 		return fmt.Errorf("%w: weight %d exceeds maximum %d", ErrTxTooLarge, weight, consensus.MaxStandardTxWeight)
 	}
 
-	// 4a. Minimum non-witness size check (Core validation.cpp:813,
-	// MIN_STANDARD_TX_NONWITNESS_SIZE = 65). Mitigates CVE-2017-12842
-	// (64-byte tx merkle-branch confusion attack).
-	{
-		var nwBuf bytes.Buffer
-		_ = tx.SerializeNoWitness(&nwBuf)
-		if nwBuf.Len() < MinStandardTxNonWitnessSize {
-			return fmt.Errorf("%w: got %d bytes", ErrTxTooSmall, nwBuf.Len())
-		}
-	}
-
 	// 5. Calculate virtual size
 	vsize := (weight + 3) / 4 // Round up
-
-	// 5a. Per-input scriptSig policy (Core IsStandardTx input loop,
-	// policy/policy.cpp:117-135):
-	//   - scriptSig size must not exceed MAX_STANDARD_SCRIPTSIG_SIZE (1650 bytes).
-	//   - scriptSig must be push-only (IsPushOnly).
-	// Both mitigate CPU-exhaustion DoS from large/non-push scriptSigs.
-	for i, in := range tx.TxIn {
-		if len(in.SignatureScript) > MaxStandardScriptSigSize {
-			return fmt.Errorf("%w: input %d scriptSig %d bytes > %d",
-				ErrScriptSigTooLarge, i, len(in.SignatureScript), MaxStandardScriptSigSize)
-		}
-		if len(in.SignatureScript) > 0 && !script.IsPushOnly(in.SignatureScript) {
-			return fmt.Errorf("%w: input %d", ErrScriptSigNotPushOnly, i)
-		}
-	}
-
-	// 5b. Check output script standardness (Core IsStandardTx vout loop,
-	// policy/policy.cpp:140).  Each output must be a known standard type:
-	//   P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2A, or well-formed nulldata
-	//   (OP_RETURN + IsPushOnly remainder per consensus.IsNullData).
-	// A script that starts with OP_RETURN but has a truncated or non-push
-	// trailing byte (e.g. 6a09deadbeef) is classified NONSTANDARD and
-	// rejected here — the W56 fix to isNullData now shares this logic via
-	// consensus.IsNullData so both the mempool gate and decodescript agree.
-	// Also enforce MAX_OP_RETURN_RELAY (100_000 bytes) cumulative budget
-	// across all OP_RETURN outputs in the transaction (Core policy.cpp:147).
-	{
-		var datacarrierBytesUsed int
-		for i, out := range tx.TxOut {
-			if !isStandardOutputScript(out.PkScript) {
-				return fmt.Errorf("%w: output %d script is nonstandard", ErrNonStandardOutput, i)
-			}
-			// Track OP_RETURN (nulldata) bytes for datacarrier budget.
-			if consensus.IsNullData(out.PkScript) {
-				datacarrierBytesUsed += len(out.PkScript)
-				if datacarrierBytesUsed > MaxOpReturnRelay {
-					return fmt.Errorf("%w: %d bytes > %d",
-						ErrDataCarrierTooLarge, datacarrierBytesUsed, MaxOpReturnRelay)
-				}
-			}
-		}
-	}
 
 	// 5c. IsFinalTx (BIP-113): reject non-final transactions at mempool admit.
 	// Mempool holds txs for the *next* block, so check against tipHeight+1
@@ -1512,6 +1460,70 @@ func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 // output + the configured MinRelayFeeRate — does not mutate or lock the pool.
 func (mp *Mempool) IsDust(txOut *wire.TxOut) bool {
 	return mp.isDust(txOut)
+}
+
+// checkStandardnessLocked runs the context-free IsStandardTx gates that gate
+// relay/admission on BOTH the single-tx path (AddTransactionFrom) and the
+// package-member path (validateTransactionLocked in packageMode). Extracting
+// them into one helper closes a relay-policy DoS hole: the package path used to
+// skip these gates entirely, so submitpackage / 1p1c could admit + relay
+// transactions the single-tx PreChecks reject (non-standard version, oversized
+// or non-push scriptSig, nonstandard output scripts, over-budget OP_RETURN).
+//
+// Mirrors the per-member PreChecks that Core's AcceptMultipleTransactions runs
+// (validation.cpp AcceptSubPackage → PreChecks → IsStandardTx, policy.cpp).
+// These checks are pure functions of the transaction bytes (no fee dependence),
+// so they are CPFP-safe: a low-fee package member still clears them, and the
+// per-tx fee floor is the ONLY gate the package path deliberately bypasses.
+func (mp *Mempool) checkStandardnessLocked(tx *wire.MsgTx) error {
+	// Transaction version range check (Core IsStandardTx, policy.h
+	// TX_MIN_STANDARD_VERSION=1 / TX_MAX_STANDARD_VERSION=3).
+	if tx.Version < TxMinStandardVersion || tx.Version > TxMaxStandardVersion {
+		return fmt.Errorf("%w: got %d, want [%d, %d]",
+			ErrTxVersion, tx.Version, TxMinStandardVersion, TxMaxStandardVersion)
+	}
+
+	// Minimum non-witness size check (Core validation.cpp:813,
+	// MIN_STANDARD_TX_NONWITNESS_SIZE = 65). Mitigates CVE-2017-12842.
+	{
+		var nwBuf bytes.Buffer
+		_ = tx.SerializeNoWitness(&nwBuf)
+		if nwBuf.Len() < MinStandardTxNonWitnessSize {
+			return fmt.Errorf("%w: got %d bytes", ErrTxTooSmall, nwBuf.Len())
+		}
+	}
+
+	// Per-input scriptSig policy (Core IsStandardTx input loop,
+	// policy/policy.cpp:117-135): scriptSig size cap + push-only.
+	for i, in := range tx.TxIn {
+		if len(in.SignatureScript) > MaxStandardScriptSigSize {
+			return fmt.Errorf("%w: input %d scriptSig %d bytes > %d",
+				ErrScriptSigTooLarge, i, len(in.SignatureScript), MaxStandardScriptSigSize)
+		}
+		if len(in.SignatureScript) > 0 && !script.IsPushOnly(in.SignatureScript) {
+			return fmt.Errorf("%w: input %d", ErrScriptSigNotPushOnly, i)
+		}
+	}
+
+	// Output script standardness + cumulative OP_RETURN datacarrier budget
+	// (Core IsStandardTx vout loop, policy/policy.cpp:140-147).
+	{
+		var datacarrierBytesUsed int
+		for i, out := range tx.TxOut {
+			if !isStandardOutputScript(out.PkScript) {
+				return fmt.Errorf("%w: output %d script is nonstandard", ErrNonStandardOutput, i)
+			}
+			if consensus.IsNullData(out.PkScript) {
+				datacarrierBytesUsed += len(out.PkScript)
+				if datacarrierBytesUsed > MaxOpReturnRelay {
+					return fmt.Errorf("%w: %d bytes > %d",
+						ErrDataCarrierTooLarge, datacarrierBytesUsed, MaxOpReturnRelay)
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // isStandardOutputScript returns true if pkScript is a known-standard output
@@ -3786,6 +3798,32 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 		return 0, 0, ErrCoinbaseNotAllowed
 	}
 
+	// Context-free IsStandardTx gates, shared with the single-tx path
+	// (AddTransactionFrom) via checkStandardnessLocked. Previously the package-
+	// member path skipped these entirely, so submitpackage / 1p1c could admit +
+	// relay non-standard transactions (bad version, oversized/non-push
+	// scriptSig, nonstandard output scripts, over-budget OP_RETURN) that the
+	// single-tx PreChecks reject — a relay-policy DoS hole. Core runs PreChecks
+	// → IsStandardTx per package member (validation.cpp AcceptSubPackage). These
+	// gates are fee-independent, so they do NOT break CPFP: a low-fee parent
+	// still clears them; only the per-tx fee floor is intentionally bypassed in
+	// package mode (handled below).
+	if err := mp.checkStandardnessLocked(tx); err != nil {
+		return 0, 0, err
+	}
+
+	// IsFinalTx (BIP-113): reject non-final members, mirroring the single-tx
+	// path. Checked against tip+1 and the chain MTP. Core PreChecks →
+	// CheckFinalTxAtTip (validation.cpp:819).
+	if mp.config.ChainState != nil {
+		cs := mp.config.ChainState
+		nextHeight := cs.TipHeight() + 1
+		mtp := uint32(cs.TipMTP())
+		if !consensus.IsFinalTx(tx, nextHeight, mtp) {
+			return 0, 0, ErrNonFinalTx
+		}
+	}
+
 	// Check weight
 	weight := consensus.CalcTxWeight(tx)
 	if weight > consensus.MaxStandardTxWeight {
@@ -3796,12 +3834,13 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 	// Gather inputs and check for conflicts
 	var totalInputValue int64
 	var missingInputs []wire.OutPoint
+	var conflictingTxs map[wire.Hash256]bool
 
 	for _, in := range tx.TxIn {
-		// Check for double-spend in mempool. Under -mempoolfullrbf=true
-		// (Core v28+ default) every conflict is replaceable regardless of
-		// signaling — the Rule 1 short-circuit here is bypassed and the
-		// final accept/reject decision is deferred to the full
+		// Record mempool conflicts so they can be RBF-validated below. Under
+		// -mempoolfullrbf=true (Core v28+ default) every conflict is replaceable
+		// regardless of signaling — the Rule 1 short-circuit here is bypassed
+		// and the final accept/reject decision is deferred to the full
 		// `checkRBFLocked` walker (Rules 3/4/5 + ImprovesFeerateDiagram).
 		// W120 BUG-5 / FIX-68.
 		if existingTxHash, ok := mp.outpoints[in.PreviousOutPoint]; ok {
@@ -3809,6 +3848,10 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 			if existingEntry != nil && !mp.config.MempoolFullRBF && !signalsRBF(existingEntry.Tx) {
 				return 0, 0, ErrRBFNotSignaled
 			}
+			if conflictingTxs == nil {
+				conflictingTxs = make(map[wire.Hash256]bool)
+			}
+			conflictingTxs[existingTxHash] = true
 		}
 
 		// Look up the UTXO
@@ -3834,8 +3877,14 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 		return 0, 0, ErrNegativeFee
 	}
 
-	// Note: In package mode, we don't check individual feerate here
-	// because the package aggregate feerate is used instead.
+	// Per-tx fee floor — CPFP CARVE-OUT. This is the ONLY single-tx gate the
+	// package path intentionally bypasses: a low-fee parent is legitimately
+	// allowed to pay below the individual min fee because its child pays for it,
+	// and the aggregate package feerate is gated separately by the caller
+	// (acceptMultiTxPackage checks PackageFeerate against MinRelayFeeRate). This
+	// mirrors Core AcceptSubPackage, which uses the PACKAGE feerate for the fee
+	// gate rather than rejecting an individual member on its own feerate. DO NOT
+	// re-introduce a per-member individual-min-fee rejection in package mode.
 	if !packageMode {
 		feeRate := float64(fee) / float64(vsize) * 1000 // sat/kvB
 		if int64(feeRate) < mp.config.MinRelayFeeRate {
@@ -3844,10 +3893,31 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 		}
 	}
 
-	// Check dust
+	// PreCheckEphemeralTx + dust outputs, mirroring the single-tx path
+	// (AddTransactionFrom step 9): a NON-zero-fee tx may not carry dust, but a
+	// 0-fee tx may (ephemeral anchor / CPFP carrier, Core
+	// policy/ephemeral_policy.cpp:23). Keeping the 0-fee carve-out preserves
+	// CPFP: a dust-carrying 0-fee parent is still admissible inside a package.
 	for i, out := range tx.TxOut {
-		if mp.isDust(out) {
-			return 0, 0, fmt.Errorf("%w: output %d value %d", ErrDustOutput, i, out.Value)
+		if !mp.isDust(out) {
+			continue
+		}
+		if fee == 0 {
+			continue
+		}
+		return 0, 0, fmt.Errorf("%w (%w): output %d value %d",
+			ErrDustOutput, ErrEphemeralDustNonZeroFee, i, out.Value)
+	}
+
+	// RBF / conflict resolution. The single-tx path runs checkRBFLocked when a
+	// candidate conflicts with the mempool; the package-member path used to skip
+	// it, so a package member could silently replace (or fail to be validated
+	// against) a mempool tx without satisfying BIP-125 Rules 3/4/5. Run the same
+	// walker here. Missing-input conflicts are impossible at this point (we
+	// returned above if any input was missing).
+	if len(conflictingTxs) > 0 {
+		if err := mp.checkRBFLocked(tx, conflictingTxs, totalInputValue); err != nil {
+			return 0, 0, err
 		}
 	}
 
