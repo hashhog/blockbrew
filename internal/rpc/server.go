@@ -777,6 +777,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 
 	case "scantxoutset":
 		return s.handleScanTxOutSet(params)
+	case "scanblocks":
+		return s.handleScanBlocks(params)
 
 	// Wave-47b P2 RPCs
 	case "gettxoutsetinfo":
