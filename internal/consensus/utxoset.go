@@ -440,6 +440,16 @@ func (u *UTXOSet) CacheBytes() int64 {
 	return u.cacheBytes
 }
 
+// MaxCacheBytes returns the configured maximum size of the in-memory coins
+// (UTXO) cache in bytes. This is the analogue of Bitcoin Core's
+// m_coinstip_cache_size_bytes — the budget for the chainstate's in-memory coin
+// cache (CCoinsViewCache), reported by the getchainstates RPC as
+// coins_tip_cache_bytes. Set once at construction (NewUTXOSetWithMaxCache) and
+// never mutated, so no lock is required.
+func (u *UTXOSet) MaxCacheBytes() int64 {
+	return u.maxCacheBytes
+}
+
 // FlushBatch writes all dirty entries using a provided batch (for atomic block connection).
 func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 	u.mu.Lock()

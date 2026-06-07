@@ -2988,17 +2988,42 @@ func (s *Server) handleGetChainStates() (interface{}, *RPCError) {
 			}
 		}
 
+		// Coins-cache budgets (Core: m_coinsdb_cache_size_bytes /
+		// m_coinstip_cache_size_bytes — always emitted). blockbrew exposes the
+		// in-memory coins (UTXO) cache budget via *UTXOSet.MaxCacheBytes; the
+		// separate on-disk (Pebble) coins-db block-cache budget is computed in
+		// cmd/blockbrew/main.go::computeCacheSplit and is not plumbed through to
+		// the RPC layer, so it is honestly reported as 0 (Core's "or 0 if no
+		// source" parity). Both fields are emitted unconditionally.
+		var coinsTipCacheBytes int64
+		if us, ok := s.chainMgr.UTXOSet().(*consensus.UTXOSet); ok && us != nil {
+			coinsTipCacheBytes = us.MaxCacheBytes()
+		}
+
 		info := ChainstateInfo{
 			Blocks:               tipHeight,
 			BestBlockHash:        tipHash.String(),
 			Difficulty:           difficulty,
 			VerificationProgress: verificationProgress,
-			Validated:            true, // Main chainstate is always validated
+			CoinsDBCacheBytes:    0,
+			CoinsTipCacheBytes:   coinsTipCacheBytes,
+			// blockbrew runs a single, fully-validated chainstate. The
+			// snapshot-bootstrap path (cmd/blockbrew/main.go::loadSnapshotFromFile)
+			// validates HASH_SERIALIZED against the assumeutxo table before
+			// promoting the snapshot and persists no "from-snapshot" /
+			// background-validation marker, so the live node never holds an
+			// unvalidated snapshot chainstate. Core reports validated =
+			// (m_assumeutxo == VALIDATED); the equivalent here is always true,
+			// and snapshot_blockhash (OPTIONAL — only for a from-snapshot
+			// chainstate) is correctly omitted.
+			Validated: true,
 		}
 
 		if tipNode != nil {
 			info.Bits = fmt.Sprintf("%08x", tipNode.Header.Bits)
-			info.Target = consensus.CompactToBig(tipNode.Header.Bits).Text(16)
+			// Full 64-hex uint256 (Core emits the zero-padded target); .Text(16)
+			// drops leading zeros and diverges from Core's RPCHelpForChainstate.
+			info.Target = fmt.Sprintf("%064x", consensus.CompactToBig(tipNode.Header.Bits))
 		}
 
 		result.Chainstates = append(result.Chainstates, info)
@@ -3032,6 +3057,13 @@ type ChainStatesResult struct {
 }
 
 // ChainstateInfo contains information about a single chainstate.
+//
+// Field shape mirrors Bitcoin Core's RPCHelpForChainstate
+// (rpc/blockchain.cpp::make_chain_data). coins_db_cache_bytes /
+// coins_tip_cache_bytes are ALWAYS emitted (Core pushKVs them
+// unconditionally), so they must NOT carry omitempty. snapshot_blockhash is
+// OPTIONAL — Core only pushes it for a from-snapshot chainstate — so it keeps
+// omitempty and is left empty for blockbrew's single validated chainstate.
 type ChainstateInfo struct {
 	Blocks               int32   `json:"blocks"`
 	BestBlockHash        string  `json:"bestblockhash"`
@@ -3039,9 +3071,9 @@ type ChainstateInfo struct {
 	Target               string  `json:"target,omitempty"`
 	Difficulty           float64 `json:"difficulty"`
 	VerificationProgress float64 `json:"verificationprogress"`
+	CoinsDBCacheBytes    int64   `json:"coins_db_cache_bytes"`
+	CoinsTipCacheBytes   int64   `json:"coins_tip_cache_bytes"`
 	SnapshotBlockHash    string  `json:"snapshot_blockhash,omitempty"`
-	CoinsDBCacheBytes    int64   `json:"coins_db_cache_bytes,omitempty"`
-	CoinsTipCacheBytes   int64   `json:"coins_tip_cache_bytes,omitempty"`
 	Validated            bool    `json:"validated"`
 }
 
