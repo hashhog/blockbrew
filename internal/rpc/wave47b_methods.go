@@ -16,6 +16,7 @@ import (
 	"math/big"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -66,8 +67,9 @@ func (s *Server) handleGetTxOutSetInfo(params json.RawMessage) (interface{}, *RP
 	}
 
 	// hash_or_height present (non-null) => coinstatsindex territory. blockbrew's
-	// base chainstate only knows the tip, so mirror Core's specific-block
-	// rejections.
+	// base chainstate only knows the tip; a specific block can only be served
+	// from the coinstatsindex, mirroring Core's gettxoutsetinfo dispatch
+	// (blockchain.cpp:1086-1092).
 	specificBlock := false
 	if len(args) >= 2 {
 		var raw interface{}
@@ -76,16 +78,65 @@ func (s *Server) handleGetTxOutSetInfo(params json.RawMessage) (interface{}, *RP
 		}
 	}
 	if specificBlock {
-		// Core checks the coinstatsindex requirement first (blockchain.cpp:1086):
-		// without g_coin_stats_index, ANY specific-block query is rejected with
-		// "Querying specific block heights requires coinstatsindex" before the
-		// hash_serialized_3-specific guard is reached. blockbrew has no
-		// coinstatsindex in the base chainstate, so it mirrors that path. Both
-		// arms use RPC_INVALID_PARAMETER (-8).
-		return nil, &RPCError{
-			Code:    RPCErrInvalidParameter,
-			Message: "Querying specific block heights requires coinstatsindex",
+		// Is the coinstatsindex registered?
+		var csi *storage.CoinStatsIndex
+		if s.indexManager != nil {
+			if idx := s.indexManager.GetIndex("coinstatsindex"); idx != nil {
+				csi, _ = idx.(*storage.CoinStatsIndex)
+			}
 		}
+		if csi == nil {
+			// Without the index, ANY specific-block query is rejected with
+			// "Querying specific block heights requires coinstatsindex"
+			// (blockchain.cpp:1086), before the hash_serialized_3-specific
+			// guard is reached. RPC_INVALID_PARAMETER (-8).
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParameter,
+				Message: "Querying specific block heights requires coinstatsindex",
+			}
+		}
+		// hash_serialized_3 cannot be served for a specific block even with the
+		// index — only the order-independent muhash (and none) are maintained
+		// per height (blockchain.cpp:992 + 1089-1092). RPC_INVALID_PARAMETER (-8).
+		if hashType == "hash_serialized_3" {
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParameter,
+				Message: "hash_serialized_3 hash type cannot be queried for a specific block",
+			}
+		}
+
+		// Resolve args[1] to a main-chain height H. It is either an integer
+		// height or a 32-byte block hash (display order, big-endian hex).
+		height, rerr := s.resolveHashOrHeight(args[1])
+		if rerr != nil {
+			return nil, rerr
+		}
+
+		stats, err := csi.GetStats(height)
+		if err != nil {
+			// Above the index best / not indexed / out of range.
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParameter,
+				Message: fmt.Sprintf("Can't read the UTXO set statistics for block at height %d", height),
+			}
+		}
+
+		// Build the index-served response. Per Core (blockchain.cpp:1034-1035)
+		// the index path omits `transactions` and `disk_size` and adds
+		// total_unspendable_amount + block_info; we emit the subset the class
+		// actually tracks (height, bestblock, txouts, bogosize, total_amount,
+		// and the muhash digest).
+		ret := map[string]interface{}{
+			"height":       height,
+			"bestblock":    stats.BlockHash.String(),
+			"txouts":       stats.UTXOCount,
+			"bogosize":     stats.BogoSize,
+			"total_amount": btcAmount(stats.TotalAmount),
+		}
+		if hashType == "muhash" {
+			ret["muhash"] = stats.HashSerialized.String()
+		}
+		return ret, nil
 	}
 
 	tipHash, tipHeight := s.chainMgr.BestBlock()
@@ -121,6 +172,69 @@ func (s *Server) handleGetTxOutSetInfo(params json.RawMessage) (interface{}, *RP
 		ret["muhash"] = info.MuHash.String()
 	}
 	return ret, nil
+}
+
+// resolveHashOrHeight maps the gettxoutsetinfo hash_or_height argument to a
+// main-chain block height. The argument is either:
+//   - a JSON integer height, validated against [0, tipHeight]; or
+//   - a JSON string block hash (display order, big-endian hex), resolved to its
+//     height via the header index (must be a known block).
+//
+// Mirrors Bitcoin Core's ParseHashOrHeight (rpc/blockchain.cpp). Errors use
+// RPC_INVALID_PARAMETER (-8), matching Core's height/hash validation arm.
+func (s *Server) resolveHashOrHeight(arg json.RawMessage) (int32, *RPCError) {
+	_, tipHeight := s.chainMgr.BestBlock()
+
+	// Try integer height first.
+	var h int64
+	if err := json.Unmarshal(arg, &h); err == nil {
+		if h < 0 || h > int64(tipHeight) {
+			return 0, &RPCError{
+				Code:    RPCErrInvalidParameter,
+				Message: fmt.Sprintf("Target block height %d after current tip %d", h, tipHeight),
+			}
+		}
+		return int32(h), nil
+	}
+
+	// Otherwise a block-hash string (display order).
+	var hs string
+	if err := json.Unmarshal(arg, &hs); err != nil {
+		return 0, &RPCError{
+			Code:    RPCErrInvalidParameter,
+			Message: "hash_or_height must be a block height (int) or block hash (hex string)",
+		}
+	}
+	b, err := hex.DecodeString(hs)
+	if err != nil || len(b) != 32 {
+		return 0, &RPCError{
+			Code:    RPCErrInvalidParameter,
+			Message: fmt.Sprintf("blockhash must be of length 64 (not %d)", len(hs)),
+		}
+	}
+	// Display order (big-endian) -> internal little-endian.
+	var hash wire.Hash256
+	copy(hash[:], b)
+	reverseBytes(hash[:])
+
+	if s.headerIndex == nil {
+		return 0, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+	node := s.headerIndex.GetNode(hash)
+	if node == nil {
+		return 0, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Block not found"}
+	}
+	if node.Height < 0 || node.Height > tipHeight {
+		return 0, &RPCError{Code: RPCErrInvalidParameter, Message: "Block is not in the main chain"}
+	}
+	// Confirm the block is on the active chain at that height (not a stale fork).
+	if s.chainDB != nil {
+		mainHash, herr := s.chainDB.GetBlockHashByHeight(node.Height)
+		if herr == nil && mainHash != hash {
+			return 0, &RPCError{Code: RPCErrInvalidParameter, Message: "Block is not in the main chain"}
+		}
+	}
+	return node.Height, nil
 }
 
 // ============================================================================

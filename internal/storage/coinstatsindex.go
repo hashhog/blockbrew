@@ -114,7 +114,32 @@ func MakeCoinStatsKey(height int32) []byte {
 	return key
 }
 
+// CoinStatsMuHashPrefix stores the per-height MuHash3072 accumulator
+// (numerator||denominator, 768 bytes). Keyed "m" + height (4 bytes big-endian).
+// This lets RevertBlock restore the exact accumulator state as of the previous
+// height without replaying or needing undo data — the finalized 32-byte digest
+// in the CoinStats row is one-way and cannot be resumed.
+var CoinStatsMuHashPrefix = []byte("m")
+
+// MakeCoinStatsMuHashKey creates a per-height MuHash accumulator key.
+func MakeCoinStatsMuHashKey(height int32) []byte {
+	key := make([]byte, 1+4)
+	key[0] = CoinStatsMuHashPrefix[0]
+	binary.BigEndian.PutUint32(key[1:], uint32(height))
+	return key
+}
+
 // CoinStatsIndex maintains running UTXO set statistics.
+//
+// The per-block UTXO-set commitment is a MuHash3072 accumulator
+// (internal/crypto/muhash.go), the same multiset hash Bitcoin Core's
+// coinstatsindex uses (index/coinstatsindex.cpp + crypto/muhash.cpp). Coins are
+// fed through the accumulator as the Core per-coin record (the exact byte layout
+// of kernel/coinstats.cpp::TxOutSer: outpoint || (height<<1|coinbase) as uint32
+// LE || value int64 LE || CompactSize(scriptLen) || script), Insert on connect,
+// Remove on spend. Because MuHash is order-invariant and homomorphic, the
+// running value at height H equals Core's muhash AS OF H, byte-for-byte — which
+// is what gettxoutsetinfo(muhash, H) returns.
 type CoinStatsIndex struct {
 	*BaseIndex
 
@@ -123,7 +148,7 @@ type CoinStatsIndex struct {
 	utxoCount   uint64
 	totalAmount int64
 	bogoSize    uint64
-	utxoHash    []byte // Running SHA256 hash accumulator
+	muhash      *crypto.MuHash3072 // running MuHash3072 over the UTXO set
 	subsidy     int64
 	fees        int64
 }
@@ -132,9 +157,16 @@ type CoinStatsIndex struct {
 func NewCoinStatsIndex(db DB) *CoinStatsIndex {
 	return &CoinStatsIndex{
 		BaseIndex: NewBaseIndex("coinstatsindex", db),
-		utxoHash:  make([]byte, 32),
+		muhash:    crypto.NewMuHash3072(),
 	}
 }
+
+// NeedsUndo reports that the coinstatsindex requires real per-block undo data
+// during startup catch-up replay (to subtract spent coins from the running
+// UTXO-set MuHash + counts). Satisfies the storage.undoNeeder capability that
+// IndexManager.catchUpOne checks. blockfilterindex / txindex do not implement
+// this, so they keep receiving nil undo on the forward path.
+func (idx *CoinStatsIndex) NeedsUndo() bool { return true }
 
 // Init initializes the coinstatsindex by loading state from the database.
 func (idx *CoinStatsIndex) Init() error {
@@ -145,6 +177,7 @@ func (idx *CoinStatsIndex) Init() error {
 	if data == nil {
 		// No existing state, start fresh
 		idx.bestHeight = -1
+		idx.muhash = crypto.NewMuHash3072()
 		return nil
 	}
 
@@ -159,11 +192,53 @@ func (idx *CoinStatsIndex) Init() error {
 	idx.utxoCount = state.UTXOCount
 	idx.totalAmount = state.TotalAmount
 	idx.bogoSize = state.BogoSize
-	idx.utxoHash = state.UTXOHash[:]
 	idx.subsidy = state.TotalSubsidy
 	idx.fees = state.TotalFees
 
+	// Restore the running MuHash3072 accumulator (numerator||denominator, 768
+	// bytes). Persisted separately from CoinStatsState because the state row
+	// only carries the finalized 32-byte digest; the accumulator is needed to
+	// continue incremental Insert/Remove across restarts.
+	mhData, err := idx.db.Get(CoinStatsMuHashKey)
+	if err != nil {
+		return err
+	}
+	if mhData == nil {
+		idx.muhash = crypto.NewMuHash3072()
+	} else {
+		mh, derr := crypto.MuHashDeserialize(mhData)
+		if derr != nil {
+			return derr
+		}
+		idx.muhash = mh
+	}
+
 	return nil
+}
+
+// coinRecord builds the Core per-coin record fed to the MuHash3072 accumulator.
+// Byte layout is identical to kernel/coinstats.cpp::TxOutSer (uncompressed):
+//
+//	outpoint (32B hash LE || 4B vout LE)
+//	code = (height << 1) | coinbase, as uint32 LE  (NOT a varint)
+//	value, int64 LE
+//	CompactSize(len(scriptPubKey)) || scriptPubKey
+//
+// Mirrors internal/consensus/utxohash.go::WriteTxOutSer, replicated here because
+// the storage package cannot import consensus (consensus imports storage).
+func coinRecord(outpoint wire.OutPoint, height int32, coinbase bool, value int64, pkScript []byte) []byte {
+	buf := new(bytes.Buffer)
+	buf.Grow(36 + 4 + 8 + 5 + len(pkScript))
+	_ = outpoint.Serialize(buf)
+	code := uint32(height) << 1
+	if coinbase {
+		code |= 1
+	}
+	wire.WriteUint32LE(buf, code)
+	wire.WriteInt64LE(buf, value)
+	wire.WriteCompactSize(buf, uint64(len(pkScript)))
+	buf.Write(pkScript)
+	return buf.Bytes()
 }
 
 // WriteBlock updates UTXO statistics for a newly connected block.
@@ -187,6 +262,7 @@ func (idx *CoinStatsIndex) WriteBlock(block *wire.MsgBlock, height int32, blockH
 	undoIdx := 0
 	for i, tx := range block.Transactions {
 		isCoinbase := (i == 0)
+		txid := tx.TxHash()
 
 		// Add new outputs (skip unspendable)
 		for j, out := range tx.TxOut {
@@ -198,20 +274,29 @@ func (idx *CoinStatsIndex) WriteBlock(block *wire.MsgBlock, height int32, blockH
 			idx.totalAmount += out.Value
 			idx.bogoSize += getBogoSize(out.PkScript)
 
-			// Update UTXO hash
-			idx.addToHash(tx.TxHash(), uint32(j), out)
+			// Insert the Core per-coin record into the MuHash accumulator.
+			op := wire.OutPoint{Hash: txid, Index: uint32(j)}
+			idx.muhash.Insert(coinRecord(op, height, isCoinbase, out.Value, out.PkScript))
 		}
 
-		// Remove spent outputs (from undo data)
+		// Remove spent outputs (from undo data). SpentCoin carries value,
+		// pkScript, the creating height and coinbase flag, but NOT the outpoint
+		// — the outpoint is the corresponding input's PreviousOutPoint, paired
+		// by index. This is required for MuHash parity: the removed record must
+		// be byte-identical to the one inserted when the coin was created.
 		if !isCoinbase && undo != nil && undoIdx < len(undo.TxUndos) {
 			txUndo := &undo.TxUndos[undoIdx]
-			for _, spent := range txUndo.SpentCoins {
+			for k := range txUndo.SpentCoins {
+				spent := &txUndo.SpentCoins[k]
 				idx.utxoCount--
 				idx.totalAmount -= spent.TxOut.Value
 				idx.bogoSize -= getBogoSize(spent.TxOut.PkScript)
 
-				// Remove from UTXO hash
-				idx.removeFromHash(spent.TxOut)
+				var op wire.OutPoint
+				if k < len(tx.TxIn) {
+					op = tx.TxIn[k].PreviousOutPoint
+				}
+				idx.muhash.Remove(coinRecord(op, spent.Height, spent.Coinbase, spent.TxOut.Value, spent.TxOut.PkScript))
 			}
 			undoIdx++
 		}
@@ -225,6 +310,11 @@ func (idx *CoinStatsIndex) WriteBlock(block *wire.MsgBlock, height int32, blockH
 		idx.fees += totalFees
 	}
 
+	// Finalize the running MuHash3072 into the 32-byte muhash digest for this
+	// height. Finalize does not consume the accumulator, so subsequent blocks
+	// continue from the same state.
+	digest := idx.muhash.Finalize()
+
 	// Store stats for this height
 	stats := &CoinStats{
 		Height:      height,
@@ -236,11 +326,15 @@ func (idx *CoinStatsIndex) WriteBlock(block *wire.MsgBlock, height int32, blockH
 		TotalSubsidy: idx.subsidy,
 		TotalFees:   idx.fees,
 	}
-	copy(stats.HashSerialized[:], idx.utxoHash)
+	copy(stats.HashSerialized[:], digest[:])
 
 	batch := idx.db.NewBatch()
 	key := MakeCoinStatsKey(height)
 	batch.Put(key, stats.Serialize())
+	// Snapshot the accumulator as of this height so RevertBlock can restore the
+	// previous height's accumulator without undo data or a replay.
+	mhSer := idx.muhash.MuHashSerialize()
+	batch.Put(MakeCoinStatsMuHashKey(height), mhSer)
 
 	// Save state
 	state := &CoinStatsState{
@@ -253,8 +347,12 @@ func (idx *CoinStatsIndex) WriteBlock(block *wire.MsgBlock, height int32, blockH
 		TotalSubsidy: idx.subsidy,
 		TotalFees:    idx.fees,
 	}
-	copy(state.UTXOHash[:], idx.utxoHash)
+	copy(state.UTXOHash[:], digest[:])
 	batch.Put(CoinStatsStateKey, state.Serialize())
+	// Persist the full current accumulator (768B) so incremental hashing
+	// survives a restart. The per-height digest above is not enough to resume
+	// Insert/Remove.
+	batch.Put(CoinStatsMuHashKey, mhSer)
 
 	if err := batch.Write(); err != nil {
 		return err
@@ -270,6 +368,7 @@ func (idx *CoinStatsIndex) RevertBlock(block *wire.MsgBlock, height int32, block
 	prevHeight := height - 1
 
 	// Load previous stats to restore state
+	var prevDigest wire.Hash256
 	if prevHeight >= 0 {
 		prevStats, err := idx.GetStats(prevHeight)
 		if err != nil {
@@ -280,25 +379,42 @@ func (idx *CoinStatsIndex) RevertBlock(block *wire.MsgBlock, height int32, block
 		idx.utxoCount = prevStats.UTXOCount
 		idx.totalAmount = prevStats.TotalAmount
 		idx.bogoSize = prevStats.BogoSize
-		copy(idx.utxoHash, prevStats.HashSerialized[:])
+		prevDigest = prevStats.HashSerialized
 		idx.subsidy = prevStats.TotalSubsidy
 		idx.fees = prevStats.TotalFees
+
+		// Restore the MuHash3072 accumulator from the previous height's
+		// snapshot. The 32-byte digest is one-way, so the full 768-byte
+		// accumulator snapshot (written in WriteBlock) is what we resume from.
+		mhData, err := idx.db.Get(MakeCoinStatsMuHashKey(prevHeight))
+		if err != nil {
+			return err
+		}
+		if mhData == nil {
+			idx.muhash = crypto.NewMuHash3072()
+		} else {
+			mh, derr := crypto.MuHashDeserialize(mhData)
+			if derr != nil {
+				return derr
+			}
+			idx.muhash = mh
+		}
 	} else {
 		// Reverting to before genesis
 		idx.txCount = 0
 		idx.utxoCount = 0
 		idx.totalAmount = 0
 		idx.bogoSize = 0
-		idx.utxoHash = make([]byte, 32)
+		idx.muhash = crypto.NewMuHash3072()
 		idx.subsidy = 0
 		idx.fees = 0
 	}
 
 	batch := idx.db.NewBatch()
 
-	// Delete stats at this height
-	key := MakeCoinStatsKey(height)
-	batch.Delete(key)
+	// Delete stats + per-height accumulator at this height
+	batch.Delete(MakeCoinStatsKey(height))
+	batch.Delete(MakeCoinStatsMuHashKey(height))
 
 	// Update state
 	state := &CoinStatsState{
@@ -311,8 +427,10 @@ func (idx *CoinStatsIndex) RevertBlock(block *wire.MsgBlock, height int32, block
 		TotalSubsidy: idx.subsidy,
 		TotalFees:    idx.fees,
 	}
-	copy(state.UTXOHash[:], idx.utxoHash)
+	state.UTXOHash = prevDigest
 	batch.Put(CoinStatsStateKey, state.Serialize())
+	// Re-point the global accumulator key at the restored accumulator.
+	batch.Put(CoinStatsMuHashKey, idx.muhash.MuHashSerialize())
 
 	if err := batch.Write(); err != nil {
 		return err
@@ -335,36 +453,6 @@ func (idx *CoinStatsIndex) GetStats(height int32) (*CoinStats, error) {
 	return DeserializeCoinStats(data)
 }
 
-// addToHash updates the running UTXO hash with a new output.
-func (idx *CoinStatsIndex) addToHash(txid wire.Hash256, vout uint32, out *wire.TxOut) {
-	// Serialize the outpoint + output
-	buf := new(bytes.Buffer)
-	txid.Serialize(buf)
-	wire.WriteUint32LE(buf, vout)
-	wire.WriteInt64LE(buf, out.Value)
-	wire.WriteVarBytes(buf, out.PkScript)
-
-	// XOR the SHA256 hash of this UTXO into the accumulator
-	hash := crypto.SHA256Hash(buf.Bytes())
-	for i := 0; i < 32; i++ {
-		idx.utxoHash[i] ^= hash[i]
-	}
-}
-
-// removeFromHash updates the running UTXO hash by removing an output.
-func (idx *CoinStatsIndex) removeFromHash(out wire.TxOut) {
-	// For XOR-based hash, removing is the same as adding
-	// We need the outpoint to properly hash, but we don't have it here
-	// Simplified: just hash the output data
-	buf := new(bytes.Buffer)
-	wire.WriteInt64LE(buf, out.Value)
-	wire.WriteVarBytes(buf, out.PkScript)
-
-	hash := crypto.SHA256Hash(buf.Bytes())
-	for i := 0; i < 32; i++ {
-		idx.utxoHash[i] ^= hash[i]
-	}
-}
 
 // calcBlockSubsidy calculates the block subsidy at a given height.
 func calcBlockSubsidy(height int32) int64 {

@@ -201,6 +201,13 @@ type Config struct {
 	// the only one Core implements server-side.
 	BlockFilterIndex bool
 
+	// CoinStatsIndex maintains a per-height UTXO-set commitment (MuHash3072 +
+	// txouts/bogosize/total_amount). Default OFF, matching Bitcoin Core's
+	// `-coinstatsindex=0`. When ON, gettxoutsetinfo can be queried for a
+	// specific block height/hash with hash_type muhash|none, served from the
+	// index. Mirrors Bitcoin Core's `-coinstatsindex` (init.cpp).
+	CoinStatsIndex bool
+
 	// ASMap is the path to an ASMap binary file for AS-level peer bucketing
 	// and eclipse-resistance diversity. When set, blockbrew loads and
 	// validates the file (up to 8 MiB) at startup and uses the embedded
@@ -534,6 +541,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.HealthPort, "healthport", 0, "If non-zero, bind a /healthz HTTP endpoint on 127.0.0.1:<port> for liveness/readiness probes. 0 disables.")
 	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", "Load a Bitcoin Core-format UTXO snapshot (utxo\\xff magic) from <path> before starting the node. Only acted on when the chainstate is fresh (height==0); otherwise an error is logged and the snapshot is skipped. Mirrors Bitcoin Core's `-loadsnapshot=<path>`.")
 	flag.BoolVar(&cfg.BlockFilterIndex, "blockfilterindex", false, "Maintain the BIP-157/158 basic compact-block-filter index. Default OFF (matches Bitcoin Core's `-blockfilterindex=0`). When ON, blockbrew populates the index on every connected block, rewinds it on disconnect (Phase 2 reorg-aware), and exposes the resulting filters via /rest/blockfilter, /rest/blockfilterheaders, and the getblockfilter RPC.")
+	flag.BoolVar(&cfg.CoinStatsIndex, "coinstatsindex", false, "Maintain the coinstatsindex (per-height UTXO-set MuHash + counts: txouts, bogosize, total_amount). Default OFF (matches Bitcoin Core's `-coinstatsindex=0`). When ON, gettxoutsetinfo can be queried for a specific block height/hash with hash_type muhash|none, served from the index; getindexinfo reports it.")
 	flag.StringVar(&cfg.ASMap, "asmap", "", "Path to an ASMap binary file for AS-level peer bucketing and eclipse-resistance diversity. When set, blockbrew loads the file (max 8 MiB), validates its trie, and uses it to map peer IPs to Autonomous System Numbers. Peer diversity is then enforced at the AS level rather than /16 subnet. Leave empty (default) to use legacy /16 grouping. Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp).")
 	flag.Var(&cfg.Connect, "connect", "Connect ONLY to the specified <ip:port> peer(s) and disable both DNS-seed resolution and addrman/auto-outbound dialing. Repeatable / comma-separated. Mirrors Bitcoin Core's `-connect=<ip:port>` (implies -dnsseed=0 and turns off automatic outbound connections). The pinned peers are dialed as manual connections and re-dialed if they drop. Empty (default) = normal peer discovery.")
 	flag.BoolVar(&cfg.NoDNSSeed, "nodnsseed", false, "Disable DNS-seed resolution without otherwise changing peer discovery (addrman/auto-outbound dialing still runs). Mirrors Bitcoin Core's `-dnsseed=0` / `-nodnsseed`. Implied automatically when -connect is set.")
@@ -952,6 +960,23 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		log.Printf("BIP-157/158 blockfilterindex enabled (best_height=%d)", blockFilterIndex.BestHeight())
 	}
 
+	// coinstatsindex (per-height UTXO-set MuHash3072 + counts). Mirrors Bitcoin
+	// Core's `-coinstatsindex` (index/coinstatsindex.cpp). Registered in the same
+	// IndexManager as blockfilterindex so the live connect/disconnect hooks and
+	// the startup CatchUp drive it unchanged. No genesis row is recorded: the
+	// genesis coinbase is unspendable and is never added to the UTXO set on any
+	// network, so height-0 stats are the empty set — matching Core, which also
+	// does not include the genesis coinbase in the coinstatsindex UTXO set. The
+	// connect hook starts firing at height 1.
+	var coinStatsIndex *storage.CoinStatsIndex
+	if cfg.CoinStatsIndex {
+		coinStatsIndex = storage.NewCoinStatsIndex(chainDB.DB())
+		if err := indexManager.RegisterIndex(coinStatsIndex); err != nil {
+			return fmt.Errorf("coinstatsindex: register: %w", err)
+		}
+		log.Printf("coinstatsindex enabled (best_height=%d)", coinStatsIndex.BestHeight())
+	}
+
 	// 6a-bis. Secondary-index startup catch-up. Mirrors Bitcoin Core's
 	// BaseIndex::Sync / Rewind (index/base.cpp): on startup each enabled index
 	// must be walked forward from its persisted best block to the active chain
@@ -963,7 +988,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// AFTER the chainstate + header-index load (NewChainManager above) and
 	// BEFORE the P2P sync manager starts connecting new blocks, so the index
 	// is consistent with the tip before live connects resume.
-	if cfg.BlockFilterIndex {
+	if cfg.BlockFilterIndex || cfg.CoinStatsIndex {
 		_, tipHeight := chainMgr.BestBlock()
 		if err := indexManager.CatchUp(tipHeight, chainDB.GetBlockHashByHeight); err != nil {
 			// Non-fatal, matching the live index hooks' posture: log loudly
@@ -1057,6 +1082,17 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 					log.Printf("blockfilterindex: revert %s @ height=%d failed: %v",
 						blockHash.String()[:16], height, err)
 				}
+			}
+		}
+		// coinstatsindex: reverse this block. RevertBlock ignores its undo arg
+		// (it restores the running state + accumulator from the stored
+		// prev-height snapshot), so nil is correct here. No batch-aware variant;
+		// the same non-atomic window the class already tolerates applies.
+		if coinStatsIndex != nil {
+			blockHash := block.Header.BlockHash()
+			if err := coinStatsIndex.RevertBlock(block, height, blockHash, nil); err != nil {
+				log.Printf("coinstatsindex: revert %s @ height=%d failed: %v",
+					blockHash.String()[:16], height, err)
 			}
 		}
 	})
@@ -1178,6 +1214,25 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 					log.Printf("blockfilterindex: write %s @ height=%d failed: %v",
 						blockHash.String()[:16], height, err)
 				}
+			}
+		}
+		// coinstatsindex: maintain the per-height UTXO-set MuHash + counts.
+		// Unlike blockfilterindex, this MUST receive real undo data so spent
+		// coins are subtracted from the running set — otherwise utxoCount /
+		// total_amount / muhash only ever grow and diverge from Core. There is
+		// no batch-aware WriteBlockBatch variant for this index; it tolerates
+		// the same non-atomic-vs-reorg window the class already accepts (Init
+		// re-reads from disk on restart). Mirrors Core's coinstatsindex
+		// CustomAppend, which is driven from undo (CCoinsViewCache spent set).
+		if coinStatsIndex != nil {
+			undo, uerr := chainDB.ReadBlockUndo(blockHash)
+			if uerr != nil {
+				log.Printf("coinstatsindex: read undo %s @ height=%d: %v",
+					blockHash.String()[:16], height, uerr)
+			}
+			if err := coinStatsIndex.WriteBlock(block, height, blockHash, undo); err != nil {
+				log.Printf("coinstatsindex: write %s @ height=%d failed: %v",
+					blockHash.String()[:16], height, err)
 			}
 		}
 	})
