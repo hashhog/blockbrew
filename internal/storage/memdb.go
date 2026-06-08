@@ -74,6 +74,20 @@ func (m *MemDB) NewBatch() Batch {
 	}
 }
 
+// NewIndexedBatch creates a batch whose Get() reflects the batch's own pending
+// writes/deletes layered over the committed DB. The MemDB batch always tracks
+// its writes/deletes in slices, so indexed and plain batches share the same
+// representation; the flag only changes Get's behavior (plain batches read the
+// committed DB only, matching pebble's non-indexed semantics).
+func (m *MemDB) NewIndexedBatch() Batch {
+	return &memBatch{
+		db:      m,
+		writes:  make([]batchOp, 0),
+		deletes: make([]string, 0),
+		indexed: true,
+	}
+}
+
 // NewIterator creates an iterator over a key range.
 // If prefix is non-nil, iterates over keys with that prefix.
 func (m *MemDB) NewIterator(prefix []byte) Iterator {
@@ -123,6 +137,7 @@ type memBatch struct {
 	db      *MemDB
 	writes  []batchOp
 	deletes []string
+	indexed bool // Get reflects pending writes/deletes when true
 }
 
 // Put adds a write operation to the batch.
@@ -136,6 +151,45 @@ func (b *memBatch) Put(key, value []byte) {
 // Delete adds a delete operation to the batch.
 func (b *memBatch) Delete(key []byte) {
 	b.deletes = append(b.deletes, string(key))
+}
+
+// Get reads a key. For an indexed batch, this batch's own pending writes and
+// deletes are layered over the committed DB (last-writer-wins among the staged
+// ops, deletes mask the committed value); a plain batch reads the committed DB
+// only. Returns (nil, nil) when the key is absent or deleted in this batch.
+func (b *memBatch) Get(key []byte) ([]byte, error) {
+	if b.indexed {
+		ks := string(key)
+		// Walk staged ops in reverse so the most recent Put/Delete wins.
+		latestPut := -1
+		latestDel := -1
+		for i := len(b.writes) - 1; i >= 0; i-- {
+			if b.writes[i].key == ks {
+				latestPut = i
+				break
+			}
+		}
+		for i := len(b.deletes) - 1; i >= 0; i-- {
+			if b.deletes[i] == ks {
+				latestDel = i
+				break
+			}
+		}
+		// A staged Delete with no later staged Put masks the committed value.
+		// (writes and deletes don't share an ordering index here, but the
+		// reorg path never re-Puts a key it Deletes in the same batch, so the
+		// "Put present => value present" rule is sufficient and correct for
+		// this usage.)
+		if latestPut >= 0 {
+			v := make([]byte, len(b.writes[latestPut].value))
+			copy(v, b.writes[latestPut].value)
+			return v, nil
+		}
+		if latestDel >= 0 {
+			return nil, nil
+		}
+	}
+	return b.db.Get(key)
 }
 
 // Write atomically applies all operations in the batch.

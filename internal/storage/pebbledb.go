@@ -3,6 +3,7 @@ package storage
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -238,6 +239,20 @@ func (p *PebbleDB) NewBatchNoSync() Batch {
 	}
 }
 
+// NewIndexedBatch creates a batch whose Get() observes the batch's own pending
+// writes layered over the committed DB. Pebble's indexed batch is the only
+// batch variant that supports reads of staged-but-uncommitted Sets; a plain
+// p.db.NewBatch() is write-only. Used by the reorg path so the coinstatsindex
+// connect hook can read undo data that earlier connects in the SAME reorg
+// staged but have not yet committed.
+func (p *PebbleDB) NewIndexedBatch() Batch {
+	return &pebbleBatch{
+		db:      p.db,
+		batch:   p.db.NewIndexedBatch(),
+		indexed: true,
+	}
+}
+
 // NewIterator creates an iterator over a key range.
 // If prefix is non-nil, iterates over keys with that prefix.
 func (p *PebbleDB) NewIterator(prefix []byte) Iterator {
@@ -292,9 +307,10 @@ func prefixUpperBound(prefix []byte) []byte {
 
 // pebbleBatch wraps a Pebble batch.
 type pebbleBatch struct {
-	db     *pebble.DB
-	batch  *pebble.Batch
-	noSync bool // Skip fsync on commit (for IBD performance)
+	db      *pebble.DB
+	batch   *pebble.Batch
+	noSync  bool // Skip fsync on commit (for IBD performance)
+	indexed bool // batch created via NewIndexedBatch; Get reads pending writes
 }
 
 // Put adds a write operation to the batch.
@@ -305,6 +321,33 @@ func (b *pebbleBatch) Put(key, value []byte) {
 // Delete adds a delete operation to the batch.
 func (b *pebbleBatch) Delete(key []byte) {
 	b.batch.Delete(key, nil)
+}
+
+// Get reads a key. For an indexed batch, the read reflects this batch's own
+// pending writes/deletes layered over the committed DB; for a plain batch it
+// falls through to the committed DB only (pebble.Batch.Get on a non-indexed
+// batch panics, so we route plain-batch reads at the DB).
+func (b *pebbleBatch) Get(key []byte) ([]byte, error) {
+	var (
+		val    []byte
+		closer io.Closer
+		err    error
+	)
+	if b.indexed {
+		val, closer, err = b.batch.Get(key)
+	} else {
+		val, closer, err = b.db.Get(key)
+	}
+	if err == pebble.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, len(val))
+	copy(out, val)
+	closer.Close()
+	return out, nil
 }
 
 // Write atomically applies all operations in the batch.
