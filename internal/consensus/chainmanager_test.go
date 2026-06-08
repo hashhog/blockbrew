@@ -2602,16 +2602,39 @@ func (c *countingDB) NewBatch() storage.Batch {
 	}
 }
 
+func (c *countingDB) NewIndexedBatch() storage.Batch {
+	type indexedBatcher interface {
+		NewIndexedBatch() storage.Batch
+	}
+	c.mu.Lock()
+	c.batchOpens++
+	failNext := c.failNextWrite
+	c.failNextWrite = false
+	c.mu.Unlock()
+	var inner storage.Batch
+	if ib, ok := c.inner.(indexedBatcher); ok {
+		inner = ib.NewIndexedBatch()
+	} else {
+		inner = c.inner.NewBatch()
+	}
+	return &countingBatch{
+		owner:    c,
+		inner:    inner,
+		failNext: failNext,
+	}
+}
+
 type countingBatch struct {
 	owner    *countingDB
 	inner    storage.Batch
 	failNext bool
 }
 
-func (b *countingBatch) Put(key, value []byte) { b.inner.Put(key, value) }
-func (b *countingBatch) Delete(key []byte)     { b.inner.Delete(key) }
-func (b *countingBatch) Reset()                { b.inner.Reset() }
-func (b *countingBatch) Len() int              { return b.inner.Len() }
+func (b *countingBatch) Put(key, value []byte)        { b.inner.Put(key, value) }
+func (b *countingBatch) Delete(key []byte)            { b.inner.Delete(key) }
+func (b *countingBatch) Get(key []byte) ([]byte, error) { return b.inner.Get(key) }
+func (b *countingBatch) Reset()                       { b.inner.Reset() }
+func (b *countingBatch) Len() int                    { return b.inner.Len() }
 func (b *countingBatch) Write() error {
 	b.owner.mu.Lock()
 	b.owner.batchWrites++

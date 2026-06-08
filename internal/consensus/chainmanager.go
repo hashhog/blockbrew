@@ -1785,7 +1785,17 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 		// behavior since there is no batch to share.
 		return cm.reorgInMemoryFallback(disconnectNodes, connectNodes)
 	}
-	batch := cm.chainDB.NewBatch()
+	// Indexed batch: each ConnectBlock during this reorg stages its undo data
+	// into this shared batch (WriteBlockUndoBatch), and the coinstatsindex
+	// connect hook reads that just-staged undo back via ReadBlockUndoFromBatch
+	// to subtract spent coins from its running MuHash. A plain (write-only)
+	// batch's Get cannot observe pending writes, so the hook would read
+	// ErrNotFound for every reconnected block and serve a stale, chain-A
+	// MuHash after the reorg (the REORG-RECONNECT desync). Indexed-batch Get
+	// layers the batch's pending undo over disk, so B's reconnected blocks get
+	// their real undo. Mirrors Core's CoinStatsIndex CustomAppend running on
+	// each connected B block during ActivateBestChain.
+	batch := cm.chainDB.NewIndexedBatch()
 
 	cm.mu.Lock()
 	if cm.reorgBatch != nil {

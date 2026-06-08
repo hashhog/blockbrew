@@ -1225,7 +1225,19 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// re-reads from disk on restart). Mirrors Core's coinstatsindex
 		// CustomAppend, which is driven from undo (CCoinsViewCache spent set).
 		if coinStatsIndex != nil {
-			undo, uerr := chainDB.ReadBlockUndo(blockHash)
+			// During a multi-block reorg, this block's undo was staged into the
+			// shared reorg batch by ConnectBlock but is NOT yet committed to
+			// disk — a plain ReadBlockUndo returns ErrNotFound for every
+			// reconnected B-chain block, which would make WriteBlock skip the
+			// spent-coin subtraction and leave the per-height MuHash stuck on
+			// chain A's value (the REORG-RECONNECT desync). Read through the
+			// in-flight reorg batch (indexed) so B's reconnected blocks get
+			// their real undo and the MuHash tracks the active chain, matching
+			// Core's CoinStatsIndex CustomAppend during ActivateBestChain.
+			// Outside a reorg, CurrentReorgBatch() is nil and this is a plain
+			// disk read.
+			reorgBatch := chainMgr.CurrentReorgBatch()
+			undo, uerr := chainDB.ReadBlockUndoFromBatch(reorgBatch, blockHash)
 			if uerr != nil {
 				log.Printf("coinstatsindex: read undo %s @ height=%d: %v",
 					blockHash.String()[:16], height, uerr)

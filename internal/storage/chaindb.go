@@ -345,6 +345,24 @@ func (c *ChainDB) NewBatch() Batch {
 	return c.db.NewBatch()
 }
 
+// NewIndexedBatch creates a write batch whose Get() observes the batch's own
+// pending writes (see DB.NewIndexedBatch). Used by ChainManager.ReorgTo so the
+// coinstatsindex connect hook can read undo data that earlier connects in the
+// same reorg staged but have not yet committed (ReadBlockUndoFromBatch).
+func (c *ChainDB) NewIndexedBatch() Batch {
+	type indexedBatcher interface {
+		NewIndexedBatch() Batch
+	}
+	if ib, ok := c.db.(indexedBatcher); ok {
+		return ib.NewIndexedBatch()
+	}
+	// Fallback: a write-only batch. Get falls through to the committed DB, so
+	// ReadBlockUndoFromBatch degrades to a plain disk read (the pre-fix
+	// behavior) rather than failing. Only reachable with a DB backend that
+	// does not implement NewIndexedBatch.
+	return c.db.NewBatch()
+}
+
 // NewBatchNoSync creates a batch that skips fsync on commit.
 // Safe during IBD where chain-state checkpoints handle crash recovery.
 func (c *ChainDB) NewBatchNoSync() Batch {
@@ -383,6 +401,33 @@ func (c *ChainDB) ReadBlockUndo(hash wire.Hash256) (*BlockUndo, error) {
 		return nil, ErrNotFound
 	}
 
+	return DeserializeBlockUndo(data)
+}
+
+// ReadBlockUndoFromBatch retrieves undo data for a block, reading through an
+// in-flight batch first. With an indexed batch (DB.NewIndexedBatch) this sees
+// undo that was staged earlier in the SAME batch but not yet committed to disk
+// — required during a multi-block reorg, where ConnectBlock stages each
+// reconnected block's undo into the shared reorg batch (cm.reorgBatch) and the
+// coinstatsindex connect hook needs that undo to subtract spent coins from its
+// running MuHash. A plain disk read (ReadBlockUndo) returns ErrNotFound for
+// those blocks because their undo only lives in the uncommitted batch, which is
+// exactly the reorg-reconnect desync this fixes.
+//
+// If batch is nil, this is identical to ReadBlockUndo (disk read). Returns
+// ErrNotFound if no undo data exists for the block in the batch or on disk.
+func (c *ChainDB) ReadBlockUndoFromBatch(batch Batch, hash wire.Hash256) (*BlockUndo, error) {
+	if batch == nil {
+		return c.ReadBlockUndo(hash)
+	}
+	key := MakeUndoBlockKey(hash)
+	data, err := batch.Get(key)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, ErrNotFound
+	}
 	return DeserializeBlockUndo(data)
 }
 
