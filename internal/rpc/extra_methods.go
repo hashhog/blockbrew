@@ -748,8 +748,12 @@ type indexSummary struct {
 //     "blockfilterindex"; emitted under Core's GetName() string
 //     ("basic block filter index", blockfilterindex.cpp:78).
 //
-// coinstatsindex / txospenderindex are not wired in blockbrew, so they are
-// never emitted — Core only lists indexes that are actually running.
+//   - "coinstatsindex"  when -coinstatsindex is set. Registered + emitted
+//     under the internal name "coinstatsindex" (Core's GetName() is the same
+//     literal). synced = caught up to the chain tip.
+//
+// txospenderindex is not wired in blockbrew, so it is never emitted — Core only
+// lists indexes that are actually running.
 func (s *Server) handleGetIndexInfo(params json.RawMessage) (interface{}, *RPCError) {
 	// Optional positional arg 0: index_name filter (default = all).
 	indexName := ""
@@ -812,6 +816,16 @@ func (s *Server) handleGetIndexInfo(params json.RawMessage) (interface{}, *RPCEr
 		if idx := s.indexManager.GetIndex("blockfilterindex"); idx != nil {
 			best := idx.BestHeight()
 			push("basic block filter index", best, best >= tipHeight)
+		}
+	}
+
+	// coinstatsindex: runs when -coinstatsindex is set. Registered and emitted
+	// under the internal name "coinstatsindex" (Core's GetName() == the same
+	// literal, coinstatsindex.cpp). synced = caught up to the chain tip.
+	if s.indexManager != nil {
+		if idx := s.indexManager.GetIndex("coinstatsindex"); idx != nil {
+			best := idx.BestHeight()
+			push("coinstatsindex", best, best >= tipHeight)
 		}
 	}
 
