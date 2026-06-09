@@ -14,9 +14,9 @@ package rpc
 //   - optional positional index_name arg filters to one index; a name that
 //     matches NO running index yields {} (an EMPTY object, NOT an error) —
 //     this is the load-bearing Core-parity assertion.
-//   - (the non-string index_name error path is intentionally not asserted:
-//     blockbrew returns -32602 there, which diverges from Core's RPC_TYPE_ERROR
-//     (-3); tracked as a follow-up rather than enshrined here.)
+//   - a non-string index_name yields Core's RPC_TYPE_ERROR (-3), NOT
+//     -32602 (RPCTypeCheck path in rpc/util.cpp). Pinned by
+//     TestGetIndexInfo_NonStringTypeError below.
 //
 // The handler (extra_methods.go::handleGetIndexInfo) is already Core-correct;
 // this test pins that shape against regressions. It deliberately drives the
@@ -148,11 +148,8 @@ func TestGetIndexInfo_Shape(t *testing.T) {
 		t.Errorf("unknown index_name result = %v, want empty object {}", unknown)
 	}
 
-	// --- (former Case 5 removed) A non-string index_name currently returns
-	//     blockbrew's -32602 "index_name must be a string", which DIVERGES from
-	//     Core's RPC_TYPE_ERROR (-3, "Wrong type passed..."). Intentionally NOT
-	//     asserted so this test does not enshrine the non-Core code; the handler
-	//     fix is tracked as a follow-up in _loop-ledger.md. ---------------------
+	// --- (non-string index_name error code is pinned by
+	//     TestGetIndexInfo_NonStringTypeError below.) ---------------------------
 
 	// --- Field-order assertion: re-marshal the txindex value and confirm
 	//     `synced` precedes `best_block_height` byte-for-byte. indexSummary is
@@ -243,5 +240,23 @@ func TestGetIndexInfo_DisabledEmpty(t *testing.T) {
 	}
 	if len(m) != 0 {
 		t.Errorf("disabled-state result = %v, want empty object {}", m)
+	}
+}
+
+// TestGetIndexInfo_NonStringTypeError pins the wrong-type arg path: a non-string
+// index_name must yield Core's RPC_TYPE_ERROR (-3), NOT RPCErrInvalidParams
+// (-32602). Core dispatches the typed `index_name` arg through RPCTypeCheck
+// (rpc/util.cpp), which throws RPC_TYPE_ERROR for a mismatched type.
+func TestGetIndexInfo_NonStringTypeError(t *testing.T) {
+	server := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0", TxIndex: true})
+
+	// arg 0 is a number, not a string.
+	resp := testRPCRequest(t, server.handleRPC, "getindexinfo", []interface{}{123}, "", "")
+	if resp.Error == nil {
+		t.Fatalf("non-string index_name must error; got result %+v", resp.Result)
+	}
+	if resp.Error.Code != RPCErrTypeError {
+		t.Errorf("non-string index_name: error code = %d, want %d (RPCErrTypeError, Core RPC_TYPE_ERROR)",
+			resp.Error.Code, RPCErrTypeError)
 	}
 }
