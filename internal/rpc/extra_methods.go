@@ -765,7 +765,9 @@ func (s *Server) handleGetIndexInfo(params json.RawMessage) (interface{}, *RPCEr
 		if len(args) >= 1 && args[0] != nil {
 			name, ok := args[0].(string)
 			if !ok {
-				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "index_name must be a string"}
+				// Core throws RPC_TYPE_ERROR (-3) for a wrong-typed arg via the
+				// typed-arg dispatch (rpc/util.cpp RPCTypeCheck path).
+				return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value is not a string as expected"}
 			}
 			indexName = name
 		}
