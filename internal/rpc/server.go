@@ -57,14 +57,21 @@ type Server struct {
 	peerMgr      *p2p.PeerManager
 	syncMgr      *p2p.SyncManager
 	templateGen  *mining.TemplateGenerator
-	wallet       *wallet.Wallet         // single wallet (legacy support)
-	walletMgr    *wallet.Manager        // multi-wallet manager
+	wallet       *wallet.Wallet  // single wallet (legacy support)
+	walletMgr    *wallet.Manager // multi-wallet manager
 	indexManager *storage.IndexManager
-	pruner       *storage.Pruner        // BIP-?? auto-prune state; nil = archive
-	dataDir      string                 // Filesystem root for mempool.dat etc.
+	pruner       *storage.Pruner // BIP-?? auto-prune state; nil = archive
+	dataDir      string          // Filesystem root for mempool.dat etc.
 	httpServer   *http.Server
 
 	cookiePassword string // hex-encoded cookie secret (empty if unused)
+
+	// blockFetchPeers is the test seam for getblockfrompeer. In production
+	// it is nil and the handler falls back to s.peerMgr.ConnectedPeers()
+	// (the exact same source getpeerinfo enumerates, so peer_id matches the
+	// id an operator sees there). Tests inject a deterministic peer list so
+	// the genuine getdata send can be captured without a live network.
+	blockFetchPeers fetchPeerLister
 
 	mu        sync.RWMutex
 	startTime time.Time
@@ -600,6 +607,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	// Network RPCs
 	case "getpeerinfo":
 		return s.handleGetPeerInfo()
+	case "getblockfrompeer":
+		return s.handleGetBlockFromPeer(params)
 	case "getconnectioncount":
 		return s.handleGetConnectionCount()
 	case "getnetworkinfo":
