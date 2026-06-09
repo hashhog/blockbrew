@@ -43,10 +43,25 @@ type WalletConfig struct {
 
 // Wallet manages keys, addresses, and balances.
 type Wallet struct {
-	mu         sync.RWMutex
-	name       string // wallet name (empty for default wallet)
-	config     WalletConfig
-	masterKey  *HDKey
+	mu        sync.RWMutex
+	name      string // wallet name (empty for default wallet)
+	config    WalletConfig
+	masterKey *HDKey
+	// mnemonic is the BIP-39 recovery phrase the master key was derived from.
+	// W161 BUG-15/17 funds-loss fix: it is set by CreateFromMnemonic (both the
+	// fresh-generation and the restore path) and persisted by SaveToFile inside
+	// the wallet's encrypted envelope BEFORE createwallet returns — mirroring
+	// Bitcoin Core, which writes the descriptor master xprv to the wallet DB
+	// within the creation transaction (wallet.cpp::SetupDescriptorScriptPubKeyMans
+	// -> scriptpubkeyman.cpp::AddDescriptorKeyWithDB -> walletdb commit) so the
+	// RPC can never return success with an unpersisted secret. Empty for blank /
+	// watch-only wallets and for legacy wallet files written before this fix
+	// (those carry only the 64-byte master-key material in walletData.Seed, from
+	// which the words are unrecoverable). Export is unlock-gated via Mnemonic(),
+	// the analog of Core's listdescriptors private=true / legacy dumpwallet
+	// 'hdseed=1' line. The BIP-39 seed passphrase ("25th word") is deliberately
+	// NOT stored — restoring such a wallet requires re-supplying it.
+	mnemonic   string
 	accounts   []*Account
 	utxos      map[wire.OutPoint]*WalletUTXO
 	txHistory  []*WalletTx
@@ -210,11 +225,17 @@ type addressIndices struct {
 
 // Wallet errors
 var (
-	ErrWalletLocked          = errors.New("wallet is locked")
-	ErrInsufficientFunds     = errors.New("insufficient funds")
-	ErrNoMasterKey           = errors.New("wallet has no master key")
-	ErrInvalidAddress        = errors.New("invalid address")
-	ErrDuplicateAddress      = errors.New("address already exists")
+	ErrWalletLocked      = errors.New("wallet is locked")
+	ErrInsufficientFunds = errors.New("insufficient funds")
+	ErrNoMasterKey       = errors.New("wallet has no master key")
+	ErrInvalidAddress    = errors.New("invalid address")
+	ErrDuplicateAddress  = errors.New("address already exists")
+	// ErrMnemonicUnavailable is returned by Mnemonic() when the wallet has no
+	// stored recovery phrase: blank / watch-only wallets, and wallet files
+	// written before the W161 BUG-15 mnemonic-persistence fix (those persisted
+	// only the derived master-key bytes, from which the BIP-39 words cannot be
+	// recovered — the derivation is one-way).
+	ErrMnemonicUnavailable = errors.New("wallet has no stored mnemonic (blank/watch-only wallet, or wallet file predates mnemonic persistence)")
 	// ErrRedeemScriptMismatch is returned when a caller-supplied P2SH
 	// redeemScript fails the BIP-16 commitment check
 	// (HASH160(redeemScript) != scriptPubKey[2:22]). Signing MUST abort
@@ -253,11 +274,11 @@ const BIP125RBFSequence uint32 = 0xFFFFFFFD
 // NewWallet creates a new empty wallet.
 func NewWallet(config WalletConfig) *Wallet {
 	return &Wallet{
-		config:      config,
-		utxos:       make(map[wire.OutPoint]*WalletUTXO),
-		txHistory:   make([]*WalletTx, 0),
-		gapLimit:    DefaultGapLimit,
-		locked:      true,
+		config:       config,
+		utxos:        make(map[wire.OutPoint]*WalletUTXO),
+		txHistory:    make([]*WalletTx, 0),
+		gapLimit:     DefaultGapLimit,
+		locked:       true,
 		addrToPath:   make(map[string]string),
 		addrToType:   make(map[string]WalletAddressType),
 		addrLabels:   make(map[string]string),
@@ -293,6 +314,11 @@ func (w *Wallet) CreateFromMnemonic(mnemonic, passphrase string) error {
 	}
 
 	w.masterKey = masterKey
+	// W161 BUG-15 fix: retain the recovery phrase so SaveToFile can persist it.
+	// Before this, the words were derived-from and discarded here — an auto-
+	// generated wallet's mnemonic existed nowhere (not returned, not on disk),
+	// so losing wallet.dat meant unrecoverable funds.
+	w.mnemonic = mnemonic
 	w.locked = false
 	w.nextExtIdx = 0
 	w.nextIntIdx = 0
@@ -305,6 +331,31 @@ func (w *Wallet) CreateFromMnemonic(mnemonic, passphrase string) error {
 
 	w.markDirtyLocked()
 	return nil
+}
+
+// Mnemonic returns the wallet's stored BIP-39 recovery phrase.
+//
+// Unlock-gated, mirroring Bitcoin Core's secret-export surfaces — Core's
+// listdescriptors private=true calls EnsureWalletIsUnlocked before revealing
+// the master xprv (bitcoin-core/src/wallet/rpc/backup.cpp), as did legacy
+// dumpwallet for the 'hdseed=1' seed line. Returns ErrWalletLocked while the
+// wallet is locked, and ErrMnemonicUnavailable when no phrase is stored
+// (blank/watch-only wallet, or a wallet file that predates W161 BUG-15
+// mnemonic persistence). The unavailability check runs first so a wallet with
+// nothing to export reports that plainly instead of demanding an unlock that
+// could never reveal anything — existence is structural metadata, the words
+// themselves remain unlock-gated.
+func (w *Wallet) Mnemonic() (string, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	if w.mnemonic == "" {
+		return "", ErrMnemonicUnavailable
+	}
+	if w.locked {
+		return "", ErrWalletLocked
+	}
+	return w.mnemonic, nil
 }
 
 // CreateFromSeed initializes the wallet from a 64-byte seed.

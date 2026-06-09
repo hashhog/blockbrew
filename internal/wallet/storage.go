@@ -142,11 +142,21 @@ func (w *Wallet) SaveToFile(password string) error {
 
 	// If we have the master key, serialize the seed for recovery
 	if w.masterKey != nil {
-		// We can't actually recover the seed from the master key,
-		// so in a real implementation we'd store the mnemonic.
-		// For this implementation, we store the master key data.
 		data.Seed = append(w.masterKey.Key, w.masterKey.ChainCode...)
 	}
+
+	// W161 BUG-15 (funds-loss) fix: persist the BIP-39 recovery phrase. The
+	// master-key bytes above cannot be reversed into the words (the BIP-39
+	// derivation is one-way), so without this an auto-generated wallet's
+	// mnemonic existed nowhere on disk and seed-words backup was impossible.
+	// The phrase rides inside the same scrypt+AES-256-GCM whole-file envelope
+	// as the master key — zero new at-rest exposure. Mirrors Bitcoin Core
+	// persisting the descriptor master xprv in the wallet DB at creation
+	// (wallet.cpp::SetupDescriptorScriptPubKeyMans -> walletdb.cpp). Note this
+	// is intentionally NOT gated on w.masterKey != nil: an encrypted+locked
+	// wallet has masterKey == nil, and the recovery phrase must never be
+	// dropped from disk by a flush that happens to run while locked.
+	data.Mnemonic = w.mnemonic
 
 	// Encode to JSON
 	plaintext, err := json.Marshal(data)
@@ -350,6 +360,11 @@ func loadWalletFile(filePath, password string, config WalletConfig, dataDir stri
 		w.masterKey = masterKey
 		w.locked = false
 	}
+
+	// Restore the persisted BIP-39 recovery phrase (W161 BUG-15 fix), so the
+	// words remain exportable (getmnemonic) and re-persistable after a restart.
+	// Empty for blank/watch-only wallets and for files written before the fix.
+	w.mnemonic = data.Mnemonic
 
 	// Restore scalar state.
 	w.nextExtIdx = data.NextExtIdx
