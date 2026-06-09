@@ -108,8 +108,27 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 		warnings = append(warnings, "Empty string given as passphrase, wallet will not be encrypted.")
 	}
 
+	// W161 BUG-15/17 funds-loss fix: when a FRESH mnemonic was generated (no
+	// restore mnemonic supplied, keys enabled), return it once so the user can
+	// write the words down. By this point Manager.CreateWallet has already
+	// durably persisted the phrase inside the encrypted wallet file (SaveToFile
+	// runs before CreateWallet returns — the analog of Core committing the
+	// descriptor master xprv to the wallet DB before the createwallet RPC
+	// responds). Returning the words is a non-Core extension (btcd/lnd
+	// convention); strict-parity callers can ignore the field and use the
+	// unlock-gated getmnemonic RPC instead. Deliberately NOT returned on the
+	// restore path (the caller already holds the words).
+	mnemonicOut := ""
+	if opts.Mnemonic == "" && !opts.Blank && !opts.DisablePrivateKeys {
+		if m, mErr := w.Mnemonic(); mErr == nil {
+			mnemonicOut = m
+			warnings = append(warnings, "Write down the mnemonic now: anyone with these words can spend the wallet's funds, and without them the funds cannot be recovered if the wallet file is lost. The phrase is stored in the wallet file and can be re-exported with getmnemonic while the wallet is unlocked.")
+		}
+	}
+
 	return &CreateWalletResult{
 		Name:     w.Name(),
+		Mnemonic: mnemonicOut,
 		Warnings: warnings,
 	}, nil
 }
@@ -629,7 +648,7 @@ func (s *Server) walletTxToListEntries(tx *wallet.WalletTx, tipHeight int32) []L
 		case "send":
 			entry.Category = "send"
 			entry.Amount = -float64(d.Amount) / satoshiPerBitcoin // negative
-			entry.Fee = -float64(tx.Fee) / satoshiPerBitcoin       // negative
+			entry.Fee = -float64(tx.Fee) / satoshiPerBitcoin      // negative
 		default: // receive / generate / immature
 			entry.Category = coinbaseCategory(d, confs)
 			entry.Amount = float64(d.Amount) / satoshiPerBitcoin // positive
@@ -754,21 +773,21 @@ func (s *Server) handleGetWalletInfoWithWallet(walletName string) (interface{}, 
 	history := w.GetHistory()
 
 	return &WalletInfo{
-		WalletName:            w.Name(),
-		WalletVersion:         169900, // Latest legacy wallet version for compatibility
-		Format:                "sqlite",
-		Balance:               float64(confirmed) / satoshiPerBitcoin,
-		UnconfirmedBalance:    float64(unconfirmed) / satoshiPerBitcoin,
-		TxCount:               len(history),
-		KeypoolSize:           20,
-		PayTxFee:              0,
-		PrivateKeysEnabled:    true,
-		AvoidReuse:            false,
-		Scanning:              false,
-		Descriptors:           true,
-		ExternalSigner:        false,
-		Blank:                 confirmed == 0 && unconfirmed == 0 && len(history) == 0,
-		Locked:                w.IsLocked(),
+		WalletName:         w.Name(),
+		WalletVersion:      169900, // Latest legacy wallet version for compatibility
+		Format:             "sqlite",
+		Balance:            float64(confirmed) / satoshiPerBitcoin,
+		UnconfirmedBalance: float64(unconfirmed) / satoshiPerBitcoin,
+		TxCount:            len(history),
+		KeypoolSize:        20,
+		PayTxFee:           0,
+		PrivateKeysEnabled: true,
+		AvoidReuse:         false,
+		Scanning:           false,
+		Descriptors:        true,
+		ExternalSigner:     false,
+		Blank:              confirmed == 0 && unconfirmed == 0 && len(history) == 0,
+		Locked:             w.IsLocked(),
 	}, nil
 }
 

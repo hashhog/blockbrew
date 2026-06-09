@@ -739,10 +739,12 @@ type indexSummary struct {
 // yields {} (an empty object, NOT an error). Empty/omitted = all running.
 //
 // blockbrew runs at most two of Core's index family:
+//
 //   - "txindex"                   when -txindex is set. It is not a
 //     registered Index (it is driven directly off the chain connect/
 //     disconnect hooks into chainDB), so it is summarised from the chain
 //     tip: it advances in lockstep with the active chain.
+//
 //   - "basic block filter index"  when -blockfilterindex=basic is set.
 //     Registered in the IndexManager under the internal name
 //     "blockfilterindex"; emitted under Core's GetName() string
@@ -988,6 +990,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"",
 		"== Wallet ==",
 		"getbalance",
+		"getmnemonic",
 		"getnewaddress",
 		"getwalletinfo",
 		"listtransactions ( \"label\" count )",

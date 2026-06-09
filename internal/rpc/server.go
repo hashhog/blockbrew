@@ -716,6 +716,12 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleImportPrivKey(params, walletName)
 	case "dumpprivkey":
 		return s.handleDumpPrivKey(params, walletName)
+	// Seed-words export (W161 BUG-15/17 funds-loss fix). Non-Core extension
+	// (companion of createwallet's mnemonic restore param); unlock-gated like
+	// Core's listdescriptors private=true / legacy dumpwallet hdseed line.
+	// Reference: bitcoin-core/src/wallet/rpc/backup.cpp::listdescriptors.
+	case "getmnemonic":
+		return s.handleGetMnemonic(walletName)
 
 	// Fee-bumping RPCs (FIX-61 / W118 BUG-2). bumpfee broadcasts the
 	// replacement; psbtbumpfee returns a PSBT for offline signing.

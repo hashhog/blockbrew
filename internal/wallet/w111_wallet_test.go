@@ -666,11 +666,17 @@ func TestW111G23_WalletFilePersistence(t *testing.T) {
 		t.Error("G23 LoadFromFile with wrong password should fail")
 	}
 
-	// BUG-1: SaveToFile stores masterKey.Key||ChainCode, NOT the BIP-39 mnemonic.
-	// The walletData.Mnemonic field is never populated (see storage.go:112-116).
-	// This means a wallet loaded from disk cannot reproduce the BIP-39 seed,
-	// making paper backup/restore impossible through the standard BIP-39 path.
-	t.Log("BUG-1: SaveToFile does not persist BIP-39 mnemonic — walletData.Mnemonic never set (storage.go:112-116)")
+	// BUG-1 (FIXED — W161 BUG-15): SaveToFile must persist the BIP-39 mnemonic
+	// alongside the master-key bytes, and LoadFromFile must restore it, so a
+	// wallet loaded from disk can reproduce the BIP-39 seed (paper backup /
+	// restore through the standard BIP-39 path).
+	gotMnemonic, err := w2.Mnemonic()
+	if err != nil {
+		t.Fatalf("G23 reloaded wallet Mnemonic(): %v", err)
+	}
+	if gotMnemonic != testMnemonic {
+		t.Errorf("G23 reloaded mnemonic = %q, want %q", gotMnemonic, testMnemonic)
+	}
 }
 
 // ── G24: Wallet encryption ────────────────────────────────────────────────────
@@ -814,11 +820,11 @@ func TestW111G27_P2WPKHSigning(t *testing.T) {
 	prevHash, _ := wire.NewHash256FromHex("0100000000000000000000000000000000000000000000000000000000000000")
 	pkScript, _ := buildP2WPKHScriptPubKey(addr, address.Mainnet)
 	utxo := &WalletUTXO{
-		OutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
-		Amount:   100000,
-		PkScript: pkScript,
-		Address:  addr,
-		KeyPath:  path,
+		OutPoint:  wire.OutPoint{Hash: prevHash, Index: 0},
+		Amount:    100000,
+		PkScript:  pkScript,
+		Address:   addr,
+		KeyPath:   path,
 		Confirmed: true,
 	}
 	tx := &wire.MsgTx{

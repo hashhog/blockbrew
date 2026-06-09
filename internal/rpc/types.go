@@ -7,29 +7,30 @@ import (
 
 // JSON-RPC error codes (from Bitcoin Core).
 const (
-	RPCErrParseError         = -32700 // Invalid JSON was received
-	RPCErrInvalidRequest     = -32600 // The JSON sent is not a valid Request object
-	RPCErrMethodNotFound     = -32601 // The method does not exist
-	RPCErrInvalidParams      = -32602 // Invalid method parameter(s)
-	RPCErrInternal           = -32603 // Internal JSON-RPC error
-	RPCErrTypeError            = -3   // Unexpected type was passed as parameter
-	RPCErrInvalidAddressOrKey  = -5   // Invalid address or key
-	RPCErrInvalidParameter     = -8   // Invalid, missing or duplicate parameter
-	RPCErrBlockNotFound      = -5     // Block not found
-	RPCErrTxNotFound         = -5     // Transaction not found
-	RPCErrWalletError        = -4     // Unspecified wallet error
-	RPCErrWalletNotFound     = -18    // Wallet not loaded
-	RPCErrWalletNotSpecified = -19    // Multiple wallets loaded, must specify which
-	RPCErrWalletAlreadyLoaded = -35   // Wallet is already loaded
-	RPCErrDeserialization      = -22    // Error parsing or validating structure in raw format
-	RPCErrVerify               = -25    // Error during verification
-	RPCErrInWarmup             = -28    // Client still warming up
-	RPCErrClientNodeNotConnected = -29  // Node not found/connected
-	RPCErrClientP2PDisabled      = -9   // P2P networking is disabled
-	RPCErrWallet               = -4     // Wallet error (general)
-	RPCErrMisc                 = -1     // Miscellaneous error
+	RPCErrParseError             = -32700 // Invalid JSON was received
+	RPCErrInvalidRequest         = -32600 // The JSON sent is not a valid Request object
+	RPCErrMethodNotFound         = -32601 // The method does not exist
+	RPCErrInvalidParams          = -32602 // Invalid method parameter(s)
+	RPCErrInternal               = -32603 // Internal JSON-RPC error
+	RPCErrTypeError              = -3     // Unexpected type was passed as parameter
+	RPCErrInvalidAddressOrKey    = -5     // Invalid address or key
+	RPCErrInvalidParameter       = -8     // Invalid, missing or duplicate parameter
+	RPCErrBlockNotFound          = -5     // Block not found
+	RPCErrTxNotFound             = -5     // Transaction not found
+	RPCErrWalletError            = -4     // Unspecified wallet error
+	RPCErrWalletNotFound         = -18    // Wallet not loaded
+	RPCErrWalletNotSpecified     = -19    // Multiple wallets loaded, must specify which
+	RPCErrWalletAlreadyLoaded    = -35    // Wallet is already loaded
+	RPCErrDeserialization        = -22    // Error parsing or validating structure in raw format
+	RPCErrVerify                 = -25    // Error during verification
+	RPCErrInWarmup               = -28    // Client still warming up
+	RPCErrClientNodeNotConnected = -29    // Node not found/connected
+	RPCErrClientP2PDisabled      = -9     // P2P networking is disabled
+	RPCErrWallet                 = -4     // Wallet error (general)
+	RPCErrMisc                   = -1     // Miscellaneous error
 
 	// Wallet encryption-state error codes (Bitcoin Core protocol.h).
+	RPCErrWalletUnlockNeeded        = -13 // Enter the wallet passphrase with walletpassphrase first
 	RPCErrWalletPassphraseIncorrect = -14 // Passphrase entered was incorrect
 	RPCErrWalletWrongEncState       = -15 // Wrong wallet encryption state
 	RPCErrWalletEncryptionFailed    = -16 // Failed to encrypt the wallet
@@ -82,20 +83,20 @@ type SyncStateResult struct {
 
 // BlockchainInfo represents the result of getblockchaininfo.
 type BlockchainInfo struct {
-	Chain                string                     `json:"chain"`
-	Blocks               int32                      `json:"blocks"`
-	Headers              int32                      `json:"headers"`
-	BestBlockHash        string                     `json:"bestblockhash"`
-	Bits                 string                     `json:"bits"`
-	Target               string                     `json:"target"`
-	Difficulty           float64                    `json:"difficulty"`
-	Time                 uint32                     `json:"time"`
-	MedianTime           int64                      `json:"mediantime"`
-	VerificationProgress float64                    `json:"verificationprogress"`
-	InitialBlockDownload bool                       `json:"initialblockdownload"`
-	ChainWork            string                     `json:"chainwork"`
-	SizeOnDisk           int64                      `json:"size_on_disk"`
-	Pruned               bool                       `json:"pruned"`
+	Chain                string  `json:"chain"`
+	Blocks               int32   `json:"blocks"`
+	Headers              int32   `json:"headers"`
+	BestBlockHash        string  `json:"bestblockhash"`
+	Bits                 string  `json:"bits"`
+	Target               string  `json:"target"`
+	Difficulty           float64 `json:"difficulty"`
+	Time                 uint32  `json:"time"`
+	MedianTime           int64   `json:"mediantime"`
+	VerificationProgress float64 `json:"verificationprogress"`
+	InitialBlockDownload bool    `json:"initialblockdownload"`
+	ChainWork            string  `json:"chainwork"`
+	SizeOnDisk           int64   `json:"size_on_disk"`
+	Pruned               bool    `json:"pruned"`
 	// PruneHeight is the lowest-height block whose body is still on disk.
 	// Only emitted when pruned=true; matches Bitcoin Core's
 	// rpc/blockchain.cpp getblockchaininfo behavior. omitempty so archive
@@ -112,33 +113,33 @@ type BlockchainInfo struct {
 	PruneTargetSize uint64 `json:"prune_target_size,omitempty"`
 	// Softforks mirrors getdeploymentinfo.deployments: both RPCs read from the
 	// same buildDeploymentMap helper so their data is always consistent.
-	Softforks            map[string]DeploymentEntry `json:"softforks"`
-	Warnings             string                     `json:"warnings"`
+	Softforks map[string]DeploymentEntry `json:"softforks"`
+	Warnings  string                     `json:"warnings"`
 }
 
 // BlockResult represents a block in RPC responses.
 type BlockResult struct {
-	Hash          string        `json:"hash"`
-	Confirmations int32         `json:"confirmations"`
-	Size          int           `json:"size"`
-	StrippedSize  int           `json:"strippedsize"`
-	Weight        int           `json:"weight"`
-	Height        int32         `json:"height"`
-	Version       int32         `json:"version"`
-	VersionHex    string        `json:"versionHex"`
-	MerkleRoot    string        `json:"merkleroot"`
-	Tx            []interface{} `json:"tx"`
-	Time          uint32        `json:"time"`
-	MedianTime    int64         `json:"mediantime"`
-	Nonce         uint32        `json:"nonce"`
-	Bits          string        `json:"bits"`
-	Target        string        `json:"target"`
+	Hash          string            `json:"hash"`
+	Confirmations int32             `json:"confirmations"`
+	Size          int               `json:"size"`
+	StrippedSize  int               `json:"strippedsize"`
+	Weight        int               `json:"weight"`
+	Height        int32             `json:"height"`
+	Version       int32             `json:"version"`
+	VersionHex    string            `json:"versionHex"`
+	MerkleRoot    string            `json:"merkleroot"`
+	Tx            []interface{}     `json:"tx"`
+	Time          uint32            `json:"time"`
+	MedianTime    int64             `json:"mediantime"`
+	Nonce         uint32            `json:"nonce"`
+	Bits          string            `json:"bits"`
+	Target        string            `json:"target"`
 	Difficulty    BitcoinDifficulty `json:"difficulty"`
-	ChainWork     string        `json:"chainwork"`
-	NTx           int           `json:"nTx"`
-	PreviousHash  string        `json:"previousblockhash,omitempty"`
-	NextHash      string        `json:"nextblockhash,omitempty"`
-	CoinbaseTx    interface{}   `json:"coinbase_tx,omitempty"`
+	ChainWork     string            `json:"chainwork"`
+	NTx           int               `json:"nTx"`
+	PreviousHash  string            `json:"previousblockhash,omitempty"`
+	NextHash      string            `json:"nextblockhash,omitempty"`
+	CoinbaseTx    interface{}       `json:"coinbase_tx,omitempty"`
 }
 
 // BitcoinDifficulty is a float64 that serialises to JSON using 16
@@ -157,22 +158,22 @@ func (d BitcoinDifficulty) MarshalJSON() ([]byte, error) {
 
 // BlockHeaderResult represents a block header in RPC responses.
 type BlockHeaderResult struct {
-	Hash          string           `json:"hash"`
-	Confirmations int32            `json:"confirmations"`
-	Height        int32            `json:"height"`
-	Version       int32            `json:"version"`
-	VersionHex    string           `json:"versionHex"`
-	MerkleRoot    string           `json:"merkleroot"`
-	Time          uint32           `json:"time"`
-	MedianTime    int64            `json:"mediantime"`
-	Nonce         uint32           `json:"nonce"`
-	Bits          string           `json:"bits"`
-	Target        string           `json:"target,omitempty"`
+	Hash          string            `json:"hash"`
+	Confirmations int32             `json:"confirmations"`
+	Height        int32             `json:"height"`
+	Version       int32             `json:"version"`
+	VersionHex    string            `json:"versionHex"`
+	MerkleRoot    string            `json:"merkleroot"`
+	Time          uint32            `json:"time"`
+	MedianTime    int64             `json:"mediantime"`
+	Nonce         uint32            `json:"nonce"`
+	Bits          string            `json:"bits"`
+	Target        string            `json:"target,omitempty"`
 	Difficulty    BitcoinDifficulty `json:"difficulty"`
-	ChainWork     string           `json:"chainwork,omitempty"`
-	NTx           int              `json:"nTx"`
-	PreviousHash  string           `json:"previousblockhash,omitempty"`
-	NextHash      string           `json:"nextblockhash,omitempty"`
+	ChainWork     string            `json:"chainwork,omitempty"`
+	NTx           int               `json:"nTx"`
+	PreviousHash  string            `json:"previousblockhash,omitempty"`
+	NextHash      string            `json:"nextblockhash,omitempty"`
 }
 
 // TxResult represents a transaction in RPC responses (verbose mode).
@@ -226,37 +227,37 @@ type ScriptPubKey struct {
 
 // MempoolInfo represents the result of getmempoolinfo.
 type MempoolInfo struct {
-	Loaded             bool    `json:"loaded"`
-	Size               int     `json:"size"`
-	Bytes              int64   `json:"bytes"`
-	Usage              int64   `json:"usage"`
-	TotalFee           float64 `json:"total_fee"`
-	MaxMempool         int64   `json:"maxmempool"`
-	MempoolMinFee      float64 `json:"mempoolminfee"`
-	MinRelayTxFee      float64 `json:"minrelaytxfee"`
+	Loaded              bool    `json:"loaded"`
+	Size                int     `json:"size"`
+	Bytes               int64   `json:"bytes"`
+	Usage               int64   `json:"usage"`
+	TotalFee            float64 `json:"total_fee"`
+	MaxMempool          int64   `json:"maxmempool"`
+	MempoolMinFee       float64 `json:"mempoolminfee"`
+	MinRelayTxFee       float64 `json:"minrelaytxfee"`
 	IncrementalRelayFee float64 `json:"incrementalrelayfee"`
-	UnbroadcastCount   int     `json:"unbroadcastcount"`
-	FullRBF            bool    `json:"fullrbf"`
+	UnbroadcastCount    int     `json:"unbroadcastcount"`
+	FullRBF             bool    `json:"fullrbf"`
 }
 
 // MempoolEntry represents a mempool entry (verbose getrawmempool).
 type MempoolEntry struct {
-	VSize            int64    `json:"vsize"`
-	Weight           int64    `json:"weight"`
-	Fee              float64  `json:"fee"`
-	ModifiedFee      float64  `json:"modifiedfee"`
-	Time             int64    `json:"time"`
-	Height           int32    `json:"height"`
-	DescendantCount  int      `json:"descendantcount"`
-	DescendantSize   int64    `json:"descendantsize"`
-	DescendantFees   float64  `json:"descendantfees"`
-	AncestorCount    int      `json:"ancestorcount"`
-	AncestorSize     int64    `json:"ancestorsize"`
-	AncestorFees     float64  `json:"ancestorfees"`
-	WTxID            string   `json:"wtxid"`
-	Depends          []string `json:"depends"`
-	SpentBy          []string `json:"spentby"`
-	Unbroadcast      bool     `json:"unbroadcast"`
+	VSize           int64    `json:"vsize"`
+	Weight          int64    `json:"weight"`
+	Fee             float64  `json:"fee"`
+	ModifiedFee     float64  `json:"modifiedfee"`
+	Time            int64    `json:"time"`
+	Height          int32    `json:"height"`
+	DescendantCount int      `json:"descendantcount"`
+	DescendantSize  int64    `json:"descendantsize"`
+	DescendantFees  float64  `json:"descendantfees"`
+	AncestorCount   int      `json:"ancestorcount"`
+	AncestorSize    int64    `json:"ancestorsize"`
+	AncestorFees    float64  `json:"ancestorfees"`
+	WTxID           string   `json:"wtxid"`
+	Depends         []string `json:"depends"`
+	SpentBy         []string `json:"spentby"`
+	Unbroadcast     bool     `json:"unbroadcast"`
 	// BIP125Replaceable mirrors Core's `bip125-replaceable` field on
 	// `getmempoolentry` / `getrawmempool verbose=true`. Boolean (not the
 	// {"yes","no","unknown"} string used in wallet RPCs because the entry
@@ -270,46 +271,46 @@ type MempoolEntry struct {
 
 // PeerInfo represents peer information in RPC responses.
 type PeerInfo struct {
-	ID                    int                    `json:"id"`
-	Addr                  string                 `json:"addr"`
-	Network               string                 `json:"network"`
-	Services              string                 `json:"services"`
-	ServicesNames         []string               `json:"servicesnames"`
-	RelayTxes             bool                   `json:"relaytxes"`
-	LastSend              int64                  `json:"lastsend"`
-	LastRecv              int64                  `json:"lastrecv"`
-	LastTransaction       int64                  `json:"last_transaction"`
-	LastBlock             int64                  `json:"last_block"`
-	BytesSent             uint64                 `json:"bytessent"`
-	BytesRecv             uint64                 `json:"bytesrecv"`
-	ConnTime              int64                  `json:"conntime"`
-	TimeOffset            int64                  `json:"timeoffset"`
-	PingTime              float64                `json:"pingtime"`
-	MinPing               float64                `json:"minping"`
-	Version               int32                  `json:"version"`
-	SubVer                string                 `json:"subver"`
-	Inbound               bool                   `json:"inbound"`
-	BIP152HBTo            bool                   `json:"bip152_hb_to"`
-	BIP152HBFrom          bool                   `json:"bip152_hb_from"`
-	StartHeight           int32                  `json:"startingheight"`
-	PreSyncedHeaders      int32                  `json:"presynced_headers"`
-	SyncedHeaders         int32                  `json:"synced_headers"`
-	SyncedBlocks          int32                  `json:"synced_blocks"`
-	Inflight              []int                  `json:"inflight"`
-	AddrRelayEnabled      bool                   `json:"addr_relay_enabled"`
-	AddrProcessed         int64                  `json:"addr_processed"`
-	AddrRateLimited       int64                  `json:"addr_rate_limited"`
-	Permissions           []string               `json:"permissions"`
-	MinFeeFilter          float64                `json:"minfeefilter"`
-	BytesSentPerMsg       map[string]int64       `json:"bytessent_per_msg"`
-	BytesRecvPerMsg       map[string]int64       `json:"bytesrecv_per_msg"`
-	ConnectionType        string                 `json:"connection_type"`
-	TransportProtocolType string                 `json:"transport_protocol_type"`
-	SessionID             string                 `json:"session_id"`
+	ID                    int              `json:"id"`
+	Addr                  string           `json:"addr"`
+	Network               string           `json:"network"`
+	Services              string           `json:"services"`
+	ServicesNames         []string         `json:"servicesnames"`
+	RelayTxes             bool             `json:"relaytxes"`
+	LastSend              int64            `json:"lastsend"`
+	LastRecv              int64            `json:"lastrecv"`
+	LastTransaction       int64            `json:"last_transaction"`
+	LastBlock             int64            `json:"last_block"`
+	BytesSent             uint64           `json:"bytessent"`
+	BytesRecv             uint64           `json:"bytesrecv"`
+	ConnTime              int64            `json:"conntime"`
+	TimeOffset            int64            `json:"timeoffset"`
+	PingTime              float64          `json:"pingtime"`
+	MinPing               float64          `json:"minping"`
+	Version               int32            `json:"version"`
+	SubVer                string           `json:"subver"`
+	Inbound               bool             `json:"inbound"`
+	BIP152HBTo            bool             `json:"bip152_hb_to"`
+	BIP152HBFrom          bool             `json:"bip152_hb_from"`
+	StartHeight           int32            `json:"startingheight"`
+	PreSyncedHeaders      int32            `json:"presynced_headers"`
+	SyncedHeaders         int32            `json:"synced_headers"`
+	SyncedBlocks          int32            `json:"synced_blocks"`
+	Inflight              []int            `json:"inflight"`
+	AddrRelayEnabled      bool             `json:"addr_relay_enabled"`
+	AddrProcessed         int64            `json:"addr_processed"`
+	AddrRateLimited       int64            `json:"addr_rate_limited"`
+	Permissions           []string         `json:"permissions"`
+	MinFeeFilter          float64          `json:"minfeefilter"`
+	BytesSentPerMsg       map[string]int64 `json:"bytessent_per_msg"`
+	BytesRecvPerMsg       map[string]int64 `json:"bytesrecv_per_msg"`
+	ConnectionType        string           `json:"connection_type"`
+	TransportProtocolType string           `json:"transport_protocol_type"`
+	SessionID             string           `json:"session_id"`
 	// MappedAS is the Autonomous System Number for the peer's IP address,
 	// derived from the loaded asmap file (0 when asmap is disabled or the
 	// IP is not in the trie). Mirrors Core rpc/net.cpp:236 "mapped_as".
-	MappedAS              uint32                 `json:"mapped_as,omitempty"`
+	MappedAS uint32 `json:"mapped_as,omitempty"`
 }
 
 // NetworkInfo represents the result of getnetworkinfo.
@@ -334,11 +335,11 @@ type NetworkInfo struct {
 
 // NetworkEntry represents a network in getnetworkinfo.
 type NetworkEntry struct {
-	Name                     string `json:"name"`
-	Limited                  bool   `json:"limited"`
-	Reachable                bool   `json:"reachable"`
-	Proxy                    string `json:"proxy"`
-	ProxyRandomizeCredentials bool  `json:"proxy_randomize_credentials"`
+	Name                      string `json:"name"`
+	Limited                   bool   `json:"limited"`
+	Reachable                 bool   `json:"reachable"`
+	Proxy                     string `json:"proxy"`
+	ProxyRandomizeCredentials bool   `json:"proxy_randomize_credentials"`
 }
 
 // SmartFeeResult represents the result of estimatesmartfee.
@@ -396,8 +397,8 @@ type ListUnspentResult struct {
 // category and positive for receive/generate/immature; "fee" is NEGATIVE and
 // present only on "send"; "generated"=true marks a coinbase credit.
 type ListTransactionsResult struct {
-	Address  string `json:"address"`
-	Category string `json:"category"` // send / receive / generate / immature
+	Address  string  `json:"address"`
+	Category string  `json:"category"` // send / receive / generate / immature
 	Amount   float64 `json:"amount"`
 	// Vout is the index of the output (send/receive) this entry refers to,
 	// matching Core's per-COutputEntry "vout".
@@ -407,13 +408,13 @@ type ListTransactionsResult struct {
 	Fee float64 `json:"fee,omitempty"`
 	// Generated is true only for coinbase credits (Core only emits the key
 	// when the tx is coinbase, so it is omitted otherwise).
-	Generated     bool    `json:"generated,omitempty"`
-	Confirmations int32   `json:"confirmations"`
-	BlockHash     string  `json:"blockhash,omitempty"`
-	BlockTime     int64   `json:"blocktime,omitempty"`
-	TxID          string  `json:"txid"`
-	Time          int64   `json:"time"`
-	BlockHeight   int32   `json:"blockheight,omitempty"`
+	Generated     bool   `json:"generated,omitempty"`
+	Confirmations int32  `json:"confirmations"`
+	BlockHash     string `json:"blockhash,omitempty"`
+	BlockTime     int64  `json:"blocktime,omitempty"`
+	TxID          string `json:"txid"`
+	Time          int64  `json:"time"`
+	BlockHeight   int32  `json:"blockheight,omitempty"`
 	// BIP125Replaceable mirrors Core's `bip125-replaceable` field on
 	// `listtransactions` / `gettransaction` / `listsinceblock`. String,
 	// one of {"yes","no","unknown"} (Core uses an enum: REPLACEABLE_BIP125
@@ -430,18 +431,18 @@ type ListTransactionsResult struct {
 // on the wallet (nNet - nFee): negative for a spend, positive for a receive.
 // "fee" is present (negative) only for transactions the wallet sent.
 type GetTransactionResult struct {
-	Amount        float64                 `json:"amount"`
-	Fee           float64                 `json:"fee,omitempty"`
-	Confirmations int32                   `json:"confirmations"`
-	Generated     bool                    `json:"generated,omitempty"`
-	BlockHash     string                  `json:"blockhash,omitempty"`
-	BlockHeight   int32                   `json:"blockheight,omitempty"`
-	BlockTime     int64                   `json:"blocktime,omitempty"`
-	TxID          string                  `json:"txid"`
-	Time          int64                   `json:"time"`
-	TimeReceived  int64                   `json:"timereceived"`
-	Details       []GetTransactionDetail  `json:"details"`
-	Hex           string                  `json:"hex"`
+	Amount        float64                `json:"amount"`
+	Fee           float64                `json:"fee,omitempty"`
+	Confirmations int32                  `json:"confirmations"`
+	Generated     bool                   `json:"generated,omitempty"`
+	BlockHash     string                 `json:"blockhash,omitempty"`
+	BlockHeight   int32                  `json:"blockheight,omitempty"`
+	BlockTime     int64                  `json:"blocktime,omitempty"`
+	TxID          string                 `json:"txid"`
+	Time          int64                  `json:"time"`
+	TimeReceived  int64                  `json:"timereceived"`
+	Details       []GetTransactionDetail `json:"details"`
+	Hex           string                 `json:"hex"`
 }
 
 // GetTransactionDetail is one entry of gettransaction.details[], mirroring the
@@ -473,16 +474,16 @@ type MiningInfoNext struct {
 }
 
 type MiningInfo struct {
-	Blocks         int32          `json:"blocks"`
-	Bits           string         `json:"bits"`
-	Difficulty     float64        `json:"difficulty"`
-	Target         string         `json:"target"`
-	NetworkHash    float64        `json:"networkhashps"`
-	PooledTx       int            `json:"pooledtx"`
-	BlockMinTxFee  float64        `json:"blockmintxfee"`
-	Chain          string         `json:"chain"`
-	Next           MiningInfoNext `json:"next"`
-	Warnings       string         `json:"warnings"`
+	Blocks        int32          `json:"blocks"`
+	Bits          string         `json:"bits"`
+	Difficulty    float64        `json:"difficulty"`
+	Target        string         `json:"target"`
+	NetworkHash   float64        `json:"networkhashps"`
+	PooledTx      int            `json:"pooledtx"`
+	BlockMinTxFee float64        `json:"blockmintxfee"`
+	Chain         string         `json:"chain"`
+	Next          MiningInfoNext `json:"next"`
+	Warnings      string         `json:"warnings"`
 }
 
 // DecodeScriptResult represents the result of decodescript.
@@ -494,36 +495,36 @@ type DecodeScriptResult struct {
 
 // BlockTemplateResult represents the result of getblocktemplate.
 type BlockTemplateResult struct {
-	Version                  int32                 `json:"version"`
-	Rules                    []string              `json:"rules"`
-	Vbavailable              map[string]int        `json:"vbavailable"`
-	Vbrequired               int                   `json:"vbrequired"`
-	PreviousBlockHash        string                `json:"previousblockhash"`
-	Transactions             []BlockTemplateTx     `json:"transactions"`
-	CoinbaseAux              map[string]string     `json:"coinbaseaux"`
-	CoinbaseValue            int64                 `json:"coinbasevalue"`
-	Target                   string                `json:"target"`
-	MinTime                  int64                 `json:"mintime"`
-	Mutable                  []string              `json:"mutable"`
-	NonceRange               string                `json:"noncerange"`
-	SigOpLimit               int64                 `json:"sigoplimit"`
-	SizeLimit                int64                 `json:"sizelimit"`
-	WeightLimit              int64                 `json:"weightlimit"`
-	CurTime                  int64                 `json:"curtime"`
-	Bits                     string                `json:"bits"`
-	Height                   int32                 `json:"height"`
-	DefaultWitnessCommitment string                `json:"default_witness_commitment,omitempty"`
+	Version                  int32             `json:"version"`
+	Rules                    []string          `json:"rules"`
+	Vbavailable              map[string]int    `json:"vbavailable"`
+	Vbrequired               int               `json:"vbrequired"`
+	PreviousBlockHash        string            `json:"previousblockhash"`
+	Transactions             []BlockTemplateTx `json:"transactions"`
+	CoinbaseAux              map[string]string `json:"coinbaseaux"`
+	CoinbaseValue            int64             `json:"coinbasevalue"`
+	Target                   string            `json:"target"`
+	MinTime                  int64             `json:"mintime"`
+	Mutable                  []string          `json:"mutable"`
+	NonceRange               string            `json:"noncerange"`
+	SigOpLimit               int64             `json:"sigoplimit"`
+	SizeLimit                int64             `json:"sizelimit"`
+	WeightLimit              int64             `json:"weightlimit"`
+	CurTime                  int64             `json:"curtime"`
+	Bits                     string            `json:"bits"`
+	Height                   int32             `json:"height"`
+	DefaultWitnessCommitment string            `json:"default_witness_commitment,omitempty"`
 }
 
 // BlockTemplateTx represents a transaction in the block template.
 type BlockTemplateTx struct {
-	Data    string   `json:"data"`
-	TxID    string   `json:"txid"`
-	Hash    string   `json:"hash"`
-	Depends []int    `json:"depends"`
-	Fee     int64    `json:"fee"`
-	SigOps  int64    `json:"sigops"`
-	Weight  int64    `json:"weight"`
+	Data    string `json:"data"`
+	TxID    string `json:"txid"`
+	Hash    string `json:"hash"`
+	Depends []int  `json:"depends"`
+	Fee     int64  `json:"fee"`
+	SigOps  int64  `json:"sigops"`
+	Weight  int64  `json:"weight"`
 }
 
 // BannedInfo represents a banned peer in RPC responses.
@@ -555,9 +556,9 @@ type AddressByLabelResult struct {
 
 // SubmitPackageResult is the result of the submitpackage RPC.
 type SubmitPackageResult struct {
-	PackageMsg           string                           `json:"package_msg"`
+	PackageMsg           string                            `json:"package_msg"`
 	TxResults            map[string]*SubmitPackageTxResult `json:"tx-results"`
-	ReplacedTransactions []string                         `json:"replaced-transactions,omitempty"`
+	ReplacedTransactions []string                          `json:"replaced-transactions,omitempty"`
 }
 
 // SubmitPackageTxResult is the per-transaction result in submitpackage.
@@ -596,8 +597,18 @@ type GenerateBlockResult struct {
 }
 
 // CreateWalletResult represents the result of createwallet.
+//
+// Mnemonic is a non-Core extension (Core's createwallet returns only
+// name+warnings, bitcoin-core/src/wallet/rpc/wallet.cpp): it carries the
+// freshly GENERATED BIP-39 recovery phrase exactly once, at creation, so the
+// user can write the words down (W161 BUG-15/17 funds-loss fix; same
+// convention as btcd/lnd). It is omitted when the caller supplied their own
+// mnemonic (restore path) and for blank / watch-only wallets. The phrase is
+// also persisted in the wallet file and retrievable later via the
+// unlock-gated getmnemonic RPC.
 type CreateWalletResult struct {
 	Name     string   `json:"name"`
+	Mnemonic string   `json:"mnemonic,omitempty"`
 	Warnings []string `json:"warnings,omitempty"`
 }
 
@@ -659,4 +670,3 @@ type DeploymentInfoResult struct {
 	Height      int32                      `json:"height"`
 	Deployments map[string]DeploymentEntry `json:"deployments"`
 }
-

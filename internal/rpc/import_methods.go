@@ -140,6 +140,41 @@ func (s *Server) handleDumpPrivKey(params json.RawMessage, walletName string) (i
 	return wallet.EncodeWIF(key, w.Network(), true), nil
 }
 
+// handleGetMnemonic implements the getmnemonic RPC (non-Core extension; the
+// companion of createwallet's mnemonic restore parameter).
+//
+//	getmnemonic -> "word1 word2 ... word24"
+//
+// Returns the wallet's BIP-39 recovery phrase, persisted in the encrypted
+// wallet file at creation (W161 BUG-15/17 funds-loss fix). This is blockbrew's
+// seed-export surface — the analog of Bitcoin Core's listdescriptors
+// private=true (which reveals the master xprv only after
+// EnsureWalletIsUnlocked, bitcoin-core/src/wallet/rpc/backup.cpp) and of
+// legacy dumpwallet's 'hdseed=1' line. Like Core, the export is a separate,
+// explicit, unlock-gated call and the words are never logged.
+//
+// Errors:
+//
+//	-13 RPCErrWalletUnlockNeeded  when the wallet is locked
+//	 -4 RPCErrWalletError         when no mnemonic is stored (blank/watch-only
+//	                              wallet, or a wallet file written before
+//	                              mnemonic persistence existed)
+func (s *Server) handleGetMnemonic(walletName string) (interface{}, *RPCError) {
+	w, rpcErr := s.getWalletForRPC(walletName)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+
+	mnemonic, err := w.Mnemonic()
+	if err != nil {
+		if err == wallet.ErrWalletLocked {
+			return nil, &RPCError{Code: RPCErrWalletUnlockNeeded, Message: "Error: Please enter the wallet passphrase with walletpassphrase first."}
+		}
+		return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
+	}
+	return mnemonic, nil
+}
+
 // handleImportPrivKey implements the importprivkey RPC.
 //
 //	importprivkey "privkey" ( "label" rescan )
