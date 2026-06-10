@@ -535,18 +535,33 @@ type BannedInfo struct {
 	BanReason   string `json:"ban_reason,omitempty"`
 }
 
-// AddressInfoResult represents the result of getaddressinfo.
+// AddressInfoResult represents the result of getaddressinfo, mirroring the
+// Core v31.99 shape (bitcoin-core/src/wallet/rpc/addresses.cpp:368-513):
+// labels is a PLAIN ARRAY OF LABEL-NAME STRINGS (addresses.cpp:503-508 — the
+// {name,purpose} object form was removed), the top-level `label` field no
+// longer exists, and iswatchonly is DEPRECATED + hardcoded false
+// (addresses.cpp:383,478) — an imported watch-only descriptor address shows
+// as ismine=true instead.
 type AddressInfoResult struct {
 	Address      string `json:"address"`
-	ScriptPubKey string `json:"scriptPubKey,omitempty"`
+	ScriptPubKey string `json:"scriptPubKey"`
 	IsMine       bool   `json:"ismine"`
-	IsWatchOnly  bool   `json:"iswatchonly"`
 	Solvable     bool   `json:"solvable"`
-	Label        string `json:"label,omitempty"`
-	Labels       []struct {
-		Name    string `json:"name"`
-		Purpose string `json:"purpose"`
-	} `json:"labels,omitempty"`
+	// Desc / ParentDesc: the output descriptor for this address and the
+	// wallet descriptor it came from (addresses.cpp:455-460, 470-476).
+	Desc       string `json:"desc,omitempty"`
+	ParentDesc string `json:"parent_desc,omitempty"`
+	// IsWatchOnly is deprecated and always false (Core addresses.cpp:383,478).
+	IsWatchOnly    bool   `json:"iswatchonly"`
+	IsScript       bool   `json:"isscript"`
+	IsWitness      bool   `json:"iswitness"`
+	WitnessVersion *int   `json:"witness_version,omitempty"`
+	WitnessProgram string `json:"witness_program,omitempty"`
+	IsChange       bool   `json:"ischange"`
+	// Timestamp is the descriptor-import creation time (addresses.cpp:485).
+	Timestamp int64    `json:"timestamp,omitempty"`
+	HDKeyPath string   `json:"hdkeypath,omitempty"`
+	Labels    []string `json:"labels"`
 }
 
 // AddressByLabelResult represents an address in getaddressesbylabel response.

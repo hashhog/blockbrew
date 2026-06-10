@@ -33,16 +33,31 @@ func (w *Wallet) MarkDirty() {
 	w.mu.Unlock()
 }
 
-// SetSavePassword sets the password the auto-flush + Flush path encrypts the
-// wallet with. The legacy unencrypted wallet uses "" (the historical behaviour
-// of SaveToFile(\"\")); encryptwallet wires the user passphrase through here so
-// subsequent auto-flushes stay encrypted. Marks dirty so the new on-disk form
-// is written promptly.
+// SetSavePassword sets the wallet's envelope password — the password every
+// save path (Flush/auto-flush, Save, unload, backup, shutdown) encrypts the
+// file with. It is wired automatically by Manager.CreateWallet (createwallet
+// passphrase), loadWalletFile (the password that decrypted the file) and
+// Wallet.EncryptWallet (the new user passphrase); this exported setter exists
+// for callers managing wallet files directly. Marks dirty so the new on-disk
+// form is written promptly.
 func (w *Wallet) SetSavePassword(password string) {
 	w.mu.Lock()
 	w.savePassword = password
 	w.dirty = true
 	w.mu.Unlock()
+}
+
+// Save persists the wallet under its CURRENT envelope password (savePassword),
+// regardless of the dirty flag. Every management save path (unload, backup,
+// shutdown, saveall) MUST go through here instead of a literal
+// SaveToFile("") — the pre-fix hardcoded empty password silently re-encrypted
+// passphrase-protected wallets under "" (stripping the protection) within one
+// unload/backup/autoflush of wallet creation.
+func (w *Wallet) Save() error {
+	w.mu.RLock()
+	pw := w.savePassword
+	w.mu.RUnlock()
+	return w.SaveToFile(pw)
 }
 
 // LastSyncedHeight returns the active-chain height the wallet's UTXO ledger has
