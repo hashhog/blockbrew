@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 
+	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -160,13 +162,27 @@ func (s *Server) handleLoadWallet(params json.RawMessage) (interface{}, *RPCErro
 		}
 	}
 
-	w, err := s.walletMgr.LoadWallet(name, loadOnStartup)
+	// args[2] is the wallet-file envelope passphrase (non-Core extension).
+	// Wallets created with a createwallet passphrase — or re-encrypted by
+	// encryptwallet — have their file encrypted under it; pre-fix they were
+	// permanently unloadable because LoadWallet hardcoded "".
+	passphrase := ""
+	if len(args) >= 3 {
+		if val, ok := args[2].(string); ok {
+			passphrase = val
+		}
+	}
+
+	w, err := s.walletMgr.LoadWalletWithPassphrase(name, passphrase, loadOnStartup)
 	if err != nil {
 		if err == wallet.ErrWalletAlreadyLoaded {
 			return nil, &RPCError{Code: RPCErrWalletAlreadyLoaded, Message: fmt.Sprintf("Wallet \"%s\" is already loaded", name)}
 		}
 		if err == wallet.ErrWalletNotFound {
 			return nil, &RPCError{Code: RPCErrWalletNotFound, Message: fmt.Sprintf("Wallet \"%s\" not found", name)}
+		}
+		if errors.Is(err, wallet.ErrInvalidPassword) {
+			return nil, &RPCError{Code: RPCErrWalletPassphraseIncorrect, Message: "Error: The wallet passphrase entered was incorrect."}
 		}
 		return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
 	}
@@ -301,7 +317,9 @@ func (s *Server) handleBackupWallet(params json.RawMessage, walletName string) (
 			return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
 		}
 	} else if s.wallet != nil {
-		if err := s.wallet.SaveToFile(""); err != nil {
+		// Save under the wallet's CURRENT envelope password (never a literal
+		// "" — that stripped passphrase protection from the on-disk file).
+		if err := s.wallet.Save(); err != nil {
 			return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
 		}
 		// For legacy mode, just return success (actual backup not implemented)
@@ -373,6 +391,11 @@ func (s *Server) handleListUnspentWithWallet(walletName string) (interface{}, *R
 
 		spendable := !w.IsLocked() && w.IsUTXOSpendable(u, tipHeight)
 
+		// Solvability comes from the ownership record, not a hardcoded true:
+		// watch-only addr() imports are ISMINE but NOT solvable (Core
+		// DescriptorImpl::IsSolvable — the wallet can't construct a witness).
+		det := w.AddressDetail(u.Address)
+
 		result = append(result, ListUnspentResult{
 			TxID:          u.OutPoint.Hash.String(),
 			Vout:          u.OutPoint.Index,
@@ -381,7 +404,7 @@ func (s *Server) handleListUnspentWithWallet(walletName string) (interface{}, *R
 			Amount:        float64(u.Amount) / satoshiPerBitcoin,
 			Confirmations: confs,
 			Spendable:     spendable,
-			Solvable:      true,
+			Solvable:      det.Solvable,
 			Safe:          u.Confirmed,
 		})
 	}
@@ -393,6 +416,12 @@ func (s *Server) handleSendToAddressWithWallet(params json.RawMessage, walletNam
 	w, rpcErr := s.getWalletForRPC(walletName)
 	if rpcErr != nil {
 		return nil, rpcErr
+	}
+
+	// Watch-only wallets cannot spend (Core: CWallet::CreateTransaction is
+	// unreachable with WALLET_FLAG_DISABLE_PRIVATE_KEYS; the RPC surfaces -4).
+	if w.PrivateKeysDisabled() {
+		return nil, &RPCError{Code: RPCErrWalletError, Message: "Error: Private keys are disabled for this wallet"}
 	}
 
 	var args []interface{}
@@ -475,6 +504,18 @@ func (s *Server) handleEncryptWalletWithWallet(params json.RawMessage, walletNam
 
 	if err := w.EncryptWallet(passphrase); err != nil {
 		return nil, mapEncryptionError(err)
+	}
+
+	// Persist the new encrypted state durably BEFORE returning, and scrub the
+	// .bak slot so no plaintext-seed copy survives — Core's EncryptWallet
+	// writes the master key transactionally and then Rewrite()s the whole DB
+	// to scrub plaintext slack (wallet.cpp:818-891). Without this the
+	// encryption existed only in memory and evaporated on restart.
+	if err := w.Flush(); err != nil {
+		return nil, &RPCError{Code: RPCErrWalletError, Message: fmt.Sprintf("wallet encrypted but the post-encryption save failed: %v", err)}
+	}
+	if err := w.ScrubBackup(); err != nil {
+		return nil, &RPCError{Code: RPCErrWalletError, Message: fmt.Sprintf("wallet encrypted but scrubbing the plaintext backup failed: %v", err)}
 	}
 
 	return "wallet encrypted; the keypool has been flushed. The wallet is now locked; use walletpassphrase to unlock.", nil
@@ -781,7 +822,9 @@ func (s *Server) handleGetWalletInfoWithWallet(walletName string) (interface{}, 
 		TxCount:            len(history),
 		KeypoolSize:        20,
 		PayTxFee:           0,
-		PrivateKeysEnabled: true,
+		// Real flag (was hardcoded true): false for createwallet
+		// disable_private_keys wallets, persisted across reloads.
+		PrivateKeysEnabled: !w.PrivateKeysDisabled(),
 		AvoidReuse:         false,
 		Scanning:           false,
 		Descriptors:        true,
@@ -882,22 +925,63 @@ func (s *Server) handleGetAddressInfoWithWallet(params json.RawMessage, walletNa
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
 	}
 
-	isMine := w.IsOwnAddress(addr)
-	label := w.GetLabel(addr)
+	return s.buildAddressInfo(w, addr)
+}
+
+// buildAddressInfo renders the Core v31.99 getaddressinfo shape
+// (bitcoin-core/src/wallet/rpc/addresses.cpp:368-513) for one address:
+// ownership/solvability from the wallet (HD path, imported key, or imported
+// descriptor — watch-only imports report ismine=true), script classification
+// from the decoded address, labels as a plain string array, and iswatchonly
+// hardcoded false (deprecated, addresses.cpp:383,478).
+func (s *Server) buildAddressInfo(w *wallet.Wallet, addr string) (*AddressInfoResult, *RPCError) {
+	decoded, err := address.DecodeAddress(addr, s.addressNetwork())
+	if err != nil {
+		// Core: RPC_INVALID_ADDRESS_OR_KEY "Invalid address".
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid address"}
+	}
+	spk := decoded.ScriptPubKey()
+	det := w.AddressDetail(addr)
 
 	result := &AddressInfoResult{
-		Address:     addr,
-		IsMine:      isMine,
-		IsWatchOnly: false,
-		Solvable:    isMine,
-		Label:       label,
+		Address:      addr,
+		ScriptPubKey: hex.EncodeToString(spk),
+		IsMine:       det.IsMine,
+		Solvable:     det.Solvable,
+		ParentDesc:   det.ParentDesc,
+		IsWatchOnly:  false, // deprecated; always false (Core addresses.cpp:383,478)
+		IsChange:     det.IsChange,
+		Timestamp:    det.Timestamp,
+		HDKeyPath:    det.HDKeyPath,
+		Labels:       []string{},
+	}
+	if det.Label != "" {
+		result.Labels = []string{det.Label}
+	}
+	// For single-address (non-ranged) imported descriptors the address's own
+	// descriptor IS the wallet descriptor it came from.
+	if det.ParentDesc != "" {
+		result.Desc = det.ParentDesc
 	}
 
-	if label != "" {
-		result.Labels = []struct {
-			Name    string `json:"name"`
-			Purpose string `json:"purpose"`
-		}{{Name: label, Purpose: "receive"}}
+	// Script classification from the scriptPubKey template.
+	witVer := func(v int) *int { return &v }
+	switch {
+	case len(spk) == 22 && spk[0] == 0x00 && spk[1] == 0x14: // P2WPKH
+		result.IsWitness = true
+		result.WitnessVersion = witVer(0)
+		result.WitnessProgram = hex.EncodeToString(spk[2:])
+	case len(spk) == 34 && spk[0] == 0x00 && spk[1] == 0x20: // P2WSH
+		result.IsScript = true
+		result.IsWitness = true
+		result.WitnessVersion = witVer(0)
+		result.WitnessProgram = hex.EncodeToString(spk[2:])
+	case len(spk) == 34 && spk[0] == 0x51 && spk[1] == 0x20: // P2TR
+		result.IsWitness = true
+		result.WitnessVersion = witVer(1)
+		result.WitnessProgram = hex.EncodeToString(spk[2:])
+	case len(spk) == 23 && spk[0] == 0xa9 && spk[1] == 0x14 && spk[22] == 0x87: // P2SH
+		result.IsScript = true
 	}
 
 	return result, nil

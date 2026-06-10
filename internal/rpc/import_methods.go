@@ -189,6 +189,12 @@ func (s *Server) handleImportPrivKey(params json.RawMessage, walletName string) 
 		return nil, rpcErr
 	}
 
+	// Core gate (wallet/rpc/backup.cpp::importprivkey): -4 when the wallet
+	// was created with disable_private_keys.
+	if w.PrivateKeysDisabled() {
+		return nil, &RPCError{Code: RPCErrWalletError, Message: "Cannot import private keys to a wallet with private keys disabled"}
+	}
+
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}

@@ -88,6 +88,28 @@ type Wallet struct {
 	// Per-type address indices
 	nextIdx map[WalletAddressType]*addressIndices
 
+	// disablePrivateKeys mirrors Bitcoin Core's WALLET_FLAG_DISABLE_PRIVATE_KEYS
+	// (createwallet disable_private_keys). When set, the wallet is watch-only:
+	// importprivkey and private-key descriptor imports are refused with -4, and
+	// getwalletinfo reports private_keys_enabled=false. Persisted in walletData
+	// so a reloaded watch-only wallet keeps refusing keys after restart.
+	disablePrivateKeys bool
+
+	// importedDescriptors is the wallet's descriptor registry (the analog of
+	// Core's DescriptorScriptPubKeyMan set, populated by importdescriptors).
+	// Each record holds the canonical descriptor string + import options and is
+	// persisted in walletData; watchedScripts/watchedAddrs are DERIVED from it
+	// (rebuilt on load) and give O(1) ownership tests for both the live
+	// ScanBlock path and the rescan path.
+	importedDescriptors []*importedDescriptor
+	// watchedScripts maps raw scriptPubKey bytes (as string) -> per-script
+	// ownership metadata for every script an imported descriptor expands to.
+	watchedScripts map[string]*watchedScriptMeta
+	// watchedAddrs is the address-keyed view of watchedScripts (for
+	// IsOwnAddress / getaddressinfo). Scripts with no standard address
+	// representation appear only in watchedScripts.
+	watchedAddrs map[string]*watchedScriptMeta
+
 	// Encryption state (Bitcoin Core "crypter" semantics).
 	//
 	// encrypted is set once EncryptWallet has been called. While encrypted,
@@ -119,8 +141,12 @@ type Wallet struct {
 	//
 	// dirty is set under w.mu by markDirtyLocked from every mutating path; the
 	// flusher clears it after a successful SaveToFile. savePassword is the
-	// password the auto-flush encrypts with (empty for the unencrypted legacy
-	// wallet, set by main.go's startup wiring; encryptwallet updates it).
+	// wallet's CURRENT envelope password — the single source of truth every
+	// save path (auto-flush, Save, unload, backup, shutdown) encrypts the file
+	// with. It is set by Manager.CreateWallet (= the createwallet passphrase),
+	// by loadWalletFile (= the password that successfully decrypted the file),
+	// and by EncryptWallet (= the new user passphrase). Empty for legacy
+	// unencrypted wallets.
 	dirty        bool
 	savePassword string
 	// lastSyncedHeight is the active-chain height the UTXO ledger has been
@@ -274,16 +300,18 @@ const BIP125RBFSequence uint32 = 0xFFFFFFFD
 // NewWallet creates a new empty wallet.
 func NewWallet(config WalletConfig) *Wallet {
 	return &Wallet{
-		config:       config,
-		utxos:        make(map[wire.OutPoint]*WalletUTXO),
-		txHistory:    make([]*WalletTx, 0),
-		gapLimit:     DefaultGapLimit,
-		locked:       true,
-		addrToPath:   make(map[string]string),
-		addrToType:   make(map[string]WalletAddressType),
-		addrLabels:   make(map[string]string),
-		importedKeys: make(map[string]*bbcrypto.PrivateKey),
-		lockedCoins:  make(map[wire.OutPoint]bool),
+		config:         config,
+		utxos:          make(map[wire.OutPoint]*WalletUTXO),
+		txHistory:      make([]*WalletTx, 0),
+		gapLimit:       DefaultGapLimit,
+		locked:         true,
+		addrToPath:     make(map[string]string),
+		addrToType:     make(map[string]WalletAddressType),
+		addrLabels:     make(map[string]string),
+		importedKeys:   make(map[string]*bbcrypto.PrivateKey),
+		lockedCoins:    make(map[wire.OutPoint]bool),
+		watchedScripts: make(map[string]*watchedScriptMeta),
+		watchedAddrs:   make(map[string]*watchedScriptMeta),
 		nextIdx: map[WalletAddressType]*addressIndices{
 			AddressTypeP2WPKH:      {External: 0, Internal: 0},
 			AddressTypeP2PKH:       {External: 0, Internal: 0},
@@ -921,15 +949,79 @@ func (w *Wallet) GetUTXO(outpoint wire.OutPoint) *WalletUTXO {
 	return w.utxos[outpoint]
 }
 
-// IsOwnAddress checks if an address belongs to this wallet.
+// IsOwnAddress checks if an address belongs to this wallet: HD-derived,
+// imported via importprivkey, or watched via an imported descriptor
+// (importdescriptors — Core's descriptor ISMINE).
 func (w *Wallet) IsOwnAddress(addr string) bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	if _, exists := w.addrToPath[addr]; exists {
 		return true
 	}
-	_, imported := w.importedKeys[addr]
-	return imported
+	if _, imported := w.importedKeys[addr]; imported {
+		return true
+	}
+	_, watched := w.watchedAddrs[addr]
+	return watched
+}
+
+// AddressDetail is the wallet's ownership view of one address, consumed by the
+// getaddressinfo RPC. Solvable mirrors Core DescriptorImpl::IsSolvable():
+// true for HD/imported-key addresses and pubkey descriptors, false for addr()
+// (the wallet knows the script but not how to construct a witness for it).
+type AddressDetail struct {
+	IsMine     bool
+	Solvable   bool
+	IsChange   bool
+	HDKeyPath  string // BIP-32 path for HD-derived addresses ("" otherwise)
+	ParentDesc string // canonical descriptor for watched addresses ("" otherwise)
+	Timestamp  int64  // descriptor import timestamp (watched addresses only)
+	Label      string
+}
+
+// AddressDetail returns the ownership detail for one address.
+func (w *Wallet) AddressDetail(addr string) AddressDetail {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+
+	d := AddressDetail{Label: w.addrLabels[addr]}
+	if path, ok := w.addrToPath[addr]; ok {
+		d.IsMine = true
+		d.Solvable = true
+		d.HDKeyPath = path
+		d.IsChange = pathIsChange(path)
+		return d
+	}
+	if _, ok := w.importedKeys[addr]; ok {
+		d.IsMine = true
+		d.Solvable = true
+		return d
+	}
+	if meta, ok := w.watchedAddrs[addr]; ok {
+		d.IsMine = true
+		d.Solvable = meta.Solvable
+		d.IsChange = meta.Internal
+		d.ParentDesc = meta.ParentDesc
+		d.Timestamp = meta.Timestamp
+	}
+	return d
+}
+
+// PrivateKeysDisabled reports whether the wallet was created with
+// disable_private_keys (Core WALLET_FLAG_DISABLE_PRIVATE_KEYS).
+func (w *Wallet) PrivateKeysDisabled() bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.disablePrivateKeys
+}
+
+// SetDisablePrivateKeys flags the wallet watch-only (set at creation by
+// Manager.CreateWallet from the createwallet disable_private_keys arg).
+func (w *Wallet) SetDisablePrivateKeys(disabled bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.disablePrivateKeys = disabled
+	w.markDirtyLocked()
 }
 
 // IsOwnScript reports whether the wallet recognises a scriptPubKey as one of
@@ -2187,6 +2279,19 @@ func (w *Wallet) ScanBlock(block *wire.MsgBlock, height int32) {
 			if addr != "" {
 				path, isOurs = w.addrToPath[addr]
 			}
+			// Watch-only (imported-descriptor) outputs are credited at the tip
+			// exactly like HD outputs — keyed on the raw scriptPubKey so
+			// non-standard watched scripts match too. Mirrors Core, where a
+			// descriptor SPKM's scripts are ISMINE on the live connect path.
+			if !isOurs {
+				if meta, ok := w.watchedScripts[string(out.PkScript)]; ok {
+					isOurs = true
+					if meta.Address != "" {
+						addr = meta.Address
+					}
+					path = ""
+				}
+			}
 
 			if isOurs {
 				credit += out.Value
@@ -2675,6 +2780,13 @@ func (w *Wallet) resolveOwnedOutputLocked(pkScript []byte, derivedIdx map[string
 			}
 		}
 	}
+	// Imported-descriptor (watch-only) scripts — keyed on the raw scriptPubKey
+	// so scripts with no standard address form are matched too. Checked last so
+	// an HD-owned script keeps its derivation path (signability) if it is
+	// somehow also watched.
+	if meta, ok := w.watchedScripts[string(pkScript)]; ok {
+		return meta.Address, "", true
+	}
 	return "", "", false
 }
 
@@ -2695,7 +2807,7 @@ func (w *Wallet) resolveOwnedOutputLocked(pkScript []byte, derivedIdx map[string
 // (e.g. a pruned or missing body). Returns the highest height actually scanned.
 func (w *Wallet) Rescan(startHeight, stopHeight int32, getBlock func(height int32) (*wire.MsgBlock, bool)) (scannedTo int32, err error) {
 	w.mu.Lock()
-	if w.masterKey == nil && len(w.importedKeys) == 0 {
+	if w.masterKey == nil && len(w.importedKeys) == 0 && len(w.watchedScripts) == 0 {
 		w.mu.Unlock()
 		return startHeight - 1, ErrNoMasterKey
 	}
@@ -2988,6 +3100,14 @@ func (w *Wallet) EncryptWallet(passphrase string) error {
 	w.encryptedMaster = envelope
 	w.encrypted = true
 
+	// The user passphrase becomes the wallet's envelope password: every
+	// subsequent save path (auto-flush, Save, unload, backup, shutdown)
+	// re-encrypts the file under it, so the at-rest protection can never be
+	// silently lowered back to the empty password. Mirrors Core, where
+	// EncryptWallet's persisted MASTER_KEY record IS the at-rest state
+	// (bitcoin-core/src/wallet/wallet.cpp:818-891).
+	w.savePassword = passphrase
+
 	// Wipe in-memory master key and lock.
 	zeroBytes(w.masterKey.Key)
 	zeroBytes(w.masterKey.ChainCode)
@@ -3129,12 +3249,197 @@ func (w *Wallet) GenerateAddresses(count int) ([]string, error) {
 	return addresses, nil
 }
 
-// ImportDescriptor imports a descriptor into the wallet.
-// TODO: Full implementation
-func (w *Wallet) ImportDescriptor(desc *Descriptor, active, internal bool, label string) error {
-	_ = desc
-	_ = active
-	_ = internal
-	_ = label
-	return errors.New("descriptor import not yet implemented")
+// Descriptor-import errors. The messages are Core-exact; the RPC layer maps
+// both to RPC_WALLET_ERROR (-4), mirroring
+// bitcoin-core/src/wallet/rpc/backup.cpp:224-226 and :259-262.
+var (
+	ErrImportPrivKeysDisabled = errors.New("Cannot import private keys to a wallet with private keys disabled")
+	ErrImportNeedsPrivKeys    = errors.New("Cannot import descriptor without private keys to a wallet with private keys enabled")
+)
+
+// DescriptorImport carries one importdescriptors request element into the
+// wallet layer — the analog of Core's WalletDescriptor constructor args
+// (bitcoin-core/src/wallet/rpc/backup.cpp:268).
+type DescriptorImport struct {
+	Active     bool
+	Internal   bool
+	Label      string
+	RangeStart int32 // only meaningful when the descriptor is ranged
+	RangeEnd   int32 // inclusive
+	NextIndex  int32
+	Timestamp  int64 // clamped import timestamp (>= 1)
+}
+
+// importedDescriptor is the persisted registry record for one imported
+// descriptor (serialized as descriptorData in walletData).
+type importedDescriptor struct {
+	Desc       string // canonical descriptor string, with checksum
+	Active     bool
+	Internal   bool
+	Label      string
+	RangeStart int32
+	RangeEnd   int32
+	NextIndex  int32
+	Timestamp  int64
+}
+
+// watchedScriptMeta is the derived per-script ownership record for one
+// scriptPubKey produced by an imported descriptor.
+type watchedScriptMeta struct {
+	Address    string // standard address form ("" for non-standard scripts)
+	ParentDesc string // canonical descriptor this script came from
+	Solvable   bool   // Core DescriptorImpl::IsSolvable (false for addr()/raw())
+	Internal   bool
+	Timestamp  int64
+}
+
+// descriptorHasAnyPrivateKeys reports whether ANY key expression in the
+// descriptor carries private-key material (Core's `!keys.keys.empty()` test
+// on the Parse output, backup.cpp:224/260). Distinct from
+// Descriptor.HasPrivateKeys, which requires ALL keys to be private.
+func descriptorHasAnyPrivateKeys(d *Descriptor) bool {
+	if d == nil {
+		return false
+	}
+	for _, k := range d.Keys {
+		if k.IsPrivate() {
+			return true
+		}
+	}
+	if d.Subdesc != nil && descriptorHasAnyPrivateKeys(d.Subdesc) {
+		return true
+	}
+	return tapTreeHasAnyPrivateKeys(d.TapTree)
+}
+
+func tapTreeHasAnyPrivateKeys(t *TapTreeDescriptor) bool {
+	if t == nil {
+		return false
+	}
+	if t.Subdesc != nil && descriptorHasAnyPrivateKeys(t.Subdesc) {
+		return true
+	}
+	return tapTreeHasAnyPrivateKeys(t.Left) || tapTreeHasAnyPrivateKeys(t.Right)
+}
+
+// ImportDescriptor imports a parsed descriptor into the wallet's descriptor
+// registry, expanding it over its range and registering every produced
+// scriptPubKey as wallet-owned (watch-only unless the descriptor carried
+// private keys). Mirrors Bitcoin Core's ProcessDescriptorImport wallet side
+// (bitcoin-core/src/wallet/rpc/backup.cpp:141-300):
+//
+//   - private keys into a disable_private_keys wallet -> ErrImportPrivKeysDisabled
+//     (the RPC maps it to -4, backup.cpp:224-226);
+//   - a key-less descriptor into a keys-enabled wallet -> ErrImportNeedsPrivKeys
+//     (-4, backup.cpp:259-262);
+//   - partial private keys -> the Core warning string is returned in warnings.
+//
+// Re-importing the same canonical descriptor replaces its registry record
+// (idempotent). Returns the standard addresses now watched. The caller is
+// responsible for the rescan (Core does it once for the whole batch).
+func (w *Wallet) ImportDescriptor(desc *Descriptor, req DescriptorImport) (addrs []string, warnings []string, err error) {
+	if desc == nil {
+		return nil, nil, errors.New("nil descriptor")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	anyPriv := descriptorHasAnyPrivateKeys(desc)
+	if w.disablePrivateKeys && anyPriv {
+		return nil, nil, ErrImportPrivKeysDisabled
+	}
+	if !w.disablePrivateKeys && !anyPriv {
+		return nil, nil, ErrImportNeedsPrivKeys
+	}
+	if !w.disablePrivateKeys && anyPriv && !desc.HasPrivateKeys() {
+		// Core backup.cpp:263-265.
+		warnings = append(warnings, "Not all private keys provided. Some wallet functionality may return unexpected errors")
+	}
+
+	rec := &importedDescriptor{
+		Desc:       desc.String(), // canonical, with checksum
+		Active:     req.Active,
+		Internal:   req.Internal,
+		Label:      req.Label,
+		RangeStart: req.RangeStart,
+		RangeEnd:   req.RangeEnd,
+		NextIndex:  req.NextIndex,
+		Timestamp:  req.Timestamp,
+	}
+	addrs, err = w.registerDescriptorLocked(desc, rec)
+	if err != nil {
+		return nil, warnings, err
+	}
+
+	replaced := false
+	for i, existing := range w.importedDescriptors {
+		if existing.Desc == rec.Desc {
+			w.importedDescriptors[i] = rec
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		w.importedDescriptors = append(w.importedDescriptors, rec)
+	}
+	w.markDirtyLocked()
+	return addrs, warnings, nil
+}
+
+// registerDescriptorLocked expands desc over its positions ([RangeStart,
+// RangeEnd] for ranged descriptors, position 0 otherwise) and registers every
+// produced scriptPubKey into watchedScripts/watchedAddrs. When the wallet has
+// private keys enabled and the descriptor carries them, the expanded keys are
+// also registered into importedKeys so the funds are spendable (Core stores
+// the expanded keys in the descriptor SPKM). Caller must hold w.mu.
+func (w *Wallet) registerDescriptorLocked(desc *Descriptor, rec *importedDescriptor) ([]string, error) {
+	start, end := rec.RangeStart, rec.RangeEnd
+	if !desc.IsRange() {
+		start, end = 0, 0
+	}
+	anyPriv := descriptorHasAnyPrivateKeys(desc)
+
+	var addrs []string
+	for pos := start; pos <= end; pos++ {
+		scripts, err := desc.Expand(uint32(pos))
+		if err != nil {
+			// Core backup.cpp:238-239.
+			return nil, fmt.Errorf("Cannot expand descriptor. Probably because of hardened derivations without private keys provided (%v)", err)
+		}
+		for _, spk := range scripts {
+			addr := ""
+			if desc.Type == DescAddr {
+				addr = desc.AddrStr
+			} else {
+				addr = w.scriptToAddress(spk)
+			}
+			meta := &watchedScriptMeta{
+				Address:    addr,
+				ParentDesc: rec.Desc,
+				Solvable:   desc.IsSolvable(),
+				Internal:   rec.Internal,
+				Timestamp:  rec.Timestamp,
+			}
+			w.watchedScripts[string(spk)] = meta
+			if addr == "" {
+				continue
+			}
+			w.watchedAddrs[addr] = meta
+			if rec.Label != "" && !rec.Internal {
+				w.addrLabels[addr] = rec.Label
+			}
+			addrs = append(addrs, addr)
+			if anyPriv && !w.disablePrivateKeys {
+				for _, kp := range desc.Keys {
+					if !kp.IsPrivate() {
+						continue
+					}
+					if pk, kerr := kp.GetPrivKey(uint32(pos)); kerr == nil && pk != nil {
+						w.importedKeys[addr] = pk
+					}
+				}
+			}
+		}
+	}
+	return addrs, nil
 }

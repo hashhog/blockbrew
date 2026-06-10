@@ -131,11 +131,13 @@ package wallet
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
+	bbcrypto "github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -1061,36 +1063,98 @@ func TestW118G27_ListUnspent(t *testing.T) {
 
 // ── G28: importdescriptors / importmulti ──────────────────────────────────────
 
-func TestW118G28_ImportDescriptorsStub(t *testing.T) {
-	// BUG-4: the RPC handler exists but the wallet method is a stub.
-	// importmulti is missing entirely from the dispatch table.
+func TestW118G28_ImportDescriptors(t *testing.T) {
+	// BUG-4 (G28) CLOSED 2026-06-10: Wallet.ImportDescriptor is implemented
+	// (descriptor registry + watchedScripts ownership, persisted + reload-
+	// safe) and the importdescriptors RPC is dispatched. This test pins the
+	// success path and the Core -4 privkey/dpk direction gates
+	// (bitcoin-core/src/wallet/rpc/backup.cpp:224-226, 259-262).
+	dir := t.TempDir()
 	config := WalletConfig{
-		DataDir:     t.TempDir(),
+		DataDir:     dir,
 		Network:     address.Mainnet,
 		AddressType: AddressTypeP2WPKH,
 		ChainParams: consensus.MainnetParams(),
 	}
 	w := NewWallet(config)
-	_ = w.CreateFromMnemonic(testMnemonic, "")
+	w.SetDisablePrivateKeys(true) // the watch-only importdescriptors target shape
 
-	// Build a valid descriptor.
 	pubHex := "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"
 	desc, err := ParseDescriptor("wpkh("+pubHex+")", address.Mainnet)
 	if err != nil {
 		t.Fatalf("G28 ParseDescriptor: %v", err)
 	}
 
-	// ImportDescriptor should ideally insert the descriptor into the
-	// wallet's keystore. blockbrew always returns "not yet implemented".
-	err = w.ImportDescriptor(desc, true, false, "test-label")
-	if err == nil {
-		t.Error("G28 ImportDescriptor returned nil — feature may have been implemented since W111; verify and remove BUG-4")
-		return
+	addrs, warnings, err := w.ImportDescriptor(desc, DescriptorImport{Timestamp: 1, Label: "test-label"})
+	if err != nil {
+		t.Fatalf("G28 ImportDescriptor: %v", err)
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("G28 ImportDescriptor error string changed: %v (expected 'not yet implemented')", err)
+	if len(warnings) != 0 {
+		t.Errorf("G28 unexpected warnings: %v", warnings)
 	}
-	t.Logf("BUG-4: wallet.ImportDescriptor is a stub returning %q (wallet.go:2275)", err)
+	if len(addrs) != 1 {
+		t.Fatalf("G28 ImportDescriptor registered %d addresses, want 1", len(addrs))
+	}
+	if !w.IsOwnAddress(addrs[0]) {
+		t.Errorf("G28 imported descriptor address %s not IsOwnAddress", addrs[0])
+	}
+	det := w.AddressDetail(addrs[0])
+	if !det.IsMine || !det.Solvable {
+		t.Errorf("G28 wpkh(pub) import: IsMine=%v Solvable=%v, want true/true", det.IsMine, det.Solvable)
+	}
+	if !strings.Contains(det.ParentDesc, "wpkh(") {
+		t.Errorf("G28 ParentDesc = %q, want canonical wpkh descriptor", det.ParentDesc)
+	}
+
+	// addr() descriptors are ISMINE but NOT solvable (Core IsSolvable=false).
+	addrDesc, err := ParseDescriptor("addr(1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH)", address.Mainnet)
+	if err != nil {
+		t.Fatalf("G28 ParseDescriptor(addr): %v", err)
+	}
+	if _, _, err := w.ImportDescriptor(addrDesc, DescriptorImport{Timestamp: 1}); err != nil {
+		t.Fatalf("G28 ImportDescriptor(addr): %v", err)
+	}
+	if d := w.AddressDetail("1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"); !d.IsMine || d.Solvable {
+		t.Errorf("G28 addr() import: IsMine=%v Solvable=%v, want true/false", d.IsMine, d.Solvable)
+	}
+
+	// Direction 1: private keys into a dpk wallet → Core -4 error.
+	wif := EncodeWIF(bbcrypto.PrivateKeyFromBytes(bytes.Repeat([]byte{0x42}, 32)), address.Mainnet, true)
+	privDesc, err := ParseDescriptor("wpkh("+wif+")", address.Mainnet)
+	if err != nil {
+		t.Fatalf("G28 ParseDescriptor(wif): %v", err)
+	}
+	if _, _, err := w.ImportDescriptor(privDesc, DescriptorImport{Timestamp: 1}); !errors.Is(err, ErrImportPrivKeysDisabled) {
+		t.Errorf("G28 privkey-into-dpk: want ErrImportPrivKeysDisabled, got %v", err)
+	}
+
+	// Persistence: registry + dpk flag must survive a save/load round trip.
+	if err := w.Save(); err != nil {
+		t.Fatalf("G28 Save: %v", err)
+	}
+	w2, err := LoadFromFile(dir, "", config)
+	if err != nil {
+		t.Fatalf("G28 LoadFromFile: %v", err)
+	}
+	if !w2.PrivateKeysDisabled() {
+		t.Errorf("G28 disable_private_keys flag lost across reload")
+	}
+	if !w2.IsOwnAddress(addrs[0]) {
+		t.Errorf("G28 imported descriptor ownership lost across reload")
+	}
+
+	// Direction 2: a key-less descriptor into a keys-ENABLED wallet → -4
+	// (Core backup.cpp:259-262).
+	wKeys := NewWallet(WalletConfig{
+		DataDir:     t.TempDir(),
+		Network:     address.Mainnet,
+		AddressType: AddressTypeP2WPKH,
+		ChainParams: consensus.MainnetParams(),
+	})
+	_ = wKeys.CreateFromMnemonic(testMnemonic, "")
+	if _, _, err := wKeys.ImportDescriptor(desc, DescriptorImport{Timestamp: 1}); !errors.Is(err, ErrImportNeedsPrivKeys) {
+		t.Errorf("G28 watchonly-into-keyed: want ErrImportNeedsPrivKeys, got %v", err)
+	}
 }
 
 // ── G29: encryptwallet + walletpassphrase round-trip ──────────────────────────

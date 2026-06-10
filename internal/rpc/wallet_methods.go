@@ -151,9 +151,10 @@ func (s *Server) handleSendToAddress(params json.RawMessage) (interface{}, *RPCE
 // wallet. Reference: bitcoin-core/src/wallet/rpc/encrypt.cpp::encryptwallet.
 //
 // Errors:
-//   -15 RPCErrWalletWrongEncState     when the wallet is already encrypted
-//   -8  RPCErrInvalidParameter        when passphrase is empty
-//   -16 RPCErrWalletEncryptionFailed  when encryption fails internally
+//
+//	-15 RPCErrWalletWrongEncState     when the wallet is already encrypted
+//	-8  RPCErrInvalidParameter        when passphrase is empty
+//	-16 RPCErrWalletEncryptionFailed  when encryption fails internally
 func (s *Server) handleEncryptWallet(params json.RawMessage) (interface{}, *RPCError) {
 	if s.wallet == nil {
 		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
@@ -176,6 +177,17 @@ func (s *Server) handleEncryptWallet(params json.RawMessage) (interface{}, *RPCE
 
 	if err := s.wallet.EncryptWallet(passphrase); err != nil {
 		return nil, mapEncryptionError(err)
+	}
+
+	// Persist the encrypted state durably + scrub the plaintext .bak before
+	// returning (Core EncryptWallet is transactional and Rewrite()s the DB,
+	// wallet.cpp:818-891). Pre-fix the state was memory-only and evaporated
+	// on restart.
+	if err := s.wallet.Flush(); err != nil {
+		return nil, &RPCError{Code: RPCErrWalletError, Message: fmt.Sprintf("wallet encrypted but the post-encryption save failed: %v", err)}
+	}
+	if err := s.wallet.ScrubBackup(); err != nil {
+		return nil, &RPCError{Code: RPCErrWalletError, Message: fmt.Sprintf("wallet encrypted but scrubbing the plaintext backup failed: %v", err)}
 	}
 
 	return "wallet encrypted; the keypool has been flushed. The wallet is now locked; use walletpassphrase to unlock.", nil
@@ -494,23 +506,5 @@ func (s *Server) handleGetAddressInfo(params json.RawMessage) (interface{}, *RPC
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
 	}
 
-	isMine := s.wallet.IsOwnAddress(addr)
-	label := s.wallet.GetLabel(addr)
-
-	result := &AddressInfoResult{
-		Address:     addr,
-		IsMine:      isMine,
-		IsWatchOnly: false,
-		Solvable:    isMine,
-		Label:       label,
-	}
-
-	if label != "" {
-		result.Labels = []struct {
-			Name    string `json:"name"`
-			Purpose string `json:"purpose"`
-		}{{Name: label, Purpose: "receive"}}
-	}
-
-	return result, nil
+	return s.buildAddressInfo(s.wallet, addr)
 }

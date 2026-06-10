@@ -559,11 +559,11 @@ type SignRawTransactionErr struct {
 
 // PrevTx describes a previous transaction output for signing.
 type PrevTx struct {
-	TxID          string `json:"txid"`
-	Vout          uint32 `json:"vout"`
-	ScriptPubKey  string `json:"scriptPubKey"`
-	RedeemScript  string `json:"redeemScript,omitempty"`
-	WitnessScript string `json:"witnessScript,omitempty"`
+	TxID          string  `json:"txid"`
+	Vout          uint32  `json:"vout"`
+	ScriptPubKey  string  `json:"scriptPubKey"`
+	RedeemScript  string  `json:"redeemScript,omitempty"`
+	WitnessScript string  `json:"witnessScript,omitempty"`
 	Amount        float64 `json:"amount,omitempty"`
 }
 
@@ -704,58 +704,47 @@ func (s *Server) handleSignRawTransactionWithWallet(params json.RawMessage, wall
 
 // ============================================================================
 // importdescriptors RPC
+//
+// Core-faithful implementation of bitcoin-core/src/wallet/rpc/backup.cpp:
+// importdescriptors (302-462) + ProcessDescriptorImport (141-300) +
+// GetImportTimestamp (127-139). Contract highlights:
+//
+//   - the response is an array the SAME SIZE as the request; every per-element
+//     failure is embedded as {success:false, error:{code,message}} and the
+//     batch continues — EXCEPT timestamp errors, which Core evaluates OUTSIDE
+//     the per-element try/catch (backup.cpp:388-391) and which therefore abort
+//     the whole RPC with -3;
+//   - descriptors are parsed with require_checksum=true; checksum failures are
+//     per-element -5 with Core's literal CheckChecksum strings;
+//   - timestamp is a number or "now" (= tip MTP), clamped to >= 1; after the
+//     batch, one synchronous rescan runs from 2h (TIMESTAMP_WINDOW, chain.h:37)
+//     before the lowest timestamp so pre-import funds near the boundary are
+//     credited (wallet.cpp:1827-1847);
+//   - if the rescan stops early, previously-successful elements whose
+//     timestamp wasn't fully covered are rewritten to success:false with the
+//     -1 "Rescan failed..." error (backup.cpp:416-455).
 // ============================================================================
 
-// ImportDescriptorRequest is a single descriptor import request.
-type ImportDescriptorRequest struct {
-	Desc      string `json:"desc"`
-	Active    bool   `json:"active,omitempty"`
-	Range     []int  `json:"range,omitempty"`
-	NextIndex int    `json:"next_index,omitempty"`
-	Timestamp interface{} `json:"timestamp"` // "now" or unix timestamp
-	Internal  bool   `json:"internal,omitempty"`
-	Label     string `json:"label,omitempty"`
-}
-
-// ImportDescriptorResult is the result of importing a single descriptor.
+// ImportDescriptorResult is one element of the importdescriptors response.
 type ImportDescriptorResult struct {
-	Success  bool     `json:"success"`
-	Warnings []string `json:"warnings,omitempty"`
-	Error    *struct {
-		Code    int    `json:"code"`
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
+	Success  bool      `json:"success"`
+	Warnings []string  `json:"warnings,omitempty"`
+	Error    *RPCError `json:"error,omitempty"`
 }
 
-func (s *Server) handleImportDescriptors(params json.RawMessage, walletName string) (interface{}, *RPCError) {
-	// Get wallet
-	w, rpcErr := s.getWalletForRPC(walletName)
-	if rpcErr != nil {
-		return nil, rpcErr
-	}
-	_ = w // We'll need to implement descriptor import in the wallet
+// rescanTimestampWindow is Core's TIMESTAMP_WINDOW = MAX_FUTURE_BLOCK_TIME
+// (bitcoin-core/src/chain.h:37): rescans begin this many seconds BEFORE the
+// earliest import timestamp.
+const rescanTimestampWindow = 7200
 
-	var args []interface{}
-	if err := json.Unmarshal(params, &args); err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
-	}
+// importDefaultKeypoolRange is the default range end (exclusive of Core's
+// half-open form; we store inclusive [0, 999]) applied when a ranged
+// descriptor is imported without a range — Core uses wallet.m_keypool_size
+// (DEFAULT_KEYPOOL_SIZE = 1000) at backup.cpp:180-184.
+const importDefaultKeypoolRange = 1000
 
-	if len(args) < 1 {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing requests parameter"}
-	}
-
-	// Parse the requests array
-	requestsData, err := json.Marshal(args[0])
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid requests array"}
-	}
-
-	var requests []ImportDescriptorRequest
-	if err := json.Unmarshal(requestsData, &requests); err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Failed to parse requests"}
-	}
-
-	// Get network
+// addressNetwork maps the node's chain params to the address-encoding network.
+func (s *Server) addressNetwork() address.Network {
 	net := address.Mainnet
 	if s.chainParams != nil {
 		switch s.chainParams.Name {
@@ -767,65 +756,326 @@ func (s *Server) handleImportDescriptors(params json.RawMessage, walletName stri
 			net = address.Signet
 		}
 	}
+	return net
+}
+
+// jsonTypeName names a decoded JSON value with Core's UniValue type
+// vocabulary, used in the -3 timestamp type error (uvTypeName).
+func jsonTypeName(v interface{}) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "bool"
+	case float64:
+		return "number"
+	case string:
+		return "string"
+	case []interface{}:
+		return "array"
+	default:
+		return "object"
+	}
+}
+
+// getImportTimestamp mirrors Core's GetImportTimestamp (backup.cpp:127-139):
+// number -> as-is; "now" -> tip MTP; missing/wrong type -> RPC_TYPE_ERROR (-3)
+// which the caller surfaces as a WHOLE-RPC error (Core evaluates it outside
+// ProcessDescriptorImport's try/catch).
+func getImportTimestamp(req map[string]json.RawMessage, now int64) (int64, *RPCError) {
+	raw, ok := req["timestamp"]
+	if !ok {
+		return 0, &RPCError{Code: RPCErrTypeError, Message: "Missing required timestamp field for key"}
+	}
+	var v interface{}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return 0, &RPCError{Code: RPCErrTypeError, Message: "Expected number or \"now\" timestamp value for key. got type null"}
+	}
+	switch t := v.(type) {
+	case float64:
+		return int64(t), nil
+	case string:
+		if t == "now" {
+			return now, nil
+		}
+	}
+	return 0, &RPCError{Code: RPCErrTypeError,
+		Message: fmt.Sprintf("Expected number or \"now\" timestamp value for key. got type %s", jsonTypeName(v))}
+}
+
+// parseImportRange mirrors Core's ParseDescriptorRange (rpc/util.cpp): a bare
+// number n means [0, n]; [begin, end] is taken as-is (inclusive). All failures
+// are -8 with Core's strings.
+func parseImportRange(raw json.RawMessage) (int32, int32, *RPCError) {
+	rangeErr := func(msg string) (int32, int32, *RPCError) {
+		return 0, 0, &RPCError{Code: RPCErrInvalidParameter, Message: msg}
+	}
+	var v interface{}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return rangeErr("Range must be specified as integer or as [begin,end]")
+	}
+	var begin, end int64
+	switch t := v.(type) {
+	case float64:
+		begin, end = 0, int64(t)
+	case []interface{}:
+		if len(t) != 2 {
+			return rangeErr("Range must have exactly two elements")
+		}
+		b, bok := t[0].(float64)
+		e, eok := t[1].(float64)
+		if !bok || !eok {
+			return rangeErr("Range must be specified as integer or as [begin,end]")
+		}
+		begin, end = int64(b), int64(e)
+	default:
+		return rangeErr("Range must be specified as integer or as [begin,end]")
+	}
+	if begin > end {
+		return rangeErr("Range specified as [begin,end] must not have begin after end")
+	}
+	if begin < 0 {
+		return rangeErr("Range should be greater or equal than 0")
+	}
+	if end-begin >= 10000 {
+		return rangeErr("Range is too large")
+	}
+	if end >= 0x7fffffff {
+		return rangeErr("End of range is too high")
+	}
+	return int32(begin), int32(end), nil
+}
+
+// processDescriptorImport is the per-element body (Core's
+// ProcessDescriptorImport, backup.cpp:141-300): every failure is embedded in
+// the element result; the batch continues.
+func (s *Server) processDescriptorImport(w *wallet.Wallet, req map[string]json.RawMessage, timestamp int64) *ImportDescriptorResult {
+	res := &ImportDescriptorResult{}
+	fail := func(code int, msg string) *ImportDescriptorResult {
+		res.Success = false
+		res.Error = &RPCError{Code: code, Message: msg}
+		return res
+	}
+
+	descRaw, ok := req["desc"]
+	if !ok {
+		return fail(RPCErrInvalidParameter, "Descriptor not found.")
+	}
+	var descStr string
+	if err := json.Unmarshal(descRaw, &descStr); err != nil {
+		return fail(RPCErrTypeError, "Expected type string for desc")
+	}
+
+	// require_checksum=true (Core Parse at backup.cpp:158; strings from
+	// descriptor.cpp CheckChecksum). -5, NOT -32602.
+	if err := wallet.RequireDescriptorChecksum(descStr); err != nil {
+		return fail(RPCErrInvalidAddressOrKey, err.Error())
+	}
+	desc, err := wallet.ParseDescriptor(descStr, s.addressNetwork())
+	if err != nil {
+		return fail(RPCErrInvalidAddressOrKey, err.Error())
+	}
+
+	var active, internal bool
+	if raw, ok := req["active"]; ok {
+		_ = json.Unmarshal(raw, &active)
+	}
+	if raw, ok := req["internal"]; ok {
+		_ = json.Unmarshal(raw, &internal)
+	}
+	label := ""
+	_, hasLabel := req["label"]
+	if hasLabel {
+		_ = json.Unmarshal(req["label"], &label)
+	}
+
+	// Range gates (Core backup.cpp:170-195).
+	isRanged := desc.IsRange()
+	rangeRaw, hasRange := req["range"]
+	var rangeStart, rangeEnd, nextIndex int32
+	if hasRange && !isRanged {
+		return fail(RPCErrInvalidParameter, "Range should not be specified for an un-ranged descriptor")
+	}
+	if isRanged {
+		if hasRange {
+			var rpcErr *RPCError
+			rangeStart, rangeEnd, rpcErr = parseImportRange(rangeRaw)
+			if rpcErr != nil {
+				return fail(rpcErr.Code, rpcErr.Message)
+			}
+		} else {
+			res.Warnings = append(res.Warnings, "Range not given, using default keypool range")
+			rangeStart, rangeEnd = 0, importDefaultKeypoolRange-1
+		}
+		nextIndex = rangeStart
+		if rawNext, hasNext := req["next_index"]; hasNext {
+			var nf float64
+			if err := json.Unmarshal(rawNext, &nf); err != nil {
+				return fail(RPCErrTypeError, "Expected type number for next_index")
+			}
+			nextIndex = int32(nf)
+			if nextIndex < rangeStart || nextIndex > rangeEnd {
+				return fail(RPCErrInvalidParameter, "next_index is out of range")
+			}
+		}
+	}
+
+	// Activity / label gates (Core backup.cpp:197-221).
+	if active && !isRanged {
+		return fail(RPCErrInvalidParameter, "Active descriptors must be ranged")
+	}
+	if isRanged && hasLabel {
+		return fail(RPCErrInvalidParameter, "Ranged descriptors should not have a label")
+	}
+	if internal && hasLabel {
+		return fail(RPCErrInvalidParameter, "Internal addresses should not have a label")
+	}
+	if active && desc.Type == wallet.DescCombo {
+		return fail(RPCErrWalletError, "Combo descriptors cannot be set to active")
+	}
+
+	// Wallet-side import: privkey/dpk direction gates (-4, Core backup.cpp:
+	// 224-226 / 259-262), expansion, registration.
+	_, warnings, err := w.ImportDescriptor(desc, wallet.DescriptorImport{
+		Active:     active,
+		Internal:   internal,
+		Label:      label,
+		RangeStart: rangeStart,
+		RangeEnd:   rangeEnd,
+		NextIndex:  nextIndex,
+		Timestamp:  timestamp,
+	})
+	if err != nil {
+		return fail(RPCErrWalletError, err.Error())
+	}
+	res.Warnings = append(res.Warnings, warnings...)
+	res.Success = true
+	return res
+}
+
+// rescanStartHeight maps the lowest import timestamp to the first active-chain
+// height whose block time is >= ts - TIMESTAMP_WINDOW, mirroring Core's
+// RescanFromTime -> CChain::FindEarliestAtLeast (wallet.cpp:1827-1847: the
+// scan starts 2h BEFORE the earliest timestamp). Returns tip+1 when no block
+// qualifies (nothing to scan).
+func (s *Server) rescanStartHeight(lowestTs int64) int32 {
+	if lowestTs <= 1 {
+		return 1 // timestamp 0/1 -> scan the whole chain
+	}
+	tip := s.chainMgr.BestBlockNode()
+	if tip == nil {
+		return 1
+	}
+	target := lowestTs - rescanTimestampWindow
+	first := tip.Height + 1
+	for node := tip; node != nil && node.Height > 0; node = node.Parent {
+		if int64(node.Header.Timestamp) >= target {
+			first = node.Height
+		}
+	}
+	return first
+}
+
+func (s *Server) handleImportDescriptors(params json.RawMessage, walletName string) (interface{}, *RPCError) {
+	w, rpcErr := s.getWalletForRPC(walletName)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if s.chainMgr == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing requests parameter"}
+	}
+
+	// Raw-keyed request objects so field PRESENCE is observable (a missing
+	// timestamp must abort the whole RPC; an explicit null is a type error).
+	var requests []map[string]json.RawMessage
+	if err := json.Unmarshal(args[0], &requests); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Failed to parse requests"}
+	}
+
+	tip := s.chainMgr.BestBlockNode()
+	if tip == nil {
+		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
+	}
+	// Core: now = tip MTP; lowest_timestamp starts at the tip block time and
+	// is lowered by every request (backup.cpp:385-396).
+	now := tip.GetMedianTimePast()
+	lowestTimestamp := int64(tip.Header.Timestamp)
 
 	results := make([]*ImportDescriptorResult, 0, len(requests))
-
-	for _, req := range requests {
-		result := &ImportDescriptorResult{}
-
-		// Parse and validate the descriptor using package-level function
-		desc, err := wallet.ParseDescriptor(req.Desc, net)
-		if err != nil {
-			result.Success = false
-			result.Error = &struct {
-				Code    int    `json:"code"`
-				Message string `json:"message"`
-			}{
-				Code:    RPCErrInvalidParams,
-				Message: fmt.Sprintf("Invalid descriptor: %v", err),
-			}
-			results = append(results, result)
-			continue
+	elemTimestamps := make([]int64, len(requests))
+	rescan := false
+	for i, req := range requests {
+		// Timestamp errors abort the ENTIRE RPC with -3 — Core calls
+		// GetImportTimestamp outside the per-element try/catch
+		// (backup.cpp:388-391).
+		ts, tsErr := getImportTimestamp(req, now)
+		if tsErr != nil {
+			return nil, tsErr
 		}
-
-		// Import the descriptor into the wallet
-		err = w.ImportDescriptor(desc, req.Active, req.Internal, req.Label)
-		if err != nil {
-			result.Success = false
-			result.Error = &struct {
-				Code    int    `json:"code"`
-				Message string `json:"message"`
-			}{
-				Code:    RPCErrWallet,
-				Message: fmt.Sprintf("Failed to import descriptor: %v", err),
-			}
-			results = append(results, result)
-			continue
+		if ts < 1 {
+			ts = 1 // minimum_timestamp clamp (backup.cpp:376,390)
 		}
+		elemTimestamps[i] = ts
 
-		// If range is specified, expand the descriptor for those indices
-		if len(req.Range) > 0 {
-			start := 0
-			end := 1000 // default lookahead
-			if len(req.Range) >= 1 {
-				end = req.Range[0]
-			}
-			if len(req.Range) >= 2 {
-				start = req.Range[0]
-				end = req.Range[1]
-			}
+		res := s.processDescriptorImport(w, req, ts)
+		results = append(results, res)
 
-			for i := start; i <= end; i++ {
-				_, err := desc.Expand(uint32(i))
-				if err != nil {
-					result.Warnings = append(result.Warnings, fmt.Sprintf("Failed to expand index %d: %v", i, err))
+		if ts < lowestTimestamp {
+			lowestTimestamp = ts
+		}
+		if res.Success {
+			rescan = true
+		}
+	}
+
+	// One synchronous rescan for the whole batch (Core backup.cpp:407-410):
+	// the RPC blocks until pre-import funds are credited.
+	if rescan {
+		_, tipHeight := s.chainMgr.BestBlock()
+		startHeight := s.rescanStartHeight(lowestTimestamp)
+		if startHeight <= tipHeight {
+			scannedTo, scanErr := w.Rescan(startHeight, tipHeight, s.blockByHeight)
+			if scanErr != nil || scannedTo < tipHeight {
+				// Post-rescan rewrite (Core backup.cpp:416-455): elements whose
+				// timestamp range was not fully scanned become success:false
+				// with the -1 "Rescan failed" error; elements that already
+				// carry an error stand unmodified.
+				scannedTime := now
+				if node := tip.GetAncestor(scannedTo + 1); node != nil {
+					scannedTime = int64(node.Header.Timestamp)
+				}
+				for i := range results {
+					if results[i].Error != nil || scannedTime <= elemTimestamps[i] {
+						continue
+					}
+					results[i] = &ImportDescriptorResult{
+						Success: false,
+						Error: &RPCError{Code: RPCErrMisc, Message: fmt.Sprintf(
+							"Rescan failed for descriptor with timestamp %d. There was an error reading a "+
+								"block from time %d, which is after or within %d seconds of key creation, and "+
+								"could contain transactions pertaining to the desc. As a result, transactions "+
+								"and coins using this desc may not appear in the wallet. This error could "+
+								"potentially caused by data corruption. If the issue persists you may want to "+
+								"reindex (see -reindex option).",
+							elemTimestamps[i], scannedTime-rescanTimestampWindow-1, rescanTimestampWindow)},
+					}
 				}
 			}
 		}
-
-		result.Success = true
-		results = append(results, result)
 	}
+
+	// Persist the registry (and any rescan credits) durably before returning —
+	// Core's AddWalletDescriptor writes through the wallet DB before the RPC
+	// responds. No-op when nothing changed.
+	_ = w.Flush()
 
 	return results, nil
 }

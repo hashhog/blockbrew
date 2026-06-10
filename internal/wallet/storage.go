@@ -61,6 +61,35 @@ type walletData struct {
 	UTXOs            []*utxoData       `json:"utxos"`
 	TxHistory        []*txData         `json:"tx_history"`
 	LastSyncedHeight int32             `json:"last_synced_height,omitempty"`
+	// Encrypted + EncryptedMaster persist the encryptwallet state (the analog
+	// of Core's DBKeys::MASTER_KEY record, walletdb.cpp:151-154): when
+	// Encrypted, EncryptedMaster holds the scrypt+AES-GCM ciphertext of the
+	// master key (salt||nonce||ciphertext) and NO plaintext Seed is written.
+	// IsEncrypted is thereby derived from disk across restarts, mirroring
+	// CWallet::HasEncryptionKeys (walletdb.cpp:189-198). omitempty keeps old
+	// (pre-fix, unencrypted) wallet files byte-compatible.
+	Encrypted       bool   `json:"encrypted,omitempty"`
+	EncryptedMaster []byte `json:"encrypted_master,omitempty"`
+	// DisablePrivateKeys persists createwallet's disable_private_keys flag
+	// (Core WALLET_FLAG_DISABLE_PRIVATE_KEYS), so a reloaded watch-only wallet
+	// keeps refusing private-key imports after restart.
+	DisablePrivateKeys bool `json:"disable_private_keys,omitempty"`
+	// Descriptors is the imported-descriptor registry (importdescriptors).
+	// The derived watchedScripts/watchedAddrs maps are rebuilt on load by
+	// re-parsing + re-expanding each record.
+	Descriptors []*descriptorData `json:"descriptors,omitempty"`
+}
+
+// descriptorData is the serialized form of one imported descriptor.
+type descriptorData struct {
+	Desc       string `json:"desc"`
+	Active     bool   `json:"active,omitempty"`
+	Internal   bool   `json:"internal,omitempty"`
+	Label      string `json:"label,omitempty"`
+	RangeStart int32  `json:"range_start,omitempty"`
+	RangeEnd   int32  `json:"range_end,omitempty"`
+	NextIndex  int32  `json:"next_index,omitempty"`
+	Timestamp  int64  `json:"timestamp,omitempty"`
 }
 
 // utxoData is the serialized UTXO format.
@@ -140,9 +169,40 @@ func (w *Wallet) SaveToFile(password string) error {
 		})
 	}
 
-	// If we have the master key, serialize the seed for recovery
-	if w.masterKey != nil {
+	// Master-key material: a wallet file must carry exactly ONE representation
+	// of the master secret — the encryptwallet CIPHERTEXT when encrypted, the
+	// plaintext seed otherwise. Mirrors Core's walletdb discipline where a key
+	// exists on disk in exactly one form and the plaintext record is erased
+	// only after the crypted record is durably written (walletdb.cpp:225-232).
+	if w.encrypted {
+		if len(w.encryptedMaster) == 0 {
+			// Refuse to write a file that would silently drop the master key
+			// (the pre-fix locked-flush funds-loss path). Analog of Core
+			// refusing key writes while locked (scriptpubkeyman.cpp:1114-1117).
+			return errors.New("wallet save: encrypted wallet has no master-key ciphertext; refusing to write a wallet file that would drop key material")
+		}
+		data.Encrypted = true
+		data.EncryptedMaster = w.encryptedMaster
+		// NEVER write the plaintext Seed for an encrypted wallet — not even
+		// while unlocked (masterKey != nil): the at-rest representation is the
+		// ciphertext (Core analog: Lock() touches RAM only, wallet.cpp:3362).
+	} else if w.masterKey != nil {
 		data.Seed = append(w.masterKey.Key, w.masterKey.ChainCode...)
+	}
+
+	// Watch-only / descriptor state.
+	data.DisablePrivateKeys = w.disablePrivateKeys
+	for _, rec := range w.importedDescriptors {
+		data.Descriptors = append(data.Descriptors, &descriptorData{
+			Desc:       rec.Desc,
+			Active:     rec.Active,
+			Internal:   rec.Internal,
+			Label:      rec.Label,
+			RangeStart: rec.RangeStart,
+			RangeEnd:   rec.RangeEnd,
+			NextIndex:  rec.NextIndex,
+			Timestamp:  rec.Timestamp,
+		})
 	}
 
 	// W161 BUG-15 (funds-loss) fix: persist the BIP-39 recovery phrase. The
@@ -259,6 +319,25 @@ func writeFileSync(path string, data []byte, perm os.FileMode) error {
 	return f.Close()
 }
 
+// ScrubBackup overwrites wallet.dat.bak with the CURRENT wallet.dat so no
+// older representation of the wallet's secrets survives on disk. Called after
+// encryptwallet persists the encrypted form: the regular .bak rotation keeps
+// the PREVIOUS (plaintext-seed, possibly weaker-password) copy as fallback,
+// which is exactly the slack Core's post-encrypt Rewrite() scrubs
+// (bitcoin-core/src/wallet/wallet.cpp:884-886).
+func (w *Wallet) ScrubBackup() error {
+	w.mu.RLock()
+	dataDir := w.config.DataDir
+	w.mu.RUnlock()
+
+	finalPath := filepath.Join(dataDir, walletFileName)
+	cur, err := os.ReadFile(finalPath)
+	if err != nil {
+		return fmt.Errorf("wallet scrub-backup: read %s: %w", finalPath, err)
+	}
+	return writeFileSync(finalPath+walletBakSuffix, cur, 0600)
+}
+
 // fsyncDir opens the directory and fsyncs it so a preceding rename is durable.
 func fsyncDir(dir string) error {
 	d, err := os.Open(dir)
@@ -292,6 +371,14 @@ func LoadFromFile(path string, password string, config WalletConfig) (*Wallet, e
 	w, err := loadWalletFile(walletPath, password, config, path)
 	if err == nil {
 		return w, nil
+	}
+
+	// A wrong password is NOT corruption: never "recover" from the backup in
+	// that case — the .bak may be an older copy written under a different
+	// (e.g. pre-encryptwallet, empty) password, and falling back to it would
+	// let a caller bypass the wallet's passphrase protection entirely.
+	if errors.Is(err, ErrInvalidPassword) {
+		return nil, err
 	}
 
 	// If the primary file is simply absent and there's no backup either, this
@@ -346,9 +433,24 @@ func loadWalletFile(filePath, password string, config WalletConfig, dataDir stri
 	config.DataDir = dataDir
 	w := NewWallet(config)
 
-	// Restore master key from seed.
-	if len(data.Seed) == 64 {
-		// Seed is stored as key || chainCode
+	// The password that successfully decrypted the file becomes the wallet's
+	// envelope password for every subsequent save (auto-flush, unload, backup),
+	// so a reload can never silently re-encrypt the file under a different —
+	// in particular weaker — password.
+	w.savePassword = password
+
+	// Restore persisted encryption state FIRST: an encrypted wallet's at-rest
+	// master-key representation is the encryptwallet ciphertext, and it boots
+	// LOCKED (Core derives IsEncrypted from the persisted MASTER_KEY records,
+	// walletdb.cpp:189-198, and an encrypted wallet starts locked). Any stray
+	// plaintext Seed is deliberately ignored in that case.
+	w.encrypted = data.Encrypted
+	w.encryptedMaster = data.EncryptedMaster
+	if data.Encrypted {
+		w.masterKey = nil
+		w.locked = true
+	} else if len(data.Seed) == 64 {
+		// Restore master key from seed (stored as key || chainCode).
 		masterKey := &HDKey{
 			Key:       data.Seed[:32],
 			ChainCode: data.Seed[32:64],
@@ -377,6 +479,40 @@ func loadWalletFile(filePath, password string, config WalletConfig, dataDir stri
 	w.addrLabels = data.AddrLabels
 	if w.addrLabels == nil {
 		w.addrLabels = make(map[string]string)
+	}
+
+	// Restore the watch-only flag + imported-descriptor registry, rebuilding
+	// the derived watchedScripts/watchedAddrs maps by re-parsing and
+	// re-expanding each persisted descriptor. A record that no longer parses
+	// or expands is skipped (logged), mirroring the fault-tolerant UTXO /
+	// history restore below — one bad record never discards the wallet.
+	w.disablePrivateKeys = data.DisablePrivateKeys
+	skippedDesc := 0
+	for _, dd := range data.Descriptors {
+		desc, derr := ParseDescriptor(dd.Desc, w.config.Network)
+		if derr != nil {
+			skippedDesc++
+			continue
+		}
+		rec := &importedDescriptor{
+			Desc:       dd.Desc,
+			Active:     dd.Active,
+			Internal:   dd.Internal,
+			Label:      dd.Label,
+			RangeStart: dd.RangeStart,
+			RangeEnd:   dd.RangeEnd,
+			NextIndex:  dd.NextIndex,
+			Timestamp:  dd.Timestamp,
+		}
+		if _, rerr := w.registerDescriptorLocked(desc, rec); rerr != nil {
+			skippedDesc++
+			continue
+		}
+		w.importedDescriptors = append(w.importedDescriptors, rec)
+	}
+	if skippedDesc > 0 {
+		log.Printf("wallet load: %s recovered with %d imported-descriptor record(s) skipped (unparseable)",
+			filePath, skippedDesc)
 	}
 
 	// Restore UTXOs — skip (don't abort on) a malformed record.

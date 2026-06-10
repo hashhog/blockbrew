@@ -17,33 +17,33 @@ import (
 
 // Descriptor errors
 var (
-	ErrInvalidDescriptor        = errors.New("invalid descriptor")
+	ErrInvalidDescriptor         = errors.New("invalid descriptor")
 	ErrInvalidDescriptorChecksum = errors.New("invalid descriptor checksum")
-	ErrInvalidKey               = errors.New("invalid key in descriptor")
-	ErrInvalidDerivationPath    = errors.New("invalid derivation path")
-	ErrDescriptorNotRanged      = errors.New("descriptor is not ranged")
-	ErrUnsupportedDescriptor    = errors.New("unsupported descriptor type")
-	ErrInvalidMultisigThreshold = errors.New("invalid multisig threshold")
-	ErrPrivateKeyNotAvailable   = errors.New("private key not available")
+	ErrInvalidKey                = errors.New("invalid key in descriptor")
+	ErrInvalidDerivationPath     = errors.New("invalid derivation path")
+	ErrDescriptorNotRanged       = errors.New("descriptor is not ranged")
+	ErrUnsupportedDescriptor     = errors.New("unsupported descriptor type")
+	ErrInvalidMultisigThreshold  = errors.New("invalid multisig threshold")
+	ErrPrivateKeyNotAvailable    = errors.New("private key not available")
 )
 
 // DescriptorType represents the type of output descriptor.
 type DescriptorType int
 
 const (
-	DescPK         DescriptorType = iota // pk(KEY)
-	DescPKH                              // pkh(KEY)
-	DescWPKH                             // wpkh(KEY)
-	DescWSH                              // wsh(SCRIPT)
-	DescSH                               // sh(SCRIPT)
-	DescMulti                            // multi(k, KEY...)
-	DescSortedMulti                      // sortedmulti(k, KEY...)
-	DescTR                               // tr(KEY) or tr(KEY, TREE)
-	DescCombo                            // combo(KEY)
-	DescRaw                              // raw(HEX)
-	DescAddr                             // addr(ADDRESS)
-	DescMiniscript                       // wsh(MINISCRIPT) or tr(KEY, MINISCRIPT)
-	DescRawTR                            // rawtr(KEY) — x-only key, no tweak
+	DescPK          DescriptorType = iota // pk(KEY)
+	DescPKH                               // pkh(KEY)
+	DescWPKH                              // wpkh(KEY)
+	DescWSH                               // wsh(SCRIPT)
+	DescSH                                // sh(SCRIPT)
+	DescMulti                             // multi(k, KEY...)
+	DescSortedMulti                       // sortedmulti(k, KEY...)
+	DescTR                                // tr(KEY) or tr(KEY, TREE)
+	DescCombo                             // combo(KEY)
+	DescRaw                               // raw(HEX)
+	DescAddr                              // addr(ADDRESS)
+	DescMiniscript                        // wsh(MINISCRIPT) or tr(KEY, MINISCRIPT)
+	DescRawTR                             // rawtr(KEY) — x-only key, no tweak
 )
 
 // String returns the function name for the descriptor type.
@@ -180,6 +180,34 @@ func ValidateDescriptorChecksum(desc string) (string, bool) {
 	}
 
 	return body, true
+}
+
+// RequireDescriptorChecksum validates desc's BIP-380 checksum in Bitcoin
+// Core's require-mode (Parse(..., require_checksum=true), as importdescriptors
+// uses): a descriptor WITHOUT a checksum is rejected. The error strings are
+// byte-identical to Core's CheckChecksum
+// (bitcoin-core/src/script/descriptor.cpp:2838-2869) because the RPC layer
+// surfaces them verbatim in the per-element -5 error.
+func RequireDescriptorChecksum(desc string) error {
+	parts := strings.Split(desc, "#")
+	if len(parts) > 2 {
+		return errors.New("Multiple '#' symbols")
+	}
+	if len(parts) == 1 {
+		return errors.New("Missing checksum")
+	}
+	body, chk := parts[0], parts[1]
+	if len(chk) != 8 {
+		return fmt.Errorf("Expected 8 character checksum, not %d characters", len(chk))
+	}
+	computed := DescriptorChecksum(body)
+	if computed == "" {
+		return errors.New("Invalid characters in payload")
+	}
+	if chk != computed {
+		return fmt.Errorf("Provided checksum '%s' does not match computed checksum '%s'", chk, computed)
+	}
+	return nil
 }
 
 // AddChecksum adds a checksum to a descriptor string.
@@ -393,16 +421,16 @@ func (p *XPubPubkeyProvider) formatKeyExpr(includePrivate bool) string {
 
 // Descriptor represents a parsed output descriptor.
 type Descriptor struct {
-	Type        DescriptorType
-	Keys        []PubkeyProvider   // Key arguments
-	Subdesc     *Descriptor        // Sub-descriptor for sh(), wsh()
-	Threshold   int                // For multi/sortedmulti
-	Network     address.Network    // Network for address generation
-	RawScript   []byte             // For raw() descriptor
-	AddrStr     string             // For addr() descriptor
-	TapTree     *TapTreeDescriptor // For tr() script tree
-	Miniscript  *script.MiniscriptNode // For miniscript descriptors
-	MiniscriptStr string            // Original miniscript string
+	Type          DescriptorType
+	Keys          []PubkeyProvider       // Key arguments
+	Subdesc       *Descriptor            // Sub-descriptor for sh(), wsh()
+	Threshold     int                    // For multi/sortedmulti
+	Network       address.Network        // Network for address generation
+	RawScript     []byte                 // For raw() descriptor
+	AddrStr       string                 // For addr() descriptor
+	TapTree       *TapTreeDescriptor     // For tr() script tree
+	Miniscript    *script.MiniscriptNode // For miniscript descriptors
+	MiniscriptStr string                 // Original miniscript string
 }
 
 // TapTreeDescriptor represents a taproot script tree.

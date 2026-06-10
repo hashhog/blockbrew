@@ -307,9 +307,9 @@ func TestW124_G20_WalletSaveBestEffort_BUG7(t *testing.T) {
 		t.Fatalf("read main.go: %v", err)
 	}
 	src := string(body)
-	// Look for the wallet save snippet pattern: `if err := w.SaveToFile(""); err != nil {`
+	// Look for the wallet save snippet pattern: `if err := w.Save(); err != nil {`
 	// immediately followed by `log.Printf("Warning: wallet save failed: %v", err)`.
-	walletSave := strings.Index(src, "w.SaveToFile(")
+	walletSave := strings.Index(src, "w.Save(")
 	if walletSave < 0 {
 		t.Fatalf("wallet save call gone? audit stale")
 	}
@@ -320,7 +320,7 @@ func TestW124_G20_WalletSaveBestEffort_BUG7(t *testing.T) {
 	if !strings.Contains(region, "Warning:") {
 		t.Fatalf("wallet save no longer warn-on-error — bug may be fixed; verify:\n%s", region)
 	}
-	t.Skip("BUG-7 (PARTIAL): cmd/blockbrew/main.go:1603 calls w.SaveToFile(\"\") " +
+	t.Skip("BUG-7 (PARTIAL): cmd/blockbrew/main.go:1603 calls w.Save() " +
 		"and warn-logs on error — shutdown proceeds and the DB closes even if the " +
 		"wallet write failed (ENOSPC, I/O error). Wallet.dat may be lost on next " +
 		"startup; operator must restore from seed. Fix: surface wallet save failures " +
