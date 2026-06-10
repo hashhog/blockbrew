@@ -97,8 +97,18 @@ func (m *Manager) walletDir(name string) string {
 	return filepath.Join(walletsDir, name)
 }
 
-// LoadWallet loads an existing wallet from disk.
+// LoadWallet loads an existing wallet from disk with an empty envelope
+// password (the default for wallets created without a passphrase).
 func (m *Manager) LoadWallet(name string, loadOnStartup *bool) (*Wallet, error) {
+	return m.LoadWalletWithPassphrase(name, "", loadOnStartup)
+}
+
+// LoadWalletWithPassphrase loads an existing wallet from disk, decrypting the
+// wallet file with the given envelope password. Wallets created with a
+// createwallet passphrase — or re-encrypted by encryptwallet — require their
+// passphrase here; loading them with "" fails with ErrInvalidPassword instead
+// of silently falling back to a weaker on-disk copy.
+func (m *Manager) LoadWalletWithPassphrase(name, passphrase string, loadOnStartup *bool) (*Wallet, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -132,7 +142,7 @@ func (m *Manager) LoadWallet(name string, loadOnStartup *bool) (*Wallet, error) 
 		AddressType: AddressTypeP2WPKH,
 	}
 
-	w, err := LoadFromFile(walletPath, "", config)
+	w, err := LoadFromFile(walletPath, passphrase, config)
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +151,11 @@ func (m *Manager) LoadWallet(name string, loadOnStartup *bool) (*Wallet, error) 
 	w.name = name
 
 	m.wallets[name] = w
+
+	// Manager-loaded wallets get the same save-on-mutation durability as the
+	// legacy default wallet (pre-fix they persisted only at unload/backup, so
+	// a SIGKILL lost every mutation since load).
+	w.StartAutoFlush(DefaultAutoFlushInterval)
 
 	// Update auto-load preference
 	if loadOnStartup != nil {
@@ -160,8 +175,12 @@ func (m *Manager) UnloadWallet(name string, loadOnStartup *bool) error {
 		return ErrWalletNotFound
 	}
 
-	// Save wallet state before unloading
-	if err := w.SaveToFile(""); err != nil {
+	// Stop the background flusher (does a final synchronous flush), then save
+	// once more under the wallet's CURRENT envelope password. Never a literal
+	// "": pre-fix this re-encrypted passphrase-protected wallets under the
+	// empty password on every unload, stripping the user's protection.
+	w.StopAutoFlush()
+	if err := w.Save(); err != nil {
 		// Log warning but continue with unload
 	}
 
@@ -220,6 +239,14 @@ func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, err
 
 	w := NewWallet(config)
 	w.name = name
+	// The createwallet passphrase is the wallet's envelope password from birth;
+	// every later save path (auto-flush, unload, backup) re-uses it via
+	// w.savePassword instead of a hardcoded "".
+	w.savePassword = opts.Passphrase
+	// Persist the watch-only flag (Core WALLET_FLAG_DISABLE_PRIVATE_KEYS):
+	// importprivkey / private-key descriptor imports are refused with -4 and
+	// getwalletinfo reports private_keys_enabled=false, also after reload.
+	w.disablePrivateKeys = opts.DisablePrivateKeys
 
 	// Initialize with keys unless blank wallet requested
 	if !opts.Blank && !opts.DisablePrivateKeys {
@@ -248,12 +275,16 @@ func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, err
 		}
 	}
 
-	// Save to disk
-	if err := w.SaveToFile(opts.Passphrase); err != nil {
+	// Save to disk (under the wallet's envelope password).
+	if err := w.Save(); err != nil {
 		return nil, err
 	}
 
 	m.wallets[name] = w
+
+	// Manager-created wallets get save-on-mutation durability immediately
+	// (pre-fix they persisted only at unload/backup).
+	w.StartAutoFlush(DefaultAutoFlushInterval)
 
 	// Update auto-load preference
 	if opts.LoadOnStartup != nil {
@@ -376,7 +407,8 @@ func (m *Manager) SaveAll() error {
 
 	var lastErr error
 	for _, w := range m.wallets {
-		if err := w.SaveToFile(""); err != nil {
+		// Each wallet saves under its OWN envelope password (never "").
+		if err := w.Save(); err != nil {
 			lastErr = err
 		}
 	}
@@ -393,8 +425,10 @@ func (m *Manager) BackupWallet(name, destination string) error {
 		return ErrWalletNotFound
 	}
 
-	// Ensure wallet is saved first
-	if err := w.SaveToFile(""); err != nil {
+	// Ensure wallet is saved first — under its CURRENT envelope password
+	// (a literal "" here used to strip the passphrase protection of the
+	// backed-up copy AND of the live wallet.dat itself).
+	if err := w.Save(); err != nil {
 		return err
 	}
 

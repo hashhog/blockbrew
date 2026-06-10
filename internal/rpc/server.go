@@ -714,6 +714,12 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleRescanBlockchain(params, walletName)
 	case "importprivkey":
 		return s.handleImportPrivKey(params, walletName)
+	// importdescriptors is Core's ONLY remaining watch-only import path
+	// (importaddress/importpubkey/importmulti are removed in v31.99 and stay
+	// -32601 here, Core-faithfully).
+	// Reference: bitcoin-core/src/wallet/rpc/backup.cpp::importdescriptors.
+	case "importdescriptors":
+		return s.handleImportDescriptors(params, walletName)
 	case "dumpprivkey":
 		return s.handleDumpPrivKey(params, walletName)
 	// Seed-words export (W161 BUG-15/17 funds-loss fix). Non-Core extension

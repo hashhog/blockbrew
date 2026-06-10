@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -1602,7 +1603,14 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// corrupt/partial primary file transparently recovers from wallet.dat.bak
 		// and never aborts startup.
 		loaded, loadErr := wallet.LoadFromFile(cfg.DataDir, "", walletCfg)
-		if loadErr != nil {
+		if errors.Is(loadErr, wallet.ErrInvalidPassword) {
+			// The on-disk wallet is passphrase-protected (encryptwallet's
+			// envelope). NEVER fall through to an empty in-memory wallet here:
+			// its auto-flush / shutdown save would OVERWRITE the protected
+			// file — the funds-loss path. Run without the legacy default
+			// wallet; the file stays untouched on disk.
+			log.Printf("ERROR: wallet at %s is passphrase-protected and cannot be opened with an empty password; leaving the file untouched and running WITHOUT the legacy default wallet", walletPath)
+		} else if loadErr != nil {
 			log.Printf("Warning: failed to load wallet from %s: %v (starting with empty wallet)", walletPath, loadErr)
 			w = wallet.NewWallet(walletCfg)
 		} else {
@@ -1956,7 +1964,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			// pending mutations) then force one more durable save so the clean
 			// shutdown is guaranteed persisted even if nothing was dirty.
 			w.StopAutoFlush()
-			if err := w.SaveToFile(""); err != nil {
+			// Save under the wallet's CURRENT envelope password (a literal ""
+			// here would strip the passphrase protection of an encrypted
+			// wallet on every clean shutdown).
+			if err := w.Save(); err != nil {
 				log.Printf("Warning: wallet save failed: %v", err)
 			} else {
 				log.Printf("Wallet saved")
@@ -2302,6 +2313,7 @@ func handleImportBlocks(args []string) {
 //  7. BUG-W102-06: base block must be on the best header chain.
 //  8. Deserialise coins with per-coin guards (BUG-W102-01..03) + EOF check (04).
 //  9. Recompute HASH_SERIALIZED and compare against table entry.
+//
 // 10. Flush, promote chainstate.
 //
 // Reference: bitcoin-core/src/validation.cpp ActivateSnapshot:5588,
