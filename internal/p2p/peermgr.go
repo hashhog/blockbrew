@@ -1962,6 +1962,26 @@ func (pm *PeerManager) makePeerConfig() PeerConfig {
 	}
 }
 
+// LocalServices returns the node's advertised service flags as reported by
+// getnetworkinfo (Core's `g_local_services`). It mirrors the bits seeded in
+// init.cpp:863 + 988-989 + 1950: NODE_NETWORK | NODE_WITNESS |
+// NODE_NETWORK_LIMITED, plus NODE_P2P_V2 when v2 transport is enabled and
+// NODE_COMPACT_FILTERS when the basic filter index is served. It deliberately
+// EXCLUDES NODE_BLOOM: in modern Core NODE_BLOOM is not part of g_local_services
+// — it is OR'd per-peer when the peer holds the BloomFilter permission
+// (net_processing.cpp:1613-1614) — so it does not appear in getnetworkinfo's
+// `localservices`. Kept in sync with makePeerConfig's `services` derivation.
+func (pm *PeerManager) LocalServices() uint64 {
+	services := uint64(ServiceNodeNetwork | ServiceNodeWitness | ServiceNodeNetworkLimited)
+	if pm.config.PreferV2 {
+		services |= ServiceNodeP2PV2
+	}
+	if pm.config.AdvertiseCompactFilters {
+		services |= ServiceNodeCompactFilters
+	}
+	return services
+}
+
 // wrapListeners wraps the configured listeners to add our own handlers.
 func (pm *PeerManager) wrapListeners() *PeerListeners {
 	listeners := &PeerListeners{}

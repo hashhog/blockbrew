@@ -786,14 +786,15 @@ func (s *Server) buildRESTBlockResult(block *wire.MsgBlock, hash wire.Hash256, i
 		cb := block.Transactions[0]
 		if len(cb.TxIn) > 0 {
 			vin0 := cb.TxIn[0]
-			cbMap := map[string]interface{}{
-				"version":  cb.Version,
-				"locktime": cb.LockTime,
-				"sequence": vin0.Sequence,
-				"coinbase": hex.EncodeToString(vin0.SignatureScript),
-			}
+			// Core coinbaseTxToJSON pushKV order (blockchain.cpp:185):
+			// version, locktime, sequence, coinbase, [witness] — NOT alphabetical.
+			cbMap := newOMap().
+				Set("version", cb.Version).
+				Set("locktime", cb.LockTime).
+				Set("sequence", vin0.Sequence).
+				Set("coinbase", hex.EncodeToString(vin0.SignatureScript))
 			if len(vin0.Witness) > 0 {
-				cbMap["witness"] = hex.EncodeToString(vin0.Witness[0])
+				cbMap.Set("witness", hex.EncodeToString(vin0.Witness[0]))
 			}
 			restCoinbaseTx = cbMap
 		}
