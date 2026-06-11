@@ -484,6 +484,81 @@ func TestPeerManagerMakePeerConfig(t *testing.T) {
 	}
 }
 
+// TestMakePeerConfigFullNodeServiceFlags verifies that a non-pruned full node
+// advertises the honest correct local service set: NODE_NETWORK |
+// NODE_WITNESS | NODE_NETWORK_LIMITED | NODE_P2P_V2 == 0xC09.
+//
+// NODE_NETWORK_LIMITED (BIP-159, 1<<10) must be advertised UNCONDITIONALLY,
+// NOT only in prune mode — Core init.cpp:863 seeds g_local_services with it on
+// every run. NODE_P2P_V2 (BIP-324, 1<<11) is advertised because v2 transport
+// runs by default (PreferV2 wired from cfg.BIP324V2, default ON), mirroring
+// Core init.cpp:988-989.
+func TestMakePeerConfigFullNodeServiceFlags(t *testing.T) {
+	config := PeerManagerConfig{
+		Network:     MainnetMagic,
+		ChainParams: consensus.MainnetParams(),
+		UserAgent:   "/blockbrew:0.1.0/",
+		// Non-pruned full node: NOT in prune mode.
+		AdvertiseNodeNetworkLimited: false,
+		// v2 transport enabled by default (cfg.BIP324V2 default true).
+		PreferV2: true,
+	}
+
+	pm := NewPeerManager(config)
+	cfg := pm.makePeerConfig()
+
+	const (
+		wantNetwork        = ServiceNodeNetwork        // 0x1
+		wantWitness        = ServiceNodeWitness        // 0x8
+		wantNetworkLimited = ServiceNodeNetworkLimited // 0x400
+		wantP2PV2          = ServiceNodeP2PV2          // 0x800
+	)
+	wantServices := wantNetwork | wantWitness | wantNetworkLimited | wantP2PV2 // 0xC09
+
+	if cfg.Services != wantServices {
+		t.Fatalf("full-node Services = 0x%X, want 0x%X (NODE_NETWORK|NODE_WITNESS|NODE_NETWORK_LIMITED|NODE_P2P_V2)",
+			cfg.Services, wantServices)
+	}
+
+	// Spell out each bit so a future regression names the exact dropped flag.
+	if cfg.Services&ServiceNodeNetwork == 0 {
+		t.Error("missing NODE_NETWORK (0x1)")
+	}
+	if cfg.Services&ServiceNodeWitness == 0 {
+		t.Error("missing NODE_WITNESS (0x8)")
+	}
+	if cfg.Services&ServiceNodeNetworkLimited == 0 {
+		t.Error("missing NODE_NETWORK_LIMITED (0x400) — must be set unconditionally for a full node, not gated on prune mode")
+	}
+	if cfg.Services&ServiceNodeP2PV2 == 0 {
+		t.Error("missing NODE_P2P_V2 (0x800) — v2 transport runs by default, so the bit must be advertised")
+	}
+
+	// And confirm NODE_NETWORK_LIMITED is present even without prune mode and
+	// even before any prune-mode signal — the regression this test guards
+	// against was gating the bit on AdvertiseNodeNetworkLimited (prune).
+	if config.AdvertiseNodeNetworkLimited {
+		t.Fatal("test setup error: AdvertiseNodeNetworkLimited should be false here")
+	}
+
+	// When v2 is disabled (-bip324v2=false), NODE_P2P_V2 must NOT be advertised
+	// (honest: do not claim a capability we are not running).
+	config.PreferV2 = false
+	pmNoV2 := NewPeerManager(config)
+	cfgNoV2 := pmNoV2.makePeerConfig()
+	if cfgNoV2.Services&ServiceNodeP2PV2 != 0 {
+		t.Errorf("NODE_P2P_V2 advertised with v2 disabled: Services = 0x%X", cfgNoV2.Services)
+	}
+	// NODE_NETWORK_LIMITED stays set regardless of v2.
+	if cfgNoV2.Services&ServiceNodeNetworkLimited == 0 {
+		t.Error("NODE_NETWORK_LIMITED dropped when v2 disabled — it must always be set for a full node")
+	}
+	wantNoV2 := wantNetwork | wantWitness | wantNetworkLimited // 0x409
+	if cfgNoV2.Services != wantNoV2 {
+		t.Errorf("v2-disabled Services = 0x%X, want 0x%X", cfgNoV2.Services, wantNoV2)
+	}
+}
+
 func TestPeerManagerWrapListeners(t *testing.T) {
 	var addrReceived bool
 	config := PeerManagerConfig{

@@ -142,13 +142,17 @@ type PeerManagerConfig struct {
 	// in this struct's zero value; main.go always sets it explicitly.
 	AdvertiseNodeBloom bool
 
-	// AdvertiseNodeNetworkLimited controls whether NODE_NETWORK_LIMITED
-	// (BIP-159, 1<<10) is OR'd into our advertised service bits in the
-	// version handshake.  Set when prune mode is enabled (-prune > 0).
-	// Mirrors Core's init.cpp: `nLocalServices |= NODE_NETWORK_LIMITED`
-	// when `IsPruneMode()` is true.  Peers seeing this bit know we serve
-	// only the most recent NODE_NETWORK_LIMITED_MIN_BLOCKS (288) blocks
-	// and must not request older blocks via getdata.
+	// AdvertiseNodeNetworkLimited records whether this node is running in
+	// prune mode (-prune > 0). NOTE: it does NOT gate the NODE_NETWORK_LIMITED
+	// (BIP-159, 1<<10) advertisement — that bit is set UNCONDITIONALLY for a
+	// full node in makePeerConfig, matching Core init.cpp:863 which seeds
+	// g_local_services with `NODE_NETWORK_LIMITED | NODE_WITNESS` on every run
+	// (prune and non-prune alike). NODE_NETWORK_LIMITED only asserts "I can
+	// serve at least the most recent 288 blocks", which is trivially true for a
+	// node serving the whole chain; the earlier "only when pruning" reading was
+	// wrong. This field is retained for callers that need to know prune mode is
+	// active (e.g. for the NODE_NETWORK distinction in future snapshot/IBD
+	// gating, per Core init.cpp:1947-1952).
 	AdvertiseNodeNetworkLimited bool
 
 	// AdvertiseCompactFilters controls whether NODE_COMPACT_FILTERS (BIP-157,
@@ -1910,16 +1914,27 @@ func (pm *PeerManager) makePeerConfig() PeerConfig {
 	// Advertising NODE_BLOOM tells peers we will honor BIP-35 "mempool"
 	// requests; main.go's OnMempool gate uses the same flag so the
 	// advertisement and the handler stay in sync.
-	services := uint64(ServiceNodeNetwork | ServiceNodeWitness)
+	// BIP-159 (NODE_NETWORK_LIMITED, 1<<10) is advertised UNCONDITIONALLY by a
+	// full node, NOT only in prune mode. Core's init.cpp:863 seeds
+	// g_local_services with `NODE_NETWORK_LIMITED | NODE_WITNESS` for every
+	// run, then OR's in NODE_NETWORK for non-prune (init.cpp:1950). A
+	// non-pruned full node therefore advertises NETWORK + NETWORK_LIMITED +
+	// WITNESS: NODE_NETWORK_LIMITED means "I can serve at least the most
+	// recent 288 blocks", which is trivially true for a node that serves the
+	// whole chain. The earlier code gated this bit on prune mode, which was
+	// backwards and dropped a flag Core always sets.
+	services := uint64(ServiceNodeNetwork | ServiceNodeWitness | ServiceNodeNetworkLimited)
 	if pm.config.AdvertiseNodeBloom {
 		services |= ServiceNodeBloom
 	}
-	// BIP-159: signal limited-archive serving when prune mode is enabled.
-	// Core advertises NODE_NETWORK alongside NODE_NETWORK_LIMITED in the
-	// auto-prune case (the node still has the recent-288 archive), so we
-	// keep NODE_NETWORK set as well.
-	if pm.config.AdvertiseNodeNetworkLimited {
-		services |= ServiceNodeNetworkLimited
+	// BIP-324 (NODE_P2P_V2, 1<<11): signal v2 encrypted-transport support when
+	// the v2 transport is enabled. PreferV2 is wired from cfg.BIP324V2 (default
+	// ON), and when set blockbrew genuinely negotiates BIP-324 v2 on both
+	// outbound and inbound connections (with v1 fall-through), so the
+	// advertisement is honest. Mirrors Core init.cpp:988-989, which OR's
+	// NODE_P2P_V2 when `-v2transport` (DEFAULT_V2_TRANSPORT = true) is on.
+	if pm.config.PreferV2 {
+		services |= ServiceNodeP2PV2
 	}
 	// BIP-157: signal compact filter serving when the blockfilterindex is
 	// enabled, mirroring Core's net_processing.cpp handling where
