@@ -2743,6 +2743,18 @@ func (sm *SyncManager) IsIBDActive() bool {
 	return sm.ibdActive.Load()
 }
 
+// RefreshIBDStatus re-evaluates the IBD latch from outside the P2P sync loop.
+// Core calls ChainstateManager::UpdateIBDStatus() in ConnectTip on EVERY block
+// connect, regardless of whether the block arrived via P2P or submitblock; the
+// blockbrew sync loop only calls updateIBDStatus on the block-download drain
+// path, so a chain advanced purely via submitblock (e.g. a miner or the
+// byte-diff harness mirroring Core) would never leave IBD. This exported wrapper
+// lets the submitblock handler trigger the same recheck after a successful
+// connect. No-op once the latch has flipped to false (updateIBDStatus is sticky).
+func (sm *SyncManager) RefreshIBDStatus() {
+	sm.updateIBDStatus()
+}
+
 // updateIBDStatus checks whether IBD should be considered complete and, if so,
 // latches ibdActive to false.  It is the Go equivalent of Bitcoin Core's
 // ChainstateManager::UpdateIBDStatus() in validation.cpp.
@@ -2778,6 +2790,27 @@ func (sm *SyncManager) updateIBDStatus() {
 		if sm.ibdActive.CompareAndSwap(true, false) {
 			log.Printf("sync: leaving InitialBlockDownload (tip age %v, height %d)",
 				time.Since(tipTime).Round(time.Second), tipHeight)
+		}
+		return
+	}
+
+	// Regtest parity: Core's IsTipRecent reads Now<NodeSeconds>(), which honors
+	// -mocktime. Regtest chains are mined under a pinned mocktime (e.g.
+	// 1700000000), so Core sees the freshly-mined tip as recent and latches
+	// m_cached_is_ibd=false even though the block timestamp is years behind real
+	// wall-clock. blockbrew has no mock clock, so the wall-clock gate above never
+	// fires on a mocktime regtest chain. We match Core's effective regtest
+	// outcome WITHOUT a mock clock: a regtest node whose connected block tip has
+	// caught up to its best-header tip (nothing left to download) and whose
+	// chainwork meets the bar (regtest MinimumChainWork == 0) is fully synced, so
+	// it is not in IBD. Scoped to regtest ONLY — mainnet/testnet keep the exact
+	// Core wall-clock tip-age gate above, and their large MinimumChainWork keeps a
+	// genuinely-behind node in IBD via the header-sync work check.
+	if sm.chainParams != nil && sm.chainParams.Name == "regtest" &&
+		sm.headerIndex != nil && tipHeight == sm.headerIndex.BestHeight() {
+		if sm.ibdActive.CompareAndSwap(true, false) {
+			log.Printf("sync: leaving InitialBlockDownload (regtest tip caught up to headers, height %d)",
+				tipHeight)
 		}
 	}
 }

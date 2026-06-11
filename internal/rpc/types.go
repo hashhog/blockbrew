@@ -83,20 +83,20 @@ type SyncStateResult struct {
 
 // BlockchainInfo represents the result of getblockchaininfo.
 type BlockchainInfo struct {
-	Chain                string  `json:"chain"`
-	Blocks               int32   `json:"blocks"`
-	Headers              int32   `json:"headers"`
-	BestBlockHash        string  `json:"bestblockhash"`
-	Bits                 string  `json:"bits"`
-	Target               string  `json:"target"`
-	Difficulty           float64 `json:"difficulty"`
-	Time                 uint32  `json:"time"`
-	MedianTime           int64   `json:"mediantime"`
-	VerificationProgress float64 `json:"verificationprogress"`
-	InitialBlockDownload bool    `json:"initialblockdownload"`
-	ChainWork            string  `json:"chainwork"`
-	SizeOnDisk           int64   `json:"size_on_disk"`
-	Pruned               bool    `json:"pruned"`
+	Chain                string            `json:"chain"`
+	Blocks               int32             `json:"blocks"`
+	Headers              int32             `json:"headers"`
+	BestBlockHash        string            `json:"bestblockhash"`
+	Bits                 string            `json:"bits"`
+	Target               string            `json:"target"`
+	Difficulty           BitcoinDifficulty `json:"difficulty"`
+	Time                 uint32            `json:"time"`
+	MedianTime           int64             `json:"mediantime"`
+	VerificationProgress float64           `json:"verificationprogress"`
+	InitialBlockDownload bool              `json:"initialblockdownload"`
+	ChainWork            string            `json:"chainwork"`
+	SizeOnDisk           int64             `json:"size_on_disk"`
+	Pruned               bool              `json:"pruned"`
 	// PruneHeight is the lowest-height block whose body is still on disk.
 	// Only emitted when pruned=true; matches Bitcoin Core's
 	// rpc/blockchain.cpp getblockchaininfo behavior. omitempty so archive
@@ -111,24 +111,31 @@ type BlockchainInfo struct {
 	// MiB — Core converts MiB to bytes here). Only emitted when
 	// automatic_pruning=true. omitempty otherwise.
 	PruneTargetSize uint64 `json:"prune_target_size,omitempty"`
-	// Softforks mirrors getdeploymentinfo.deployments: both RPCs read from the
-	// same buildDeploymentMap helper so their data is always consistent.
-	Softforks map[string]DeploymentEntry `json:"softforks"`
-	Warnings  string                     `json:"warnings"`
+	// Warnings is an ARRAY of strings in Core v31.99 (node::GetWarningsForRpc
+	// returns a UniValue array; rpc/blockchain.cpp:1499). blockbrew previously
+	// emitted a bare string. NOTE: softforks was REMOVED from getblockchaininfo
+	// in Core v31.99 — it now lives ONLY in getdeploymentinfo
+	// (blockchain.cpp:1499 getdeploymentinfo helper), so getblockchaininfo emits
+	// no softforks key.
+	Warnings []string `json:"warnings"`
 }
 
 // BlockResult represents a block in RPC responses.
+//
+// Field order mirrors Bitcoin Core's blockToJSON / blockheaderToJSON pushKV
+// order (rpc/blockchain.cpp:154,202) EXACTLY, because the byte-diff harness
+// checks field-emission order: hash, confirmations, height, version,
+// versionHex, merkleroot, time, mediantime, nonce, bits, target, difficulty,
+// chainwork, nTx, previousblockhash, nextblockhash, then the block-only tail
+// strippedsize, size, weight, coinbase_tx, tx. Go marshals struct fields in
+// declaration order, so the declaration order IS the wire order.
 type BlockResult struct {
 	Hash          string            `json:"hash"`
 	Confirmations int32             `json:"confirmations"`
-	Size          int               `json:"size"`
-	StrippedSize  int               `json:"strippedsize"`
-	Weight        int               `json:"weight"`
 	Height        int32             `json:"height"`
 	Version       int32             `json:"version"`
 	VersionHex    string            `json:"versionHex"`
 	MerkleRoot    string            `json:"merkleroot"`
-	Tx            []interface{}     `json:"tx"`
 	Time          uint32            `json:"time"`
 	MedianTime    int64             `json:"mediantime"`
 	Nonce         uint32            `json:"nonce"`
@@ -139,7 +146,12 @@ type BlockResult struct {
 	NTx           int               `json:"nTx"`
 	PreviousHash  string            `json:"previousblockhash,omitempty"`
 	NextHash      string            `json:"nextblockhash,omitempty"`
-	CoinbaseTx    interface{}       `json:"coinbase_tx,omitempty"`
+	// Block-only tail (blockToJSON adds these after the header fields).
+	StrippedSize int           `json:"strippedsize"`
+	Size         int           `json:"size"`
+	Weight       int           `json:"weight"`
+	CoinbaseTx   interface{}   `json:"coinbase_tx,omitempty"`
+	Tx           []interface{} `json:"tx"`
 }
 
 // BitcoinDifficulty is a float64 that serialises to JSON using 16
@@ -238,6 +250,13 @@ type MempoolInfo struct {
 	IncrementalRelayFee float64 `json:"incrementalrelayfee"`
 	UnbroadcastCount    int     `json:"unbroadcastcount"`
 	FullRBF             bool    `json:"fullrbf"`
+	// Core v31.99 added five fields after fullrbf (rpc/mempool.cpp:1059-1063,
+	// MempoolInfoToJSON pushKV order). Emitted in Core's order, after fullrbf.
+	PermitBareMultisig bool  `json:"permitbaremultisig"`
+	MaxDataCarrierSize int64 `json:"maxdatacarriersize"`
+	LimitClusterCount  int64 `json:"limitclustercount"`
+	LimitClusterSize   int64 `json:"limitclustersize"`
+	Optimal            bool  `json:"optimal"`
 }
 
 // MempoolEntry represents a mempool entry (verbose getrawmempool).
@@ -330,7 +349,9 @@ type NetworkInfo struct {
 	RelayFee           float64        `json:"relayfee"`
 	IncrementalFee     float64        `json:"incrementalfee"`
 	LocalAddresses     []interface{}  `json:"localaddresses"`
-	Warnings           string         `json:"warnings"`
+	// Warnings is an ARRAY of strings in Core v31.99 (node::GetWarningsForRpc;
+	// rpc/net.cpp). blockbrew previously emitted a bare string.
+	Warnings []string `json:"warnings"`
 }
 
 // NetworkEntry represents a network in getnetworkinfo.
@@ -467,23 +488,24 @@ type TxOutResult struct {
 // MiningInfo represents the result of getmininginfo.
 // MiningInfoNext is the "next" sub-object in getmininginfo (Core 31.99).
 type MiningInfoNext struct {
-	Height     int32   `json:"height"`
-	Bits       string  `json:"bits"`
-	Difficulty float64 `json:"difficulty"`
-	Target     string  `json:"target"`
+	Height     int32             `json:"height"`
+	Bits       string            `json:"bits"`
+	Difficulty BitcoinDifficulty `json:"difficulty"`
+	Target     string            `json:"target"`
 }
 
 type MiningInfo struct {
-	Blocks        int32          `json:"blocks"`
-	Bits          string         `json:"bits"`
-	Difficulty    float64        `json:"difficulty"`
-	Target        string         `json:"target"`
-	NetworkHash   float64        `json:"networkhashps"`
-	PooledTx      int            `json:"pooledtx"`
-	BlockMinTxFee float64        `json:"blockmintxfee"`
-	Chain         string         `json:"chain"`
-	Next          MiningInfoNext `json:"next"`
-	Warnings      string         `json:"warnings"`
+	Blocks        int32             `json:"blocks"`
+	Bits          string            `json:"bits"`
+	Difficulty    BitcoinDifficulty `json:"difficulty"`
+	Target        string            `json:"target"`
+	NetworkHash   float64           `json:"networkhashps"`
+	PooledTx      int               `json:"pooledtx"`
+	BlockMinTxFee float64           `json:"blockmintxfee"`
+	Chain         string            `json:"chain"`
+	Next          MiningInfoNext    `json:"next"`
+	// Warnings is an ARRAY of strings in Core v31.99 (rpc/mining.cpp:494).
+	Warnings []string `json:"warnings"`
 }
 
 // DecodeScriptResult represents the result of decodescript.

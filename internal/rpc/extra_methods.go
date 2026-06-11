@@ -81,15 +81,16 @@ func (s *Server) handleGetTxOut(params json.RawMessage) (interface{}, *RPCError)
 	// (core_io.cpp:409): full {asm, desc, hex, address?, type} shape.
 	spkMap := scriptPubKeyToUniv(utxo.PkScript, s.getNetwork())
 
-	// Return Core-compatible shape. Value uses btcAmount for 8 fixed decimal
-	// places ("0.03600000" not "0.036"), mirroring Core's ValueFromAmount.
-	return map[string]any{
-		"bestblock":     bestHash.String(),
-		"confirmations": confs,
-		"value":         btcAmount(utxo.Amount),
-		"scriptPubKey":  spkMap,
-		"coinbase":      utxo.IsCoinbase,
-	}, nil
+	// Return Core-compatible shape in Core's pushKV order (blockchain.cpp:1245):
+	// bestblock, confirmations, value, scriptPubKey, coinbase — NOT alphabetical.
+	// Value uses btcAmount for 8 fixed decimal places ("0.03600000" not "0.036"),
+	// mirroring Core's ValueFromAmount.
+	return newOMap().
+		Set("bestblock", bestHash.String()).
+		Set("confirmations", confs).
+		Set("value", btcAmount(utxo.Amount)).
+		Set("scriptPubKey", spkMap).
+		Set("coinbase", utxo.IsCoinbase), nil
 }
 
 // ============================================================================
@@ -474,7 +475,7 @@ func (s *Server) handleDecodeScript(params json.RawMessage) (interface{}, *RPCEr
 	// Build top-level object using W52 helper (include_hex=false per Core's
 	// ScriptToUniv call in decodescript: include_hex=false, include_address=true).
 	r := scriptPubKeyToUniv(scriptBytes, net)
-	delete(r, "hex") // top-level decodescript never emits hex (Core: include_hex=false)
+	r.Delete("hex") // top-level decodescript never emits hex (Core: include_hex=false)
 
 	// ── can_wrap logic (mirrors Core rawtransaction.cpp:498-527) ─────────────
 	// can_wrap is true for PUBKEY/PUBKEYHASH/MULTISIG/NONSTANDARD/
@@ -494,7 +495,7 @@ func (s *Server) handleDecodeScript(params json.RawMessage) (interface{}, *RPCEr
 		// p2sh = P2SH-wrap of the input script: Hash160(script) → P2SH address.
 		h160 := bbcrypto.Hash160(scriptBytes)
 		p2shAddr, _ := address.NewP2SHAddress(h160, net).Encode()
-		r["p2sh"] = p2shAddr
+		r.Set("p2sh", p2shAddr)
 
 		// ── can_wrap_P2WSH (Core rawtransaction.cpp:533-560) ─────────────────
 		// P2WSH wrap is only possible for non-witness types with compressed keys.
@@ -545,9 +546,9 @@ func (s *Server) handleDecodeScript(params json.RawMessage) (interface{}, *RPCEr
 			// p2sh-segwit = P2SH-wrap of the segwit script.
 			sh160 := bbcrypto.Hash160(segwitScript)
 			p2shSegwitAddr, _ := address.NewP2SHAddress(sh160, net).Encode()
-			sr["p2sh-segwit"] = p2shSegwitAddr
+			sr.Set("p2sh-segwit", p2shSegwitAddr)
 
-			r["segwit"] = sr
+			r.Set("segwit", sr)
 		}
 	}
 
@@ -696,20 +697,22 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 	next := MiningInfoNext{
 		Height:     tipHeight + 1,
 		Bits:       tipBitsHex,
-		Difficulty: difficulty,
+		Difficulty: BitcoinDifficulty(difficulty),
 		Target:     tipTargetHex,
 	}
 
 	return &MiningInfo{
 		Blocks:        tipHeight,
 		Bits:          tipBitsHex,
-		Difficulty:    difficulty,
+		Difficulty:    BitcoinDifficulty(difficulty),
 		Target:        tipTargetHex,
 		PooledTx:      pooledTx,
-		BlockMinTxFee: 0.00001,
+		// Core's DEFAULT_BLOCK_MIN_TX_FEE (policy.h) is 1 sat/kvB =
+		// 0.00000001 BTC/kvB (1e-08), the block-assembler's minimum fee floor.
+		BlockMinTxFee: 0.00000001,
 		Chain:         s.rpcChainName(),
 		Next:          next,
-		Warnings:      "",
+		Warnings:      []string{},
 	}, nil
 }
 

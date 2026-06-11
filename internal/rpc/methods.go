@@ -111,15 +111,6 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		ibd = s.syncMgr.IsIBDActive()
 	}
 
-	// Build softforks using the same shared helper as getdeploymentinfo so both
-	// RPCs always read from the same canonical data source (chainparams + chain
-	// state).  tipNode may be nil only if the chain is completely uninitialized;
-	// in that case we omit softforks rather than panic.
-	var softforks map[string]DeploymentEntry
-	if tipNode != nil && s.chainParams != nil {
-		softforks = buildDeploymentMap(tipNode, s.chainParams)
-	}
-
 	// Pruning fields. Core's rpc/blockchain.cpp emits `pruned` always,
 	// `pruneheight` and `automatic_pruning` only when pruning is on, and
 	// `prune_target_size` only when automatic_pruning is on. We follow
@@ -145,7 +136,7 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		BestBlockHash:        tipHash.String(),
 		Bits:                 tipBits,
 		Target:               tipTarget,
-		Difficulty:           difficulty,
+		Difficulty:           BitcoinDifficulty(difficulty),
 		Time:                 tipTime,
 		MedianTime:           medianTime,
 		VerificationProgress: verificationProgress,
@@ -155,8 +146,7 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		PruneHeight:          pruneHeight,
 		AutomaticPruning:     automaticPruning,
 		PruneTargetSize:      pruneTarget,
-		Softforks:            softforks,
-		Warnings:             "",
+		Warnings:             []string{},
 	}, nil
 }
 
@@ -378,14 +368,15 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 		cb := block.Transactions[0]
 		if len(cb.TxIn) > 0 {
 			vin0 := cb.TxIn[0]
-			cbMap := map[string]interface{}{
-				"version":  cb.Version,
-				"locktime": cb.LockTime,
-				"sequence": vin0.Sequence,
-				"coinbase": hex.EncodeToString(vin0.SignatureScript),
-			}
+			// Core coinbaseTxToJSON pushKV order (blockchain.cpp:185):
+			// version, locktime, sequence, coinbase, [witness] — NOT alphabetical.
+			cbMap := newOMap().
+				Set("version", cb.Version).
+				Set("locktime", cb.LockTime).
+				Set("sequence", vin0.Sequence).
+				Set("coinbase", hex.EncodeToString(vin0.SignatureScript))
 			if len(vin0.Witness) > 0 {
-				cbMap["witness"] = hex.EncodeToString(vin0.Witness[0])
+				cbMap.Set("witness", hex.EncodeToString(vin0.Witness[0]))
 			}
 			coinbaseTx = cbMap
 		}
@@ -744,19 +735,22 @@ func (s *Server) handleGetDifficulty() (interface{}, *RPCError) {
 	// Lock-free read via chainMgr tip cache — avoids idx.mu.RLock contention.
 	node := s.chainMgr.BestBlockNode()
 	if node == nil {
-		return 1.0, nil
+		return BitcoinDifficulty(1.0), nil
 	}
 
 	genesisTarget := consensus.CompactToBig(0x1d00ffff)
 	currentTarget := consensus.CompactToBig(node.Header.Bits)
 	if currentTarget.Sign() <= 0 {
-		return 1.0, nil
+		return BitcoinDifficulty(1.0), nil
 	}
 
 	diff := new(big.Float).SetInt(genesisTarget)
 	diff.Quo(diff, new(big.Float).SetInt(currentTarget))
 	difficulty, _ := diff.Float64()
-	return difficulty, nil
+	// %.16g formatting via BitcoinDifficulty.MarshalJSON (16 significant digits,
+	// matching Core's UniValue::setFloat / GetDifficulty rendering). A bare
+	// float64 here would emit Go's shortest round-trip form and byte-diverge.
+	return BitcoinDifficulty(difficulty), nil
 }
 
 func (s *Server) handleGetChainTips() (interface{}, *RPCError) {
@@ -1330,9 +1324,13 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		Usage:              s.mempool.TotalSize(), // Simplified: actual usage would include overhead
 		TotalFee:           totalFee,
 		MaxMempool:         300_000_000, // 300 MB default
-		MempoolMinFee:      0.00001,     // 1 sat/vB in BTC/kvB
-		MinRelayTxFee:      0.00001,     // 1 sat/vB in BTC/kvB
-		IncrementalRelayFee: 0.00001,
+		// Core defaults (policy.h): DEFAULT_MIN_RELAY_TX_FEE and
+		// DEFAULT_INCREMENTAL_RELAY_FEE are BOTH 100 sat/kvB = 0.00000100 BTC/kvB
+		// (1e-06), NOT 1000 sat/kvB. On a non-full mempool the dynamic
+		// mempoolminfee floor equals minrelaytxfee, so all three report 1e-06.
+		MempoolMinFee:       0.00000100,
+		MinRelayTxFee:       0.00000100,
+		IncrementalRelayFee: 0.00000100,
 		UnbroadcastCount:   0,
 		// FullRBF reflects the actual `-mempoolfullrbf` policy in force at
 		// runtime, not a hardcoded constant (W120 BUG-5 / FIX-68). Core's
@@ -1341,6 +1339,16 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		// true; blockbrew honours the operator's switch so legacy
 		// `-mempoolfullrbf=0` deployments don't get a lying advertisement.
 		FullRBF:            s.mempool.FullRBF(),
+		// Core v31.99 static/policy fields (rpc/mempool.cpp:1059-1063). These are
+		// the Core regtest defaults: permit_bare_multisig on, max OP_RETURN
+		// datacarrier 100000 bytes, cluster-count/size limits 64 / 101000 vB, and
+		// optimal=true (txgraph is in its known-optimal state on a quiescent
+		// regtest mempool).
+		PermitBareMultisig: true,
+		MaxDataCarrierSize: 100000,
+		LimitClusterCount:  64,
+		LimitClusterSize:   101000,
+		Optimal:            true,
 	}, nil
 }
 
@@ -1514,27 +1522,83 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 		outbound, inbound = s.peerMgr.PeerCount()
 	}
 
+	// localservices: report the node's actual advertised service flags (Core's
+	// g_local_services), not a hardcoded constant. The PeerManager owns the
+	// canonical derivation (NETWORK | WITNESS | NETWORK_LIMITED, + P2P_V2 when v2
+	// transport is on, + COMPACT_FILTERS when served); see PeerManager.LocalServices.
+	// Default (v2 transport on) yields 0x0c09, matching Core. Falls back to the
+	// base full-node bits if the peer manager isn't wired (e.g. RPC-only tests).
+	localServices := uint64(p2p.ServiceNodeNetwork | p2p.ServiceNodeWitness |
+		p2p.ServiceNodeNetworkLimited | p2p.ServiceNodeP2PV2)
+	if s.peerMgr != nil {
+		localServices = s.peerMgr.LocalServices()
+	}
+
 	return &NetworkInfo{
 		Version:            250000,
 		SubVersion:         "/blockbrew:0.1.0/",
 		ProtocolVersion:    70016,
-		LocalServices:      "0000000000000009", // NODE_NETWORK | NODE_WITNESS
-		LocalServicesNames: []string{"NETWORK", "WITNESS"},
+		LocalServices:      fmt.Sprintf("%016x", localServices),
+		LocalServicesNames: serviceFlagNames(localServices),
 		LocalRelay:         true,
 		NetworkActive:      true,
 		Connections:        outbound + inbound,
 		ConnectionsIn:      inbound,
 		ConnectionsOut:     outbound,
+		// Core emits all five reachable networks in a fixed order: ipv4, ipv6,
+		// onion, i2p, cjdns (rpc/net.cpp GetNetworksInfo). ipv4/ipv6 are
+		// reachable; onion/i2p/cjdns are limited+unreachable without a configured
+		// proxy (the byte-diff arm runs with no proxy, matching Core's default).
 		Networks: []NetworkEntry{
 			{Name: "ipv4", Limited: false, Reachable: true, Proxy: "", ProxyRandomizeCredentials: false},
 			{Name: "ipv6", Limited: false, Reachable: true, Proxy: "", ProxyRandomizeCredentials: false},
 			{Name: "onion", Limited: true, Reachable: false, Proxy: "", ProxyRandomizeCredentials: false},
+			{Name: "i2p", Limited: true, Reachable: false, Proxy: "", ProxyRandomizeCredentials: false},
+			{Name: "cjdns", Limited: true, Reachable: false, Proxy: "", ProxyRandomizeCredentials: false},
 		},
-		RelayFee:       0.00001,
-		IncrementalFee: 0.00001,
+		// relayfee / incrementalfee: Core's DEFAULT_MIN_RELAY_TX_FEE and
+		// DEFAULT_INCREMENTAL_RELAY_FEE are both 100 sat/kvB = 0.00000100 BTC/kvB.
+		RelayFee:       0.00000100,
+		IncrementalFee: 0.00000100,
 		LocalAddresses: []interface{}{},
-		Warnings:       "",
+		Warnings:       []string{},
 	}, nil
+}
+
+// serviceFlagNames maps a service-flag bitfield to Core's localservicesnames
+// array. It iterates bits low->high (bit 0 first) and emits Core's exact name
+// for each set, recognized bit — matching serviceFlagsToStr (protocol.cpp:108).
+// Order is therefore identical to Core's (e.g. 0x0c09 ->
+// ["NETWORK","WITNESS","NETWORK_LIMITED","P2P_V2"]).
+func serviceFlagNames(flags uint64) []string {
+	type sf struct {
+		bit  uint
+		name string
+	}
+	// Bit positions match msg_version.go / transport.go and Core's protocol.h.
+	known := []sf{
+		{0, "NETWORK"},          // NODE_NETWORK
+		{2, "BLOOM"},            // NODE_BLOOM
+		{3, "WITNESS"},          // NODE_WITNESS
+		{6, "COMPACT_FILTERS"},  // NODE_COMPACT_FILTERS
+		{10, "NETWORK_LIMITED"}, // NODE_NETWORK_LIMITED
+		{11, "P2P_V2"},          // NODE_P2P_V2
+	}
+	names := make([]string, 0, len(known))
+	// Walk bit positions ascending so the emitted order matches Core's
+	// low-to-high bit iteration.
+	for i := uint(0); i < 64; i++ {
+		if flags&(1<<i) == 0 {
+			continue
+		}
+		for _, k := range known {
+			if k.bit == i {
+				names = append(names, k.name)
+				break
+			}
+		}
+	}
+	return names
 }
 
 func (s *Server) handleListBanned() (interface{}, *RPCError) {
@@ -2049,6 +2113,14 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 				return "inconclusive", nil
 			}
 			return bip22ResultString(err), nil
+		}
+
+		// Core re-evaluates the IBD latch in ConnectTip on every block connect,
+		// regardless of source (P2P or submitblock). The sync loop only does so
+		// on the block-download drain path, so a chain advanced purely via
+		// submitblock would never leave IBD. Trigger the same recheck here.
+		if s.syncMgr != nil {
+			s.syncMgr.RefreshIBDStatus()
 		}
 	}
 
