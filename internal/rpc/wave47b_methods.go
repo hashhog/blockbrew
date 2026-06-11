@@ -126,16 +126,17 @@ func (s *Server) handleGetTxOutSetInfo(params json.RawMessage) (interface{}, *RP
 		// total_unspendable_amount + block_info; we emit the subset the class
 		// actually tracks (height, bestblock, txouts, bogosize, total_amount,
 		// and the muhash digest).
-		ret := map[string]interface{}{
-			"height":       height,
-			"bestblock":    stats.BlockHash.String(),
-			"txouts":       stats.UTXOCount,
-			"bogosize":     stats.BogoSize,
-			"total_amount": btcAmount(stats.TotalAmount),
-		}
+		// Core order (index path, blockchain.cpp:1115): height, bestblock,
+		// txouts, bogosize, [muhash], total_amount — muhash before total_amount.
+		ret := newOMap().
+			Set("height", height).
+			Set("bestblock", stats.BlockHash.String()).
+			Set("txouts", stats.UTXOCount).
+			Set("bogosize", stats.BogoSize)
 		if hashType == "muhash" {
-			ret["muhash"] = stats.HashSerialized.String()
+			ret.Set("muhash", stats.HashSerialized.String())
 		}
+		ret.Set("total_amount", btcAmount(stats.TotalAmount))
 		return ret, nil
 	}
 
@@ -152,25 +153,36 @@ func (s *Server) handleGetTxOutSetInfo(params json.RawMessage) (interface{}, *RP
 		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to read UTXO set"}
 	}
 
-	// disk_size: impl-specific estimate. Bogosize bytes are a reasonable
-	// database-independent proxy; Core uses CoinsDB::EstimateSize().
-	diskSize := info.BogoSize
+	// disk_size: Core fills this from CCoinsViewDB::EstimateSize(), the LevelDB
+	// estimated on-disk byte count of the coins database. That value is storage-
+	// engine-specific and non-deterministic (it depends on flush/compaction
+	// state) — on a freshly-mined regtest chain whose coins are still in the
+	// in-memory cache (unflushed) Core's EstimateSize() returns 0. blockbrew's
+	// from-scratch UTXO store has no comparable LevelDB-estimate and cannot
+	// reproduce Core's number byte-for-byte, so (matching the cross-impl
+	// convention — rustoshi server.rs:10384, clearbit rpc.zig:16349 both emit 0)
+	// we report disk_size as 0 rather than a non-portable proxy (it was bogosize,
+	// which spuriously diverged from Core's 0).
+	diskSize := uint64(0)
 
-	ret := map[string]interface{}{
-		"height":       tipHeight,
-		"bestblock":    tipHash.String(),
-		"txouts":       info.TxOuts,
-		"bogosize":     info.BogoSize,
-		"transactions": info.Transactions,
-		"disk_size":    diskSize,
-		"total_amount": btcAmount(info.TotalAmount),
-	}
+	// Emit in Core's gettxoutsetinfo pushKV order (blockchain.cpp:1115):
+	// height, bestblock, txouts, bogosize, [hash_serialized_3|muhash],
+	// total_amount, transactions, disk_size — the hash digest is pushed BEFORE
+	// total_amount, NOT last. Go map order (alphabetical) diverges, so use omap.
+	ret := newOMap().
+		Set("height", tipHeight).
+		Set("bestblock", tipHash.String()).
+		Set("txouts", info.TxOuts).
+		Set("bogosize", info.BogoSize)
 	switch hashType {
 	case "hash_serialized_3":
-		ret["hash_serialized_3"] = info.HashSerialized3.String()
+		ret.Set("hash_serialized_3", info.HashSerialized3.String())
 	case "muhash":
-		ret["muhash"] = info.MuHash.String()
+		ret.Set("muhash", info.MuHash.String())
 	}
+	ret.Set("total_amount", btcAmount(info.TotalAmount)).
+		Set("transactions", info.Transactions).
+		Set("disk_size", diskSize)
 	return ret, nil
 }
 

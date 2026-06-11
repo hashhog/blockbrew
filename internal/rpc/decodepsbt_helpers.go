@@ -463,30 +463,32 @@ func inferDescriptor(s []byte, net address.Network) string {
 // Core's ScriptToUniv (core_io.cpp:409). Always emits {asm, desc, hex, type};
 // emits `address` only when extractable and type is not "pubkey" (Core skips
 // address for bare-pubkey outputs).
-func scriptPubKeyToUniv(s []byte, net address.Network) map[string]any {
-	out := map[string]any{
-		"asm":  scriptToAsmStr(s, false),
-		"desc": inferDescriptor(s, net),
-		"hex":  hex.EncodeToString(s),
-		"type": scriptTypeName(s),
-	}
-	// Suppress address for bare-pubkey outputs (matches Core's ScriptToUniv
-	// which only emits address when type != PUBKEY).
+func scriptPubKeyToUniv(s []byte, net address.Network) *omap {
+	// Emit in Core's ScriptToUniv pushKV order (core_io.cpp:409):
+	// asm, desc, hex, [address], type — NOT alphabetical (Go map order). The
+	// byte-diff harness checks field-emission order, so this must match Core.
+	out := newOMap()
+	out.Set("asm", scriptToAsmStr(s, false))
+	out.Set("desc", inferDescriptor(s, net))
+	out.Set("hex", hex.EncodeToString(s))
+	// address is pushed BEFORE type, and suppressed for bare-pubkey outputs
+	// (matches Core's ScriptToUniv which only emits address when type != PUBKEY).
 	if scriptTypeName(s) != "pubkey" {
 		if addr, ok := extractAddressFromScript(s, net); ok {
-			out["address"] = addr
+			out.Set("address", addr)
 		}
 	}
+	out.Set("type", scriptTypeName(s))
 	return out
 }
 
 // scriptSigToUniv builds the JSON map for a scriptSig, always emitting
 // {asm, hex} even when the script is empty (PSBT unsigned tx convention).
-func scriptSigToUniv(s []byte, attemptSighashDecode bool) map[string]any {
-	return map[string]any{
-		"asm": scriptToAsmStr(s, attemptSighashDecode),
-		"hex": hex.EncodeToString(s),
-	}
+func scriptSigToUniv(s []byte, attemptSighashDecode bool) *omap {
+	// Core (core_io.cpp:460): pushKV("asm"), pushKV("hex") — in that order.
+	return newOMap().
+		Set("asm", scriptToAsmStr(s, attemptSighashDecode)).
+		Set("hex", hex.EncodeToString(s))
 }
 
 // buildDecodeRawTxJSON builds the JSON result for decoderawtransaction,
@@ -499,7 +501,7 @@ func scriptSigToUniv(s []byte, attemptSighashDecode bool) map[string]any {
 //   - Non-coinbase input: emit {txid, vout, scriptSig, sequence, txinwitness?}
 //   - No `hex` field (Core omits it from decoderawtransaction output)
 //   - vout.value uses btcAmount (8 fixed decimal places)
-func buildDecodeRawTxJSON(tx *wire.MsgTx, net address.Network) map[string]any {
+func buildDecodeRawTxJSON(tx *wire.MsgTx, net address.Network) *omap {
 	// Serialize for size/weight
 	var buf bytes.Buffer
 	tx.Serialize(&buf)
@@ -508,58 +510,54 @@ func buildDecodeRawTxJSON(tx *wire.MsgTx, net address.Network) map[string]any {
 	weight := int(consensus.CalcTxWeight(tx))
 	vsize := (weight + 3) / 4
 
-	// vin array
-	vin := make([]map[string]any, len(tx.TxIn))
+	// vin array — built as *omap in Core's pushKV order (core_io.cpp:451).
+	vin := make([]*omap, len(tx.TxIn))
 	for i, in := range tx.TxIn {
 		// Coinbase detection: null outpoint (all-zero hash + 0xFFFFFFFF index).
 		// Mirrors Bitcoin Core's CTxIn::IsCoinBase() which is used in
 		// TxToUniv (core_io.cpp) to emit the coinbase field.
 		isCoinbaseIn := in.PreviousOutPoint.Hash.IsZero() && in.PreviousOutPoint.Index == 0xFFFFFFFF
-		var vinObj map[string]any
+		vinObj := newOMap()
 		if isCoinbaseIn {
-			vinObj = map[string]any{
-				"coinbase": hex.EncodeToString(in.SignatureScript),
-				"sequence": in.Sequence,
-			}
+			vinObj.Set("coinbase", hex.EncodeToString(in.SignatureScript))
 		} else {
-			vinObj = map[string]any{
-				"txid":      in.PreviousOutPoint.Hash.String(),
-				"vout":      in.PreviousOutPoint.Index,
-				"scriptSig": scriptSigToUniv(in.SignatureScript, true),
-				"sequence":  in.Sequence,
-			}
+			vinObj.Set("txid", in.PreviousOutPoint.Hash.String())
+			vinObj.Set("vout", in.PreviousOutPoint.Index)
+			vinObj.Set("scriptSig", scriptSigToUniv(in.SignatureScript, true))
 		}
+		// Core pushes txinwitness BEFORE sequence (core_io.cpp:464-490).
 		if len(in.Witness) > 0 {
 			witness := make([]string, len(in.Witness))
 			for j, w := range in.Witness {
 				witness[j] = hex.EncodeToString(w)
 			}
-			vinObj["txinwitness"] = witness
+			vinObj.Set("txinwitness", witness)
 		}
+		vinObj.Set("sequence", in.Sequence)
 		vin[i] = vinObj
 	}
 
-	// vout array
-	vout := make([]map[string]any, len(tx.TxOut))
+	// vout array — Core pushKV order: value, n, scriptPubKey (core_io.cpp:502).
+	vout := make([]*omap, len(tx.TxOut))
 	for i, out := range tx.TxOut {
-		vout[i] = map[string]any{
-			"value":        btcAmount(out.Value),
-			"n":            i,
-			"scriptPubKey": scriptPubKeyToUniv(out.PkScript, net),
-		}
+		vout[i] = newOMap().
+			Set("value", btcAmount(out.Value)).
+			Set("n", i).
+			Set("scriptPubKey", scriptPubKeyToUniv(out.PkScript, net))
 	}
 
-	return map[string]any{
-		"txid":     tx.TxHash().String(),
-		"hash":     tx.WTxHash().String(),
-		"version":  tx.Version,
-		"size":     size,
-		"vsize":    vsize,
-		"weight":   weight,
-		"locktime": tx.LockTime,
-		"vin":      vin,
-		"vout":     vout,
-	}
+	// Root: Core TxToUniv order — txid, hash, version, size, vsize, weight,
+	// locktime, vin, vout (core_io.cpp:434).
+	return newOMap().
+		Set("txid", tx.TxHash().String()).
+		Set("hash", tx.WTxHash().String()).
+		Set("version", tx.Version).
+		Set("size", size).
+		Set("vsize", vsize).
+		Set("weight", weight).
+		Set("locktime", tx.LockTime).
+		Set("vin", vin).
+		Set("vout", vout)
 }
 
 // buildGetBlockTxJSON builds the per-tx JSON for getblock verbosity=2.
@@ -572,7 +570,7 @@ func buildDecodeRawTxJSON(tx *wire.MsgTx, net address.Network) map[string]any {
 //   - `confirmations`, `time`, `blocktime` are NOT emitted (those are getrawtransaction extras)
 //   - Coinbase vin emits `txinwitness` array if present (TxToUniv always checks this)
 //   - Non-coinbase vin always emits `scriptSig: {asm, hex}` even when empty
-func buildGetBlockTxJSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo, net address.Network) map[string]any {
+func buildGetBlockTxJSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo, net address.Network) *omap {
 	// Serialize for size/weight
 	var buf bytes.Buffer
 	tx.Serialize(&buf)
@@ -581,77 +579,71 @@ func buildGetBlockTxJSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo
 	weight := int(consensus.CalcTxWeight(tx))
 	vsize := (weight + 3) / 4
 
-	// vin array — mirrors TxToUniv's vin loop in core_io.cpp
-	vin := make([]map[string]any, len(tx.TxIn))
+	// vin array — mirrors TxToUniv's vin loop in core_io.cpp (pushKV order).
+	vin := make([]*omap, len(tx.TxIn))
 	var amtTotalIn int64
 	haveUndo := txUndo != nil
 
 	for i, in := range tx.TxIn {
-		var vinObj map[string]any
+		vinObj := newOMap()
 		if isCoinbase {
-			vinObj = map[string]any{
-				"coinbase": hex.EncodeToString(in.SignatureScript),
-				"sequence": in.Sequence,
-			}
+			vinObj.Set("coinbase", hex.EncodeToString(in.SignatureScript))
 		} else {
-			vinObj = map[string]any{
-				"txid":      in.PreviousOutPoint.Hash.String(),
-				"vout":      in.PreviousOutPoint.Index,
-				"scriptSig": scriptSigToUniv(in.SignatureScript, true),
-				"sequence":  in.Sequence,
-			}
+			vinObj.Set("txid", in.PreviousOutPoint.Hash.String())
+			vinObj.Set("vout", in.PreviousOutPoint.Index)
+			vinObj.Set("scriptSig", scriptSigToUniv(in.SignatureScript, true))
 			if haveUndo && i < len(txUndo.SpentCoins) {
 				amtTotalIn += txUndo.SpentCoins[i].TxOut.Value
 			}
 		}
-		// Emit txinwitness for ALL inputs (coinbase and non-coinbase) if present.
-		// Core's TxToUniv checks !tx.vin[i].scriptWitness.IsNull() for every input.
+		// Emit txinwitness for ALL inputs (coinbase and non-coinbase) if present,
+		// BEFORE sequence — Core's TxToUniv checks !scriptWitness.IsNull() and
+		// pushes txinwitness then sequence (core_io.cpp:464-490).
 		if len(in.Witness) > 0 {
 			witness := make([]string, len(in.Witness))
 			for j, w := range in.Witness {
 				witness[j] = hex.EncodeToString(w)
 			}
-			vinObj["txinwitness"] = witness
+			vinObj.Set("txinwitness", witness)
 		}
+		vinObj.Set("sequence", in.Sequence)
 		vin[i] = vinObj
 	}
 
-	// vout array
-	vout := make([]map[string]any, len(tx.TxOut))
+	// vout array — Core pushKV order: value, n, scriptPubKey.
+	vout := make([]*omap, len(tx.TxOut))
 	var amtTotalOut int64
 	for i, out := range tx.TxOut {
-		vout[i] = map[string]any{
-			"value":        btcAmount(out.Value),
-			"n":            i,
-			"scriptPubKey": scriptPubKeyToUniv(out.PkScript, net),
-		}
+		vout[i] = newOMap().
+			Set("value", btcAmount(out.Value)).
+			Set("n", i).
+			Set("scriptPubKey", scriptPubKeyToUniv(out.PkScript, net))
 		if haveUndo {
 			amtTotalOut += out.Value
 		}
 	}
 
-	// Base result (matches TxToUniv field-emission order)
-	result := map[string]any{
-		"txid":     tx.TxHash().String(),
-		"hash":     tx.WTxHash().String(),
-		"version":  tx.Version,
-		"size":     size,
-		"vsize":    vsize,
-		"weight":   weight,
-		"locktime": tx.LockTime,
-		"vin":      vin,
-		"vout":     vout,
-	}
+	// Base result (matches TxToUniv field-emission order).
+	result := newOMap().
+		Set("txid", tx.TxHash().String()).
+		Set("hash", tx.WTxHash().String()).
+		Set("version", tx.Version).
+		Set("size", size).
+		Set("vsize", vsize).
+		Set("weight", weight).
+		Set("locktime", tx.LockTime).
+		Set("vin", vin).
+		Set("vout", vout)
 
 	// Fee: emitted only when undo data is available (non-coinbase txs only).
 	// Core: entry.pushKV("fee", ValueFromAmount(fee)) after vin/vout loops.
 	if haveUndo && !isCoinbase {
 		fee := amtTotalIn - amtTotalOut
-		result["fee"] = btcAmount(fee)
+		result.Set("fee", btcAmount(fee))
 	}
 
 	// Hex: always emitted for getblock verbosity=2 (include_hex=true).
-	result["hex"] = hex.EncodeToString(buf.Bytes())
+	result.Set("hex", hex.EncodeToString(buf.Bytes()))
 
 	return result
 }

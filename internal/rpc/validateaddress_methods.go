@@ -25,10 +25,13 @@ type validateAddressResult struct {
 }
 
 // validateAddressInvalidResult is the result for an invalid address (Core 27+).
+// Field order mirrors Core's pushKV order (rpc/output_script.cpp:67,80,81):
+// isvalid, error_locations, error — NOT isvalid/error/error_locations. The
+// byte-diff harness checks field-emission order.
 type validateAddressInvalidResult struct {
 	IsValid        bool     `json:"isvalid"`
-	Error          string   `json:"error"`
 	ErrorLocations []string `json:"error_locations"`
+	Error          string   `json:"error"`
 }
 
 func (s *Server) handleValidateAddress(params json.RawMessage) (interface{}, *RPCError) {
