@@ -120,6 +120,19 @@ type Config struct {
 	// `true` to opt in).  CLI flag takes precedence when both are set.
 	BIP324V2 bool
 
+	// EnablePackageRelay opts in to BIP-331 package relay (the "sendpackages"
+	// handshake message). Default OFF: Bitcoin Core v31.99 has no
+	// package-relay wire protocol, so an out-of-the-box node speaks only
+	// Core's wire and never emits sendpackages (honest-wire parity, same
+	// spirit as the service-flags / Erlay default-off work). The receive
+	// side (handling a peer's sendpackages / answering getpkgtxns) stays
+	// enabled regardless; only our SEND is gated.
+	//
+	// Settable via the `-packagerelay` CLI flag (`-packagerelay=true` to opt
+	// in) or `BLOCKBREW_PACKAGE_RELAY` env var (`1` / `true` to opt in).
+	// CLI flag takes precedence when both are set.
+	EnablePackageRelay bool
+
 	// PeerBloomFilters controls advertisement of the BIP-111 NODE_BLOOM
 	// service bit and is the gate for serving BIP-35 "mempool" requests.
 	// Mirrors Bitcoin Core's `-peerbloomfilters` flag (see init.cpp:1104):
@@ -531,6 +544,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
+	flag.BoolVar(&cfg.EnablePackageRelay, "packagerelay", false, "Enable BIP-331 package relay (sendpackages). Default OFF — Bitcoin Core v31.99 has no package-relay wire protocol. Pass `-packagerelay=true` to opt in. Also settable via BLOCKBREW_PACKAGE_RELAY=1.")
 	flag.BoolVar(&cfg.PeerBloomFilters, "peerbloomfilters", false, "Advertise NODE_BLOOM (BIP-111) and honor BIP-35 \"mempool\" requests. Default OFF, matching Bitcoin Core's DEFAULT_PEERBLOOMFILTERS=false. Pass `-peerbloomfilters=true` to opt in.")
 	flag.Int64Var(&cfg.Prune, "prune", 0, "Auto-prune target in MiB for the blk*.dat directory. 0 = archive (no pruning, default). Must be >= 550 if non-zero (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES). Headers, UTXO set, and the last 288 blocks are never pruned.")
 	// Operational-parity flags. Mirror Bitcoin Core init.cpp argspec.
@@ -620,6 +634,21 @@ func parseFlags() *Config {
 	})
 	if !cliBIP324V2Set {
 		cfg.BIP324V2 = parseBIP324V2Env(os.Getenv("BLOCKBREW_BIP324_V2"), true)
+	}
+
+	// Env-var fallback: BLOCKBREW_PACKAGE_RELAY=0/1 overrides the compiled-in
+	// default if the CLI flag wasn't explicitly set. CLI flag wins when both
+	// are present. Default is OFF — Bitcoin Core v31.99 has no package-relay
+	// wire protocol, so a default node never emits sendpackages. The tristate
+	// env parser is generic ("1"/"true"→on, "0"/"false"→off, else default).
+	cliPackageRelaySet := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "packagerelay" {
+			cliPackageRelaySet = true
+		}
+	})
+	if !cliPackageRelaySet {
+		cfg.EnablePackageRelay = parseBIP324V2Env(os.Getenv("BLOCKBREW_PACKAGE_RELAY"), false)
 	}
 
 	if cfg.ListenP2P == "" {
@@ -1325,6 +1354,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			return h
 		},
 		PreferV2:                    cfg.BIP324V2,
+		EnablePackageRelay:          cfg.EnablePackageRelay,
 		AdvertiseNodeBloom:          cfg.PeerBloomFilters,
 		AdvertiseNodeNetworkLimited: cfg.Prune > 0,
 		AdvertiseCompactFilters:     cfg.BlockFilterIndex,
@@ -1572,6 +1602,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			}
 		},
 		PreferV2:                    cfg.BIP324V2,
+		EnablePackageRelay:          cfg.EnablePackageRelay,
 		AdvertiseNodeBloom:          cfg.PeerBloomFilters,
 		AdvertiseNodeNetworkLimited: cfg.Prune > 0,
 		// BIP-157: advertise NODE_COMPACT_FILTERS when blockfilterindex is

@@ -116,16 +116,16 @@ const (
 
 // PeerManagerConfig configures the peer manager.
 type PeerManagerConfig struct {
-	Network           uint32
-	ChainParams       *consensus.ChainParams
-	MaxOutbound       int             // Target full-relay outbound connections (default: 8)
-	MaxBlockRelayOnly int             // Target block-relay-only connections (default: 2)
-	MaxInbound        int             // Maximum inbound connections (default: 117)
-	ListenAddr        string          // Address to listen for inbound (e.g., ":8333")
-	UserAgent         string          // Our user agent string
-	DataDir           string          // Data directory for persisting ban list
-	BestHeightFunc    func() int32    // Callback to get current best height
-	Listeners         *PeerListeners  // Callbacks for received messages
+	Network            uint32
+	ChainParams        *consensus.ChainParams
+	MaxOutbound        int            // Target full-relay outbound connections (default: 8)
+	MaxBlockRelayOnly  int            // Target block-relay-only connections (default: 2)
+	MaxInbound         int            // Maximum inbound connections (default: 117)
+	ListenAddr         string         // Address to listen for inbound (e.g., ":8333")
+	UserAgent          string         // Our user agent string
+	DataDir            string         // Data directory for persisting ban list
+	BestHeightFunc     func() int32   // Callback to get current best height
+	Listeners          *PeerListeners // Callbacks for received messages
 	OnPeerConnected    func(p *Peer)  // Called when a peer completes handshake
 	OnPeerDisconnected func(p *Peer)  // Called when a peer disconnects
 	// PreferV2 enables BIP-324 v2 transport negotiation on both new outbound
@@ -133,6 +133,11 @@ type PeerManagerConfig struct {
 	// peeks 64 bytes; v1 peers fall through to legacy plaintext via the
 	// prefixed-conn shim in transport.go.
 	PreferV2 bool
+
+	// EnablePackageRelay gates the BIP-331 "sendpackages" SEND in the version
+	// handshake. Default OFF (Core v31.99 has no package-relay wire protocol);
+	// opt in via cfg.EnablePackageRelay (-packagerelay / BLOCKBREW_PACKAGE_RELAY=1).
+	EnablePackageRelay bool
 
 	// AdvertiseNodeBloom controls whether NODE_BLOOM (BIP-111) is OR'd
 	// into our advertised service bits in the version handshake.  This is
@@ -217,23 +222,23 @@ type PeerInfo struct {
 
 // PeerManager manages all peer connections.
 type PeerManager struct {
-	config          PeerManagerConfig
-	mu              sync.RWMutex
-	peers           map[string]*PeerInfo  // addr -> PeerInfo (all connected peers)
-	outbound        int                   // Count of full-relay outbound peers
-	blockRelayOnly  int                   // Count of block-relay-only outbound peers
-	inbound         int                   // Count of inbound peers
-	addrBook        *AddressBook          // Known addresses
-	banned          map[string]*BanInfo   // IP -> ban info
-	banDirty        bool                  // Whether ban list needs saving
-	listener        net.Listener          // TCP listener for inbound
-	quit            chan struct{}         // Signal to stop
-	quitOnce        sync.Once             // Ensure quit is closed only once
-	wg              sync.WaitGroup        // Wait for goroutines
-	started         bool                  // Whether the manager has started
-	subnetCounts    map[string]int        // subnet -> count of outbound connections (for diversity)
-	rng             *rand.Rand            // Random number generator
-	asmap           []byte                // Loaded asmap trie bytes (nil = disabled)
+	config         PeerManagerConfig
+	mu             sync.RWMutex
+	peers          map[string]*PeerInfo // addr -> PeerInfo (all connected peers)
+	outbound       int                  // Count of full-relay outbound peers
+	blockRelayOnly int                  // Count of block-relay-only outbound peers
+	inbound        int                  // Count of inbound peers
+	addrBook       *AddressBook         // Known addresses
+	banned         map[string]*BanInfo  // IP -> ban info
+	banDirty       bool                 // Whether ban list needs saving
+	listener       net.Listener         // TCP listener for inbound
+	quit           chan struct{}        // Signal to stop
+	quitOnce       sync.Once            // Ensure quit is closed only once
+	wg             sync.WaitGroup       // Wait for goroutines
+	started        bool                 // Whether the manager has started
+	subnetCounts   map[string]int       // subnet -> count of outbound connections (for diversity)
+	rng            *rand.Rand           // Random number generator
+	asmap          []byte               // Loaded asmap trie bytes (nil = disabled)
 
 	// fixedSeedsAdded is the one-shot guard for the last-resort fixed-seed
 	// fallback. Set true after addFixedSeeds() has injected the curated
@@ -265,11 +270,11 @@ func (pm *PeerManager) GetMappedASForAddr(addr string) uint32 {
 
 // ASMapHealthCheckResult holds the statistics produced by ASMapHealthCheck.
 type ASMapHealthCheckResult struct {
-	Total    int            // total clearnet addresses sampled
-	Mapped   int            // addresses with a non-zero ASN
-	Unmapped int            // addresses with ASN == 0 (no trie entry)
-	UniqueAS int            // distinct ASNs seen
-	TopASNs  []ASNCount     // top ASMapHealthCheckTopN ASNs by address count
+	Total    int        // total clearnet addresses sampled
+	Mapped   int        // addresses with a non-zero ASN
+	Unmapped int        // addresses with ASN == 0 (no trie entry)
+	UniqueAS int        // distinct ASNs seen
+	TopASNs  []ASNCount // top ASMapHealthCheckTopN ASNs by address count
 }
 
 // ASNCount pairs an ASN with its occurrence count in the sampled address set.
@@ -816,6 +821,7 @@ func (pm *PeerManager) AnnounceBlock(header wire.BlockHeader, hash wire.Hash256)
 // Per BIP-339 and Bitcoin Core net_processing.cpp RelayTransaction:
 //   - Peers with wtxidrelay negotiated: announce as inv{MSG_WTX=5, wtxid}
 //   - Legacy peers:                     announce as inv{MSG_TX=1, txid}
+//
 // MSG_WITNESS_TX (0x40000001) is a BIP-144 getdata witness request flag and
 // must NOT be used in inv announcements — Core peers log "Unknown inv type"
 // and discard any inv with that type value.
@@ -1944,14 +1950,15 @@ func (pm *PeerManager) makePeerConfig() PeerConfig {
 	}
 
 	return PeerConfig{
-		Network:         pm.config.Network,
-		ProtocolVersion: ProtocolVersion,
-		Services:        services,
-		UserAgent:       pm.config.UserAgent,
-		BestHeight:      bestHeight,
-		DisableRelayTx:  false,
-		Listeners:       listeners,
-		PreferV2:        pm.config.PreferV2,
+		Network:            pm.config.Network,
+		ProtocolVersion:    ProtocolVersion,
+		Services:           services,
+		UserAgent:          pm.config.UserAgent,
+		BestHeight:         bestHeight,
+		DisableRelayTx:     false,
+		Listeners:          listeners,
+		PreferV2:           pm.config.PreferV2,
+		EnablePackageRelay: pm.config.EnablePackageRelay,
 	}
 }
 

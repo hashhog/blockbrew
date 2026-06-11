@@ -56,6 +56,13 @@ type PeerConfig struct {
 	DisableRelayTx  bool           // Whether to disable tx relay
 	Listeners       *PeerListeners // Callbacks for received messages
 	PreferV2        bool           // Whether to prefer BIP324 v2 transport
+	// EnablePackageRelay gates the BIP-331 "sendpackages" handshake message.
+	// Default OFF: Bitcoin Core v31.99 has no package-relay wire protocol and a
+	// default node never emits sendpackages. The RECEIVE side (handling a
+	// peer's sendpackages / answering getpkgtxns) stays enabled regardless;
+	// only our SEND of sendpackages is gated. Opt in via -packagerelay /
+	// BLOCKBREW_PACKAGE_RELAY=1.
+	EnablePackageRelay bool
 }
 
 // PeerListeners contains callbacks invoked when messages are received.
@@ -150,29 +157,29 @@ const (
 
 // Peer represents a connection to a remote Bitcoin node.
 type Peer struct {
-	config        PeerConfig
-	conn          net.Conn
-	transport     Transport    // v1 or v2 transport layer
-	addr          string // "host:port"
-	state         PeerState
-	mu            sync.RWMutex
-	inbound       bool         // Whether this is an inbound connection
-	versionSent   bool
-	versionRecvd  bool
-	verAckRecvd   bool
-	peerVersion   *MsgVersion // Received version message
-	sendQueue     chan Message // Outbound message queue
-	quit          chan struct{} // Signal to stop goroutines
-	quitOnce      sync.Once    // Ensure quit is closed only once
-	wg            sync.WaitGroup // Wait for goroutines to finish
-	lastRecv      time.Time
-	lastSend      time.Time
-	lastPingNonce uint64
-	lastPingTime  time.Time
-	pingLatency   time.Duration
-	startTime     time.Time
-	bytesSent     uint64
-	bytesRecvd    uint64
+	config            PeerConfig
+	conn              net.Conn
+	transport         Transport // v1 or v2 transport layer
+	addr              string    // "host:port"
+	state             PeerState
+	mu                sync.RWMutex
+	inbound           bool // Whether this is an inbound connection
+	versionSent       bool
+	versionRecvd      bool
+	verAckRecvd       bool
+	peerVersion       *MsgVersion    // Received version message
+	sendQueue         chan Message   // Outbound message queue
+	quit              chan struct{}  // Signal to stop goroutines
+	quitOnce          sync.Once      // Ensure quit is closed only once
+	wg                sync.WaitGroup // Wait for goroutines to finish
+	lastRecv          time.Time
+	lastSend          time.Time
+	lastPingNonce     uint64
+	lastPingTime      time.Time
+	pingLatency       time.Duration
+	startTime         time.Time
+	bytesSent         uint64
+	bytesRecvd        uint64
 	versionReceivedAt time.Time // When we received the peer's VERSION message (for timeoffset)
 
 	// Our local nonce for self-connection detection
@@ -192,24 +199,24 @@ type Peer struct {
 	compactBlockState *CompactBlockState
 
 	// BIP330 Erlay state
-	erlaySupported    bool   // Peer supports Erlay (received sendtxrcncl)
-	erlaySalt         uint64 // Peer's Erlay salt from sendtxrcncl
-	erlayVersion      uint32 // Peer's Erlay protocol version
-	erlaySentTxRcncl  bool   // Whether we sent sendtxrcncl to peer
+	erlaySupported   bool   // Peer supports Erlay (received sendtxrcncl)
+	erlaySalt        uint64 // Peer's Erlay salt from sendtxrcncl
+	erlayVersion     uint32 // Peer's Erlay protocol version
+	erlaySentTxRcncl bool   // Whether we sent sendtxrcncl to peer
 
 	// BIP133 feefilter state
-	feeFilterReceived int64         // Peer's minimum fee rate (sat/kvB), atomic
-	feeFilterSent     int64         // Last fee filter we sent to peer (sat/kvB)
-	nextFeeFilterTime time.Time     // When to next send feefilter
-	feeFilterMu       sync.Mutex    // Protects feefilter state
+	feeFilterReceived int64      // Peer's minimum fee rate (sat/kvB), atomic
+	feeFilterSent     int64      // Last fee filter we sent to peer (sat/kvB)
+	nextFeeFilterTime time.Time  // When to next send feefilter
+	feeFilterMu       sync.Mutex // Protects feefilter state
 
 	// Handshake completion signal
 	handshakeDone chan struct{}
 
 	// Misbehavior tracking
-	misbehaviorScore int           // Accumulated misbehavior score
-	shouldBan        bool          // Set to true when threshold reached
-	banCallback      func(*Peer)   // Called when peer should be banned
+	misbehaviorScore int         // Accumulated misbehavior score
+	shouldBan        bool        // Set to true when threshold reached
+	banCallback      func(*Peer) // Called when peer should be banned
 
 	// W99 G2: NoBan flag — when set, the ban callback is suppressed entirely.
 	// Bitcoin Core equivalent: HasPermission(NetPermissionFlags::NoBan).
@@ -776,7 +783,13 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 		p.SendMessage(&MsgSendAddrv2{})
 		// BIP-331: advertise ancestor-package support so peers may push
 		// "pkgtxns" / request "getpkgtxns" against us. Bit 0 = ancestor.
-		p.SendMessage(&MsgSendPackages{Versions: PackageRelayVersionAncestor})
+		// Default OFF — Bitcoin Core v31.99 has no package-relay wire protocol,
+		// so a default node must not emit sendpackages (honest-wire parity).
+		// Opt in via -packagerelay / BLOCKBREW_PACKAGE_RELAY=1. The receive
+		// side stays enabled unconditionally.
+		if p.config.EnablePackageRelay {
+			p.SendMessage(&MsgSendPackages{Versions: PackageRelayVersionAncestor})
+		}
 	}
 
 	// Send verack
@@ -962,7 +975,7 @@ func (p *Peer) ShouldRelayTx(fee int64, vsize int64) bool {
 
 	// Calculate the minimum fee required for this transaction size
 	// filterRate is in sat/kvB (satoshis per 1000 virtual bytes)
-	minFee := (filterRate * vsize + 999) / 1000 // Round up
+	minFee := (filterRate*vsize + 999) / 1000 // Round up
 
 	return fee >= minFee
 }
