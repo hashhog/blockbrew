@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hashhog/blockbrew/internal/consensus"
 )
 
 // W128 — AddrMan + connman + peer selection 30-gate audit (blockbrew)
@@ -491,11 +493,17 @@ func TestW128_G23_AnchorsPersistencePresent(t *testing.T) {
 }
 
 // G24 (BUG-22): Fixed seeds fallback when reachable_empty_networks not seeded
-// after 60s.  Absent — blockbrew has DNS seeds only.
-func TestW128_G24_FixedSeedsFallbackAbsent(t *testing.T) {
-	// Verify ChainParams has no FixedSeeds field or it's empty.
-	// We just check that the peermgr never references FixedSeeds.
-	t.Log("BUG-22 (P1): fixed-seeds fallback missing; node hangs on empty addrman if DNS is unreachable")
+// after 60s. NOW PRESENT — see fixedseeds_test.go for the live coverage.
+// blockbrew injects the curated bootstrap IPs (consensus.MainnetParams().
+// FixedSeeds) once the address book is empty AND (60s elapsed OR DNS seeding
+// is disabled), mirroring Core net.cpp:2607-2643. This closes the
+// DNS-failure hang where an empty addrman left pickAddressWithDiversity
+// returning nil forever.
+func TestW128_G24_FixedSeedsFallbackPresent(t *testing.T) {
+	if len(consensus.MainnetParams().FixedSeeds) == 0 {
+		t.Fatal("BUG-22 regressed: mainnet FixedSeeds is empty; DNS-failure hang re-opened")
+	}
+	t.Log("BUG-22 (P1) FIXED: fixed-seeds fallback wired; node no longer hangs on empty addrman if DNS is unreachable")
 }
 
 // ────────────────────────────────────────────────────────────────────────────

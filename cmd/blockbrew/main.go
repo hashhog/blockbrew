@@ -237,6 +237,14 @@ type Config struct {
 	// Core's `-dnsseed=0` / `-nodnsseed`, and clearbit's `--nodnsseed`
 	// (sets dns_seed=false). Implied automatically when -connect is set.
 	NoDNSSeed bool
+
+	// FixedSeeds controls the last-resort fixed-seed fallback. Default true
+	// (Bitcoin Core DEFAULT_FIXEDSEEDS=true). When DNS seeding returns empty
+	// or fails AND the address book is empty, blockbrew injects the curated
+	// bootstrap IPs from the chain params so the dialer has candidates instead
+	// of hanging with zero peers. Pass -fixedseeds=0 to disable. Suppressed
+	// unconditionally under -connect.
+	FixedSeeds bool
 }
 
 // connectFlag implements flag.Value so `-connect=<ip:port>` may be repeated
@@ -546,6 +554,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.ASMap, "asmap", "", "Path to an ASMap binary file for AS-level peer bucketing and eclipse-resistance diversity. When set, blockbrew loads the file (max 8 MiB), validates its trie, and uses it to map peer IPs to Autonomous System Numbers. Peer diversity is then enforced at the AS level rather than /16 subnet. Leave empty (default) to use legacy /16 grouping. Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp).")
 	flag.Var(&cfg.Connect, "connect", "Connect ONLY to the specified <ip:port> peer(s) and disable both DNS-seed resolution and addrman/auto-outbound dialing. Repeatable / comma-separated. Mirrors Bitcoin Core's `-connect=<ip:port>` (implies -dnsseed=0 and turns off automatic outbound connections). The pinned peers are dialed as manual connections and re-dialed if they drop. Empty (default) = normal peer discovery.")
 	flag.BoolVar(&cfg.NoDNSSeed, "nodnsseed", false, "Disable DNS-seed resolution without otherwise changing peer discovery (addrman/auto-outbound dialing still runs). Mirrors Bitcoin Core's `-dnsseed=0` / `-nodnsseed`. Implied automatically when -connect is set.")
+	flag.BoolVar(&cfg.FixedSeeds, "fixedseeds", true, "Enable the last-resort fixed-seed fallback (default ON, mirrors Bitcoin Core's `-fixedseeds=1`). When DNS seeding returns empty or fails AND the address book is empty, blockbrew injects the curated bootstrap IPs so the node can still find peers instead of hanging with zero outbound connections. Pass -fixedseeds=0 to disable. Suppressed under -connect.")
 	flag.Parse()
 
 	// Apply config file (CLI > config > default). Build the set of flags
@@ -1575,6 +1584,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// dnsseed=0 from -connect) suppresses DNS-seed resolution.
 		ConnectPeers: cfg.Connect,
 		NoDNSSeed:    cfg.NoDNSSeed,
+		// -fixedseeds default-ON (Core DEFAULT_FIXEDSEEDS=true); -fixedseeds=0
+		// flips NoFixedSeeds. The fallback fires only when DNS is empty/disabled
+		// and the address book is empty, and is suppressed under -connect.
+		NoFixedSeeds: !cfg.FixedSeeds,
 	})
 
 	// Wire the peer manager back into the sync manager (breaks circular dependency)

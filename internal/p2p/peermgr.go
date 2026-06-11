@@ -184,6 +184,15 @@ type PeerManagerConfig struct {
 	// Bitcoin Core's `-dnsseed=0` / `-nodnsseed` and clearbit's
 	// `--nodnsseed` (dns_seed=false). Implied when ConnectPeers is set.
 	NoDNSSeed bool
+
+	// NoFixedSeeds disables the last-resort fixed-seed fallback. Mirrors
+	// Bitcoin Core's `-fixedseeds=0` (DEFAULT_FIXEDSEEDS=true, so fixed seeds
+	// are ON by default — net.h:97). The zero value (false) keeps fixed seeds
+	// enabled. When true, a node whose DNS seeding fails and whose address
+	// book is empty will NOT inject the curated bootstrap IPs (it relies
+	// solely on -addnode / gossip / inbound). Suppressed unconditionally under
+	// -connect, exactly like DNS seeding.
+	NoFixedSeeds bool
 }
 
 // BanInfo contains information about a banned peer.
@@ -221,6 +230,12 @@ type PeerManager struct {
 	subnetCounts    map[string]int        // subnet -> count of outbound connections (for diversity)
 	rng             *rand.Rand            // Random number generator
 	asmap           []byte                // Loaded asmap trie bytes (nil = disabled)
+
+	// fixedSeedsAdded is the one-shot guard for the last-resort fixed-seed
+	// fallback. Set true after addFixedSeeds() has injected the curated
+	// bootstrap IPs so they are never re-injected (Core net.cpp:2641 sets
+	// add_fixed_seeds=false after firing). Guarded by mu.
+	fixedSeedsAdded bool
 }
 
 // UsingASMap returns true when an asmap was loaded at startup. Mirrors
@@ -1014,6 +1029,117 @@ func (pm *PeerManager) dialConnectPeers() {
 	}
 }
 
+// fixedSeedsEnabled reports whether the last-resort fixed-seed fallback is
+// active. Off when -fixedseeds=0 (NoFixedSeeds) or when -connect pinned the
+// peer set (Core: -connect implies no fixed seeds — the addrman is unused).
+// Mirrors net.cpp:2569 (`add_fixed_seeds = GetBoolArg("-fixedseeds", true)`)
+// combined with the -connect short-circuit that bypasses ThreadOpenConnections
+// fixed-seed logic entirely.
+func (pm *PeerManager) fixedSeedsEnabled() bool {
+	return !pm.config.NoFixedSeeds && !pm.connectMode()
+}
+
+// maybeAddFixedSeeds implements the Bitcoin Core fixed-seed trigger
+// (net.cpp ThreadOpenConnections, 2607-2643). It is called on every
+// connection-attempt tick with the loop's start time. It injects the curated
+// fixed-seed IPs (once) when ALL of the following hold:
+//
+//   - fixed seeds are enabled (-fixedseeds!=0 and not -connect),
+//   - they have not already been injected (one-shot, Core sets
+//     add_fixed_seeds=false after firing),
+//   - the address book is empty (Core's GetReachableEmptyNetworks() proxy:
+//     for our IPv4-only seed set, an empty book == the one reachable network
+//     has zero addrman addresses), AND EITHER
+//   - ~60s have elapsed since the connection loop started (the normal path —
+//     gives DNS / -addnode 60s to populate the book first, Core net.cpp:2614),
+//     OR
+//   - DNS seeding is disabled (Core's `!dnsseed && !use_seednodes` cheap
+//     shortcut, net.cpp:2620 — fire immediately, there's no point waiting on
+//     DNS that's turned off).
+//
+// Returns true if the seeds were injected on this call (for tests / logging).
+func (pm *PeerManager) maybeAddFixedSeeds(start time.Time) bool {
+	if !pm.fixedSeedsEnabled() {
+		return false
+	}
+
+	pm.mu.RLock()
+	already := pm.fixedSeedsAdded
+	pm.mu.RUnlock()
+	if already {
+		return false
+	}
+
+	// Core's "reachable network has zero addrman addresses" proxy. With an
+	// IPv4-only seed set the single reachable network is IPv4, so an empty
+	// book is exactly the GetReachableEmptyNetworks()-non-empty condition.
+	if pm.addrBook.Size() != 0 {
+		return false
+	}
+
+	// Fire after the 60s grace, OR immediately when DNS seeding is off (no
+	// other peer source to wait for). dnsSeedingDisabled() already folds in
+	// -connect, but connectMode() is excluded above via fixedSeedsEnabled().
+	graceElapsed := time.Since(start) > time.Minute
+	if !graceElapsed && !pm.dnsSeedingDisabled() {
+		return false
+	}
+
+	return pm.addFixedSeeds()
+}
+
+// addFixedSeeds injects the curated fixed-seed IPs from the active chain
+// params' FixedSeeds list into the address book, honouring the one-shot guard.
+// Mirrors net.cpp:2628-2643: ConvertSeeds(m_params.FixedSeeds()) →
+// addrman.Add(..., local="fixedseeds") → add_fixed_seeds=false. -onlynet
+// filtering is trivial here (the curated set is IPv4-only and AddAddress
+// already rejects non-routable IPs). Returns true if it injected (i.e. it was
+// the firing call, not a no-op repeat). Safe to call concurrently with the
+// connect loop — the one-shot flag is set under the write lock.
+func (pm *PeerManager) addFixedSeeds() bool {
+	cp := pm.config.ChainParams
+	if cp == nil || len(cp.FixedSeeds) == 0 {
+		return false
+	}
+
+	// One-shot under the write lock so a concurrent caller can't double-inject.
+	pm.mu.Lock()
+	if pm.fixedSeedsAdded {
+		pm.mu.Unlock()
+		return false
+	}
+	pm.fixedSeedsAdded = true
+	pm.mu.Unlock()
+
+	added := 0
+	for _, addr := range cp.FixedSeeds {
+		host, _, err := net.SplitHostPort(addr)
+		if err != nil {
+			// Tolerate a bare IP (no port) by falling back to the default port.
+			host = addr
+		}
+		netIP := net.ParseIP(host)
+		if netIP == nil {
+			log.Printf("fixed seed: skipping unparseable seed %q", addr)
+			continue
+		}
+		// AddAddress rejects non-routable IPs (Core only adds reachable nets);
+		// it dedups and bounds the book. Source "fixedseeds" mirrors Core's
+		// local.SetInternal("fixedseeds").
+		before := pm.addrBook.Size()
+		pm.addrBook.AddAddress(NetAddress{
+			IP:   netIP.To16(),
+			Port: cp.DefaultPort,
+		}, "fixedseeds")
+		if pm.addrBook.Size() > before {
+			added++
+		}
+	}
+
+	log.Printf("fixed seed: injected %d last-resort bootstrap address(es) (DNS empty / disabled, address book was empty)", added)
+	return true
+}
+
 // connectionHandler manages outbound connection attempts.
 func (pm *PeerManager) connectionHandler() {
 	defer pm.wg.Done()
@@ -1022,6 +1148,11 @@ func (pm *PeerManager) connectionHandler() {
 	// operator pinned a fixed peer set we dial ONLY those peers and skip both
 	// DNS-seed resolution and the addrman/auto-outbound maintenance loop. The
 	// pinned peers are dialed up front and re-dialed on every tick below.
+	// connStart anchors the fixed-seed 60s grace window (Core net.cpp:2562
+	// `auto start = GetTime<microseconds>()`). Recorded before the initial DNS
+	// resolution so the grace clock starts at loop entry, matching Core.
+	connStart := time.Now()
+
 	if pm.connectMode() {
 		log.Printf("P2P: -connect set (%d peer(s)) — DNS seeds and auto-outbound dialing disabled; pinning to %s",
 			len(pm.config.ConnectPeers), strings.Join(pm.config.ConnectPeers, ", "))
@@ -1029,6 +1160,16 @@ func (pm *PeerManager) connectionHandler() {
 	} else {
 		// Initial DNS seed resolution (skipped when -nodnsseed / -dnsseed=0).
 		pm.maybeResolveDNSSeeds()
+
+		// Immediate fixed-seed fallback when DNS seeding is disabled: there is
+		// no other peer source to wait for, so fire right away rather than
+		// idling for 60s (Core's `!dnsseed && !use_seednodes` shortcut,
+		// net.cpp:2620). When DNS is enabled this is a no-op (the book is
+		// non-empty after a successful resolve, or the 60s-grace path below
+		// fires once DNS is confirmed dead). This is THE fix for the
+		// DNS-failure hang: with DNS off (or unreachable) and an empty book,
+		// the node now seeds itself instead of idling forever with zero peers.
+		pm.maybeAddFixedSeeds(connStart)
 	}
 
 	// Random start offset for feeler timer to avoid synchronization
@@ -1049,6 +1190,15 @@ func (pm *PeerManager) connectionHandler() {
 
 	banCleanupTicker := time.NewTicker(1 * time.Hour)
 	defer banCleanupTicker.Stop()
+
+	// Fixed-seed fallback ticker. Core re-checks the trigger on every 500ms
+	// loop tick (net.cpp:2594); we poll every 5s, which is far finer than the
+	// 60s grace window and ensures the seeds are injected promptly once DNS is
+	// confirmed dead and the book is still empty. One-shot: maybeAddFixedSeeds
+	// no-ops after it fires (and immediately when fixed seeds are disabled or
+	// already added), so this becomes a cheap flag check thereafter.
+	fixedSeedsTicker := time.NewTicker(5 * time.Second)
+	defer fixedSeedsTicker.Stop()
 
 	// ASMap health-check ticker — only fires when asmap is loaded.
 	// Mirrors Core's CConnman::Start() which calls ASMapHealthCheck() once at
@@ -1119,6 +1269,16 @@ func (pm *PeerManager) connectionHandler() {
 				// Occasionally rotate a block-relay-only connection
 				pm.maybeRotateBlockRelayPeer()
 			}
+
+		case <-fixedSeedsTicker.C:
+			// Last-resort fixed-seed fallback (Core net.cpp:2607-2643). One-shot:
+			// injects the curated bootstrap IPs the first tick after the address
+			// book is empty AND (60s elapsed since loop start OR DNS seeding is
+			// disabled). This rescues a node whose DNS seeds were reachable at
+			// startup but returned nothing useful (or began failing) — without
+			// it, an empty book means pickAddressWithDiversity returns nil
+			// forever and the node hangs with zero outbound peers.
+			pm.maybeAddFixedSeeds(connStart)
 
 		case <-dnsRefreshTicker.C:
 			// Refresh DNS seeds when peer health is poor. Two triggers:

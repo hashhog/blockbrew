@@ -12,6 +12,15 @@ type ChainParams struct {
 	Name                   string
 	DefaultPort            uint16
 	DNSSeeds               []string
+	// FixedSeeds is the curated last-resort bootstrap peer list, used only when
+	// DNS seeding returns nothing (or is disabled) AND the address book is empty
+	// for a reachable network — mirroring Bitcoin Core's vFixedSeeds
+	// (kernel/chainparams.cpp:153, ConvertSeeds in net.cpp, and the
+	// ThreadOpenConnections fixed-seed trigger at net.cpp:2607-2643).
+	// Each entry is an "ip:port" string. Default-ON; only mainnet is populated
+	// for this campaign. Regtest/test/signet/testnet4 leave this nil (no
+	// fixed-seed fallback), matching Core clearing vFixedSeeds for regtest.
+	FixedSeeds             []string
 	GenesisBlock           *wire.MsgBlock
 	GenesisHash            wire.Hash256
 	PowLimitBits           uint32   // Highest allowed target in compact form
@@ -123,6 +132,56 @@ func MainnetParams() *ChainParams {
 			"seed.bitcoin.sprovoost.nl",
 			"dnsseed.emzy.de",
 			"seed.bitcoin.wiz.biz",
+		},
+		// FixedSeeds: curated last-resort bootstrap set of 40 Core-vetted
+		// mainnet :8333 listeners, extracted verbatim from
+		// bitcoin-core/contrib/seeds/nodes_main.txt (the makeseeds-filtered
+		// live set that generates chainparamsseeds.h). Selected one-per-leading
+		// -octet for AS/netgroup diversity (no two share a /8), maximizing
+		// eclipse resistance for a tiny bootstrap set. Used only when DNS
+		// seeding returns empty/fails and the address book is empty — see
+		// PeerManager.addFixedSeeds (Core net.cpp:2607-2643 parity).
+		FixedSeeds: []string{
+			"2.121.116.198:8333",
+			"3.86.179.235:8333",
+			"4.2.51.251:8333",
+			"5.2.23.226:8333",
+			"12.11.29.34:8333",
+			"14.49.142.41:8333",
+			"18.27.125.103:8333",
+			"23.93.18.82:8333",
+			"24.16.202.74:8333",
+			"27.83.109.113:8333",
+			"31.41.23.249:8333",
+			"34.65.45.157:8333",
+			"35.78.97.86:8333",
+			"37.15.61.236:8333",
+			"38.52.3.192:8333",
+			"40.160.1.232:8333",
+			"44.223.26.178:8333",
+			"45.19.130.200:8333",
+			"46.126.216.3:8333",
+			"47.90.137.13:8333",
+			"50.4.123.66:8333",
+			"51.154.0.142:8333",
+			"52.182.185.242:8333",
+			"60.241.1.72:8333",
+			"62.34.57.141:8333",
+			"63.247.147.166:8333",
+			"64.23.97.128:8333",
+			"65.94.134.253:8333",
+			"66.35.84.14:8333",
+			"67.4.139.122:8333",
+			"68.61.69.53:8333",
+			"69.4.94.226:8333",
+			"70.44.20.24:8333",
+			"71.56.178.136:8333",
+			"72.88.192.74:8333",
+			"73.42.33.255:8333",
+			"74.48.195.218:8333",
+			"75.80.3.4:8333",
+			"76.124.35.108:8333",
+			"77.38.72.37:8333",
 		},
 		GenesisBlock:           genesisBlock,
 		GenesisHash:            genesisHash,
