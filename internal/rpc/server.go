@@ -590,6 +590,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetMempoolDescendants(params)
 	case "getorphantxs":
 		return s.handleGetOrphanTxs(params)
+	case "gettxspendingprevout":
+		return s.handleGetTxSpendingPrevout(params)
 	case "savemempool", "dumpmempool":
 		return s.handleDumpMempool(params)
 	case "loadmempool":
