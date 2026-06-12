@@ -836,6 +836,16 @@ func (s *Server) handleGetIndexInfo(params json.RawMessage) (interface{}, *RPCEr
 		}
 	}
 
+	// txospenderindex: runs when -txospenderindex is set. Registered and emitted
+	// under the internal name "txospenderindex" (Core's GetName() == the same
+	// literal, txospenderindex BaseIndex name). synced = caught up to the tip.
+	if s.indexManager != nil {
+		if idx := s.indexManager.GetIndex("txospenderindex"); idx != nil {
+			best := idx.BestHeight()
+			push("txospenderindex", best, best >= tipHeight)
+		}
+	}
+
 	return result, nil
 }
 
