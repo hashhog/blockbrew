@@ -358,21 +358,49 @@ func TestW135_G20_BUG9_PermitBareMultisigToggle(t *testing.T) {
 
 // ─── G21-G24: Dust ──────────────────────────────────────────────────────────
 
-// G21 / BUG-1: dust math must use DUST_RELAY_TX_FEE = 3000, not MinRelayFeeRate = 1000.
-// Core: policy.cpp:27-64 uses dustRelayFee directly.
+// G21 / BUG-1: dust math must use DUST_RELAY_TX_FEE = 3000, NOT MinRelayFeeRate.
+// Core: policy.cpp:27-64 uses dustRelayFee directly, independent of the
+// -minrelaytxfee floor.
 //
-// SKIP — bug present.
+// FIXED: isDust now reads consensus.DustRelayFeeRate (mempool.go isDust). This
+// test asserts the dust threshold is computed at 3000 sat/kvB and is INDEPENDENT
+// of the configured MinRelayFeeRate (the load-bearing decouple).
 func TestW135_G21_BUG1_DustRelayFeeRate(t *testing.T) {
 	if consensus.DustRelayFeeRate != 3000 {
 		t.Errorf("DustRelayFeeRate = %d, want 3000 (Core policy.h:68)",
 			consensus.DustRelayFeeRate)
 	}
-	// The constant exists; isDust just doesn't use it.
-	t.Logf("BUG-1: DustRelayFeeRate=3000 is defined in consensus/params.go, "+
-		"but isDust (mempool.go:1465) uses MinRelayFeeRate=%d instead. Direct 3× under-rejection.",
-		1000)
-	t.Skip("BUG-1 (P0-CDIV-relay): isDust uses wrong fee rate. " +
-		"audit/w135_standardness_rules.md BUG-1.")
+
+	// P2WPKH output: OP_0 <20 bytes>. isDust uses spendingSize=68 for P2WPKH,
+	// so the dust threshold is 68 * DustRelayFeeRate / 1000 = 68*3000/1000 = 204
+	// sat, regardless of the relay floor. (Note: the 68-byte spending size is the
+	// separate G22 size-formula divergence and is NOT being fixed here.)
+	p2wpkhScript := append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0x02}, 20)...)
+	const wantThreshold = 204 // 68 * 3000 / 1000
+
+	// Two different relay floors prove the dust math no longer couples to it.
+	for _, minRelay := range []int64{100, 1000} {
+		mp := New(Config{MinRelayFeeRate: minRelay, MaxSize: 1_000_000}, newTestUTXOSet())
+
+		// Value exactly one below the 3000-based threshold must be dust.
+		if !mp.isDust(&wire.TxOut{Value: wantThreshold - 1, PkScript: p2wpkhScript}) {
+			t.Errorf("minRelay=%d: P2WPKH value %d should be dust (threshold %d at DustRelayFeeRate=3000)",
+				minRelay, wantThreshold-1, wantThreshold)
+		}
+		// Value at the threshold must NOT be dust (strict <).
+		if mp.isDust(&wire.TxOut{Value: wantThreshold, PkScript: p2wpkhScript}) {
+			t.Errorf("minRelay=%d: P2WPKH value %d should NOT be dust (threshold %d)",
+				minRelay, wantThreshold, wantThreshold)
+		}
+		// Decouple proof: a value that WOULD be dust under the old
+		// MinRelayFeeRate-coupled math at minRelay=1000 (68*1000/1000=68 -> 67
+		// dust) but is well above the 100-coupled floor — under the 3000 math it
+		// is dust at BOTH floors. Pick a value (100) that is < 204 always.
+		if !mp.isDust(&wire.TxOut{Value: 100, PkScript: p2wpkhScript}) {
+			t.Errorf("minRelay=%d: P2WPKH value 100 should be dust under DustRelayFeeRate=3000 (threshold %d)",
+				minRelay, wantThreshold)
+		}
+	}
 }
 
 // G22 / BUG-1: dust math must size as GetSerializeSize(txout) + 148 (legacy) or +64 (segwit).
@@ -596,11 +624,14 @@ func TestW135_AuditFramework_CoreDustThresholdTable(t *testing.T) {
 	//   P2TR:   34 + 1 + 8 = 43 + 64 = 107 → 321 sat
 	//   P2A:    4 + 1 + 8 = 13 + 64 = 77 → 231 sat
 	//
-	// blockbrew's isDust with MinRelayFeeRate=1000 and fixed spending sizes:
-	//   P2PKH:  148 × 1000/1000 = 148 sat (3.7× under)
-	//   P2WPKH: 68 × 1000/1000 = 68 sat (4.2× under)
-	//   P2WSH:  68 × 1000/1000 = 68 sat (4.7× under)
-	//   P2TR:   58 × 1000/1000 = 58 sat (5.5× under)
+	// blockbrew's isDust now uses DustRelayFeeRate=3000 (G21/BUG-1 fee-rate
+	// coupling FIXED), but still uses the fixed-per-type spending sizes
+	// (148/68/68/58) rather than GetSerializeSize(txout)+148/+64 — that size
+	// formula is the SEPARATE G22 divergence, still skipped:
+	//   P2PKH:  148 × 3000/1000 = 444 sat  (Core 546; size-formula under)
+	//   P2WPKH: 68 × 3000/1000 = 204 sat   (Core 285; size-formula under)
+	//   P2WSH:  68 × 3000/1000 = 204 sat   (Core 321; size-formula under)
+	//   P2TR:   58 × 3000/1000 = 174 sat   (Core 321; size-formula under)
 	//   P2A:    value > 240 = "dust" (different rule entirely; see BUG-5)
 }
 

@@ -334,8 +334,8 @@ type ChainState interface {
 // Config configures the mempool.
 type Config struct {
 	MaxSize             int64 // Maximum mempool size in bytes (default: 300 MB)
-	MinRelayFeeRate     int64 // Minimum fee rate in sat/kvB (default: 1000)
-	IncrementalRelayFee int64 // Incremental relay fee in sat/kvB (default: 1000)
+	MinRelayFeeRate     int64 // Minimum fee rate in sat/kvB (default: 100, Core DEFAULT_MIN_RELAY_TX_FEE)
+	IncrementalRelayFee int64 // Incremental relay fee in sat/kvB (default: 100, Core DEFAULT_INCREMENTAL_RELAY_FEE)
 	MaxOrphanTxs        int   // Maximum orphan transactions (default: 100)
 	ChainParams         *consensus.ChainParams
 
@@ -387,8 +387,8 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{
 		MaxSize:                300_000_000, // 300 MB
-		MinRelayFeeRate:        1000,        // 1 sat/vB
-		IncrementalRelayFee:    1000,        // 1 sat/vB
+		MinRelayFeeRate:        100,         // 0.1 sat/vB (Core DEFAULT_MIN_RELAY_TX_FEE, policy.h:70)
+		IncrementalRelayFee:    100,         // 0.1 sat/vB (Core DEFAULT_INCREMENTAL_RELAY_FEE, policy.h:48)
 		MaxOrphanTxs:           100,
 		ChainParams:            consensus.MainnetParams(),
 		MempoolFullRBF:         DefaultMempoolFullRBF,
@@ -646,10 +646,10 @@ func New(config Config, utxoSet consensus.UTXOView) *Mempool {
 		config.MaxSize = 300_000_000
 	}
 	if config.MinRelayFeeRate == 0 {
-		config.MinRelayFeeRate = 1000
+		config.MinRelayFeeRate = 100 // Core DEFAULT_MIN_RELAY_TX_FEE (policy.h:70)
 	}
 	if config.IncrementalRelayFee == 0 {
-		config.IncrementalRelayFee = 1000
+		config.IncrementalRelayFee = 100 // Core DEFAULT_INCREMENTAL_RELAY_FEE (policy.h:48)
 	}
 	if config.MaxOrphanTxs == 0 {
 		config.MaxOrphanTxs = 100
@@ -1449,7 +1449,11 @@ func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 		spendingSize = 58 // Taproot key path spending size
 	}
 
-	dustThreshold := spendingSize * mp.config.MinRelayFeeRate / 1000
+	// Dust uses the dedicated DUST_RELAY_TX_FEE (3000 sat/kvB), which Core
+	// keeps INDEPENDENT of -minrelaytxfee (policy.cpp GetDustThreshold uses
+	// dustRelayFee, not the min-relay floor). Coupling these would collapse the
+	// dust threshold 30x when the relay floor sits at the Core default of 100.
+	dustThreshold := spendingSize * consensus.DustRelayFeeRate / 1000
 	return txOut.Value < dustThreshold
 }
 
@@ -1457,7 +1461,7 @@ func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 // check. It delegates to the same isDust the AddTransaction gate uses (Core's
 // IsDust, policy/policy.cpp:66), so the testmempoolaccept RPC dry-run applies
 // the IDENTICAL dust threshold as real mempool submission. Pure function of the
-// output + the configured MinRelayFeeRate — does not mutate or lock the pool.
+// output + the consensus DustRelayFeeRate (3000 sat/kvB) — does not mutate or lock the pool.
 func (mp *Mempool) IsDust(txOut *wire.TxOut) bool {
 	return mp.isDust(txOut)
 }
@@ -2759,6 +2763,26 @@ func (mp *Mempool) GetMinFeeRate() int64 {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
 	return mp.getMinFeeRateLocked()
+}
+
+// MinRelayFeeRateKvB returns the static minimum relay fee rate in sat/kvB
+// (the configured -minrelaytxfee floor). This is the Core minrelaytxfee /
+// relayfee value reported by getmempoolinfo and getnetworkinfo — distinct from
+// the dynamic GetMinFeeRate(), which folds in the rolling-eviction floor.
+// RLock-guarded read of the immutable-after-New config field.
+func (mp *Mempool) MinRelayFeeRateKvB() int64 {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.config.MinRelayFeeRate
+}
+
+// IncrementalRelayFeeKvB returns the incremental relay fee rate in sat/kvB
+// (Core -incrementalrelayfee). Reported by getmempoolinfo.incrementalrelayfee
+// and getnetworkinfo.incrementalfee. RLock-guarded read of the config field.
+func (mp *Mempool) IncrementalRelayFeeKvB() int64 {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.config.IncrementalRelayFee
 }
 
 // getMinFeeRateLocked returns the current dynamic minimum fee rate in sat/kvB.

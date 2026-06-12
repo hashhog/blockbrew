@@ -1324,13 +1324,17 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		Usage:              s.mempool.TotalSize(), // Simplified: actual usage would include overhead
 		TotalFee:           totalFee,
 		MaxMempool:         300_000_000, // 300 MB default
-		// Core defaults (policy.h): DEFAULT_MIN_RELAY_TX_FEE and
-		// DEFAULT_INCREMENTAL_RELAY_FEE are BOTH 100 sat/kvB = 0.00000100 BTC/kvB
-		// (1e-06), NOT 1000 sat/kvB. On a non-full mempool the dynamic
-		// mempoolminfee floor equals minrelaytxfee, so all three report 1e-06.
-		MempoolMinFee:       0.00000100,
-		MinRelayTxFee:       0.00000100,
-		IncrementalRelayFee: 0.00000100,
+		// Fee fields READ the live mempool policy so display == policy (no
+		// hardcoded drift). Mirrors Core rpc/mempool.cpp:1054-1056:
+		//   mempoolminfee  = max(rolling-eviction floor, minrelaytxfee)
+		//   minrelaytxfee  = the static -minrelaytxfee floor
+		//   incrementalrelayfee = the static -incrementalrelayfee
+		// All three are sat/kvB internally; divide by 1e8 to render BTC/kvB. At
+		// the Core default floor (100 sat/kvB) on a non-full mempool these all
+		// render 0.00000100.
+		MempoolMinFee:       float64(s.mempool.GetMinFeeRate()) / satoshiPerBitcoin,
+		MinRelayTxFee:       float64(s.mempool.MinRelayFeeRateKvB()) / satoshiPerBitcoin,
+		IncrementalRelayFee: float64(s.mempool.IncrementalRelayFeeKvB()) / satoshiPerBitcoin,
 		UnbroadcastCount:   0,
 		// FullRBF reflects the actual `-mempoolfullrbf` policy in force at
 		// runtime, not a hardcoded constant (W120 BUG-5 / FIX-68). Core's
@@ -1522,6 +1526,17 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 		outbound, inbound = s.peerMgr.PeerCount()
 	}
 
+	// relayfee / incrementalfee read the live mempool policy (display == policy).
+	// Fall back to the Core defaults (DEFAULT_MIN_RELAY_TX_FEE /
+	// DEFAULT_INCREMENTAL_RELAY_FEE = 100 sat/kvB) when the mempool is not wired
+	// (RPC-only tests), so the fields still render the honest 0.00000100.
+	relayFeeKvB := int64(100)
+	incrementalFeeKvB := int64(100)
+	if s.mempool != nil {
+		relayFeeKvB = s.mempool.MinRelayFeeRateKvB()
+		incrementalFeeKvB = s.mempool.IncrementalRelayFeeKvB()
+	}
+
 	// localservices: report the node's actual advertised service flags (Core's
 	// g_local_services), not a hardcoded constant. The PeerManager owns the
 	// canonical derivation (NETWORK | WITNESS | NETWORK_LIMITED, + P2P_V2 when v2
@@ -1556,10 +1571,12 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 			{Name: "i2p", Limited: true, Reachable: false, Proxy: "", ProxyRandomizeCredentials: false},
 			{Name: "cjdns", Limited: true, Reachable: false, Proxy: "", ProxyRandomizeCredentials: false},
 		},
-		// relayfee / incrementalfee: Core's DEFAULT_MIN_RELAY_TX_FEE and
-		// DEFAULT_INCREMENTAL_RELAY_FEE are both 100 sat/kvB = 0.00000100 BTC/kvB.
-		RelayFee:       0.00000100,
-		IncrementalFee: 0.00000100,
+		// relayfee / incrementalfee READ the live mempool policy so display ==
+		// policy (Core rpc/net.cpp:717-718: relayfee = minrelaytxfee,
+		// incrementalfee = incrementalrelayfee). sat/kvB / 1e8 -> BTC/kvB. At the
+		// Core default 100 sat/kvB floor these render 0.00000100.
+		RelayFee:       float64(relayFeeKvB) / satoshiPerBitcoin,
+		IncrementalFee: float64(incrementalFeeKvB) / satoshiPerBitcoin,
 		LocalAddresses: []interface{}{},
 		Warnings:       []string{},
 	}, nil
