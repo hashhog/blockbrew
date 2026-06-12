@@ -81,7 +81,48 @@ const (
 	// (50000) which caps inv messages. Sending more than 1000 items in a
 	// single getdata wastes bandwidth (50× amplification if MaxInvVects used).
 	MaxGetDataSize = 1000
+
+	// MaxPctAddrToSend is the maximum percentage of the addrman shared in a
+	// single getaddr response. Bitcoin Core net_processing.cpp:188
+	// (MAX_PCT_ADDR_TO_SEND = 23). The getaddr response is capped at
+	// min(MaxAddresses, floor(MaxPctAddrToSend * size / 100)) — the primary
+	// getaddr anti-DoS / anti-fingerprinting limit.
+	MaxPctAddrToSend = 23
 )
+
+// Addr token-bucket constants for INBOUND addr rate limiting (Bitcoin Core
+// net_processing.cpp:193-197). The per-peer bucket refills at
+// MaxAddrRatePerSecond tokens/sec, capped (for the time-based refill) at
+// MaxAddrProcessingTokenBucket; each processed address consumes one token and
+// surplus addresses are dropped once the bucket runs dry.
+const (
+	// MaxAddrRatePerSecond is Core MAX_ADDR_RATE_PER_SECOND = 0.1 (1 addr / 10s).
+	MaxAddrRatePerSecond = 0.1
+	// MaxAddrProcessingTokenBucket is Core MAX_ADDR_PROCESSING_TOKEN_BUCKET,
+	// which equals MAX_ADDR_TO_SEND = 1000 (= MaxAddresses).
+	MaxAddrProcessingTokenBucket = float64(MaxAddresses)
+)
+
+// getaddrCap computes the getaddr 23%-cap over an addrman of `size` entries:
+// the number of addresses we are willing to return in a single getaddr
+// response, i.e. min(MaxAddresses, floor(MaxPctAddrToSend * size / 100)).
+//
+// Mirrors Bitcoin Core AddrManImpl::GetAddr_ (addrman.cpp:797-804):
+//
+//	nNodes = max_pct * nNodes / 100;          // integer division == FLOOR
+//	nNodes = std::min(nNodes, max_addresses);
+//
+// Integer division (FLOOR), NOT ceil — matches Core exactly.
+func getaddrCap(size int) int {
+	if size <= 0 {
+		return 0
+	}
+	n := MaxPctAddrToSend * size / 100
+	if n > MaxAddresses {
+		n = MaxAddresses
+	}
+	return n
+}
 
 // MessageHeader represents a Bitcoin P2P message header.
 type MessageHeader struct {
