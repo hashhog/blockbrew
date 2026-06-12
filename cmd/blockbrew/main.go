@@ -536,7 +536,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.RPCTLSCert, "rpc-tls-cert", "", "Path to a PEM-encoded x509 certificate for HTTPS-terminating the RPC + REST socket. Must be paired with -rpc-tls-key. Empty (default) = serve plain HTTP. Setting exactly one of cert/key is a startup error. Required for BIP-78 clearnet PayJoin endpoints (W119 / FIX-64).")
 	flag.StringVar(&cfg.RPCTLSKey, "rpc-tls-key", "", "Path to a PEM-encoded private key paired with -rpc-tls-cert. Empty (default) = serve plain HTTP. See -rpc-tls-cert.")
 	flag.Int64Var(&cfg.MaxMempool, "maxmempool", 300, "Maximum mempool size in MB")
-	flag.Float64Var(&cfg.MinRelayFee, "minrelayfee", 0.00001, "Minimum relay fee (BTC/kvB)")
+	flag.Float64Var(&cfg.MinRelayFee, "minrelayfee", 0.000001, "Minimum relay fee (BTC/kvB). Default 0.000001 = 100 sat/kvB == Core DEFAULT_MIN_RELAY_TX_FEE (policy.h:70).")
 	flag.BoolVar(&cfg.MempoolFullRBF, "mempoolfullrbf", true, "Accept mempool replacements without BIP-125 opt-in signaling (Core v28+ default; DEFAULT_MEMPOOL_FULL_RBF=true). When true, Rule 1 is skipped — every conflict is replaceable subject to Rules 3/4/5 + ImprovesFeerateDiagram. When false (legacy), conflicts must signal (directly or via in-mempool ancestor) to be replaceable. The `getmempoolinfo.fullrbf` field reflects this setting. W120 BUG-5 / FIX-68.")
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "Print version and exit")
 	flag.StringVar(&cfg.PprofAddr, "pprof", "", "pprof HTTP server address (e.g., localhost:6060)")
@@ -943,12 +943,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// (the unit every downstream consumer uses: the min-relay gate
 	// `fee/vsize*1000`, and the dust threshold `spendingSize*MinRelayFeeRate/1000`
 	// — see mempool.go:isDust / validateTransactionLocked). The conversion is
-	// therefore BTC/kvB * COIN = sat/kvB. The default 0.00001 BTC/kvB maps to
-	// 1000 sat/kvB, exactly Bitcoin Core's DEFAULT_MIN_RELAY_TX_FEE
-	// (policy/policy.h). A stray extra `/1000` here previously produced 1
-	// sat/kvB, collapsing the dust threshold to 0 (68*1/1000 == 0) so NO output
-	// was ever dust — testmempoolaccept then accepted dust txns that default
-	// Core rejects. Removing the `/1000` restores the genuine relay-policy floor.
+	// therefore BTC/kvB * COIN = sat/kvB. The default 0.000001 BTC/kvB maps to
+	// 100 sat/kvB, exactly Bitcoin Core's DEFAULT_MIN_RELAY_TX_FEE
+	// (policy/policy.h:70 == 100, NOT 1000). Dust is decoupled from this floor:
+	// isDust uses consensus.DustRelayFeeRate (3000 sat/kvB, Core DUST_RELAY_TX_FEE)
+	// independently, so dropping the relay floor to 100 does NOT collapse dust.
+	// A stray extra `/1000` here previously produced sub-sat sat/kvB, collapsing
+	// the relay floor; the conversion is a plain BTC/kvB * COIN.
 	minRelayFeeRate := int64(cfg.MinRelayFee * 100_000_000) // BTC/kvB to sat/kvB
 	mp := mempool.New(mempool.Config{
 		MaxSize:         cfg.MaxMempool * 1_000_000,

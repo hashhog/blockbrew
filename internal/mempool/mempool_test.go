@@ -1625,16 +1625,16 @@ func TestGetMinFee(t *testing.T) {
 
 // TestIncrementalRelayFeeConfig tests that the config defaults are applied correctly.
 func TestIncrementalRelayFeeConfig(t *testing.T) {
-	// Test default config
+	// Test default config (Core DEFAULT_INCREMENTAL_RELAY_FEE = 100, policy.h:48)
 	config := DefaultConfig()
-	if config.IncrementalRelayFee != 1000 {
-		t.Errorf("DefaultConfig().IncrementalRelayFee = %d, want 1000", config.IncrementalRelayFee)
+	if config.IncrementalRelayFee != 100 {
+		t.Errorf("DefaultConfig().IncrementalRelayFee = %d, want 100", config.IncrementalRelayFee)
 	}
 
 	// Test that New() applies defaults
 	mp := New(Config{}, nil)
-	if mp.config.IncrementalRelayFee != 1000 {
-		t.Errorf("New(Config{}).config.IncrementalRelayFee = %d, want 1000", mp.config.IncrementalRelayFee)
+	if mp.config.IncrementalRelayFee != 100 {
+		t.Errorf("New(Config{}).config.IncrementalRelayFee = %d, want 100", mp.config.IncrementalRelayFee)
 	}
 
 	// Test custom value is preserved

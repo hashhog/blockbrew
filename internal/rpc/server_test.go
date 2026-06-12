@@ -390,6 +390,21 @@ func TestGetMempoolInfo(t *testing.T) {
 		t.Errorf("expected empty mempool, got size %v", size)
 	}
 
+	// Fee-display fields READ the live policy (display == policy). DefaultConfig
+	// sets the Core default 100 sat/kvB floor for both min-relay and incremental,
+	// and on an empty mempool the dynamic mempoolminfee equals the min-relay
+	// floor, so all three render 0.00000100 BTC/kvB.
+	for _, f := range []string{"mempoolminfee", "minrelaytxfee", "incrementalrelayfee"} {
+		v, ok := result[f].(float64)
+		if !ok {
+			t.Errorf("getmempoolinfo.%s missing or not a number: %v", f, result[f])
+			continue
+		}
+		if v != 0.00000100 {
+			t.Errorf("getmempoolinfo.%s = %v, want 0.00000100 (honest read of 100 sat/kvB floor)", f, v)
+		}
+	}
+
 	// W120 BUG-5 / FIX-68: getmempoolinfo.fullrbf reflects the actual
 	// mp.FullRBF() value, not a hardcoded constant. DefaultConfig() turns
 	// on fullrbf to mirror Core DEFAULT_MEMPOOL_FULL_RBF=true.
@@ -657,6 +672,20 @@ func TestGetNetworkInfo(t *testing.T) {
 
 	if subver, ok := result["subversion"].(string); !ok || subver == "" {
 		t.Error("expected non-empty subversion")
+	}
+
+	// relayfee / incrementalfee READ the live policy (display == policy). With
+	// no mempool wired the handler falls back to the Core default 100 sat/kvB
+	// floor, so both render the honest 0.00000100 BTC/kvB.
+	for _, f := range []string{"relayfee", "incrementalfee"} {
+		v, ok := result[f].(float64)
+		if !ok {
+			t.Errorf("getnetworkinfo.%s missing or not a number: %v", f, result[f])
+			continue
+		}
+		if v != 0.00000100 {
+			t.Errorf("getnetworkinfo.%s = %v, want 0.00000100 (honest read of 100 sat/kvB floor)", f, v)
+		}
 	}
 }
 
