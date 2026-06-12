@@ -222,6 +222,15 @@ type Config struct {
 	// index. Mirrors Bitcoin Core's `-coinstatsindex` (init.cpp).
 	CoinStatsIndex bool
 
+	// TxoSpenderIndex maintains a transaction-output spender index: for every
+	// input of every block it records (spent outpoint -> spending txid). Used
+	// by the confirmed-spend path of the gettxspendingprevout RPC. Default OFF,
+	// matching Bitcoin Core's `-txospenderindex=0`
+	// (DEFAULT_TXOSPENDERINDEX{false}, index/txospenderindex.h). The RPC itself
+	// is always registered (its mempool form always works); only the
+	// confirmed/index path requires this flag.
+	TxoSpenderIndex bool
+
 	// ASMap is the path to an ASMap binary file for AS-level peer bucketing
 	// and eclipse-resistance diversity. When set, blockbrew loads and
 	// validates the file (up to 8 MiB) at startup and uses the embedded
@@ -565,6 +574,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", "Load a Bitcoin Core-format UTXO snapshot (utxo\\xff magic) from <path> before starting the node. Only acted on when the chainstate is fresh (height==0); otherwise an error is logged and the snapshot is skipped. Mirrors Bitcoin Core's `-loadsnapshot=<path>`.")
 	flag.BoolVar(&cfg.BlockFilterIndex, "blockfilterindex", false, "Maintain the BIP-157/158 basic compact-block-filter index. Default OFF (matches Bitcoin Core's `-blockfilterindex=0`). When ON, blockbrew populates the index on every connected block, rewinds it on disconnect (Phase 2 reorg-aware), and exposes the resulting filters via /rest/blockfilter, /rest/blockfilterheaders, and the getblockfilter RPC.")
 	flag.BoolVar(&cfg.CoinStatsIndex, "coinstatsindex", false, "Maintain the coinstatsindex (per-height UTXO-set MuHash + counts: txouts, bogosize, total_amount). Default OFF (matches Bitcoin Core's `-coinstatsindex=0`). When ON, gettxoutsetinfo can be queried for a specific block height/hash with hash_type muhash|none, served from the index; getindexinfo reports it.")
+	flag.BoolVar(&cfg.TxoSpenderIndex, "txospenderindex", false, "Maintain a transaction output spender index (spent outpoint -> spending txid), used by the gettxspendingprevout RPC call. Default OFF (matches Bitcoin Core's `-txospenderindex=0`). When ON, gettxspendingprevout can resolve confirmed spends (mempool_only=false); getindexinfo reports it. The RPC's mempool form works regardless of this flag.")
 	flag.StringVar(&cfg.ASMap, "asmap", "", "Path to an ASMap binary file for AS-level peer bucketing and eclipse-resistance diversity. When set, blockbrew loads the file (max 8 MiB), validates its trie, and uses it to map peer IPs to Autonomous System Numbers. Peer diversity is then enforced at the AS level rather than /16 subnet. Leave empty (default) to use legacy /16 grouping. Mirrors Bitcoin Core's `-asmap=<file>` (init.cpp).")
 	flag.Var(&cfg.Connect, "connect", "Connect ONLY to the specified <ip:port> peer(s) and disable both DNS-seed resolution and addrman/auto-outbound dialing. Repeatable / comma-separated. Mirrors Bitcoin Core's `-connect=<ip:port>` (implies -dnsseed=0 and turns off automatic outbound connections). The pinned peers are dialed as manual connections and re-dialed if they drop. Empty (default) = normal peer discovery.")
 	flag.BoolVar(&cfg.NoDNSSeed, "nodnsseed", false, "Disable DNS-seed resolution without otherwise changing peer discovery (addrman/auto-outbound dialing still runs). Mirrors Bitcoin Core's `-dnsseed=0` / `-nodnsseed`. Implied automatically when -connect is set.")
@@ -1017,6 +1027,24 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		log.Printf("coinstatsindex enabled (best_height=%d)", coinStatsIndex.BestHeight())
 	}
 
+	// txospenderindex (spent outpoint -> spending txid). Mirrors Bitcoin Core's
+	// `-txospenderindex` (index/txospenderindex.cpp). Registered in the same
+	// IndexManager as the other secondary indexes so the live connect/disconnect
+	// hooks and the startup CatchUp drive it unchanged. Like txindex (and unlike
+	// coinstatsindex) it needs NO undo data: both the connect and disconnect
+	// paths derive their keys purely from each block's own inputs (Core's
+	// CustomAppend/CustomRemove(BuildSpenderPositions(block))). No genesis row:
+	// the genesis coinbase has only the null prevout, so the connect hook starts
+	// recording real spends at height 1.
+	var txoSpenderIndex *storage.TxoSpenderIndex
+	if cfg.TxoSpenderIndex {
+		txoSpenderIndex = storage.NewTxoSpenderIndex(chainDB.DB())
+		if err := indexManager.RegisterIndex(txoSpenderIndex); err != nil {
+			return fmt.Errorf("txospenderindex: register: %w", err)
+		}
+		log.Printf("txospenderindex enabled (best_height=%d)", txoSpenderIndex.BestHeight())
+	}
+
 	// 6a-bis. Secondary-index startup catch-up. Mirrors Bitcoin Core's
 	// BaseIndex::Sync / Rewind (index/base.cpp): on startup each enabled index
 	// must be walked forward from its persisted best block to the active chain
@@ -1028,7 +1056,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// AFTER the chainstate + header-index load (NewChainManager above) and
 	// BEFORE the P2P sync manager starts connecting new blocks, so the index
 	// is consistent with the tip before live connects resume.
-	if cfg.BlockFilterIndex || cfg.CoinStatsIndex {
+	if cfg.BlockFilterIndex || cfg.CoinStatsIndex || cfg.TxoSpenderIndex {
 		_, tipHeight := chainMgr.BestBlock()
 		if err := indexManager.CatchUp(tipHeight, chainDB.GetBlockHashByHeight); err != nil {
 			// Non-fatal, matching the live index hooks' posture: log loudly
@@ -1132,6 +1160,16 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			blockHash := block.Header.BlockHash()
 			if err := coinStatsIndex.RevertBlock(block, height, blockHash, nil); err != nil {
 				log.Printf("coinstatsindex: revert %s @ height=%d failed: %v",
+					blockHash.String()[:16], height, err)
+			}
+		}
+		// txospenderindex: erase this block's spend entries. Like txindex,
+		// RevertBlock re-derives the keys from the block's own inputs (no undo
+		// data), so nil is correct — Core CustomRemove(BuildSpenderPositions).
+		if txoSpenderIndex != nil {
+			blockHash := block.Header.BlockHash()
+			if err := txoSpenderIndex.RevertBlock(block, height, blockHash, nil); err != nil {
+				log.Printf("txospenderindex: revert %s @ height=%d failed: %v",
 					blockHash.String()[:16], height, err)
 			}
 		}
@@ -1284,6 +1322,16 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			}
 			if err := coinStatsIndex.WriteBlock(block, height, blockHash, undo); err != nil {
 				log.Printf("coinstatsindex: write %s @ height=%d failed: %v",
+					blockHash.String()[:16], height, err)
+			}
+		}
+		// txospenderindex: record (spent outpoint -> spending txid) for every
+		// non-coinbase input. Needs NO undo data — the keys are a pure function
+		// of the block's inputs (Core CustomAppend(BuildSpenderPositions)), so
+		// pass nil. Works identically on a live connect and a reorg reconnect.
+		if txoSpenderIndex != nil {
+			if err := txoSpenderIndex.WriteBlock(block, height, blockHash, nil); err != nil {
+				log.Printf("txospenderindex: write %s @ height=%d failed: %v",
 					blockHash.String()[:16], height, err)
 			}
 		}
