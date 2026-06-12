@@ -428,6 +428,63 @@ func (ab *AddressBook) AllAddresses() []*KnownAddress {
 	return all
 }
 
+// ShareableCount returns the number of addresses eligible to be advertised in a
+// getaddr response — the pool over which the getaddr 23%-cap is computed. We
+// share addresses we have successfully connected to (LastSuccess set), the same
+// "Good" filter used by GetAddressesForGetAddr below; this is analogous to Core
+// computing the cap over its addrman.
+func (ab *AddressBook) ShareableCount() int {
+	ab.mu.RLock()
+	defer ab.mu.RUnlock()
+	n := 0
+	for _, ka := range ab.addrs {
+		if !ka.LastSuccess.IsZero() {
+			n++
+		}
+	}
+	return n
+}
+
+// GetAddressesForGetAddr returns a randomly-selected subset of shareable
+// addresses for answering a getaddr message, capped at the getaddr 23%-cap
+// (min(MaxAddresses, floor(MaxPctAddrToSend*size/100))). Mirrors Bitcoin Core
+// AddrManImpl::GetAddr_ (addrman.cpp:792): the percentage is applied over the
+// shareable pool and the result is a random sample — never the full table.
+func (ab *AddressBook) GetAddressesForGetAddr() []NetAddress {
+	ab.mu.RLock()
+	good := make([]*KnownAddress, 0, len(ab.addrs))
+	for _, ka := range ab.addrs {
+		if !ka.LastSuccess.IsZero() {
+			good = append(good, ka)
+		}
+	}
+	ab.mu.RUnlock()
+
+	limit := getaddrCap(len(good))
+	if limit <= 0 {
+		return nil
+	}
+
+	// Random sample (Core returns a random permutation prefix from vRandom).
+	ab.mu.Lock()
+	ab.rand.Shuffle(len(good), func(i, j int) { good[i], good[j] = good[j], good[i] })
+	ab.mu.Unlock()
+
+	if limit > len(good) {
+		limit = len(good)
+	}
+	out := make([]NetAddress, 0, limit)
+	for _, ka := range good[:limit] {
+		na := ka.Addr
+		na.Timestamp = uint32(ka.LastSeen.Unix())
+		if ka.LastSeen.IsZero() {
+			na.Timestamp = uint32(time.Now().Unix())
+		}
+		out = append(out, na)
+	}
+	return out
+}
+
 // NeedMoreAddresses returns true if we should request more addresses from peers.
 func (ab *AddressBook) NeedMoreAddresses() bool {
 	ab.mu.RLock()

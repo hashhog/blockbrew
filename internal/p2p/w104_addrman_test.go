@@ -425,28 +425,41 @@ func TestW104_G21_G25_PeersDatPersistenceMissing(t *testing.T) {
 // ANTI-DOS GATES (G26–G30)
 // ────────────────────────────────────────────────────────────────────────────
 
-// BUG-26 (G26): Add() rate-limit (addr token bucket) absent.
-// Core net_processing.cpp:5646 maintains per-peer m_addr_token_bucket
-// (rate: 1 addr/10s, max MAX_ADDR_PROCESSING_TOKEN_BUCKET=1000).
-// Peers exceeding the bucket get addr flood protection.
-// blockbrew's OnAddr handler in peermgr.go:1452 caps at MaxAddresses=1000
-// per message but has no token-bucket rate limiting across messages.
-func TestW104_G26_AddrTokenBucketRateLimitAbsent(t *testing.T) {
-	// Core: each addr consumes 1 token; bucket refills at 1 per 10s;
-	// bucket starts at 1 and caps at MAX_ADDR_PROCESSING_TOKEN_BUCKET=1000.
-	// Excess addresses are silently dropped (not Misbehaving).
-	//
-	// blockbrew: the only guard is `if len(addrs) > MaxAddresses { addrs = addrs[:MaxAddresses] }`
-	// at message receipt.  A peer can send 1000-address messages repeatedly
-	// at high rate; each batch is accepted in full.
+// BUG-26 (G26) FIXED: Add() rate-limit (addr token bucket) PRESENT.
+// Core net_processing.cpp:5644-5671 maintains per-peer m_addr_token_bucket
+// (init 1.0, refill elapsed*MAX_ADDR_RATE_PER_SECOND=0.1, soft cap
+// MAX_ADDR_PROCESSING_TOKEN_BUCKET=1000, spend 1/addr). Excess addresses are
+// silently dropped for rate-limited (non-Addr-permission) peers.
+//
+// blockbrew now implements this on Peer.takeAddrTokens, wired into the live
+// OnAddr AND OnAddrv2 handlers (peermgr.admitAddrTokens / admitAddrV2Tokens)
+// sharing ONE per-peer bucket. The assertion is FLIPPED from "absent" to
+// "present and Core-exact".
+func TestW104_G26_AddrTokenBucketRateLimit(t *testing.T) {
+	// Constants must match Core exactly.
+	if MaxAddrRatePerSecond != 0.1 {
+		t.Errorf("G26: MaxAddrRatePerSecond = %v, want 0.1 (Core MAX_ADDR_RATE_PER_SECOND)", MaxAddrRatePerSecond)
+	}
+	if MaxAddrProcessingTokenBucket != 1000 {
+		t.Errorf("G26: MaxAddrProcessingTokenBucket = %v, want 1000 (Core = MAX_ADDR_TO_SEND)", MaxAddrProcessingTokenBucket)
+	}
 
-	pm := NewPeerManager(PeerManagerConfig{
-		MaxOutbound: 1,
-	})
+	pm := NewPeerManager(PeerManagerConfig{MaxOutbound: 1})
+	p := &Peer{addr: "203.0.113.9:8333", inbound: true,
+		sendQueue: make(chan Message, 4), quit: make(chan struct{})}
 
-	// Confirm no token bucket field exists in PeerManager or AddressBook.
-	_ = pm
-	t.Log("BUG-26: no per-peer addr token bucket; ADDR flood protection absent (Core m_addr_token_bucket)")
+	// Bucket starts at 1.0 → only ONE address admitted from a flood batch.
+	batch := make([]NetAddress, 500)
+	for i := range batch {
+		batch[i] = NetAddress{IP: net.IPv4(9, 9, byte(i>>8), byte(i)), Port: 8333}
+	}
+	if got := pm.admitAddrTokens(p, batch); len(got) != 1 {
+		t.Errorf("G26: first flood batch (bucket=1.0) must admit exactly 1, admitted %d", len(got))
+	}
+	// Immediate follow-up batch → bucket drained → 0 admitted (flood protection).
+	if got := pm.admitAddrTokens(p, batch); len(got) != 0 {
+		t.Errorf("G26: drained bucket must admit 0 on the next immediate batch, admitted %d", len(got))
+	}
 }
 
 // TestW104_G27_SourceRoutabilityCheck verifies that non-routable addresses are
@@ -571,27 +584,40 @@ func TestW104_G30_AddrManKeyPerLaunchAbsent(t *testing.T) {
 // ADDITIONAL / CROSS-GATE FINDINGS
 // ────────────────────────────────────────────────────────────────────────────
 
-// BUG-15 (G2): GetAddr max pct (23%) gate absent.
-// Core GetAddr_: returns min(max_addresses, max_pct% of total, 1000).
-// Default max_pct is 23% — a node never reveals more than 23% of its address
-// table in a single getaddr response.  blockbrew has no GetAddr() method on
-// AddressBook; the OnAddr listener simply stores received addresses but there
-// is no controlled response to getaddr that limits disclosure.
-func TestW104_G2_GetAddrMaxPctAbsent(t *testing.T) {
-	// Add 1000 addresses
+// BUG-15 (G2) FIXED: GetAddr max pct (23%) gate PRESENT.
+// Core GetAddr_ (addrman.cpp:797-804): returns min(max_addresses,
+// floor(max_pct% * total)). Default max_pct is 23 — a node never reveals more
+// than 23% of its shareable address pool in a single getaddr response.
+// blockbrew now has AddressBook.GetAddressesForGetAddr() (capped via
+// getaddrCap) wired into the live OnGetAddr handler (peermgr.handleGetAddr).
+// This was previously absent; the assertion is FLIPPED from "absent" to
+// "present and Core-exact (FLOOR, not ceil)".
+func TestW104_G2_GetAddrMaxPct(t *testing.T) {
+	// 200 shareable (successfully-connected) addresses → cap = floor(23*200/100) = 46.
 	ab := NewAddressBook()
 	for i := 0; i < 200; i++ {
-		ab.AddAddress(NetAddress{
-			IP:   net.ParseIP(itoa(1+i/200) + "." + itoa(i/100+1) + "." + itoa((i/10)%10) + "." + itoa(i%10+1)),
-			Port: 8333,
-		}, "test")
+		ip := net.IPv4(byte(8+i/65536), byte(i>>16), byte(i>>8), byte(i))
+		na := NetAddress{IP: ip, Port: 8333}
+		ab.AddAddress(na, "test")
+		ab.MarkSuccess(net.JoinHostPort(ip.String(), "8333"))
 	}
 
-	// Core: getaddr response would be capped at 23% of total (max 1000).
-	// blockbrew has no GetAddr() method — no controlled getaddr response at all.
-	// The OnAddr listener only INGESTS addresses; there is no outbound
-	// address-serving path with the 23% cap.
-	t.Logf("BUG-15: no GetAddr() method; 23%% disclosure cap absent; addr table has %d entries", ab.Size())
+	pool := ab.ShareableCount()
+	if pool == 0 {
+		t.Fatal("G2: expected a non-empty shareable pool")
+	}
+	want := getaddrCap(pool) // floor(23*pool/100), clamped to MaxAddresses
+	got := ab.GetAddressesForGetAddr()
+	if len(got) != want {
+		t.Errorf("G2: getaddr response = %d, want exactly the 23%% cap %d over pool %d", len(got), want, pool)
+	}
+	if len(got) > MaxAddresses {
+		t.Errorf("G2: getaddr response %d exceeds MaxAddresses %d", len(got), MaxAddresses)
+	}
+	// FLOOR, not ceil: floor(23*200/100) = 46.
+	if want != 46 {
+		t.Errorf("G2: 23%% cap over 200 shareable = %d, want 46 (Core floor(23*200/100))", want)
+	}
 }
 
 // BUG-16: AddressBook uses math/rand (non-CSPRNG) for selection.

@@ -1982,6 +1982,75 @@ func (pm *PeerManager) LocalServices() uint64 {
 	return services
 }
 
+// handleGetAddr answers an inbound getaddr with the full Bitcoin Core anti-DoS
+// guards (net_processing.cpp:4816-4849):
+//
+//   - getaddr from an OUTBOUND peer is ignored — the asymmetric inbound-only
+//     behaviour prevents a fingerprinting attack where an attacker seeds fake
+//     addresses and later requests them back (Core: if (!pfrom.IsInboundConn())
+//     return);
+//   - only the FIRST getaddr per connection is answered; repeats are ignored
+//     (Core m_getaddr_recvd, net_processing.cpp:4833);
+//   - the response is capped at min(MaxAddresses, floor(23*size/100)) via
+//     getaddrCap over the shareable pool (Core MAX_PCT_ADDR_TO_SEND = 23).
+func (pm *PeerManager) handleGetAddr(p *Peer) {
+	if p == nil {
+		return
+	}
+	// Ignore getaddr from outbound peers (anti-fingerprinting).
+	if !p.Inbound() {
+		return
+	}
+	// Only answer the first getaddr per connection.
+	if !p.markGetAddrRecvd() {
+		return
+	}
+	// Build a capped, randomly-sampled response from the addr book.
+	addrs := pm.addrBook.GetAddressesForGetAddr()
+	if len(addrs) == 0 {
+		// Core still sends an (empty) response set; we have nothing to share,
+		// so we send nothing — sending an empty addr is a no-op for the peer.
+		return
+	}
+	p.SendMessage(&MsgAddr{AddrList: addrs})
+}
+
+// admitAddrTokens applies the inbound-addr leaky token bucket to a slice of
+// received addresses and returns the prefix that may be admitted. NoBan /
+// whitelisted (manual) peers bypass the limit entirely (Core only rate-limits
+// peers WITHOUT NetPermissionFlags::Addr; manual/whitelisted peers carry that
+// permission). The bucket is per-peer and shared with admitAddrV2Tokens.
+func (pm *PeerManager) admitAddrTokens(p *Peer, addrs []NetAddress) []NetAddress {
+	if p == nil {
+		return addrs
+	}
+	if p.IsNoBan() {
+		return addrs
+	}
+	admit := p.takeAddrTokens(len(addrs))
+	if admit >= len(addrs) {
+		return addrs
+	}
+	return addrs[:admit]
+}
+
+// admitAddrV2Tokens is the addrv2 counterpart of admitAddrTokens. It draws from
+// the SAME per-peer token bucket so a peer cannot evade the inbound-addr rate
+// limit by sending addrv2 instead of addr.
+func (pm *PeerManager) admitAddrV2Tokens(p *Peer, addrs []NetAddressV2) []NetAddressV2 {
+	if p == nil {
+		return addrs
+	}
+	if p.IsNoBan() {
+		return addrs
+	}
+	admit := p.takeAddrTokens(len(addrs))
+	if admit >= len(addrs) {
+		return addrs
+	}
+	return addrs[:admit]
+}
+
 // wrapListeners wraps the configured listeners to add our own handlers.
 func (pm *PeerManager) wrapListeners() *PeerListeners {
 	listeners := &PeerListeners{}
@@ -1989,6 +2058,16 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 	// Copy existing listeners if provided
 	if pm.config.Listeners != nil {
 		*listeners = *pm.config.Listeners
+	}
+
+	// Wrap OnGetAddr to answer a getaddr with the addr anti-DoS guards
+	// (Bitcoin Core net_processing.cpp:4816-4849).
+	originalOnGetAddr := listeners.OnGetAddr
+	listeners.OnGetAddr = func(p *Peer, msg *MsgGetAddr) {
+		pm.handleGetAddr(p)
+		if originalOnGetAddr != nil {
+			originalOnGetAddr(p, msg)
+		}
 	}
 
 	// Wrap OnAddr to add addresses to our book
@@ -1999,6 +2078,12 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 		if len(addrs) > MaxAddresses {
 			addrs = addrs[:MaxAddresses]
 		}
+
+		// Inbound-addr leaky token bucket (Core ProcessAddrs rate limiter):
+		// admit at most floor(bucket) addresses; drop the surplus for
+		// non-NoBan / non-manual peers. The SAME per-peer bucket is shared
+		// with the addrv2 handler so addrv2 cannot bypass the limit.
+		addrs = pm.admitAddrTokens(p, addrs)
 
 		// Add to address book
 		source := "unknown"
@@ -2024,6 +2109,12 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 		if len(addrs) > MaxAddresses {
 			addrs = addrs[:MaxAddresses]
 		}
+
+		// Inbound-addr leaky token bucket — shares ONE per-peer bucket with
+		// the addr handler above so a peer cannot exceed the inbound-addr rate
+		// limit by switching to addrv2 (Core uses one m_addr_token_bucket for
+		// both the addr and addrv2 ProcessAddrs paths).
+		addrs = pm.admitAddrV2Tokens(p, addrs)
 
 		// Add to address book
 		source := "unknown"

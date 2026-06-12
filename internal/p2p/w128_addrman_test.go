@@ -367,18 +367,34 @@ func TestW128_G16_PeersDatPersistenceAbsent(t *testing.T) {
 	t.Log("BUG-15 (P0): no peers.dat; every restart cold-starts via DNS seeds; DNS attacker can bias initial peer set")
 }
 
-// G17 (BUG-16): addr_token_bucket per-peer rate limit.
-// No tokenbucket / rate-limit on incoming addr messages.
-func TestW128_G17_AddrTokenBucketAbsent(t *testing.T) {
+// G17 (BUG-16) FIXED: addr_token_bucket per-peer rate limit PRESENT.
+// Core net_processing.cpp:5644-5671 rate-limits incoming addr messages with a
+// per-peer leaky token bucket. blockbrew now carries addrTokenBucket /
+// addrTokenTimestamp on Peer and enforces them via takeAddrTokens (wired into
+// OnAddr + OnAddrv2). The assertion is FLIPPED from "absent" to "present".
+func TestW128_G17_AddrTokenBucketPresent(t *testing.T) {
 	p := &Peer{}
 	v := reflect.ValueOf(p).Elem()
+	found := false
 	for i := 0; i < v.NumField(); i++ {
 		name := strings.ToLower(v.Type().Field(i).Name)
 		if strings.Contains(name, "tokenbucket") || strings.Contains(name, "token_bucket") {
-			t.Errorf("BUG-16 FIXED? unexpected token-bucket field on Peer")
+			found = true
 		}
 	}
-	t.Log("BUG-16: addr_token_bucket missing; misbehaving peer can flood our addrbook at full message-rate")
+	if !found {
+		t.Error("BUG-16 REGRESSED: addr token-bucket field missing from Peer")
+	}
+
+	// Behavioural proof: the bucket starts at 1.0 and admits exactly one addr
+	// before draining, then refills at MaxAddrRatePerSecond.
+	peer := &Peer{}
+	if got := peer.takeAddrTokens(100); got != 1 {
+		t.Errorf("BUG-16: initial bucket (1.0) must admit exactly 1 addr, admitted %d", got)
+	}
+	if got := peer.takeAddrTokens(100); got != 0 {
+		t.Errorf("BUG-16: drained bucket must admit 0 on the next immediate call, admitted %d", got)
+	}
 }
 
 // G18 (BUG-17): ADDRMAN_HORIZON / RETRIES / MAX_FAILURES / MIN_FAIL / REPLACEMENT

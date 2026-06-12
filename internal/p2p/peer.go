@@ -76,6 +76,7 @@ type PeerListeners struct {
 	OnPing        func(p *Peer, msg *MsgPing)
 	OnPong        func(p *Peer, msg *MsgPong)
 	OnAddr        func(p *Peer, msg *MsgAddr)
+	OnGetAddr     func(p *Peer, msg *MsgGetAddr)
 	OnGetData     func(p *Peer, msg *MsgGetData)
 	OnGetHeaders  func(p *Peer, msg *MsgGetHeaders)
 	OnNotFound    func(p *Peer, msg *MsgNotFound)
@@ -222,6 +223,103 @@ type Peer struct {
 	// Bitcoin Core equivalent: HasPermission(NetPermissionFlags::NoBan).
 	// Set by the peer manager for whitelisted / explicitly trusted peers.
 	noBan bool
+
+	// addrMu guards the getaddr/addr anti-DoS state below.
+	addrMu sync.Mutex
+	// getaddrRecvd records whether we have already answered a getaddr from
+	// this peer. Bitcoin Core net_processing.cpp:4833 (peer.m_getaddr_recvd):
+	// only the FIRST getaddr per connection is answered; subsequent ones are
+	// ignored to reduce resource waste and discourage addr stamping.
+	getaddrRecvd bool
+	// addrTokenBucket is the INBOUND addr leaky token bucket. Core
+	// net_processing.cpp:380 (m_addr_token_bucket) initialises to 1.0; it
+	// refills at MaxAddrRatePerSecond tokens/sec (capped at
+	// MaxAddrProcessingTokenBucket on the time-based refill) and each admitted
+	// address consumes one token. A SINGLE bucket is shared by both the addr
+	// and addrv2 handlers so addrv2 cannot bypass the limit.
+	addrTokenBucket float64
+	// addrTokenTimestamp is when addrTokenBucket was last refilled. Core
+	// m_addr_token_timestamp (initialised to "now").
+	addrTokenTimestamp time.Time
+	// addrTokenInit guards lazy one-time initialisation of the bucket to 1.0
+	// for peers constructed before this field existed.
+	addrTokenInit bool
+}
+
+// markGetAddrRecvd records that we have answered a getaddr from this peer and
+// returns true if this is the FIRST getaddr (i.e. it should be answered).
+// Subsequent calls return false. Mirrors Bitcoin Core's m_getaddr_recvd
+// one-time guard (net_processing.cpp:4833-4837).
+func (p *Peer) markGetAddrRecvd() bool {
+	p.addrMu.Lock()
+	defer p.addrMu.Unlock()
+	if p.getaddrRecvd {
+		return false
+	}
+	p.getaddrRecvd = true
+	return true
+}
+
+// GetAddrRecvd reports whether a getaddr from this peer has already been
+// answered (test/inspection helper).
+func (p *Peer) GetAddrRecvd() bool {
+	p.addrMu.Lock()
+	defer p.addrMu.Unlock()
+	return p.getaddrRecvd
+}
+
+// takeAddrTokens refills this peer's inbound-addr token bucket and consumes up
+// to `requested` tokens, returning how many of the `requested` addresses may be
+// admitted. Mirrors the per-peer rate limiter in Bitcoin Core's ProcessAddrs
+// (net_processing.cpp:5644-5671):
+//
+//   - the bucket refills by elapsed * MaxAddrRatePerSecond since the last call,
+//     capped at MaxAddrProcessingTokenBucket (the time-based refill is skipped
+//     once the bucket is already at/above the cap, exactly as Core's
+//     "Don't increment bucket if it's already full" guard);
+//   - each admitted address costs one token; once the bucket drops below 1.0
+//     the remaining addresses are dropped (we never grant Addr-permission, so
+//     all inbound addr traffic is rate-limited, matching Core's default).
+//
+// The same bucket is shared by both the addr and addrv2 paths.
+func (p *Peer) takeAddrTokens(requested int) int {
+	if requested <= 0 {
+		return 0
+	}
+	now := time.Now()
+
+	p.addrMu.Lock()
+	defer p.addrMu.Unlock()
+
+	if !p.addrTokenInit {
+		// Lazy init for peers created before the bucket existed (and for the
+		// inbound/outbound constructors that don't set it). Core inits to 1.0.
+		p.addrTokenBucket = 1.0
+		p.addrTokenTimestamp = now
+		p.addrTokenInit = true
+	}
+
+	// Refill (skip when already at/above the soft cap — Core's
+	// "Don't increment bucket if it's already full").
+	if p.addrTokenBucket < MaxAddrProcessingTokenBucket {
+		elapsed := now.Sub(p.addrTokenTimestamp).Seconds()
+		if elapsed < 0 {
+			elapsed = 0
+		}
+		p.addrTokenBucket += elapsed * MaxAddrRatePerSecond
+		if p.addrTokenBucket > MaxAddrProcessingTokenBucket {
+			p.addrTokenBucket = MaxAddrProcessingTokenBucket
+		}
+	}
+	p.addrTokenTimestamp = now
+
+	// Admit up to floor(bucket) addresses, bounded by the request size.
+	admit := int(p.addrTokenBucket)
+	if admit > requested {
+		admit = requested
+	}
+	p.addrTokenBucket -= float64(admit)
+	return admit
 }
 
 // NewOutboundPeer creates a new outbound peer and initiates the TCP connection.
@@ -617,6 +715,10 @@ func (p *Peer) handleMessage(msg Message) {
 	case *MsgAddr:
 		if p.config.Listeners != nil && p.config.Listeners.OnAddr != nil {
 			p.config.Listeners.OnAddr(p, m)
+		}
+	case *MsgGetAddr:
+		if p.config.Listeners != nil && p.config.Listeners.OnGetAddr != nil {
+			p.config.Listeners.OnGetAddr(p, m)
 		}
 	case *MsgGetData:
 		if p.config.Listeners != nil && p.config.Listeners.OnGetData != nil {
