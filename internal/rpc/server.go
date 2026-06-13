@@ -572,6 +572,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleCreateRawTransaction(params)
 	case "signrawtransactionwithwallet":
 		return s.handleSignRawTransactionWithWallet(params, walletName)
+	case "signrawtransactionwithkey":
+		return s.handleSignRawTransactionWithKey(params)
 
 	// Mempool RPCs
 	case "getmempoolinfo":
