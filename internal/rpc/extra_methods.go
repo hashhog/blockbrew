@@ -50,9 +50,12 @@ func (s *Server) handleGetTxOut(params json.RawMessage) (interface{}, *RPCError)
 		}
 	}
 
-	txid, err := wire.NewHash256FromHex(txidStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid format"}
+	// ParseHashV(txid): malformed txid -> -8 at the parse boundary, BEFORE
+	// any lookup (Core rpc/util.cpp:117). A well-formed-but-absent txid
+	// returns null below, exactly as Core's gettxout does.
+	txid, perr := parseHashV(txidStr, "txid")
+	if perr != nil {
+		return nil, perr
 	}
 
 	outpoint := wire.OutPoint{Hash: txid, Index: vout}
@@ -176,9 +179,12 @@ func (s *Server) handleGetMempoolEntry(params json.RawMessage) (interface{}, *RP
 		return nil, &RPCError{Code: RPCErrInternal, Message: "Mempool not available"}
 	}
 
-	txid, err := wire.NewHash256FromHex(txidStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid format"}
+	// ParseHashV(txid): malformed txid -> -8 at the parse boundary, BEFORE
+	// any lookup (Core rpc/util.cpp:117). A well-formed-but-absent txid
+	// stays -5 "Transaction not in mempool" below.
+	txid, perr := parseHashV(txidStr, "txid")
+	if perr != nil {
+		return nil, perr
 	}
 
 	entry := s.mempool.GetEntry(txid)

@@ -247,10 +247,12 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 		}
 	}
 
-	// Parse hash
-	hash, err := wire.NewHash256FromHex(hashStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid block hash format"}
+	// ParseHashV(blockhash): malformed hash -> -8 at the parse boundary,
+	// BEFORE any lookup (Core rpc/util.cpp:117). A well-formed-but-absent
+	// hash stays -5 "Block not found" below.
+	hash, perr := parseHashV(hashStr, "blockhash")
+	if perr != nil {
+		return nil, perr
 	}
 
 	// Get block from database
@@ -544,9 +546,12 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 		}
 	}
 
-	hash, err := wire.NewHash256FromHex(hashStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid block hash format"}
+	// ParseHashV(blockhash): malformed hash -> -8 at the parse boundary,
+	// BEFORE any lookup (Core rpc/util.cpp:117). A well-formed-but-absent
+	// hash stays -5 "Block not found" below.
+	hash, perr := parseHashV(hashStr, "blockhash")
+	if perr != nil {
+		return nil, perr
 	}
 
 	node := s.headerIndex.GetNode(hash)
@@ -811,21 +816,24 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 		}
 	}
 
-	// Parse optional blockhash parameter
+	// Parse optional blockhash parameter. Malformed (wrong length / non-hex)
+	// is rejected with -8 at the parse boundary, mirroring Core's ParseHashV.
 	var blockHashParam *wire.Hash256
 	if len(args) >= 3 {
 		if bhStr, ok := args[2].(string); ok && bhStr != "" {
-			bh, err := wire.NewHash256FromHex(bhStr)
-			if err != nil {
-				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+			bh, perr := parseHashV(bhStr, "blockhash")
+			if perr != nil {
+				return nil, perr
 			}
 			blockHashParam = &bh
 		}
 	}
 
-	txid, err := wire.NewHash256FromHex(txidStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid txid format"}
+	// ParseHashV(txid): malformed txid -> -8 BEFORE any lookup (Core
+	// rpc/util.cpp:117). A well-formed-but-absent txid stays -5 below.
+	txid, perr := parseHashV(txidStr, "txid")
+	if perr != nil {
+		return nil, perr
 	}
 
 	// Special exception for the genesis block coinbase transaction.
