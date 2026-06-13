@@ -1743,6 +1743,22 @@ func (w *Wallet) signLegacyP2SH(tx *wire.MsgTx, idx int, redeemScript []byte, si
 // the given compressed public key. Linear in the number of issued
 // addresses; acceptable since wallets in this codebase issue O(100s).
 func (w *Wallet) findKeyForPubKey(pubKey []byte) (*bbcrypto.PrivateKey, error) {
+	// Resolve raw (non-HD) keys first — importprivkey keys and the temporary
+	// keystore built by signrawtransactionwithkey live here, NOT under
+	// addrToPath/DerivePath. This honours the documented contract on the
+	// importedKeys field ("signing resolves these via importedKeys before
+	// falling back to addrToPath/DerivePath") and lets a master-key-less
+	// keystore (Core's FillableSigningProvider for signrawtransactionwithkey)
+	// sign. Dedup by identity-pointer so multiple addresses of the same key
+	// don't slow the scan materially.
+	for _, priv := range w.importedKeys {
+		if priv == nil {
+			continue
+		}
+		if subtleEqualBytes(priv.PubKey().SerializeCompressed(), pubKey) {
+			return priv, nil
+		}
+	}
 	if w.masterKey == nil {
 		return nil, ErrNoMasterKey
 	}
@@ -1913,7 +1929,11 @@ func (w *Wallet) SignTransactionWithPrevs(tx *wire.MsgTx, prevs []PrevTxInfo) er
 	if w.locked {
 		return ErrWalletLocked
 	}
-	if w.masterKey == nil {
+	// A keystore with no HD master key can still sign if it carries raw
+	// imported keys — this is exactly the signrawtransactionwithkey case,
+	// where the signing provider is a temporary FillableSigningProvider built
+	// from the caller's WIF keys (Core: rawtransaction.cpp SignTransaction).
+	if w.masterKey == nil && len(w.importedKeys) == 0 {
 		return ErrNoMasterKey
 	}
 
@@ -1972,6 +1992,88 @@ func (w *Wallet) SignTransactionWithPrevs(tx *wire.MsgTx, prevs []PrevTxInfo) er
 	}
 
 	return nil
+}
+
+// SignTransactionPerInput signs every input it can and returns a per-input
+// error slice (len == len(tx.TxIn)): entry i is nil iff input i was signed,
+// otherwise it carries the reason that input could not be signed. Unlike
+// SignTransactionWithPrevs (which aborts on the first failure), this matches
+// Bitcoin Core's signrawtransactionwithkey partial-sign behaviour, where the
+// RPC signs the inputs it has keys for and reports the rest in the "errors"
+// array while leaving "complete":false (rawtransaction.cpp::SignTransaction).
+//
+// It reuses the exact same dispatcher + sighash/ECDSA/Schnorr signer as the
+// whole-tx and PSBT paths (signInputWithScripts); the only behavioural change
+// is that a per-input failure is collected rather than fatal.
+func (w *Wallet) SignTransactionPerInput(tx *wire.MsgTx, prevs []PrevTxInfo) ([]error, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	errs := make([]error, len(tx.TxIn))
+
+	if w.locked {
+		return errs, ErrWalletLocked
+	}
+	if w.masterKey == nil && len(w.importedKeys) == 0 {
+		return errs, ErrNoMasterKey
+	}
+
+	prevMap := make(map[wire.OutPoint]*PrevTxInfo, len(prevs))
+	for i := range prevs {
+		p := &prevs[i]
+		prevMap[p.OutPoint] = p
+	}
+
+	prevOuts := make([]*wire.TxOut, len(tx.TxIn))
+	utxos := make([]*WalletUTXO, len(tx.TxIn))
+	overrideScripts := make([]*PrevTxInfo, len(tx.TxIn))
+
+	for i, txIn := range tx.TxIn {
+		if pinfo, ok := prevMap[txIn.PreviousOutPoint]; ok {
+			overrideScripts[i] = pinfo
+			utxos[i] = &WalletUTXO{
+				OutPoint: txIn.PreviousOutPoint,
+				Amount:   pinfo.Amount,
+				PkScript: pinfo.ScriptPubKey,
+			}
+			if utxo, exists := w.utxos[txIn.PreviousOutPoint]; exists {
+				if utxos[i].Amount == 0 {
+					utxos[i].Amount = utxo.Amount
+				}
+				if len(utxos[i].PkScript) == 0 {
+					utxos[i].PkScript = utxo.PkScript
+				}
+				if utxos[i].KeyPath == "" {
+					utxos[i].KeyPath = utxo.KeyPath
+				}
+			}
+		} else if utxo, exists := w.utxos[txIn.PreviousOutPoint]; exists {
+			utxos[i] = utxo
+		} else {
+			// No prevout info at all — record and skip (Core: "Input not found
+			// or already spent"). prevOuts[i] is left zero-valued so taproot
+			// sighash for OTHER inputs still computes; this input is unsigned.
+			errs[i] = fmt.Errorf("Input not found or already spent")
+			prevOuts[i] = &wire.TxOut{}
+			continue
+		}
+
+		prevOuts[i] = &wire.TxOut{
+			Value:    utxos[i].Amount,
+			PkScript: utxos[i].PkScript,
+		}
+	}
+
+	for i := range tx.TxIn {
+		if errs[i] != nil {
+			continue
+		}
+		if err := w.signInputWithScripts(tx, i, utxos[i], prevOuts, overrideScripts[i]); err != nil {
+			errs[i] = err
+		}
+	}
+
+	return errs, nil
 }
 
 // signInputWithScripts is the script-template dispatcher used by
@@ -2160,6 +2262,16 @@ func verifyP2WSHCommitment(witnessScript, program []byte) error {
 // findKeyForPubKeyHash searches addrToPath for any key whose hash160
 // matches; used for P2SH-P2WPKH redeem-script dispatch.
 func (w *Wallet) findKeyForPubKeyHash(hash160 []byte) (*bbcrypto.PrivateKey, error) {
+	// Raw imported / temporary-keystore keys first (see findKeyForPubKey).
+	for _, priv := range w.importedKeys {
+		if priv == nil {
+			continue
+		}
+		h := bbcrypto.Hash160(priv.PubKey().SerializeCompressed())
+		if subtleEqualBytes(h[:], hash160) {
+			return priv, nil
+		}
+	}
 	if w.masterKey == nil {
 		return nil, ErrNoMasterKey
 	}
@@ -2206,6 +2318,13 @@ func (w *Wallet) findKeyForUTXO(utxo *WalletUTXO) (*bbcrypto.PrivateKey, error) 
 	addr := w.scriptToAddress(utxo.PkScript)
 	if addr == "" {
 		return nil, fmt.Errorf("wallet does not own scriptPubKey")
+	}
+	// Raw imported / temporary-keystore keys (importprivkey,
+	// signrawtransactionwithkey) are keyed by their standard addresses in
+	// importedKeys and have no HD derivation path. Resolve them here before
+	// the addrToPath/DerivePath fallback.
+	if priv, ok := w.importedKeys[addr]; ok && priv != nil {
+		return priv, nil
 	}
 	path, ok := w.addrToPath[addr]
 	if !ok {
@@ -2924,6 +3043,38 @@ func (w *Wallet) ImportPrivKey(privKey *bbcrypto.PrivateKey, label string) ([]st
 	}
 	w.markDirtyLocked()
 	return addrs, nil
+}
+
+// NewKeystoreFromWIFKeys builds an ephemeral, in-memory, master-key-less
+// wallet that holds ONLY the supplied WIF private keys. It is the
+// signrawtransactionwithkey signing provider — Core's temporary
+// FillableSigningProvider built from the request's "privkeys" array, distinct
+// from any loaded wallet (rawtransaction.cpp::SignTransaction). The returned
+// keystore reuses the wallet's existing signer end-to-end
+// (SignTransactionWithPrevs -> signInputWithScripts -> signInput / signP2*),
+// i.e. the SAME BIP-143/BIP-341 sighash + ECDSA/Schnorr engine the wallet and
+// PSBT paths use; the only difference is where the keys come from.
+//
+// It is unlocked (so signing is permitted) and never touches disk. Decoding
+// errors are returned per Core (which aborts the RPC with -5 on a bad WIF).
+func NewKeystoreFromWIFKeys(wifs []string, net address.Network) (*Wallet, error) {
+	w := NewWallet(WalletConfig{Network: net})
+	// Unlocked: the keystore is in-memory only, has no encryption envelope,
+	// and exists solely to sign the one transaction.
+	w.locked = false
+	for _, wif := range wifs {
+		priv, err := DecodeWIF(wif, net)
+		if err != nil {
+			return nil, fmt.Errorf("invalid private key WIF: %w", err)
+		}
+		// ImportPrivKey registers the key under its P2WPKH / P2PKH /
+		// P2SH-P2WPKH addresses in importedKeys, exactly what the signer's
+		// findKey* lookups now consult.
+		if _, err := w.ImportPrivKey(priv, ""); err != nil {
+			return nil, err
+		}
+	}
+	return w, nil
 }
 
 // GetTransaction returns the wallet's history entry for txid, or nil if the
