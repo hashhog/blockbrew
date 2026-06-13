@@ -1,7 +1,6 @@
 package consensus
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -28,15 +27,15 @@ var (
 	ErrSnapshotBlockNotFound      = errors.New("snapshot base block not found in headers")
 	ErrBackgroundValidationFailed = errors.New("background validation failed to match snapshot")
 	// Per-coin guard errors (BUG-W102-01..03)
-	ErrCoinHeightExceedsBase  = errors.New("snapshot coin height exceeds snapshot base height")
-	ErrCoinAmountOutOfRange   = errors.New("snapshot coin amount out of MoneyRange")
-	ErrCoinOutpointIndexMax   = errors.New("snapshot coin outpoint index equals max uint32 (wrap-around risk)")
+	ErrCoinHeightExceedsBase = errors.New("snapshot coin height exceeds snapshot base height")
+	ErrCoinAmountOutOfRange  = errors.New("snapshot coin amount out of MoneyRange")
+	ErrCoinOutpointIndexMax  = errors.New("snapshot coin outpoint index equals max uint32 (wrap-around risk)")
 	// Trailing-bytes error (BUG-W102-04)
-	ErrSnapshotTrailingBytes  = errors.New("unexpected trailing bytes after snapshot coin data")
+	ErrSnapshotTrailingBytes = errors.New("unexpected trailing bytes after snapshot coin data")
 	// Precondition errors (BUG-W102-05..07)
-	ErrSnapshotBaseBlockInvalid   = errors.New("snapshot base block is marked invalid")
+	ErrSnapshotBaseBlockInvalid        = errors.New("snapshot base block is marked invalid")
 	ErrSnapshotBaseBlockNotOnBestChain = errors.New("snapshot base block is not on the best header chain")
-	ErrMempoolNotEmpty            = errors.New("can't activate a snapshot when mempool is not empty")
+	ErrMempoolNotEmpty                 = errors.New("can't activate a snapshot when mempool is not empty")
 	// Metadata cross-check error (BUG-W102-14)
 	ErrSnapshotHeightMismatch = errors.New("snapshot file metadata height does not match assumeutxo table entry height")
 )
@@ -105,10 +104,10 @@ func (m *SnapshotMetadata) Deserialize(r io.Reader) error {
 
 // AssumeUTXOData contains the expected values for a known-good UTXO snapshot.
 type AssumeUTXOData struct {
-	Height       int32
+	Height         int32
 	HashSerialized wire.Hash256 // SHA256 hash of the serialized UTXO set
-	ChainTxCount uint64        // Total transactions in the chain up to this block
-	BlockHash    wire.Hash256  // The block hash at this height
+	ChainTxCount   uint64       // Total transactions in the chain up to this block
+	BlockHash      wire.Hash256 // The block hash at this height
 }
 
 // AssumeUTXOParams maps heights to known-good snapshot data.
@@ -353,10 +352,11 @@ func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networ
 // writeCoin writes a single coin in the Bitcoin Core snapshot format.
 //
 // Layout (bytes-identical to Core's Coin::Serialize + TxOutCompression):
-//   VARINT(code = (height<<1) | coinbase)
-//   VARINT(CompressAmount(amount))
-//   ScriptCompression: either special-tag (1+20 or 1+32 bytes) or
-//                      VARINT(size+6) followed by raw script bytes.
+//
+//	VARINT(code = (height<<1) | coinbase)
+//	VARINT(CompressAmount(amount))
+//	ScriptCompression: either special-tag (1+20 or 1+32 bytes) or
+//	                   VARINT(size+6) followed by raw script bytes.
 //
 // Reference: bitcoin-core/src/coins.h, src/compressor.{h,cpp}.
 func writeCoin(w io.Writer, entry *UTXOEntry) error {
@@ -365,9 +365,9 @@ func writeCoin(w io.Writer, entry *UTXOEntry) error {
 
 // SnapshotStats contains statistics about a snapshot operation.
 type SnapshotStats struct {
-	CoinsWritten uint64
-	BlockHash    wire.Hash256
-	Height       int32
+	CoinsWritten   uint64
+	BlockHash      wire.Hash256
+	Height         int32
 	HashSerialized wire.Hash256 // SHA256 of the entire snapshot
 }
 
@@ -537,51 +537,38 @@ type SnapshotLoadStats struct {
 	Height      int32
 }
 
-// ComputeUTXOHash computes a deterministic hash of the UTXO set.
-// This is used to verify snapshot integrity.
+// ComputeUTXOHash computes the Bitcoin Core HASH_SERIALIZED commitment over the
+// UTXO set. This is the value AssumeUTXO snapshot validation compares against
+// (AssumeUTXOData.HashSerialized / Core's au_data.hash_serialized).
+//
+// HISTORY / STEP-0 FIX (2026-06-13): this function previously computed a plain
+// single-SHA256 over (outpoint || compressed-coin) records — the WRONG hash
+// flavour. That digest could never equal a real Core snapshot's
+// hash_serialized, because Core (kernel/coinstats.cpp::TxOutSer + ApplyHash,
+// finalized by HashWriter::GetHash) uses a DIFFERENT serialization and a DOUBLE
+// SHA256:
+//
+//	per coin: outpoint(36) || uint32_LE(nHeight<<1 | fCoinBase) || nValue_i64_LE
+//	          || CompactSize(len(scriptPubKey)) || scriptPubKey   (UNCOMPRESSED)
+//	digest:   SHA256d over the whole stream (NOT single SHA256), in cursor order
+//	          (txid ascending, then vout ascending), grouped per txid.
+//
+// A wrong hash flavour silently defeats AssumeUTXO authentication: the
+// background validator (CheckBackgroundValidation) would compute one thing while
+// the assumeutxo table pins another, so an honest replay could never match — or,
+// worse, a coincidental collision could let a malicious snapshot through. The
+// fix delegates to the canonical implementation in utxohash.go so the load-time
+// gate (ComputeHashSerialized / ComputeUTXOSetInfo) and the background validator
+// use byte-identical kernels. Cross-checked against lunarblock
+// compute_utxo_hash (src/utxo.lua) and camlcoin compute_utxo_hash_from_db
+// (lib/assume_utxo.ml).
+//
+// Note: ComputeHashSerialized iterates the in-memory cache. For a set that has
+// spilled to disk, prefer ComputeUTXOSetInfo (full DB-cursor walk). The
+// dual-chainstate background validator uses the DB-cursor walk (see
+// runBackgroundToBase) so it is correct even after a flush.
 func ComputeUTXOHash(utxoSet *UTXOSet) (wire.Hash256, uint64, error) {
-	utxoSet.mu.RLock()
-	defer utxoSet.mu.RUnlock()
-
-	// Collect all UTXOs
-	type coinEntry struct {
-		outpoint wire.OutPoint
-		entry    *UTXOEntry
-	}
-	coins := make([]coinEntry, 0, len(utxoSet.cache))
-	for op, entry := range utxoSet.cache {
-		if entry != nil {
-			coins = append(coins, coinEntry{op, entry})
-		}
-	}
-
-	// Sort deterministically
-	sort.Slice(coins, func(i, j int) bool {
-		for k := 0; k < 32; k++ {
-			if coins[i].outpoint.Hash[k] != coins[j].outpoint.Hash[k] {
-				return coins[i].outpoint.Hash[k] < coins[j].outpoint.Hash[k]
-			}
-		}
-		return coins[i].outpoint.Index < coins[j].outpoint.Index
-	})
-
-	// Hash all coins
-	h := sha256.New()
-	for _, c := range coins {
-		// Serialize outpoint
-		var buf bytes.Buffer
-		c.outpoint.Serialize(&buf)
-		h.Write(buf.Bytes())
-
-		// Serialize entry
-		buf.Reset()
-		writeCoin(&buf, c.entry)
-		h.Write(buf.Bytes())
-	}
-
-	var hash wire.Hash256
-	copy(hash[:], h.Sum(nil))
-	return hash, uint64(len(coins)), nil
+	return ComputeHashSerialized(utxoSet)
 }
 
 // DualChainstateManager manages both a snapshot chainstate and a background validation chainstate.
@@ -728,28 +715,28 @@ func (m *DualChainstateManager) SetValidationCallback(cb func(success bool)) {
 var MainnetAssumeUTXOParams = AssumeUTXOParams{
 	Data: []AssumeUTXOData{
 		{
-			Height:       840000,
+			Height:         840000,
 			HashSerialized: mustParseHash("a2a5521b1b5ab65f67818e5e8eccabb7171a517f9e2382208f77687310768f96"),
-			ChainTxCount: 991032194,
-			BlockHash:    mustParseHash("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
+			ChainTxCount:   991032194,
+			BlockHash:      mustParseHash("0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"),
 		},
 		{
-			Height:       880000,
+			Height:         880000,
 			HashSerialized: mustParseHash("dbd190983eaf433ef7c15f78a278ae42c00ef52e0fd2a54953782175fbadcea9"),
-			ChainTxCount: 1145604538,
-			BlockHash:    mustParseHash("000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"),
+			ChainTxCount:   1145604538,
+			BlockHash:      mustParseHash("000000000000000000010b17283c3c400507969a9c2afd1dcf2082ec5cca2880"),
 		},
 		{
-			Height:       910000,
+			Height:         910000,
 			HashSerialized: mustParseHash("4daf8a17b4902498c5787966a2b51c613acdab5df5db73f196fa59a4da2f1568"),
-			ChainTxCount: 1226586151,
-			BlockHash:    mustParseHash("0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"),
+			ChainTxCount:   1226586151,
+			BlockHash:      mustParseHash("0000000000000000000108970acb9522ffd516eae17acddcb1bd16469194a821"),
 		},
 		{
-			Height:       935000,
+			Height:         935000,
 			HashSerialized: mustParseHash("e4b90ef9eae834f56c4b64d2d50143cee10ad87994c614d7d04125e2a6025050"),
-			ChainTxCount: 1305397408,
-			BlockHash:    mustParseHash("0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"),
+			ChainTxCount:   1305397408,
+			BlockHash:      mustParseHash("0000000000000000000147034958af1652b2b91bba607beacc5e72a56f0fb5ee"),
 		},
 		// hashhog-local snapshot at h=944183 (utxo-snapshot-raw.dat from
 		// /data/nvme1/hashhog-mainnet/), used to recover blockbrew + lunarblock
@@ -778,4 +765,288 @@ var Testnet4AssumeUTXOParams = AssumeUTXOParams{
 	Data: []AssumeUTXOData{
 		// Add testnet4 snapshot data as available
 	},
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AssumeUTXO dual-chainstate (real background validation)
+//
+// Core reference: bitcoin-core/src/validation.cpp.
+//   * ActivateSnapshot (5588) loads the snapshot coins into a NEW chainstate
+//     which becomes the active/tip-serving chainstate (m_assumeutxo =
+//     UNVALIDATED).
+//   * AddChainstate (6170) DEMOTES the original genesis-validated chainstate to
+//     a BACKGROUND chainstate by setting its m_target_blockhash to the snapshot
+//     base. The background chainstate keeps its OWN coins DB and connects blocks
+//     genesis -> base independently (prev_chainstate.m_assumeutxo == VALIDATED).
+//   * MaybeCompleteSnapshotValidation (5967) runs once the background chainstate
+//     reaches the base: it computes the HASH_SERIALIZED of the background
+//     chainstate's OWN coins (ComputeUTXOStats / coinstats.cpp) and compares it
+//     to au_data.hash_serialized. MATCH -> the snapshot chainstate's
+//     m_assumeutxo flips to VALIDATED and the background chainstate is retired
+//     (ValidatedSnapshotCleanup, 6280). MISMATCH -> snapshot marked INVALID and
+//     fatalError/AbortNode (handle_invalid_snapshot, 6010-6017) — NEVER silently
+//     accepted.
+//
+// The load-time HASH_SERIALIZED gate already authenticates the snapshot bytes.
+// This background pass is the trustless re-verification by INDEPENDENT
+// re-computation: it never trusts the loaded coins, it rebuilds the UTXO set
+// from genesis in a SEPARATE coins store and checks that an honest replay
+// arrives at the same committed hash.
+//
+// Cross-impl references for the same machinery: lunarblock a39dd42
+// (activate_snapshot_with_background / BackgroundValidator, src/utxo.lua) and
+// camlcoin 2675b31 (make_background_chainstate / run_background_to_completion,
+// lib/assume_utxo.ml).
+// ─────────────────────────────────────────────────────────────────────────────
+
+// BackgroundValidationResult is the terminal verdict of the background pass.
+type BackgroundValidationResult int
+
+const (
+	// BackgroundPending: the background pass has not yet reached the base.
+	BackgroundPending BackgroundValidationResult = iota
+	// BackgroundValidated: bg coins hash MATCHED the assumeutxo commitment.
+	BackgroundValidated
+	// BackgroundInvalid: bg coins hash MISMATCHED (snapshot is INVALID/abort) or
+	// a block failed to connect.
+	BackgroundInvalid
+)
+
+// BackgroundValidator owns the SECOND (background) chainstate for AssumeUTXO
+// validation: a genesis-rooted chainstate with its OWN separate coins store (a
+// distinct *UTXOSet over a distinct *storage.ChainDB — NOT the active snapshot
+// chainstate's store / not the same keyspace). It re-connects every block
+// genesis -> base into that store via REAL block connection (UTXOSet.
+// ConnectBlockUTXOs — spend inputs, add outputs), then recomputes the
+// HASH_SERIALIZED of its OWN coins and compares it to the assumeutxo commitment.
+//
+// This is Core's background (validated, genesis-rooted) chainstate from
+// AddChainstate — it keeps its own m_coins_views and replays forward to
+// m_target_blockhash (the snapshot base).
+type BackgroundValidator struct {
+	// bgUTXO is the background chainstate's OWN coins store, a genuinely
+	// separate object from the active (snapshot) chainstate's UTXOSet. A write
+	// to the active store is INVISIBLE here and vice-versa (proven by the
+	// dual-chainstate falsification test).
+	bgUTXO *UTXOSet
+
+	// targetHeight is the snapshot base height (Core m_target_blockhash height).
+	targetHeight int32
+	// targetHash is the assumeutxo HASH_SERIALIZED commitment (au_data.
+	// hash_serialized) the recomputed bg hash is compared against.
+	targetHash wire.Hash256
+
+	// getBlock reads canonical blocks from the node's block store for
+	// genesis+1..base. The bg chainstate only owns its coins, not block bodies
+	// (Core shares BlockManager across chainstates), so blocks come from the
+	// shared store.
+	getBlock func(height int32) (*wire.MsgBlock, error)
+
+	currentHeight int32
+	result        BackgroundValidationResult
+	err           error
+}
+
+// NewBackgroundValidator constructs the background validator with its OWN coins
+// store. bgUTXO MUST be a different object (over a different ChainDB / keyspace)
+// from the active snapshot chainstate's UTXOSet; the caller (and the production
+// orchestrator ActivateSnapshotWithBackground) is responsible for that
+// separation. The bg store starts EMPTY at genesis (the genesis coinbase is
+// unspendable and not in the UTXO set — exactly the height-0 state Core's
+// background chainstate replays forward from).
+//
+//   - bgUTXO        the SEPARATE background coins store (must not alias active)
+//   - targetHeight  snapshot base height to validate up to
+//   - targetHash    assumeutxo HASH_SERIALIZED commitment at the base
+//   - getBlock      fn(height) -> block for heights 1..targetHeight
+func NewBackgroundValidator(
+	bgUTXO *UTXOSet,
+	targetHeight int32,
+	targetHash wire.Hash256,
+	getBlock func(height int32) (*wire.MsgBlock, error),
+) *BackgroundValidator {
+	return &BackgroundValidator{
+		bgUTXO:        bgUTXO,
+		targetHeight:  targetHeight,
+		targetHash:    targetHash,
+		getBlock:      getBlock,
+		currentHeight: 0, // genesis-seeded: empty coins at height 0
+		result:        BackgroundPending,
+	}
+}
+
+// CurrentHeight returns the background chainstate's current tip height.
+func (b *BackgroundValidator) CurrentHeight() int32 { return b.currentHeight }
+
+// Result returns the terminal verdict (Pending until RunToBase completes).
+func (b *BackgroundValidator) Result() BackgroundValidationResult { return b.result }
+
+// Err returns the connection / mismatch error, if any.
+func (b *BackgroundValidator) Err() error { return b.err }
+
+// BackgroundUTXOSet exposes the background chainstate's OWN coins store. Used by
+// tests to prove the store is genuinely separate from the active one (an
+// active-store write is NOT visible here).
+func (b *BackgroundValidator) BackgroundUTXOSet() *UTXOSet { return b.bgUTXO }
+
+// connectNext connects exactly one block (currentHeight+1) into the background
+// chainstate's OWN coins via REAL block connection. This is NOT a counter bump:
+// ConnectBlockUTXOs spends every non-coinbase input out of bgUTXO and adds every
+// new output into bgUTXO, mutating the independent coins set.
+func (b *BackgroundValidator) connectNext() error {
+	next := b.currentHeight + 1
+	block, err := b.getBlock(next)
+	if err != nil {
+		return fmt.Errorf("background validation: failed to get block at height %d: %w", next, err)
+	}
+	if block == nil {
+		return fmt.Errorf("background validation: nil block at height %d", next)
+	}
+	// REAL connection into the SEPARATE bg coins store. ConnectBlockUTXOs
+	// returns ErrUTXONotFound on a spend of a coin absent from THIS store, so
+	// an aliasing bug (reading the active store) or a gap would surface here.
+	if _, err := b.bgUTXO.ConnectBlockUTXOs(block, next); err != nil {
+		return fmt.Errorf("background validation: failed to connect block %d: %w", next, err)
+	}
+	b.currentHeight = next
+	return nil
+}
+
+// finalizeAtBase recomputes the background chainstate's HASH_SERIALIZED at the
+// base and applies the verdict (Core MaybeCompleteSnapshotValidation:6061-6076).
+//
+// It uses ComputeUTXOSetInfo, which FLUSHES the bg coins to its DB and walks the
+// full DB cursor (txid asc, vout asc) — the faithful analogue of Core's
+// ForceFlushStateToDisk + ComputeUTXOStats over the chainstate cursor. This is
+// correct even if the bg cache has spilled to disk.
+func (b *BackgroundValidator) finalizeAtBase() {
+	info, err := ComputeUTXOSetInfo(b.bgUTXO)
+	if err != nil {
+		b.err = fmt.Errorf("background validation: failed to compute UTXO hash: %w", err)
+		b.result = BackgroundInvalid
+		return
+	}
+	if info.HashSerialized3 == b.targetHash {
+		// MATCH: Core flips the snapshot chainstate to VALIDATED and retires bg.
+		b.result = BackgroundValidated
+		return
+	}
+	// MISMATCH: Core marks the snapshot INVALID and AbortNodes. Surface a hard
+	// error; never silently accept. The word "mismatch" is kept in the message
+	// so external tooling scraping it keeps working (cross-impl convention).
+	b.err = fmt.Errorf("%w: background-recomputed HASH_SERIALIZED %s != assumeutxo %s",
+		ErrBackgroundValidationFailed, info.HashSerialized3.String(), b.targetHash.String())
+	b.result = BackgroundInvalid
+}
+
+// RunToBase synchronously drives the background validation to its terminal state:
+// connect every block genesis+1..base into the bg coins store, then recompute
+// the HASH_SERIALIZED and compare to the assumeutxo commitment. Returns the
+// terminal result and error. Used by the in-process path and the functional
+// test; a live node could instead tick connectNext from a maintenance loop and
+// call finalizeAtBase on reaching the base.
+func (b *BackgroundValidator) RunToBase() (BackgroundValidationResult, error) {
+	if b.result != BackgroundPending {
+		return b.result, b.err
+	}
+	for b.currentHeight < b.targetHeight {
+		if err := b.connectNext(); err != nil {
+			b.err = err
+			b.result = BackgroundInvalid
+			return b.result, b.err
+		}
+	}
+	b.finalizeAtBase()
+	return b.result, b.err
+}
+
+// SnapshotActivation pairs the active (snapshot) chainstate with the background
+// validator that re-derives its UTXO hash. Mirrors Core's triple through
+// ActivateSnapshot / AddChainstate: the UNVALIDATED snapshot chainstate, and the
+// VALIDATED background chainstate targeting the snapshot base.
+type SnapshotActivation struct {
+	// Snapshot is the ACTIVE chainstate (snapshot-loaded). It starts
+	// ChainstateRoleSnapshot (Core Assumeutxo::UNVALIDATED); the background
+	// pass flips it to Validated (match) or Invalid (mismatch).
+	Snapshot *Chainstate
+	// Background is the genesis-rooted validator with its OWN separate coins.
+	Background *BackgroundValidator
+}
+
+// ActivateSnapshotWithBackground wires up a real dual-chainstate validation for
+// an already-loaded snapshot chainstate (Core ActivateSnapshot + AddChainstate).
+//
+//   - snapshotCS    the ACTIVE chainstate produced by loading the snapshot (its
+//     coins live in its OWN UTXOSet). Marked role Snapshot here.
+//   - bgUTXO        the BACKGROUND chainstate's OWN coins store — MUST be a
+//     genuinely separate object (different ChainDB) from the
+//     snapshot chainstate's UTXOSet. ActivateSnapshotWithBackground
+//     refuses to proceed if it is the same object (aliasing guard,
+//     mirroring lunarblock's "background storage must be separate"
+//     check).
+//   - au            the assumeutxo entry for the base (its HashSerialized is the
+//     commitment the background pass re-derives and checks).
+//   - getBlock      fn(height) -> block for genesis+1..base (shared block store).
+//
+// The activation performs NO block connection itself — exactly like Core's
+// ActivateSnapshot, which returns after demoting the prior chainstate and lets
+// the validation queue do the background work. Drive it with
+// Background.RunToBase() and then call Finish.
+func ActivateSnapshotWithBackground(
+	snapshotCS *Chainstate,
+	bgUTXO *UTXOSet,
+	au *AssumeUTXOData,
+	getBlock func(height int32) (*wire.MsgBlock, error),
+) (*SnapshotActivation, error) {
+	if snapshotCS == nil {
+		return nil, errors.New("ActivateSnapshotWithBackground: nil snapshot chainstate")
+	}
+	if au == nil {
+		return nil, errors.New("ActivateSnapshotWithBackground: nil assumeutxo data")
+	}
+	if bgUTXO == nil {
+		return nil, errors.New("ActivateSnapshotWithBackground: nil background coins store")
+	}
+	// Aliasing guard: the bg coins store MUST be a different object from the
+	// active store (Core's background chainstate keeps its OWN m_coins_views).
+	if bgUTXO == snapshotCS.utxoSet {
+		return nil, errors.New("ActivateSnapshotWithBackground: background coins store must be separate from the active (snapshot) chainstate store")
+	}
+
+	// The snapshot chainstate is the active, not-yet-validated one
+	// (Core Assumeutxo::UNVALIDATED). NewSnapshotChainstate already sets role
+	// Snapshot; enforce it in case the caller passed a validated chainstate.
+	snapshotCS.mu.Lock()
+	snapshotCS.role = ChainstateRoleSnapshot
+	snapshotCS.mu.Unlock()
+
+	bg := NewBackgroundValidator(bgUTXO, au.Height, au.HashSerialized, getBlock)
+	return &SnapshotActivation{Snapshot: snapshotCS, Background: bg}, nil
+}
+
+// Finish applies the background verdict to the snapshot chainstate and returns
+// it (Core's flip of unvalidated_cs.m_assumeutxo). On a Validated result the
+// snapshot is marked Validated (and the background chainstate is logically
+// retired). On an Invalid result the snapshot is marked Invalid and the error
+// is returned — the snapshot is NEVER silently accepted on a mismatch.
+//
+//   - returns (true, nil)   snapshot validated (background hash MATCHED).
+//   - returns (false, err)  snapshot invalid (mismatch / connect failure); the
+//     caller should treat this as fatal (Core AbortNode).
+//   - returns (false, nil)  background pass not yet run to its terminal state.
+func (a *SnapshotActivation) Finish() (validated bool, err error) {
+	switch a.Background.Result() {
+	case BackgroundValidated:
+		a.Snapshot.MarkValidated()
+		return true, nil
+	case BackgroundInvalid:
+		a.Snapshot.MarkInvalid()
+		if a.Background.Err() != nil {
+			return false, a.Background.Err()
+		}
+		return false, ErrBackgroundValidationFailed
+	default:
+		// Still pending: not terminal. Do not flip the snapshot's role.
+		return false, nil
+	}
 }

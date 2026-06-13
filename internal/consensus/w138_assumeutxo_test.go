@@ -464,18 +464,17 @@ func TestW138_G25_NoChainTxCountStampOnSnapshotTip(t *testing.T) {
 // G26–G28: BackgroundValidator + multi-chainstate
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestW138_G26_BackgroundValidatorHashAlgorithmMismatch (BUG-1 P0-CDIV).
-// CheckBackgroundValidation (assumeutxo.go:677) calls ComputeUTXOHash (custom
-// SHA256-once) but compares against AssumeUTXOData.HashSerialized which
-// uses ComputeHashSerialized (SHA256d-over-TxOutSer). The two algorithms
-// produce different digests for the same UTXO set, so the validator can
-// never report success.
+// TestW138_G26_BackgroundValidatorHashAlgorithmFixed (BUG-1 P0-CDIV — FIXED
+// 2026-06-13). Before the STEP-0 fix, CheckBackgroundValidation called
+// ComputeUTXOHash (custom single-SHA256 over the compressed coin form) but
+// compared against AssumeUTXOData.HashSerialized (ComputeHashSerialized =
+// SHA256d-over-TxOutSer). The two algorithms produced different digests, so the
+// background validator could never report success against a real Core snapshot.
 //
-// This pin DIVERGES the two functions on a known input to prove the mismatch.
-// If a future fix makes them converge (or rewires CheckBackgroundValidation
-// to call ComputeHashSerialized), this test should FAIL and the BUG-1
-// status should be flipped to FIXED.
-func TestW138_G26_BackgroundValidatorHashAlgorithmMismatch(t *testing.T) {
+// ComputeUTXOHash now delegates to ComputeHashSerialized, so the validator and
+// the assumeutxo commitment use byte-identical kernels. This pin asserts the
+// two converge; if a regression re-diverges them it FAILS.
+func TestW138_G26_BackgroundValidatorHashAlgorithmFixed(t *testing.T) {
 	chainDB := storage.NewChainDB(storage.NewMemDB())
 	us := NewUTXOSet(chainDB)
 	var op wire.OutPoint
@@ -495,8 +494,8 @@ func TestW138_G26_BackgroundValidatorHashAlgorithmMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComputeHashSerialized: %v", err)
 	}
-	if h1 == h2 {
-		t.Errorf("BUG-1 pin: ComputeUTXOHash and ComputeHashSerialized agreed; check whether the fix landed and flip BUG-1 to FIXED in audit doc")
+	if h1 != h2 {
+		t.Errorf("BUG-1 regression: ComputeUTXOHash (%s) != ComputeHashSerialized (%s); the STEP-0 fix requires them to agree", h1.String(), h2.String())
 	}
 }
 
