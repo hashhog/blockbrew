@@ -877,10 +877,11 @@ func TestInvalidParams(t *testing.T) {
 		t.Error("expected invalid params error for getblockhash without height")
 	}
 
-	// getblock with invalid hash
+	// getblock with malformed hash -> -8 RPC_INVALID_PARAMETER at Core's
+	// ParseHashV boundary (rpc/util.cpp:117), not -32602.
 	resp = testRPCRequest(t, server.handleRPC, "getblock", []interface{}{"invalid"}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected invalid params error for getblock with invalid hash")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParameter {
+		t.Errorf("expected -8 RPC_INVALID_PARAMETER for getblock with malformed hash, got %v", resp.Error)
 	}
 }
 
@@ -1273,17 +1274,18 @@ func TestGetRawTransactionInvalidParams(t *testing.T) {
 		t.Error("expected invalid params error for missing txid")
 	}
 
-	// Invalid txid format
+	// Malformed txid -> -8 RPC_INVALID_PARAMETER at Core's ParseHashV
+	// boundary (rpc/util.cpp:117), not -32602.
 	resp = testRPCRequest(t, server.handleRPC, "getrawtransaction", []interface{}{"invalid"}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected invalid params error for invalid txid")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParameter {
+		t.Errorf("expected -8 RPC_INVALID_PARAMETER for malformed txid, got %v", resp.Error)
 	}
 
-	// Invalid blockhash format
+	// Malformed blockhash -> -8 RPC_INVALID_PARAMETER (same ParseHashV path).
 	resp = testRPCRequest(t, server.handleRPC, "getrawtransaction",
 		[]interface{}{"0000000000000000000000000000000000000000000000000000000000000001", false, "invalid"}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected invalid params error for invalid blockhash")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParameter {
+		t.Errorf("expected -8 RPC_INVALID_PARAMETER for malformed blockhash, got %v", resp.Error)
 	}
 }
 

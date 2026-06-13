@@ -115,22 +115,25 @@ func TestW125_BUG_03_GetBlockHeader_MissingArg(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// BUG-1 — getrawtransaction invalid txid hex.
-// Core: -5 RPC_INVALID_ADDRESS_OR_KEY
-// blockbrew: -32602
+// BUG-1 — getrawtransaction malformed txid (FIXED).
+// A malformed (wrong-length / non-hex) txid is rejected at Core's
+// ParseHashV parse boundary with -8 RPC_INVALID_PARAMETER, BEFORE any
+// lookup (rpc/util.cpp:117). The earlier doc note "Core wants -5" was
+// wrong: -5 is the well-formed-but-absent case, not the malformed-parse
+// case. blockbrew now emits -8.
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_01_GetRawTransaction_InvalidTxidHex(t *testing.T) {
 	server := w125TestServer(t)
-	// Non-hex string in txid slot — hex.DecodeString fails.
+	// Non-hex string in txid slot — wrong length AND non-hex.
 	resp := testRPCRequest(t, server.handleRPC,
 		"getrawtransaction", []interface{}{"not-a-valid-txid-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}, "", "")
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -5.",
-			resp.Error.Code, RPCErrInvalidParams)
+	if resp.Error.Code != RPCErrInvalidParameter {
+		t.Errorf("malformed txid: code = %d, want %d (-8 RPC_INVALID_PARAMETER, Core ParseHashV)",
+			resp.Error.Code, RPCErrInvalidParameter)
 	}
 }
 
@@ -173,14 +176,15 @@ func TestW125_BUG_05a_GetTxOut_MissingArgs(t *testing.T) {
 
 func TestW125_BUG_05b_GetTxOut_InvalidTxidHex(t *testing.T) {
 	server := w125TestServer(t)
+	// FIXED: malformed txid -> -8 at Core's ParseHashV boundary.
 	resp := testRPCRequest(t, server.handleRPC,
 		"gettxout", []interface{}{"not-hex", float64(0)}, "", "")
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	if resp.Error.Code != RPCErrInvalidParameter {
+		t.Errorf("malformed txid: code = %d, want %d (-8 RPC_INVALID_PARAMETER)",
+			resp.Error.Code, RPCErrInvalidParameter)
 	}
 }
 
@@ -214,14 +218,16 @@ func TestW125_BUG_07a_GetMempoolEntry_NotFoundMessage(t *testing.T) {
 
 func TestW125_BUG_07b_GetMempoolEntry_InvalidTxidHex(t *testing.T) {
 	server := w125TestServer(t)
+	// FIXED: malformed txid -> -8 at Core's ParseHashV boundary, BEFORE the
+	// mempool lookup. (-5 is the well-formed-but-absent case, see BUG-07a.)
 	resp := testRPCRequest(t, server.handleRPC,
 		"getmempoolentry", []interface{}{"not-hex"}, "", "")
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -5.",
-			resp.Error.Code, RPCErrInvalidParams)
+	if resp.Error.Code != RPCErrInvalidParameter {
+		t.Errorf("malformed txid: code = %d, want %d (-8 RPC_INVALID_PARAMETER)",
+			resp.Error.Code, RPCErrInvalidParameter)
 	}
 }
 
@@ -268,14 +274,16 @@ func TestW125_BUG_09_SubmitBlock_MissingHex(t *testing.T) {
 
 func TestW125_BUG_10a_GetBlock_InvalidHashHex(t *testing.T) {
 	server := w125TestServer(t)
+	// FIXED: malformed blockhash -> -8 at Core's ParseHashV boundary, BEFORE
+	// the block lookup. (-5 "Block not found" is the absent case, BUG-10b.)
 	resp := testRPCRequest(t, server.handleRPC,
 		"getblock", []interface{}{"not-hex"}, "", "")
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	if resp.Error.Code != RPCErrInvalidParameter {
+		t.Errorf("malformed blockhash: code = %d, want %d (-8 RPC_INVALID_PARAMETER)",
+			resp.Error.Code, RPCErrInvalidParameter)
 	}
 }
 
