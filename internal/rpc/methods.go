@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
@@ -2992,41 +2993,89 @@ func (s *Server) writeUtxoSnapshotFile(
 	}, nil
 }
 
-// handleLoadTxOutSet refuses the loadtxoutset RPC and directs the operator
-// at the CLI flag instead.
+// assumeUTXOParamsForNetwork returns the AssumeUTXO whitelist that applies to
+// the server's network. Mainnet/testnet4 use the immutable chainparams table;
+// regtest uses the runtime-registerable whitelist (Core's regtest
+// m_assumeutxo_data is a purpose-built mockable table — see
+// consensus.RegtestAssumeUTXOParams). Returns nil if the network has no table
+// (e.g. testnet3/signet with AssumeUTXO==nil).
+func (s *Server) assumeUTXOParamsForNetwork() *consensus.AssumeUTXOParams {
+	if s.chainParams != nil && s.chainParams.Name == "regtest" {
+		return consensus.RegtestAssumeUTXOParams()
+	}
+	if s.chainParams != nil {
+		return s.chainParams.AssumeUTXO
+	}
+	return nil
+}
+
+// snapshotGetBlockByHeight returns a getBlock(height)->block closure over the
+// node's shared block store for the background validator. The bg chainstate
+// owns only its coins (Core shares BlockManager across chainstates); block
+// bodies come from chainDB. It resolves height->hash via the persisted
+// height->hash index, falling back to the header index, then reads the body
+// from chainDB.
+func (s *Server) snapshotGetBlockByHeight() func(height int32) (*wire.MsgBlock, error) {
+	return func(height int32) (*wire.MsgBlock, error) {
+		var hash wire.Hash256
+		var resolved bool
+		if s.chainDB != nil {
+			if h, err := s.chainDB.GetBlockHashByHeight(height); err == nil {
+				hash = h
+				resolved = true
+			}
+		}
+		if !resolved && s.headerIndex != nil {
+			if node := s.headerIndex.GetHeaderByHeight(height); node != nil {
+				hash = node.Hash
+				resolved = true
+			}
+		}
+		if !resolved {
+			return nil, fmt.Errorf("no block hash for height %d", height)
+		}
+		if s.chainDB == nil {
+			return nil, fmt.Errorf("no block store to read height %d", height)
+		}
+		block, err := s.chainDB.GetBlock(hash)
+		if err != nil {
+			return nil, fmt.Errorf("read block %s at height %d: %w", hash.String(), height, err)
+		}
+		return block, nil
+	}
+}
+
+// handleLoadTxOutSet imports a Bitcoin Core-format UTXO snapshot and drives the
+// trustless background re-derivation (Core's loadtxoutset RPC / ActivateSnapshot
+// + AddChainstate + MaybeCompleteSnapshotValidation, bitcoin-core/src/
+// validation.cpp:5588 / 6170 / 5967).
 //
-// Background (cross-impl audit 2026-05-05,
-// CORE-PARITY-AUDIT/_snapshot-cli-rpc-parity-audit-2026-05-05.md): the
-// previous implementation called consensus.LoadSnapshot + utxoSet.Flush
-// and reported the resulting stats as success, but it did NOT call:
+// Flow (cross-impl reference: camlcoin 3140ab9, lunarblock a39dd42):
 //
-//   - chainDB.SetChainState({BestHash, BestHeight, ...})
-//   - chainDB.SetBlockHeight(stats.Height, stats.BlockHash)
+//  1. Parse metadata, verify network magic.
+//  2. AssumeUTXO table lookup by snapshot base block hash (mainnet/testnet4 =
+//     immutable chainparams table; regtest = runtime whitelist).
+//  3. Preconditions: mempool empty; base block not invalid; base block on the
+//     best header chain; metadata/table heights agree.
+//  4. LOAD-TIME CONTENT GATE: deserialise coins into the SNAPSHOT chainstate's
+//     OWN coins store and recompute HASH_SERIALIZED; it must match the
+//     committed assumeutxo hash. This AUTHENTICATES THE FILE (a tampered file
+//     whose coins don't hash to the commitment is rejected here, with an
+//     Error).
+//  5. BACKGROUND RE-DERIVATION: ActivateSnapshotWithBackground builds a SECOND
+//     (background) chainstate with a SEPARATE coins store, then RunToBase
+//     re-connects every block genesis->base into it and recomputes the hash
+//     independently. Finish flips the snapshot chainstate to Validated (match)
+//     or Invalid (mismatch).
 //
-// Both of those are made by the CLI path
-// (cmd/blockbrew/main.go::loadSnapshotFromFile, lines 1567-1654) AFTER
-// LoadSnapshot returns. Without them the snapshot UTXOs live in chainDB
-// while the persisted chain-tip pointer still points at genesis, so
-// subsequent IBD silently re-downloads the entire chain from genesis
-// and overwrites the snapshot UTXOs. Restart does not self-heal — the
-// persisted tip pointer is wrong.
-//
-// Wiring the missing SetChainState/SetBlockHeight calls in-handler is
-// also not enough: the running daemon's header sync / block downloader /
-// chain manager were initialised at boot from the pre-load chainstate
-// and have no in-handler refresh path. The CLI is the only entry point
-// that runs BEFORE those components start.
-//
-// Fix is option (B) from rustoshi 1d0a325 / hotbuns e355cd7: refuse the
-// RPC at the gate, leave the datadir untouched, point the operator at
-// the CLI flag. Same JSON-RPC error code Bitcoin Core uses in
-// bitcoin-core/src/rpc/blockchain.cpp::loadtxoutset when
-// ActivateSnapshot cannot proceed.
-//
-// The gate fires before any file I/O so a refused call leaves the
-// datadir untouched.
+// A BACKGROUND MISMATCH must NOT silently succeed, but — mirroring Core's
+// ASYNCHRONOUS MaybeCompleteSnapshotValidation / AbortNode model — loadtxoutset
+// itself still returns SUCCESS; the verdict is surfaced via the snapshot
+// chainstate's role (read by getchainstates: validated=false on mismatch). The
+// LOAD-TIME gate (step 4) is synchronous and DOES return an Error when the file
+// itself fails to authenticate. The activation is recorded on the Server so
+// getchainstates reads validated / snapshot_blockhash from it.
 func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCError) {
-	// Parse parameters for shape only; never open the snapshot file.
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
@@ -3034,19 +3083,146 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 	if len(args) < 1 {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing path parameter"}
 	}
-	if path, ok := args[0].(string); !ok || path == "" {
+	path, ok := args[0].(string)
+	if !ok || path == "" {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid path"}
 	}
 
-	return nil, &RPCError{
-		Code: RPCErrInternal,
-		Message: "loadtxoutset RPC is disabled in this build because the live " +
-			"daemon cannot atomically activate a UTXO snapshot once the " +
-			"header-sync and block-download components have started. Use " +
-			"the CLI flag -load-snapshot=<path> at startup instead — that " +
-			"path imports the snapshot, pins the chain tip, and writes the " +
-			"block index before any P2P/sync components are constructed.",
+	if s.chainDB == nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "no chain database configured"}
 	}
+
+	// --- Step 1: open file + parse metadata header.
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Couldn't open file %s for reading: %v", path, err)}
+	}
+	defer f.Close()
+	reader := bufio.NewReaderSize(f, 8*1024*1024)
+
+	sr, err := consensus.NewSnapshotReader(reader)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Unable to parse snapshot metadata: %v", err)}
+	}
+	meta := sr.Metadata()
+	if meta.NetworkMagic != s.chainParams.NetworkMagic {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: consensus.ErrNetworkMismatch.Error()}
+	}
+
+	// --- Step 2: AssumeUTXO table lookup by base block hash (BEFORE coin I/O).
+	auParams := s.assumeUTXOParamsForNetwork()
+	if auParams == nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("network %q has no AssumeUTXO params; snapshot loading not supported", s.chainParams.Name)}
+	}
+	expected := auParams.ForBlockHash(meta.BlockHash)
+	if expected == nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
+			"assumeutxo block hash in snapshot metadata not recognized (hash: %s). The following snapshot heights are available: %v",
+			meta.BlockHash.String(), auParams.AvailableHeights())}
+	}
+	// Cross-check metadata/table height agreement (BUG-W102-14).
+	if byHeight := auParams.ForHeight(expected.Height); byHeight == nil || byHeight.BlockHash != expected.BlockHash {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
+			"%v: table entry at height %d has unexpected block hash", consensus.ErrSnapshotHeightMismatch, expected.Height)}
+	}
+
+	// --- Step 3: preconditions.
+	// Mempool must be empty (Core ActivateSnapshot:5627-5630).
+	if s.mempool != nil && s.mempool.Count() > 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
+			"%v: %d transactions pending", consensus.ErrMempoolNotEmpty, s.mempool.Count())}
+	}
+	if s.headerIndex != nil {
+		baseNode := s.headerIndex.GetNode(meta.BlockHash)
+		if baseNode == nil {
+			// Core: the base block header must appear in the headers chain.
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
+				"The base block header (%s) must appear in the headers chain. Make sure all headers are syncing, and call loadtxoutset again",
+				meta.BlockHash.String())}
+		}
+		if baseNode.Status.IsInvalid() {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
+				"%v: %s", consensus.ErrSnapshotBaseBlockInvalid, meta.BlockHash.String())}
+		}
+		if bestTip := s.headerIndex.BestTip(); bestTip != nil {
+			if ancestor := bestTip.GetAncestor(expected.Height); ancestor != nil && ancestor.Hash != meta.BlockHash {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
+					"%v: best-header ancestor at height %d is %s, snapshot base is %s",
+					consensus.ErrSnapshotBaseBlockNotOnBestChain, expected.Height, ancestor.Hash.String(), meta.BlockHash.String())}
+			}
+		}
+	}
+
+	// --- Step 4: LOAD-TIME CONTENT GATE — load coins into the snapshot
+	// chainstate's OWN coins store and authenticate against the commitment.
+	//
+	// The snapshot coins live in a dedicated in-memory ChainDB so they are a
+	// genuinely separate object from the background validator's store (the
+	// aliasing guard in ActivateSnapshotWithBackground requires this).
+	snapDB := storage.NewChainDB(storage.NewMemDB())
+	loaded, _, err := consensus.LoadSnapshotCoins(sr, snapDB, expected.Height)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Unable to load snapshot coins: %v", err)}
+	}
+	computed, _, err := consensus.ComputeHashSerialized(loaded)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Unable to compute snapshot UTXO hash: %v", err)}
+	}
+	if computed != expected.HashSerialized {
+		// Load-time authentication failure (the file's own coins don't hash to
+		// the committed value). Core returns an error from ActivateSnapshot in
+		// this synchronous phase; surface it as an RPC error.
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
+			"%v: expected %s, got %s", consensus.ErrSnapshotHashMismatch,
+			expected.HashSerialized.String(), computed.String())}
+	}
+	// Persist the authenticated snapshot coins durably in the snapshot store so
+	// the snapshot chainstate serves the loaded coins on demand.
+	if err := loaded.Flush(); err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Unable to flush snapshot coins: %v", err)}
+	}
+
+	// --- Step 5: BACKGROUND RE-DERIVATION (the trustless re-verification).
+	snapshotCS := consensus.NewSnapshotChainstate(loaded, meta.BlockHash)
+	bgUTXO := consensus.NewUTXOSet(storage.NewChainDB(storage.NewMemDB()))
+	activation, actErr := consensus.ActivateSnapshotWithBackground(
+		snapshotCS, bgUTXO, expected, s.snapshotGetBlockByHeight())
+	if actErr != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Unable to activate snapshot: %v", actErr)}
+	}
+
+	// Drive the background validation to its terminal verdict. RunToBase
+	// connects genesis->base into the SEPARATE bg store and recomputes the
+	// hash; Finish flips the snapshot chainstate to Validated (match) or
+	// Invalid (mismatch). A mismatch is surfaced ONLY via the chainstate's
+	// role (read by getchainstates) — loadtxoutset still returns success, the
+	// Core async AbortNode model. The bg error is logged, not returned.
+	_, _ = activation.Background.RunToBase()
+	validated, finishErr := activation.Finish()
+	if !validated && finishErr != nil {
+		log.Printf("[snapshot] background validation rejected snapshot %s: %v (getchainstates.validated=false)",
+			meta.BlockHash.String(), finishErr)
+	}
+
+	// Record the activation on the server so getchainstates can read
+	// validated / snapshot_blockhash from the snapshot chainstate.
+	s.snapshotMu.Lock()
+	s.snapshotActivation = activation
+	s.snapshotBaseHashHex = meta.BlockHash.String()
+	s.snapshotMu.Unlock()
+
+	loadStats, _ := s.computeLoadResult(meta, expected.Height)
+	return loadStats, nil
+}
+
+// computeLoadResult builds the LoadTxOutSetResult for a completed load.
+func (s *Server) computeLoadResult(meta *consensus.SnapshotMetadata, baseHeight int32) (*LoadTxOutSetResult, *RPCError) {
+	return &LoadTxOutSetResult{
+		CoinsLoaded: meta.CoinsCount,
+		TipHash:     meta.BlockHash.String(),
+		BaseHeight:  baseHeight,
+		Path:        "",
+	}, nil
 }
 
 func (s *Server) handleGetChainStates() (interface{}, *RPCError) {
@@ -3097,6 +3273,27 @@ func (s *Server) handleGetChainStates() (interface{}, *RPCError) {
 			coinsTipCacheBytes = us.MaxCacheBytes()
 		}
 
+		// AssumeUTXO awareness (Core getchainstates / make_chain_data,
+		// rpc/blockchain.cpp:3462-3519). When a snapshot has been activated via
+		// loadtxoutset, the active chainstate is the snapshot one: it carries
+		// snapshot_blockhash (the snapshot base) and validated reflects whether
+		// the background re-validation has matched the base UTXO hash yet
+		// (false while the background pass runs / after a mismatch, true after a
+		// match — Core ChainstateRole.validated from the snapshot chainstate's
+		// m_assumeutxo). With no snapshot active we keep the single
+		// fully-validated chainstate (validated=true, snapshot_blockhash
+		// omitted).
+		validated := true
+		snapshotBlockHash := ""
+		s.snapshotMu.RLock()
+		act := s.snapshotActivation
+		baseHashHex := s.snapshotBaseHashHex
+		s.snapshotMu.RUnlock()
+		if act != nil {
+			validated = act.Snapshot.IsValidated()
+			snapshotBlockHash = baseHashHex
+		}
+
 		info := ChainstateInfo{
 			Blocks:               tipHeight,
 			BestBlockHash:        tipHash.String(),
@@ -3104,16 +3301,15 @@ func (s *Server) handleGetChainStates() (interface{}, *RPCError) {
 			VerificationProgress: verificationProgress,
 			CoinsDBCacheBytes:    0,
 			CoinsTipCacheBytes:   coinsTipCacheBytes,
-			// blockbrew runs a single, fully-validated chainstate. The
-			// snapshot-bootstrap path (cmd/blockbrew/main.go::loadSnapshotFromFile)
-			// validates HASH_SERIALIZED against the assumeutxo table before
-			// promoting the snapshot and persists no "from-snapshot" /
-			// background-validation marker, so the live node never holds an
-			// unvalidated snapshot chainstate. Core reports validated =
-			// (m_assumeutxo == VALIDATED); the equivalent here is always true,
-			// and snapshot_blockhash (OPTIONAL — only for a from-snapshot
-			// chainstate) is correctly omitted.
-			Validated: true,
+			// validated mirrors Core's m_assumeutxo == VALIDATED. With no active
+			// snapshot it is always true; once loadtxoutset activates a snapshot
+			// it reflects the background validator's verdict (false until the
+			// genesis->base replay matches the committed hash, false forever on
+			// a mismatch). snapshot_blockhash (OPTIONAL — Core only pushes it
+			// for a from-snapshot chainstate) is emitted only while a snapshot
+			// is active.
+			Validated:         validated,
+			SnapshotBlockHash: snapshotBlockHash,
 		}
 
 		if tipNode != nil {
