@@ -705,6 +705,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleListLockUnspent(walletName)
 	case "walletcreatefundedpsbt":
 		return s.handleWalletCreateFundedPSBT(params, walletName)
+	case "fundrawtransaction":
+		return s.handleFundRawTransaction(params, walletName)
 
 	// Wallet rescan + key import. rescanblockchain rebuilds the wallet's UTXO
 	// ledger + history from existing chain blocks (the wallet half of recovery,

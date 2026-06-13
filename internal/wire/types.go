@@ -416,6 +416,54 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 	return err
 }
 
+// DeserializeNoWitness reads the transaction forcing the legacy (non-segwit)
+// encoding: version | vin-count | vins | vout-count | vouts | locktime, with no
+// BIP144 marker/flag handling. This disambiguates a transaction with zero
+// inputs, whose first post-version byte (0x00) is otherwise indistinguishable
+// from the segwit marker in Deserialize (which would mis-parse it). It mirrors
+// SerializeNoWitness and matches Bitcoin Core's DecodeHexTx(try_no_witness=true)
+// fallback used by fundrawtransaction.
+func (tx *MsgTx) DeserializeNoWitness(r io.Reader) error {
+	var err error
+	tx.Version, err = ReadInt32LE(r)
+	if err != nil {
+		return err
+	}
+
+	inputCount, err := ReadCompactSize(r)
+	if err != nil {
+		return err
+	}
+	if inputCount > MaxTxInputs {
+		return fmt.Errorf("transaction input count %d exceeds maximum %d", inputCount, MaxTxInputs)
+	}
+	tx.TxIn = make([]*TxIn, inputCount)
+	for i := range tx.TxIn {
+		tx.TxIn[i] = &TxIn{}
+		if err := tx.TxIn[i].Deserialize(r); err != nil {
+			return err
+		}
+	}
+
+	outputCount, err := ReadCompactSize(r)
+	if err != nil {
+		return err
+	}
+	if outputCount > MaxTxOutputs {
+		return fmt.Errorf("transaction output count %d exceeds maximum %d", outputCount, MaxTxOutputs)
+	}
+	tx.TxOut = make([]*TxOut, outputCount)
+	for i := range tx.TxOut {
+		tx.TxOut[i] = &TxOut{}
+		if err := tx.TxOut[i].Deserialize(r); err != nil {
+			return err
+		}
+	}
+
+	tx.LockTime, err = ReadUint32LE(r)
+	return err
+}
+
 // TxHash computes the transaction hash (txid) without witness data.
 func (tx *MsgTx) TxHash() Hash256 {
 	var buf []byte
