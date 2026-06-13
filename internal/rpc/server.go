@@ -77,6 +77,21 @@ type Server struct {
 	startTime time.Time
 	shutdown  chan struct{}
 
+	// snapshotActivation records the live AssumeUTXO snapshot activation (Core
+	// ChainstateManager's second chainstate). nil while no snapshot is loaded;
+	// set once handleLoadTxOutSet has activated a snapshot + driven the
+	// background validator. Read by handleGetChainStates to surface
+	// validated/snapshot_blockhash. Guarded by snapshotMu so the loadtxoutset
+	// handler can record the activation on the SAME Server the getter reads —
+	// mirrors Core where ActivateSnapshot installs the chainstate into the
+	// long-lived ChainstateManager that getchainstates later inspects.
+	// snapshotBaseHashHex is the snapshot base block hash (display hex), cached
+	// alongside so getchainstates can emit snapshot_blockhash without a relock
+	// of the chainstate internals.
+	snapshotMu          sync.RWMutex
+	snapshotActivation  *consensus.SnapshotActivation
+	snapshotBaseHashHex string
+
 	// blockSubmissionPaused gates inbound block acceptance during the
 	// `dumptxoutset rollback` rewind→dump→replay dance. Mirrors Bitcoin
 	// Core's NetworkDisable RAII wrapper around TemporaryRollback in
