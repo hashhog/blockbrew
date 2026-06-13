@@ -1,6 +1,7 @@
 package rpc
 
 import (
+	"bytes"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -305,20 +306,6 @@ func (s *Server) handleWalletCreateFundedPSBT(params json.RawMessage, walletName
 	}
 
 	// 4. Optional options object (fourth arg).
-	type fundOptions struct {
-		AddInputs              *bool    `json:"add_inputs,omitempty"`
-		IncludeUnsafe          *bool    `json:"include_unsafe,omitempty"`
-		Minconf                *int     `json:"minconf,omitempty"`
-		Maxconf                *int     `json:"maxconf,omitempty"`
-		ChangeAddress          string   `json:"changeAddress,omitempty"`
-		ChangePosition         *int     `json:"changePosition,omitempty"`
-		ChangeType             string   `json:"change_type,omitempty"`
-		LockUnspents           bool     `json:"lockUnspents,omitempty"`
-		FeeRate                *float64 `json:"fee_rate,omitempty"` // sat/vB
-		FeeRateLegacy          *float64 `json:"feeRate,omitempty"`  // BTC/kvB
-		SubtractFeeFromOutputs []int    `json:"subtractFeeFromOutputs,omitempty"`
-		Replaceable            *bool    `json:"replaceable,omitempty"`
-	}
 	var opts fundOptions
 	if len(args) >= 4 && string(args[3]) != "null" {
 		if err := json.Unmarshal(args[3], &opts); err != nil {
@@ -400,14 +387,8 @@ func (s *Server) handleWalletCreateFundedPSBT(params json.RawMessage, walletName
 		manualInputs = append(manualInputs, op)
 	}
 
-	// 7b. Add outputs and capture each output's amount + scriptPubKey for
-	// later fee-from-output adjustment.
-	type outputRec struct {
-		amount   int64
-		pkScript []byte
-		isData   bool
-	}
-	var outRecs []outputRec
+	// 7b. Add outputs to the skeleton. The shared funding engine reads the
+	// per-output amounts back off tx.TxOut, so we don't need a side table.
 	for i, out := range outputs {
 		// Core enforces single-key objects in array form. Loop here to
 		// stay tolerant of {addr1: amt, addr2: amt} object form too,
@@ -442,7 +423,6 @@ func (s *Server) handleWalletCreateFundedPSBT(params json.RawMessage, walletName
 					pkScript = append(pkScript, 0x4c, byte(len(dataBytes)))
 				}
 				pkScript = append(pkScript, dataBytes...)
-				outRecs = append(outRecs, outputRec{amount: 0, pkScript: pkScript, isData: true})
 				tx.TxOut = append(tx.TxOut, &wire.TxOut{Value: 0, PkScript: pkScript})
 				continue
 			}
@@ -466,10 +446,100 @@ func (s *Server) handleWalletCreateFundedPSBT(params json.RawMessage, walletName
 				}
 			}
 			pkScript := parsed.ScriptPubKey()
-			outRecs = append(outRecs, outputRec{amount: satoshis, pkScript: pkScript})
 			tx.TxOut = append(tx.TxOut, &wire.TxOut{Value: satoshis, PkScript: pkScript})
 		}
 	}
+
+	// 8-13. Run the shared funding engine: pick coins, compute fee, insert
+	// the change output, lock UTXOs. This is the SAME engine fundrawtransaction
+	// reuses — see fundTxSkeleton below.
+	fundRes, rpcErr := s.fundTxSkeleton(w, tx, manualInputs, &opts, locktime, replaceable)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	changePos := fundRes.changePos
+
+	// 14. Build the PSBT skeleton and populate WitnessUTXO for each input
+	// we own (so it round-trips through walletprocesspsbt).
+	psbt, err := wallet.NewPSBT(tx)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to create PSBT: %v", err)}
+	}
+	for i, in := range tx.TxIn {
+		u := walletUTXOByOutpoint(w, in.PreviousOutPoint)
+		if u == nil {
+			continue
+		}
+		psbt.Inputs[i].WitnessUTXO = &wire.TxOut{Value: u.Amount, PkScript: u.PkScript}
+	}
+
+	encoded, err := psbt.EncodeBase64()
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to encode PSBT"}
+	}
+
+	// 15. Report the actual fee = sum(inputs) - sum(outputs), computed by the
+	// shared engine.
+	return &WalletCreateFundedPSBTResult{
+		PSBT:      encoded,
+		Fee:       float64(fundRes.feeSat) / satoshiPerBitcoin,
+		ChangePos: changePos,
+	}, nil
+}
+
+// ============================================================================
+// Shared funding engine (reused by walletcreatefundedpsbt + fundrawtransaction)
+//
+// Reference: bitcoin-core/src/wallet/rpc/spend.cpp::FundTransaction (L470).
+// Both RPCs decode their input into a CMutableTransaction skeleton (PSBT from
+// the inputs/outputs JSON, fundrawtransaction from the raw tx hex) and hand it
+// to the SAME Core FundTransaction engine, which auto-selects coins, computes
+// the fee, and inserts a change output. blockbrew mirrors that: this function
+// is the single coin-selection + fee + change implementation; the two handlers
+// only differ in how they build the skeleton and how they serialize the result
+// (base64 PSBT vs. raw hex).
+// ============================================================================
+
+// fundOptions is the shared options object for walletcreatefundedpsbt and
+// fundrawtransaction. (Core's FundTransaction RPCTypeCheckObj, spend.cpp:485.)
+type fundOptions struct {
+	AddInputs              *bool    `json:"add_inputs,omitempty"`
+	IncludeUnsafe          *bool    `json:"include_unsafe,omitempty"`
+	Minconf                *int     `json:"minconf,omitempty"`
+	Maxconf                *int     `json:"maxconf,omitempty"`
+	ChangeAddress          string   `json:"changeAddress,omitempty"`
+	ChangePosition         *int     `json:"changePosition,omitempty"`
+	ChangeType             string   `json:"change_type,omitempty"`
+	LockUnspents           bool     `json:"lockUnspents,omitempty"`
+	FeeRate                *float64 `json:"fee_rate,omitempty"` // sat/vB
+	FeeRateLegacy          *float64 `json:"feeRate,omitempty"`  // BTC/kvB
+	SubtractFeeFromOutputs []int    `json:"subtractFeeFromOutputs,omitempty"`
+	Replaceable            *bool    `json:"replaceable,omitempty"`
+}
+
+// fundResult is what the shared engine returns after funding the skeleton.
+type fundResult struct {
+	feeSat    int64 // sum(selected+manual inputs) - sum(final outputs)
+	changePos int   // index of the inserted change output, or -1
+}
+
+// fundTxSkeleton is the shared funding engine. It mutates tx in place: appends
+// wallet-selected inputs to cover sum(tx.TxOut)+fee, optionally subtracts the
+// fee from caller outputs, and inserts a change output. The caller is
+// responsible for building tx.TxIn (manual inputs) and tx.TxOut beforehand.
+//
+// manualInputs lists the caller-supplied outpoints already present in tx.TxIn
+// (so the selector can exclude them and value them). This is the SAME logic
+// walletcreatefundedpsbt previously inlined — see Core FundTransaction.
+func (s *Server) fundTxSkeleton(
+	w *wallet.Wallet,
+	tx *wire.MsgTx,
+	manualInputs []wire.OutPoint,
+	opts *fundOptions,
+	locktime uint32,
+	replaceable bool,
+) (*fundResult, *RPCError) {
+	net := w.Network()
 
 	// 8. Determine fee rate. Order of precedence (matches Core):
 	//    fee_rate (sat/vB) > feeRate (BTC/kvB) > wallet estimate.
@@ -488,10 +558,10 @@ func (s *Server) handleWalletCreateFundedPSBT(params json.RawMessage, walletName
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Fee rate cannot be negative"}
 	}
 
-	// 9. Sum target output amount.
+	// 9. Sum target output amount (read straight off the skeleton outputs).
 	var targetOut int64
-	for _, r := range outRecs {
-		targetOut += r.amount
+	for _, o := range tx.TxOut {
+		targetOut += o.Value
 	}
 
 	// 10. Compute total amount of caller-supplied inputs (need wallet UTXOs).
@@ -677,36 +747,116 @@ func (s *Server) handleWalletCreateFundedPSBT(params json.RawMessage, walletName
 		}
 	}
 
-	// 14. Build the PSBT skeleton and populate WitnessUTXO for each input
-	// we own (so it round-trips through walletprocesspsbt).
-	psbt, err := wallet.NewPSBT(tx)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to create PSBT: %v", err)}
-	}
-	for i, in := range tx.TxIn {
-		u := walletUTXOByOutpoint(w, in.PreviousOutPoint)
-		if u == nil {
-			continue
-		}
-		psbt.Inputs[i].WitnessUTXO = &wire.TxOut{Value: u.Amount, PkScript: u.PkScript}
-	}
-
-	encoded, err := psbt.EncodeBase64()
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to encode PSBT"}
-	}
-
-	// 15. Compute the actual fee = totalIn - sum(outputs) for reporting.
+	// Final fee = sum(inputs) - sum(final outputs). Recompute totalOut because
+	// subtractFeeFromOutputs / change insertion changed the output set.
 	var totalOut int64
 	for _, o := range tx.TxOut {
 		totalOut += o.Value
 	}
-	fee := totalIn - totalOut
+	return &fundResult{feeSat: totalIn - totalOut, changePos: changePos}, nil
+}
 
-	return &WalletCreateFundedPSBTResult{
-		PSBT:      encoded,
-		Fee:       float64(fee) / satoshiPerBitcoin,
-		ChangePos: changePos,
+// ============================================================================
+// fundrawtransaction
+//
+// Reference: bitcoin-core/src/wallet/rpc/spend.cpp::fundrawtransaction (L706),
+// which decodes the raw tx hex, clears tx.vout into a recipients vector, and
+// calls FundTransaction (the SAME engine walletcreatefundedpsbt uses). The
+// raw-tx sibling of walletcreatefundedpsbt: existing inputs/outputs are kept,
+// wallet inputs + a change output are added to fund all outputs + fee, and the
+// result is serialized back to hex instead of a PSBT.
+//
+// Result: { "hex": <funded raw tx>, "fee": <BTC>, "changepos": <int or -1> }.
+// ============================================================================
+
+// FundRawTransactionResult is the result of fundrawtransaction.
+type FundRawTransactionResult struct {
+	Hex       string  `json:"hex"`
+	Fee       float64 `json:"fee"`
+	ChangePos int     `json:"changepos"`
+}
+
+// handleFundRawTransaction implements `fundrawtransaction "hexstring" ( options iswitness )`.
+func (s *Server) handleFundRawTransaction(params json.RawMessage, walletName string) (interface{}, *RPCError) {
+	w, rpcErr := s.getWalletForRPC(walletName)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing required parameter: hexstring"}
+	}
+
+	// 1. Parse hexstring (first arg).
+	var hexStr string
+	if err := json.Unmarshal(args[0], &hexStr); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid 'hexstring' (expected string)"}
+	}
+	txBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "TX decode failed"}
+	}
+	// Mirror Core's DecodeHexTx fallback (spend.cpp:808): try the witness-aware
+	// decode first, then the legacy (no-witness) decode. The fallback is what
+	// lets us accept an empty-vin raw tx (as emitted by createrawtransaction),
+	// whose 0x00 input-count byte the witness-aware path mistakes for the
+	// BIP144 segwit marker.
+	tx := &wire.MsgTx{}
+	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		tx = &wire.MsgTx{}
+		if err2 := tx.DeserializeNoWitness(bytes.NewReader(txBytes)); err2 != nil {
+			return nil, &RPCError{Code: RPCErrDeserialization, Message: "TX decode failed"}
+		}
+	}
+
+	// 2. Optional options object (second arg). Core also accepts a bare bool
+	//    here for backward compatibility (does nothing) — we tolerate it.
+	var opts fundOptions
+	if len(args) >= 2 && string(args[1]) != "null" {
+		if string(args[1]) != "true" && string(args[1]) != "false" {
+			if err := json.Unmarshal(args[1], &opts); err != nil {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid 'options' object"}
+			}
+		}
+	}
+	// (third arg `iswitness` only affects how the hex is decoded; our
+	//  Deserialize auto-detects the BIP144 marker, so it is accepted and
+	//  ignored here.)
+
+	// 3. Determine RBF behavior: default signal RBF unless explicitly disabled.
+	replaceable := true
+	if opts.Replaceable != nil {
+		replaceable = *opts.Replaceable
+	}
+
+	// 4. Collect the caller-supplied inputs so the selector excludes/values
+	//    them (these are the existing tx.vin that we keep).
+	manualInputs := make([]wire.OutPoint, 0, len(tx.TxIn))
+	for _, in := range tx.TxIn {
+		manualInputs = append(manualInputs, in.PreviousOutPoint)
+	}
+
+	// 5. Run the SAME shared funding engine walletcreatefundedpsbt uses:
+	//    auto-select coins, compute fee, insert change output.
+	fundRes, rpcErr := s.fundTxSkeleton(w, tx, manualInputs, &opts, tx.LockTime, replaceable)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+
+	// 6. Serialize the funded tx back to hex (vs. PSBT for the sibling RPC).
+	var buf bytes.Buffer
+	if err := tx.Serialize(&buf); err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to serialize funded transaction"}
+	}
+
+	return &FundRawTransactionResult{
+		Hex:       hex.EncodeToString(buf.Bytes()),
+		Fee:       float64(fundRes.feeSat) / satoshiPerBitcoin,
+		ChangePos: fundRes.changePos,
 	}, nil
 }
 
