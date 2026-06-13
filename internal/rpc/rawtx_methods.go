@@ -548,13 +548,18 @@ type SignRawTransactionResult struct {
 	Errors   []SignRawTransactionErr `json:"errors,omitempty"`
 }
 
-// SignRawTransactionErr describes an error signing an input.
+// SignRawTransactionErr describes an error signing an input. The shape mirrors
+// Bitcoin Core's per-input error object (rawtransaction.cpp::SignTransaction ->
+// TxInErrorToJSON): {txid, vout, witness, scriptSig, sequence, error}. Witness
+// is the input's witness stack (each item hex-encoded) and is omitted when the
+// input is non-segwit so the field tracks Core's "witness": [...] entry.
 type SignRawTransactionErr struct {
-	TxID      string `json:"txid"`
-	Vout      uint32 `json:"vout"`
-	ScriptSig string `json:"scriptSig"`
-	Sequence  uint32 `json:"sequence"`
-	Error     string `json:"error"`
+	TxID      string   `json:"txid"`
+	Vout      uint32   `json:"vout"`
+	Witness   []string `json:"witness,omitempty"`
+	ScriptSig string   `json:"scriptSig"`
+	Sequence  uint32   `json:"sequence"`
+	Error     string   `json:"error"`
 }
 
 // PrevTx describes a previous transaction output for signing.
@@ -699,6 +704,167 @@ func (s *Server) handleSignRawTransactionWithWallet(params json.RawMessage, wall
 		result.Errors = signErrors
 	}
 
+	return result, nil
+}
+
+// ============================================================================
+// signrawtransactionwithkey RPC
+//
+// Core-faithful port of bitcoin-core/src/rpc/rawtransaction.cpp
+// signrawtransactionwithkey (672) + SignTransaction. Unlike
+// signrawtransactionwithwallet, this RPC needs NO wallet: the caller supplies
+// the WIF private keys directly. blockbrew builds a temporary, in-memory
+// keystore from those keys (wallet.NewKeystoreFromWIFKeys — Core's
+// FillableSigningProvider) and drives the SAME signer the wallet path uses
+// (SignTransactionPerInput -> signInputWithScripts -> signP2WPKH / signP2PKH /
+// signP2TR / signP2WSH ... -> script.CalcWitnessSignatureHash /
+// script.CalcSignatureHash + bbcrypto.SignECDSA / Schnorr). The only
+// difference from signrawtransactionwithwallet is the source of the keys.
+//
+// Signature: signrawtransactionwithkey "hexstring" ["privatekey",...]
+//	( [{prevtx}...] "sighashtype" )
+// Result: { "hex", "complete", "errors"? } where errors[] entries carry the
+// {txid, vout, witness, scriptSig, sequence, error} shape for every input left
+// unsigned, and complete is true iff EVERY input was fully signed.
+// ============================================================================
+
+func (s *Server) handleSignRawTransactionWithKey(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "signrawtransactionwithkey requires hexstring and privkeys"}
+	}
+
+	hexStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hexstring"}
+	}
+
+	// Arg 1: array of WIF private keys.
+	rawKeys, ok := args[1].([]interface{})
+	if !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "privkeys must be an array"}
+	}
+	wifs := make([]string, 0, len(rawKeys))
+	for _, k := range rawKeys {
+		ks, ok := k.(string)
+		if !ok {
+			return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid private key"}
+		}
+		wifs = append(wifs, ks)
+	}
+
+	// Arg 2 (optional): prevtxs array.
+	var prevTxs []PrevTx
+	if len(args) >= 3 && args[2] != nil {
+		prevTxsData, err := json.Marshal(args[2])
+		if err == nil {
+			json.Unmarshal(prevTxsData, &prevTxs)
+		}
+	}
+
+	// Arg 3 (optional): sighashtype (default ALL).
+	sighashType := "ALL"
+	if len(args) >= 4 {
+		if st, ok := args[3].(string); ok {
+			sighashType = st
+		}
+	}
+	validSighashTypes := map[string]bool{
+		"ALL": true, "NONE": true, "SINGLE": true,
+		"ALL|ANYONECANPAY": true, "NONE|ANYONECANPAY": true, "SINGLE|ANYONECANPAY": true,
+	}
+	if !validSighashTypes[sighashType] {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid sighash type: %s", sighashType)}
+	}
+
+	// Build the temporary keystore from the supplied WIF keys (Core's
+	// FillableSigningProvider for this RPC).
+	ks, err := wallet.NewKeystoreFromWIFKeys(wifs, s.getNetwork())
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: err.Error()}
+	}
+
+	// Decode the transaction.
+	txBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Invalid transaction hex"}
+	}
+	tx := &wire.MsgTx{}
+	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Transaction decode failed: %v", err)}
+	}
+
+	// Merge prevout info from the prevtxs array (txid/vout/scriptPubKey/amount
+	// + optional redeem/witness scripts). Same decoding the wallet RPC uses.
+	walletPrevs := make([]wallet.PrevTxInfo, 0, len(prevTxs))
+	for _, ptx := range prevTxs {
+		hash, err := wire.NewHash256FromHex(ptx.TxID)
+		if err != nil {
+			continue
+		}
+		info := wallet.PrevTxInfo{OutPoint: wire.OutPoint{Hash: hash, Index: ptx.Vout}}
+		if ptx.ScriptPubKey != "" {
+			if b, err := hex.DecodeString(ptx.ScriptPubKey); err == nil {
+				info.ScriptPubKey = b
+			}
+		}
+		if ptx.RedeemScript != "" {
+			if b, err := hex.DecodeString(ptx.RedeemScript); err == nil {
+				info.RedeemScript = b
+			}
+		}
+		if ptx.WitnessScript != "" {
+			if b, err := hex.DecodeString(ptx.WitnessScript); err == nil {
+				info.WitnessScript = b
+			}
+		}
+		// RPC amount is BTC; the BIP-143 signer needs satoshis.
+		info.Amount = int64(math.Round(ptx.Amount * 1e8))
+		walletPrevs = append(walletPrevs, info)
+	}
+
+	// Sign every input we can; collect per-input errors for the rest.
+	inputErrs, err := ks.SignTransactionPerInput(tx, walletPrevs)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Signing failed: %v", err)}
+	}
+
+	complete := true
+	var signErrors []SignRawTransactionErr
+	for i, txIn := range tx.TxIn {
+		if inputErrs[i] == nil {
+			continue
+		}
+		complete = false
+		witness := make([]string, 0, len(txIn.Witness))
+		for _, item := range txIn.Witness {
+			witness = append(witness, hex.EncodeToString(item))
+		}
+		signErrors = append(signErrors, SignRawTransactionErr{
+			TxID:      txIn.PreviousOutPoint.Hash.String(),
+			Vout:      txIn.PreviousOutPoint.Index,
+			Witness:   witness,
+			ScriptSig: hex.EncodeToString(txIn.SignatureScript),
+			Sequence:  txIn.Sequence,
+			Error:     inputErrs[i].Error(),
+		})
+	}
+
+	var buf bytes.Buffer
+	if err := tx.Serialize(&buf); err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to serialize transaction: %v", err)}
+	}
+
+	result := &SignRawTransactionResult{
+		Hex:      hex.EncodeToString(buf.Bytes()),
+		Complete: complete,
+	}
+	if len(signErrors) > 0 {
+		result.Errors = signErrors
+	}
 	return result, nil
 }
 
