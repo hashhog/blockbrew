@@ -768,6 +768,65 @@ var Testnet4AssumeUTXOParams = AssumeUTXOParams{
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Regtest AssumeUTXO whitelist (runtime-registerable).
+//
+// Core's regtest chainparams DOES carry m_assumeutxo_data entries
+// (bitcoin-core/src/kernel/chainparams.cpp:607-628, heights 110 / 200 / 299,
+// explicitly "for use by test/functional/feature_assumeutxo.py" and the
+// snapshot fuzz target). Those Core values are pinned to Core's deterministic
+// regtest mining chain; blockbrew's snapshot tests build their own short
+// regtest chains, so the regtest table is REGISTERABLE at runtime — exactly
+// mirroring how Core's regtest is a mockable chain whose assumeutxo data is
+// purpose-built for the snapshot tests rather than a permanent network
+// commitment.
+//
+// This table is NEVER consulted for mainnet/testnet4 (their whitelists remain
+// the hardcoded, immutable MainnetAssumeUTXOParams / Testnet4AssumeUTXOParams
+// above); it only gates the regtest snapshot test path. Cross-impl reference:
+// camlcoin 3140ab9 (register_regtest_assumeutxo, lib/assume_utxo.ml) and
+// lunarblock a39dd42.
+var (
+	regtestAssumeUTXOMu   sync.Mutex
+	regtestAssumeUTXOData []AssumeUTXOData
+)
+
+// RegisterRegtestAssumeUTXO adds (or replaces, keyed on (Height, BlockHash))
+// an entry to the regtest AssumeUTXO whitelist so a regtest snapshot whose base
+// block is BlockHash can be loaded via loadtxoutset. Regtest only — see the
+// regtestAssumeUTXOData note. Safe for concurrent use.
+func RegisterRegtestAssumeUTXO(d AssumeUTXOData) {
+	regtestAssumeUTXOMu.Lock()
+	defer regtestAssumeUTXOMu.Unlock()
+	filtered := regtestAssumeUTXOData[:0:0]
+	for _, e := range regtestAssumeUTXOData {
+		if e.Height == d.Height && e.BlockHash == d.BlockHash {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+	regtestAssumeUTXOData = append(filtered, d)
+}
+
+// ClearRegtestAssumeUTXO empties the regtest whitelist (test teardown hygiene
+// so registrations never leak across test cases).
+func ClearRegtestAssumeUTXO() {
+	regtestAssumeUTXOMu.Lock()
+	defer regtestAssumeUTXOMu.Unlock()
+	regtestAssumeUTXOData = nil
+}
+
+// RegtestAssumeUTXOParams returns a snapshot of the current regtest whitelist
+// as an *AssumeUTXOParams (ForBlockHash / ForHeight consumers). The returned
+// params is a copy — mutating the live whitelist afterwards does not affect it.
+func RegtestAssumeUTXOParams() *AssumeUTXOParams {
+	regtestAssumeUTXOMu.Lock()
+	defer regtestAssumeUTXOMu.Unlock()
+	cp := make([]AssumeUTXOData, len(regtestAssumeUTXOData))
+	copy(cp, regtestAssumeUTXOData)
+	return &AssumeUTXOParams{Data: cp}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // AssumeUTXO dual-chainstate (real background validation)
 //
 // Core reference: bitcoin-core/src/validation.cpp.
