@@ -632,20 +632,45 @@ func TestW102_G13_ThreeChainstateModelIntegration(t *testing.T) {
 // G15–G17: Background validation (BUG-W102-09)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TestW102_G15_CheckBackgroundValidationUsesWrongHashAlgorithm (BUG-W102-09)
-// CheckBackgroundValidation (assumeutxo.go:618) calls ComputeUTXOHash which
-// uses plain SHA256 over custom serialization. The expectedHash field is loaded
-// from AssumeUTXOData.HashSerialized which is SHA256d over TxOutSer records.
-// These two digests can never match — background validation would always declare
-// the snapshot invalid if it were wired.
+// TestW102_G15_CheckBackgroundValidationUsesWrongHashAlgorithm (BUG-W102-09 —
+// FIXED 2026-06-13). Was: CheckBackgroundValidation called ComputeUTXOHash
+// (plain single-SHA256 over the compressed coin form), but the expectedHash
+// loaded from AssumeUTXOData.HashSerialized is SHA256d over uncompressed TxOutSer
+// records — the two digests could never match. The STEP-0 fix makes
+// ComputeUTXOHash delegate to ComputeHashSerialized, so the validator and the
+// assumeutxo commitment now use byte-identical kernels. The convergence is
+// pinned by TestW102_G15_ComputeUTXOHashMatchesComputeHashSerialized and
+// exercised end-to-end by TestDualChainstate_AcceptCorrectHash /
+// TestDualChainstate_RejectWrongHash.
 func TestW102_G15_CheckBackgroundValidationUsesWrongHashAlgorithm(t *testing.T) {
-	t.Skip("W102 audit: BUG-W102-09 — CheckBackgroundValidation calls ComputeUTXOHash (SHA256) but AssumeUTXOData.HashSerialized uses ComputeHashSerialized (SHA256d/TxOutSer)")
+	// Verify the two hash kernels now agree (BUG-W102-09 fixed).
+	chainDB := storage.NewChainDB(storage.NewMemDB())
+	us := NewUTXOSet(chainDB)
+	var op wire.OutPoint
+	op.Hash[0] = 0x09
+	us.AddUTXO(op, &UTXOEntry{Amount: 1234, PkScript: []byte{0x51}, Height: 3, IsCoinbase: true})
+
+	h1, _, err := ComputeUTXOHash(us)
+	if err != nil {
+		t.Fatalf("ComputeUTXOHash: %v", err)
+	}
+	h2, _, err := ComputeHashSerialized(us)
+	if err != nil {
+		t.Fatalf("ComputeHashSerialized: %v", err)
+	}
+	if h1 != h2 {
+		t.Errorf("BUG-W102-09 regression: ComputeUTXOHash != ComputeHashSerialized")
+	}
 }
 
-// TestW102_G15_ComputeUTXOHashVsComputeHashSerializedDiverge confirms that
-// ComputeUTXOHash and ComputeHashSerialized produce different digests for the
-// same UTXO set, proving the two functions are NOT interchangeable.
-func TestW102_G15_ComputeUTXOHashVsComputeHashSerializedDiverge(t *testing.T) {
+// TestW102_G15_ComputeUTXOHashMatchesComputeHashSerialized confirms the STEP-0
+// fix (2026-06-13): ComputeUTXOHash now computes the genuine Core
+// HASH_SERIALIZED and is byte-identical to ComputeHashSerialized for the same
+// UTXO set. (Before the fix it was plain single-SHA256 over the compressed coin
+// form and the two digests DIVERGED — BUG-W102-09 / BUG-W102-13. The background
+// validator compared a load-time HASH_SERIALIZED commitment against the wrong
+// flavour, so an honest replay could never match a real Core snapshot.)
+func TestW102_G15_ComputeUTXOHashMatchesComputeHashSerialized(t *testing.T) {
 	chainDB := storage.NewChainDB(storage.NewMemDB())
 	us := NewUTXOSet(chainDB)
 	var op wire.OutPoint
@@ -666,8 +691,8 @@ func TestW102_G15_ComputeUTXOHashVsComputeHashSerializedDiverge(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ComputeHashSerialized: %v", err)
 	}
-	if h1 == h2 {
-		t.Errorf("ComputeUTXOHash and ComputeHashSerialized returned the same digest for the same UTXO set — this would only happen by coincidence; the algorithms are different and should diverge")
+	if h1 != h2 {
+		t.Errorf("ComputeUTXOHash (%s) != ComputeHashSerialized (%s); STEP-0 fix means ComputeUTXOHash must compute the genuine Core HASH_SERIALIZED", h1.String(), h2.String())
 	}
 }
 
