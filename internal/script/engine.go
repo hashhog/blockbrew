@@ -607,6 +607,45 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 		return nil
 	}
 
+	// OP_SUCCESSx pre-scan: Core ExecuteWitnessScript (interpreter.cpp:1837-1851)
+	// runs this BEFORE the initial stack-size / element-size checks.
+	// Comment from Core: "OP_SUCCESSx processing overrides everything, including
+	// stack element size limits".  A bare OP_SUCCESSx leaf with an oversized or
+	// over-count witness stack MUST be accepted (or policy-rejected with
+	// DISCOURAGE_OP_SUCCESS), never consensus-rejected for stack limits.
+	{
+		scanPC := 0
+		for scanPC < len(script) {
+			op := script[scanPC]
+			scanPC++
+			if op >= 0x01 && op <= 0x4b {
+				scanPC += int(op)
+			} else if op == OP_PUSHDATA1 {
+				if scanPC >= len(script) {
+					break
+				}
+				scanPC += 1 + int(script[scanPC])
+			} else if op == OP_PUSHDATA2 {
+				if scanPC+2 > len(script) {
+					break
+				}
+				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8
+				scanPC += 2 + dataLen
+			} else if op == OP_PUSHDATA4 {
+				if scanPC+4 > len(script) {
+					break
+				}
+				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8 | int(script[scanPC+2])<<16 | int(script[scanPC+3])<<24
+				scanPC += 4 + dataLen
+			} else if IsOpSuccess(op) {
+				if e.flags&ScriptVerifyDiscourageOpSuccess != 0 {
+					return errors.New("discouraged OP_SUCCESS opcode in tapscript")
+				}
+				return nil
+			}
+		}
+	}
+
 	// BIP-342 initial validity checks on the witness stack BEFORE the
 	// interpreter runs (Core ExecuteWitnessScript interpreter.cpp:1855-1861):
 	//   * tapscript: initial stack size <= MAX_STACK_SIZE

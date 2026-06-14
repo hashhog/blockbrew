@@ -134,6 +134,47 @@ func TestCalcBlockSubsidy(t *testing.T) {
 	}
 }
 
+// TestCalcBlockSubsidyRegtestInterval verifies that CalcBlockSubsidyForInterval
+// uses the caller-supplied halving interval, not the hardcoded mainnet 210000.
+// Specifically, the regtest halving interval is 150 (Core kernel/chainparams.cpp:535),
+// so subsidy must halve at height 150, not at height 210000.
+//
+// This is the unit-level evidence for Finding 6C: CalcBlockSubsidy always uses
+// SubsidyHalvingInterval=210000, whereas CalcBlockSubsidyForInterval (and the
+// now-fixed ConnectBlock call) uses the network-aware value from ChainParams.
+func TestCalcBlockSubsidyRegtestInterval(t *testing.T) {
+	const regtestInterval = 150 // RegtestParams().SubsidyHalvingInterval
+
+	tests := []struct {
+		height      int32
+		wantSubsidy int64  // expected with regtestInterval=150
+		wrongSubsidy int64 // what the mainnet interval (210000) would compute
+	}{
+		// height < 150: both intervals agree (no halving has occurred yet).
+		{1, 5_000_000_000, 5_000_000_000},
+		{149, 5_000_000_000, 5_000_000_000},
+		// height == 150: first halving with regtestInterval; mainnet hasn't halved.
+		{150, 2_500_000_000, 5_000_000_000},
+		{151, 2_500_000_000, 5_000_000_000},
+		// height == 300: second halving with regtestInterval; mainnet still hasn't halved.
+		{300, 1_250_000_000, 5_000_000_000},
+	}
+	for _, tt := range tests {
+		// The correct (network-aware) call.
+		got := CalcBlockSubsidyForInterval(tt.height, regtestInterval)
+		if got != tt.wantSubsidy {
+			t.Errorf("CalcBlockSubsidyForInterval(%d, %d) = %d, want %d",
+				tt.height, regtestInterval, got, tt.wantSubsidy)
+		}
+		// The old (buggy) call that hardcodes 210000.
+		wrong := CalcBlockSubsidy(tt.height)
+		if wrong != tt.wrongSubsidy {
+			t.Errorf("CalcBlockSubsidy(%d) [mainnet] = %d, want %d (confirming bug-side value)",
+				tt.height, wrong, tt.wrongSubsidy)
+		}
+	}
+}
+
 func TestMainnetGenesisBlockHash(t *testing.T) {
 	block := MainnetGenesisBlock()
 	hash := block.Header.BlockHash()

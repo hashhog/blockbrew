@@ -10,6 +10,55 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// createTestBlockWithCoinbaseValue is like createTestBlock but lets the caller
+// specify an explicit coinbaseValue instead of deriving it from CalcBlockSubsidy.
+// Used by tests that need to assert on subsidy enforcement at the ConnectBlock level.
+func createTestBlockWithCoinbaseValue(t *testing.T, params *ChainParams, prevNode *BlockNode, coinbaseValue int64) *wire.MsgBlock {
+	t.Helper()
+
+	blockHeight := prevNode.Height + 1
+	heightScript := encodeBIP34Height(blockHeight)
+	if len(heightScript) < 2 {
+		heightScript = append(heightScript, 0x00)
+	}
+
+	coinbase := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{
+				PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+				SignatureScript:  heightScript,
+				Sequence:         0xFFFFFFFF,
+			},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: coinbaseValue, PkScript: []byte{0x51}},
+		},
+		LockTime: 0,
+	}
+
+	txHashes := []wire.Hash256{coinbase.TxHash()}
+	merkleRoot := CalcMerkleRoot(txHashes)
+
+	header := wire.BlockHeader{
+		Version:    4,
+		PrevBlock:  prevNode.Hash,
+		MerkleRoot: merkleRoot,
+		Timestamp:  prevNode.Header.Timestamp + 600,
+		Bits:       params.PowLimitBits,
+		Nonce:      0,
+	}
+	target := CompactToBig(header.Bits)
+	for i := uint32(0); i < 10_000_000; i++ {
+		header.Nonce = i
+		if HashToBig(header.BlockHash()).Cmp(target) <= 0 {
+			break
+		}
+	}
+
+	return &wire.MsgBlock{Header: header, Transactions: []*wire.MsgTx{coinbase}}
+}
+
 // createTestBlock creates a valid test block that spends the previous coinbase.
 func createTestBlock(t *testing.T, params *ChainParams, prevNode *BlockNode, txs []*wire.MsgTx) *wire.MsgBlock {
 	t.Helper()
@@ -2940,5 +2989,97 @@ func TestReorgTo_MaxReorgDepthCap(t *testing.T) {
 	if postTipHeight != preTipHeight {
 		t.Errorf("tip height moved despite ErrReorgTooDeep: pre=%d post=%d",
 			preTipHeight, postTipHeight)
+	}
+}
+
+// TestConnectBlockSubsidyUsesNetworkParams verifies that ConnectBlock enforces
+// the coinbase subsidy limit using the network's SubsidyHalvingInterval, not
+// the hardcoded mainnet constant 210000.
+//
+// Finding 6C: before the fix, chainmanager.go:551 called CalcBlockSubsidy which
+// hardcodes 210000.  On regtest (interval=150) or any network with a shorter
+// interval, a miner could claim the pre-halving subsidy (50 BTC) for blocks past
+// the halving point without being rejected.
+//
+// This test uses a copy of RegtestParams with SubsidyHalvingInterval=2 so we
+// only need to connect two blocks before hitting the halving boundary.
+func TestConnectBlockSubsidyUsesNetworkParams(t *testing.T) {
+	// Shallow-copy regtest params and override the halving interval to 2 so the
+	// halving fires at height 2 (not 150 or 210000).  All other fields — genesis
+	// block, PoW limit, etc. — stay identical to regtest.
+	base := *RegtestParams()
+	base.SubsidyHalvingInterval = 2
+	params := &base
+
+	idx := NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+
+	genesis := idx.Genesis()
+
+	// Block 1: height 1, no halving yet.  subsidy = 50 BTC.
+	block1 := createTestBlock(t, params, genesis, nil)
+	node1, err := idx.AddHeader(block1.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader block1: %v", err)
+	}
+	if err := db.StoreBlock(block1.Header.BlockHash(), block1); err != nil {
+		t.Fatalf("StoreBlock block1: %v", err)
+	}
+	if err := cm.ConnectBlock(block1); err != nil {
+		t.Fatalf("ConnectBlock block1: %v", err)
+	}
+
+	// Block 2: height 2, last block before halving (halvings = 2/2 = 1 → 25 BTC).
+	// CalcBlockSubsidyForInterval(2, 2) = 50>>1 = 25 BTC.
+	// Build it with the correct subsidy so it passes.
+	correctSubsidyH2 := CalcBlockSubsidyForInterval(2, params.SubsidyHalvingInterval)
+	block2 := createTestBlockWithCoinbaseValue(t, params, node1, correctSubsidyH2)
+	node2, err := idx.AddHeader(block2.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader block2: %v", err)
+	}
+	if err := db.StoreBlock(block2.Header.BlockHash(), block2); err != nil {
+		t.Fatalf("StoreBlock block2: %v", err)
+	}
+	if err := cm.ConnectBlock(block2); err != nil {
+		t.Fatalf("ConnectBlock block2 (correct subsidy %d sat): %v", correctSubsidyH2, err)
+	}
+
+	// Block 3: height 3, halvings = 3/2 = 1 → 25 BTC.  Same halving epoch.
+	// A block claiming the pre-halving 50 BTC must be REJECTED (false-accept
+	// before fix: CalcBlockSubsidy(3) with interval=210000 → 50 BTC allowed).
+	preFix50BTC := CalcBlockSubsidy(3) // mainnet computation = 50 BTC (wrong for this chain)
+	badBlock3 := createTestBlockWithCoinbaseValue(t, params, node2, preFix50BTC)
+	_, err = idx.AddHeader(badBlock3.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader bad block3: %v", err)
+	}
+	if err := db.StoreBlock(badBlock3.Header.BlockHash(), badBlock3); err != nil {
+		t.Fatalf("StoreBlock bad block3: %v", err)
+	}
+	if err := cm.ConnectBlock(badBlock3); err == nil {
+		t.Errorf("ConnectBlock with oversized coinbase (%d sat > %d sat allowed) must be rejected; got nil (6C false-accept)",
+			preFix50BTC, CalcBlockSubsidyForInterval(3, params.SubsidyHalvingInterval))
+	}
+
+	// A block at height 3 with the correct 25 BTC subsidy must be ACCEPTED.
+	correctSubsidyH3 := CalcBlockSubsidyForInterval(3, params.SubsidyHalvingInterval)
+	goodBlock3 := createTestBlockWithCoinbaseValue(t, params, node2, correctSubsidyH3)
+	_, err = idx.AddHeader(goodBlock3.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader good block3: %v", err)
+	}
+	if err := db.StoreBlock(goodBlock3.Header.BlockHash(), goodBlock3); err != nil {
+		t.Fatalf("StoreBlock good block3: %v", err)
+	}
+	if err := cm.ConnectBlock(goodBlock3); err != nil {
+		t.Errorf("ConnectBlock with correct post-halving coinbase (%d sat) rejected: %v",
+			correctSubsidyH3, err)
 	}
 }
