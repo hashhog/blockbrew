@@ -115,6 +115,15 @@ func NewBlockFilterIndex(db DB) *BlockFilterIndex {
 	}
 }
 
+// NeedsUndo reports that the blockfilterindex requires real per-block undo data
+// on both the catch-up and live connect paths so that spent-prevout scriptPubKeys
+// are included in the BIP-158 basic filter. Bitcoin Core's blockfilterindex sets
+// options.connect_undo_data = true (index/blockfilterindex.cpp:94) for exactly
+// this reason, and its CustomAppend asserts block.undo_data non-nil (line 252).
+// Without undo the filter misses spent prevout scripts, breaking wallet rescans
+// against the filter for any block that spends outputs.
+func (idx *BlockFilterIndex) NeedsUndo() bool { return true }
+
 // Init initializes the blockfilterindex by loading state from the database.
 //
 // FIX-83 / W122 migration: if the state row carries no

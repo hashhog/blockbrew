@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -259,12 +260,17 @@ func (m *IndexManager) CatchUp(tipHeight int32, hashAt func(int32) (wire.Hash256
 }
 
 // undoNeeder is an optional capability: an index implementing it asks the
-// catch-up replay to feed it real per-block undo data (spent coins) on the
-// forward path, instead of the nil undo that blockfilterindex deliberately
-// wants (its BIP-158 filters must be byte-identical between catch-up and live
-// connect, which requires nil undo — see catchUpOne's forward loop). The
-// coinstatsindex needs undo to subtract spent coins from its running UTXO-set
-// MuHash + counts; without it the stats only ever grow.
+// catch-up replay (and the live connect hook in main.go) to feed it real
+// per-block undo data. Indexes that do not declare NeedsUndo get nil undo.
+//
+// Both the blockfilterindex and the coinstatsindex declare NeedsUndo():
+//   - coinstatsindex needs undo to subtract spent coins from the running
+//     UTXO-set MuHash + counts; without it the stats only ever grow.
+//   - blockfilterindex needs undo so that spent-prevout scriptPubKeys are
+//     included in BIP-158 basic filters. Bitcoin Core's blockfilterindex sets
+//     options.connect_undo_data = true (index/blockfilterindex.cpp:94) and its
+//     CustomAppend asserts block.undo_data (line 252). Without undo data,
+//     filters built here omit spent scripts and diverge from Core's filters.
 type undoNeeder interface {
 	// NeedsUndo reports whether this index requires real undo data during
 	// catch-up replay. Indexes that return false get nil undo (the default).
@@ -335,25 +341,23 @@ func (m *IndexManager) catchUpOne(idx Index, tipHeight int32, hashAt func(int32)
 		if err != nil {
 			return fmt.Errorf("read block %s at height %d: %w", hash.String(), h, err)
 		}
-		// Default: pass nil undo to mirror the live OnBlockConnected hook in
-		// cmd/blockbrew/main.go exactly (it calls WriteBlock/WriteBlockBatch
-		// with a nil undo). Feeding real undo data here would change the
-		// blockfilterindex output for catch-up blocks (BIP-158 basic filters
-		// include spent-input scriptPubKeys when undo is present), making
-		// catch-up filters diverge from live-connected filters and breaking
-		// the BIP-157 filter-header chain continuity. Keep them identical.
-		//
-		// Exception: an index that declares NeedsUndo() (coinstatsindex) gets
-		// real undo so it can subtract spent coins from its running UTXO-set
-		// MuHash + counts — exactly what the live connect hook in main.go does
-		// for it (it reads ReadBlockUndo before calling WriteBlock).
+		// Default: pass nil undo. An index that declares NeedsUndo() gets real
+		// per-block undo data so spent coins are correctly processed:
+		//   - coinstatsindex: subtracts spent coins from the running UTXO-set
+		//     MuHash + counts.
+		//   - blockfilterindex: includes spent-prevout scriptPubKeys in the
+		//     BIP-158 basic filter (mirrors Core index/blockfilterindex.cpp:94,
+		//     options.connect_undo_data = true, and CustomAppend line 252).
+		// The live OnBlockConnected hook in main.go must feed real undo to both
+		// indexes for exactly the same reasons; the live hook and catch-up path
+		// must stay in sync so filter bytes are identical between them.
 		var undo *BlockUndo
 		if needsUndo {
 			u, uerr := m.chainDB.ReadBlockUndo(hash)
-			if uerr != nil {
+			if uerr != nil && !errors.Is(uerr, ErrNotFound) {
 				return fmt.Errorf("read undo for block %s at height %d: %w", hash.String(), h, uerr)
 			}
-			undo = u
+			undo = u // nil on ErrNotFound — mirrors live hook behaviour when undo is unavailable
 		}
 		if err := idx.WriteBlock(block, h, hash, undo); err != nil {
 			return fmt.Errorf("write block %s at height %d: %w", hash.String(), h, err)
