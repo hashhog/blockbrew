@@ -236,6 +236,28 @@ func NewAddressBook() *AddressBook {
 	}
 }
 
+// clampAddrTimestamp applies the Bitcoin Core net_processing.cpp:5678-5680
+// timestamp clamp to a peer-advertised addr/addrv2 nTime value.
+//
+// Core clamps a received nTime to (now - 5*24h) when it is either:
+//   - pre-2001 (Unix timestamp <= 100000000, i.e., before 2001-03-09), or
+//   - more than 10 minutes in the future (> now + 10 min).
+//
+// This prevents peers from poisoning our address manager with bogus
+// last-seen timestamps (either extremely stale or far-future values).
+func clampAddrTimestamp(ts uint32, now time.Time) time.Time {
+	const (
+		pre2001Cutoff  = 100_000_000            // Unix seconds ≈ 2001-03-09
+		futureSlack    = 10 * time.Minute
+		staleDefault   = 5 * 24 * time.Hour     // Core: current_time - 5*24h
+	)
+	t := time.Unix(int64(ts), 0)
+	if ts <= pre2001Cutoff || t.After(now.Add(futureSlack)) {
+		t = now.Add(-staleDefault)
+	}
+	return t
+}
+
 // AddAddress adds a new address to the book.
 // Non-routable addresses (RFC1918 private, loopback, link-local, benchmarking,
 // shared address space, documentation ranges, ORCHID/ORCHIDv2) are rejected,
@@ -250,12 +272,25 @@ func (ab *AddressBook) AddAddress(addr NetAddress, source string) {
 		return
 	}
 
+	// Apply Core net_processing.cpp:5678-5680 timestamp clamp before storing.
+	// Zero means "no timestamp supplied" (e.g. DNS seed entries); fall back to
+	// now so the address is immediately useful for selection scoring.
+	now := time.Now()
+	var lastSeen time.Time
+	if addr.Timestamp == 0 {
+		lastSeen = now
+	} else {
+		lastSeen = clampAddrTimestamp(addr.Timestamp, now)
+	}
+
 	key := addrKey(addr)
 
 	// Check if we already have this address
 	if existing, ok := ab.addrs[key]; ok {
-		// Update last seen time
-		existing.LastSeen = time.Now()
+		// Update last seen time only if the incoming timestamp is more recent.
+		if lastSeen.After(existing.LastSeen) {
+			existing.LastSeen = lastSeen
+		}
 		return
 	}
 
@@ -268,7 +303,7 @@ func (ab *AddressBook) AddAddress(addr NetAddress, source string) {
 	ab.addrs[key] = &KnownAddress{
 		Addr:     addr,
 		Source:   source,
-		LastSeen: time.Now(),
+		LastSeen: lastSeen,
 	}
 }
 

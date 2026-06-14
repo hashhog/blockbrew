@@ -30,7 +30,8 @@ var (
 	ErrInvalidSigCount      = errors.New("invalid signature count")
 	ErrWitnessProgram       = errors.New("invalid witness program")
 	ErrWitnessMismatch      = errors.New("witness data mismatch")
-	ErrWitnessMalleated     = errors.New("witness malleated")
+	ErrWitnessMalleated       = errors.New("witness malleated")
+	ErrWitnessMalleatedP2SH   = errors.New("witness malleated P2SH: scriptSig is not an exact single push of the redeemScript")
 	ErrTaprootSigVerify         = errors.New("taproot signature verification failed")
 	ErrDiscourageUpgradableTaprootVersion = errors.New("upgradable taproot leaf version (discouraged)")
 	ErrDiscourageUpgradablePubKeyType     = errors.New("upgradable tapscript pubkey type (discouraged)")
@@ -226,6 +227,13 @@ func (e *Engine) Execute() error {
 		if witnessVersion >= 0 && (e.flags&ScriptVerifyWitness != 0) {
 			// P2SH-wrapped segwit
 			hadWitness = true
+			// Core interpreter.cpp:2082-2086: the scriptSig must be EXACTLY a
+			// single canonical push of the redeemScript bytes — any extra push
+			// before or after (e.g. OP_0 <redeemScript>) reintroduces scriptSig
+			// malleability that BIP141 is designed to prevent.
+			if !bytes.Equal(scriptSig, canonicalPushScript(serializedScript)) {
+				return ErrWitnessMalleatedP2SH
+			}
 			// Fix #7: P2SH-wrapped witness v1+ is not executed (BIP341).
 			if witnessVersion >= 1 {
 				return nil
@@ -1389,6 +1397,53 @@ func IsPushOnly(script []byte) bool {
 		}
 	}
 	return true
+}
+
+// canonicalPushScript returns the minimal-encoding push script for data,
+// mirroring the CScript << std::vector<unsigned char> operator in Bitcoin Core.
+// The encoding is:
+//   - empty data  → OP_0 (0x00)
+//   - 1–75 bytes  → <len> <data>
+//   - 76–255 bytes → OP_PUSHDATA1 <len8> <data>
+//   - 256–65535 bytes → OP_PUSHDATA2 <len16le> <data>
+//   - larger       → OP_PUSHDATA4 <len32le> <data>
+//
+// This is used by the P2SH-wrapped-witness malleation check (BIP141 / Core
+// interpreter.cpp:2082) to reconstruct the expected scriptSig and compare it
+// byte-for-byte against the actual scriptSig.
+func canonicalPushScript(data []byte) []byte {
+	n := len(data)
+	switch {
+	case n == 0:
+		return []byte{OP_0}
+	case n <= 75:
+		script := make([]byte, 1+n)
+		script[0] = byte(n)
+		copy(script[1:], data)
+		return script
+	case n <= 0xff:
+		script := make([]byte, 2+n)
+		script[0] = OP_PUSHDATA1
+		script[1] = byte(n)
+		copy(script[2:], data)
+		return script
+	case n <= 0xffff:
+		script := make([]byte, 3+n)
+		script[0] = OP_PUSHDATA2
+		script[1] = byte(n)
+		script[2] = byte(n >> 8)
+		copy(script[3:], data)
+		return script
+	default:
+		script := make([]byte, 5+n)
+		script[0] = OP_PUSHDATA4
+		script[1] = byte(n)
+		script[2] = byte(n >> 8)
+		script[3] = byte(n >> 16)
+		script[4] = byte(n >> 24)
+		copy(script[5:], data)
+		return script
+	}
 }
 
 // VerifyScript is a convenience function to verify a transaction input.

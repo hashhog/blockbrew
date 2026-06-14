@@ -422,3 +422,107 @@ func TestAddressBookPickPrefersSucessful(t *testing.T) {
 		t.Errorf("successful address should be preferred, got %d/%d picks", successCount, iterations)
 	}
 }
+
+// TestClampAddrTimestamp verifies the Core net_processing.cpp:5678-5680 timestamp
+// clamp: a received nTime that is pre-2001 (<=100000000) or more than 10 minutes
+// in the future is replaced by (now - 5*24h).  A normal recent timestamp is kept.
+func TestClampAddrTimestamp(t *testing.T) {
+	now := time.Now()
+	stale := now.Add(-5 * 24 * time.Hour).Unix()
+
+	tests := []struct {
+		name      string
+		ts        uint32
+		wantStale bool // true → expect clamped to ~(now-5d), false → expect ts preserved
+	}{
+		{"pre-2001 (ts=0)", 0, true},
+		{"pre-2001 (ts=100000000)", 100_000_000, true},
+		{"far-future (ts=now+20min)", uint32(now.Add(20 * time.Minute).Unix()), true},
+		{"recent (ts=now-1h)", uint32(now.Add(-time.Hour).Unix()), false},
+		{"exactly 5 days ago", uint32(now.Add(-5 * 24 * time.Hour).Unix()), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := clampAddrTimestamp(tt.ts, now)
+			if tt.wantStale {
+				// Must be within 2 seconds of (now-5d).
+				diff := got.Unix() - stale
+				if diff < -2 || diff > 2 {
+					t.Errorf("expected clamped to now-5d (~%d), got %d (diff %d)", stale, got.Unix(), diff)
+				}
+			} else {
+				// Must equal the raw timestamp.
+				if got.Unix() != int64(tt.ts) {
+					t.Errorf("expected preserved ts=%d, got %d", tt.ts, got.Unix())
+				}
+			}
+		})
+	}
+}
+
+// TestAddAddressTimestampClamp verifies that AddAddress stores the Core-clamped
+// timestamp as LastSeen rather than always using time.Now().
+// FAILS before the clamp fix (AddAddress always wrote time.Now()) because the
+// pre-2001 address would have a LastSeen≈now instead of ≈now-5d.
+func TestAddAddressTimestampClamp(t *testing.T) {
+	ab := NewAddressBook()
+	now := time.Now()
+
+	// Address with a pre-2001 timestamp — must be clamped to (now-5d).
+	pre2001Addr := NetAddress{
+		IP:        net.ParseIP("1.2.3.1"),
+		Port:      8333,
+		Timestamp: 1000, // well before 100000000 cutoff
+	}
+	ab.AddAddress(pre2001Addr, "test")
+
+	ka := ab.GetAddress("1.2.3.1:8333")
+	if ka == nil {
+		t.Fatal("address should have been added")
+	}
+	wantStale := now.Add(-5 * 24 * time.Hour)
+	// Allow ±5 second tolerance for test execution time.
+	diff := ka.LastSeen.Unix() - wantStale.Unix()
+	if diff < -5 || diff > 5 {
+		t.Errorf("pre-2001 addr: LastSeen should be clamped to now-5d (~%d), got %d (diff %d)",
+			wantStale.Unix(), ka.LastSeen.Unix(), diff)
+	}
+
+	// Address with a far-future timestamp — must also be clamped.
+	futureAddr := NetAddress{
+		IP:        net.ParseIP("1.2.3.2"),
+		Port:      8333,
+		Timestamp: uint32(now.Add(30 * time.Minute).Unix()),
+	}
+	ab.AddAddress(futureAddr, "test")
+
+	ka2 := ab.GetAddress("1.2.3.2:8333")
+	if ka2 == nil {
+		t.Fatal("future-ts address should have been added")
+	}
+	diff2 := ka2.LastSeen.Unix() - wantStale.Unix()
+	if diff2 < -5 || diff2 > 5 {
+		t.Errorf("future-ts addr: LastSeen should be clamped to now-5d (~%d), got %d (diff %d)",
+			wantStale.Unix(), ka2.LastSeen.Unix(), diff2)
+	}
+
+	// Address with a normal recent timestamp — must be preserved.
+	recentTs := uint32(now.Add(-time.Hour).Unix())
+	recentAddr := NetAddress{
+		IP:        net.ParseIP("1.2.3.3"),
+		Port:      8333,
+		Timestamp: recentTs,
+	}
+	ab.AddAddress(recentAddr, "test")
+
+	ka3 := ab.GetAddress("1.2.3.3:8333")
+	if ka3 == nil {
+		t.Fatal("recent-ts address should have been added")
+	}
+	diff3 := ka3.LastSeen.Unix() - int64(recentTs)
+	if diff3 < -2 || diff3 > 2 {
+		t.Errorf("recent-ts addr: LastSeen should equal advertised ts %d, got %d (diff %d)",
+			recentTs, ka3.LastSeen.Unix(), diff3)
+	}
+}
