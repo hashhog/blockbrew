@@ -1279,48 +1279,56 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 				}
 			}
 		}
+		// Read real undo data whenever blockfilterindex or coinstatsindex is
+		// enabled. Both indexes require spent-prevout information:
+		//   - blockfilterindex: spent prevout scriptPubKeys belong in the BIP-158
+		//     basic filter (Core index/blockfilterindex.cpp:94 + blockfilter.cpp:200-206).
+		//   - coinstatsindex: spent coins must be subtracted from the UTXO-set
+		//     MuHash + counts (Core index/coinstatsindex.cpp:159-174).
+		// During a multi-block reorg the undo was staged into the shared reorg
+		// batch by ConnectBlock but is NOT yet committed to disk. Read through the
+		// in-flight reorg batch (indexed) so the undo is visible; outside a reorg
+		// CurrentReorgBatch() is nil and this is a plain disk read.
+		var blockUndo *storage.BlockUndo
+		if blockFilterIndex != nil || coinStatsIndex != nil {
+			reorgBatch := chainMgr.CurrentReorgBatch()
+			u, uerr := chainDB.ReadBlockUndoFromBatch(reorgBatch, blockHash)
+			if uerr != nil {
+				log.Printf("index: read undo %s @ height=%d: %v",
+					blockHash.String()[:16], height, uerr)
+			} else {
+				blockUndo = u
+			}
+		}
+
 		if blockFilterIndex != nil {
+			// BIP-157/158: basic filters include spent-prevout scriptPubKeys.
+			// Pass the real undo so buildBasicFilter sees the spent scripts.
+			// Mirrors Bitcoin Core index/blockfilterindex.cpp:250-257 (CustomAppend
+			// asserts block.undo_data and calls BlockFilter(type, block, undo)).
 			if reorgBatch := chainMgr.CurrentReorgBatch(); reorgBatch != nil {
-				if err := blockFilterIndex.WriteBlockBatch(reorgBatch, block, height, blockHash, nil); err != nil {
+				if err := blockFilterIndex.WriteBlockBatch(reorgBatch, block, height, blockHash, blockUndo); err != nil {
 					log.Printf("blockfilterindex: write (batched) %s @ height=%d failed: %v",
 						blockHash.String()[:16], height, err)
 					return
 				}
 				blockFilterIndex.CommitWriteState(height, blockHash)
 			} else {
-				if err := blockFilterIndex.WriteBlock(block, height, blockHash, nil); err != nil {
+				if err := blockFilterIndex.WriteBlock(block, height, blockHash, blockUndo); err != nil {
 					log.Printf("blockfilterindex: write %s @ height=%d failed: %v",
 						blockHash.String()[:16], height, err)
 				}
 			}
 		}
 		// coinstatsindex: maintain the per-height UTXO-set MuHash + counts.
-		// Unlike blockfilterindex, this MUST receive real undo data so spent
-		// coins are subtracted from the running set — otherwise utxoCount /
-		// total_amount / muhash only ever grow and diverge from Core. There is
-		// no batch-aware WriteBlockBatch variant for this index; it tolerates
-		// the same non-atomic-vs-reorg window the class already accepts (Init
-		// re-reads from disk on restart). Mirrors Core's coinstatsindex
-		// CustomAppend, which is driven from undo (CCoinsViewCache spent set).
+		// Receives real undo data (shared with blockfilterindex read above) so
+		// spent coins are subtracted from the running set. Mirrors Core's
+		// coinstatsindex CustomAppend, driven from undo (CCoinsViewCache spent set).
+		// No batch-aware WriteBlockBatch variant; tolerates the same non-atomic-
+		// vs-reorg window the class already accepts (Init re-reads from disk on
+		// restart).
 		if coinStatsIndex != nil {
-			// During a multi-block reorg, this block's undo was staged into the
-			// shared reorg batch by ConnectBlock but is NOT yet committed to
-			// disk — a plain ReadBlockUndo returns ErrNotFound for every
-			// reconnected B-chain block, which would make WriteBlock skip the
-			// spent-coin subtraction and leave the per-height MuHash stuck on
-			// chain A's value (the REORG-RECONNECT desync). Read through the
-			// in-flight reorg batch (indexed) so B's reconnected blocks get
-			// their real undo and the MuHash tracks the active chain, matching
-			// Core's CoinStatsIndex CustomAppend during ActivateBestChain.
-			// Outside a reorg, CurrentReorgBatch() is nil and this is a plain
-			// disk read.
-			reorgBatch := chainMgr.CurrentReorgBatch()
-			undo, uerr := chainDB.ReadBlockUndoFromBatch(reorgBatch, blockHash)
-			if uerr != nil {
-				log.Printf("coinstatsindex: read undo %s @ height=%d: %v",
-					blockHash.String()[:16], height, uerr)
-			}
-			if err := coinStatsIndex.WriteBlock(block, height, blockHash, undo); err != nil {
+			if err := coinStatsIndex.WriteBlock(block, height, blockHash, blockUndo); err != nil {
 				log.Printf("coinstatsindex: write %s @ height=%d failed: %v",
 					blockHash.String()[:16], height, err)
 			}

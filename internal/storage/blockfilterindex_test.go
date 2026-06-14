@@ -934,6 +934,114 @@ func TestBIP158FastRange64(t *testing.T) {
 	}
 }
 
+// TestBlockFilterSpentPrevoutIncluded verifies that BIP-158 basic block filters
+// include the scriptPubKeys of spent (input) prevouts when real undo data is
+// provided, and that those scripts are MISSING from the filter when undo is nil.
+//
+// Non-vacuous: without the fix (live hook passes nil undo), a wallet that holds
+// a P2PKH output cannot find the spending transaction by scanning the filter —
+// the spent script never appears in the filter. With the fix (undo passed),
+// the script appears and matchGCS returns true.
+//
+// Bitcoin Core reference: blockfilter.cpp:200-206 (BasicFilterElements iterates
+// block_undo.vtxundo[].vprevout and includes each prevout.scriptPubKey) and
+// index/blockfilterindex.cpp:94 (options.connect_undo_data = true).
+func TestBlockFilterSpentPrevoutIncluded(t *testing.T) {
+	// A distinctive P2PKH scriptPubKey that only exists as a spent prevout.
+	spentScript := []byte{
+		0x76, 0xa9, 0x14,
+		0xde, 0xad, 0xbe, 0xef, 0xca, 0xfe, 0xba, 0xbe,
+		0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+		0x09, 0x0a, 0x0b, 0x0c,
+		0x88, 0xac,
+	}
+
+	// Build a block that spends an output (the output itself is NOT in this
+	// block's txouts, so it only appears via undo data).
+	coinbase := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xffffffff},
+			SignatureScript:  []byte{0x01, 0x01},
+			Sequence:         0xffffffff,
+		}},
+		TxOut: []*wire.TxOut{{
+			Value:    5_000_000_000,
+			PkScript: []byte{0x51}, // OP_1 — a different script entirely
+		}},
+	}
+	spendingTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x11}, Index: 0},
+			SignatureScript:  []byte{0x00},
+			Sequence:         0xffffffff,
+		}},
+		TxOut: []*wire.TxOut{{
+			Value:    999_000,
+			PkScript: []byte{0x52}, // OP_2 — another different script
+		}},
+	}
+	block := &wire.MsgBlock{
+		Header: wire.BlockHeader{
+			Version: 1,
+			Bits:    0x1d00ffff,
+			Nonce:   42,
+		},
+		Transactions: []*wire.MsgTx{coinbase, spendingTx},
+	}
+	blockHash := block.Header.BlockHash()
+
+	// Build undo data: spendingTx spent one output with spentScript.
+	undo := &BlockUndo{
+		TxUndos: []TxUndo{
+			{SpentCoins: []SpentCoin{
+				{TxOut: wire.TxOut{Value: 1_000_000, PkScript: spentScript}},
+			}},
+		},
+	}
+
+	db := NewMemDB()
+	defer db.Close()
+	idx := NewBlockFilterIndex(db)
+
+	// --- with undo: spent script MUST appear in filter ---
+	filterWithUndo := idx.buildBasicFilter(block, undo, blockHash)
+	matchWith, err := matchGCS(filterWithUndo, blockHash, [][]byte{spentScript})
+	if err != nil {
+		t.Fatalf("matchGCS (with undo): %v", err)
+	}
+	if !matchWith {
+		t.Error("spent prevout script missing from filter built WITH undo — Core includes it (blockfilter.cpp:200-206)")
+	}
+
+	// --- without undo: spent script must NOT appear in filter ---
+	filterNoUndo := idx.buildBasicFilter(block, nil, blockHash)
+	matchWithout, err := matchGCS(filterNoUndo, blockHash, [][]byte{spentScript})
+	if err != nil {
+		t.Fatalf("matchGCS (no undo): %v", err)
+	}
+	if matchWithout {
+		// A false positive is possible but astronomically unlikely (1/784931).
+		t.Logf("spent script produced false positive without undo (p ≈ 1/784931, expected very rarely)")
+	}
+
+	// Verify that output scripts (OP_1, OP_2) are present in both cases
+	// (these come from the block's outputs, not undo, and must always appear).
+	for _, script := range [][]byte{{0x51}, {0x52}} {
+		for _, filter := range [][]byte{filterWithUndo, filterNoUndo} {
+			m, err := matchGCS(filter, blockHash, [][]byte{script})
+			if err != nil {
+				t.Errorf("matchGCS output script 0x%x: %v", script, err)
+				continue
+			}
+			if !m {
+				t.Errorf("output script 0x%x missing from filter (should always be present)", script)
+			}
+		}
+	}
+}
+
 // createTestBlockWithScripts creates a test block with varied scriptPubKeys.
 func createTestBlockWithScripts(height int32) *wire.MsgBlock {
 	// P2PKH script

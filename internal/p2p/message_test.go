@@ -611,6 +611,89 @@ func TestMaxLimits(t *testing.T) {
 	}
 }
 
+// TestGetDataIncomingSizeLimit verifies that incoming getdata messages up to
+// MaxInvVects (50000) are accepted, and only messages exceeding that limit are
+// rejected.
+//
+// Bitcoin Core uses MAX_INV_SZ=50000 for incoming getdata
+// (net_processing.cpp:4131). MaxGetDataSize=1000 is the OUTGOING limit only
+// (the comment at net_processing.cpp:127-128 says "Not used in processing
+// incoming GETDATA for compatibility"). Rejecting peers at 1001 invs was a
+// false-disconnect bug.
+//
+// Non-vacuous: without the fix, Deserialize returns ErrTooManyInvVects for
+// count=1001; with the fix it succeeds.
+func TestGetDataIncomingSizeLimit(t *testing.T) {
+	// Serialize a getdata with MaxGetDataSize+1 entries (1001) and verify it
+	// deserializes successfully (it is below MaxInvVects=50000).
+	serialize := func(count int) []byte {
+		var buf bytes.Buffer
+		// Write CompactSize count
+		if count < 0xfd {
+			buf.WriteByte(byte(count))
+		} else {
+			buf.WriteByte(0xfd)
+			buf.WriteByte(byte(count & 0xff))
+			buf.WriteByte(byte(count >> 8))
+		}
+		// Write `count` InvVect entries (each is 4-byte type + 32-byte hash = 36 bytes)
+		for i := 0; i < count; i++ {
+			// type = MSG_TX (1), hash = all zeros
+			buf.Write([]byte{0x01, 0x00, 0x00, 0x00})
+			buf.Write(make([]byte, 32))
+		}
+		return buf.Bytes()
+	}
+
+	t.Run("1000 invs accepted", func(t *testing.T) {
+		data := serialize(MaxGetDataSize) // exactly the old (wrong) cap
+		var msg MsgGetData
+		if err := msg.Deserialize(bytes.NewReader(data)); err != nil {
+			t.Errorf("1000 invs should be accepted, got: %v", err)
+		}
+		if len(msg.InvList) != MaxGetDataSize {
+			t.Errorf("InvList len = %d, want %d", len(msg.InvList), MaxGetDataSize)
+		}
+	})
+
+	t.Run("1001 invs accepted (above old wrong cap)", func(t *testing.T) {
+		data := serialize(MaxGetDataSize + 1)
+		var msg MsgGetData
+		if err := msg.Deserialize(bytes.NewReader(data)); err != nil {
+			// This is the bug: pre-fix this returned ErrTooManyInvVects.
+			t.Errorf("1001 invs should be accepted (Core allows up to 50000), got: %v", err)
+		}
+		if len(msg.InvList) != MaxGetDataSize+1 {
+			t.Errorf("InvList len = %d, want %d", len(msg.InvList), MaxGetDataSize+1)
+		}
+	})
+
+	t.Run("50001 invs rejected (above MaxInvVects)", func(t *testing.T) {
+		// Serialize a getdata with 50001 entries. 50001 = 0xC351 in hex;
+		// CompactSize LE encoding: 0xFD 0x51 0xC3.
+		// Rejection happens at the count check before any entries are read.
+		data := serialize(MaxInvVects + 1)
+		var msg MsgGetData
+		err := msg.Deserialize(bytes.NewReader(data))
+		if err != ErrTooManyInvVects {
+			t.Errorf("50001 invs should be rejected with ErrTooManyInvVects, got: %v", err)
+		}
+	})
+
+	// AddInvVect still caps OUTGOING getdata at MaxGetDataSize=1000.
+	t.Run("AddInvVect caps at MaxGetDataSize=1000", func(t *testing.T) {
+		var msg MsgGetData
+		for i := 0; i < MaxGetDataSize; i++ {
+			if err := msg.AddInvVect(&InvVect{}); err != nil {
+				t.Fatalf("AddInvVect failed at %d: %v", i, err)
+			}
+		}
+		if err := msg.AddInvVect(&InvVect{}); err != ErrTooManyInvVects {
+			t.Errorf("AddInvVect should cap at %d, got %v", MaxGetDataSize, err)
+		}
+	})
+}
+
 func TestVersionMessageKnownSerialization(t *testing.T) {
 	// This is a real version message captured from the Bitcoin network
 	// (without the message header)
