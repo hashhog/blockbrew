@@ -1125,6 +1125,18 @@ func TestCalculateSequenceLocks(t *testing.T) {
 			wantTime:    -1,
 		},
 		{
+			// Core stores version as uint32_t and compares unsigned >= 2
+			// (tx_verify.cpp:51), so a high-bit version still enforces BIP68.
+			// A signed `< 2` (the bug) treats int32(0x80000002) as negative and
+			// skips enforcement, returning wantHeight=-1 instead of 109.
+			name:        "high-bit version 0x80000002 enforces BIP68 (Core unsigned)",
+			txVersion:   -2147483646, // int32 bit pattern 0x80000002 (high bit set)
+			sequences:   []uint32{10},
+			prevHeights: []int32{100},
+			wantHeight:  100 + 10 - 1, // 109 -- same as v2; pre-fix bug returns -1
+			wantTime:    -1,
+		},
+		{
 			name:        "height-based lock of 1 block (minimum)",
 			txVersion:   2,
 			sequences:   []uint32{1},
