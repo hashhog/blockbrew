@@ -284,6 +284,106 @@ func TestCoinStatsIndexPersistence(t *testing.T) {
 	}
 }
 
+// TestCoinStatsIndexBIP30Skip verifies that WriteBlock does NOT apply the
+// coinbase outputs of the two mainnet BIP30 duplicate-coinbase blocks (heights
+// 91722 and 91812) to the UTXO-set totals. Core skips them in
+// index/coinstatsindex.cpp:128-132 (isBIP30Unspendable check).
+//
+// Non-vacuous: without the fix, UTXOCount and TotalAmount both increase for
+// the BIP30 block; with the fix they stay at their pre-block values.
+func TestCoinStatsIndexBIP30Skip(t *testing.T) {
+	// The BIP30 duplicate-coinbase blocks are mainnet-only. We simulate them
+	// by writing a block whose hash matches one of the two hardcoded constants.
+	// At height 91722 / hash bip30Hash91722 the coinbase MUST be skipped.
+
+	for _, tc := range []struct {
+		name    string
+		height  int32
+		hash    wire.Hash256
+		skipped bool // true = coinbase should NOT be applied
+	}{
+		{
+			name:    "BIP30 h=91722 duplicate coinbase skipped",
+			height:  91722,
+			hash:    bip30Hash91722,
+			skipped: true,
+		},
+		{
+			name:    "BIP30 h=91812 duplicate coinbase skipped",
+			height:  91812,
+			hash:    bip30Hash91812,
+			skipped: true,
+		},
+		{
+			name:    "non-BIP30 h=91723 coinbase applied",
+			height:  91723,
+			hash:    wire.Hash256{0x01, 0x02}, // arbitrary non-matching hash
+			skipped: false,
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			db := NewMemDB()
+			defer db.Close()
+			idx := NewCoinStatsIndex(db)
+			if err := idx.Init(); err != nil {
+				t.Fatalf("Init: %v", err)
+			}
+
+			// Build a coinbase-only block (one spendable coinbase output, no
+			// regular txs so we don't need undo data).
+			coinbase := &wire.MsgTx{
+				Version: 1,
+				TxIn: []*wire.TxIn{{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xffffffff},
+					SignatureScript:  []byte{0x03, 0x01, 0x00, 0x00},
+					Sequence:         0xffffffff,
+				}},
+				TxOut: []*wire.TxOut{{
+					Value:    3_125_000_000, // 31.25 BTC (post-4th-halving)
+					PkScript: []byte{0x76, 0xa9, 0x14, 0xaa, 0xbb, 0xcc, 0x88, 0xac},
+				}},
+				LockTime: 0,
+			}
+			block := &wire.MsgBlock{
+				Header: wire.BlockHeader{
+					Version: 1,
+					Bits:    0x1d00ffff,
+					Nonce:   uint32(tc.height),
+				},
+				Transactions: []*wire.MsgTx{coinbase},
+			}
+
+			utxoBefore := idx.utxoCount
+			amtBefore := idx.totalAmount
+
+			if err := idx.WriteBlock(block, tc.height, tc.hash, nil); err != nil {
+				t.Fatalf("WriteBlock: %v", err)
+			}
+
+			if tc.skipped {
+				// Coinbase skipped: UTXO count and total amount must not change.
+				if idx.utxoCount != utxoBefore {
+					t.Errorf("BIP30 block: utxoCount = %d, want %d (coinbase was applied but should be skipped)",
+						idx.utxoCount, utxoBefore)
+				}
+				if idx.totalAmount != amtBefore {
+					t.Errorf("BIP30 block: totalAmount = %d, want %d (coinbase was applied but should be skipped)",
+						idx.totalAmount, amtBefore)
+				}
+			} else {
+				// Normal block: UTXO count and total amount must increase.
+				if idx.utxoCount <= utxoBefore {
+					t.Errorf("normal block: utxoCount = %d, want > %d", idx.utxoCount, utxoBefore)
+				}
+				if idx.totalAmount <= amtBefore {
+					t.Errorf("normal block: totalAmount = %d, want > %d", idx.totalAmount, amtBefore)
+				}
+			}
+		})
+	}
+}
+
 func TestBlockSubsidy(t *testing.T) {
 	tests := []struct {
 		height  int32

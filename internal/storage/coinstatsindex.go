@@ -241,6 +241,39 @@ func coinRecord(outpoint wire.OutPoint, height int32, coinbase bool, value int64
 	return buf.Bytes()
 }
 
+// bip30Hash91722 and bip30Hash91812 are the hashes of the two mainnet blocks
+// whose coinbases duplicated earlier coinbases that still had unspent outputs.
+// Byte order: wire.Hash256 is stored little-endian (reversed display form).
+// Display form is "00000000000271a2..." and "00000000000af0ae..." respectively;
+// parsed via wire.NewHash256FromHex which reverses on decode to match Core's
+// uint256 storage (validation.cpp:6196-6198, IsBIP30Unspendable).
+var (
+	bip30Hash91722 = mustDecodeHash("00000000000271a2dc26e7667f8419f2e15416dc6955e5a6c6cdf3f2574dd08e")
+	bip30Hash91812 = mustDecodeHash("00000000000af0aed4792b1acee3d966af36cf5def14935db8de83d6f9306f2f")
+)
+
+func mustDecodeHash(displayHex string) wire.Hash256 {
+	h, err := wire.NewHash256FromHex(displayHex)
+	if err != nil {
+		panic("coinstatsindex: invalid BIP30 hash constant: " + err.Error())
+	}
+	return h
+}
+
+// isBIP30Unspendable reports whether the block at the given height and hash is
+// one of the two mainnet blocks whose coinbase is a duplicate of an earlier
+// coinbase that still had unspent outputs at the time. Those outputs were
+// permanently lost (the earlier coin was overwritten), so the duplicate
+// coinbase must NOT be counted in the UTXO set hash or totals.
+//
+// Mirrors Bitcoin Core index/coinstatsindex.cpp:128-132 and
+// validation.cpp:6195-6199 IsBIP30Unspendable. Heights and hashes are
+// mainnet-only constants (no other network has BIP30 duplicate coinbases).
+func isBIP30Unspendable(height int32, blockHash wire.Hash256) bool {
+	return (height == 91722 && blockHash == bip30Hash91722) ||
+		(height == 91812 && blockHash == bip30Hash91812)
+}
+
 // WriteBlock updates UTXO statistics for a newly connected block.
 func (idx *CoinStatsIndex) WriteBlock(block *wire.MsgBlock, height int32, blockHash wire.Hash256, undo *BlockUndo) error {
 	// Calculate block subsidy
@@ -263,6 +296,15 @@ func (idx *CoinStatsIndex) WriteBlock(block *wire.MsgBlock, height int32, blockH
 	for i, tx := range block.Transactions {
 		isCoinbase := (i == 0)
 		txid := tx.TxHash()
+
+		// Skip the duplicate-coinbase BIP30 blocks on mainnet (heights 91722 and
+		// 91812). Their coinbases duplicated earlier ones that still had unspent
+		// outputs, so the earlier coins were permanently lost; the duplicate
+		// outputs must NOT be added to the UTXO-set hash or totals.
+		// Mirrors Bitcoin Core index/coinstatsindex.cpp:128-132.
+		if isCoinbase && isBIP30Unspendable(height, blockHash) {
+			continue
+		}
 
 		// Add new outputs (skip unspendable)
 		for j, out := range tx.TxOut {

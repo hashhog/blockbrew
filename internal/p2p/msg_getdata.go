@@ -33,9 +33,14 @@ func (m *MsgGetData) Deserialize(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	// Bitcoin Core caps incoming getdata at MAX_GETDATA_SZ=1000
-	// (net_processing.cpp:128). Reject oversized messages.
-	if count > MaxGetDataSize {
+	// Bitcoin Core uses MAX_INV_SZ=50000 for INCOMING getdata, NOT the
+	// outgoing-only MAX_GETDATA_SZ=1000 cap. From net_processing.cpp:126-128
+	// and the comment: "Not used in processing incoming GETDATA for
+	// compatibility". MaxGetDataSize (1000) caps OUTGOING messages we build;
+	// MaxInvVects (50000) is the wire-protocol limit applied to received msgs.
+	// Using 1000 here incorrectly disconnects peers that send us large batch
+	// requests (e.g. block-download pipelines).
+	if count > MaxInvVects {
 		return ErrTooManyInvVects
 	}
 	m.InvList = make([]*InvVect, count)
