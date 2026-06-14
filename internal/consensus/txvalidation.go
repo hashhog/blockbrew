@@ -500,8 +500,13 @@ func CalculateSequenceLocks(tx *wire.MsgTx, prevHeights []int32, getMTP MTPLooku
 		MinTime:   -1,
 	}
 
-	// BIP68 only applies to version >= 2 transactions.
-	if tx.Version < 2 {
+	// BIP68 only applies to version >= 2 transactions. Core stores version as
+	// uint32_t and compares unsigned (consensus/tx_verify.cpp:51), so a high-bit
+	// version (e.g. 0x80000002) still enforces BIP68. tx.Version is int32 here, so
+	// a signed `< 2` would treat 0x80000002 as negative and SKIP enforcement,
+	// false-accepting a tx with an unmet relative timelock (chain split). Compare
+	// unsigned to match Core -- same as the OP_CSV path (script/opcodes_impl.go).
+	if uint32(tx.Version) < 2 {
 		return lock
 	}
 
