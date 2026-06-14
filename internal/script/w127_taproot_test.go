@@ -435,6 +435,101 @@ func TestW127_G18_OpSuccessShortCircuitsCleanStack(t *testing.T) {
 	}
 }
 
+// TestW127_G19_OpSuccessOverridesStackLimits verifies that an OP_SUCCESSx leaf
+// is accepted (short-circuits) even when the witness stack exceeds the initial
+// stack-size limit or carries an oversized element.
+//
+// Finding 4B — Before the fix, executeTaprootScriptPath enforced
+//   len(stackItems) > MaxStackSize  and  len(item) > MaxScriptElementSize
+// BEFORE the OP_SUCCESSx pre-scan.  Bitcoin Core's ExecuteWitnessScript
+// (interpreter.cpp:1837-1851) runs the OP_SUCCESSx scan first and explicitly
+// says "OP_SUCCESSx processing overrides everything, including stack element
+// size limits".  The fix moves the OP_SUCCESSx scan before both checks.
+//
+// Two sub-cases:
+//  (a) witness stack has MaxStackSize+1 empty items → must succeed (not reject with ErrInitialStackSize).
+//  (b) witness stack has a single 521-byte element → must succeed (not reject with ErrInitialPushSize).
+//
+// The test builds a valid taproot script-path commitment so that the
+// VerifyTaprootCommitment check passes and the bug (stack-limit before OP_SUCCESS)
+// is what actually determines the outcome.
+func TestW127_G19_OpSuccessOverridesStackLimits(t *testing.T) {
+	// OP_SUCCESS80 = 0x50.  BIP-342 §Script execution: "If any opcode numbered
+	// 80, 98, 126-129, 131-134, 137-138, 141-142, 149-153, 187-254 is
+	// encountered, validation succeeds."  IsOpSuccess(0x50) must be true.
+	if !IsOpSuccess(0x50) {
+		t.Fatalf("IsOpSuccess(0x50) = false; test precondition violated")
+	}
+	opSuccessScript := []byte{0x50} // bare OP_SUCCESS80
+
+	// BIP-340 test vector 0 pubkey — a known valid secp256k1 x-only public key.
+	internalKey := []byte{
+		0xF9, 0x30, 0x8A, 0x01, 0x92, 0x58, 0xC3, 0x10,
+		0x49, 0x34, 0x4F, 0x85, 0xF8, 0x9D, 0x52, 0x29,
+		0xB5, 0x31, 0xC8, 0x45, 0x83, 0x6F, 0x99, 0xB0,
+		0x86, 0x01, 0xF1, 0x13, 0xBC, 0xE0, 0x36, 0xF9,
+	}
+
+	// Compute the leaf hash for our OP_SUCCESS script, then the tweak.
+	leafHash := TapLeaf(TaprootLeafTapscript, opSuccessScript)
+	tweak := TapTweak(internalKey, leafHash[:])
+
+	// Derive the output key and its parity so VerifyTaprootCommitment passes.
+	outputKey, parity := crypto.ComputeTaprootOutputKey(internalKey, tweak)
+	if outputKey == nil {
+		t.Fatal("ComputeTaprootOutputKey returned nil for known-good internal key")
+	}
+
+	// Control block: [leafVersion | parity] [internalKey 32 bytes], no path nodes.
+	control := make([]byte, TaprootControlBaseSize)
+	control[0] = TaprootLeafTapscript | parity
+	copy(control[1:], internalKey)
+
+	buildEngine := func(flags ScriptFlags) *Engine {
+		t.Helper()
+		tx := w127DummyTx()
+		prevOuts := []*wire.TxOut{{Value: 0, PkScript: []byte{}}}
+		eng, err := NewEngine([]byte{}, tx, 0, flags, 0, prevOuts)
+		if err != nil {
+			t.Fatalf("NewEngine: %v", err)
+		}
+		return eng
+	}
+
+	// Case (a): stack with MaxStackSize+1 items (each empty, so element-size is fine).
+	// Before fix: ErrInitialStackSize; after fix: nil (OP_SUCCESS short-circuit).
+	t.Run("oversized_stack_count", func(t *testing.T) {
+		eng := buildEngine(ScriptVerifyTaproot)
+		nItems := MaxStackSize + 1
+		witness := make([][]byte, nItems+2)
+		for i := 0; i < nItems; i++ {
+			witness[i] = []byte{} // empty items
+		}
+		witness[nItems] = opSuccessScript
+		witness[nItems+1] = control
+
+		err := eng.executeTaprootScriptPath(outputKey, witness, nil)
+		if err != nil {
+			t.Errorf("OP_SUCCESS with %d-item stack (> MaxStackSize %d) must succeed; got %v",
+				nItems, MaxStackSize, err)
+		}
+	})
+
+	// Case (b): stack with a single element of 521 bytes (> MaxScriptElementSize 520).
+	// Before fix: ErrInitialPushSize; after fix: nil (OP_SUCCESS short-circuit).
+	t.Run("oversized_element_size", func(t *testing.T) {
+		eng := buildEngine(ScriptVerifyTaproot)
+		bigItem := make([]byte, MaxScriptElementSize+1) // 521 bytes
+		witness := [][]byte{bigItem, opSuccessScript, control}
+
+		err := eng.executeTaprootScriptPath(outputKey, witness, nil)
+		if err != nil {
+			t.Errorf("OP_SUCCESS with 521-byte stack element (> MaxScriptElementSize %d) must succeed; got %v",
+				MaxScriptElementSize, err)
+		}
+	})
+}
+
 func TestW127_G19_InitialStackSizeLimit(t *testing.T) {
 	// G19 — Initial stack size (post-pop, after annex/script/control
 	// strip) <= MAX_STACK_SIZE (1000).  Core 1855.  Assert the constant.
