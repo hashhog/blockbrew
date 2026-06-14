@@ -2151,8 +2151,17 @@ func extractIP(addr string) string {
 }
 
 // relayAddrToRandomPeers relays an addr message to up to 2 random connected
-// peers, excluding the source peer. This implements Bitcoin Core's RelayAddress.
+// peers, excluding the source peer. This implements Bitcoin Core's RelayAddress
+// (net_processing.cpp:5688): only relay when the incoming message has at most 10
+// addresses, matching Core's unsolicited-addr relay gate.
 func (pm *PeerManager) relayAddrToRandomPeers(source *Peer, msg *MsgAddr) {
+	// Core net_processing.cpp:5688 gates relay on vAddr.size() <= 10.
+	// Messages with more entries are responses to GETADDR and should not
+	// be forwarded — only spontaneous announcements (<=10) get relayed.
+	if len(msg.AddrList) > 10 {
+		return
+	}
+
 	pm.mu.RLock()
 	var candidates []*Peer
 	for _, pi := range pm.peers {
@@ -2178,8 +2187,16 @@ func (pm *PeerManager) relayAddrToRandomPeers(source *Peer, msg *MsgAddr) {
 }
 
 // relayAddrv2ToRandomPeers relays an addrv2 message to up to 2 random connected
-// peers that support addrv2, excluding the source peer.
+// peers that support addrv2, excluding the source peer. Applies the same
+// Core net_processing.cpp:5688 size<=10 gate as relayAddrToRandomPeers since
+// Core uses a single ProcessAddrs handler for both ADDR and ADDRV2.
 func (pm *PeerManager) relayAddrv2ToRandomPeers(source *Peer, msg *MsgAddrv2) {
+	// Core net_processing.cpp:4022 uses one handler for ADDR and ADDRV2;
+	// the vAddr.size() <= 10 relay gate (line 5688) applies to both.
+	if len(msg.AddrList) > 10 {
+		return
+	}
+
 	pm.mu.RLock()
 	var candidates []*Peer
 	for _, pi := range pm.peers {

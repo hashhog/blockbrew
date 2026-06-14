@@ -306,22 +306,53 @@ func TestBlockSubsidy(t *testing.T) {
 }
 
 func TestIsUnspendable(t *testing.T) {
+	// Make a script longer than maxScriptSize (10000) that does NOT start with
+	// OP_RETURN — it must still be classified as unspendable (Core script.h:565).
+	oversized := make([]byte, maxScriptSize+1)
+	oversized[0] = 0x51 // OP_1 — definitely not OP_RETURN
+
 	tests := []struct {
+		name        string
 		script      []byte
 		unspendable bool
 	}{
-		{[]byte{}, true},
-		{[]byte{0x6a}, true},                           // OP_RETURN
-		{[]byte{0x6a, 0x04, 0xde, 0xad}, true},         // OP_RETURN with data
-		{[]byte{0x76, 0xa9, 0x14}, false},              // P2PKH start
-		{[]byte{0x00, 0x14}, false},                    // P2WPKH
-		{[]byte{0xa9, 0x14}, false},                    // P2SH start
+		// Bitcoin Core script.h:563-566: empty script is SPENDABLE.
+		// (Old blockbrew code returned true here — that was the bug.)
+		{"empty", []byte{}, false},
+		{"OP_RETURN bare", []byte{0x6a}, true},
+		{"OP_RETURN with data", []byte{0x6a, 0x04, 0xde, 0xad}, true},
+		{"P2PKH", []byte{0x76, 0xa9, 0x14}, false},
+		{"P2WPKH", []byte{0x00, 0x14}, false},
+		{"P2SH", []byte{0xa9, 0x14}, false},
+		// Scripts exceeding MAX_SCRIPT_SIZE are unspendable (Core script.h:565).
+		{"oversized non-OP_RETURN", oversized, true},
 	}
 
-	for i, tc := range tests {
+	for _, tc := range tests {
 		got := isUnspendable(tc.script)
 		if got != tc.unspendable {
-			t.Errorf("test %d: expected %v, got %v", i, tc.unspendable, got)
+			t.Errorf("%s: isUnspendable = %v, want %v", tc.name, got, tc.unspendable)
+		}
+	}
+}
+
+// TestGetBogoSize verifies the UTXO size metric matches Bitcoin Core
+// kernel/coinstats.cpp:35-43: 32+4+4+8+2+len = 50+len.
+func TestGetBogoSize(t *testing.T) {
+	tests := []struct {
+		name   string
+		script []byte
+		want   uint64
+	}{
+		{"empty", []byte{}, 50},
+		{"P2PKH (25 bytes)", make([]byte, 25), 75},
+		{"P2WSH (34 bytes)", make([]byte, 34), 84},
+	}
+	for _, tc := range tests {
+		got := getBogoSize(tc.script)
+		if got != tc.want {
+			t.Errorf("%s: getBogoSize = %d, want %d (old broken value was %d)",
+				tc.name, got, tc.want, uint64(32+4+8+1+len(tc.script)))
 		}
 	}
 }

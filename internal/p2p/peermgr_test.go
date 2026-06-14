@@ -10,6 +10,101 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// makeFakePeer creates a minimal Peer that passes WantsTxRelay() and
+// WantsAddrv2() checks so it can be added to a PeerManager's peer map for
+// relay-gate tests.  No TCP connection is established; the sendQueue is a
+// buffered channel we can drain.
+func makeFakePeer(addr string) *Peer {
+	p := &Peer{
+		addr:          addr,
+		state:         PeerStateConnected,
+		sendQueue:     make(chan Message, SendQueueSize),
+		quit:          make(chan struct{}),
+		handshakeDone: make(chan struct{}),
+		peerVersion:   &MsgVersion{Relay: true},
+		wantsAddrv2:   true,
+	}
+	close(p.handshakeDone)
+	return p
+}
+
+// TestRelayAddrSizeGate verifies that relayAddrToRandomPeers and
+// relayAddrv2ToRandomPeers honour the Core net_processing.cpp:5688 gate:
+// messages with >10 addresses MUST NOT be forwarded.
+//
+// Without the gate fix the function would relay any-size message to up to 2
+// random peers. With the fix it returns early for len > 10.
+func TestRelayAddrSizeGate(t *testing.T) {
+	cfg := PeerManagerConfig{
+		Network:     MainnetMagic,
+		ChainParams: consensus.MainnetParams(),
+	}
+	pm := NewPeerManager(cfg)
+
+	// Inject two fake peers so relay has candidates.
+	p1 := makeFakePeer("1.2.3.4:8333")
+	p2 := makeFakePeer("1.2.3.5:8333")
+	pm.mu.Lock()
+	pm.peers["1.2.3.4:8333"] = &PeerInfo{peer: p1}
+	pm.peers["1.2.3.5:8333"] = &PeerInfo{peer: p2}
+	pm.mu.Unlock()
+
+	makeAddrs := func(n int) []NetAddress {
+		addrs := make([]NetAddress, n)
+		for i := range addrs {
+			addrs[i] = NetAddress{IP: net.ParseIP("203.0.113.1"), Port: uint16(8333 + i)}
+		}
+		return addrs
+	}
+	makeAddrsV2 := func(n int) []NetAddressV2 {
+		addrs := make([]NetAddressV2, n)
+		for i := range addrs {
+			addrs[i] = NetAddressV2{NetworkID: NetIPv4, Addr: []byte{203, 0, 113, byte(i)}, Port: 8333}
+		}
+		return addrs
+	}
+
+	drain := func(p *Peer) int {
+		n := 0
+		for {
+			select {
+			case <-p.sendQueue:
+				n++
+			default:
+				return n
+			}
+		}
+	}
+
+	// addr: <=10 entries — MUST relay.
+	pm.relayAddrToRandomPeers(nil, &MsgAddr{AddrList: makeAddrs(10)})
+	sent1 := drain(p1) + drain(p2)
+	if sent1 == 0 {
+		t.Error("relayAddrToRandomPeers: expected relay for <=10 addrs, got none")
+	}
+
+	// addr: 11 entries — MUST NOT relay (Core gate).
+	pm.relayAddrToRandomPeers(nil, &MsgAddr{AddrList: makeAddrs(11)})
+	sent2 := drain(p1) + drain(p2)
+	if sent2 != 0 {
+		t.Errorf("relayAddrToRandomPeers: expected no relay for 11 addrs, got %d", sent2)
+	}
+
+	// addrv2: <=10 entries — MUST relay.
+	pm.relayAddrv2ToRandomPeers(nil, &MsgAddrv2{AddrList: makeAddrsV2(10)})
+	sent3 := drain(p1) + drain(p2)
+	if sent3 == 0 {
+		t.Error("relayAddrv2ToRandomPeers: expected relay for <=10 addrs, got none")
+	}
+
+	// addrv2: 11 entries — MUST NOT relay (Core gate).
+	pm.relayAddrv2ToRandomPeers(nil, &MsgAddrv2{AddrList: makeAddrsV2(11)})
+	sent4 := drain(p1) + drain(p2)
+	if sent4 != 0 {
+		t.Errorf("relayAddrv2ToRandomPeers: expected no relay for 11 addrs, got %d", sent4)
+	}
+}
+
 func TestNewPeerManager(t *testing.T) {
 	config := PeerManagerConfig{
 		Network:     MainnetMagic,

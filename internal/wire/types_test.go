@@ -559,6 +559,27 @@ func BenchmarkDoubleHashB(b *testing.B) {
 	}
 }
 
+// TestDeserializeSuperfluousWitness exercises the BIP144 "Superfluous witness
+// record" rejection (Bitcoin Core primitives/transaction.h:228-231).
+//
+// The 63-byte hex encodes a version=1 transaction with the segwit marker (0x00)
+// and flag (0x01) set, one input whose witness stack has zero items (empty
+// witness), and one output.  All witness stacks are empty, so HasWitness() is
+// false after parsing — Core throws "Superfluous witness record" and we must do
+// the same.  Without the fix this deserialises successfully (false acceptance).
+func TestDeserializeSuperfluousWitness(t *testing.T) {
+	const superfluousWitnessTxHex = "0100000000010100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff0100f2052a01000000000000000000"
+	raw := mustDecodeHexTypes(superfluousWitnessTxHex)
+	var tx MsgTx
+	err := tx.Deserialize(bytes.NewReader(raw))
+	if err == nil {
+		t.Fatal("Deserialize: expected error for superfluous witness record, got nil")
+	}
+	if got := err.Error(); got != "superfluous witness record" {
+		t.Errorf("Deserialize error message: got %q, want %q", got, "superfluous witness record")
+	}
+}
+
 func BenchmarkTxHash(b *testing.B) {
 	tx := &MsgTx{
 		Version: 1,
