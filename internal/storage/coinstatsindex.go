@@ -465,23 +465,29 @@ func calcBlockSubsidy(height int32) int64 {
 	return int64(5_000_000_000) >> uint(halvings)
 }
 
-// getBogoSize returns an approximate size measure for a UTXO.
+// getBogoSize returns the database-independent size metric for a UTXO.
+// Mirrors Bitcoin Core kernel/coinstats.cpp:35-43 GetBogoSize exactly:
+//
+//	32 (txid) + 4 (vout index) + 4 (height+coinbase) + 8 (amount) +
+//	2 (scriptPubKey varint) + len(scriptPubKey) = 50 + len.
 func getBogoSize(pkScript []byte) uint64 {
-	// Base size + script size
-	// This matches Bitcoin Core's GetBogoSize function approximately
-	return uint64(32 + 4 + 8 + 1 + len(pkScript))
+	return uint64(32 + 4 + 4 + 8 + 2 + len(pkScript))
 }
 
-// isUnspendable returns true if the script is unspendable.
+// isUnspendable reports whether a scriptPubKey is provably unspendable.
+// Mirrors Bitcoin Core script.h:563-566 CScript::IsUnspendable():
+//
+//	return (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE);
+//
+// Key divergences from the old implementation:
+//   - Empty scripts are SPENDABLE (Core includes them in the UTXO set).
+//   - Scripts longer than MAX_SCRIPT_SIZE (10000) are unspendable regardless
+//     of their first byte (they can never be executed within consensus rules).
+const maxScriptSize = 10000
+const opReturn = 0x6a
+
 func isUnspendable(pkScript []byte) bool {
-	if len(pkScript) == 0 {
-		return true
-	}
-	// OP_RETURN scripts are unspendable
-	if pkScript[0] == 0x6a {
-		return true
-	}
-	return false
+	return (len(pkScript) > 0 && pkScript[0] == opReturn) || len(pkScript) > maxScriptSize
 }
 
 // CoinStatsState stores the state of the coin stats index.

@@ -410,6 +410,12 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 				}
 			}
 		}
+		// Bitcoin Core primitives/transaction.h:228-231: it is illegal to encode
+		// witnesses when all witness stacks are empty (BIP144 marker+flag present
+		// but tx.HasWitness() is false). Reject with "Superfluous witness record".
+		if !tx.HasWitness() {
+			return fmt.Errorf("superfluous witness record")
+		}
 	}
 
 	tx.LockTime, err = ReadUint32LE(r)
