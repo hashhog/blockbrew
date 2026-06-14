@@ -547,8 +547,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// Get script flags for this block (hash checked against exception map)
 	flags := GetBlockScriptFlags(node.Height, cm.params, hash)
 
-	// Calculate expected subsidy
-	subsidy := CalcBlockSubsidy(node.Height)
+	// Calculate expected subsidy using the network-aware halving interval.
+	// Core: GetBlockSubsidy(nHeight, consensusParams) reads
+	// consensusParams.nSubsidyHalvingInterval (validation.cpp:1839).
+	// Regtest uses 150; mainnet/testnet4 use 210000.  CalcBlockSubsidy
+	// hardcodes 210000, which would false-reject coinbases on regtest after
+	// block 150 (subsidy expected to halve but coinbase still pays 50 BTC).
+	subsidy := CalcBlockSubsidyForInterval(node.Height, cm.params.SubsidyHalvingInterval)
 
 	// Track total fees and undo data.
 	// Skip undo data generation during assume-valid IBD for performance.
