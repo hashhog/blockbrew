@@ -2181,6 +2181,106 @@ func TestP2AExecution(t *testing.T) {
 	})
 }
 
+// TestP2SHWrappedWitnessMalleation tests Core interpreter.cpp:2082-2086:
+// for a P2SH-wrapped witness program the scriptSig MUST be EXACTLY a single
+// canonical push of the redeemScript bytes.  Any extra push (e.g. OP_0 before
+// the redeemScript) must be rejected with ErrWitnessMalleatedP2SH.
+func TestP2SHWrappedWitnessMalleation(t *testing.T) {
+	privKey, err := crypto.GeneratePrivateKey()
+	if err != nil {
+		t.Fatalf("GeneratePrivateKey: %v", err)
+	}
+	pubKey := privKey.PubKey()
+	pubKeyHash := crypto.Hash160(pubKey.SerializeCompressed())
+
+	// Build the redeemScript: OP_0 <20-byte pubKeyHash>  (P2WPKH)
+	redeemScript := make([]byte, 22)
+	redeemScript[0] = OP_0
+	redeemScript[1] = 20
+	copy(redeemScript[2:], pubKeyHash[:])
+
+	// Build the P2SH scriptPubKey: OP_HASH160 <20-byte hash(redeemScript)> OP_EQUAL
+	redeemScriptHash := crypto.Hash160(redeemScript)
+	scriptPubKey := []byte{OP_HASH160, 20}
+	scriptPubKey = append(scriptPubKey, redeemScriptHash[:]...)
+	scriptPubKey = append(scriptPubKey, OP_EQUAL)
+
+	// Canonical scriptSig: exactly a single push of redeemScript (22 bytes → direct push)
+	canonicalScriptSig := append([]byte{byte(len(redeemScript))}, redeemScript...)
+
+	// Malleated scriptSig: OP_0 followed by the redeemScript push — an extra element
+	malleatedScriptSig := []byte{OP_0, byte(len(redeemScript))}
+	malleatedScriptSig = append(malleatedScriptSig, redeemScript...)
+
+	// Build the witness for a valid P2WPKH spend.
+	// BIP143 sighash uses the redeemScript as the scriptCode for P2WPKH.
+	amount := int64(100_000)
+	scriptCodeForSig := make([]byte, 25)
+	scriptCodeForSig[0] = OP_DUP
+	scriptCodeForSig[1] = OP_HASH160
+	scriptCodeForSig[2] = 20
+	copy(scriptCodeForSig[3:], pubKeyHash[:])
+	scriptCodeForSig[23] = OP_EQUALVERIFY
+	scriptCodeForSig[24] = OP_CHECKSIG
+
+	txTemplate := func(scriptSig []byte) *wire.MsgTx {
+		return &wire.MsgTx{
+			Version: 1,
+			TxIn: []*wire.TxIn{
+				{
+					PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01}, Index: 0},
+					SignatureScript:  scriptSig,
+					Sequence:         0xffffffff,
+				},
+			},
+			TxOut: []*wire.TxOut{
+				{Value: 90_000, PkScript: scriptPubKey},
+			},
+		}
+	}
+
+	prevOut := &wire.TxOut{Value: amount, PkScript: scriptPubKey}
+	prevOuts := []*wire.TxOut{prevOut}
+	flags := ScriptVerifyP2SH | ScriptVerifyWitness
+
+	// --- Rejection case ---
+	// A malleated scriptSig (OP_0 <redeemScript push>) must be rejected.
+	t.Run("malleated_scriptSig_rejected", func(t *testing.T) {
+		tx := txTemplate(malleatedScriptSig)
+		tx.TxIn[0].Witness = [][]byte{nil, pubKey.SerializeCompressed()} // witness doesn't matter
+
+		err := VerifyScript(malleatedScriptSig, scriptPubKey, tx, 0, flags, amount, prevOuts)
+		if err != ErrWitnessMalleatedP2SH {
+			t.Errorf("expected ErrWitnessMalleatedP2SH, got: %v", err)
+		}
+	})
+
+	// --- Acceptance case ---
+	// A canonical scriptSig (single push of redeemScript) with a valid witness must pass.
+	t.Run("canonical_scriptSig_accepted", func(t *testing.T) {
+		tx := txTemplate(canonicalScriptSig)
+
+		// Compute BIP143 sighash for the P2WPKH input.
+		sighash, err := CalcWitnessSignatureHash(scriptCodeForSig, SigHashAll, tx, 0, amount)
+		if err != nil {
+			t.Fatalf("CalcWitnessSignatureHash: %v", err)
+		}
+		sig, err := crypto.SignECDSA(privKey, sighash)
+		if err != nil {
+			t.Fatalf("SignECDSA: %v", err)
+		}
+		sig = append(sig, byte(SigHashAll))
+
+		// P2WPKH witness stack: [<sig>, <compressed-pubkey>]
+		tx.TxIn[0].Witness = [][]byte{sig, pubKey.SerializeCompressed()}
+
+		err = VerifyScript(canonicalScriptSig, scriptPubKey, tx, 0, flags, amount, prevOuts)
+		if err != nil {
+			t.Errorf("canonical P2SH-P2WPKH spend should pass, got: %v", err)
+		}
+	})
+}
+
 func TestP2AStandard(t *testing.T) {
 	// Test P2A output standardness checks
 	p2aScript := []byte{0x51, 0x02, 0x4e, 0x73}
