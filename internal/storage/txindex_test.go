@@ -93,21 +93,24 @@ func TestTxIndexRevert(t *testing.T) {
 		t.Fatalf("RevertBlock failed: %v", err)
 	}
 
-	// Best height should be 1
+	// Best height pointer should roll back to 1
 	if idx.BestHeight() != 1 {
 		t.Errorf("expected best height 1, got %d", idx.BestHeight())
 	}
 
-	// Block 2 transactions should be gone
+	// bug-hunt 8C: Core-faithful behavior — disconnecting a block must NOT erase
+	// its txid->position entries (TxIndex has no CustomRemove). The records stay
+	// resolvable; they are overwritten only when the same txid reconnects on the
+	// new chain. Block 2's transactions must therefore still be present.
 	for _, tx := range block2.Transactions {
 		txid := tx.TxHash()
 		_, err := idx.GetTx(txid)
-		if err != ErrNotFound {
-			t.Errorf("expected tx from block 2 to be removed, got err=%v", err)
+		if err != nil {
+			t.Errorf("expected tx from disconnected block 2 to remain (Core keeps it), got err=%v", err)
 		}
 	}
 
-	// Block 1 transactions should still be there
+	// Block 1 transactions should still be there as well
 	for _, tx := range block1.Transactions {
 		txid := tx.TxHash()
 		_, err := idx.GetTx(txid)
