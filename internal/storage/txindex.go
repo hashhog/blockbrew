@@ -117,19 +117,25 @@ func (idx *TxIndex) WriteBlock(block *wire.MsgBlock, height int32, blockHash wir
 	return nil
 }
 
-// RevertBlock removes all transactions from a disconnected block.
+// RevertBlock rolls the index best-block pointer back by one on a disconnect.
+// It intentionally does NOT remove the disconnected block's txid->position
+// entries, matching Bitcoin Core's TxIndex (no CustomRemove); see the note
+// below.
 func (idx *TxIndex) RevertBlock(block *wire.MsgBlock, height int32, blockHash wire.Hash256, _ *BlockUndo) error {
 	// Find previous block hash
 	prevHash := block.Header.PrevBlock
 
 	batch := idx.db.NewBatch()
 
-	// Remove each transaction from the index
-	for _, tx := range block.Transactions {
-		txid := tx.TxHash()
-		key := MakeTxIndexDataKey(txid)
-		batch.Delete(key)
-	}
+	// bug-hunt 8C: Do NOT delete txid->position entries on disconnect. Bitcoin
+	// Core's TxIndex overrides only CustomAppend, never CustomRemove (index/
+	// txindex.h declares CustomAppend alone), so BaseIndex::Rewind leaves the
+	// txid->CDiskTxPos records in place across a reorg (index/base.cpp Rewind
+	// calls the default no-op CustomRemove). Stale entries are harmless: they are
+	// overwritten when the same txid is reconnected on the new chain, and
+	// getrawtransaction still resolves them from the on-disk block. Deleting here
+	// diverged from Core — a tx present only on the disconnected branch became
+	// unreachable. Only the best-block pointer rolls back.
 
 	// Update state to previous block
 	prevHeight := height - 1
