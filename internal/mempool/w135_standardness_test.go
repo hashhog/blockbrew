@@ -332,19 +332,15 @@ func TestW135_G17_WitnessUnknown_v1_NonTaprootSize(t *testing.T) {
 // Core: solver.cpp:156-177 — v0 falls through to NONSTANDARD when size is
 // neither 20 (P2WPKH) nor 32 (P2WSH).
 //
-// blockbrew: isUnknownWitnessProgram accepts v0 with any size 2..40 →
-// returns true → STANDARD.
-//
-// SKIP — bug present.
+// blockbrew (pre-fix): isUnknownWitnessProgram accepted v0 with any size 2..40 →
+// returned true → STANDARD. FIXED: isUnknownWitnessProgram now requires
+// ver in 0x51..0x60 (v1..v16); a leftover v0 program (size ∉ {20, 32}) is
+// NONSTANDARD.
 func TestW135_G17_BUG4_WitnessV0_BadSize_IsNonStandard(t *testing.T) {
-	t.Skip("BUG-4 (HIGH): isUnknownWitnessProgram accepts v0 with size ∉ {20, 32}; Core rejects as NONSTANDARD. " +
-		"audit/w135_standardness_rules.md BUG-4. " +
-		"Fix: require ver != 0x00 in isUnknownWitnessProgram early predicate.")
-
 	// v0 program with 5-byte payload: 0x00 0x05 <5 bytes>
 	script := append([]byte{0x00, 0x05}, bytes.Repeat([]byte{0x01}, 5)...)
 	if isStandardOutputScript(script) {
-		t.Fatalf("BUG-4: v0 witness program with size 5 must be NONSTANDARD (Core solver.cpp:156-177)")
+		t.Fatalf("BUG-4: v0 witness program with size 5 must be NONSTANDARD (Core solver.cpp:157-176)")
 	}
 
 	// v0 program with 16-byte payload (also not P2WPKH/P2WSH).
@@ -357,6 +353,18 @@ func TestW135_G17_BUG4_WitnessV0_BadSize_IsNonStandard(t *testing.T) {
 	script40 := append([]byte{0x00, 0x28}, bytes.Repeat([]byte{0x01}, 40)...)
 	if isStandardOutputScript(script40) {
 		t.Fatalf("BUG-4: v0 witness program with size 40 must be NONSTANDARD")
+	}
+
+	// Positive controls: the only two STANDARD v0 sizes per Core Solver
+	// (solver.cpp:157-164) — 20-byte P2WPKH and 32-byte P2WSH — must remain
+	// standard. Guards against an over-broad fix that rejects all v0.
+	p2wpkh := append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0x02}, 20)...) // v0 + 20
+	if !isStandardOutputScript(p2wpkh) {
+		t.Fatalf("v0 20-byte program (P2WPKH) must be STANDARD (Core solver.cpp:157-160)")
+	}
+	p2wsh := append([]byte{0x00, 0x20}, bytes.Repeat([]byte{0x03}, 32)...) // v0 + 32
+	if !isStandardOutputScript(p2wsh) {
+		t.Fatalf("v0 32-byte program (P2WSH) must be STANDARD (Core solver.cpp:161-164)")
 	}
 }
 
@@ -803,10 +811,10 @@ func TestW135_AuditFramework_SolverDispatchContrast(t *testing.T) {
 			blockbrewStd: false, coreStd: false, // both reject, different code path
 		},
 		{
-			name:         "WitnessV0_size5_BUG4",
+			name:         "WitnessV0_size5_BUG4fixed",
 			script:       append([]byte{0x00, 0x05}, bytes.Repeat([]byte{0x01}, 5)...),
 			coreType:     "NONSTANDARD (v0 with non-{20,32} size)",
-			blockbrewStd: true, coreStd: false, // BUG-4 divergence
+			blockbrewStd: false, coreStd: false, // BUG-4 FIXED: now matches Core
 		},
 		{
 			name:         "WitnessV2_size32_UNKNOWN",
@@ -835,9 +843,10 @@ func TestW135_AuditFramework_SolverDispatchContrast(t *testing.T) {
 				tc.name, got, tc.coreStd, tc.coreType)
 		}
 	}
-	if divergences != 3 {
-		// BUG-2 (BarePubKey + BareMultisig_2of3) + BUG-4 (WitnessV0_size5) = 3 divergences.
-		t.Logf("Expected 3 divergences (BUG-2 ×2 + BUG-4 ×1), got %d. "+
+	if divergences != 2 {
+		// BUG-2 (BarePubKey + BareMultisig_2of3) = 2 divergences.
+		// BUG-4 (WitnessV0_size5) is now FIXED, so it no longer diverges.
+		t.Logf("Expected 2 divergences (BUG-2 ×2; BUG-4 fixed), got %d. "+
 			"Update the audit if the table changes.", divergences)
 	}
 }

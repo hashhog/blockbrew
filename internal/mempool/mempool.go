@@ -1597,17 +1597,26 @@ func isStandardOutputScript(pkScript []byte) bool {
 	}
 }
 
-// isUnknownWitnessProgram returns true for segwit v2+ witness programs that
+// isUnknownWitnessProgram returns true for segwit v1+ witness programs that
 // Core accepts as WITNESS_UNKNOWN (forward-compat for future soft forks).
-// Format: OP_N <push of 2..40 bytes> where N is 0x00 (v0), 0x51..0x60 (v1–v16).
-// v0 (P2WPKH/P2WSH) and v1 (P2TR) are handled above; only v2–v16 land here.
+// Format: OP_N <push of 2..40 bytes> where N is 0x51..0x60 (v1–v16).
+//
+// Version 0 is NEVER WITNESS_UNKNOWN: Core's Solver (src/script/solver.cpp:157-176)
+// classifies a v0 program as WITNESS_V0_KEYHASH only at size 20 and
+// WITNESS_V0_SCRIPTHASH only at size 32; any other v0 program size falls through
+// to NONSTANDARD (the `if (witnessversion != 0)` guard at solver.cpp:172 excludes
+// v0 from WITNESS_UNKNOWN). The size-20/32 v0 cases are matched above as
+// P2WPKH/P2WSH, so a v0 program reaching here has a non-standard size and must
+// be rejected. v1 (P2TR) at size 32 is also matched above; only v1..v16 land here.
 func isUnknownWitnessProgram(pkScript []byte) bool {
 	if len(pkScript) < 4 || len(pkScript) > 42 {
 		return false
 	}
-	// First byte must be a witness version opcode.
+	// First byte must be a witness version opcode in the v1..v16 range.
+	// v0 is excluded: a v0 program of size ∉ {20, 32} is NONSTANDARD, not
+	// WITNESS_UNKNOWN (Core solver.cpp:172 `if (witnessversion != 0)`).
 	ver := pkScript[0]
-	if ver != 0x00 && (ver < 0x51 || ver > 0x60) {
+	if ver < 0x51 || ver > 0x60 {
 		return false
 	}
 	// Second byte is the push length; must push 2..40 bytes.
