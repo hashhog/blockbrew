@@ -709,6 +709,63 @@ func TestGetPeerInfo(t *testing.T) {
 	}
 }
 
+// TestGetPeerInfoWireShape pins the getpeerinfo per-peer JSON field shape to
+// Bitcoin Core v31.99 (rpc/net.cpp):
+//
+//   - `last_inv_sequence` (NUM) and `inv_to_send` (NUM) are emitted
+//     immediately after `relaytxes` and before `lastsend` (net.cpp:243-244).
+//   - `startingheight` is NOT emitted — Core v31.99 removed it; the order is
+//     `bip152_hb_from` -> `presynced_headers` (net.cpp:269-270).
+//
+// Go marshals struct fields in declaration order, so asserting byte offsets in
+// the marshaled JSON is a faithful wire-order check. This test FAILS without
+// the ported fix (fields absent / startingheight present) and PASSES with it.
+func TestGetPeerInfoWireShape(t *testing.T) {
+	raw, err := json.Marshal(PeerInfo{})
+	if err != nil {
+		t.Fatalf("marshal PeerInfo: %v", err)
+	}
+	js := string(raw)
+
+	idx := func(key string) int { return bytes.Index(raw, []byte(`"`+key+`"`)) }
+
+	// startingheight must be ABSENT (Core v31.99 removed it).
+	if bytes.Contains(raw, []byte(`"startingheight"`)) {
+		t.Errorf("getpeerinfo must NOT emit startingheight (removed in Core v31.99); got: %s", js)
+	}
+
+	// All four ordered keys must be present.
+	relaytxes := idx("relaytxes")
+	lastInvSeq := idx("last_inv_sequence")
+	invToSend := idx("inv_to_send")
+	lastsend := idx("lastsend")
+	for name, pos := range map[string]int{
+		"relaytxes": relaytxes, "last_inv_sequence": lastInvSeq,
+		"inv_to_send": invToSend, "lastsend": lastsend,
+	} {
+		if pos < 0 {
+			t.Fatalf("getpeerinfo missing field %q: %s", name, js)
+		}
+	}
+
+	// Contiguous Core order: relaytxes < last_inv_sequence < inv_to_send < lastsend.
+	if !(relaytxes < lastInvSeq && lastInvSeq < invToSend && invToSend < lastsend) {
+		t.Errorf("getpeerinfo field order wrong; want relaytxes < last_inv_sequence < inv_to_send < lastsend, got %d, %d, %d, %d\n%s",
+			relaytxes, lastInvSeq, invToSend, lastsend, js)
+	}
+
+	// bip152_hb_from must be directly followed by presynced_headers (no
+	// startingheight between them).
+	hbFrom := idx("bip152_hb_from")
+	preSynced := idx("presynced_headers")
+	if hbFrom < 0 || preSynced < 0 {
+		t.Fatalf("getpeerinfo missing bip152_hb_from/presynced_headers: %s", js)
+	}
+	if hbFrom >= preSynced {
+		t.Errorf("getpeerinfo: bip152_hb_from must precede presynced_headers, got %d >= %d\n%s", hbFrom, preSynced, js)
+	}
+}
+
 func TestUptime(t *testing.T) {
 	server := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0"})
 

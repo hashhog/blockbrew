@@ -1437,24 +1437,53 @@ func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 		return txOut.Value > AnchorDust // P2A is only standard if value <= AnchorDust
 	}
 
-	// Dust is defined as an output whose spending cost exceeds its value.
-	// Spending cost depends on the script type.
-	spendingSize := int64(148) // Conservative default (P2PKH spending size)
+	// Dust is defined as an output whose value is below the cost of spending
+	// it. Delegate to the Core-faithful DustThreshold (policy.cpp
+	// GetDustThreshold), which uses GetSerializeSize(txout) + a per-output
+	// spending cost — NOT a flat per-shape table.
+	return txOut.Value < DustThreshold(txOut, consensus.DustRelayFeeRate)
+}
 
-	if consensus.IsP2WPKH(txOut.PkScript) {
-		spendingSize = 68 // Witness v0 keyhash spending size
-	} else if consensus.IsP2WSH(txOut.PkScript) {
-		spendingSize = 68 // Conservative estimate
-	} else if consensus.IsP2TR(txOut.PkScript) {
-		spendingSize = 58 // Taproot key path spending size
+// DustThreshold computes the dust threshold (in satoshis) for an output at the
+// given dust relay fee rate (sat/kvB), faithful to Core GetDustThreshold
+// (policy/policy.cpp:27-63):
+//
+//	nSize = GetSerializeSize(txout) + spending_cost
+//
+// where GetSerializeSize(txout) = 8 (value) + CompactSize(scriptlen) + scriptlen
+// and the spending cost is a fixed estimate of the CTxIn needed to spend it:
+//   - witness program: 32 + 4 + 1 + (107 / WITNESS_SCALE_FACTOR) + 4 = 67
+//   - non-witness:     32 + 4 + 1 + 107 + 4                          = 148
+//
+// The witness/non-witness branch is Core's IsWitnessProgram test — it is uniform
+// across all witness versions/sizes (P2WPKH, P2WSH, P2TR and unknown witness
+// programs all take the segwit-discounted 67), NOT a per-script-type table. The
+// threshold is dustRelayFee.GetFee(nSize) = CeilDiv(nSize * fee, 1000). Provably
+// unspendable outputs (OP_RETURN / empty) return 0 (Core IsUnspendable ⇒ 0).
+//
+// This is mempool RELAY policy (IsStandardTx / standardness) only — it is never
+// reached from block or transaction consensus validation.
+func DustThreshold(txOut *wire.TxOut, dustRelayFee int64) int64 {
+	if consensus.IsUnspendable(txOut.PkScript) {
+		return 0
 	}
 
-	// Dust uses the dedicated DUST_RELAY_TX_FEE (3000 sat/kvB), which Core
-	// keeps INDEPENDENT of -minrelaytxfee (policy.cpp GetDustThreshold uses
-	// dustRelayFee, not the min-relay floor). Coupling these would collapse the
-	// dust threshold 30x when the relay floor sits at the Core default of 100.
-	dustThreshold := spendingSize * consensus.DustRelayFeeRate / 1000
-	return txOut.Value < dustThreshold
+	// GetSerializeSize(txout): 8-byte value + CompactSize(scriptlen) + script.
+	var buf bytes.Buffer
+	_ = txOut.Serialize(&buf)
+	nSize := int64(buf.Len())
+
+	// IsWitnessProgram(version, program): ExtractWitnessProgram returns a
+	// non-negative version exactly when the script is a witness program.
+	version, _ := script.ExtractWitnessProgram(txOut.PkScript)
+	if version >= 0 {
+		nSize += 32 + 4 + 1 + (107 / consensus.WitnessScaleFactor) + 4 // 67
+	} else {
+		nSize += 32 + 4 + 1 + 107 + 4 // 148
+	}
+
+	// dustRelayFee.GetFee(nSize) = CeilDiv(nSize * fee, 1000).
+	return (nSize*dustRelayFee + 999) / 1000
 }
 
 // IsDust is the exported, read-only accessor for the dust-output standardness
