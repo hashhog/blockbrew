@@ -371,12 +371,11 @@ func TestW135_G21_BUG1_DustRelayFeeRate(t *testing.T) {
 			consensus.DustRelayFeeRate)
 	}
 
-	// P2WPKH output: OP_0 <20 bytes>. isDust uses spendingSize=68 for P2WPKH,
-	// so the dust threshold is 68 * DustRelayFeeRate / 1000 = 68*3000/1000 = 204
-	// sat, regardless of the relay floor. (Note: the 68-byte spending size is the
-	// separate G22 size-formula divergence and is NOT being fixed here.)
+	// P2WPKH output: OP_0 <20 bytes>. DustThreshold now uses the Core
+	// GetSerializeSize(txout)+67 formula, giving CeilDiv(98*3000,1000) = 294 sat,
+	// regardless of the relay floor.
 	p2wpkhScript := append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0x02}, 20)...)
-	const wantThreshold = 204 // 68 * 3000 / 1000
+	const wantThreshold = 294 // CeilDiv((31 + 67) * 3000, 1000)
 
 	// Two different relay floors prove the dust math no longer couples to it.
 	for _, minRelay := range []int64{100, 1000} {
@@ -392,10 +391,8 @@ func TestW135_G21_BUG1_DustRelayFeeRate(t *testing.T) {
 			t.Errorf("minRelay=%d: P2WPKH value %d should NOT be dust (threshold %d)",
 				minRelay, wantThreshold, wantThreshold)
 		}
-		// Decouple proof: a value that WOULD be dust under the old
-		// MinRelayFeeRate-coupled math at minRelay=1000 (68*1000/1000=68 -> 67
-		// dust) but is well above the 100-coupled floor — under the 3000 math it
-		// is dust at BOTH floors. Pick a value (100) that is < 204 always.
+		// Decouple proof: 100 sat is < 294 at BOTH relay floors → dust under the
+		// dedicated DustRelayFeeRate=3000 math, independent of MinRelayFeeRate.
 		if !mp.isDust(&wire.TxOut{Value: 100, PkScript: p2wpkhScript}) {
 			t.Errorf("minRelay=%d: P2WPKH value 100 should be dust under DustRelayFeeRate=3000 (threshold %d)",
 				minRelay, wantThreshold)
@@ -403,26 +400,41 @@ func TestW135_G21_BUG1_DustRelayFeeRate(t *testing.T) {
 	}
 }
 
-// G22 / BUG-1: dust math must size as GetSerializeSize(txout) + 148 (legacy) or +64 (segwit).
-// Core: policy.cpp:46-58.
+// G22 / BUG-1: dust math must size as GetSerializeSize(txout) + 148 (legacy) or
+// +67 (segwit). Core: policy.cpp:46-58 (GetDustThreshold).
 //
-// SKIP — bug present (and combined with G21).
+// FIXED: DustThreshold now sums GetSerializeSize(txout) (8-byte value +
+// CompactSize(scriptlen) + script) and the per-output spending cost
+// (witness 67 / non-witness 148), with CeilDiv rounding — NOT a flat
+// per-script-type table. Repro: a P2WPKH output at 250 sat must now be dust
+// (Core threshold 294, not the old 68/204).
 func TestW135_G22_BUG1_DustSizeFormula(t *testing.T) {
-	t.Skip("BUG-1 (P0-CDIV-relay): isDust uses fixed-per-type spending sizes (148/68/68/58); " +
-		"Core uses GetSerializeSize(txout) + 148 (legacy) or +64 (segwit). " +
-		"audit/w135_standardness_rules.md BUG-1.")
+	mp := New(Config{MinRelayFeeRate: 1000, MaxSize: 1_000_000}, newTestUTXOSet())
 
-	// Repro: P2WPKH output at value 250 sat.
-	// Core threshold: GetSerializeSize ≈ 31 bytes (22-byte script + 1-byte
-	// script_len varint + 8-byte value) + 64 (segwit cost) = 95 bytes.
-	// × 3000 / 1000 = 285 sat. → 250 < 285 → IsDust = true → REJECT.
-	//
-	// blockbrew threshold: 68 (P2WPKH branch) × 1000 / 1000 = 68 sat.
-	// → 250 < 68 false → not dust → ACCEPT.
-	//
-	// To make this testable we'd need to expose getDustThreshold directly;
-	// the audit md file documents the divergence and the test would assert
-	// the Core-byte-exact threshold against a fixed-table.
+	// P2WPKH output: OP_0 <20-byte program>.
+	p2wpkhScript := append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0x02}, 20)...)
+
+	// Core GetDustThreshold(P2WPKH, 3000):
+	//   GetSerializeSize = 8 + 1 + 22 = 31; + 67 (segwit) = 98 bytes
+	//   CeilDiv(98 * 3000, 1000) = 294 sat.
+	const coreThreshold = 294
+	if got := DustThreshold(&wire.TxOut{Value: 0, PkScript: p2wpkhScript}, consensus.DustRelayFeeRate); got != coreThreshold {
+		t.Fatalf("DustThreshold(P2WPKH) = %d, want %d (Core GetDustThreshold)", got, coreThreshold)
+	}
+
+	// 250 sat sits BELOW the Core threshold (294) but ABOVE the old buggy
+	// per-shape threshold (68 byte * 3000 / 1000 = 204) — so it surfaces the
+	// size-formula divergence: pre-fix accepted (250 >= 204), post-fix dust.
+	if !mp.isDust(&wire.TxOut{Value: 250, PkScript: p2wpkhScript}) {
+		t.Errorf("P2WPKH value 250 should be dust (Core threshold %d); the old per-shape table (204) under-rejected it", coreThreshold)
+	}
+	// One below / at the threshold (strict <).
+	if !mp.isDust(&wire.TxOut{Value: coreThreshold - 1, PkScript: p2wpkhScript}) {
+		t.Errorf("P2WPKH value %d should be dust (threshold %d)", coreThreshold-1, coreThreshold)
+	}
+	if mp.isDust(&wire.TxOut{Value: coreThreshold, PkScript: p2wpkhScript}) {
+		t.Errorf("P2WPKH value %d should NOT be dust (threshold %d, strict <)", coreThreshold, coreThreshold)
+	}
 }
 
 // G23 / BUG-3: MAX_DUST_OUTPUTS_PER_TX = 1 enforced.
@@ -605,34 +617,71 @@ func TestW135_G35_TRUCSizeLimits(t *testing.T) {
 // dust_relay_fee = 3000 sat/kvB. The table is hand-computed from
 // policy.cpp:27-64 and serves as the post-fix assertion target.
 //
-// SKIP until fix lands; documents the target.
+// FIXED (BUG-1): DustThreshold is now byte-exact vs Core GetDustThreshold at
+// dust_relay_fee = 3000. Each value is CeilDiv((GetSerializeSize(txout) +
+// spending_cost) * 3000, 1000), where spending_cost = 67 for witness programs
+// (segwit-discounted, uniform P2WPKH/P2WSH/P2TR) else 148.
+//
+//	P2PKH:  8 + 1 + 25 = 34; + 148 = 182 → 546 sat
+//	P2SH:   8 + 1 + 23 = 32; + 148 = 180 → 540 sat
+//	P2WPKH: 8 + 1 + 22 = 31; +  67 =  98 → 294 sat
+//	P2WSH:  8 + 1 + 34 = 43; +  67 = 110 → 330 sat
+//	P2TR:   8 + 1 + 34 = 43; +  67 = 110 → 330 sat
+//
+// These are the canonical Core dust thresholds (policy.cpp:35-43 comments:
+// P2PKH 546, P2WPKH 294). The earlier per-shape table (148/68/68/58 × 3000)
+// produced 444/204/204/174 — all under-rejecting dust. Mutation-proven: revert
+// DustThreshold to the per-shape table and these assertions fail.
 func TestW135_AuditFramework_CoreDustThresholdTable(t *testing.T) {
-	t.Skip("BUG-1 (P0-CDIV-relay): Core-byte-exact dust threshold table. " +
-		"Tests fail until isDust is rewritten against GetSerializeSize + dust_relay_fee=3000. " +
-		"audit/w135_standardness_rules.md BUG-1.")
+	cases := []struct {
+		name   string
+		script []byte
+		want   int64
+	}{
+		{
+			name:   "P2PKH",
+			script: append(append([]byte{0x76, 0xa9, 0x14}, bytes.Repeat([]byte{0x01}, 20)...), 0x88, 0xac),
+			want:   546,
+		},
+		{
+			name:   "P2SH",
+			script: append(append([]byte{0xa9, 0x14}, bytes.Repeat([]byte{0x01}, 20)...), 0x87),
+			want:   540,
+		},
+		{
+			name:   "P2WPKH",
+			script: append([]byte{0x00, 0x14}, bytes.Repeat([]byte{0x01}, 20)...),
+			want:   294,
+		},
+		{
+			name:   "P2WSH",
+			script: append([]byte{0x00, 0x20}, bytes.Repeat([]byte{0x01}, 32)...),
+			want:   330,
+		},
+		{
+			name:   "P2TR",
+			script: append([]byte{0x51, 0x20}, bytes.Repeat([]byte{0x01}, 32)...),
+			want:   330,
+		},
+	}
 
-	// Reference table: Core's GetDustThreshold at dust_relay_fee=3000.
-	// All values are dust_relay_fee × (serialized_size + 148 or +64) / 1000.
-	//
-	// Hand-computed:
-	//   P2PKH:  25 (script) + 1 (script_len varint) + 8 (value) = 34 bytes
-	//             + 148 (legacy input cost) = 182 → × 3000/1000 = 546 sat
-	//   P2SH:   23 + 1 + 8 = 32 + 148 = 180 → 540 sat
-	//   P2PK:   35 + 1 + 8 = 44 + 148 = 192 → 576 sat (compressed)
-	//   P2WPKH: 22 + 1 + 8 = 31 + 64 (segwit cost) = 95 → 285 sat (Core docs: 294 with rounding)
-	//   P2WSH:  34 + 1 + 8 = 43 + 64 = 107 → 321 sat
-	//   P2TR:   34 + 1 + 8 = 43 + 64 = 107 → 321 sat
-	//   P2A:    4 + 1 + 8 = 13 + 64 = 77 → 231 sat
-	//
-	// blockbrew's isDust now uses DustRelayFeeRate=3000 (G21/BUG-1 fee-rate
-	// coupling FIXED), but still uses the fixed-per-type spending sizes
-	// (148/68/68/58) rather than GetSerializeSize(txout)+148/+64 — that size
-	// formula is the SEPARATE G22 divergence, still skipped:
-	//   P2PKH:  148 × 3000/1000 = 444 sat  (Core 546; size-formula under)
-	//   P2WPKH: 68 × 3000/1000 = 204 sat   (Core 285; size-formula under)
-	//   P2WSH:  68 × 3000/1000 = 204 sat   (Core 321; size-formula under)
-	//   P2TR:   58 × 3000/1000 = 174 sat   (Core 321; size-formula under)
-	//   P2A:    value > 240 = "dust" (different rule entirely; see BUG-5)
+	mp := New(Config{MinRelayFeeRate: 1000, MaxSize: 1_000_000}, newTestUTXOSet())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := &wire.TxOut{Value: 0, PkScript: tc.script}
+			if got := DustThreshold(out, consensus.DustRelayFeeRate); got != tc.want {
+				t.Errorf("DustThreshold(%s) = %d, want %d (Core GetDustThreshold @ 3000)", tc.name, got, tc.want)
+			}
+			// Boundary pins: value == threshold is NOT dust (strict <),
+			// value == threshold-1 IS dust.
+			if mp.isDust(&wire.TxOut{Value: tc.want, PkScript: tc.script}) {
+				t.Errorf("%s value %d (== threshold) should NOT be dust", tc.name, tc.want)
+			}
+			if !mp.isDust(&wire.TxOut{Value: tc.want - 1, PkScript: tc.script}) {
+				t.Errorf("%s value %d (threshold-1) should be dust", tc.name, tc.want-1)
+			}
+		})
+	}
 }
 
 // Documents the contrast between Core's Solver dispatch and blockbrew's

@@ -304,6 +304,13 @@ type PeerInfo struct {
 	Services              string           `json:"services"`
 	ServicesNames         []string         `json:"servicesnames"`
 	RelayTxes             bool             `json:"relaytxes"`
+	// LastInvSequence (Core m_last_inv_seq) and InvToSend (Core m_inv_to_send)
+	// are emitted immediately after relaytxes and before lastsend, matching
+	// Core v31.99 getpeerinfo wire order (rpc/net.cpp:243-244). blockbrew does
+	// not track either value at the manager layer, so both are emitted as 0 —
+	// the same convention as addr_processed/addr_rate_limited.
+	LastInvSequence       int64            `json:"last_inv_sequence"`
+	InvToSend             int64            `json:"inv_to_send"`
 	LastSend              int64            `json:"lastsend"`
 	LastRecv              int64            `json:"lastrecv"`
 	LastTransaction       int64            `json:"last_transaction"`
@@ -319,7 +326,10 @@ type PeerInfo struct {
 	Inbound               bool             `json:"inbound"`
 	BIP152HBTo            bool             `json:"bip152_hb_to"`
 	BIP152HBFrom          bool             `json:"bip152_hb_from"`
-	StartHeight           int32            `json:"startingheight"`
+	// Core v31.99 getpeerinfo no longer emits `startingheight` — rpc/net.cpp
+	// pushes presynced_headers directly after bip152_hb_from. The legacy
+	// m_starting_height was dropped from RPC output, so the field is omitted
+	// here to match Core's wire shape exactly.
 	PreSyncedHeaders      int32            `json:"presynced_headers"`
 	SyncedHeaders         int32            `json:"synced_headers"`
 	SyncedBlocks          int32            `json:"synced_blocks"`
