@@ -159,6 +159,35 @@ func TestBech32RoundTrip(t *testing.T) {
 	}
 }
 
+// TestBech32CharLimit verifies the BIP173/BIP350 90-character limit
+// (bitcoin-core/src/bech32.cpp:378, CharLimit::BECH32 = 90). Both vectors
+// below carry a *valid* checksum (produced by Bech32Encode), so the only
+// difference between them is length: the 90-char string must decode, and the
+// 91-char string must be rejected purely because it exceeds the limit — not
+// because of a bad checksum. Beyond 90 chars the BCH 4-error-detection
+// guarantee no longer holds, which is why Core rejects up front.
+func TestBech32CharLimit(t *testing.T) {
+	// 90 chars, valid checksum — must decode.
+	valid90 := "bc1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0senwatw"
+	if len(valid90) != 90 {
+		t.Fatalf("test vector valid90 is %d chars, expected 90", len(valid90))
+	}
+	if _, _, err := Bech32Decode(valid90); err != nil {
+		t.Errorf("90-char valid bech32 should decode, got err=%v", err)
+	}
+
+	// 91 chars, valid checksum — must be rejected because it is over the limit.
+	over91 := "bc1qpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3jn54khce6mua7lqpzry9x8gf2tvdw0s3d6e83u"
+	if len(over91) != 91 {
+		t.Fatalf("test vector over91 is %d chars, expected 91", len(over91))
+	}
+	if _, _, err := Bech32Decode(over91); err == nil {
+		t.Errorf("91-char bech32 (valid checksum) must be rejected for exceeding the %d-char limit", bech32CharLimit)
+	} else if err != ErrInvalidBech32Length {
+		t.Errorf("over-limit bech32 should fail with ErrInvalidBech32Length, got %v", err)
+	}
+}
+
 func TestBech32mRoundTrip(t *testing.T) {
 	testCases := []struct {
 		hrp  string

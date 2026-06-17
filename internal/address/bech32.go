@@ -25,6 +25,14 @@ func init() {
 	}
 }
 
+// bech32CharLimit is the maximum allowed length (in characters) of a
+// bech32/bech32m encoded string, per BIP173/BIP350. The BCH code's
+// 4-error-detection guarantee only holds at or below this length, so Core
+// rejects any longer string before even checking the checksum
+// (bitcoin-core/src/bech32.cpp:378 `if (str.size() > limit) return {};`,
+// CharLimit::BECH32 = 90 in bech32.h:38-40).
+const bech32CharLimit = 90
+
 // Bech32 errors
 var (
 	ErrInvalidBech32Char     = errors.New("invalid bech32 character")
@@ -164,6 +172,13 @@ func bech32Decode(s string) (string, []byte, int, error) {
 	}
 	if hasLower && hasUpper {
 		return "", nil, 0, ErrMixedCase
+	}
+
+	// Enforce the BIP173/BIP350 90-character limit regardless of checksum.
+	// Beyond 90 chars the BCH 4-error-detection guarantee no longer holds, so
+	// Core rejects the string up front (bech32.cpp:378, CharLimit::BECH32 = 90).
+	if len(s) > bech32CharLimit {
+		return "", nil, 0, ErrInvalidBech32Length
 	}
 
 	// Convert to lowercase
