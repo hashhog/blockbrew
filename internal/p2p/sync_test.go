@@ -1054,6 +1054,18 @@ type mockChainConnector struct {
 	tipHash      wire.Hash256
 	tipHeight    int32
 	tipTimestamp uint32 // Unix seconds for the simulated tip block
+
+	// postIBD inverts IsIBD(): the zero value keeps IsIBD()==true so every
+	// pre-existing test sees the original behaviour (connectPendingBlocks uses
+	// raw ConnectBlock). Set postIBD=true to model the at-tip / post-IBD case
+	// where connectPendingBlocks routes through ProcessSubmittedBlock (the
+	// side-branch-aware reorg path, part 2).
+	postIBD bool
+
+	// processFn, when set, backs ProcessSubmittedBlock so a test can model the
+	// side-branch-store / reorg semantics. connectFn (if set) backs ConnectBlock.
+	processFn func(*wire.MsgBlock) error
+	connectFn func(*wire.MsgBlock) error
 }
 
 func (m *mockChainConnector) BestBlock() (wire.Hash256, int32) {
@@ -1068,10 +1080,24 @@ func (m *mockChainConnector) BestBlockNode() *consensus.BlockNode {
 	}
 }
 
-func (m *mockChainConnector) ConnectBlock(_ *wire.MsgBlock) error { return nil }
-func (m *mockChainConnector) ReloadChainState()                   {}
-func (m *mockChainConnector) HasPendingRecovery() bool            { return false }
-func (m *mockChainConnector) IsIBD() bool                         { return true }
+func (m *mockChainConnector) ConnectBlock(b *wire.MsgBlock) error {
+	if m.connectFn != nil {
+		return m.connectFn(b)
+	}
+	return nil
+}
+
+func (m *mockChainConnector) ProcessSubmittedBlock(b *wire.MsgBlock) error {
+	if m.processFn != nil {
+		return m.processFn(b)
+	}
+	// Default: behave like a plain extension (no side branch).
+	return m.ConnectBlock(b)
+}
+
+func (m *mockChainConnector) ReloadChainState()        {}
+func (m *mockChainConnector) HasPendingRecovery() bool { return false }
+func (m *mockChainConnector) IsIBD() bool              { return !m.postIBD }
 
 // TestIsIBDActive_TrueAtStartup verifies that a freshly created SyncManager
 // reports IsIBDActive()=true before any blocks have connected.

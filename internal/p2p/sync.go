@@ -273,6 +273,18 @@ type SyncManager struct {
 type ChainConnector interface {
 	// ConnectBlock validates and connects a block to the active chain.
 	ConnectBlock(block *wire.MsgBlock) error
+	// ProcessSubmittedBlock connects a block via the side-branch-aware path:
+	// it extends the active tip (fast ConnectBlock path) when the block's
+	// parent IS the tip, reorgs when the block is a heavier side branch, and
+	// STORES the block returning consensus.ErrSideBranchAccepted when it is an
+	// equal/less-work side branch. Used by the post-IBD competing-fork connect
+	// path so fork bodies arriving bottom-up are stored (not rejected) until a
+	// heavier fork tip drives ReorgTo. Caller contract: the header is already in
+	// the index and the body is already persisted on disk (both guaranteed by
+	// the headers-first download path before the block reaches the connect loop).
+	// Mirrors the RPC submitblock path (rpc/methods.go) and Bitcoin Core's
+	// AcceptBlock/ActivateBestChain split (validation.cpp).
+	ProcessSubmittedBlock(block *wire.MsgBlock) error
 	// BestBlock returns the current chain tip hash and height.
 	BestBlock() (wire.Hash256, int32)
 	// BestBlockNode returns the BlockNode for the current chain tip via
@@ -2473,6 +2485,12 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 		if sm.chainMgr != nil {
 			// Recover from panics in ConnectBlock
 			var connectErr error
+			// sideBranchAccepted latches when the connect routed through the
+			// side-branch-aware path and stored the block on a non-active
+			// branch (reorg-drop fix part 2). It is a SUCCESS, not an error:
+			// the active tip legitimately stays put, the cursor advances to
+			// the next fork body, and a heavier fork tip later drives ReorgTo.
+			var sideBranchAccepted bool
 			// W75 instrumentation: wall-clock timing around the
 			// ConnectBlock call.  Only success-path timings feed the
 			// rolling window below (see post-call accumulator).
@@ -2483,7 +2501,33 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 						connectErr = fmt.Errorf("PANIC in ConnectBlock: %v", r)
 					}
 				}()
-				connectErr = sm.chainMgr.ConnectBlock(bwr.block)
+				// reorg-drop fix part 2: post-IBD, route through the
+				// side-branch-aware ProcessSubmittedBlock so a competing fork
+				// forking BELOW the active tip is STORED (its bodies arrive
+				// bottom-up, each lighter than the active chain) until the
+				// fork tip's TotalWork overtakes the tip and triggers ReorgTo.
+				// Raw ConnectBlock (chainmanager.go:512) rejects+discards such
+				// a block ("does not connect to tip ... and has less work"),
+				// which is exactly why fork bodies never accumulated (the
+				// runtime-proven part-1 gap). During IBD proper we KEEP raw
+				// ConnectBlock: blocks arrive in order and extend the tip, and
+				// ConnectBlock intentionally refuses reorgs there (invariant 3).
+				// The extension fast path is identical either way —
+				// ProcessSubmittedBlock dispatches parent==tip straight to
+				// ConnectBlock — so steady-state behaviour/performance is
+				// unchanged (invariant 1).
+				if sm.chainMgr.IsIBD() {
+					connectErr = sm.chainMgr.ConnectBlock(bwr.block)
+				} else {
+					connectErr = sm.chainMgr.ProcessSubmittedBlock(bwr.block)
+					if errors.Is(connectErr, consensus.ErrSideBranchAccepted) {
+						// Side-branch store succeeded. Clear the error: this is
+						// NOT a validation failure and must never reach the
+						// wedge / chainstate-corruption path below (invariant 2).
+						sideBranchAccepted = true
+						connectErr = nil
+					}
+				}
 			}()
 			_connDurNs := time.Since(_connStart).Nanoseconds()
 
@@ -2677,6 +2721,27 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				break
 			}
 
+			// reorg-drop fix part 2: side-branch store path. The block was
+			// validated + stored on a non-active branch (parent is NOT the
+			// active tip and the branch is not yet heavier). The active tip
+			// LEGITIMATELY did not move — there is no connected block to notify
+			// on, no real ConnectBlock latency to record, no tip advance, and
+			// the tip-anchored desync check below would false-fire (it expects
+			// the tip to equal nextHeight). Simply advance the cursor to the
+			// next fork body and continue: when the fork tip's TotalWork finally
+			// overtakes the active tip, ProcessSubmittedBlock returns nil after
+			// ReorgTo and falls through to the normal connected-block path below.
+			if sideBranchAccepted {
+				bwr.req.State = BlockDownloadConnected
+				delete(pending, nextHeight)
+				sm.mu.Lock()
+				sm.removeFromQueue(bwr.req.Hash)
+				nextHeight++
+				sm.nextHeight = nextHeight
+				sm.mu.Unlock()
+				continue
+			}
+
 			// W75 instrumentation: success-path ConnectBlock latency.
 			// Only connectionWorker's goroutine mutates these fields
 			// (connectPendingBlocks is invoked only from there), so
@@ -2728,9 +2793,16 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 		// forward-sync thrash: nextHeight runs ahead of the tip, every block
 		// then fails "does not connect", and the gap-handler churns the cursor
 		// back and forth for hours. Halt loudly on the anomaly instead.
+		//
+		// A reorg (ProcessSubmittedBlock → ReorgTo on the fork tip) lands the
+		// active tip on the fork tip, whose height can EXCEED nextHeight (the
+		// fork tip may be higher than the body we were connecting). tipH >=
+		// nextHeight after a reorg is healthy progress, not desync; only a tip
+		// BEHIND nextHeight is the pathological forward-sync thrash this guard
+		// targets. Anchor nextHeight to the real tip in both cases.
 		if sm.chainMgr != nil {
 			_, tipH := sm.chainMgr.BestBlock()
-			if tipH != nextHeight {
+			if tipH < nextHeight {
 				log.Printf("[IBD-DESYNC] sync: ConnectBlock(%d) succeeded but the "+
 					"chain tip is %d — connect cursor desynced from the chainstate; "+
 					"halting the connect loop (layer-A forward-sync thrash)",
