@@ -1484,6 +1484,8 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 			Services:              fmt.Sprintf("%016x", services),
 			ServicesNames:         decodeServiceNames(services),
 			RelayTxes:             p.RelayTxes(),
+			LastInvSequence:       0, // not tracked at the manager layer (Core m_last_inv_seq)
+			InvToSend:             0, // not tracked at the manager layer (Core m_inv_to_send)
 			LastSend:              p.LastSend().Unix(),
 			LastRecv:              p.LastRecv().Unix(),
 			LastTransaction:       0,
@@ -1499,7 +1501,6 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 			Inbound:               p.Inbound(),
 			BIP152HBTo:            false,
 			BIP152HBFrom:          false,
-			StartHeight:           p.StartHeight(),
 			PreSyncedHeaders:      -1,
 			SyncedHeaders:         -1,
 			SyncedBlocks:          -1,
