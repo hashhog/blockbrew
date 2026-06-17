@@ -22,6 +22,7 @@ import (
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
+	"github.com/hashhog/blockbrew/internal/p2p"
 	"github.com/hashhog/blockbrew/internal/storage"
 )
 
@@ -53,6 +54,41 @@ func w125TestServer(t *testing.T) *Server {
 		WithChainManager(cm),
 		WithChainDB(db),
 		WithMempool(mp),
+	)
+}
+
+// w125TestServerWithPeerMgr builds the same minimal RPC server as
+// w125TestServer but also wires a real (un-Started) PeerManager so the
+// addnode / setban / disconnectnode handlers reach their actual
+// peer-management error paths instead of short-circuiting on the
+// peerMgr-nil guard. NewPeerManager with an empty config performs no
+// network I/O and (with no DataDir) loads no ban list, so this is cheap
+// and side-effect free for a unit test.
+func w125TestServerWithPeerMgr(t *testing.T) *Server {
+	t.Helper()
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+	})
+	mp := mempool.New(mempool.Config{
+		MaxSize:                10_000_000,
+		MinRelayFeeRate:        1000,
+		MempoolFullRBF:         true,
+		MempoolFullRBFExplicit: true,
+	}, nil)
+	pm := p2p.NewPeerManager(p2p.PeerManagerConfig{ChainParams: params})
+	return NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithHeaderIndex(idx),
+		WithChainManager(cm),
+		WithChainDB(db),
+		WithMempool(mp),
+		WithPeerManager(pm),
 	)
 }
 
@@ -308,19 +344,42 @@ func TestW125_BUG_10b_GetBlock_NotFound_Present(t *testing.T) {
 // blockbrew: all -32602 (no -23/-30 constants defined at all).
 // ─────────────────────────────────────────────────────────────────────
 
+// FIXED (was a documented-divergence xfail): setban with an un-parseable
+// IP/subnet now returns RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) with Core's
+// exact message, matching bitcoin-core rpc/net.cpp (the !IsValid → throw
+// JSONRPCError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet")
+// gate). Driven through the live handler with a real peerMgr wired so the
+// validity check (not the nil-guard) is what fires.
 func TestW125_BUG_11a_SetBan_InvalidIP(t *testing.T) {
-	server := w125TestServer(t)
-	// Without peerMgr this returns -1; verify that case first separately:
-	// For audit purposes, just exercise the missing-args path which
-	// short-circuits before peerMgr is checked.
+	server := w125TestServerWithPeerMgr(t)
 	resp := testRPCRequest(t, server.handleRPC,
-		"setban", []interface{}{}, "", "")
+		"setban", []interface{}{"not-an-ip", "add"}, "", "")
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -30/-8/-23 per case.",
-			resp.Error.Code, RPCErrInvalidParams)
+	if resp.Error.Code != RPCErrClientInvalidIPOrSubnet {
+		t.Errorf("setban invalid IP code = %d, want %d (RPC_CLIENT_INVALID_IP_OR_SUBNET)",
+			resp.Error.Code, RPCErrClientInvalidIPOrSubnet)
+	}
+	if resp.Error.Message != "Error: Invalid IP/Subnet" {
+		t.Errorf("setban invalid IP message = %q, want %q",
+			resp.Error.Message, "Error: Invalid IP/Subnet")
+	}
+
+	// A malformed subnet (has '/', bad CIDR) takes the subnet branch and is
+	// likewise rejected with -30.
+	resp2 := testRPCRequest(t, server.handleRPC,
+		"setban", []interface{}{"10.0.0.0/99", "add"}, "", "")
+	if resp2.Error == nil || resp2.Error.Code != RPCErrClientInvalidIPOrSubnet {
+		t.Errorf("setban invalid subnet code = %v, want %d",
+			resp2.Error, RPCErrClientInvalidIPOrSubnet)
+	}
+
+	// Sanity: a well-formed IP does NOT hit the -30 path (success).
+	resp3 := testRPCRequest(t, server.handleRPC,
+		"setban", []interface{}{"1.2.3.4", "add"}, "", "")
+	if resp3.Error != nil {
+		t.Errorf("setban valid IP unexpectedly errored: %v", resp3.Error)
 	}
 }
 
@@ -386,6 +445,60 @@ func TestW125_BUG_13_AddNode_InvalidCommand(t *testing.T) {
 		// peerMgr nil guard fired first; Core would still emit -8 for the command
 	default:
 		t.Logf("unexpected: code = %d", resp.Error.Code)
+	}
+}
+
+// FIXED (was a documented-divergence xfail): addnode "add" of an
+// already-added node returns RPC_CLIENT_NODE_ALREADY_ADDED (-23), and
+// "remove" of a node that was never added returns RPC_CLIENT_NODE_NOT_ADDED
+// (-24), each with Core's exact message (bitcoin-core rpc/net.cpp:362/368,
+// backed by CConnman::AddNode dedup / RemoveAddedNode absent-check). Driven
+// through the live handler with a real peerMgr wired.
+func TestW125_BUG_13_AddNode_DuplicateAddAndRemoveUnknown(t *testing.T) {
+	server := w125TestServerWithPeerMgr(t)
+	node := "1.2.3.4:8333"
+
+	// remove before any add → -24 RPC_CLIENT_NODE_NOT_ADDED.
+	respNoAdd := testRPCRequest(t, server.handleRPC,
+		"addnode", []interface{}{node, "remove"}, "", "")
+	if respNoAdd.Error == nil || respNoAdd.Error.Code != RPCErrClientNodeNotAdded {
+		t.Fatalf("addnode remove-unknown code = %v, want %d (RPC_CLIENT_NODE_NOT_ADDED)",
+			respNoAdd.Error, RPCErrClientNodeNotAdded)
+	}
+	if respNoAdd.Error.Message != "Error: Node could not be removed. It has not been added previously." {
+		t.Errorf("addnode remove-unknown message = %q", respNoAdd.Error.Message)
+	}
+
+	// first add → success (no error).
+	respAdd := testRPCRequest(t, server.handleRPC,
+		"addnode", []interface{}{node, "add"}, "", "")
+	if respAdd.Error != nil {
+		t.Fatalf("addnode first add unexpectedly errored: %v", respAdd.Error)
+	}
+
+	// duplicate add → -23 RPC_CLIENT_NODE_ALREADY_ADDED.
+	respDup := testRPCRequest(t, server.handleRPC,
+		"addnode", []interface{}{node, "add"}, "", "")
+	if respDup.Error == nil || respDup.Error.Code != RPCErrClientNodeAlreadyAdded {
+		t.Fatalf("addnode duplicate-add code = %v, want %d (RPC_CLIENT_NODE_ALREADY_ADDED)",
+			respDup.Error, RPCErrClientNodeAlreadyAdded)
+	}
+	if respDup.Error.Message != "Error: Node already added" {
+		t.Errorf("addnode duplicate-add message = %q", respDup.Error.Message)
+	}
+
+	// remove the now-added node → success (round-trip), and a second remove
+	// is again -24.
+	respRm := testRPCRequest(t, server.handleRPC,
+		"addnode", []interface{}{node, "remove"}, "", "")
+	if respRm.Error != nil {
+		t.Fatalf("addnode remove-after-add unexpectedly errored: %v", respRm.Error)
+	}
+	respRm2 := testRPCRequest(t, server.handleRPC,
+		"addnode", []interface{}{node, "remove"}, "", "")
+	if respRm2.Error == nil || respRm2.Error.Code != RPCErrClientNodeNotAdded {
+		t.Errorf("addnode second remove code = %v, want %d",
+			respRm2.Error, RPCErrClientNodeNotAdded)
 	}
 }
 
