@@ -1,8 +1,11 @@
 package p2p
 
 import (
+	"encoding/json"
 	"math/rand"
 	"net"
+	"os"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -11,10 +14,13 @@ import (
 // mirroring Bitcoin Core's CNetAddr::IsRoutable() in netaddress.cpp:462.
 //
 // Core rejects: RFC1918, RFC2544, RFC3927, RFC4862, RFC6598, RFC5737,
-//               RFC4193, RFC4843, RFC7343, local (loopback/unspecified), internal.
+//
+//	RFC4193, RFC4843, RFC7343, local (loopback/unspecified), internal.
 //
 // Go stdlib covers: loopback (IsLoopback), RFC1918+RFC4193 (IsPrivate),
-//                   RFC3927+RFC4862 link-local (IsLinkLocalUnicast).
+//
+//	RFC3927+RFC4862 link-local (IsLinkLocalUnicast).
+//
 // The remaining ranges are checked explicitly via CIDR nets.
 func isRoutableIP(ip net.IP) bool {
 	if ip == nil {
@@ -80,13 +86,13 @@ var nonRoutableCIDRs []*net.IPNet
 
 func init() {
 	cidrs := []string{
-		"198.18.0.0/15",    // RFC2544 benchmarking
-		"100.64.0.0/10",    // RFC6598 shared address space (CGNAT)
-		"192.0.2.0/24",     // RFC5737 TEST-NET-1
-		"198.51.100.0/24",  // RFC5737 TEST-NET-2
-		"203.0.113.0/24",   // RFC5737 TEST-NET-3
-		"2001:10::/28",     // RFC4843 ORCHID
-		"2001:20::/28",     // RFC7343 ORCHIDv2
+		"198.18.0.0/15",   // RFC2544 benchmarking
+		"100.64.0.0/10",   // RFC6598 shared address space (CGNAT)
+		"192.0.2.0/24",    // RFC5737 TEST-NET-1
+		"198.51.100.0/24", // RFC5737 TEST-NET-2
+		"203.0.113.0/24",  // RFC5737 TEST-NET-3
+		"2001:10::/28",    // RFC4843 ORCHID
+		"2001:20::/28",    // RFC7343 ORCHIDv2
 	}
 	for _, s := range cidrs {
 		_, cidr, err := net.ParseCIDR(s)
@@ -247,9 +253,9 @@ func NewAddressBook() *AddressBook {
 // last-seen timestamps (either extremely stale or far-future values).
 func clampAddrTimestamp(ts uint32, now time.Time) time.Time {
 	const (
-		pre2001Cutoff  = 100_000_000            // Unix seconds ≈ 2001-03-09
-		futureSlack    = 10 * time.Minute
-		staleDefault   = 5 * 24 * time.Hour     // Core: current_time - 5*24h
+		pre2001Cutoff = 100_000_000 // Unix seconds ≈ 2001-03-09
+		futureSlack   = 10 * time.Minute
+		staleDefault  = 5 * 24 * time.Hour // Core: current_time - 5*24h
 	)
 	t := time.Unix(int64(ts), 0)
 	if ts <= pre2001Cutoff || t.After(now.Add(futureSlack)) {
@@ -530,4 +536,169 @@ func (ab *AddressBook) NeedMoreAddresses() bool {
 // addrKey returns a unique string key for a NetAddress.
 func addrKey(addr NetAddress) string {
 	return net.JoinHostPort(addr.IP.String(), itoa(int(addr.Port)))
+}
+
+// --- Persistence (peers.json) -----------------------------------------------
+//
+// Bitcoin Core persists its address manager to peers.dat on shutdown
+// (CAddrDB::Write, addrdb.cpp) and reloads it on startup (DumpAddresses /
+// CAddrDB::Read) so a node does not forget its learned peer set across a
+// restart — losing that set on every restart is an eclipse/bootstrap-fragility
+// hazard. blockbrew's live PeerManager uses this flat AddressBook (not the
+// Core-exact bucketed AddrMan), so we serialize the AddressBook's entries to a
+// JSON peers file. This is P2P/peer-discovery state only — it never touches
+// block or transaction validation.
+
+// AddressBookFilename is the file blockbrew persists the live AddressBook to.
+// Distinct from PeersDatabaseFilename ("peers.dat", used by the bucketed
+// AddrMan) so the two on-disk formats never collide.
+const AddressBookFilename = "peers.json"
+
+// knownAddressJSON is the on-disk form of a KnownAddress. Times are stored as
+// Unix seconds (0 = zero time) so the format is compact and self-describing;
+// the IP is stored as its string form (To16-normalised on load).
+type knownAddressJSON struct {
+	IP          string `json:"ip"`
+	Port        uint16 `json:"port"`
+	Services    uint64 `json:"services"`
+	Source      string `json:"source"`
+	LastAttempt int64  `json:"last_attempt"`
+	LastSuccess int64  `json:"last_success"`
+	Attempts    int    `json:"attempts"`
+	LastSeen    int64  `json:"last_seen"`
+}
+
+// addressBookJSON is the versioned on-disk container.
+type addressBookJSON struct {
+	Version int                `json:"version"`
+	Addrs   []knownAddressJSON `json:"addrs"`
+}
+
+// addressBookDatVersion is the peers.json format version. Bump on any
+// incompatible field change; loadFile cold-starts on a version mismatch.
+const addressBookDatVersion = 1
+
+func unixOrZero(t time.Time) int64 {
+	if t.IsZero() {
+		return 0
+	}
+	return t.Unix()
+}
+
+func timeOrZero(u int64) time.Time {
+	if u == 0 {
+		return time.Time{}
+	}
+	return time.Unix(u, 0)
+}
+
+// snapshotJSON returns the serializable form of every known address, taken
+// under the read lock.
+func (ab *AddressBook) snapshotJSON() addressBookJSON {
+	ab.mu.RLock()
+	defer ab.mu.RUnlock()
+
+	out := addressBookJSON{
+		Version: addressBookDatVersion,
+		Addrs:   make([]knownAddressJSON, 0, len(ab.addrs)),
+	}
+	for _, ka := range ab.addrs {
+		out.Addrs = append(out.Addrs, knownAddressJSON{
+			IP:          ka.Addr.IP.String(),
+			Port:        ka.Addr.Port,
+			Services:    ka.Addr.Services,
+			Source:      ka.Source,
+			LastAttempt: unixOrZero(ka.LastAttempt),
+			LastSuccess: unixOrZero(ka.LastSuccess),
+			Attempts:    ka.Attempts,
+			LastSeen:    unixOrZero(ka.LastSeen),
+		})
+	}
+	return out
+}
+
+// Save atomically writes the address book to <dataDir>/peers.json (temp file +
+// rename), mirroring Bitcoin Core's CAddrDB::Write atomicity. An empty dataDir
+// is a no-op (matches the PeerManager ban-list / anchors convention). Failures
+// are returned but are never fatal to the caller.
+func (ab *AddressBook) Save(dataDir string) error {
+	if dataDir == "" {
+		return nil
+	}
+
+	data, err := json.MarshalIndent(ab.snapshotJSON(), "", "  ")
+	if err != nil {
+		return err
+	}
+
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dataDir, AddressBookFilename)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// Load reads <dataDir>/peers.json and restores the saved entries into the book.
+// A missing file (cold start), an empty dataDir, a corrupt/truncated file, or a
+// version mismatch are all non-fatal: the book is simply left unchanged
+// (graceful cold start, never a panic), mirroring Core's tolerant CAddrDB::Read.
+// Returns the number of addresses restored.
+func (ab *AddressBook) Load(dataDir string) int {
+	if dataDir == "" {
+		return 0
+	}
+	path := filepath.Join(dataDir, AddressBookFilename)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0 // missing -> cold start
+	}
+
+	var container addressBookJSON
+	if err := json.Unmarshal(raw, &container); err != nil {
+		return 0 // corrupt -> cold start
+	}
+	if container.Version != addressBookDatVersion {
+		return 0 // unknown version -> cold start
+	}
+
+	ab.mu.Lock()
+	defer ab.mu.Unlock()
+
+	loaded := 0
+	for _, r := range container.Addrs {
+		ip := net.ParseIP(r.IP)
+		if ip == nil {
+			continue // skip malformed records rather than aborting the load
+		}
+		if len(ab.addrs) >= AddressBookMaxSize {
+			break // honour the bound
+		}
+		na := NetAddress{
+			Services: r.Services,
+			IP:       ip.To16(),
+			Port:     r.Port,
+		}
+		key := addrKey(na)
+		if _, exists := ab.addrs[key]; exists {
+			continue
+		}
+		ab.addrs[key] = &KnownAddress{
+			Addr:        na,
+			Source:      r.Source,
+			LastAttempt: timeOrZero(r.LastAttempt),
+			LastSuccess: timeOrZero(r.LastSuccess),
+			Attempts:    r.Attempts,
+			LastSeen:    timeOrZero(r.LastSeen),
+		}
+		loaded++
+	}
+	return loaded
 }
