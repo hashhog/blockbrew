@@ -24,10 +24,18 @@ const (
 	RPCErrDeserialization        = -22    // Error parsing or validating structure in raw format
 	RPCErrVerify                 = -25    // Error during verification
 	RPCErrInWarmup               = -28    // Client still warming up
-	RPCErrClientNodeNotConnected = -29    // Node not found/connected
+	RPCErrClientNodeNotConnected = -29    // Node to disconnect not found in connected nodes
 	RPCErrClientP2PDisabled      = -9     // P2P networking is disabled
-	RPCErrWallet                 = -4     // Wallet error (general)
-	RPCErrMisc                   = -1     // Miscellaneous error
+
+	// P2P peer/ban-management error codes (Bitcoin Core protocol.h:60-63).
+	// These map operator addnode/setban bad-input cases to the exact Core
+	// JSON-RPC error codes so operator scripts can distinguish a duplicate
+	// add / stale remove / malformed IP from a generic parameter error.
+	RPCErrClientNodeAlreadyAdded  = -23 // Node is already added (addnode "add" dup)
+	RPCErrClientNodeNotAdded      = -24 // Node has not been added before (addnode "remove")
+	RPCErrClientInvalidIPOrSubnet = -30 // Invalid IP/Subnet (setban)
+	RPCErrWallet                  = -4  // Wallet error (general)
+	RPCErrMisc                    = -1  // Miscellaneous error
 
 	// Wallet encryption-state error codes (Bitcoin Core protocol.h).
 	RPCErrWalletUnlockNeeded        = -13 // Enter the wallet passphrase with walletpassphrase first
