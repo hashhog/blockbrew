@@ -353,18 +353,43 @@ func TestW128_G15_GetGroupNotInBucketHash(t *testing.T) {
 	t.Log("BUG-14 (P0-CDIV): GetGroup result is not threaded into any bucket-hash function; FIX-51 deferred is inert until BUG-2 fixed")
 }
 
-// G16 (BUG-15): peers.dat persistence.
-// AddressBook has no Save / Load / Serialize / Deserialize.
-func TestW128_G16_PeersDatPersistenceAbsent(t *testing.T) {
+// G16 (BUG-15) FIXED: address-book persistence PRESENT.
+// Bitcoin Core dumps its address manager to peers.dat on shutdown and reloads
+// it at startup (addrdb.cpp CAddrDB::Write/Read) so a restart resumes with its
+// learned peer set instead of cold-starting via DNS seeds (which a DNS attacker
+// could bias). blockbrew's live AddressBook now carries Save/Load, wired into
+// PeerManager.Stop()/NewPeerManager (peermgr.go savePeers/loadPeers). The
+// assertion is FLIPPED from "absent" to "present" (matching the G17 precedent).
+func TestW128_G16_PeersDatPersistencePresent(t *testing.T) {
 	ab := NewAddressBook()
 	mab := reflect.TypeOf(ab)
+	haveSave, haveLoad := false, false
 	for i := 0; i < mab.NumMethod(); i++ {
-		name := mab.Method(i).Name
-		if name == "Save" || name == "Load" || name == "Serialize" || name == "Deserialize" {
-			t.Errorf("BUG-15 FIXED? unexpected AddressBook method %s", name)
+		switch mab.Method(i).Name {
+		case "Save":
+			haveSave = true
+		case "Load":
+			haveLoad = true
 		}
 	}
-	t.Log("BUG-15 (P0): no peers.dat; every restart cold-starts via DNS seeds; DNS attacker can bias initial peer set")
+	if !haveSave || !haveLoad {
+		t.Errorf("BUG-15 REGRESSED: AddressBook persistence missing (Save=%v Load=%v)", haveSave, haveLoad)
+	}
+
+	// Behavioural proof: an address survives a Save -> fresh Load round-trip.
+	dir := t.TempDir()
+	na := NetAddress{IP: net.ParseIP("1.2.3.4"), Port: 8333}
+	ab.AddAddress(na, "test")
+	if err := ab.Save(dir); err != nil {
+		t.Fatalf("BUG-15: Save failed: %v", err)
+	}
+	restored := NewAddressBook()
+	if n := restored.Load(dir); n != 1 {
+		t.Fatalf("BUG-15: Load restored %d addresses, want 1", n)
+	}
+	if restored.GetAddress(addrKey(NetAddress{IP: na.IP.To16(), Port: na.Port})) == nil {
+		t.Error("BUG-15: address not restored after peers.json round-trip")
+	}
 }
 
 // G17 (BUG-16) FIXED: addr_token_bucket per-peer rate limit PRESENT.

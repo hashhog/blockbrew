@@ -1406,6 +1406,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		MaxInbound:  cfg.MaxInbound,
 		ListenAddr:  listenAddr,
 		UserAgent:   fmt.Sprintf("/blockbrew:%s/", version),
+		DataDir:     cfg.DataDir,
 		BestHeightFunc: func() int32 {
 			_, h := chainMgr.BestBlock()
 			return h
@@ -1640,6 +1641,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		MaxInbound:  cfg.MaxInbound,
 		ListenAddr:  listenAddr,
 		UserAgent:   fmt.Sprintf("/blockbrew:%s/", version),
+		DataDir:     cfg.DataDir,
 		BestHeightFunc: func() int32 {
 			_, h := chainMgr.BestBlock()
 			return h

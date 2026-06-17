@@ -444,6 +444,12 @@ func NewPeerManager(config PeerManagerConfig) *PeerManager {
 	// Load ban list from disk
 	pm.loadBanList()
 
+	// Restore the learned peer address set from a previous session so the node
+	// does not start cold (eclipse/bootstrap fragility) after every restart.
+	// Mirrors Bitcoin Core reading peers.dat into its address manager at init
+	// (CAddrDB::Read). No-op when DataDir is empty (e.g. ephemeral tests).
+	pm.loadPeers()
+
 	return pm
 }
 
@@ -484,6 +490,11 @@ func (pm *PeerManager) Stop() {
 	pm.quitOnce.Do(func() {
 		// Save block-relay-only peers as anchors before disconnecting
 		pm.saveAnchors()
+
+		// Persist the learned peer address set so the next start resumes with a
+		// warm address book instead of re-bootstrapping from DNS/fixed seeds.
+		// Mirrors Bitcoin Core dumping peers.dat on shutdown (CAddrDB::Write).
+		pm.savePeers()
 
 		close(pm.quit)
 
@@ -2473,5 +2484,33 @@ func (pm *PeerManager) loadAnchors() {
 			},
 		}
 		go pm.connectToPeerWithType(ka, ConnBlockRelayOnly)
+	}
+}
+
+// savePeers persists the learned AddressBook to <DataDir>/peers.json on
+// shutdown. No-op when DataDir is empty. Mirrors Core CAddrDB::Write; errors are
+// logged but never fatal (a node must always be able to shut down).
+func (pm *PeerManager) savePeers() {
+	if pm.config.DataDir == "" {
+		return
+	}
+	if err := pm.addrBook.Save(pm.config.DataDir); err != nil {
+		log.Printf("failed to save peer address book: %v", err)
+		return
+	}
+	log.Printf("saved %d peer address(es) to %s",
+		pm.addrBook.Size(), filepath.Join(pm.config.DataDir, AddressBookFilename))
+}
+
+// loadPeers restores the AddressBook from <DataDir>/peers.json at startup.
+// No-op when DataDir is empty; tolerant of a missing/corrupt file (cold start).
+// Mirrors Core CAddrDB::Read.
+func (pm *PeerManager) loadPeers() {
+	if pm.config.DataDir == "" {
+		return
+	}
+	if n := pm.addrBook.Load(pm.config.DataDir); n > 0 {
+		log.Printf("loaded %d peer address(es) from %s",
+			n, filepath.Join(pm.config.DataDir, AddressBookFilename))
 	}
 }
