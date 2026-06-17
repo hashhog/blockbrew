@@ -281,6 +281,53 @@ func TestW135_G17_WitnessUnknown_v2(t *testing.T) {
 	}
 }
 
+// G17 (WITNESS_UNKNOWN for version >= 1): a witness program with version 1 (or
+// any v1..v16) whose program size is NOT one of the canonical recognised types
+// (P2TR is v1+32; P2A is the v1 4-byte anchor) must classify as WITNESS_UNKNOWN
+// and therefore be STANDARD-to-create — NOT NONSTANDARD.
+//
+// Core Solver (script/solver.cpp:154-178): after P2WPKH/P2WSH (v0), P2TR
+// (v1+32) and P2A are ruled out, ANY remaining witness program with
+// `witnessversion != 0` returns TxoutType::WITNESS_UNKNOWN. Core does NOT
+// special-case OP_1 out of this branch, so a v1 16-byte program is
+// WITNESS_UNKNOWN (standard), exactly like a v2 program.
+//
+// This guards against the rustoshi-269681b failure mode, where the
+// witness-unknown branch hardcoded an OP_2..OP_16 (0x52..0x60) range, EXCLUDING
+// OP_1 (0x51) — which would wrongly drop a v1 non-32-byte program to
+// NONSTANDARD. blockbrew's isUnknownWitnessProgram already accepts the full
+// v1..v16 (0x51..0x60) range, so this passes; the test pins that behavior.
+//
+// NON-consensus: isStandardOutputScript is reached only from
+// checkStandardnessLocked → mempool acceptance (AddTransactionFrom /
+// validateTransactionLocked package-member), never from block/tx consensus.
+func TestW135_G17_WitnessUnknown_v1_NonTaprootSize(t *testing.T) {
+	// OP_1 (witness version 1) <16-byte program>. Not P2TR (which is v1+32),
+	// not P2A (v1 4-byte anchor) → must be WITNESS_UNKNOWN ⇒ STANDARD.
+	v1prog16 := append([]byte{0x51, 0x10}, bytes.Repeat([]byte{0x01}, 16)...)
+	if !isStandardOutputScript(v1prog16) {
+		t.Errorf("v1 16-byte witness program must be STANDARD via WITNESS_UNKNOWN "+
+			"(Core Solver solver.cpp:172-177 returns WITNESS_UNKNOWN for witnessversion != 0); "+
+			"got NONSTANDARD")
+	}
+
+	// Sanity controls that the v1+ acceptance is gated on being a *valid witness
+	// program shape*, not accept-everything.
+
+	// A 50-byte all-OP_1 (0x51) blob is NOT a witness program (push-length byte
+	// 0x51 = 81 > 40), so it must remain NONSTANDARD.
+	notWitProg := bytes.Repeat([]byte{0x51}, 50)
+	if isStandardOutputScript(notWitProg) {
+		t.Errorf("50-byte all-OP_1 blob is not a valid witness program; must be NONSTANDARD")
+	}
+
+	// P2TR (v1 + 32-byte) is still recognised as its own standard type.
+	p2tr := append([]byte{0x51, 0x20}, bytes.Repeat([]byte{0x03}, 32)...)
+	if !isStandardOutputScript(p2tr) {
+		t.Errorf("v1 32-byte program (P2TR) must be STANDARD")
+	}
+}
+
 // G17 / BUG-4: v0 witness program with size ∉ {20, 32} must be NONSTANDARD.
 // Core: solver.cpp:156-177 — v0 falls through to NONSTANDARD when size is
 // neither 20 (P2WPKH) nor 32 (P2WSH).
