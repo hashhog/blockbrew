@@ -245,6 +245,16 @@ type PeerManager struct {
 	// bootstrap IPs so they are never re-injected (Core net.cpp:2641 sets
 	// add_fixed_seeds=false after firing). Guarded by mu.
 	fixedSeedsAdded bool
+
+	// addedNodes is the addnode-managed list of persistent peer address
+	// strings, keyed by the exact node string the operator supplied.
+	// Mirrors Core's CConnman::m_added_node_params (src/net.cpp): membership
+	// is what addnode "add"/"remove" toggle, and the list's contents — not
+	// the live connection state — decide whether a duplicate add or a stale
+	// remove is an error. Distinct from addrBook (which also holds
+	// gossiped/seed addresses); only operator-pinned entries live here.
+	// Guarded by mu.
+	addedNodes []string
 }
 
 // UsingASMap returns true when an asmap was loaded at startup. Mirrors
@@ -898,6 +908,55 @@ func (pm *PeerManager) GetPeerInfo(addr string) *PeerInfo {
 // AddressBook returns the address book for external use.
 func (pm *PeerManager) AddressBook() *AddressBook {
 	return pm.addrBook
+}
+
+// AddAddedNode records a node string on the addnode-managed persistent-peer
+// list, the blockbrew equivalent of CConnman::AddNode (src/net.cpp:3740).
+//
+// Returns false — and makes NO change — when the node is already on the list,
+// exactly as Core does (net.cpp returns false on a string collision). The RPC
+// layer turns that false into RPC_CLIENT_NODE_ALREADY_ADDED (-23)
+// (net.cpp:362). Returns true when a fresh entry is recorded.
+func (pm *PeerManager) AddAddedNode(node string) bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for _, n := range pm.addedNodes {
+		if n == node {
+			return false
+		}
+	}
+	pm.addedNodes = append(pm.addedNodes, node)
+	return true
+}
+
+// RemoveAddedNode removes a node string from the addnode-managed list, the
+// blockbrew equivalent of CConnman::RemoveAddedNode (src/net.cpp:3754).
+//
+// Returns false when the node was never added (Core returns false after
+// scanning the whole list), which the RPC layer turns into
+// RPC_CLIENT_NODE_NOT_ADDED (-24) (net.cpp:368). Returns true when an entry
+// was found and erased.
+func (pm *PeerManager) RemoveAddedNode(node string) bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for i, n := range pm.addedNodes {
+		if n == node {
+			pm.addedNodes = append(pm.addedNodes[:i], pm.addedNodes[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+// AddedNodes returns a snapshot of the current addnode-managed node strings
+// (for getaddednodeinfo and tests). Mirrors reading
+// CConnman::m_added_node_params.
+func (pm *PeerManager) AddedNodes() []string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	out := make([]string, len(pm.addedNodes))
+	copy(out, pm.addedNodes)
+	return out
 }
 
 // ConnectManualPeer adds an address to the address book and immediately

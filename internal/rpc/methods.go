@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -1327,12 +1328,12 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 	}
 
 	return &MempoolInfo{
-		Loaded:             true,
-		Size:               s.mempool.Count(),
-		Bytes:              s.mempool.TotalSize(),
-		Usage:              s.mempool.TotalSize(), // Simplified: actual usage would include overhead
-		TotalFee:           totalFee,
-		MaxMempool:         300_000_000, // 300 MB default
+		Loaded:     true,
+		Size:       s.mempool.Count(),
+		Bytes:      s.mempool.TotalSize(),
+		Usage:      s.mempool.TotalSize(), // Simplified: actual usage would include overhead
+		TotalFee:   totalFee,
+		MaxMempool: 300_000_000, // 300 MB default
 		// Fee fields READ the live mempool policy so display == policy (no
 		// hardcoded drift). Mirrors Core rpc/mempool.cpp:1054-1056:
 		//   mempoolminfee  = max(rolling-eviction floor, minrelaytxfee)
@@ -1344,14 +1345,14 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		MempoolMinFee:       float64(s.mempool.GetMinFeeRate()) / satoshiPerBitcoin,
 		MinRelayTxFee:       float64(s.mempool.MinRelayFeeRateKvB()) / satoshiPerBitcoin,
 		IncrementalRelayFee: float64(s.mempool.IncrementalRelayFeeKvB()) / satoshiPerBitcoin,
-		UnbroadcastCount:   0,
+		UnbroadcastCount:    0,
 		// FullRBF reflects the actual `-mempoolfullrbf` policy in force at
 		// runtime, not a hardcoded constant (W120 BUG-5 / FIX-68). Core's
 		// `getmempoolinfo` field is marked DEPRECATED at
 		// `bitcoin-core/src/rpc/mempool.cpp:1085` and is always emitted as
 		// true; blockbrew honours the operator's switch so legacy
 		// `-mempoolfullrbf=0` deployments don't get a lying advertisement.
-		FullRBF:            s.mempool.FullRBF(),
+		FullRBF: s.mempool.FullRBF(),
 		// Core v31.99 static/policy fields (rpc/mempool.cpp:1059-1063). These are
 		// the Core regtest defaults: permit_bare_multisig on, max OP_RETURN
 		// datacarrier 100000 bytes, cluster-count/size limits 64 / 101000 vB, and
@@ -1647,6 +1648,20 @@ func (s *Server) handleListBanned() (interface{}, *RPCError) {
 	return result, nil
 }
 
+// validIPOrSubnet reports whether s parses as a bare IP address or a CIDR
+// IP/subnet, mirroring Bitcoin Core's setban validity gate (rpc/net.cpp):
+// a string containing '/' is treated as a subnet (LookupSubNet → CSubNet,
+// must be valid); otherwise it is a host that must resolve to a valid
+// CNetAddr (LookupHost). Anything that satisfies neither is rejected with
+// RPC_CLIENT_INVALID_IP_OR_SUBNET (-30).
+func validIPOrSubnet(s string) bool {
+	if strings.Contains(s, "/") {
+		_, _, err := net.ParseCIDR(s)
+		return err == nil
+	}
+	return net.ParseIP(s) != nil
+}
+
 func (s *Server) handleSetBan(params json.RawMessage) (interface{}, *RPCError) {
 	// Parse parameters: [ip, command, bantime, absolute]
 	// command: "add" or "remove"
@@ -1673,6 +1688,17 @@ func (s *Server) handleSetBan(params json.RawMessage) (interface{}, *RPCError) {
 
 	if s.peerMgr == nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: "Peer manager not available"}
+	}
+
+	// Core validates the command before the IP/subnet, then rejects a
+	// malformed IP/subnet with RPC_CLIENT_INVALID_IP_OR_SUBNET (-30) before
+	// running either the add or remove branch (net.cpp: !isValid → throw
+	// JSONRPCError(RPC_CLIENT_INVALID_IP_OR_SUBNET, "Error: Invalid IP/Subnet")).
+	if command != "add" && command != "remove" {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid command (use 'add' or 'remove')"}
+	}
+	if !validIPOrSubnet(ip) {
+		return nil, &RPCError{Code: RPCErrClientInvalidIPOrSubnet, Message: "Error: Invalid IP/Subnet"}
 	}
 
 	switch command {
@@ -1752,10 +1778,34 @@ func (s *Server) handleAddNode(params json.RawMessage) (interface{}, *RPCError) 
 	}
 
 	switch command {
-	case "onetry", "add":
+	case "onetry":
+		// Core: "onetry" opens a one-off MANUAL connection and does NOT touch
+		// the added-node list (net.cpp:356). It must not raise -23/-24.
+		s.peerMgr.ConnectManualPeer(addr)
+	case "add":
+		// Core: addnode "add" raises RPC_CLIENT_NODE_ALREADY_ADDED (-23) when
+		// the node is already on the added-node list (net.cpp:359-363,
+		// CConnman::AddNode returns false). Record the string first; only
+		// initiate the manual connection on a fresh add.
+		if !s.peerMgr.AddAddedNode(addr) {
+			return nil, &RPCError{
+				Code:    RPCErrClientNodeAlreadyAdded,
+				Message: "Error: Node already added",
+			}
+		}
 		s.peerMgr.ConnectManualPeer(addr)
 	case "remove":
-		// Disconnect if connected
+		// Core: addnode "remove" raises RPC_CLIENT_NODE_NOT_ADDED (-24) when
+		// the node was never added (net.cpp:365-369, CConnman::RemoveAddedNode
+		// returns false).
+		if !s.peerMgr.RemoveAddedNode(addr) {
+			return nil, &RPCError{
+				Code:    RPCErrClientNodeNotAdded,
+				Message: "Error: Node could not be removed. It has not been added previously.",
+			}
+		}
+		// Disconnect if currently connected (best-effort, matches the prior
+		// observable success-path behaviour).
 		if peer := s.peerMgr.GetPeer(addr); peer != nil {
 			peer.Disconnect()
 		}
@@ -1881,15 +1931,15 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 	}
 
 	return &BlockTemplateResult{
-		Version:                  template.Block.Header.Version,
-		Rules:                    gbtRules,
-		Vbavailable:              gbtVbavailable,
-		Vbrequired:               0,
-		PreviousBlockHash:        template.Block.Header.PrevBlock.String(),
-		Transactions:             txs,
-		CoinbaseAux:              map[string]string{},
-		CoinbaseValue:            template.CoinbaseValue,
-		Target:                   targetHex,
+		Version:           template.Block.Header.Version,
+		Rules:             gbtRules,
+		Vbavailable:       gbtVbavailable,
+		Vbrequired:        0,
+		PreviousBlockHash: template.Block.Header.PrevBlock.String(),
+		Transactions:      txs,
+		CoinbaseAux:       map[string]string{},
+		CoinbaseValue:     template.CoinbaseValue,
+		Target:            targetHex,
 		// MinTime: GetMinimumTime(pindexPrev, diffAdjInterval) per Core rpc/mining.cpp:1004.
 		// = max(MTP+1, prevBlockTime−MAX_TIMEWARP) at retarget boundaries (BIP-94).
 		// Bug fixed: was template.Block.Header.Timestamp (current time, not consensus minimum).
@@ -2854,7 +2904,7 @@ func (s *Server) resolveRollbackTarget(v interface{}) (*consensus.BlockNode, *RP
 		// anything that isn't an integer in int32 range.
 		if t < 0 || t > float64(int32(0x7fffffff)) || t != float64(int32(t)) {
 			return nil, &RPCError{
-				Code: RPCErrInvalidParams,
+				Code:    RPCErrInvalidParams,
 				Message: fmt.Sprintf("Invalid rollback height %v", t),
 			}
 		}
