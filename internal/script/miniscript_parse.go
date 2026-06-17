@@ -745,12 +745,27 @@ func (p *policyParser) parsePolicy() (*MiniscriptNode, error) {
 		if err != nil {
 			return nil, err
 		}
+		// after(n): absolute-locktime value must satisfy 1 <= n < 2^31. n == 0
+		// is meaningless and n with bit 31 set is outside the expressible range,
+		// so Core rejects both (bitcoin-core/src/script/miniscript.h:2027:
+		// `*num < 1 || *num >= 0x80000000L`). Mirror the descriptor parser's
+		// bound here so the policy compiler can never emit a bit-31 timelock.
+		if n < 1 || n >= 0x80000000 {
+			return nil, ErrMiniscriptInvalidK
+		}
 		node = &MiniscriptNode{Fragment: FragAfter, K: uint32(n), Ctx: p.ctx}
 
 	case "older":
 		n, err := p.parseNumber()
 		if err != nil {
 			return nil, err
+		}
+		// older(n): relative-timelock value must satisfy 1 <= n < 2^31. n == 0
+		// is meaningless and bit 31 collides with the BIP-68 disable flag, so
+		// Core rejects both (bitcoin-core/src/script/miniscript.h:2034:
+		// `*num < 1 || *num >= 0x80000000L`).
+		if n < 1 || n >= 0x80000000 {
+			return nil, ErrMiniscriptInvalidK
 		}
 		node = &MiniscriptNode{Fragment: FragOlder, K: uint32(n), Ctx: p.ctx}
 

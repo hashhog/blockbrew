@@ -244,6 +244,52 @@ func TestParseMiniscript(t *testing.T) {
 	}
 }
 
+// TestMiniscriptTimelockBound verifies that older(n)/after(n) only accept
+// 1 <= n < 2^31, matching Bitcoin Core's miniscript parser
+// (bitcoin-core/src/script/miniscript.h:2027 after, :2034 older, both reject
+// `*num < 1 || *num >= 0x80000000L`). For older() bit 31 collides with the
+// BIP-68 disable flag; for after() it is outside the expressible range. Both
+// parser entry points must enforce the bound: the descriptor parser
+// (ParseMiniscript) and the policy compiler (CompilePolicy).
+func TestMiniscriptTimelockBound(t *testing.T) {
+	cases := []struct {
+		input   string
+		wantErr bool
+	}{
+		// In range — must parse.
+		{"older(1)", false},
+		{"after(1)", false},
+		{"older(144)", false},
+		{"after(500000)", false},
+		{"older(2147483647)", false}, // 2^31 - 1, max valid
+		{"after(2147483647)", false}, // 2^31 - 1, max valid
+		// Out of range — must reject.
+		{"older(0)", true},          // n == 0
+		{"after(0)", true},          // n == 0
+		{"older(2147483648)", true}, // 2^31, bit 31 set (BIP-68 disable flag)
+		{"after(2147483648)", true}, // 2^31, bit 31 set
+		{"older(4294967295)", true}, // max uint32
+		{"after(4294967295)", true}, // max uint32
+	}
+
+	for _, tc := range cases {
+		// Descriptor parser path.
+		t.Run("descriptor/"+tc.input, func(t *testing.T) {
+			_, err := ParseMiniscript(tc.input, P2WSH)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("ParseMiniscript(%q) err = %v, wantErr %v", tc.input, err, tc.wantErr)
+			}
+		})
+		// Policy compiler path (same older(n)/after(n) surface syntax).
+		t.Run("policy/"+tc.input, func(t *testing.T) {
+			_, err := CompilePolicy(tc.input, P2WSH)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("CompilePolicy(%q) err = %v, wantErr %v", tc.input, err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestMiniscriptToScript(t *testing.T) {
 	tests := []struct {
 		name   string
