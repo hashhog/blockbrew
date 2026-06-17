@@ -1433,23 +1433,98 @@ func (sm *SyncManager) StartBlockDownload() {
 		_, startHeight = sm.chainMgr.BestBlock()
 	}
 
-	// Build the block queue from headers
+	// Build the block queue from headers.
 	bestTip := sm.headerIndex.BestTip()
-	if bestTip == nil || bestTip.Height <= startHeight {
-		log.Printf("sync: no blocks to download, already at height %d (bestTip=%v)", startHeight, bestTip)
+	if bestTip == nil {
+		log.Printf("sync: no blocks to download, header index empty (startHeight=%d)", startHeight)
 		return
 	}
 
-	// Walk from tip back to startHeight to collect all block hashes,
-	// then reverse. This is O(n) instead of O(n^2) from repeated GetAncestor calls.
-	count := int(bestTip.Height - startHeight)
-	nodes := make([]*consensus.BlockNode, 0, count)
+	// GAP2 fix (Core FindNextBlocksToDownload, net_processing.cpp; ports the
+	// shipped rustoshi Unit-E E3 fork-aware download floor). We must collect
+	// EVERY block whose body we still need on the path from bestTip back to the
+	// fork point — NOT just the blocks strictly above the active validated tip.
+	//
+	// The old code floored the walk at startHeight (= chainMgr.BestBlock()),
+	// so for a heavier branch that forks BELOW the active tip (active tip H,
+	// fork point F < H, fork tip T > H by work) it collected only H+1..T and
+	// STOPPED at the sibling whose Height == H. The bridging fork bodies at
+	// F+1..H were never enqueued → never getdata-d → ConnectBlock never saw the
+	// fork tip → the (already P2P-reachable) ReorgTo trigger was starved. The
+	// SOLE disqualifier for blockbrew's reorg path.
+	//
+	// Core's rule (line 1506): a block on the walk is skipped iff we already
+	// HAVE its body (BLOCK_HAVE_DATA, here StatusDataStored) OR it is on the
+	// active chain (Contains — covers a pruned-but-active body). We descend by
+	// ancestry from bestTip and stop at the deepest ancestor that satisfies that
+	// predicate — the common ancestor / fork point. With NO active-tip height
+	// floor on the walk.
+	//
+	// Resolve the active validated tip BlockNode (chainMgr tip hash → index
+	// node) so we can test "on active chain" precisely. When it cannot be
+	// resolved (pre-init, or a stub connector with no real tip hash), fall back
+	// to the legacy startHeight floor so steady-state behaviour is unchanged.
+	var activeTip *consensus.BlockNode
+	if sm.chainMgr != nil {
+		if tipHash, _ := sm.chainMgr.BestBlock(); tipHash != (wire.Hash256{}) {
+			activeTip = sm.headerIndex.GetNode(tipHash)
+		}
+	}
+
+	// onActiveChain reports whether n is on the active validated chain (an
+	// ancestor of, or equal to, the active tip). Mirrors CChain::Contains.
+	onActiveChain := func(n *consensus.BlockNode) bool {
+		if activeTip != nil {
+			if n.Height > activeTip.Height {
+				return false
+			}
+			return activeTip.GetAncestor(n.Height) == n
+		}
+		// Legacy fallback (no resolvable active tip node): treat everything at
+		// or below the connected height as already-on-chain, exactly the old
+		// startHeight floor.
+		return n.Height <= startHeight
+	}
+
+	// needBody reports whether we still have to download n's block body: we do
+	// NOT have its data AND it is not already on the active chain. The descent
+	// stops at the first ancestor for which this is false — the fork point.
+	needBody := func(n *consensus.BlockNode) bool {
+		if n.Status&consensus.StatusDataStored != 0 {
+			return false
+		}
+		return !onActiveChain(n)
+	}
+
+	// If bestTip itself is already covered, there is nothing to fetch. This
+	// replaces the old `bestTip.Height <= startHeight` early-return: it does NOT
+	// bail when bestTip has MORE WORK than the active tip but is not strictly
+	// taller (a below-tip heavier fork), because needBody(bestTip) is true there.
+	if !needBody(bestTip) {
+		log.Printf("sync: no blocks to download, best tip already have-data/on-chain at height %d (startHeight=%d)",
+			bestTip.Height, startHeight)
+		return
+	}
+
+	// Walk from bestTip back to the fork point collecting the blocks we need,
+	// then reverse to ascending order. O(n) parent walk (no repeated
+	// GetAncestor). Cap the descent depth defensively so a pathologically deep
+	// or malformed fork cannot enqueue an unbounded set — a reorg deeper than
+	// MaxReorgDepth would be refused by ReorgTo anyway. We never floor on the
+	// active tip height; the floor is purely the have-data / on-chain fork
+	// point (Core BLOCK_HAVE_DATA), bounded by MaxReorgDepth.
+	nodes := make([]*consensus.BlockNode, 0, 64)
 	node := bestTip
-	for node != nil && node.Height > startHeight {
+	for node != nil && needBody(node) {
 		nodes = append(nodes, node)
+		if len(nodes) >= consensus.MaxReorgDepth {
+			log.Printf("sync: block-download descent hit MaxReorgDepth=%d at height %d without reaching the fork point; "+
+				"capping (a deeper reorg would be refused by ReorgTo)", consensus.MaxReorgDepth, node.Height)
+			break
+		}
 		node = node.Parent
 	}
-	// Reverse to get ascending order
+	// Reverse to get ascending order.
 	for i, j := 0, len(nodes)-1; i < j; i, j = i+1, j-1 {
 		nodes[i], nodes[j] = nodes[j], nodes[i]
 	}
@@ -1467,10 +1542,19 @@ func (sm *SyncManager) StartBlockDownload() {
 		})
 	}
 
-	sm.nextHeight = startHeight + 1
+	// nextHeight is the height of the first block we will connect. For a normal
+	// extension this is startHeight+1; for a below-tip fork it is the first
+	// height above the fork point (which may be <= startHeight). Derive it from
+	// the lowest node we actually enqueued rather than assuming startHeight+1,
+	// so the connect/stall loop targets the right height on the fork.
+	if len(nodes) > 0 {
+		sm.nextHeight = nodes[0].Height
+	} else {
+		sm.nextHeight = startHeight + 1
+	}
 
-	log.Printf("sync: starting block download from height %d to %d (%d blocks)",
-		startHeight+1, bestTip.Height, len(sm.blockQueue))
+	log.Printf("sync: starting block download from height %d to %d (%d blocks, startHeight=%d)",
+		sm.nextHeight, bestTip.Height, len(sm.blockQueue), startHeight)
 
 	// Start requesting blocks
 	go sm.blockDownloadLoop()
