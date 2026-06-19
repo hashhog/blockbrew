@@ -1413,6 +1413,126 @@ func (cm *ChainManager) flushUTXOs() {
 	}
 }
 
+// RecoverFromPersistedBlocks replays block bodies that were durably written to
+// the block store + height index but sit AHEAD of the flushed chain-state tip.
+//
+// During IBD the block body + undo + height->hash map are written every block
+// (NoSync batch — survives a SIGKILL/OOM via the OS page cache), but the
+// chain-state tip pointer + UTXO flush only fire on the flushInterval cadence
+// (writeChainState = !isIBD || shouldFlush), because the tip pointer must never
+// lead the persisted UTXO on disk (the tip-ahead-of-UTXO corruption invariant —
+// see ConnectBlock lines ~1110-1131). An unclean crash between flushes therefore
+// boots to the last flush even though every block up to the crash height is on
+// disk; without this replay the node re-downloads that gap (up to flushInterval
+// blocks) from peers — or, when the last flush was genesis, boots all the way to
+// height 0 (the "comes up at 0 despite an intact datadir" failure the W16/W17
+// hydration work only partially closed: HydrateFromDB walks BACKWARD from the
+// flushed tip, so it never reaches blocks persisted ahead of it).
+//
+// This walks the height index FORWARD from the current (flushed) tip, rebuilds
+// the missing header-index nodes from the persisted bodies, and re-connects each
+// block through the normal ConnectBlock path (full re-validation; UTXO applied
+// in memory). It then flushes the UTXO and advances the on-disk chain-state
+// pointer so the recovered tip is durable. Mirrors Bitcoin Core, which on
+// startup rolls the chainstate forward over block files from the last flushed
+// best-block (validation.cpp LoadChainTip / RollforwardBlock).
+//
+// SAFE on every boot: on a fresh datadir or a clean shutdown the next height is
+// absent from the index, so the loop is a no-op (0 replayed). It only ever
+// replays blocks already on disk and already validated once, in order, stopping
+// at the first gap/unreadable body/validation error (then the node falls back to
+// normal P2P sync for the remainder). Must be called once at startup BEFORE the
+// P2P/sync layer starts and before the per-block index callbacks are wired (the
+// secondary indexes catch up to the recovered tip via their own startup sync).
+func (cm *ChainManager) RecoverFromPersistedBlocks() (int, error) {
+	if cm.chainDB == nil {
+		return 0, nil
+	}
+
+	// Phase 1 — rebuild the header index from the durable height->hash map + block
+	// bodies, for blocks the backward HydrateFromDB walk couldn't reach. The
+	// header index is hydrated by walking the SEPARATE header store
+	// (MakeBlockHeaderKey), which is written by P2P header sync — NOT by
+	// ConnectBlock. So blocks accepted via submitblock/mining (or after a header-
+	// store loss) leave no header-store entry, and HydrateFromDB stops short even
+	// though the body + height map are durable. Rebuild from the bodies (AddHeader
+	// only — no UTXO mutation), in ascending height so each connects to its parent.
+	rebuilt := 0
+	for {
+		next := cm.headerIndex.BestHeight() + 1
+		hash, err := cm.chainDB.GetBlockHashByHeight(next)
+		if err != nil {
+			break // no persisted block at this height
+		}
+		if cm.headerIndex.GetNode(hash) != nil {
+			break // already present but BestHeight didn't advance — avoid a loop
+		}
+		block, err := cm.chainDB.GetBlock(hash)
+		if err != nil || block == nil {
+			break
+		}
+		if _, err := cm.headerIndex.AddHeader(block.Header, true); err != nil {
+			log.Printf("chainmgr: recovery: AddHeader at height %d failed (%v); stopping header rebuild", next, err)
+			break
+		}
+		rebuilt++
+	}
+
+	// Phase 2 — now that the header index reaches the persisted chainstate tip,
+	// re-resolve the in-memory tip from the (UTXO-consistent) saved chain state.
+	// ReloadChainState's happy path adopts the saved tip once its node is present.
+	if rebuilt > 0 && cm.tipHeight == 0 {
+		cm.ReloadChainState()
+	}
+
+	// Phase 3 — replay any block bodies AHEAD of the flushed chainstate tip (the
+	// genuine IBD unflushed-gap case: during IBD the body + height map are written
+	// every block but the chainstate pointer + UTXO flush only on the ~2000-block
+	// cadence). Re-applies their UTXO via the normal ConnectBlock path. No-op in
+	// the at-tip/submitblock case where the chainstate already covers the bodies.
+	replayed := 0
+	for {
+		_, height := cm.BestBlock()
+		next := height + 1
+		hash, err := cm.chainDB.GetBlockHashByHeight(next)
+		if err != nil {
+			break
+		}
+		block, err := cm.chainDB.GetBlock(hash)
+		if err != nil || block == nil {
+			break
+		}
+		if cm.headerIndex.GetNode(hash) == nil {
+			if _, err := cm.headerIndex.AddHeader(block.Header, true); err != nil {
+				log.Printf("chainmgr: recovery: AddHeader (replay) at height %d failed (%v); stopping", next, err)
+				break
+			}
+		}
+		if err := cm.ConnectBlock(block); err != nil {
+			log.Printf("chainmgr: recovery: ConnectBlock at height %d failed (%v); stopping replay", next, err)
+			break
+		}
+		replayed++
+	}
+	if replayed > 0 {
+		// Make the replayed tip durable: flush the UTXO FIRST, then advance the
+		// on-disk chainstate pointer, so a crash mid-recovery never leaves the tip
+		// pointing past coins that are only in memory (the ConnectBlock invariant).
+		cm.flushUTXOs()
+		hash, height := cm.BestBlock()
+		if err := cm.chainDB.SetChainState(&storage.ChainState{BestHash: hash, BestHeight: height}); err != nil {
+			log.Printf("chainmgr: recovery: SetChainState after replay failed: %v", err)
+		}
+	}
+
+	if rebuilt > 0 || replayed > 0 {
+		_, height := cm.BestBlock()
+		log.Printf("chainmgr: crash recovery: rebuilt %d header(s) + replayed %d block(s) from disk; tip now at height %d",
+			rebuilt, replayed, height)
+	}
+	return rebuilt + replayed, nil
+}
+
 // collectPrevTimestamps collects timestamps from the previous N blocks.
 func (cm *ChainManager) collectPrevTimestamps(node *BlockNode, count int) []uint32 {
 	timestamps := make([]uint32, 0, count)
