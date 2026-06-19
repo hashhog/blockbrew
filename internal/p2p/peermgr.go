@@ -1271,6 +1271,13 @@ func (pm *PeerManager) connectionHandler() {
 	banCleanupTicker := time.NewTicker(1 * time.Hour)
 	defer banCleanupTicker.Stop()
 
+	// Periodic address-book flush. Core's CConnman::Start() schedules
+	// DumpAddresses() every DUMP_PEERS_INTERVAL (15 min, addrdb.h) so the
+	// learned addrman survives an unclean crash — without it, savePeers()
+	// only runs on a clean shutdown and a kill -9 loses the whole book.
+	peersDumpTicker := time.NewTicker(15 * time.Minute)
+	defer peersDumpTicker.Stop()
+
 	// Fixed-seed fallback ticker. Core re-checks the trigger on every 500ms
 	// loop tick (net.cpp:2594); we poll every 5s, which is far finer than the
 	// 60s grace window and ensures the seeds are injected promptly once DNS is
@@ -1377,6 +1384,11 @@ func (pm *PeerManager) connectionHandler() {
 
 		case <-banCleanupTicker.C:
 			pm.cleanupBans()
+
+		case <-peersDumpTicker.C:
+			// Periodically flush the learned address book to disk so it
+			// survives an unclean crash (Core DumpAddresses, 15 min).
+			pm.savePeers()
 
 		case <-asmapHealthC:
 			pm.ASMapHealthCheck()
