@@ -928,6 +928,19 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	})
 	log.Printf("Chain manager initialized (parallel scripts: %v)", cfg.ParallelScripts)
 
+	// Crash recovery: replay any block bodies that are durably on disk but ahead
+	// of the flushed chain-state tip (an unclean SIGKILL/OOM between the ~2000-
+	// block IBD flushes leaves the bodies + height index persisted but the tip
+	// pointer behind — the "boots to height 0 / re-downloads the gap" durability
+	// gap). Runs BEFORE the per-block index callbacks are wired (the secondary
+	// indexes catch up to the recovered tip via their own startup sync below) and
+	// BEFORE P2P starts. No-op on a fresh datadir or a clean shutdown.
+	if n, err := chainMgr.RecoverFromPersistedBlocks(); err != nil {
+		log.Printf("WARNING: crash-recovery replay error: %v", err)
+	} else if n > 0 {
+		log.Printf("Crash recovery: replayed %d unflushed block(s) from disk", n)
+	}
+
 	// Forward-declared so the chain → wallet connect/disconnect hooks
 	// (installed below, before section 10a) can close over the multi-wallet
 	// manager by reference. It is constructed later at section 10a; until then
