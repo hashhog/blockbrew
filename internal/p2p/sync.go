@@ -479,6 +479,20 @@ func (sm *SyncManager) startHeaderSync() {
 		return
 	}
 
+	// Don't (re)start header sync while a PRESYNC/REDOWNLOAD pipeline is already
+	// active. A periodic sync-ticker / retry call mid-pipeline would otherwise
+	// delete the live HeadersSyncState (below, line ~503) and start a fresh
+	// presync rooted at the current — and, with the addPipelineHeaders fix,
+	// advancing — header-index tip, whose getheaders reply collides with the
+	// in-flight redownload stream → false "non-continuous" abort + self-
+	// disconnect (the genesis-IBD wedge). The active pipeline drives itself to
+	// completion via HandleHeaders/NextLocator. Legitimate restarts (initial
+	// sync, or after a pipeline failure) reach here with peerHeadersSync already
+	// empty (the failure path deletes it first), so they are not blocked.
+	if len(sm.peerHeadersSync) > 0 {
+		return
+	}
+
 	// Select best peer
 	syncPeer := sm.selectSyncPeer()
 	if syncPeer == nil {
@@ -639,7 +653,9 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 		}
 
 		if result.RequestMore {
-			// Still in PRESYNC or REDOWNLOAD — ask for the next batch.
+			// Still in PRESYNC or REDOWNLOAD — ask for the next batch. This is
+			// the ONLY getheaders allowed to this peer while the pipeline is
+			// active (Core MaybeSendGetHeaders inside the headerssync path).
 			locator := hss.NextLocator(func(height int32) wire.Hash256 {
 				n := sm.headerIndex.BestTip().GetAncestor(height)
 				if n == nil {
@@ -651,6 +667,20 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 				locator = sm.headerIndex.BestTip().BuildLocator()
 			}
 			sm.sendGetHeaders(peer, locator)
+
+			// Core parity (net_processing.cpp:2751 `headers.swap(result.
+			// pow_validated_headers)`): during REDOWNLOAD the state machine drains
+			// its validated-lookahead buffer on EVERY batch, not just the final
+			// one. Promote those to the header index now (index-only — the pipeline
+			// still owns the next getheaders via NextLocator above). The previous
+			// early return DROPPED result.POWValidatedHeaders, so the index stayed
+			// stuck at genesis through the entire redownload; only the final batch
+			// tried to promote, its parent (height base-of-buffer) was never added
+			// → ErrOrphanHeader → a spurious tip-rooted re-sync that wedged the IBD
+			// at h102000. See _ibd-from-genesis-campaign finding #1.
+			if len(result.POWValidatedHeaders) > 0 {
+				sm.addPipelineHeaders(result.POWValidatedHeaders)
+			}
 			return
 		}
 
@@ -669,6 +699,57 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	// Normal path (chain already above nMinimumChainWork)
 	// -----------------------------------------------------------------------
 	sm.addValidatedHeaders(peer, msg.Headers)
+}
+
+// addPipelineHeaders adds PRESYNC/REDOWNLOAD-promoted headers to the header
+// index ONLY. Unlike addValidatedHeaders it performs NO out-of-band side effects:
+// no orphan getheaders re-request, no full-batch getheaders, no block-download
+// kickoff, no headersSynced flip, no chain-recovery hook. The HeadersSyncState is
+// still active and owns the next request via NextLocator (Core gates the
+// "fetch more" getheaders on !have_headers_sync, net_processing.cpp:3104). The
+// redownload set is pre-validated and strictly in order, so an AddHeader error
+// here is unexpected — log and stop, but DO NOT send a getheaders (that ad-hoc
+// re-request, rooted at a stale tip, is exactly the collision class that wedged
+// the genesis IBD). Caller must hold sm.mu.
+func (sm *SyncManager) addPipelineHeaders(headers []wire.BlockHeader) {
+	startHeight := sm.headerIndex.BestHeight()
+	added := 0
+	var pending []storage.HeaderBatchEntry
+	if sm.chainDB != nil {
+		pending = make([]storage.HeaderBatchEntry, 0, len(headers))
+	}
+	for i := range headers {
+		node, err := sm.headerIndex.AddHeader(headers[i], true)
+		if err != nil {
+			if err == consensus.ErrDuplicateHeader {
+				continue
+			}
+			// Pre-validated, in-order redownload headers should always connect;
+			// an error means a real pipeline bug. Flush what we have and stop —
+			// no getheaders, no disconnect (the pipeline retries/aborts itself).
+			if sm.chainDB != nil && len(pending) > 0 {
+				if ferr := sm.chainDB.StoreBlockHeadersBatch(pending); ferr != nil {
+					log.Printf("headerssync: failed to flush %d pipeline headers: %v", len(pending), ferr)
+				}
+				pending = pending[:0]
+			}
+			log.Printf("headerssync: unexpected error promoting redownload header at height %d: %v",
+				sm.headerIndex.BestHeight()+1, err)
+			break
+		}
+		added++
+		if sm.chainDB != nil {
+			pending = append(pending, storage.HeaderBatchEntry{Hash: node.Hash, Header: &headers[i]})
+		}
+	}
+	if sm.chainDB != nil && len(pending) > 0 {
+		if err := sm.chainDB.StoreBlockHeadersBatch(pending); err != nil {
+			log.Printf("headerssync: failed to batch-store %d pipeline headers: %v", len(pending), err)
+		}
+	}
+	if added > 0 {
+		log.Printf("sync: added %d headers (%d -> %d)", added, startHeight, sm.headerIndex.BestHeight())
+	}
 }
 
 // addValidatedHeaders inserts a batch of headers (already PoW-vetted) into the
@@ -744,6 +825,17 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 				// FindForkInGlobalIndex behavior).
 				log.Printf("sync: orphan header from %s (unconnecting #%d/%d), re-requesting headers",
 					addr, count, MaxNumUnconnectingHeadersMsgs)
+				// Do NOT send a tip-rooted getheaders while a headerssync pipeline
+				// is active for any peer: it would re-enter the live HeadersSyncState
+				// out of order and trip the continuity check (false "non-continuous"
+				// abort). The pipeline owns header requests via NextLocator. Core
+				// gates unconnecting-header handling on !have_headers_sync. (With the
+				// addPipelineHeaders fix the redownload index now climbs in order, so
+				// this orphan should no longer fire mid-pipeline; this is the general
+				// class guard.)
+				if len(sm.peerHeadersSync) > 0 {
+					return
+				}
 				locator := sm.headerIndex.BestTip().BuildLocator()
 				sm.sendGetHeaders(peer, locator)
 				return
@@ -1144,6 +1236,15 @@ func (sm *SyncManager) HandleInv(peer *Peer, msg *MsgInv) {
 func (sm *SyncManager) sendPeriodicGetHeaders() {
 	sm.mu.RLock()
 	pm := sm.peerMgr
+	// Do NOT broadcast a tip-rooted getheaders while a headerssync pipeline is
+	// active for any peer — the reply would re-enter that peer's live
+	// HeadersSyncState out of order (false "non-continuous" abort). The pipeline
+	// owns header requests via NextLocator. Core's periodic header fetch in
+	// SendMessages is likewise gated off while presync is active.
+	if len(sm.peerHeadersSync) > 0 {
+		sm.mu.RUnlock()
+		return
+	}
 	// Build the locator once from the best header tip so we ask for everything
 	// above our highest known header (not just above the connected chain tip).
 	var locator []wire.Hash256
@@ -1209,6 +1310,27 @@ func (sm *SyncManager) checkStaleTip() {
 	sm.mu.Unlock()
 
 	if !sm.tipMayBeStale() {
+		return
+	}
+
+	// Do NOT re-issue a tip-rooted getheaders while a PRESYNC/REDOWNLOAD
+	// headerssync pipeline is active. During a from-genesis IBD, presync
+	// deliberately does not store low-work headers, so headerIndex.BestTip()
+	// stays frozen (e.g. at 450000) and lastTipUpdate (advanced only on block
+	// connect) never moves during the headers phase — so this stale-tip path
+	// fires ~StaleTipThreshold (30min) in and sends a getheaders rooted at the
+	// FROZEN tip to the active sync peer. That reply re-enters the live
+	// HeadersSyncState whose lastHeaderReceived has already advanced, tripping
+	// the continuity check → false "non-continuous at height=N (presync)" abort
+	// and a self-inflicted disconnect (the genesis-IBD wedge at h452000).
+	// Bitcoin Core's CheckForStaleTipAndEvictPeers never sends getheaders for
+	// exactly this reason (net_processing.cpp:5372 only SetTryNewOutboundPeer);
+	// legitimate presync next-batch requests flow through HeadersSyncState via
+	// NextLocator in HandleHeaders. Skip while any pipeline is active.
+	sm.mu.RLock()
+	presyncActive := len(sm.peerHeadersSync) > 0
+	sm.mu.RUnlock()
+	if presyncActive {
 		return
 	}
 
