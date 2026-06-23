@@ -339,20 +339,25 @@ func (u *UTXOSet) flushLocked() error {
 	u.flushes++
 	u.blocksSinceFlush = 0
 
-	// Evict clean cache entries to bring memory under the limit.
-	// After flushing, all cache entries are clean (persisted to disk)
-	// and can be safely evicted — they'll be re-read from PebbleDB
-	// on the next GetUTXO call.
-	if u.cacheBytes > u.maxCacheBytes/2 {
+	// Post-flush the entire cache is clean (persisted to disk), so it is SAFE
+	// to keep serving every entry from memory until we actually exceed the
+	// operator's configured budget. Mirror Bitcoin Core: CCoinsViewCache is
+	// flushed to disk but NOT shrunk to a fraction of m_coinstip_cache_size_bytes
+	// (coins.cpp Flush/Sync). Only evict when strictly OVER budget, and only
+	// down TO the budget — never to a quarter of it. This keeps the warm working
+	// set the operator paid for via -dbcache resident, cutting cold Pebble
+	// re-reads on the IBD connect path. (Read-path only; results unchanged —
+	// eviction drops only clean, already-flushed entries.)
+	if u.cacheBytes > u.maxCacheBytes {
 		// Rebuild the cache map with only entries we want to keep.
 		// Go maps never shrink their hash table on delete(), so we must
 		// allocate a new map to actually free memory.
-		target := u.maxCacheBytes / 4
-		newCache := make(map[wire.OutPoint]*UTXOEntry, len(u.cache)/2)
+		target := u.maxCacheBytes
+		newCache := make(map[wire.OutPoint]*UTXOEntry, len(u.cache))
 		var newBytes int64
 		for op, entry := range u.cache {
 			if newBytes >= target {
-				continue // Skip — already at target
+				continue // At budget — drop the remainder
 			}
 			newCache[op] = entry
 			newBytes += estimateEntrySize(entry)
@@ -478,12 +483,15 @@ func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 	u.flushes++
 	u.blocksSinceFlush = 0
 
-	// Evict clean cache entries to bring memory under the limit,
-	// same as Flush(). After the caller writes the batch, all entries
-	// are persisted and can be safely re-read from disk.
-	if u.cacheBytes > u.maxCacheBytes/2 {
-		target := u.maxCacheBytes / 4
-		newCache := make(map[wire.OutPoint]*UTXOEntry, len(u.cache)/2)
+	// Evict clean cache entries to bring memory under the limit, same as
+	// Flush(). After the caller writes the batch, all entries are persisted
+	// and can be safely re-read from disk. Keep the warm working set resident
+	// up to the configured -dbcache budget (Core CCoinsViewCache parity); only
+	// evict when strictly OVER budget and only down TO it — not to a quarter.
+	// Kept byte-for-byte in sync with flushLocked's eviction block.
+	if u.cacheBytes > u.maxCacheBytes {
+		target := u.maxCacheBytes
+		newCache := make(map[wire.OutPoint]*UTXOEntry, len(u.cache))
 		var newBytes int64
 		for op, entry := range u.cache {
 			if newBytes >= target {
