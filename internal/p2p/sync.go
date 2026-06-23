@@ -1557,8 +1557,58 @@ func (sm *SyncManager) StartBlockDownload() {
 		if evicted > 0 {
 			log.Printf("sync: StartBlockDownload evicted %d stale slots owned by dead peers", evicted)
 		}
-		log.Printf("sync: StartBlockDownload called but block queue already populated")
-		return
+
+		// #30 fix: rebuild a STALE queue instead of pinning it forever. The queue
+		// is built once from chainMgr.BestBlock() as the walk floor; on a
+		// -load-snapshot boot that floor is a stale genesis (the snapshot base
+		// header is not yet in the index, so BestBlock()==genesis), so the walk
+		// floors at genesis and enqueues heights 1.. that the snapshot UTXO set
+		// already covers. Once ReloadChainState adopts the real tip the queue is
+		// stale, but the old unconditional "return" pinned it forever (nextH=1).
+		//
+		// Detect staleness by ANCESTRY, not height: rebuild iff the LOWEST queued
+		// block is now ON the active validated chain (an ancestor of the validated
+		// tip = already covered). This is exactly the snapshot case (floor=block1,
+		// an ancestor of validated tip 944183). It is deliberately FALSE for a
+		// below-tip heavier fork: that queue's floor (F+1) is on the FORK, NOT an
+		// ancestor of the active tip H, so onActiveChain is false and the GAP2
+		// fork-aware queue is left fully intact (reorg-drop invariant preserved —
+		// see TestConnectPendingBlocks_BelowTipHeavierForkReorgs).
+		stale := false
+		var floorH int32
+		if sm.chainMgr != nil && sm.headerIndex != nil && len(sm.blockQueue) > 0 {
+			floor := sm.blockQueue[0]
+			for _, req := range sm.blockQueue {
+				if req.Height < floor.Height {
+					floor = req
+				}
+			}
+			floorH = floor.Height
+			if tipHash, _ := sm.chainMgr.BestBlock(); tipHash != (wire.Hash256{}) {
+				if at := sm.headerIndex.GetNode(tipHash); at != nil {
+					if fn := sm.headerIndex.GetNode(floor.Hash); fn != nil {
+						// CChain::Contains: fn is on the active chain iff it is at/
+						// below the validated tip AND the tip's ancestor at fn.Height
+						// is fn itself.
+						stale = fn.Height <= at.Height && at.GetAncestor(fn.Height) == fn
+					}
+				}
+			}
+		}
+		if stale {
+			log.Printf("sync: StartBlockDownload rebuilding stale queue (floor height %d now on the active validated chain — rebuilding from the real tip)", floorH)
+			// Drop the stale queue + its in-flight bookkeeping and fall through to a
+			// fresh fork-aware build below; the running blockDownloadLoop exits via
+			// its drain branch and this call relaunches one.
+			for _, req := range sm.blockQueue {
+				delete(sm.inflight, req.Hash)
+			}
+			sm.blockQueue = nil
+			// fall through to the build path
+		} else {
+			log.Printf("sync: StartBlockDownload called but block queue already populated (floor=%d)", floorH)
+			return
+		}
 	}
 
 	// Determine where to start downloading from
@@ -1647,8 +1697,27 @@ func (sm *SyncManager) StartBlockDownload() {
 	// MaxReorgDepth would be refused by ReorgTo anyway. We never floor on the
 	// active tip height; the floor is purely the have-data / on-chain fork
 	// point (Core BLOCK_HAVE_DATA), bounded by MaxReorgDepth.
+	// #30 fix: descend-from-bestTip + the MaxReorgDepth cap is correct for a REORG
+	// (a fork within MaxReorgDepth of the tip), but for a large IBD / forward-sync
+	// gap (bestTip far above the validated floor) it would collect the TOP
+	// MaxReorgDepth blocks near the header tip while sequential validation needs
+	// the BOTTOM (startHeight+1) next — wedging the connect loop (the snapshot &
+	// genesis fresh-sync stalls). When the gap exceeds MaxReorgDepth, start the
+	// descent from a capped height just above the floor so we collect the bottom
+	// window (startHeight+1 ..) in ascending order; the drain-rebuild advances the
+	// window each time it empties. This does NOT change reorg behaviour: a legit
+	// below-tip fork has bestTip within MaxReorgDepth of the active tip (deeper
+	// reorgs are refused by ReorgTo), so the gap is <= MaxReorgDepth and
+	// descendFrom stays bestTip — the fork-aware descent below the active tip is
+	// untouched (GAP2 reorg-drop invariant preserved).
+	descendFrom := bestTip
+	if bestTip.Height-startHeight > consensus.MaxReorgDepth {
+		if capped := bestTip.GetAncestor(startHeight + consensus.MaxReorgDepth); capped != nil {
+			descendFrom = capped
+		}
+	}
 	nodes := make([]*consensus.BlockNode, 0, 64)
-	node := bestTip
+	node := descendFrom
 	for node != nil && needBody(node) {
 		nodes = append(nodes, node)
 		if len(nodes) >= consensus.MaxReorgDepth {
