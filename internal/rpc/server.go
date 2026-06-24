@@ -650,6 +650,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetAddrmanInfo(params)
 	case "getmemoryinfo":
 		return s.handleGetMemoryInfo(params)
+	case "getaddednodeinfo":
+		return s.handleGetAddedNodeInfo(params)
 	case "addpeeraddress":
 		return s.handleAddPeerAddress(params)
 
