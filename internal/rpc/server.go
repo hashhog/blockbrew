@@ -64,6 +64,12 @@ type Server struct {
 	dataDir      string          // Filesystem root for mempool.dat etc.
 	httpServer   *http.Server
 
+	// debugLog is the live per-category debug-logging controller backing the
+	// `logging` RPC. nil when the daemon did not inject one (the handler then
+	// raises the Core-faithful P2P/internal-unavailable error rather than
+	// silently succeeding). Injected via WithDebugLogController.
+	debugLog DebugLogController
+
 	cookiePassword string // hex-encoded cookie secret (empty if unused)
 
 	// blockFetchPeers is the test seam for getblockfrompeer. In production
@@ -227,6 +233,16 @@ func WithCookiePassword(password string) ServerOption {
 func WithDataDir(dir string) ServerOption {
 	return func(s *Server) {
 		s.dataDir = dir
+	}
+}
+
+// WithDebugLogController injects the node's live per-category debug-logging
+// state, backing the `logging` RPC. The controller mutates the SAME in-memory
+// mask the logger consults on every record, so toggles take effect immediately
+// with no restart (Core parity: rpc/node.cpp logging mutates m_categories).
+func WithDebugLogController(c DebugLogController) ServerOption {
+	return func(s *Server) {
+		s.debugLog = c
 	}
 }
 
@@ -654,6 +670,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetAddedNodeInfo(params)
 	case "ping":
 		return s.handlePing(params)
+	case "logging":
+		return s.handleLogging(params)
 	case "addpeeraddress":
 		return s.handleAddPeerAddress(params)
 
