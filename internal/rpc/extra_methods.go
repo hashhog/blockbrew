@@ -1024,6 +1024,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"== Control ==",
 		"getinfo",
 		"getmemoryinfo ( \"mode\" )",
+		"logging ( [\"include_category\",...] [\"exclude_category\",...] )",
 		"help ( \"command\" )",
 		"stop",
 		"uptime",

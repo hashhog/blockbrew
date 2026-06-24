@@ -1858,6 +1858,12 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// passed; RPC handlers gate on whether the requested index is
 		// registered. See section 6a above.
 		rpc.WithIndexManager(indexManager),
+		// Live debug-logging controller backing the `logging` RPC.
+		// globalDebug is the SAME mutex-guarded category mask
+		// IsDebugEnabled consults on every gated log site, so a toggle
+		// via this RPC takes effect immediately (no restart) — Core
+		// parity with mutating m_categories.
+		rpc.WithDebugLogController(globalDebug),
 	)
 
 	// 12. Start all services
