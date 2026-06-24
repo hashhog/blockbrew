@@ -928,6 +928,14 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	})
 	log.Printf("Chain manager initialized (parallel scripts: %v)", cfg.ParallelScripts)
 
+	// Wire the wait-family-RPC tip-change notifier (Core KernelNotifications
+	// blockTip / WaitTipChanged). Pulsed by chainMgr.updateTipCache on every
+	// tip advance (ConnectBlock IBD + post-IBD, submitblock/generate, and both
+	// halves of a reorg), it wakes any waitfornewblock / waitforblock /
+	// waitforblockheight RPC blocked on a tip change. The RPC server reaches it
+	// via chainMgr.TipNotifier(); set before the server starts serving.
+	chainMgr.SetTipNotifier(consensus.NewTipNotifier())
+
 	// Crash recovery: replay any block bodies that are durably on disk but ahead
 	// of the flushed chain-state tip (an unclean SIGKILL/OOM between the ~2000-
 	// block IBD flushes leaves the bodies + height index persisted but the tip
