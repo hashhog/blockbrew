@@ -1023,6 +1023,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"",
 		"== Control ==",
 		"getinfo",
+		"getmemoryinfo ( \"mode\" )",
 		"help ( \"command\" )",
 		"stop",
 		"uptime",
