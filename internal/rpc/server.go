@@ -646,6 +646,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleClearBanned()
 	case "getnodeaddresses":
 		return s.handleGetNodeAddresses(params)
+	case "getaddrmaninfo":
+		return s.handleGetAddrmanInfo(params)
 	case "addpeeraddress":
 		return s.handleAddPeerAddress(params)
 
