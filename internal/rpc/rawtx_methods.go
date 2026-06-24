@@ -187,6 +187,218 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 }
 
 // ============================================================================
+// combinerawtransaction RPC
+// ============================================================================
+
+// handleCombineRawTransaction combines multiple partially-signed versions of
+// the SAME transaction into one carrying the union of their signature data.
+//
+// Reference: Bitcoin Core rpc/rawtransaction.cpp combinerawtransaction (impl
+// body 605-668). Each element of the (single, required) array param is a
+// hex-encoded raw tx with the SAME inputs/outputs/version/locktime but
+// DIFFERENT partial signatures. The first variant is the structural template;
+// per input we merge the scriptSig + witness across all variants and write the
+// combined result back. Returns the witness-serialized hex as a bare JSON
+// string.
+//
+// MERGE SCOPE (single-sig parity, the dominant case — identical to the
+// ouroboros reference, committed f4c98ee): for the common/realistic case where
+// each variant carries a COMPLETE single-key signature for a DIFFERENT subset
+// of inputs (or one variant is unsigned), we take, per input, the non-empty
+// (signed) scriptSig + witness. This is BYTE-IDENTICAL to Core for single-sig
+// inputs (P2PKH / P2WPKH / P2SH-P2WPKH), because Core's DataFromTransaction
+// returns the variant's scriptSig + scriptWitness verbatim once VerifyScript
+// marks the input complete, and MergeSignatureData adopts that complete sigdata
+// wholesale.
+//
+// KNOWN LIMITATION (flagged, not faked): the FULL Core behavior also merges
+// PARTIAL multisig signatures WITHIN a single input — two variants each holding
+// one of M sigs for a bare/P2SH/P2WSH M-of-N — via SignatureData::Merge over
+// the extracted (pubkey -> sig) map. That needs Solver / a VerifyScript with a
+// signature-extracting checker / sighash validation, which this handler does
+// NOT implement. For an input that is partially signed in BOTH variants
+// (neither alone complete) we keep the longer (more-signatures) of the two
+// scriptSigs rather than splicing the two sig sets together; the output for
+// that input is therefore NOT guaranteed byte-identical to Core.
+//
+// DEVIATION (flagged): Core resolves every input's prevout from its own UTXO +
+// mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found or
+// already spent" when a coin is missing/spent. This handler does NOT consult
+// chainstate — combine is a pure function of the provided variants here — so it
+// does NOT raise -25 for unresolvable prevouts. The -22 empty / -22
+// decode-failure / -3 non-array error paths DO match Core byte-for-byte.
+func (s *Server) handleCombineRawTransaction(params json.RawMessage) (interface{}, *RPCError) {
+	// Core: UniValue txs = request.params[0].get_array(); a non-array (or a
+	// missing param) is a JSON type error from get_array(). We accept the
+	// positional-args envelope and require the first element to be an array.
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrTypeError, Message: "Expected type array, got null"}
+	}
+
+	var txsRaw []interface{}
+	if err := json.Unmarshal(args[0], &txsRaw); err != nil {
+		// Not an array — mirror Core's get_array() type error (-3). Report the
+		// actual JSON type seen, as Core's UniValue::get_array() does.
+		var any interface{}
+		_ = json.Unmarshal(args[0], &any)
+		return nil, &RPCError{
+			Code:    RPCErrTypeError,
+			Message: fmt.Sprintf("Expected type array, got %s", jsonTypeName(any)),
+		}
+	}
+
+	// 1. Decode every variant (witness-aware). Core: DecodeHexTx per idx; on
+	//    failure -> -22 "TX decode failed for tx %d. Make sure the tx has at
+	//    least one input." (0-based idx).
+	variants := make([]*wire.MsgTx, 0, len(txsRaw))
+	for idx, item := range txsRaw {
+		// Core reads each element with .get_str() -> a non-string element is a
+		// type error before the body's decode runs.
+		hexStr, ok := item.(string)
+		if !ok {
+			return nil, &RPCError{
+				Code:    RPCErrTypeError,
+				Message: fmt.Sprintf("JSON value of type %s is not of expected type string", jsonTypeName(item)),
+			}
+		}
+		tx, decErr := decodeCombineVariant(hexStr)
+		if decErr != nil {
+			return nil, &RPCError{
+				Code:    RPCErrDeserialization,
+				Message: fmt.Sprintf("TX decode failed for tx %d. Make sure the tx has at least one input.", idx),
+			}
+		}
+		variants = append(variants, tx)
+	}
+
+	// 2. Empty array -> -22 "Missing transactions". (Core: txVariants.empty().)
+	if len(variants) == 0 {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Missing transactions"}
+	}
+
+	// 3. mergedTx starts as a clone of the first variant (the template: its
+	//    version / locktime / vin / vout define the result; only each input's
+	//    scriptSig + witness get rebuilt below).
+	template := variants[0]
+	merged := &wire.MsgTx{
+		Version:  template.Version,
+		LockTime: template.LockTime,
+		TxIn:     make([]*wire.TxIn, 0, len(template.TxIn)),
+		TxOut:    make([]*wire.TxOut, len(template.TxOut)),
+	}
+	copy(merged.TxOut, template.TxOut)
+
+	for i := range template.TxIn {
+		base := template.TxIn[i]
+		var bestScriptSig []byte
+		var bestWitness [][]byte
+		bestScore := -1 // rank candidates; higher = more complete
+
+		for _, variant := range variants {
+			if i >= len(variant.TxIn) {
+				continue
+			}
+			vin := variant.TxIn[i]
+			ss := vin.SignatureScript
+			wit := vin.Witness
+
+			ssNonempty := len(ss) > 0
+			witNonempty := false
+			for _, w := range wit {
+				if len(w) > 0 {
+					witNonempty = true
+					break
+				}
+			}
+
+			// Score the candidate so we deterministically prefer the variant
+			// that actually carries signature data for this input. Tie-break by
+			// total signature-data length (longer = more sigs, matching the
+			// partial-multisig fallback note above). Equal length -> keep the
+			// earliest variant (Core's merge is order-stable for the complete
+			// single-sig case).
+			var score int
+			if !ssNonempty && !witNonempty {
+				score = 0
+			} else {
+				sigLen := len(ss)
+				for _, w := range wit {
+					sigLen += len(w)
+				}
+				score = 1000000 + sigLen
+			}
+
+			if score > bestScore {
+				bestScore = score
+				bestScriptSig = ss
+				if len(wit) > 0 {
+					bestWitness = wit
+				} else {
+					bestWitness = nil
+				}
+			}
+		}
+
+		merged.TxIn = append(merged.TxIn, &wire.TxIn{
+			PreviousOutPoint: base.PreviousOutPoint,
+			SignatureScript:  bestScriptSig,
+			Sequence:         base.Sequence,
+			Witness:          bestWitness,
+		})
+	}
+
+	// Core re-encodes WITH witness (TX_WITH_WITNESS) unconditionally; the
+	// serializer only emits the marker/flag when the tx HasWitness (Core
+	// CTransaction::HasWitness). MsgTx.Serialize already drives the marker off
+	// HasWitness(), so a plain Serialize matches Core: witness-serialize iff any
+	// input carries a non-empty witness stack.
+	var buf bytes.Buffer
+	if err := merged.Serialize(&buf); err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Failed to serialize combined transaction: %v", err)}
+	}
+	return hex.EncodeToString(buf.Bytes()), nil
+}
+
+// decodeCombineVariant decodes one hex-encoded raw tx for combinerawtransaction,
+// mirroring Core's DecodeHexTx default (try_no_witness=false, try_witness=true):
+// witness-extended decoding is attempted first; if that fails to consume the
+// whole input we fall back to legacy (no-witness) decoding. An input that
+// decodes to zero inputs is rejected (Core's "at least one input" guard is the
+// natural failure of the witness-marker ambiguity for a 0-input tx).
+func decodeCombineVariant(hexStr string) (*wire.MsgTx, error) {
+	raw, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Witness-extended attempt (Core try_witness=true, tried first). Require it
+	// to consume the entire buffer, matching Core's "ssData.empty()" check.
+	txExt := &wire.MsgTx{}
+	rExt := bytes.NewReader(raw)
+	extErr := txExt.Deserialize(rExt)
+	if extErr == nil && rExt.Len() == 0 && len(txExt.TxIn) > 0 {
+		return txExt, nil
+	}
+
+	// Legacy (no-witness) fallback (Core try_no_witness path). This handles a
+	// non-segwit variant whose post-version byte happens to be 0x00 etc.
+	txLegacy := &wire.MsgTx{}
+	rLeg := bytes.NewReader(raw)
+	legErr := txLegacy.DeserializeNoWitness(rLeg)
+	if legErr == nil && rLeg.Len() == 0 && len(txLegacy.TxIn) > 0 {
+		return txLegacy, nil
+	}
+
+	// Prefer the extended result if it fully decoded (even past the input
+	// guard) before failing the legacy path entirely.
+	if extErr == nil && rExt.Len() == 0 && len(txExt.TxIn) > 0 {
+		return txExt, nil
+	}
+	return nil, fmt.Errorf("TX decode failed")
+}
+
+// ============================================================================
 // testmempoolaccept RPC
 // ============================================================================
 
