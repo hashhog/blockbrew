@@ -632,6 +632,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetConnectionCount()
 	case "getnetworkinfo":
 		return s.handleGetNetworkInfo()
+	case "setnetworkactive":
+		return s.handleSetNetworkActive(params)
 	case "addnode":
 		return s.handleAddNode(params)
 	case "disconnectnode":
