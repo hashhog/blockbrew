@@ -601,6 +601,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleDecodeRawTransaction(params)
 	case "createrawtransaction":
 		return s.handleCreateRawTransaction(params)
+	case "combinerawtransaction":
+		return s.handleCombineRawTransaction(params)
 	case "signrawtransactionwithwallet":
 		return s.handleSignRawTransactionWithWallet(params, walletName)
 	case "signrawtransactionwithkey":
