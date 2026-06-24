@@ -152,6 +152,100 @@ func debugCategoriesSnapshot() (categories []string, all bool) {
 	return categories, all
 }
 
+// ---------------------------------------------------------------------------
+// Runtime (RPC-mutable) category control — backs the `logging` RPC.
+// ---------------------------------------------------------------------------
+//
+// The `logging` RPC (Bitcoin Core rpc/node.cpp:218 + logging.cpp Enable/Disable
+// Category) reads and MUTATES the running node's per-category debug mask in
+// memory, taking effect immediately with no restart. blockbrew already holds
+// that live mask in globalDebug (an enabled-set + an `all` bool, mutex-guarded,
+// consulted by IsDebugEnabled on EVERY call). The methods below let the RPC
+// layer flip individual categories on that SAME live state, so the toggle is
+// genuinely live — IsDebugEnabled (and therefore every gated debug log site)
+// observes the change on its very next read. This deliberately avoids the
+// snapshot trap: the RPC never copies the category set into the logger at
+// construction time; it mutates globalDebug, which the logger consults per
+// record. (Core: m_categories is the single source of truth the logger checks.)
+//
+// *debugState satisfies rpc.DebugLogController; main.go injects globalDebug into
+// the RPC server via rpc.WithDebugLogController(globalDebug).
+
+// Categories returns the full set of REAL category names blockbrew exposes,
+// matching the `-debug=<cat>` set in debugCategories. Order is unspecified
+// (the RPC sorts); the special tokens all/1/none/0/"" are NOT real categories
+// and are never returned here.
+func (d *debugState) Categories() []string {
+	out := make([]string, 0, len(debugCategories))
+	for k := range debugCategories {
+		out = append(out, k)
+	}
+	return out
+}
+
+// IsCategoryActive reports whether the named category is currently being debug
+// logged — i.e. exactly what IsDebugEnabled would return for it (honouring the
+// `all` mask). The name must be a real category (the RPC validates first).
+func (d *debugState) IsCategoryActive(name string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.all {
+		return true
+	}
+	return d.enabled[name]
+}
+
+// EnableCategory turns a single real category on. Live: the next IsDebugEnabled
+// read sees it. When the `all` mask is active, enabling an individual category
+// is a no-op (it is already on) — mirroring Core's bit-set on an all-mask.
+func (d *debugState) EnableCategory(name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.enabled[name] = true
+}
+
+// DisableCategory turns a single real category off. Live. If the `all` mask is
+// active we must first expand it to the explicit per-category set (every real
+// category minus the one being disabled) so that "everything except <cat>" is
+// faithfully representable — Core clears one bit out of the ALL mask the same
+// way (m_categories &= ~flag). This makes `logging ["all"], ["net"]` report
+// every category true EXCEPT net (exclude-wins), exactly as Core does.
+func (d *debugState) DisableCategory(name string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.all {
+		d.all = false
+		d.enabled = map[string]bool{}
+		for k := range debugCategories {
+			d.enabled[k] = true
+		}
+	}
+	delete(d.enabled, name)
+}
+
+// EnableAll turns every category on (Core: BCLog::ALL). Live.
+func (d *debugState) EnableAll() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.all = true
+}
+
+// DisableAll clears every category (Core: DisableCategory of the ALL flag, and
+// blockbrew's `-debug=none`/`0`). Live.
+func (d *debugState) DisableAll() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.all = false
+	d.enabled = map[string]bool{}
+}
+
+// IsKnownCategory reports whether name is one of the real exposed categories
+// (NOT a special token). The RPC uses this to raise Core's -8 "unknown logging
+// category <cat>" for anything outside the exposed set.
+func (d *debugState) IsKnownCategory(name string) bool {
+	return debugCategories[name]
+}
+
 // logFileHandle wraps the stdlib log package's output sink with a SIGHUP
 // reopen mechanism. The default sink is os.Stderr (matching the previous
 // behaviour); when -logfile=<path> is provided we open that file and
