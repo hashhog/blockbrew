@@ -162,6 +162,19 @@ type ChainManager struct {
 	// a coherent state.
 	onBlockDisconnected func(block *wire.MsgBlock, height int32)
 
+	// tipNotifier, if set, is pulsed once per active-chain tip advance via
+	// updateTipCache — the single chokepoint every tip change funnels through:
+	// ConnectBlock during IBD (genesis + extend), ConnectBlock post-IBD, the
+	// submitblock/generate accept path (ProcessSubmittedBlock → ConnectBlock),
+	// and BOTH halves of a reorg (DisconnectBlock peels + ConnectBlock replays
+	// inside ReorgTo all route through updateTipCache). Wakes any
+	// waitfornewblock / waitforblock / waitforblockheight RPC blocked on a tip
+	// change. Mirrors Bitcoin Core's KernelNotifications::blockTip /
+	// WaitTipChanged signal. Lock-free Notify (its own mutex) so calling it
+	// while cm.mu is held introduces no lock-order risk. nil = no waiters wired
+	// (degraded boot / unit tests); Notify on a nil receiver is a no-op.
+	tipNotifier *TipNotifier
+
 	// onBlockConnected, if set, is invoked once per block whose ConnectBlock
 	// successfully extends the active tip — including each replay inside
 	// ReorgTo. Wired from main.go to chainDB.WriteTxIndex so the txindex
@@ -2030,6 +2043,26 @@ func (cm *ChainManager) updateTipCache(hash wire.Hash256, height int32) {
 	cm.cachedTipHash.Store(hash)
 	cm.cachedTipHeight.Store(height)
 	cm.cachedTipNode.Store(cm.tipNode)
+	// Wake any wait-family RPC blocked on a tip change. This is THE chokepoint
+	// every active-chain tip advance funnels through (ConnectBlock IBD +
+	// post-IBD, ProcessSubmittedBlock/generate, and both halves of a reorg via
+	// DisconnectBlock peels + ConnectBlock replays inside ReorgTo). Notify is
+	// a no-op on a nil notifier and takes its own lock, so it is safe to call
+	// here regardless of whether cm.mu is held by the caller.
+	cm.tipNotifier.Notify()
+}
+
+// SetTipNotifier wires the wait-family-RPC tip-change notifier. Called once at
+// startup (main.go) after the notifier is constructed and before the RPC server
+// begins serving. Pulsed by updateTipCache on every tip advance.
+func (cm *ChainManager) SetTipNotifier(tn *TipNotifier) {
+	cm.tipNotifier = tn
+}
+
+// TipNotifier returns the wired tip-change notifier (nil if none). The RPC
+// server reads it to block the wait-family handlers on tip advances.
+func (cm *ChainManager) TipNotifier() *TipNotifier {
+	return cm.tipNotifier
 }
 
 // BestBlock returns the current chain tip hash and height.
