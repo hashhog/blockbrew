@@ -641,17 +641,7 @@ func (p *Peer) pingHandler() {
 	for {
 		select {
 		case <-ticker.C:
-			nonce, err := randomUint64()
-			if err != nil {
-				continue
-			}
-
-			p.mu.Lock()
-			p.lastPingNonce = nonce
-			p.lastPingTime = time.Now()
-			p.mu.Unlock()
-
-			p.SendMessage(&MsgPing{Nonce: nonce})
+			p.SendPing()
 
 		case <-p.quit:
 			return
@@ -1283,6 +1273,32 @@ func (p *Peer) State() PeerState {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 	return p.state
+}
+
+// SendPing sends a single BIP-31 ping (a fresh random nonce) to this peer and
+// records it as the outstanding ping for round-trip measurement. It is
+// fire-and-forget: the message is queued on the peer's send queue (it does NOT
+// block on the network or wait for the matching pong). When the pong arrives,
+// handlePong matches the nonce and stores the latency, which getpeerinfo
+// surfaces as pingtime.
+//
+// This is blockbrew's per-peer ping-send primitive, used both by the periodic
+// keepalive pingHandler and by the `ping` RPC (Core net.cpp ping ->
+// PeerManager::SendPings, which sends one ping per connected peer). A failed
+// nonce draw is a no-op for this peer (the next tick / call retries) so a
+// caller iterating all peers is never aborted by one peer.
+func (p *Peer) SendPing() {
+	nonce, err := randomUint64()
+	if err != nil {
+		return
+	}
+
+	p.mu.Lock()
+	p.lastPingNonce = nonce
+	p.lastPingTime = time.Now()
+	p.mu.Unlock()
+
+	p.SendMessage(&MsgPing{Nonce: nonce})
 }
 
 // PingLatency returns the measured ping latency.
