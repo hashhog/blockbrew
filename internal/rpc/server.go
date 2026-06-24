@@ -582,6 +582,16 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	case "getblockfilter":
 		return s.handleGetBlockFilter(params)
 
+	// Wait-family RPCs (Core rpc/blockchain.cpp). Block until a tip predicate
+	// holds or a millisecond timeout elapses; return the current tip in both
+	// cases. Woken by chainMgr's TipNotifier on every tip advance.
+	case "waitfornewblock":
+		return s.handleWaitForNewBlock(params)
+	case "waitforblock":
+		return s.handleWaitForBlock(params)
+	case "waitforblockheight":
+		return s.handleWaitForBlockHeight(params)
+
 	// Chain management RPCs
 	case "invalidateblock":
 		return s.handleInvalidateBlock(params)
