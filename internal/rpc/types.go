@@ -25,7 +25,7 @@ const (
 	RPCErrVerify                 = -25    // Error during verification
 	RPCErrInWarmup               = -28    // Client still warming up
 	RPCErrClientNodeNotConnected = -29    // Node to disconnect not found in connected nodes
-	RPCErrClientP2PDisabled      = -9     // P2P networking is disabled
+	RPCErrClientP2PDisabled      = -31    // No valid connection manager instance found (Core protocol.h:64)
 
 	// P2P peer/ban-management error codes (Bitcoin Core protocol.h:60-63).
 	// These map operator addnode/setban bad-input cases to the exact Core

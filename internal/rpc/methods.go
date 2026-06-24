@@ -1533,8 +1533,14 @@ func (s *Server) handleGetConnectionCount() (interface{}, *RPCError) {
 
 func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 	outbound, inbound := 0, 0
+	// networkActive mirrors the node-global P2P-active flag toggled by
+	// setnetworkactive (Core rpc/net.cpp:709 reads connman.GetNetworkActive()).
+	// Default true; falls back to true when the peer manager is not wired
+	// (RPC-only tests), matching Core's "networking enabled" default.
+	networkActive := true
 	if s.peerMgr != nil {
 		outbound, inbound = s.peerMgr.PeerCount()
+		networkActive = s.peerMgr.NetworkActive()
 	}
 
 	// relayfee / incrementalfee read the live mempool policy (display == policy).
@@ -1567,7 +1573,7 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 		LocalServices:      fmt.Sprintf("%016x", localServices),
 		LocalServicesNames: serviceFlagNames(localServices),
 		LocalRelay:         true,
-		NetworkActive:      true,
+		NetworkActive:      networkActive,
 		Connections:        outbound + inbound,
 		ConnectionsIn:      inbound,
 		ConnectionsOut:     outbound,
@@ -1591,6 +1597,54 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 		LocalAddresses: []interface{}{},
 		Warnings:       []string{},
 	}, nil
+}
+
+// handleSetNetworkActive disables/enables all P2P network activity.
+//
+// Reference: Bitcoin Core rpc/net.cpp setnetworkactive (:889) +
+// CConnman::SetNetworkActive (net.cpp:3361).
+//
+// Param: state (bool, REQUIRED) — true to enable networking, false to disable.
+//
+// Returns the value that was passed in (a bare JSON boolean), read back from
+// the peer manager after the toggle (Core returns connman.GetNetworkActive(),
+// which absent a race equals the state arg). Setting false suppresses the
+// establishment of NEW connections only — existing peers are NOT disconnected.
+// The `networkactive` field of getnetworkinfo mirrors this flag.
+func (s *Server) handleSetNetworkActive(params json.RawMessage) (interface{}, *RPCError) {
+	// Required positional bool. Core reads request.params[0].get_bool(): a
+	// missing arg is RPC_INVALID_PARAMETER (-8); a non-bool (string/number/
+	// object) is RPC_TYPE_ERROR (-3). json.Unmarshal into []interface{} yields
+	// a Go bool for true/false and a float64 for JSON numbers, so a type
+	// assertion to bool cleanly rejects ints/floats — matching get_bool()'s
+	// strictness (Core does not coerce 0/1 to false/true).
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameters"}
+	}
+	if len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Missing required argument: state"}
+	}
+
+	state, ok := args[0].(bool)
+	if !ok {
+		return nil, &RPCError{
+			Code:    RPCErrTypeError,
+			Message: "JSON value is not a boolean as expected",
+		}
+	}
+
+	// EnsureConnman parity (server_util.cpp:100): a missing connection manager
+	// is RPC_CLIENT_P2P_DISABLED (-31), NOT an empty success.
+	if s.peerMgr == nil {
+		return nil, &RPCError{
+			Code:    RPCErrClientP2PDisabled,
+			Message: "Error: Peer-to-peer functionality missing or disabled",
+		}
+	}
+
+	// SetNetworkActive then return the read-back value (Core net.cpp:904-906).
+	return s.peerMgr.SetNetworkActive(state), nil
 }
 
 // serviceFlagNames maps a service-flag bitfield to Core's localservicesnames

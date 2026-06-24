@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -255,6 +256,21 @@ type PeerManager struct {
 	// gossiped/seed addresses); only operator-pinned entries live here.
 	// Guarded by mu.
 	addedNodes []string
+
+	// networkActive is the node-global "P2P network active" flag (Core
+	// CConnman.fNetworkActive, net.h:1164 / SetNetworkActive net.cpp:3361,
+	// DEFAULT TRUE). Toggled by the `setnetworkactive` RPC and surfaced
+	// read-only as `networkactive` in getnetworkinfo. When false we suppress
+	// the establishment of NEW connections ONLY — existing/established peers
+	// are NEVER force-dropped (Core's contract): (a) inbound accepts are
+	// refused (listenHandler), (b) the outbound auto-dial / feeler / block-
+	// relay refill is skipped (connectionHandler), and (c) DNS-seed / fixed-
+	// seed re-seeding AND the -connect pinned-reconnect loop are skipped
+	// (connectionHandler). Health/disconnect sweeps keep running. When true
+	// (default) every gate is a no-op, so behaviour is identical to before.
+	// An atomic so the connect-loop / accept-loop hot paths read it without
+	// the peer-map lock. Not persisted; resets to enabled on restart.
+	networkActive atomic.Bool
 }
 
 // UsingASMap returns true when an asmap was loaded at startup. Mirrors
@@ -428,6 +444,10 @@ func NewPeerManager(config PeerManagerConfig) *PeerManager {
 		quit:         make(chan struct{}),
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
+
+	// P2P networking is active by default (Core CConnman.fNetworkActive
+	// initialises true). `setnetworkactive false` flips it; not persisted.
+	pm.networkActive.Store(true)
 
 	// Load asmap if configured. Mirrors Core init.cpp:1603-1628.
 	if config.ASMapFile != "" {
@@ -1220,6 +1240,32 @@ func (pm *PeerManager) addFixedSeeds() bool {
 	return true
 }
 
+// NetworkActive reports whether P2P networking is active (Core
+// CConnman::GetNetworkActive, net.h:1164). Default true. Read on the hot
+// connect/accept paths, so it is an atomic and takes no lock.
+func (pm *PeerManager) NetworkActive() bool {
+	return pm.networkActive.Load()
+}
+
+// SetNetworkActive enables/disables the establishment of all NEW P2P network
+// activity (Core CConnman::SetNetworkActive, net.cpp:3361). Idempotent: when
+// the flag already equals *state* it logs and early-returns (no notification);
+// otherwise it flips the atomic flag. Does NOT disconnect existing/established
+// peers — only suppresses establishing new connections (inbound accept,
+// outbound auto-dial / feeler / block-relay refill, DNS/fixed-seed re-seeding
+// and the -connect pinned-reconnect loop). Returns the read-back value
+// (GetNetworkActive() equivalent), which absent a race equals *state*. Not
+// persisted; resets to enabled on restart.
+func (pm *PeerManager) SetNetworkActive(state bool) bool {
+	if pm.networkActive.Load() == state {
+		log.Printf("SetNetworkActive: %t (unchanged)", state)
+		return pm.networkActive.Load()
+	}
+	pm.networkActive.Store(state)
+	log.Printf("SetNetworkActive: %t", state)
+	return pm.networkActive.Load()
+}
+
 // connectionHandler manages outbound connection attempts.
 func (pm *PeerManager) connectionHandler() {
 	defer pm.wg.Done()
@@ -1233,23 +1279,29 @@ func (pm *PeerManager) connectionHandler() {
 	// resolution so the grace clock starts at loop entry, matching Core.
 	connStart := time.Now()
 
-	if pm.connectMode() {
-		log.Printf("P2P: -connect set (%d peer(s)) — DNS seeds and auto-outbound dialing disabled; pinning to %s",
-			len(pm.config.ConnectPeers), strings.Join(pm.config.ConnectPeers, ", "))
-		pm.dialConnectPeers()
-	} else {
-		// Initial DNS seed resolution (skipped when -nodnsseed / -dnsseed=0).
-		pm.maybeResolveDNSSeeds()
+	// Network-active gate (Core net.cpp:2351/3022/3219): while networking is
+	// disabled at startup, hold off the initial -connect dial AND the initial
+	// DNS/fixed-seed re-seeding. The ticker loop below re-checks the flag, so a
+	// later `setnetworkactive true` resumes establishment without a restart.
+	if pm.NetworkActive() {
+		if pm.connectMode() {
+			log.Printf("P2P: -connect set (%d peer(s)) — DNS seeds and auto-outbound dialing disabled; pinning to %s",
+				len(pm.config.ConnectPeers), strings.Join(pm.config.ConnectPeers, ", "))
+			pm.dialConnectPeers()
+		} else {
+			// Initial DNS seed resolution (skipped when -nodnsseed / -dnsseed=0).
+			pm.maybeResolveDNSSeeds()
 
-		// Immediate fixed-seed fallback when DNS seeding is disabled: there is
-		// no other peer source to wait for, so fire right away rather than
-		// idling for 60s (Core's `!dnsseed && !use_seednodes` shortcut,
-		// net.cpp:2620). When DNS is enabled this is a no-op (the book is
-		// non-empty after a successful resolve, or the 60s-grace path below
-		// fires once DNS is confirmed dead). This is THE fix for the
-		// DNS-failure hang: with DNS off (or unreachable) and an empty book,
-		// the node now seeds itself instead of idling forever with zero peers.
-		pm.maybeAddFixedSeeds(connStart)
+			// Immediate fixed-seed fallback when DNS seeding is disabled: there is
+			// no other peer source to wait for, so fire right away rather than
+			// idling for 60s (Core's `!dnsseed && !use_seednodes` shortcut,
+			// net.cpp:2620). When DNS is enabled this is a no-op (the book is
+			// non-empty after a successful resolve, or the 60s-grace path below
+			// fires once DNS is confirmed dead). This is THE fix for the
+			// DNS-failure hang: with DNS off (or unreachable) and an empty book,
+			// the node now seeds itself instead of idling forever with zero peers.
+			pm.maybeAddFixedSeeds(connStart)
+		}
 	}
 
 	// Random start offset for feeler timer to avoid synchronization
@@ -1303,6 +1355,16 @@ func (pm *PeerManager) connectionHandler() {
 	for {
 		select {
 		case <-ticker.C:
+			// Network-active gate (Core net.cpp:2351/3022/3219): while
+			// networking is disabled the outbound connect loop holds off
+			// establishing ANY new connection — the -connect pinned-reconnect
+			// loop AND the addrman auto-outbound refill alike. Existing peers
+			// stay up (the health/ban/dump sweeps below run unconditionally);
+			// only NEW establishment is suppressed.
+			if !pm.NetworkActive() {
+				continue
+			}
+
 			// -connect mode: re-dial pinned peers only; never fill outbound
 			// slots from the addrman (Core parity / clearbit peer.zig:7050).
 			if pm.connectMode() {
@@ -1332,6 +1394,12 @@ func (pm *PeerManager) connectionHandler() {
 			}
 
 		case <-feelerTicker.C:
+			// Network-active gate: feeler + extra-block-relay establishment is
+			// NEW outbound connection activity — suppress while inactive.
+			if !pm.NetworkActive() {
+				continue
+			}
+
 			// In -connect mode we make no feeler or extra block-relay
 			// connections — the addrman is intentionally unused.
 			if pm.connectMode() {
@@ -1358,6 +1426,12 @@ func (pm *PeerManager) connectionHandler() {
 			}
 
 		case <-fixedSeedsTicker.C:
+			// Network-active gate (Core net.cpp:2351): hold off fixed-seed
+			// re-seeding while networking is disabled.
+			if !pm.NetworkActive() {
+				continue
+			}
+
 			// Last-resort fixed-seed fallback (Core net.cpp:2607-2643). One-shot:
 			// injects the curated bootstrap IPs the first tick after the address
 			// book is empty AND (60s elapsed since loop start OR DNS seeding is
@@ -1368,6 +1442,12 @@ func (pm *PeerManager) connectionHandler() {
 			pm.maybeAddFixedSeeds(connStart)
 
 		case <-dnsRefreshTicker.C:
+			// Network-active gate (Core net.cpp:2351): hold off DNS-seed
+			// re-querying while networking is disabled.
+			if !pm.NetworkActive() {
+				continue
+			}
+
 			// Refresh DNS seeds when peer health is poor. Two triggers:
 			//   (a) book is too small to provide candidates, or
 			//   (b) too few addresses have a known-good handshake history
@@ -1745,6 +1825,14 @@ func (pm *PeerManager) listenHandler() {
 				// Temporary error, continue
 				continue
 			}
+		}
+
+		// Network-active gate (Core net.cpp:1786): while networking is disabled
+		// (`setnetworkactive false`) refuse NEW inbound connections. Existing
+		// peers are untouched — only new establishment is suppressed.
+		if !pm.NetworkActive() {
+			conn.Close()
+			continue
 		}
 
 		// Check limits and bans

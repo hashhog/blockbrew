@@ -993,6 +993,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"getconnectioncount",
 		"getnetworkinfo",
 		"getpeerinfo",
+		"setnetworkactive state",
 		"",
 		"== Transaction ==",
 		"decoderawtransaction \"hexstring\"",
