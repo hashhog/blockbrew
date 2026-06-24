@@ -990,6 +990,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"",
 		"== Network ==",
 		"addnode \"node\" \"command\"",
+		"getaddrmaninfo",
 		"getconnectioncount",
 		"getnetworkinfo",
 		"getpeerinfo",
