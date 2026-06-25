@@ -19,11 +19,16 @@ import (
 // createrawtransaction RPC
 // ============================================================================
 
-// CreateRawTransactionInput represents an input for createrawtransaction.
-type CreateRawTransactionInput struct {
-	TxID     string `json:"txid"`
-	Vout     uint32 `json:"vout"`
-	Sequence uint32 `json:"sequence,omitempty"`
+// createRawTxInput is the parsed form of one createrawtransaction input. The
+// "sequence" key is captured as an *optional* (HasSequence) so that an explicit
+// sequence of 0 is distinguishable from an absent one — Core's AddInputs only
+// overrides the computed default when the JSON object actually carries a numeric
+// "sequence" (rawtransaction_util.cpp:57-66).
+type createRawTxInput struct {
+	TxID        string
+	Vout        uint32
+	Sequence    uint32
+	HasSequence bool
 }
 
 func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}, *RPCError) {
@@ -36,22 +41,54 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing required parameters: inputs and outputs"}
 	}
 
-	// Parse inputs array
-	var inputs []CreateRawTransactionInput
-	if err := json.Unmarshal(args[0], &inputs); err != nil {
+	// Parse inputs array. Decode each element as a raw object so we can detect
+	// whether the optional "sequence" key was supplied (Core uses an explicit
+	// presence check, not a sentinel value).
+	var rawInputs []map[string]json.RawMessage
+	if err := json.Unmarshal(args[0], &rawInputs); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid inputs array"}
 	}
-
-	// Parse outputs - can be array of objects or single object
-	var outputs []map[string]interface{}
-	// First try parsing as array
-	if err := json.Unmarshal(args[1], &outputs); err != nil {
-		// Try single object format
-		var singleOutput map[string]interface{}
-		if err := json.Unmarshal(args[1], &singleOutput); err != nil {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+	inputs := make([]createRawTxInput, 0, len(rawInputs))
+	for _, ri := range rawInputs {
+		var in createRawTxInput
+		if err := json.Unmarshal(ri["txid"], &in.TxID); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, missing txid key"}
 		}
-		outputs = []map[string]interface{}{singleOutput}
+		voutRaw, ok := ri["vout"]
+		if !ok {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, missing vout key"}
+		}
+		var vout int64
+		if err := json.Unmarshal(voutRaw, &vout); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, missing vout key"}
+		}
+		if vout < 0 {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, vout cannot be negative"}
+		}
+		in.Vout = uint32(vout)
+		if seqRaw, ok := ri["sequence"]; ok {
+			var seq int64
+			if err := json.Unmarshal(seqRaw, &seq); err != nil {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, sequence number is out of range"}
+			}
+			if seq < 0 || seq > 0xFFFFFFFF {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, sequence number is out of range"}
+			}
+			in.Sequence = uint32(seq)
+			in.HasSequence = true
+		}
+		inputs = append(inputs, in)
+	}
+
+	// Parse outputs - can be array of single-key objects OR a single object.
+	// Core's NormalizeOutputs flattens the array form (which permits duplicate
+	// addresses + ordering) into the same ordered key/value list the object form
+	// produces. We mirror that by decoding to an ordered slice of (key,value)
+	// pairs rather than a Go map (whose iteration order is non-deterministic and
+	// would also collapse duplicates).
+	outputs, oerr := parseCreateRawOutputs(args[1])
+	if oerr != nil {
+		return nil, oerr
 	}
 
 	// Parse optional locktime
@@ -63,15 +100,14 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 		}
 	}
 
-	// Parse optional replaceable flag
-	replaceable := false
+	// Parse optional replaceable flag. Core's `rbf` is std::optional<bool> and
+	// AddInputs uses rbf.value_or(true): when the arg is ABSENT the default is
+	// TRUE (BIP-125 opt-in RBF). An explicit `false` disables it.
+	replaceable := true
 	if len(args) >= 4 {
-		if err := json.Unmarshal(args[3], &replaceable); err != nil {
-			// Try parsing as bool directly
-			var r bool
-			if err := json.Unmarshal(args[3], &r); err == nil {
-				replaceable = r
-			}
+		var r bool
+		if err := json.Unmarshal(args[3], &r); err == nil {
+			replaceable = r
 		}
 	}
 
@@ -101,14 +137,13 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid txid: %s", in.TxID)}
 		}
 
-		sequence := in.Sequence
-		if sequence == 0 {
-			if replaceable {
-				// BIP125: signal RBF with sequence < 0xFFFFFFFE
-				sequence = 0xFFFFFFFD
-			} else {
-				sequence = 0xFFFFFFFF
-			}
+		// Core AddInputs (rawtransaction_util.cpp:47-66): the default sequence is
+		// computed from (replaceable, locktime); an EXPLICIT "sequence" in the
+		// input object overrides it. Reuse the shared sequenceForLocktime helper
+		// the wallet/PSBT paths use so the default stays consistent.
+		sequence := sequenceForLocktime(locktime, replaceable)
+		if in.HasSequence {
+			sequence = in.Sequence
 		}
 
 		tx.TxIn = append(tx.TxIn, &wire.TxIn{
@@ -120,60 +155,76 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 		})
 	}
 
-	// Add outputs
+	// Add outputs. `outputs` is an ordered slice of (key,value) pairs produced by
+	// NormalizeOutputs parity — both the object and array JSON forms collapse to
+	// this same shape, preserving order and (in the array form) duplicate keys.
+	// Core ParseOutputs (rawtransaction_util.cpp:101-131) rejects a duplicate
+	// "data" key and a duplicate address.
+	seenData := false
+	seenAddrs := make(map[string]struct{})
 	for _, out := range outputs {
-		for key, val := range out {
-			if key == "data" {
-				// OP_RETURN output
-				dataStr, ok := val.(string)
-				if !ok {
-					return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid data value"}
-				}
-				data, err := hex.DecodeString(dataStr)
-				if err != nil {
-					return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid data hex"}
-				}
-				if len(data) > 80 {
-					return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Data exceeds OP_RETURN limit (80 bytes)"}
-				}
-
-				// Build OP_RETURN script: OP_RETURN <data>
-				pkScript := make([]byte, 0, 2+len(data))
-				pkScript = append(pkScript, 0x6a) // OP_RETURN
-				if len(data) <= 75 {
-					pkScript = append(pkScript, byte(len(data)))
-				} else {
-					pkScript = append(pkScript, 0x4c) // OP_PUSHDATA1
-					pkScript = append(pkScript, byte(len(data)))
-				}
-				pkScript = append(pkScript, data...)
-
-				tx.TxOut = append(tx.TxOut, &wire.TxOut{
-					Value:    0,
-					PkScript: pkScript,
-				})
-			} else {
-				// Address output
-				amount, ok := val.(float64)
-				if !ok {
-					return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid amount for address %s", key)}
-				}
-
-				satoshis := int64(math.Round(amount * satoshiPerBitcoin))
-				if satoshis < 0 {
-					return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Negative amount"}
-				}
-
-				addr, err := address.DecodeAddress(key, net)
-				if err != nil {
-					return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid address: %s", key)}
-				}
-
-				tx.TxOut = append(tx.TxOut, &wire.TxOut{
-					Value:    satoshis,
-					PkScript: addr.ScriptPubKey(),
-				})
+		key, val := out.key, out.value
+		if key == "data" {
+			// OP_RETURN output. Core: ParseHexV then CScript() << OP_RETURN << data.
+			if seenData {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, duplicate key: data"}
 			}
+			seenData = true
+			var dataStr string
+			if err := json.Unmarshal(val, &dataStr); err != nil {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid data value"}
+			}
+			data, err := hex.DecodeString(dataStr)
+			if err != nil {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Data must be hexadecimal string (not '%s')", dataStr)}
+			}
+
+			// Build OP_RETURN script: OP_RETURN <data> using canonical push
+			// encoding (Core's CScript operator<< pushes a minimally-encoded
+			// data push: direct length byte for <76, OP_PUSHDATA1 for 76-255).
+			pkScript := make([]byte, 0, 2+len(data))
+			pkScript = append(pkScript, 0x6a) // OP_RETURN
+			if len(data) < 0x4c {
+				pkScript = append(pkScript, byte(len(data)))
+			} else if len(data) <= 0xff {
+				pkScript = append(pkScript, 0x4c) // OP_PUSHDATA1
+				pkScript = append(pkScript, byte(len(data)))
+			} else {
+				pkScript = append(pkScript, 0x4d) // OP_PUSHDATA2
+				pkScript = append(pkScript, byte(len(data)&0xff), byte((len(data)>>8)&0xff))
+			}
+			pkScript = append(pkScript, data...)
+
+			tx.TxOut = append(tx.TxOut, &wire.TxOut{
+				Value:    0,
+				PkScript: pkScript,
+			})
+		} else {
+			// Address output. Reuse the node's existing address decoder
+			// (address.DecodeAddress) → scriptPubKey, the same machinery the
+			// wallet / decoderawtransaction paths use.
+			addr, err := address.DecodeAddress(key, net)
+			if err != nil {
+				return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: fmt.Sprintf("Invalid Bitcoin address: %s", key)}
+			}
+			if _, dup := seenAddrs[key]; dup {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid parameter, duplicated address: %s", key)}
+			}
+			seenAddrs[key] = struct{}{}
+
+			var amount float64
+			if err := json.Unmarshal(val, &amount); err != nil {
+				return nil, &RPCError{Code: RPCErrTypeError, Message: "Invalid amount"}
+			}
+			satoshis := int64(math.Round(amount * satoshiPerBitcoin))
+			if satoshis < 0 {
+				return nil, &RPCError{Code: RPCErrTypeError, Message: "Amount out of range"}
+			}
+
+			tx.TxOut = append(tx.TxOut, &wire.TxOut{
+				Value:    satoshis,
+				PkScript: addr.ScriptPubKey(),
+			})
 		}
 	}
 
@@ -184,6 +235,93 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 	}
 
 	return hex.EncodeToString(buf.Bytes()), nil
+}
+
+// createRawOutput is one ordered (address-or-"data", value) pair from the
+// createrawtransaction outputs argument, after NormalizeOutputs flattening.
+type createRawOutput struct {
+	key   string
+	value json.RawMessage
+}
+
+// parseCreateRawOutputs mirrors Core's NormalizeOutputs
+// (rawtransaction_util.cpp:74-99): the outputs argument is EITHER a JSON object
+// {address:amount, "data":hex, ...} OR a JSON array of single-key objects
+// [{address:amount}, {"data":hex}, ...]. The array form is flattened into the
+// same ordered key/value list the object form yields — preserving order and
+// permitting duplicate addresses (which Core's ParseOutputs then rejects). We
+// decode to an ordered slice (not a Go map) so ordering is deterministic and
+// duplicates survive to the dup-address check.
+func parseCreateRawOutputs(raw json.RawMessage) ([]createRawOutput, *RPCError) {
+	// Distinguish object vs array by the first non-whitespace byte.
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	if len(trimmed) == 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, output argument must be non-null"}
+	}
+
+	switch trimmed[0] {
+	case '{':
+		// Object form: decode preserving source order via json.Decoder token
+		// stream (a plain map loses both order and duplicate keys).
+		return decodeOrderedObject(trimmed)
+	case '[':
+		// Array form: each element must be a single-key object; flatten in order.
+		var arr []json.RawMessage
+		if err := json.Unmarshal(trimmed, &arr); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+		}
+		out := make([]createRawOutput, 0, len(arr))
+		for _, elem := range arr {
+			et := bytes.TrimLeft(elem, " \t\r\n")
+			if len(et) == 0 || et[0] != '{' {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, key-value pair not an object as expected"}
+			}
+			pairs, perr := decodeOrderedObject(et)
+			if perr != nil {
+				return nil, perr
+			}
+			if len(pairs) != 1 {
+				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, key-value pair must contain exactly one key"}
+			}
+			out = append(out, pairs[0])
+		}
+		return out, nil
+	default:
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+	}
+}
+
+// decodeOrderedObject decodes a JSON object into an ordered slice of
+// (key, raw-value) pairs, preserving the source key order (json.Decoder emits
+// tokens in document order). Used so createrawtransaction output ordering is
+// byte-stable against Core.
+func decodeOrderedObject(raw json.RawMessage) ([]createRawOutput, *RPCError) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	// Opening '{'.
+	tok, err := dec.Token()
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+	}
+	if delim, ok := tok.(json.Delim); !ok || delim != '{' {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+	}
+	var out []createRawOutput
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+		}
+		var val json.RawMessage
+		if err := dec.Decode(&val); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+		}
+		out = append(out, createRawOutput{key: key, value: val})
+	}
+	return out, nil
 }
 
 // ============================================================================
