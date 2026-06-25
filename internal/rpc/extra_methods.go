@@ -975,6 +975,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"getblocktemplate ( \"template_request\" )",
 		"getmininginfo",
 		"submitblock \"hexdata\"",
+		"submitheader \"hexdata\"",
 		"",
 		"== Mempool ==",
 		"dumpmempool",
