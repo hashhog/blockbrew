@@ -573,6 +573,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetChainTxStats(params)
 	case "getblockstats":
 		return s.handleGetBlockStats(params)
+	case "verifychain":
+		return s.handleVerifyChain(params)
 	case "getdeploymentinfo":
 		return s.handleGetDeploymentInfo(params)
 	case "gettxout":
