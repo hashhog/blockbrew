@@ -994,6 +994,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"getaddrmaninfo",
 		"getconnectioncount",
 		"getnetworkinfo",
+		"getnettotals",
 		"getpeerinfo",
 		"setnetworkactive state",
 		"",
