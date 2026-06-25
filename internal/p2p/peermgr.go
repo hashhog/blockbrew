@@ -554,6 +554,28 @@ func (pm *PeerManager) ConnectedPeers() []*Peer {
 	return peers
 }
 
+// GetTotalBytes returns the cumulative bytes received and sent across the
+// node's P2P connections, for the `getnettotals` RPC.
+//
+// Core's CConnman maintains TRUE global totals (nTotalBytesRecv/Sent,
+// net.cpp:3862-3872) that are incremented at every socket read/write and so
+// survive peer disconnects (GetTotalBytesRecv/Sent, net.cpp:3950-3959).
+// blockbrew keeps only PER-PEER counters (Peer.bytesRecvd/bytesSent, the same
+// source getpeerinfo reports as bytesrecv/bytessent), with no cumulative
+// accumulator carried across disconnected peers. This method therefore sums
+// the CURRENTLY-CONNECTED peers' counters via the same ConnectedPeers()
+// machinery getpeerinfo uses — an APPROXIMATION of Core's global totals that
+// undercounts traffic from peers that have since disconnected. Reuses the
+// existing per-peer counters rather than introducing a parallel accounting
+// path.
+func (pm *PeerManager) GetTotalBytes() (recv, sent uint64) {
+	for _, p := range pm.ConnectedPeers() {
+		recv += p.BytesRecvd()
+		sent += p.BytesSent()
+	}
+	return recv, sent
+}
+
 // BanPeer bans a peer's IP for a duration.
 func (pm *PeerManager) BanPeer(addr string, duration time.Duration, reason string) {
 	// Extract IP from addr (which may be "ip:port")
