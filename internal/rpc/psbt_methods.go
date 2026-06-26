@@ -582,7 +582,8 @@ func (s *Server) handleJoinPSBTs(params json.RawMessage) (interface{}, *RPCError
 	}
 
 	if len(psbtsRaw) < 2 {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "At least two PSBTs required for join"}
+		// Core: rpc/rawtransaction.cpp joinpsbts throws RPC_INVALID_PARAMETER (-8).
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "At least two PSBTs are required to join PSBTs."}
 	}
 
 	// Decode all PSBTs
