@@ -3402,7 +3402,7 @@ func (s *Server) handleGetChainStates() (interface{}, *RPCError) {
 		info := ChainstateInfo{
 			Blocks:               tipHeight,
 			BestBlockHash:        tipHash.String(),
-			Difficulty:           difficulty,
+			Difficulty:           BitcoinDifficulty(difficulty),
 			VerificationProgress: verificationProgress,
 			CoinsDBCacheBytes:    0,
 			CoinsTipCacheBytes:   coinsTipCacheBytes,
@@ -3463,16 +3463,19 @@ type ChainStatesResult struct {
 // OPTIONAL — Core only pushes it for a from-snapshot chainstate — so it keeps
 // omitempty and is left empty for blockbrew's single validated chainstate.
 type ChainstateInfo struct {
-	Blocks               int32   `json:"blocks"`
-	BestBlockHash        string  `json:"bestblockhash"`
-	Bits                 string  `json:"bits,omitempty"`
-	Target               string  `json:"target,omitempty"`
-	Difficulty           float64 `json:"difficulty"`
-	VerificationProgress float64 `json:"verificationprogress"`
-	CoinsDBCacheBytes    int64   `json:"coins_db_cache_bytes"`
-	CoinsTipCacheBytes   int64   `json:"coins_tip_cache_bytes"`
-	SnapshotBlockHash    string  `json:"snapshot_blockhash,omitempty"`
-	Validated            bool    `json:"validated"`
+	Blocks        int32  `json:"blocks"`
+	BestBlockHash string `json:"bestblockhash"`
+	Bits          string `json:"bits,omitempty"`
+	Target        string `json:"target,omitempty"`
+	// Difficulty uses BitcoinDifficulty so it serializes with Core's %.16g
+	// (16 significant digits) precision (rpc/blockchain.cpp emits the double
+	// via UniValue) rather than Go's shortest round-trip float form.
+	Difficulty           BitcoinDifficulty `json:"difficulty"`
+	VerificationProgress float64           `json:"verificationprogress"`
+	CoinsDBCacheBytes    int64             `json:"coins_db_cache_bytes"`
+	CoinsTipCacheBytes   int64             `json:"coins_tip_cache_bytes"`
+	SnapshotBlockHash    string            `json:"snapshot_blockhash,omitempty"`
+	Validated            bool              `json:"validated"`
 }
 
 // ============================================================================
