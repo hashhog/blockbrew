@@ -1376,8 +1376,8 @@ func TestInvalidateBlockRPC(t *testing.T) {
 
 	// Invalid blockhash format
 	resp = testRPCRequest(t, server.handleRPC, "invalidateblock", []interface{}{"invalid"}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected error for invalid blockhash format")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParameter {
+		t.Error("expected -8 RPC_INVALID_PARAMETER for malformed blockhash (Core ParseHashV)")
 	}
 
 	// Block not found
@@ -1421,8 +1421,8 @@ func TestReconsiderBlockRPC(t *testing.T) {
 
 	// Invalid blockhash format
 	resp = testRPCRequest(t, server.handleRPC, "reconsiderblock", []interface{}{"invalid"}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected error for invalid blockhash format")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParameter {
+		t.Error("expected -8 RPC_INVALID_PARAMETER for malformed blockhash (Core ParseHashV)")
 	}
 
 	// Block not found
@@ -1466,8 +1466,8 @@ func TestPreciousBlockRPC(t *testing.T) {
 
 	// Invalid blockhash format
 	resp = testRPCRequest(t, server.handleRPC, "preciousblock", []interface{}{"invalid"}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected error for invalid blockhash format")
+	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParameter {
+		t.Error("expected -8 RPC_INVALID_PARAMETER for malformed blockhash (Core ParseHashV)")
 	}
 
 	// Block not found

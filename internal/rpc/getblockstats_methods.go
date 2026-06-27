@@ -218,9 +218,11 @@ func (s *Server) parseHashOrHeight(param interface{}) (*consensus.BlockNode, *RP
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "hash_or_height must be a height or block hash"}
 	}
-	hash, err := wire.NewHash256FromHex(hashStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid block hash format"}
+	// ParseHashV (via ParseHashOrHeight): malformed hash -> -8 at the parse
+	// boundary with Core's message (was -32602).
+	hash, perr := parseHashV(hashStr, "hash_or_height")
+	if perr != nil {
+		return nil, perr
 	}
 	node := s.headerIndex.GetNode(hash)
 	if node == nil {

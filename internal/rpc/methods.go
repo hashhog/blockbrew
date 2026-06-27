@@ -3886,9 +3886,12 @@ func (s *Server) handleInvalidateBlock(params json.RawMessage) (interface{}, *RP
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash"}
 	}
 
-	hash, err := wire.NewHash256FromHex(hashStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+	// ParseHashV: a malformed (non-hex / wrong-length) blockhash -> -8
+	// RPC_INVALID_PARAMETER at the parse boundary with Core's message (was
+	// -32602). A well-formed-but-absent hash stays -5 "Block not found" below.
+	hash, perr := parseHashV(hashStr, "blockhash")
+	if perr != nil {
+		return nil, perr
 	}
 
 	if s.chainMgr == nil {
@@ -3925,9 +3928,12 @@ func (s *Server) handleReconsiderBlock(params json.RawMessage) (interface{}, *RP
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash"}
 	}
 
-	hash, err := wire.NewHash256FromHex(hashStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+	// ParseHashV: a malformed (non-hex / wrong-length) blockhash -> -8
+	// RPC_INVALID_PARAMETER at the parse boundary with Core's message (was
+	// -32602). A well-formed-but-absent hash stays -5 "Block not found" below.
+	hash, perr := parseHashV(hashStr, "blockhash")
+	if perr != nil {
+		return nil, perr
 	}
 
 	if s.chainMgr == nil {
@@ -4149,9 +4155,12 @@ func (s *Server) handlePreciousBlock(params json.RawMessage) (interface{}, *RPCE
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash"}
 	}
 
-	hash, err := wire.NewHash256FromHex(hashStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash format"}
+	// ParseHashV: a malformed (non-hex / wrong-length) blockhash -> -8
+	// RPC_INVALID_PARAMETER at the parse boundary with Core's message (was
+	// -32602). A well-formed-but-absent hash stays -5 "Block not found" below.
+	hash, perr := parseHashV(hashStr, "blockhash")
+	if perr != nil {
+		return nil, perr
 	}
 
 	if s.chainMgr == nil {
