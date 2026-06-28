@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 
 	"github.com/hashhog/blockbrew/internal/p2p"
-	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 // getblockfrompeer mirrors Bitcoin Core's
@@ -91,9 +90,11 @@ func (s *Server) handleGetBlockFromPeer(params json.RawMessage) (interface{}, *R
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid block hash"}
 	}
-	hash, err := wire.NewHash256FromHex(hashStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid block hash format"}
+	// ParseHashV: a malformed (non-hex / wrong-length) blockhash -> -8
+	// RPC_INVALID_PARAMETER at the parse boundary with Core's message (was -32602).
+	hash, perr := parseHashV(hashStr, "blockhash")
+	if perr != nil {
+		return nil, perr
 	}
 
 	// peer_id arrives as a JSON number (float64 over the wire).

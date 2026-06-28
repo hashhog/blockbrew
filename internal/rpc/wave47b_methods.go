@@ -363,13 +363,13 @@ func (s *Server) handleGetTxOutProof(params json.RawMessage) (interface{}, *RPCE
 		if !ok2 {
 			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "blockhash must be a string"}
 		}
-		b, err := hex.DecodeString(bh)
-		if err != nil || len(b) != 32 {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid blockhash"}
+		// ParseHashV: a malformed blockhash -> -8 at the parse boundary with
+		// Core's message (was -32602); parseHashV returns the display-order-
+		// reversed (internal) Hash256.
+		hash, perr := parseHashV(bh, "blockhash")
+		if perr != nil {
+			return nil, perr
 		}
-		var hash wire.Hash256
-		copy(hash[:], b)
-		reverseBytes(hash[:])
 		blk, err2 := s.chainDB.GetBlock(hash)
 		if err2 != nil || blk == nil {
 			return nil, &RPCError{Code: RPCErrBlockNotFound, Message: "Block not found"}
