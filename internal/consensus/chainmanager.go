@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
+	"math/big"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -451,6 +453,109 @@ func (cm *ChainManager) ReloadChainState() {
 		state.BestHash.String(), state.BestHeight, headerHeight)
 }
 
+// getBlockProofEquivalentTime computes the number of seconds of chain activity
+// represented by the work difference between bestHeader and pindex.
+//
+// Mirrors Bitcoin Core chain.cpp GetBlockProofEquivalentTime, called as
+// GetBlockProofEquivalentTime(*best_header, *pindex, *best_header, params):
+//
+//	r = (bestHeader.nChainWork - pindex.nChainWork) * nPowTargetSpacing / GetBlockProof(bestHeader)
+//
+// Result is clamped to [0, math.MaxInt64].  Used by shouldSkipScripts condition 5.
+func getBlockProofEquivalentTime(bestHeader, pindex *BlockNode, params *ChainParams) int64 {
+	// Work difference: bestHeader always has >= work in the skip-scripts call path.
+	r := new(big.Int)
+	if bestHeader.TotalWork.Cmp(pindex.TotalWork) >= 0 {
+		r.Sub(bestHeader.TotalWork, pindex.TotalWork)
+	} else {
+		// Shouldn't occur on the skip path (bestHeader must have >= work than pindex),
+		// but handle defensively so we never skip in an unexpected scenario.
+		return 0
+	}
+
+	// Multiply by PoW target spacing.
+	r.Mul(r, big.NewInt(params.TargetSpacing))
+
+	// Divide by GetBlockProof(bestHeader) == CalcWork(bestHeader.Header.Bits).
+	bestProof := CalcWork(bestHeader.Header.Bits)
+	if bestProof.Sign() <= 0 {
+		// Unreachable for any valid block, but be defensive — never skip.
+		return 0
+	}
+	r.Div(r, bestProof)
+
+	// Clamp to int64 max (mirrors Core's `r.bits() > 63` guard).
+	if r.BitLen() > 63 {
+		return math.MaxInt64
+	}
+	return r.Int64()
+}
+
+// shouldSkipScripts implements Bitcoin Core's assume-valid script-skip gate
+// (validation.cpp:2346-2382). Returns true ONLY when ALL five conditions hold:
+//
+//  1. assumevalid is configured (assumeValidHash != zero hash).
+//  2. The assumevalid block hash is present in our block index.
+//  3a. node is an ANCESTOR OF (or equal to) the assumevalid block
+//      (avNode.GetAncestor(node.Height) == node). A fork block at height ≤
+//      av_height fails here because it is NOT on the av block's ancestry chain.
+//  3b. node is on the BEST-HEADER CHAIN
+//      (bestHeader.GetAncestor(node.Height) == node). Ensures avNode is
+//      itself on our best-known chain.
+//  4. bestHeader.TotalWork >= MinimumChainWork (eclipse-attack defense).
+//  5. getBlockProofEquivalentTime(bestHeader, node) > 1209600 s (2 weeks,
+//     DoS defense: blocks mined too recently are always script-verified).
+//
+// This gate is STRICTLY NARROWER than the old height-only check
+// (assumeValidHeight > 0 && node.Height <= assumeValidHeight): it can only
+// increase verification — never skip more blocks.
+//
+// Must be called while cm.mu is held; acquires idx.mu.RLock internally via
+// GetNode/BestTip, consistent with existing ConnectBlock → GetNode calls.
+func (cm *ChainManager) shouldSkipScripts(node *BlockNode) bool {
+	const twoWeeksSec = int64(60 * 60 * 24 * 7 * 2) // 1 209 600 s
+
+	// Condition 1: assumevalid must be configured.
+	if cm.assumeValidHash.IsZero() {
+		return false
+	}
+
+	// Condition 2: assumevalid block must be in our header index.
+	avNode := cm.headerIndex.GetNode(cm.assumeValidHash)
+	if avNode == nil {
+		return false
+	}
+
+	// Condition 3a: node must be an ancestor of (or equal to) avNode.
+	// Equivalent to Core: it->second.GetAncestor(pindex->nHeight) == pindex.
+	// A fork block at the same height as a mainchain ancestor of avNode returns
+	// a DIFFERENT node from GetAncestor, so the condition fails → verify scripts.
+	if avNode.GetAncestor(node.Height) != node {
+		return false
+	}
+
+	// Condition 3b: node must be on the best-header chain.
+	// Equivalent to Core: m_best_header->GetAncestor(pindex->nHeight) == pindex.
+	bestHeader := cm.headerIndex.BestTip()
+	if bestHeader == nil || bestHeader.GetAncestor(node.Height) != node {
+		return false
+	}
+
+	// Condition 4: best header chainwork must meet MinimumChainWork (eclipse defense).
+	if bestHeader.TotalWork.Cmp(cm.params.MinimumChainWork) < 0 {
+		return false
+	}
+
+	// Condition 5: equivalent time between node and bestHeader must exceed 2 weeks.
+	// This prevents the DoS attack of presenting a long chain of recent blocks
+	// and skipping their scripts by claiming they are under the assumevalid block.
+	if getBlockProofEquivalentTime(bestHeader, node, cm.params) <= twoWeeksSec {
+		return false
+	}
+
+	return true
+}
+
 // ConnectBlock validates and connects a block to the active chain.
 func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	hash := block.Header.BlockHash()
@@ -525,7 +630,10 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			block.Header.PrevBlock.String()[:16], cm.tipNode.Hash.String()[:16])
 	}
 
-	// Resolve assume-valid early so we can skip expensive work during IBD.
+	// Resolve assume-valid height (used for IBD-exit check further below).
+	// The full skip-scripts decision is made by shouldSkipScripts (which calls
+	// GetNode directly), so this early-resolution block is kept only for the
+	// assumeValidHeight field used in the IBD exit gate at the bottom.
 	if cm.assumeValidHeight == 0 && !cm.assumeValidHash.IsZero() {
 		avNode := cm.headerIndex.GetNode(cm.assumeValidHash)
 		if avNode != nil {
@@ -533,7 +641,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			log.Printf("chainmgr: assume-valid block resolved at height %d", cm.assumeValidHeight)
 		}
 	}
-	skipScripts := cm.assumeValidHeight > 0 && node.Height <= cm.assumeValidHeight
+
+	// Apply Bitcoin Core's faithful assume-valid script-skip gate
+	// (validation.cpp:2346-2382). This replaces the old HEIGHT-ONLY check
+	// (node.Height <= assumeValidHeight) with the full 5-condition gate:
+	// ancestor-of-avBlock, on-best-header-chain, MinimumChainWork, and
+	// 2-week equivalent-time burial. See shouldSkipScripts for details.
+	skipScripts := cm.shouldSkipScripts(node)
 
 	// Full block validation (skip sanity during IBD -- already done by validationWorker)
 	if !cm.isIBD {
