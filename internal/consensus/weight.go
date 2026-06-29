@@ -160,3 +160,41 @@ func CalcTxSerializeSizeNoWitness(tx *wire.MsgTx) int64 {
 	tx.SerializeNoWitness(&buf)
 	return int64(buf.Len())
 }
+
+// CalcStrippedBlockWeight computes the "stripped" block weight:
+// GetSerializeSize(TX_NO_WITNESS(block)) × WITNESS_SCALE_FACTOR (4).
+//
+// This is the context-free size check that Bitcoin Core applies in CheckBlock
+// (validation.cpp:3947) BEFORE witness data is validated:
+//
+//	GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+//
+// By excluding witness data, this check can be applied context-free without
+// being vulnerable to witness-padding attacks: an attacker can pad witness
+// data on a valid block (the block hash does not commit to witness) to inflate
+// the full block weight beyond MAX_BLOCK_WEIGHT. If the witness-inclusive check
+// ran first, the block hash would be permanently marked invalid — preventing
+// the legitimate block (same hash, correct witness) from ever being accepted.
+// The full witness-inclusive weight check is deferred to CheckBlockContext, after
+// CheckWitnessMalleation has verified the witness commitment (so any excessive
+// witness is the block's own, not an attacker's padding). See Core's
+// ContextualCheckBlock comment (validation.cpp:4173-4178).
+func CalcStrippedBlockWeight(block *wire.MsgBlock) int64 {
+	nTx := uint64(len(block.Transactions))
+
+	// Header (80 bytes) is non-witness data; it contributes 80 × 4 = 320 WU.
+	headerWU := int64(MaxBlockHeaderPayload * WitnessScaleFactor)
+
+	// Tx-count varint is the same in stripped and full serializations.
+	varIntWU := compactSizeLen(nTx) * WitnessScaleFactor
+
+	// Sum stripped (no-witness) tx sizes, each scaled by WitnessScaleFactor.
+	var txWU int64
+	for _, tx := range block.Transactions {
+		var buf bytes.Buffer
+		tx.SerializeNoWitness(&buf)
+		txWU += int64(buf.Len()) * WitnessScaleFactor
+	}
+
+	return headerWU + varIntWU + txWU
+}
