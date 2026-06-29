@@ -151,10 +151,17 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int, skipPOW ...bool) 
 		return ErrBlockMutated
 	}
 
-	// 7. Block weight must not exceed MaxBlockWeight
-	weight := CalcBlockWeight(block)
-	if weight > MaxBlockWeight {
-		return fmt.Errorf("%w: %d > %d", ErrBlockWeightTooHigh, weight, MaxBlockWeight)
+	// 7. Stripped block weight must not exceed MaxBlockWeight.
+	// Uses the non-witness serialized size × WITNESS_SCALE_FACTOR, mirroring
+	// Bitcoin Core's CheckBlock (validation.cpp:3947):
+	//   GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
+	// The witness-inclusive weight check is deferred to CheckBlockContext (after
+	// CheckWitnessMalleation), so a witness-padded block that shares its hash with
+	// a legitimate block cannot be permanently rejected before witness integrity is
+	// verified. See Bitcoin Core ContextualCheckBlock comment (validation.cpp:4173-4178).
+	strippedWeight := CalcStrippedBlockWeight(block)
+	if strippedWeight > MaxBlockWeight {
+		return fmt.Errorf("%w: stripped weight %d > %d", ErrBlockWeightTooHigh, strippedWeight, MaxBlockWeight)
 	}
 
 	return nil
@@ -220,6 +227,23 @@ func CheckBlockContext(block *wire.MsgBlock, prevHeader *wire.BlockHeader, heigh
 				return ErrUnexpectedWitnessInBlock
 			}
 		}
+	}
+
+	// Witness-inclusive block weight check, deferred from CheckBlockSanity to
+	// here so a witness-padded block (same hash, inflated witness) is rejected as
+	// BLOCK_MUTATED (transient) by the witness commitment check above, rather than
+	// permanently rejected on weight before witness integrity is verified.
+	// Mirrors Bitcoin Core ContextualCheckBlock (validation.cpp:4173-4181):
+	//   "After the coinbase witness reserved value and commitment are verified,
+	//    we can check if the block weight passes (before we've checked the
+	//    coinbase witness, it would be possible for the weight to be too large
+	//    by filling up the coinbase witness, which doesn't change the block hash,
+	//    so we couldn't mark the block as permanently failed)."
+	// For pre-segwit blocks the witness is empty so CalcBlockWeight ==
+	// CalcStrippedBlockWeight and this check is redundant but harmless.
+	weight := CalcBlockWeight(block)
+	if weight > MaxBlockWeight {
+		return fmt.Errorf("%w: %d > %d", ErrBlockWeightTooHigh, weight, MaxBlockWeight)
 	}
 
 	// BIP34: coinbase must include the block height as a script number push

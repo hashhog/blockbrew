@@ -2365,15 +2365,35 @@ func (sm *SyncManager) validationWorker() {
 				if err != nil {
 					log.Printf("sync: block %s (height %d) failed sanity check: %v",
 						bwr.req.Hash.String()[:16], bwr.req.Height, err)
-					// CVE-2012-2459 defense: ErrBlockMutated means the merkle
-					// tree had a duplicated adjacent pair, so the same block
-					// hash could legitimately arrive later from an honest peer.
-					// Treat as TRANSIENT — drop this copy and ban the sender
-					// (they shipped a mutated form), but do NOT mark the block
-					// hash permanently invalid. Mirrors Bitcoin Core
-					// validation.cpp:3850-3858 which uses BLOCK_MUTATED
-					// (transient) instead of BLOCK_CONSENSUS for this case.
-					transientMutation := errors.Is(err, consensus.ErrBlockMutated)
+					// BLOCK_MUTATED defense (Bitcoin Core validation.cpp:3843-3911):
+					// The following errors all map to BLOCK_MUTATED (transient) in
+					// Core — the block must be rejected but the block HASH must NOT
+					// be marked permanently invalid, because the same hash can arrive
+					// in a legitimate (non-mutated) form from an honest peer later.
+					//
+					// ErrBlockMutated: CVE-2012-2459 merkle-tree mutation. Duplicate
+					//   adjacent leaves produce the same root as the legitimate block;
+					//   the legitimate block has the same hash and is still valid.
+					//   Core ref: validation.cpp:3850-3858 ("bad-txns-duplicate",
+					//   BLOCK_MUTATED).
+					//
+					// ErrBadMerkleRoot: wrong block body delivered for a known-good
+					//   header. In headers-first sync a misbehaving peer can send wrong
+					//   transaction bytes for a header we already accepted. The block
+					//   hash (which commits only to the header, including the declared
+					//   MerkleRoot) is still valid; another peer may deliver the correct
+					//   body. Core ref: validation.cpp:3843-3848 ("bad-txnmrklroot",
+					//   BLOCK_MUTATED).
+					//
+					// ErrBadWitnessNonceSize / ErrUnexpectedWitnessInBlock: witness
+					//   malleation. Witness data is NOT committed to by the block hash;
+					//   an attacker can modify witness bytes on a valid block without
+					//   changing its hash. Core ref: validation.cpp:3870-3916
+					//   (CheckWitnessMalleation, BLOCK_MUTATED).
+					transientMutation := errors.Is(err, consensus.ErrBlockMutated) ||
+						errors.Is(err, consensus.ErrBadMerkleRoot) ||
+						errors.Is(err, consensus.ErrBadWitnessNonceSize) ||
+						errors.Is(err, consensus.ErrUnexpectedWitnessInBlock)
 					if !transientMutation {
 						// Mark as invalid in header index
 						node := sm.headerIndex.GetNode(bwr.req.Hash)
