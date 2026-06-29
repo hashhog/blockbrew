@@ -7,7 +7,7 @@ package rpc
 //   - dispatch table wires both methods
 //   - getprioritisedtransactions shape (modified_fee omitted when not in
 //     mempool — Core mining.cpp:558).
-//   - getmempoolentry.modifiedfee reflects the operator delta.
+//   - getmempoolentry.fees.modified reflects the operator delta.
 //
 // References: bitcoin-core/src/rpc/mining.cpp.
 
@@ -146,9 +146,9 @@ func TestFIX72_GetPrioritisedTransactionsRPC_Shape(t *testing.T) {
 	}
 }
 
-// TestFIX72_GetMempoolEntry_ModifiedFee asserts the modifiedfee field of
+// TestFIX72_GetMempoolEntry_ModifiedFee asserts the fees.modified field of
 // getmempoolentry / getrawmempool(verbose) actually reflects the operator
-// delta. Without FIX-72 modifiedfee was hardcoded to equal fee.
+// delta. Without FIX-72 fees.modified was hardcoded to equal fees.base.
 func TestFIX72_GetMempoolEntry_ModifiedFee(t *testing.T) {
 	mp := mempool.New(mempool.Config{
 		MaxSize:                10_000_000,
@@ -195,11 +195,11 @@ func TestFIX72_GetMempoolEntry_ModifiedFee(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.ModifiedFee != 1.0 {
-		t.Errorf("pre-delta modifiedfee = %v, want 1.0", got.ModifiedFee)
+	if got.Fees.Modified != 1.0 {
+		t.Errorf("pre-delta fees.modified = %v, want 1.0", got.Fees.Modified)
 	}
 
-	// Apply +50_000_000 sat delta → modifiedfee = 1.5 BTC.
+	// Apply +50_000_000 sat delta → fees.modified = 1.5 BTC.
 	if _, e := mp.GetEntry(txHash), mp.GetFeeDelta(txHash); e != 0 {
 		t.Fatalf("expected zero starting delta, got %d", e)
 	}
@@ -214,10 +214,10 @@ func TestFIX72_GetMempoolEntry_ModifiedFee(t *testing.T) {
 	if err := json.Unmarshal(raw, &got); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if got.Fee != 1.0 {
-		t.Errorf("base fee changed unexpectedly: %v, want 1.0", got.Fee)
+	if got.Fees.Base != 1.0 {
+		t.Errorf("base fee changed unexpectedly: fees.base = %v, want 1.0", got.Fees.Base)
 	}
-	if got.ModifiedFee != 1.5 {
-		t.Errorf("post-delta modifiedfee = %v, want 1.5", got.ModifiedFee)
+	if got.Fees.Modified != 1.5 {
+		t.Errorf("post-delta fees.modified = %v, want 1.5", got.Fees.Modified)
 	}
 }

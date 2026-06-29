@@ -267,33 +267,46 @@ type MempoolInfo struct {
 	Optimal            bool  `json:"optimal"`
 }
 
-// MempoolEntry represents a mempool entry (verbose getrawmempool).
+// MempoolEntryFees is the nested "fees" object emitted by getmempoolentry and
+// getrawmempool(verbose=true). Mirrors Bitcoin Core's fees sub-object in
+// MempoolEntryToJSON (src/rpc/mempool.cpp:528-532): base fee, modified fee
+// (base + prioritisetransaction deltas), ancestor package fees, descendant
+// package fees. All values are in BTC (satoshis / 1e8).
+type MempoolEntryFees struct {
+	Base       float64 `json:"base"`
+	Modified   float64 `json:"modified"`
+	Ancestor   float64 `json:"ancestor"`
+	Descendant float64 `json:"descendant"`
+}
+
+// MempoolEntry represents a mempool entry (verbose getrawmempool /
+// getmempoolentry). Field order matches Bitcoin Core's MempoolEntryToJSON
+// pushKV order (src/rpc/mempool.cpp:515-568).
 type MempoolEntry struct {
-	VSize           int64    `json:"vsize"`
-	Weight          int64    `json:"weight"`
-	Fee             float64  `json:"fee"`
-	ModifiedFee     float64  `json:"modifiedfee"`
-	Time            int64    `json:"time"`
-	Height          int32    `json:"height"`
-	DescendantCount int      `json:"descendantcount"`
-	DescendantSize  int64    `json:"descendantsize"`
-	DescendantFees  float64  `json:"descendantfees"`
-	AncestorCount   int      `json:"ancestorcount"`
-	AncestorSize    int64    `json:"ancestorsize"`
-	AncestorFees    float64  `json:"ancestorfees"`
-	WTxID           string   `json:"wtxid"`
-	Depends         []string `json:"depends"`
-	SpentBy         []string `json:"spentby"`
-	Unbroadcast     bool     `json:"unbroadcast"`
-	// BIP125Replaceable mirrors Core's `bip125-replaceable` field on
-	// `getmempoolentry` / `getrawmempool verbose=true`. Boolean (not the
-	// {"yes","no","unknown"} string used in wallet RPCs because the entry
-	// is by construction known-in-mempool). Computed by walking the tx +
-	// unconfirmed mempool ancestors per BIP-125 §"Signaling implementation"
-	// and short-circuiting to true when `-mempoolfullrbf=1` is in force.
+	VSize           int64            `json:"vsize"`
+	Weight          int64            `json:"weight"`
+	Time            int64            `json:"time"`
+	Height          int32            `json:"height"`
+	DescendantCount int              `json:"descendantcount"`
+	DescendantSize  int64            `json:"descendantsize"`
+	AncestorCount   int              `json:"ancestorcount"`
+	AncestorSize    int64            `json:"ancestorsize"`
+	WTxID           string           `json:"wtxid"`
+	// Fees is the nested fee sub-object matching Core's fees{base, modified,
+	// ancestor, descendant} shape. Replaces the old flat fee/modifiedfee/
+	// ancestorfees/descendantfees top-level fields which Core removed.
 	// W120 BUG-1 / FIX-68. Reference:
 	// `bitcoin-core/src/rpc/mempool.cpp::MempoolEntryToJSON`.
+	Fees            MempoolEntryFees `json:"fees"`
+	Depends         []string         `json:"depends"`
+	SpentBy         []string         `json:"spentby"`
+	// BIP125Replaceable mirrors Core's `bip125-replaceable` field. Boolean
+	// (not the {"yes","no","unknown"} string used in wallet RPCs because the
+	// entry is by construction known-in-mempool). Computed by walking the tx
+	// + unconfirmed mempool ancestors per BIP-125 §"Signaling implementation"
+	// and short-circuiting to true when `-mempoolfullrbf=1` is in force.
 	BIP125Replaceable bool `json:"bip125-replaceable"`
+	Unbroadcast     bool `json:"unbroadcast"`
 }
 
 // PeerInfo represents peer information in RPC responses.

@@ -143,22 +143,25 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 		modifiedFee = s.mempool.GetModifiedFee(entry)
 	}
 	return MempoolEntry{
-		VSize:             entry.Size,
-		Weight:            entry.Size * 4,
-		Fee:               float64(entry.Fee) / satoshiPerBitcoin,
-		ModifiedFee:       float64(modifiedFee) / satoshiPerBitcoin,
-		Time:              entry.Time.Unix(),
-		Height:            entry.Height,
-		DescendantCount:   len(entry.SpentBy) + 1,
-		DescendantSize:    entry.DescendantSize,
-		DescendantFees:    float64(entry.DescendantFee) / satoshiPerBitcoin,
-		AncestorCount:     len(entry.Depends) + 1,
-		AncestorSize:      entry.AncestorSize,
-		AncestorFees:      float64(entry.AncestorFee) / satoshiPerBitcoin,
-		WTxID:             entry.Tx.WTxHash().String(),
+		VSize:           entry.Size,
+		Weight:          entry.Size * 4,
+		Time:            entry.Time.Unix(),
+		Height:          entry.Height,
+		DescendantCount: len(entry.SpentBy) + 1,
+		DescendantSize:  entry.DescendantSize,
+		AncestorCount:   len(entry.Depends) + 1,
+		AncestorSize:    entry.AncestorSize,
+		WTxID:           entry.Tx.WTxHash().String(),
+		Fees: MempoolEntryFees{
+			Base:       float64(entry.Fee) / satoshiPerBitcoin,
+			Modified:   float64(modifiedFee) / satoshiPerBitcoin,
+			Ancestor:   float64(entry.AncestorFee) / satoshiPerBitcoin,
+			Descendant: float64(entry.DescendantFee) / satoshiPerBitcoin,
+		},
 		Depends:           depends,
 		SpentBy:           spentBy,
 		BIP125Replaceable: replaceable,
+		Unbroadcast:       false, // not tracked yet; Core pool.IsUnbroadcastTx()
 	}
 }
 

@@ -1394,7 +1394,10 @@ func (s *Server) handleGetRawMempool(params json.RawMessage) (interface{}, *RPCE
 		return txids, nil
 	}
 
-	// Verbose mode: return detailed entries
+	// Verbose mode: return detailed entries.
+	// Delegate to mempoolEntryFromTxEntry so getrawmempool(verbose) and
+	// getmempoolentry always emit the same shape, including the nested
+	// fees{} object and bip125-replaceable (FIX-72 / W120 BUG-1).
 	result := make(map[string]MempoolEntry)
 	hashes := s.mempool.GetAllTxHashes()
 	for _, h := range hashes {
@@ -1402,39 +1405,7 @@ func (s *Server) handleGetRawMempool(params json.RawMessage) (interface{}, *RPCE
 		if entry == nil {
 			continue
 		}
-
-		depends := make([]string, len(entry.Depends))
-		for i, d := range entry.Depends {
-			depends[i] = d.String()
-		}
-
-		spentBy := make([]string, len(entry.SpentBy))
-		for i, sb := range entry.SpentBy {
-			spentBy[i] = sb.String()
-		}
-
-		// `modifiedfee` is base fee + operator delta from
-		// prioritisetransaction (FIX-72). Identical to the path in
-		// extra_methods.go::mempoolEntryFromTxEntry so getrawmempool
-		// verbose and getmempoolentry agree on the value.
-		modifiedFee := s.mempool.GetModifiedFee(entry)
-		result[h.String()] = MempoolEntry{
-			VSize:           entry.Size,
-			Weight:          entry.Size * 4, // Simplified
-			Fee:             float64(entry.Fee) / satoshiPerBitcoin,
-			ModifiedFee:     float64(modifiedFee) / satoshiPerBitcoin,
-			Time:            entry.Time.Unix(),
-			Height:          entry.Height,
-			DescendantCount: len(entry.SpentBy) + 1,
-			DescendantSize:  entry.DescendantSize,
-			DescendantFees:  float64(entry.DescendantFee) / satoshiPerBitcoin,
-			AncestorCount:   len(entry.Depends) + 1,
-			AncestorSize:    entry.AncestorSize,
-			AncestorFees:    float64(entry.AncestorFee) / satoshiPerBitcoin,
-			WTxID:           entry.Tx.WTxHash().String(),
-			Depends:         depends,
-			SpentBy:         spentBy,
-		}
+		result[h.String()] = s.mempoolEntryFromTxEntry(entry)
 	}
 
 	return result, nil
@@ -1443,6 +1414,43 @@ func (s *Server) handleGetRawMempool(params json.RawMessage) (interface{}, *RPCE
 // ============================================================================
 // Network RPCs
 // ============================================================================
+
+// peerNetworkFromAddr derives the Bitcoin Core "network" string from a peer
+// address of the form "host:port". Mirrors Bitcoin Core's GetNetworkName()
+// mapping (src/netbase.cpp:114-129):
+//
+//	IPv4              → "ipv4"
+//	IPv6 (non-CJDNS) → "ipv6"
+//	fc00::/8 (CJDNS)  → "cjdns"
+//	*.onion           → "onion"
+//	*.i2p             → "i2p"
+//	anything else     → "not_publicly_routable"
+func peerNetworkFromAddr(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// addr may lack a port (rare); try using it raw.
+		host = addr
+	}
+	lower := strings.ToLower(host)
+	if strings.HasSuffix(lower, ".onion") {
+		return "onion"
+	}
+	if strings.HasSuffix(lower, ".i2p") {
+		return "i2p"
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "not_publicly_routable"
+	}
+	if ip.To4() != nil {
+		return "ipv4"
+	}
+	// 16-byte IPv6; CJDNS occupies fc00::/8 (first byte == 0xfc).
+	if ip16 := ip.To16(); ip16 != nil && ip16[0] == 0xfc {
+		return "cjdns"
+	}
+	return "ipv6"
+}
 
 // decodeServiceNames returns human-readable names for service flags.
 func decodeServiceNames(services uint64) []string {
@@ -1480,7 +1488,7 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 		result = append(result, PeerInfo{
 			ID:                    i,
 			Addr:                  p.Address(),
-			Network:               "ipv4",
+			Network:               peerNetworkFromAddr(p.Address()),
 			Services:              fmt.Sprintf("%016x", services),
 			ServicesNames:         decodeServiceNames(services),
 			RelayTxes:             p.RelayTxes(),
