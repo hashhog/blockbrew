@@ -2588,9 +2588,10 @@ func TestProcessSubmittedBlock_FiresOnBlockConnectedOnHappyPath(t *testing.T) {
 // the whole reorg atomically. A crash before that commit leaves on-disk
 // state at the pre-reorg tip; success leaves it at the post-reorg tip.
 //
-// Memory cap: MaxReorgDepth=100 (Bitcoin Core default). Reorgs of greater
-// span return ErrReorgTooDeep rather than splitting the work across multiple
-// commits (which would defeat the atomicity guarantee).
+// Memory cap: MaxReorgDepth (impl-specific, currently 288; Bitcoin Core has
+// no reorg-depth cap). Reorgs of greater span return ErrReorgTooDeep rather
+// than splitting the work across multiple commits (which would defeat the
+// atomicity guarantee).
 //
 // Cross-impl reference: bitcoin-core validation.cpp::ActivateBestChain holds
 // a single CDBBatch across all DisconnectTip / ConnectTip calls.

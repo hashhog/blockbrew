@@ -1520,7 +1520,7 @@ func driveDisconnect(block *wire.MsgBlock, height int32, undoTxs map[int][]prevo
 // phases mirror ChainManager.ReorgTo (chainmanager.go:1705) / ProcessSubmitted
 // Block (chainmanager.go:1286):
 //
-//	(0) DEPTH CAP: len(disconnect) > consensus.MaxReorgDepth(100) ->
+//	(0) DEPTH CAP: len(disconnect) > consensus.MaxReorgDepth (currently 288) ->
 //	    reorg-too-deep (ReorgTo's span bound, chainmanager.go:1740). Core has
 //	    no fixed cap — EXPECTED-DIVERGENCE.
 //	(1) WORK COMPARE: STRICT new>old via *big.Int.Cmp (the EXACT comparator

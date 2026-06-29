@@ -21,15 +21,14 @@ const PhaseStatsLogEvery = 100
 
 // MaxReorgDepth caps the disconnect+reconnect span of a single ReorgTo so the
 // resulting Pebble batch (Pattern D, multi-block atomicity) cannot grow without
-// bound. Bitcoin Core's default is 100 (-maxreorgdepth in chainparams), well
-// below Pebble's 4 GiB ErrBatchTooLarge guardrail at typical undo+UTXO sizes.
-// A reorg that wants more than this returns an error rather than splitting
-// across multiple batches — splitting would forfeit the very atomicity this
-// constant exists to enforce.
-//
-// Cross-impl: clearbit ReorgManager has the same cap; Core uses 100 in
-// validation.cpp's MaxReorgDepth() helper.
-const MaxReorgDepth = 100
+// bound. This is an implementation-specific memory-safety bound; Bitcoin Core
+// has NO reorg-depth cap and follows the most-work chain limited only by prune
+// and undo-file retention. 288 is chosen to match Core's MIN_BLOCKS_TO_KEEP
+// (the minimum pruned-node undo retention), so any reorg within the pruned
+// window is never refused. A reorg that wants more than this returns an error
+// rather than splitting across multiple batches — splitting would forfeit the
+// very atomicity this constant exists to enforce.
+const MaxReorgDepth = 288
 
 // cachedUTXOView wraps a UTXOView with a cache of entries that may have been
 // spent from the underlying view. This is used during block connection so that
@@ -1864,7 +1863,7 @@ var ErrReorgTooDeep = errors.New("reorg span exceeds MaxReorgDepth")
 // MaxReorgDepth caps the span: a reorg that would require disconnect+connect
 // of more than MaxReorgDepth blocks returns ErrReorgTooDeep rather than
 // splitting the work across multiple commits (which would defeat the
-// atomicity guarantee). Bitcoin Core uses the same 100-block default.
+// atomicity guarantee). This is an impl-specific bound; Core has no cap.
 //
 // Cross-impl: validation.cpp::ActivateBestChain holds a single CDBBatch
 // across all DisconnectTip / ConnectTip calls inside one activation; we
