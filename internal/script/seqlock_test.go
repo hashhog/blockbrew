@@ -159,10 +159,10 @@ func TestCSVGate14a_FiveByteScriptNum(t *testing.T) {
 	}
 }
 
-// Gate 14b: fRequireMinimal enforced in witness v0 context.
+// Gate 14b: fRequireMinimal enforced when ScriptVerifyMinimalData flag is set.
 // Non-minimal push of a CSV value MUST be rejected when requireMinimalData() is true.
-// Regression test for Bug 1: previously ScriptNumDeserialize(..., 5, false) was used
-// instead of ScriptNumDeserialize(..., 5, e.requireMinimalData()).
+// Core interpreter.cpp:432: fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA) != 0.
+// The flag — not the sig version — controls enforcement.
 func TestCSVGate14b_RequireMinimalEnforced(t *testing.T) {
 	// Minimal encoding of 1 is 0x01 (1 byte). A non-minimal encoding is 0x01 0x00
 	// (2 bytes: same value, but has an unnecessary zero extension).
@@ -170,18 +170,16 @@ func TestCSVGate14b_RequireMinimalEnforced(t *testing.T) {
 	script := append(nonMinimal, OP_CHECKSEQUENCEVERIFY)
 	tx := makeCSVTx(2, 1, 0) // tx.Sequence=1 so mask check would pass if we got there
 
-	// Witness v0 context: sigVersion is set by executeWitnessProgram which we skip.
-	// We test by building an engine and manually setting sigVersion to WitnessV0
-	// to replicate what happens inside a P2WSH.
-	engine, err := NewEngine(script, tx, 0, ScriptVerifyCSV, 0, []*wire.TxOut{{PkScript: script}})
+	// ScriptVerifyMinimalData flag drives rejection; sig version alone does not.
+	engine, err := NewEngine(script, tx, 0, ScriptVerifyCSV|ScriptVerifyMinimalData, 0, []*wire.TxOut{{PkScript: script}})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	engine.sigVersion = SigVersionWitnessV0 // forces requireMinimalData() = true
+	engine.sigVersion = SigVersionWitnessV0
 	engine.stack = NewStack()
 	err = engine.executeScript(script)
 	if err == nil {
-		t.Fatal("expected failure for non-minimal CSV operand in witness v0, got nil")
+		t.Fatal("expected failure for non-minimal CSV operand with MINIMALDATA flag, got nil")
 	}
 }
 
@@ -205,6 +203,7 @@ func TestCSVGate14c_NonMinimalAcceptedWithoutFlag(t *testing.T) {
 }
 
 // Gate 14d: Same fRequireMinimal fix for OP_CHECKLOCKTIMEVERIFY.
+// ScriptVerifyMinimalData flag is required to trigger rejection (not sig version).
 func TestCLTVGate14d_RequireMinimalEnforced(t *testing.T) {
 	// Non-minimal encoding of locktime 1.
 	nonMinimal := []byte{0x02, 0x01, 0x00}
@@ -220,7 +219,7 @@ func TestCLTVGate14d_RequireMinimalEnforced(t *testing.T) {
 		LockTime: 1,
 	}
 
-	engine, err := NewEngine(script, tx, 0, ScriptVerifyCLTV, 0, []*wire.TxOut{{PkScript: script}})
+	engine, err := NewEngine(script, tx, 0, ScriptVerifyCLTV|ScriptVerifyMinimalData, 0, []*wire.TxOut{{PkScript: script}})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
@@ -228,7 +227,7 @@ func TestCLTVGate14d_RequireMinimalEnforced(t *testing.T) {
 	engine.stack = NewStack()
 	err = engine.executeScript(script)
 	if err == nil {
-		t.Fatal("expected failure for non-minimal CLTV operand in witness v0, got nil")
+		t.Fatal("expected failure for non-minimal CLTV operand with MINIMALDATA flag, got nil")
 	}
 }
 

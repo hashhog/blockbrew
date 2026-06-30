@@ -2305,3 +2305,74 @@ func TestP2AStandard(t *testing.T) {
 		}
 	})
 }
+
+// TestRequireMinimalDataFlagOnly verifies that requireMinimalData() is driven
+// solely by the ScriptVerifyMinimalData flag, matching Core's
+// `fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA) != 0`
+// (interpreter.cpp:432).  Before the fix, SigVersionWitnessV0 and
+// SigVersionTapscript unconditionally returned true, false-rejecting
+// non-minimal pushes in P2WSH/P2TR scripts at block-validation consensus
+// (GetBlockScriptFlags never sets MINIMALDATA).
+func TestRequireMinimalDataFlagOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sv      SigVersion
+		flags   ScriptFlags
+		wantReq bool
+	}{
+		{"base, no flag", SigVersionBase, ScriptVerifyNone, false},
+		{"witnessv0, no flag", SigVersionWitnessV0, ScriptVerifyNone, false},
+		{"tapscript, no flag", SigVersionTapscript, ScriptVerifyNone, false},
+		{"base, flag set", SigVersionBase, ScriptVerifyMinimalData, true},
+		{"witnessv0, flag set", SigVersionWitnessV0, ScriptVerifyMinimalData, true},
+		{"tapscript, flag set", SigVersionTapscript, ScriptVerifyMinimalData, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &Engine{sigVersion: tc.sv, flags: tc.flags}
+			got := e.requireMinimalData()
+			if got != tc.wantReq {
+				t.Errorf("requireMinimalData() = %v, want %v", got, tc.wantReq)
+			}
+		})
+	}
+}
+
+// TestFindAndDeleteOpcodeAligned verifies that FindAndDelete only removes
+// matches at opcode boundaries, mirroring Core's GetOp-based scan
+// (interpreter.cpp:229-255).  The pre-fix raw bytes.Index scan wrongly deleted
+// a pushSig occurrence that began inside a larger push payload.
+func TestFindAndDeleteOpcodeAligned(t *testing.T) {
+	// sig = [0x01,0x02,0x03] → pushSig = [0x03,0x01,0x02,0x03] (direct push, 4 bytes total)
+	sig := []byte{0x01, 0x02, 0x03}
+	pushSig := []byte{0x03, 0x01, 0x02, 0x03} // how it encodes on the wire
+
+	// script = [0x04, 0x03, 0x01, 0x02, 0x03]:
+	//   opcode 0x04 = direct push of 4 bytes, payload = [0x03,0x01,0x02,0x03]
+	// The pushSig [0x03,0x01,0x02,0x03] appears at raw offset 1 (inside the payload)
+	// but NOT at opcode boundary 0 (where the byte is 0x04, not 0x03).
+	// Core DOES NOT delete it; old raw-scan code DID — this is the regression test.
+	embeddedScript := []byte{0x04, 0x03, 0x01, 0x02, 0x03}
+	got := FindAndDelete(embeddedScript, sig)
+	if !bytes.Equal(got, embeddedScript) {
+		t.Errorf("FindAndDelete deleted a match embedded inside a push payload (opcode-boundary bug):\n  got  %x\n  want %x", got, embeddedScript)
+	}
+
+	// Sanity: when the same pushSig sits at real opcode boundaries it IS deleted.
+	atBoundary := append(append([]byte(nil), pushSig...), pushSig...)
+	got2 := FindAndDelete(atBoundary, sig)
+	if len(got2) != 0 {
+		t.Errorf("FindAndDelete should remove boundary matches; got %x, want empty", got2)
+	}
+
+	// Mixed: script = [0x04, pushSig_payload, pushSig] — only the second (at boundary) is removed.
+	// payload inside first push = [0x03,0x01,0x02,0x03] = same bytes as pushSig
+	// boundary occurrence = pushSig bytes starting at offset 5
+	mixedScript := append(append([]byte(nil), embeddedScript...), pushSig...)
+	got3, n := FindAndDeleteCount(mixedScript, sig)
+	if n != 1 {
+		t.Errorf("mixed script: FindAndDeleteCount removed %d occurrences, want 1", n)
+	}
+	if !bytes.Equal(got3, embeddedScript) {
+		t.Errorf("mixed script: after removal got %x, want %x (embedded payload preserved)", got3, embeddedScript)
+	}
+}
