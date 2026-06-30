@@ -205,14 +205,13 @@ func ReadBytes(r io.Reader, n int) ([]byte, error) {
 	return buf, nil
 }
 
-// ReadCompactSize reads a CompactSize-encoded integer from the reader.
-// Returns an error if the value exceeds MaxCompactSize.
-func ReadCompactSize(r io.Reader) (uint64, error) {
-	first, err := ReadUint8(r)
-	if err != nil {
-		return 0, err
-	}
-
+// readCompactSizeContinuation completes a CompactSize read given the first byte
+// that has already been consumed from the reader. It enforces canonical encoding
+// (matching Bitcoin Core's "non-canonical ReadCompactSize()" check) and the
+// MaxCompactSize upper bound. This allows callers that speculatively read the
+// first byte (e.g. to distinguish segwit vs legacy tx format) to reuse the
+// same canonical decoder without pushing the byte back.
+func readCompactSizeContinuation(first byte, r io.Reader) (uint64, error) {
 	var val uint64
 	switch first {
 	case 0xFD:
@@ -245,11 +244,20 @@ func ReadCompactSize(r io.Reader) (uint64, error) {
 	default:
 		val = uint64(first)
 	}
-
 	if val > MaxCompactSize {
 		return 0, ErrCompactSizeTooLarge
 	}
 	return val, nil
+}
+
+// ReadCompactSize reads a CompactSize-encoded integer from the reader.
+// Returns an error if the value exceeds MaxCompactSize.
+func ReadCompactSize(r io.Reader) (uint64, error) {
+	first, err := ReadUint8(r)
+	if err != nil {
+		return 0, err
+	}
+	return readCompactSizeContinuation(first, r)
 }
 
 // ReadVarBytes reads a byte slice with a CompactSize length prefix.

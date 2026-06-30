@@ -889,6 +889,92 @@ func writeVaruintForTest(w *bytes.Buffer, val uint64) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// G31 — legacy tx vin-count non-canonical CompactSize is rejected via
+//        MsgTx.Deserialize (equivalent of Core's "non-canonical ReadCompactSize()")
+//
+// Before the fix, the legacy vin-count branch hand-inlined ReadUint16/32/64LE
+// without the canonical-encoding check, so 0xFD 0x02 0x00 (value 2 in 3 bytes)
+// was silently accepted.  Bitcoin Core rejects it with
+// "non-canonical ReadCompactSize()".
+// ---------------------------------------------------------------------------
+
+func TestW107_G31_LegacyVinCountNonCanonical(t *testing.T) {
+	// Helper: build a raw legacy tx prefix through the version + vin-count bytes.
+	// We intentionally craft only as many bytes as needed to reach the compact
+	// size rejection; the decoder must not reach further fields.
+	makePrefix := func(vinCountBytes ...byte) []byte {
+		// version = 1 (int32 LE)
+		out := []byte{0x01, 0x00, 0x00, 0x00}
+		out = append(out, vinCountBytes...)
+		return out
+	}
+
+	cases := []struct {
+		name      string
+		raw       []byte
+		wantErr   error
+	}{
+		{
+			// 0xFD 0x02 0x00 → value 2 via 3-byte form; canonical would be 0x02
+			name:    "0xFD value=2 (non-canonical)",
+			raw:     makePrefix(0xFD, 0x02, 0x00),
+			wantErr: ErrNonCanonicalCompactSize,
+		},
+		{
+			// 0xFD 0x00 0x00 → value 0 via 3-byte form; canonical would be 0x00
+			name:    "0xFD value=0 (non-canonical)",
+			raw:     makePrefix(0xFD, 0x00, 0x00),
+			wantErr: ErrNonCanonicalCompactSize,
+		},
+		{
+			// 0xFD 0xFC 0x00 → value 252 via 3-byte form; canonical would be 0xFC
+			name:    "0xFD value=252 (non-canonical)",
+			raw:     makePrefix(0xFD, 0xFC, 0x00),
+			wantErr: ErrNonCanonicalCompactSize,
+		},
+		{
+			// 0xFE 0x01 0x00 0x00 0x00 → value 1 via 5-byte form (non-canonical)
+			name:    "0xFE value=1 (non-canonical)",
+			raw:     makePrefix(0xFE, 0x01, 0x00, 0x00, 0x00),
+			wantErr: ErrNonCanonicalCompactSize,
+		},
+		{
+			// 0xFE 0xFF 0xFF 0x00 0x00 → value 0xFFFF (65535) via 5-byte form (non-canonical)
+			name:    "0xFE value=0xFFFF (non-canonical)",
+			raw:     makePrefix(0xFE, 0xFF, 0xFF, 0x00, 0x00),
+			wantErr: ErrNonCanonicalCompactSize,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var tx MsgTx
+			err := tx.Deserialize(bytes.NewReader(tc.raw))
+			if err == nil {
+				t.Fatalf("G31 %s: expected rejection, got nil error", tc.name)
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Errorf("G31 %s: got error %v, want %v", tc.name, err, tc.wantErr)
+			}
+		})
+	}
+
+	// Boundary: 0xFD 0xFD 0x00 → value 253, the minimum canonical use of the
+	// 3-byte form.  The compact-size parse must succeed (no non-canonical error);
+	// the tx will then fail for a different reason (truncated inputs), but that
+	// is fine — we only need to verify the vin-count field itself is accepted.
+	t.Run("0xFD value=253 (canonical boundary)", func(t *testing.T) {
+		raw := makePrefix(0xFD, 0xFD, 0x00)
+		var tx MsgTx
+		err := tx.Deserialize(bytes.NewReader(raw))
+		if errors.Is(err, ErrNonCanonicalCompactSize) {
+			t.Errorf("G31 canonical boundary: 0xFD 0xFD 0x00 (value=253) must NOT be rejected as non-canonical, got: %v", err)
+		}
+		// Any other error (e.g. io.EOF from truncated input) is expected and fine.
+	})
+}
+
 // readVaruintForTest mirrors utxoset.go readVaruint (internal CompactSize, no cap).
 func readVaruintForTest(r *bytes.Reader) (uint64, error) {
 	first, err := r.ReadByte()
