@@ -759,9 +759,11 @@ func processCheckHeader(req *request) string {
 	idx := consensus.NewHeaderIndex(params)
 
 	// Optional retarget-boundary "first" block (height H-2016): wire as
-	// parent.Parent so getTestnetNonMinDiffBits / CalculateNextWorkRequired can
-	// walk to it via GetPrevHeader, matching the rustoshi reference. The corpus's
-	// boundary rows instead supply expected_bits, so this path is defensive.
+	// parent.Parent so getTestnetNonMinDiffBits can walk to it via GetPrevHeader.
+	// NOTE: after the W3 fix, CalculateNextWorkRequired uses lastNode.GetAncestor
+	// (not provider.GetHeaderByHeight), so a single-link parent.Parent chain is
+	// not sufficient for a full ancestor walk to firstHeight. The corpus's boundary
+	// rows always supply expected_bits, so this path is not exercised in practice.
 	if req.First != nil {
 		fbits, ferr := strconv.ParseUint(req.First.Bits, 16, 32)
 		if ferr != nil {
@@ -1024,10 +1026,10 @@ func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMe
 }
 
 // stubBlockProvider is a minimal consensus.BlockProvider backed by a
-// height->BlockNode map plus parent pointers. For the mainnet retarget case
-// blockbrew's CalculateNextWorkRequired only calls GetHeaderByHeight(H-2016)
-// (= "first"); GetPrevHeader is used by the testnet min-difficulty walk-back.
-// A 2-node chain (last -> first) is sufficient for the mainnet boundary case.
+// height->BlockNode map plus parent pointers. GetPrevHeader is used by the
+// testnet min-difficulty walk-back. CalculateNextWorkRequired now resolves the
+// retarget firstNode via lastNode.GetAncestor (W3 fix), so GetHeaderByHeight
+// is no longer called there; it remains to satisfy the BlockProvider interface.
 type stubBlockProvider struct {
 	byHeight map[int32]*consensus.BlockNode
 }

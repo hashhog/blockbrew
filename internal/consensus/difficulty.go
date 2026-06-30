@@ -314,7 +314,7 @@ func GetNextWorkRequired(params *ChainParams, height int32, newBlockTimestamp in
 	}
 
 	// At a difficulty adjustment boundary (every 2016 blocks)
-	return CalculateNextWorkRequired(params, height, lastNode, provider)
+	return CalculateNextWorkRequired(params, height, lastNode)
 }
 
 // getTestnetNonMinDiffBits walks back through the chain to find the last block
@@ -334,10 +334,20 @@ func getTestnetNonMinDiffBits(params *ChainParams, lastNode *BlockNode, provider
 
 // CalculateNextWorkRequired calculates the new difficulty at a retarget boundary.
 // Implements both standard and BIP94 (testnet4) retarget logic.
-func CalculateNextWorkRequired(params *ChainParams, height int32, lastNode *BlockNode, provider BlockProvider) uint32 {
-	// Find the first block of the difficulty period
+//
+// The period-first block is resolved by walking lastNode's OWN parent ancestry,
+// matching Bitcoin Core pow.cpp:44:
+//
+//	pindexFirst = pindexLast->GetAncestor(nHeightFirst)
+//
+// This is branch-correct for fork headers: a fork tip uses its own lineage for
+// the retarget, not whatever the active (best) chain has at that height.
+func CalculateNextWorkRequired(params *ChainParams, height int32, lastNode *BlockNode) uint32 {
+	// Find the first block of the difficulty period by walking lastNode's ancestry.
+	// Core pow.cpp:42-44: nHeightFirst = pindexLast->nHeight - (DifficultyAdjustmentInterval-1)
+	//                      pindexFirst  = pindexLast->GetAncestor(nHeightFirst)
 	firstHeight := height - int32(params.DifficultyAdjInterval)
-	firstNode := provider.GetHeaderByHeight(firstHeight)
+	firstNode := lastNode.GetAncestor(firstHeight)
 	if firstNode == nil {
 		return lastNode.Header.Bits
 	}
