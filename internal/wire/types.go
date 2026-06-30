@@ -335,28 +335,15 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 			return err
 		}
 	} else {
-		// Legacy format: marker was actually the first byte of input count
-		// We need to handle CompactSize properly
-		if marker < 0xFD {
-			inputCount = uint64(marker)
-		} else if marker == 0xFD {
-			v, err := ReadUint16LE(r)
-			if err != nil {
-				return err
-			}
-			inputCount = uint64(v)
-		} else if marker == 0xFE {
-			v, err := ReadUint32LE(r)
-			if err != nil {
-				return err
-			}
-			inputCount = uint64(v)
-		} else {
-			v, err := ReadUint64LE(r)
-			if err != nil {
-				return err
-			}
-			inputCount = v
+		// Legacy format: marker was actually the first byte of the vin count
+		// CompactSize. Delegate to the shared canonical reader so that
+		// non-minimal encodings (e.g. 0xFD 0x02 0x00 for value 2) are
+		// rejected with ErrNonCanonicalCompactSize, matching Bitcoin Core's
+		// "non-canonical ReadCompactSize()" error.
+		var err2 error
+		inputCount, err2 = readCompactSizeContinuation(marker, r)
+		if err2 != nil {
+			return err2
 		}
 	}
 
