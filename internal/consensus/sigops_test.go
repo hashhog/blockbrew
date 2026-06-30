@@ -716,6 +716,64 @@ func TestW74Gate11MaxTxLegacySigOps(t *testing.T) {
 	}
 }
 
+// TestW3P2SHTrailingSmallIntZeroSigops verifies that a P2SH scriptSig whose
+// last opcode is OP_0, OP_1NEGATE, or any OP_1..OP_16 yields 0 P2SH sigops
+// (not the sigops of the prior push), matching Bitcoin Core script.cpp:182-204.
+//
+// Bitcoin Core mechanism: GetScriptOp (script.cpp:312-362) calls pvchRet->clear()
+// at the start of every iteration. For OP_0 (< OP_PUSHDATA1), nSize=0 bytes are
+// read → vData = empty. For OP_1NEGATE/OP_RESERVED/OP_1..OP_16 (> OP_PUSHDATA4),
+// the data block is not entered → vData stays cleared = empty. Either way the
+// last vData after the loop is empty → subscript empty → 0 sigops.
+//
+// Pre-fix: extractLastPush left lastPush unchanged for these opcodes, so the
+// prior push (the real redeemScript) was returned → over-count (false-reject).
+// Post-fix: these opcodes reset lastPush to a non-nil empty slice → 0 sigops.
+//
+// EFFECTIVE: pre-fix CountScriptSigOps returned 3 for the first sub-test;
+// post-fix returns 0, matching Core.
+func TestW3P2SHTrailingSmallIntZeroSigops(t *testing.T) {
+	// RedeemScript with 3 CHECKSIGs — 3 sigops when used as subscript.
+	redeemScript := []byte{script.OP_CHECKSIG, script.OP_CHECKSIG, script.OP_CHECKSIG}
+
+	// Regression baseline: plain push of redeemScript → 3 sigops.
+	plainSig := append([]byte{byte(len(redeemScript))}, redeemScript...)
+	if got := CountScriptSigOps(plainSig); got != 3 {
+		t.Fatalf("baseline: push(redeemScript) → %d sigops, want 3", got)
+	}
+
+	// Each of these trailing opcodes should reset lastPush to empty → 0 sigops.
+	trailingOps := []struct {
+		name string
+		op   byte
+	}{
+		{"OP_0", script.OP_0},
+		{"OP_1NEGATE", script.OP_1NEGATE},
+		{"OP_1", script.OP_1},
+		{"OP_8", script.OP_8},
+		{"OP_16", script.OP_16},
+	}
+	for _, tc := range trailingOps {
+		sig := make([]byte, 0, 1+len(redeemScript)+1)
+		sig = append(sig, byte(len(redeemScript)))
+		sig = append(sig, redeemScript...)
+		sig = append(sig, tc.op)
+
+		got := CountScriptSigOps(sig)
+		if got != 0 {
+			t.Errorf("push(redeemScript) then %s (0x%02x): CountScriptSigOps = %d, want 0 "+
+				"(Core: trailing small-int clears vData → empty redeemScript → 0 sigops)",
+				tc.name, tc.op, got)
+		}
+	}
+
+	// Sanity: OP_0 alone (no prior push) → 0 (nil lastPush or empty lastPush both yield 0).
+	op0Only := []byte{script.OP_0}
+	if got := CountScriptSigOps(op0Only); got != 0 {
+		t.Errorf("OP_0 only: got %d, want 0", got)
+	}
+}
+
 // TestW74CountScriptPubKeySigOps verifies CountScriptPubKeySigOps:
 // - For non-P2SH prevout: uses CountSigOps(scriptPubKey) accurate.
 // - For P2SH prevout: uses CountScriptSigOps(scriptSig) (accurate redeemScript count).

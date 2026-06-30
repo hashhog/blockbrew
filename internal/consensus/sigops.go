@@ -170,11 +170,25 @@ func extractLastPush(scriptBytes []byte) []byte {
 			}
 			pushData = scriptBytes[pc : pc+dataLen]
 			pc += dataLen
+		} else {
+			// OP_0 (0x00), OP_1NEGATE (0x4f), OP_RESERVED (0x50), OP_1..OP_16 (0x51..0x60).
+			// IsPushOnly (called before extractLastPush) guarantees op <= OP_16, so no
+			// other opcodes reach here.
+			//
+			// Bitcoin Core GetScriptOp (script.cpp:312-362) calls pvchRet->clear() at
+			// the start of every call:
+			//   - OP_0 (0x00 < OP_PUSHDATA1): reads 0 bytes → pvchRet = empty slice.
+			//   - OP_1NEGATE..OP_16 (> OP_PUSHDATA4): the data-assignment block is not
+			//     entered → pvchRet stays cleared, i.e. empty.
+			//
+			// In GetSigOpCount(scriptSig) (script.cpp:182-204), vData holds the last
+			// GetOp result. A trailing OP_0 or OP_1..OP_16 therefore leaves vData empty,
+			// so the P2SH redeemScript subscript is empty → 0 sigops.
+			//
+			// Mirror this by setting pushData to a non-nil empty slice, so the
+			// lastPush update below resets it to empty instead of keeping the prior push.
+			pushData = []byte{}
 		}
-		// OP_0 (0x00), OP_1NEGATE (0x4f), and OP_1..OP_16 (0x51..0x60) push
-		// no counted bytes but are valid push opcodes — pushData stays nil and
-		// lastPush is not updated. The caller (CountScriptSigOps) already
-		// verified IsPushOnly, so any opcode > OP_16 cannot reach here.
 
 		if pushData != nil {
 			lastPush = pushData

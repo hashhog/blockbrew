@@ -832,6 +832,148 @@ func TestCheckProofOfWorkZeroTarget(t *testing.T) {
 // BUG-2: PermittedDifficultyTransition
 // ---------------------------------------------------------------------------
 
+// TestW3RetargetForkUsesOwnAncestry verifies that CalculateNextWorkRequired
+// resolves the period-first block from the validated block's OWN parent ancestry
+// (lastNode.GetAncestor(firstHeight)), not the best-chain height index.
+//
+// Bitcoin Core reference: pow.cpp:44
+//
+//	pindexFirst = pindexLast->GetAncestor(nHeightFirst)
+//
+// Pre-fix: provider.GetHeaderByHeight(firstHeight) was called, implemented by
+// HeaderIndex as bestTip.GetAncestor(height). For a fork header whose lineage
+// diverges before the period boundary, this silently used the active chain's
+// firstNode — wrong timestamps, wrong nBits.
+//
+// Post-fix: CalculateNextWorkRequired uses lastNode.GetAncestor(firstHeight).
+//
+// EFFECTIVE: the correct answer (forkChain's firstNode timestamp) and the buggy
+// answer (bestChain's firstNode timestamp) are numerically distinct; the test
+// asserts the function returns the correct one.
+func TestW3RetargetForkUsesOwnAncestry(t *testing.T) {
+	mainnet := MainnetParams()
+	// Custom params with DifficultyAdjInterval=4 so we only need 7+1 blocks.
+	const adjInterval = int64(4)
+	params := &ChainParams{
+		Name:                  "test-w3",
+		DifficultyAdjInterval: adjInterval,
+		TargetTimespan:        adjInterval * 600, // 2400s
+		TargetSpacing:         600,
+		PowNoRetargeting:      false,
+		MinDiffReductionTime:  false,
+		EnforceBIP94:          false,
+		PowLimit:              mainnet.PowLimit,
+		PowLimitBits:          mainnet.PowLimitBits,
+	}
+
+	normalBits := uint32(0x1c00ffff)
+	baseTS := uint32(1_000_000)
+
+	// Best chain: 600-second blocks (regular pace), h=0..7.
+	bestChain := make([]*BlockNode, 8)
+	bestChain[0] = &BlockNode{
+		Height: 0,
+		Header: wire.BlockHeader{Bits: normalBits, Timestamp: baseTS},
+	}
+	for h := 1; h < 8; h++ {
+		bestChain[h] = &BlockNode{
+			Height: int32(h),
+			Parent: bestChain[h-1],
+			Header: wire.BlockHeader{
+				Bits:      normalBits,
+				Timestamp: baseTS + uint32(h)*600,
+			},
+		}
+	}
+
+	// Fork chain: shares genesis (h=0) but uses 1200-second (20-min) blocks from h=1.
+	// This means forkChain[4].Timestamp != bestChain[4].Timestamp.
+	forkChain := make([]*BlockNode, 8)
+	forkChain[0] = bestChain[0] // shared genesis
+	for h := 1; h < 8; h++ {
+		forkChain[h] = &BlockNode{
+			Height: int32(h),
+			Parent: forkChain[h-1],
+			Header: wire.BlockHeader{
+				Bits:      normalBits,
+				Timestamp: baseTS + uint32(h)*1200,
+			},
+		}
+	}
+
+	// At height=8 (second period retarget), firstHeight = 8-4 = 4.
+	//   forkChain[4].Timestamp = baseTS + 4*1200 = baseTS + 4800
+	//   bestChain[4].Timestamp = baseTS + 4*600  = baseTS + 2400
+	//   forkChain[7].Timestamp = baseTS + 7*1200 = baseTS + 8400
+	//
+	// Correct actualTimespan (fork's own ancestry):
+	//   baseTS+8400 - (baseTS+4800) = 3600  (within [600, 9600], no clamping)
+	// Wrong actualTimespan (best-chain ancestry — the pre-fix bug):
+	//   baseTS+8400 - (baseTS+2400) = 6000  (also within bounds)
+	//
+	// TargetTimespan = 2400; baseBits = normalBits (EnforceBIP94=false → lastNode.Bits).
+	// Correct newTarget = normalTarget * 3600 / 2400 = normalTarget * 3/2
+	// Wrong newTarget   = normalTarget * 6000 / 2400 = normalTarget * 5/2
+
+	forkLastNode := forkChain[7]
+
+	result := CalculateNextWorkRequired(params, 8, forkLastNode)
+
+	// Verify the fork's own ancestor at h=4 is accessible and correct.
+	forkFirst := forkLastNode.GetAncestor(4)
+	if forkFirst == nil {
+		t.Fatal("forkLastNode.GetAncestor(4) is nil — parent chain not wired correctly")
+	}
+	if forkFirst != forkChain[4] {
+		t.Fatal("forkLastNode.GetAncestor(4) returned wrong node")
+	}
+
+	// Compute the CORRECT expected nBits (using fork's own firstNode).
+	correctTimespan := int64(forkLastNode.Header.Timestamp) - int64(forkFirst.Header.Timestamp)
+	if correctTimespan < params.TargetTimespan/4 {
+		correctTimespan = params.TargetTimespan / 4
+	}
+	if correctTimespan > params.TargetTimespan*4 {
+		correctTimespan = params.TargetTimespan * 4
+	}
+	oldTarget := CompactToBig(normalBits)
+	expectedTarget := new(big.Int).Mul(oldTarget, big.NewInt(correctTimespan))
+	expectedTarget.Div(expectedTarget, big.NewInt(params.TargetTimespan))
+	if expectedTarget.Cmp(params.PowLimit) > 0 {
+		expectedTarget.Set(params.PowLimit)
+	}
+	expectedBits := BigToCompact(expectedTarget)
+
+	// Compute the WRONG (pre-fix) nBits that would result from using the best
+	// chain's node at h=4 instead of the fork's own node.
+	wrongTimespan := int64(forkLastNode.Header.Timestamp) - int64(bestChain[4].Header.Timestamp)
+	if wrongTimespan < params.TargetTimespan/4 {
+		wrongTimespan = params.TargetTimespan / 4
+	}
+	if wrongTimespan > params.TargetTimespan*4 {
+		wrongTimespan = params.TargetTimespan * 4
+	}
+	wrongTarget := new(big.Int).Mul(oldTarget, big.NewInt(wrongTimespan))
+	wrongTarget.Div(wrongTarget, big.NewInt(params.TargetTimespan))
+	if wrongTarget.Cmp(params.PowLimit) > 0 {
+		wrongTarget.Set(params.PowLimit)
+	}
+	wrongBits := BigToCompact(wrongTarget)
+
+	// Sanity: the two expected results must differ for this test to be meaningful.
+	if expectedBits == wrongBits {
+		t.Fatal("test setup error: correct and wrong nBits are identical — " +
+			"timestamps must differ between fork's h=4 and best chain's h=4")
+	}
+
+	if result != expectedBits {
+		t.Errorf("CalculateNextWorkRequired(h=8, forkLastNode): got %08x, want %08x "+
+			"(fork chain's own firstNode at h=4 → timespan=%ds); "+
+			"pre-fix would give %08x (best-chain firstNode at h=4 → timespan=%ds)",
+			result, expectedBits, correctTimespan, wrongBits, wrongTimespan)
+	}
+}
+
 // TestPermittedDifficultyTransitionMainnet exercises all gate paths on mainnet.
 func TestPermittedDifficultyTransitionMainnet(t *testing.T) {
 	params := MainnetParams()
