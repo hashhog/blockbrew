@@ -485,21 +485,73 @@ func removeOpCodeSeparators(script []byte) []byte {
 	return result
 }
 
-// FindAndDelete removes all occurrences of a push-encoded signature from
-// scriptCode and returns the modified script. Only applies to legacy
-// (sig_version BASE) transactions.
+// scriptOpcodeLen returns the total number of bytes consumed by one opcode
+// starting at script[off] (opcode byte plus any push-data bytes).
+// Returns 0 if off is out of bounds or the script is truncated/malformed.
+// This mirrors Bitcoin Core's CScript::GetOp advancing logic.
+func scriptOpcodeLen(script []byte, off int) int {
+	if off >= len(script) {
+		return 0
+	}
+	op := script[off]
+	switch {
+	case op < OP_PUSHDATA1: // 0x00..0x4b: OP_0 or direct push of op bytes
+		dlen := int(op)
+		if off+1+dlen > len(script) {
+			return 0
+		}
+		return 1 + dlen
+	case op == OP_PUSHDATA1:
+		if off+2 > len(script) {
+			return 0
+		}
+		dlen := int(script[off+1])
+		if off+2+dlen > len(script) {
+			return 0
+		}
+		return 2 + dlen
+	case op == OP_PUSHDATA2:
+		if off+3 > len(script) {
+			return 0
+		}
+		dlen := int(script[off+1]) | int(script[off+2])<<8
+		if off+3+dlen > len(script) {
+			return 0
+		}
+		return 3 + dlen
+	case op == OP_PUSHDATA4:
+		if off+5 > len(script) {
+			return 0
+		}
+		dlen := int(script[off+1]) | int(script[off+2])<<8 | int(script[off+3])<<16 | int(script[off+4])<<24
+		if off+5+dlen > len(script) {
+			return 0
+		}
+		return 5 + dlen
+	default: // all other opcodes are 1 byte
+		return 1
+	}
+}
+
+// FindAndDelete removes all opcode-boundary-aligned occurrences of a
+// push-encoded signature from scriptCode and returns the modified script.
+// Only applies to legacy (sig_version BASE) transactions.
 func FindAndDelete(script []byte, sig []byte) []byte {
 	result, _ := FindAndDeleteCount(script, sig)
 	return result
 }
 
-// FindAndDeleteCount removes all occurrences of a push-encoded signature from
-// scriptCode and returns the modified script together with the number of
-// occurrences removed. Callers that need to enforce CONST_SCRIPTCODE (BIP-342)
-// should use this variant and check whether count > 0.
+// FindAndDeleteCount removes all opcode-boundary-aligned occurrences of a
+// push-encoded signature from scriptCode and returns the modified script
+// together with the number of occurrences removed.  Callers that need to
+// enforce CONST_SCRIPTCODE (BIP-342) should use this variant and check
+// whether count > 0.
 //
-// The returned slice is always a fresh copy; the caller's backing array is
-// never modified.
+// Matches Core's FindAndDelete (interpreter.cpp:229-255): the scan advances
+// pc with GetOp so only positions that begin exactly at an opcode boundary
+// are tested.  A byte sequence that happens to equal the push-encoded sig
+// but starts INSIDE a push payload is not deleted.  The pre-fix raw
+// bytes.Index scan did not respect opcode boundaries.
 func FindAndDeleteCount(script []byte, sig []byte) ([]byte, int) {
 	if len(sig) == 0 {
 		return script, 0
@@ -517,29 +569,56 @@ func FindAndDeleteCount(script []byte, sig []byte) ([]byte, int) {
 		pushSig = append([]byte{OP_PUSHDATA4, byte(len(sig)), byte(len(sig) >> 8), byte(len(sig) >> 16), byte(len(sig) >> 24)}, sig...)
 	}
 
-	// Fast-path: if the pattern doesn't appear at all, return a fresh copy
-	// without the overhead of additional scanning.
+	// Fast-path: if the pattern does not appear anywhere in the raw bytes,
+	// it certainly does not appear at any opcode boundary either.
 	if !bytes.Contains(script, pushSig) {
 		return script, 0
 	}
 
-	// Make a copy so we never mutate the caller's backing array.  The
-	// original FindAndDelete in Bitcoin Core operates on a CScript value
-	// (copy-on-write), but Go slices share their backing array, so an in-place
-	// append would corrupt e.currentScript / prevOut.PkScript.
-	result := make([]byte, len(script))
-	copy(result, script)
+	// Opcode-aligned scan mirroring Core's GetOp do-while loop
+	// (interpreter.cpp:237-247).  pc advances one full opcode at a time;
+	// the pattern is tested only at opcode boundary positions.
+	result := make([]byte, 0, len(script))
+	pc := 0  // always at an opcode boundary
+	pc2 := 0 // start of the pending unwritten region
+	nFound := 0
 
-	// Remove all occurrences and count them.
-	count := 0
 	for {
-		idx := bytes.Index(result, pushSig)
-		if idx == -1 {
+		// Flush bytes accumulated from the previous opcode boundary (pc2..pc).
+		result = append(result, script[pc2:pc]...)
+
+		// Consume all consecutive pattern occurrences at this boundary.
+		for pc+len(pushSig) <= len(script) && bytes.Equal(script[pc:pc+len(pushSig)], pushSig) {
+			pc += len(pushSig)
+			nFound++
+		}
+		pc2 = pc
+
+		// End of script — break before calling scriptOpcodeLen.
+		if pc >= len(script) {
 			break
 		}
-		result = append(result[:idx], result[idx+len(pushSig):]...)
-		count++
+
+		// Advance past one opcode (mirrors GetOp).
+		step := scriptOpcodeLen(script, pc)
+		if step == 0 {
+			// Malformed / truncated script: emit the remainder verbatim and stop,
+			// matching Core's GetOp returning false and the loop exiting with
+			// result += script[pc2..end].
+			result = append(result, script[pc:]...)
+			pc2 = len(script)
+			break
+		}
+		pc += step
 	}
 
-	return result, count
+	// Flush any bytes after the last match (or the entire script if nFound==0).
+	result = append(result, script[pc2:]...)
+
+	if nFound == 0 {
+		// Pattern appeared in the raw bytes but never at an opcode boundary.
+		// Return the original slice without allocating a new one.
+		return script, 0
+	}
+	return result, nFound
 }
