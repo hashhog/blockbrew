@@ -278,25 +278,25 @@ func TestCLTVGate7_OneBelowFinalPasses(t *testing.T) {
 
 // ─── Gate W80 regression: fRequireMinimal ─────────────────────────────────────
 
-// TestCLTVGateW80_RequireMinimalWitnessV0 is the regression test for W80 fix:
-// ScriptNumDeserialize must be called with e.requireMinimalData(), not hard-
-// coded false. In witness v0 context, a non-minimal encoding must be rejected.
-// The seqlock_test.go already covers this (TestCLTVGate14d_RequireMinimalEnforced)
-// but we include it here as a named W80 regression sentinel.
+// TestCLTVGateW80_RequireMinimalWitnessV0Regression is the regression test for W80:
+// ScriptNumDeserialize must be called with e.requireMinimalData(), not hard-coded false,
+// so that the ScriptVerifyMinimalData flag controls enforcement.
+// Core interpreter.cpp:432: fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA) != 0 —
+// the flag, not the sig version, is the sole criterion.
 func TestCLTVGateW80_RequireMinimalWitnessV0Regression(t *testing.T) {
 	// Non-minimal encoding of locktime 1: push 2 bytes [0x01, 0x00] instead of [0x01].
 	nonMinimal := []byte{0x02, 0x01, 0x00}
 	script := append(nonMinimal, OP_CHECKLOCKTIMEVERIFY)
 	tx := makeCLTVTx(1, 0xFFFFFFFE)
-	engine, err := NewEngine(script, tx, 0, ScriptVerifyCLTV, 0, []*wire.TxOut{{PkScript: script}})
+	engine, err := NewEngine(script, tx, 0, ScriptVerifyCLTV|ScriptVerifyMinimalData, 0, []*wire.TxOut{{PkScript: script}})
 	if err != nil {
 		t.Fatalf("NewEngine: %v", err)
 	}
-	// WitnessV0 forces requireMinimalData() = true.
+	// ScriptVerifyMinimalData flag drives the rejection; sig version does not.
 	engine.sigVersion = SigVersionWitnessV0
 	engine.stack = NewStack()
 	if err := engine.executeScript(script); err == nil {
-		t.Fatal("W80 regression: non-minimal CLTV operand in witness v0 must be rejected")
+		t.Fatal("W80 regression: non-minimal CLTV operand with MINIMALDATA flag must be rejected")
 	}
 }
 

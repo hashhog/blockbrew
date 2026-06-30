@@ -726,12 +726,13 @@ func compactSizeLen(n int) int {
 }
 
 // requireMinimalData returns true if minimal push encoding must be enforced.
-// This is mandatory for witness v0 and tapscript (consensus), and for legacy
-// scripts when ScriptVerifyMinimalData flag is set.
+// This is driven solely by the ScriptVerifyMinimalData flag, matching Core's
+// `bool fRequireMinimal = (flags & SCRIPT_VERIFY_MINIMALDATA) != 0`
+// (interpreter.cpp:432). MINIMALDATA is a policy flag — GetBlockScriptFlags
+// (validation.cpp:2250-2289) never includes it, so enforcing it unconditionally
+// for SigVersionWitnessV0/SigVersionTapscript was a false-reject at consensus.
 func (e *Engine) requireMinimalData() bool {
-	return e.sigVersion == SigVersionWitnessV0 ||
-		e.sigVersion == SigVersionTapscript ||
-		(e.flags&ScriptVerifyMinimalData != 0)
+	return e.flags&ScriptVerifyMinimalData != 0
 }
 
 // checkMinimalPush verifies that a push operation uses the minimal encoding.
