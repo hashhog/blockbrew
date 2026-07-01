@@ -57,6 +57,25 @@ type UTXOSet struct {
 	flushes      uint64 // Number of flush operations
 	freshHits    uint64 // Spends of FRESH entries (saved a write+delete)
 	blocksSinceFlush int // Blocks connected since last flush
+
+	// reorgJournal, when non-nil, records the pre-mutation state of every
+	// outpoint touched since BeginReorgJournal (first-write-wins). It lets a
+	// multi-block reorg that fails partway (ChainManager.ReorgTo) restore the
+	// exact pre-reorg in-memory UTXO view without a full-cache wipe — critical
+	// because at tip the freshly-connected coins live ONLY in this cache (the
+	// per-block on-disk flush is deferred), so a blind cache discard would
+	// lose committed state. nil on the hot path (single nil-check per mutation).
+	reorgJournal map[wire.OutPoint]utxoPreimage
+}
+
+// utxoPreimage is the snapshot of one outpoint's cache + tracking-flag state
+// captured before its first mutation within an active reorg journal.
+type utxoPreimage struct {
+	cached  bool
+	entry   *UTXOEntry // prior cache entry (immutable; safe to retain by pointer)
+	dirty   bool
+	deleted bool
+	fresh   bool
 }
 
 // NewUTXOSet creates a new UTXO set backed by the given database.
@@ -135,6 +154,8 @@ func (u *UTXOSet) AddUTXO(outpoint wire.OutPoint, entry *UTXOEntry) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
+	u.journalPre(outpoint)
+
 	// Track size change
 	if existing, ok := u.cache[outpoint]; ok {
 		u.cacheBytes -= estimateEntrySize(existing)
@@ -154,6 +175,8 @@ func (u *UTXOSet) AddUTXO(outpoint wire.OutPoint, entry *UTXOEntry) {
 func (u *UTXOSet) SpendUTXO(outpoint wire.OutPoint) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+
+	u.journalPre(outpoint)
 
 	// Track size change
 	if existing, ok := u.cache[outpoint]; ok {
@@ -179,6 +202,8 @@ func (u *UTXOSet) SpendUTXO(outpoint wire.OutPoint) {
 func (u *UTXOSet) SpendUTXOChecked(outpoint wire.OutPoint) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+
+	u.journalPre(outpoint)
 
 	// Check if already deleted
 	if u.deleted[outpoint] {
@@ -505,6 +530,89 @@ func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 	}
 
 	return nil
+}
+
+// journalPre records the pre-mutation state of op the first time it is touched
+// under an active reorg journal. Callers MUST already hold u.mu. No-op (one
+// map-nil comparison) when no journal is active — i.e. the entire hot path.
+func (u *UTXOSet) journalPre(op wire.OutPoint) {
+	if u.reorgJournal == nil {
+		return
+	}
+	if _, seen := u.reorgJournal[op]; seen {
+		return
+	}
+	e, cached := u.cache[op]
+	u.reorgJournal[op] = utxoPreimage{
+		cached:  cached,
+		entry:   e,
+		dirty:   u.dirty[op],
+		deleted: u.deleted[op],
+		fresh:   u.fresh[op],
+	}
+}
+
+// BeginReorgJournal starts recording UTXO pre-images so the mutations of a
+// multi-block reorg can be rolled back exactly. Idempotent-guarded: a second
+// begin without an intervening commit/rollback is a programming error and
+// panics rather than silently dropping the outer journal.
+func (u *UTXOSet) BeginReorgJournal() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.reorgJournal != nil {
+		panic("consensus: BeginReorgJournal called with a journal already active")
+	}
+	u.reorgJournal = make(map[wire.OutPoint]utxoPreimage, 4096)
+}
+
+// CommitReorgJournal discards the recorded pre-images, making the mutations
+// applied since BeginReorgJournal permanent. Called on a successful reorg.
+func (u *UTXOSet) CommitReorgJournal() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.reorgJournal = nil
+}
+
+// RollbackReorgJournal reverts every outpoint touched since BeginReorgJournal
+// to its recorded pre-image, restoring the exact pre-reorg in-memory UTXO view
+// (cache contents + dirty/deleted/fresh tracking + byte accounting). Untouched
+// entries — including coins merely read into the cache during the reorg — are
+// left in place. Mirrors Bitcoin Core discarding its per-activation
+// CCoinsViewCache when ConnectTip fails in ActivateBestChainStep.
+func (u *UTXOSet) RollbackReorgJournal() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.reorgJournal == nil {
+		return
+	}
+	setBool := func(m map[wire.OutPoint]bool, op wire.OutPoint, v bool) {
+		if v {
+			m[op] = true
+		} else {
+			delete(m, op)
+		}
+	}
+	for op, pre := range u.reorgJournal {
+		var curSize int64
+		if cur, ok := u.cache[op]; ok {
+			curSize = estimateEntrySize(cur)
+		}
+		var preSize int64
+		if pre.cached {
+			preSize = estimateEntrySize(pre.entry)
+		}
+		u.cacheBytes += preSize - curSize
+
+		if pre.cached {
+			u.cache[op] = pre.entry
+		} else {
+			delete(u.cache, op)
+		}
+		setBool(u.dirty, op, pre.dirty)
+		setBool(u.deleted, op, pre.deleted)
+		setBool(u.fresh, op, pre.fresh)
+	}
+	u.reorgJournal = nil
 }
 
 // Size returns the number of cached UTXOs.
@@ -1231,6 +1339,8 @@ func (u *UTXOSet) ApplyTxInUndo(undo *UTXOEntry, outpoint wire.OutPoint) (clean 
 func (u *UTXOSet) SpendUTXOWithCoin(outpoint wire.OutPoint) (*UTXOEntry, bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+
+	u.journalPre(outpoint)
 
 	// Snapshot the existing entry (if any) before mutating cache state.
 	// Use a deep-ish copy of the script so the returned entry doesn't alias

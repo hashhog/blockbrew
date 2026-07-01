@@ -2068,9 +2068,52 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 		cm.mu.Unlock()
 	}()
 
+	// Atomic rollback to the pre-reorg tip.
+	//
+	// A reorg that fails partway (e.g. the competing chain has an invalid
+	// block near its tip — bad-cb-amount) must NOT leave the node on a
+	// partial switch: DisconnectBlock/ConnectBlock advance the in-memory tip
+	// (cm.tipNode) and mutate the in-memory UTXO cache as they run, so an
+	// early `return err` here would strand the node on the losing branch
+	// (tip at B2 after B3 rejected) with a polluted UTXO view — and a later
+	// heavier VALID block that extends the original chain would then be
+	// rejected as "less work / does not connect". Bitcoin Core never does a
+	// partial switch: ActivateBestChainStep connects against a throwaway
+	// CoinsViewCache and only flushes on success; a ConnectTip failure drops
+	// that view and re-selects the best VALID chain, so the node stays on a
+	// fully-connected tip (validation.cpp:3191-3262).
+	//
+	// blockbrew's union-batch design makes the rollback cheap and total: the
+	// on-disk chainstate + UTXO set are untouched until batch.Write() at the
+	// very end, so the on-disk state is STILL the pre-reorg tip throughout the
+	// disconnect/connect loop. We therefore only have to restore the IN-MEMORY
+	// state: the tip pointer and the UTXO cache. The freshly-connected tip's
+	// coins live only in that cache (the per-block on-disk flush is deferred to
+	// the end of the reorg), so a blind cache wipe would lose committed state;
+	// instead the reorg journal (BeginReorgJournal above) recorded a pre-image
+	// of every outpoint the reorg touched, and RollbackReorgJournal reverts
+	// exactly those. currentTip was snapshotted above under cm.mu.
+	rollbackToOriginalTip := func() {
+		cm.mu.Lock()
+		cm.tipNode = currentTip
+		cm.tipHeight = currentTip.Height
+		cm.updateTipCache(currentTip.Hash, currentTip.Height)
+		cm.mu.Unlock()
+		if j, ok := cm.utxoSet.(utxoReorgJournal); ok {
+			j.RollbackReorgJournal()
+		}
+	}
+
+	// Begin recording UTXO pre-images so any failure below can be unwound
+	// exactly. Committed (dropped) only on the fully-successful path.
+	if j, ok := cm.utxoSet.(utxoReorgJournal); ok {
+		j.BeginReorgJournal()
+	}
+
 	// Disconnect blocks from current tip back to fork.
 	for _, node := range disconnectNodes {
 		if err := cm.DisconnectBlock(node.Hash); err != nil {
+			rollbackToOriginalTip()
 			return fmt.Errorf("disconnect block %s failed: %w", node.Hash.String()[:16], err)
 		}
 	}
@@ -2079,9 +2122,23 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 	for _, node := range connectNodes {
 		block, err := cm.chainDB.GetBlock(node.Hash)
 		if err != nil {
+			rollbackToOriginalTip()
 			return fmt.Errorf("block %s not found for reorg: %w", node.Hash.String()[:16], err)
 		}
 		if err := cm.ConnectBlock(block); err != nil {
+			// Consensus failure in the competing chain. Mark the offending
+			// block invalid (and its descendants invalid-child) so it is
+			// excluded from future best-chain selection and the doomed reorg
+			// is not retried on every subsequent block announcement — mirrors
+			// Core's InvalidBlockFound + InvalidChainFound
+			// (validation.cpp:3040-3043, 3237-3243). B-prefix blocks that DID
+			// connect (B1, B2) stay valid, exactly as in Core. The block can
+			// be un-blacklisted later via reconsiderblock.
+			cm.mu.Lock()
+			node.Status |= StatusInvalid
+			cm.markDescendantsInvalid(node)
+			cm.mu.Unlock()
+			rollbackToOriginalTip()
 			return fmt.Errorf("connect block %s failed during reorg: %w", node.Hash.String()[:16], err)
 		}
 	}
@@ -2098,6 +2155,7 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 	if f, ok := cm.utxoSet.(batchFlusher); ok {
 		if err := f.FlushBatch(batch); err != nil {
 			cm.mu.Unlock()
+			rollbackToOriginalTip()
 			return fmt.Errorf("failed to flush reorg UTXO mutations to batch: %w", err)
 		}
 	}
@@ -2107,11 +2165,36 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 	// on-disk state at the pre-reorg tip (in-memory mutations are lost on
 	// restart and the chainstate key on disk still points at currentTip).
 	// After this call returns nil, on-disk state is at newTip.
+	//
+	// A Pebble batch write is all-or-nothing: on error nothing is committed,
+	// so the on-disk state is still the pre-reorg tip and we roll the
+	// in-memory state back to match (FlushBatch already reset the cache's
+	// dirty/deleted/fresh tracking, so DiscardCache here also drops the now
+	// batch-only mutations and re-reads the pre-reorg coins from disk).
 	if err := batch.Write(); err != nil {
+		rollbackToOriginalTip()
 		return fmt.Errorf("failed to commit multi-block reorg batch: %w", err)
 	}
 
+	// Reorg fully applied and durable — the recorded pre-images are no longer
+	// needed; drop them.
+	if j, ok := cm.utxoSet.(utxoReorgJournal); ok {
+		j.CommitReorgJournal()
+	}
+
 	return nil
+}
+
+// utxoReorgJournal is the optional savepoint contract a UTXO view exposes so
+// ReorgTo can record + roll back the in-memory UTXO mutations of a multi-block
+// reorg. *UTXOSet implements it; in-memory test views may not (the reorg then
+// runs without a journal, which is fine because those paths do not rely on the
+// exact-restore guarantee). Kept off UpdatableUTXOView so unrelated views need
+// not implement it.
+type utxoReorgJournal interface {
+	BeginReorgJournal()
+	RollbackReorgJournal()
+	CommitReorgJournal()
 }
 
 // reorgInMemoryFallback executes a reorg without the union-batch path. Only
