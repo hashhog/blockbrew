@@ -779,6 +779,17 @@ func checkMinimalPush(op byte, data []byte, dataLen int) error {
 }
 
 // executeScript executes a single script.
+// checkStackSize enforces MAX_STACK_SIZE exactly like Bitcoin Core
+// interpreter.cpp:1222, which runs `if (stack.size() + altstack.size() >
+// MAX_STACK_SIZE)` at the END of EVERY loop iteration — including pure push
+// opcodes. Exactly 1000 elements is legal; 1001 is a stack-size error.
+func (e *Engine) checkStackSize() error {
+	if e.stack.Size()+e.altStack.Size() > MaxStackSize {
+		return ErrStackOverflow
+	}
+	return nil
+}
+
 func (e *Engine) executeScript(script []byte) error {
 	// Fix #2: Script size limit only applies to BASE and WITNESS_V0.
 	if (e.sigVersion == SigVersionBase || e.sigVersion == SigVersionWitnessV0) && len(script) > MaxScriptSize {
@@ -859,6 +870,9 @@ func (e *Engine) executeScript(script []byte) error {
 				e.stack.Push([]byte{})
 			}
 			opcodePos++
+			if err := e.checkStackSize(); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -881,6 +895,9 @@ func (e *Engine) executeScript(script []byte) error {
 			}
 			pc += dataLen
 			opcodePos++
+			if err := e.checkStackSize(); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -906,6 +923,9 @@ func (e *Engine) executeScript(script []byte) error {
 			}
 			pc += dataLen
 			opcodePos++
+			if err := e.checkStackSize(); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -931,6 +951,9 @@ func (e *Engine) executeScript(script []byte) error {
 			}
 			pc += dataLen
 			opcodePos++
+			if err := e.checkStackSize(); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -956,6 +979,9 @@ func (e *Engine) executeScript(script []byte) error {
 			}
 			pc += dataLen
 			opcodePos++
+			if err := e.checkStackSize(); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -964,6 +990,9 @@ func (e *Engine) executeScript(script []byte) error {
 				e.stack.PushInt(-1)
 			}
 			opcodePos++
+			if err := e.checkStackSize(); err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -972,6 +1001,9 @@ func (e *Engine) executeScript(script []byte) error {
 				e.stack.PushInt(int64(op - OP_1 + 1))
 			}
 			opcodePos++
+			if err := e.checkStackSize(); err != nil {
+				return err
+			}
 			continue
 		}
 
