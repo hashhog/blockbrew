@@ -97,6 +97,17 @@ type Config struct {
 	PprofAddr       string
 	ParallelScripts bool
 
+	// AssumeValid mirrors Bitcoin Core's `-assumevalid` argument. Empty
+	// (default) uses the network's built-in assume-valid block, below which
+	// script verification is skipped during IBD. "0" DISABLES assume-valid
+	// entirely (zeroes the hash) so every historical block is fully
+	// script-verified from genesis — the knob the mainnet-replay harness
+	// uses. A 64-char hex value sets a custom assume-valid block hash.
+	// Applied via ChainParams.ApplyAssumeValidOverride before the chain
+	// manager is constructed. Disabling only ADDS verification, so it can
+	// never make the node accept a block Core would reject.
+	AssumeValid string
+
 	// Prometheus metrics
 	MetricsPort int
 
@@ -513,6 +524,17 @@ func main() {
 		log.Fatalf("Unknown network: %s", cfg.Network)
 	}
 
+	// Apply the -assumevalid override (Core parity). "0" disables assume-valid
+	// so all history is fully script-verified; a hex value sets a custom block.
+	if err := chainParams.ApplyAssumeValidOverride(cfg.AssumeValid); err != nil {
+		log.Fatalf("Invalid -assumevalid: %v", err)
+	}
+	if cfg.AssumeValid == "0" {
+		log.Printf("assumevalid DISABLED (-assumevalid=0): full script verification of all history")
+	} else if cfg.AssumeValid != "" {
+		log.Printf("assumevalid override: %s", chainParams.AssumeValidHash.String())
+	}
+
 	// Warn if RPC password is empty
 	if cfg.RPCPassword == "" {
 		log.Printf("WARNING: RPC password is empty, consider setting --rpcpassword for security")
@@ -550,6 +572,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "Print version and exit")
 	flag.StringVar(&cfg.PprofAddr, "pprof", "", "pprof HTTP server address (e.g., localhost:6060)")
 	flag.BoolVar(&cfg.ParallelScripts, "parallelscripts", true, "Enable parallel script validation")
+	flag.StringVar(&cfg.AssumeValid, "assumevalid", "", "Assume-valid block hash (display hex). Below this block, script verification is skipped during IBD. Empty (default) uses the network's built-in value. `-assumevalid=0` DISABLES the skip so ALL history is fully script-verified (used by the mainnet-replay harness). Mirrors Bitcoin Core's -assumevalid.")
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
@@ -2262,6 +2285,7 @@ func handleImportBlocks(args []string) {
 	dataDir := fs.String("datadir", defaultDataDir, "Data directory")
 	network := fs.String("network", "mainnet", "Network (mainnet, testnet, regtest, signet, testnet4)")
 	parallelScripts := fs.Bool("parallelscripts", true, "Enable parallel script validation")
+	assumeValid := fs.String("assumevalid", "", "Assume-valid block hash (display hex). `-assumevalid=0` disables the skip so ALL history is fully script-verified. Mirrors Bitcoin Core's -assumevalid.")
 	fs.Parse(args)
 
 	var chainParams *consensus.ChainParams
@@ -2278,6 +2302,14 @@ func handleImportBlocks(args []string) {
 		chainParams = consensus.Testnet4Params()
 	default:
 		log.Fatalf("Unknown network: %s", *network)
+	}
+
+	// Apply the -assumevalid override (Core parity). "0" disables assume-valid.
+	if err := chainParams.ApplyAssumeValidOverride(*assumeValid); err != nil {
+		log.Fatalf("Invalid -assumevalid: %v", err)
+	}
+	if *assumeValid == "0" {
+		log.Printf("assumevalid DISABLED (-assumevalid=0): full script verification of all history")
 	}
 
 	// For non-mainnet networks, create a subdirectory
