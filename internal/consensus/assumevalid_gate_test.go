@@ -296,3 +296,96 @@ func TestGetBlockProofEquivalentTime(t *testing.T) {
 		t.Errorf("expected > 1209600 (2 weeks), got %d", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// -assumevalid=0 DISABLE-KNOB (mainnet-replay harness). EFFECTIVE proof:
+// a block that IS script-skipped when assume-valid is configured becomes
+// FULLY script-verified once ChainParams.ApplyAssumeValidOverride("0") zeroes
+// the hash — the exact transformation the `-assumevalid=0` CLI flag performs
+// (cmd/blockbrew/main.go passes chainParams.AssumeValidHash into the manager).
+// ---------------------------------------------------------------------------
+func TestAssumeValidDisableFlag_ForcesFullVerification(t *testing.T) {
+	idx, b1Node, _ := buildTestChainForAV(t)
+	params := RegtestParams()
+
+	// RegtestParams() returns a shared instance and an earlier test in this
+	// package mutates MinimumChainWork; pin it low so condition 4 is satisfied
+	// and this test stays self-contained regardless of run order.
+	params.MinimumChainWork = big.NewInt(0)
+
+	// Configure b1Node (a buried, on-chain, sufficiently-aged block) as the
+	// network's assume-valid block, exactly as mainnet/testnet4 params do.
+	// With AV configured, all five gate conditions hold → scripts are SKIPPED.
+	params.AssumeValidHash = b1Node.Hash
+	cmConfigured := NewChainManager(ChainManagerConfig{
+		Params:          params,
+		HeaderIndex:     idx,
+		AssumeValidHash: params.AssumeValidHash,
+	})
+	if !cmConfigured.shouldSkipScripts(b1Node) {
+		t.Fatal("baseline broken: with assume-valid configured, buried block below av height must be skipped")
+	}
+
+	// --- Apply the flag transformation: -assumevalid=0 ---
+	if err := params.ApplyAssumeValidOverride("0"); err != nil {
+		t.Fatalf("ApplyAssumeValidOverride(\"0\"): %v", err)
+	}
+	if !params.AssumeValidHash.IsZero() {
+		t.Fatal("-assumevalid=0 must zero AssumeValidHash")
+	}
+
+	// Rebuild the manager exactly as cmd/blockbrew/main.go does after the
+	// override (AssumeValidHash: chainParams.AssumeValidHash).
+	cmDisabled := NewChainManager(ChainManagerConfig{
+		Params:          params,
+		HeaderIndex:     idx,
+		AssumeValidHash: params.AssumeValidHash,
+	})
+
+	// --- The EFFECTIVE assertion ---
+	// The SAME buried block below the old assume-valid height now goes through
+	// FULL script verification: shouldSkipScripts must be false because
+	// condition 1 (assumeValidHash.IsZero()) short-circuits to "verify".
+	if cmDisabled.shouldSkipScripts(b1Node) {
+		t.Error("FAIL: with -assumevalid=0, a block below the old assumevalid height must be fully script-verified (skip=false)")
+	} else {
+		t.Log("PASS: -assumevalid=0 forces full script verification of a block below the old assumevalid height")
+	}
+}
+
+// TestApplyAssumeValidOverride_Cases covers the flag-value parsing itself:
+// "" is a no-op, "0" disables, a valid 64-hex sets a custom hash (display →
+// internal byte order), and a malformed value errors.
+func TestApplyAssumeValidOverride_Cases(t *testing.T) {
+	// "" leaves the built-in default untouched.
+	p := MainnetParams()
+	def := p.AssumeValidHash
+	if err := p.ApplyAssumeValidOverride(""); err != nil {
+		t.Fatalf(`ApplyAssumeValidOverride(""): %v`, err)
+	}
+	if p.AssumeValidHash != def {
+		t.Error(`"" must leave AssumeValidHash unchanged`)
+	}
+
+	// "0" zeroes the hash.
+	if err := p.ApplyAssumeValidOverride("0"); err != nil {
+		t.Fatalf(`ApplyAssumeValidOverride("0"): %v`, err)
+	}
+	if !p.AssumeValidHash.IsZero() {
+		t.Error(`"0" must zero AssumeValidHash`)
+	}
+
+	// A valid display-hex hash round-trips to the same String() form.
+	const disp = "00000000000000000000ccebd6d74d9194d8dcdc1d177c478e094bfad51ba5ac"
+	if err := p.ApplyAssumeValidOverride(disp); err != nil {
+		t.Fatalf("ApplyAssumeValidOverride(hex): %v", err)
+	}
+	if got := p.AssumeValidHash.String(); got != disp {
+		t.Errorf("custom hash round-trip: got %s, want %s", got, disp)
+	}
+
+	// A malformed value errors and does not silently no-op.
+	if err := p.ApplyAssumeValidOverride("not-a-hash"); err == nil {
+		t.Error("malformed -assumevalid value must return an error")
+	}
+}
