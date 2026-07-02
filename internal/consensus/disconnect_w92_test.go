@@ -25,7 +25,7 @@ func TestW92_IsUnspendable_MaxScriptSize(t *testing.T) {
 		script []byte
 		want   bool
 	}{
-		{"empty", []byte{}, true},
+		{"empty", []byte{}, false}, // empty scriptPubKey is SPENDABLE (Core script.h:563); block 230926 tx62 vout0 spent at 231021
 		{"opreturn", []byte{0x6a}, true},
 		{"opreturn_with_data", []byte{0x6a, 0x04, 0xde, 0xad, 0xbe, 0xef}, true},
 		{"normal_p2pkh", []byte{0x76, 0xa9, 0x14, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x88, 0xac}, false},
@@ -87,6 +87,49 @@ func TestW92_AddTxOutputs_SkipsOversized(t *testing.T) {
 	}
 	if e := u.GetUTXO(wire.OutPoint{Hash: txid, Index: 2}); e != nil {
 		t.Error("OP_RETURN output (idx 2) should NOT be added")
+	}
+}
+
+// Regression: an EMPTY scriptPubKey is spendable and MUST enter the UTXO set.
+// Mainnet block 230926 tx 62
+// (7bd54def72825008b4ca0f4aeff13e6be2c5fe0f23430629a9d484a1ac2a29b8) vout 0 has
+// an empty scriptPubKey (40960 sats) and is spent at block 231021 tx 192. The
+// old IsUnspendable returned true for empty scripts, so AddTxOutputs dropped the
+// coin; connecting 231021 then failed "missing UTXO" and the from-genesis
+// assumevalid=0 replay wedged at height 231020. Core (script.h:563) treats empty
+// as spendable.
+func TestEmptyScriptOutputIsSpendable(t *testing.T) {
+	if IsUnspendable([]byte{}) {
+		t.Fatal("empty scriptPubKey must be spendable (Core script.h:563)")
+	}
+
+	db := storage.NewChainDB(storage.NewMemDB())
+	u := NewUTXOSet(db)
+
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{
+			{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF}, Sequence: 0xFFFFFFFF},
+		},
+		TxOut: []*wire.TxOut{
+			{Value: 40960, PkScript: []byte{}},   // empty script — MUST be added
+			{Value: 149495904, PkScript: []byte{0x76, 0xa9, 0x14}}, // p2pkh stub — added
+		},
+		LockTime: 0,
+	}
+
+	u.AddTxOutputs(tx, 230926)
+	txid := tx.TxHash()
+
+	if e := u.GetUTXO(wire.OutPoint{Hash: txid, Index: 0}); e == nil {
+		t.Error("empty-script output (idx 0) must be added to the UTXO set — this is the 231020 wedge bug")
+	}
+	if e := u.GetUTXO(wire.OutPoint{Hash: txid, Index: 1}); e == nil {
+		t.Error("p2pkh output (idx 1) should be added")
+	}
+	// Spend it: the coin must be retrievable/removable (proves it is a real UTXO).
+	if _, spent := u.SpendUTXOWithCoin(wire.OutPoint{Hash: txid, Index: 0}); !spent {
+		t.Error("empty-script output must be spendable")
 	}
 }
 
