@@ -578,6 +578,20 @@ func (p *Peer) readHandler() {
 			// kill the connection. The payload was fully consumed and checksum-
 			// verified, so the TCP stream remains valid.
 			if IsNonFatalMessageError(err) {
+				// Bitcoin Core net_processing.cpp:4040 (inv) / :4131 (getdata):
+				// an inv/getdata carrying > MAX_INV_SZ (50000) entries is peer
+				// misbehavior — Misbehaving() + disconnect, NOT a silent skip.
+				// blockbrew's MsgInv/MsgGetData.Deserialize surface this as a
+				// NonFatalMessageError wrapping ErrTooManyInvVects; without this
+				// guard an attacker could stream oversized invs forever unpenalised.
+				var nfe *NonFatalMessageError
+				if errors.As(err, &nfe) && errors.Is(nfe.Err, ErrTooManyInvVects) &&
+					(nfe.Command == "inv" || nfe.Command == "getdata") {
+					p.Misbehaving(100, fmt.Sprintf(
+						"oversize %s message (> MAX_INV_SZ=%d)", nfe.Command, MaxInvVects))
+					p.Disconnect()
+					return
+				}
 				log.Printf("peer %s: skipping bad message: %v", p.addr, err)
 				continue
 			}
