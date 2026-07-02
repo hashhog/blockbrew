@@ -332,10 +332,6 @@ func (v *InMemoryUTXOView) ApplyTxInUndo(undo *UTXOEntry, outpoint wire.OutPoint
 //	return (size() > 0 && *begin() == OP_RETURN) || (size() > MAX_SCRIPT_SIZE);
 //
 // A script is unspendable if:
-//   - it is empty (matches Core's `size() > 0 && ...` falsy branch — Core treats
-//     empty as spendable, but blockbrew's ConnectBlock/DisconnectBlock both elide
-//     empty-script outputs as a degenerate case so we keep the empty=>true
-//     fast path; an empty script can never appear on a real chain anyway), OR
 //   - it starts with OP_RETURN (0x6a), OR
 //   - it exceeds MaxScriptSize (10,000 bytes) — a script larger than this can
 //     never be evaluated successfully, so the output is pruned from the UTXO
@@ -343,11 +339,20 @@ func (v *InMemoryUTXOView) ApplyTxInUndo(undo *UTXOEntry, outpoint wire.OutPoint
 //     where an unspendable >10k-byte output WAS added to the UTXO set during
 //     ConnectBlock, then DisconnectBlock dutifully tried to remove it on
 //     reorg. Both paths must use the SAME predicate to stay symmetric.
+//
+// An EMPTY scriptPubKey is SPENDABLE and MUST enter the UTXO set — Core's
+// `size() > 0 && *begin() == OP_RETURN` short-circuits to false for size()==0,
+// so empty scripts are never pruned. The prior code wrongly returned true for
+// empty scripts on the assumption "an empty script can never appear on a real
+// chain"; that assumption is false. Mainnet block 230926 tx 62
+// (7bd54def72825008b4ca0f4aeff13e6be2c5fe0f23430629a9d484a1ac2a29b8) vout 0 has
+// an empty scriptPubKey (value 40960 sats) and is spent at block 231021 tx 192.
+// Dropping it here left the coin absent from the UTXO set, so connecting 231021
+// failed "missing UTXO" and the from-genesis assumevalid=0 replay wedged at
+// height 231020. This now mirrors Core (script.h:563 CScript::IsUnspendable)
+// exactly.
 func IsUnspendable(pkScript []byte) bool {
-	if len(pkScript) == 0 {
-		return true
-	}
-	if pkScript[0] == 0x6a { // OP_RETURN
+	if len(pkScript) > 0 && pkScript[0] == 0x6a { // OP_RETURN
 		return true
 	}
 	if len(pkScript) > MaxScriptSize {
@@ -414,14 +419,15 @@ func IsNullData(pkScript []byte) bool {
 }
 
 // AddTxOutputs adds all outputs from a transaction to the UTXO view.
-// Outputs that are provably unspendable (OP_RETURN or empty script) are
-// skipped to avoid polluting the UTXO set.
+// Outputs that are provably unspendable (OP_RETURN or oversized scripts) are
+// skipped to avoid polluting the UTXO set. Empty scriptPubKeys are SPENDABLE
+// and are added (see IsUnspendable).
 func (v *InMemoryUTXOView) AddTxOutputs(tx *wire.MsgTx, height int32) {
 	txHash := tx.TxHash()
 	isCoinbase := IsCoinbaseTx(tx)
 
 	for i, out := range tx.TxOut {
-		// Skip provably unspendable outputs (OP_RETURN or empty script)
+		// Skip provably unspendable outputs (OP_RETURN or oversized scripts).
 		if IsUnspendable(out.PkScript) {
 			continue
 		}
