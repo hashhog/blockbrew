@@ -766,6 +766,7 @@ func (e *Engine) opCheckSig(script []byte) error {
 			TapLeafHash: &leafHash,
 			KeyVersion:  0,
 			CodeSepPos:  e.codesepPos,
+			AnnexHash:   e.annexHash,
 		}
 		sighash, err = CalcTaprootSignatureHash(hashType, e.tx, e.txIdx, e.prevOuts, opts)
 		if err != nil {
@@ -1055,6 +1056,7 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 		TapLeafHash: &leafHash,
 		KeyVersion:  0,
 		CodeSepPos:  e.codesepPos,
+		AnnexHash:   e.annexHash,
 	}
 	sighash, err := CalcTaprootSignatureHash(hashType, e.tx, e.txIdx, e.prevOuts, opts)
 	if err != nil {
