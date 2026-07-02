@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"fmt"
 	"math/big"
 
 	"github.com/hashhog/blockbrew/internal/script"
@@ -568,4 +569,41 @@ func Testnet4Params() *ChainParams {
 		}(),
 	}
 	return testnet4Params
+}
+
+// ApplyAssumeValidOverride applies a CLI/config `-assumevalid=<value>` override
+// to p.AssumeValidHash, mirroring Bitcoin Core's `-assumevalid` argument
+// (src/init.cpp / src/kernel/chainparams; ArgsManager "-assumevalid"):
+//
+//   - ""       — flag not set: leave the chain-params default untouched.
+//   - "0"      — DISABLE assume-valid: zero the hash so every historical
+//                block is FULLY script-verified. In Core a null/zero
+//                assumevalid hash means "always verify" (validation.cpp: the
+//                assumevalid gate short-circuits when the configured block is
+//                null); blockbrew's ChainManager.shouldSkipScripts condition 1
+//                (`assumeValidHash.IsZero() -> return false`) does the same.
+//                This is the knob the mainnet-replay harness uses to force a
+//                from-genesis full-script replay.
+//   - 64-hex   — set a custom assume-valid block hash (display/big-endian hex,
+//                converted to internal little-endian order, like the built-in
+//                defaults). Matches Core allowing an operator-supplied hash.
+//
+// Returns an error only for a malformed non-"0" value. Because disabling only
+// ADDS verification, it can never make the node accept a block it would
+// otherwise reject.
+func (p *ChainParams) ApplyAssumeValidOverride(assumevalid string) error {
+	switch assumevalid {
+	case "":
+		return nil // unset: keep the params default
+	case "0":
+		p.AssumeValidHash = wire.Hash256{} // zero hash -> always verify
+		return nil
+	default:
+		h, err := wire.NewHash256FromHex(assumevalid)
+		if err != nil {
+			return fmt.Errorf("-assumevalid=%q: %w", assumevalid, err)
+		}
+		p.AssumeValidHash = h
+		return nil
+	}
 }
