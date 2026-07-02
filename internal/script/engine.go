@@ -114,6 +114,7 @@ type Engine struct {
 	codesepPos  uint32        // Position of last OP_CODESEPARATOR (for tapscript)
 	sigopBudget int           // Tapscript signature validation weight budget
 	opSuccess   bool          // True if an OP_SUCCESSx short-circuit fired in the most recent tapscript executeScript()
+	annexHash   *[32]byte     // SHA256 of the length-prefixed annex (nil = no annex), committed to by tapscript CHECKSIG(ADD) sighash
 
 	// For legacy sighash: track the script and the byte offset after last OP_CODESEPARATOR
 	currentScript    []byte // The script currently being executed
@@ -550,6 +551,21 @@ func (e *Engine) executeTaprootKeyPath(pubKey []byte, sig []byte, annex []byte) 
 // executeTaprootScriptPath executes a taproot script path spend.
 func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, annex []byte) error {
 	e.sigVersion = SigVersionTapscript
+
+	// Compute the annex commitment ONCE for the whole spend, mirroring the key
+	// path (executeTaprootKeyPath) and Core, which computes execdata (including
+	// m_annex_hash) before branching on key- vs script-path
+	// (interpreter.cpp:1951-1959). BIP341 commits to the annex on BOTH paths:
+	// spend_type = (ext_flag<<1) + have_annex, so a script-path spend with an
+	// annex present has spend_type=3 and sha_annex in the SigMsg. The tapscript
+	// CHECKSIG/CHECKSIGADD opcodes thread e.annexHash into their sighash options.
+	e.annexHash = nil
+	if annex != nil {
+		var annexBuf bytes.Buffer
+		wire.WriteVarBytes(&annexBuf, annex)
+		annexHash := crypto.SHA256Hash(annexBuf.Bytes())
+		e.annexHash = &annexHash
+	}
 
 	// witness = [stack items..., script, control block]
 	if len(witness) < 2 {
