@@ -2909,10 +2909,11 @@ func TestReorgTo_CrashPreCommitPreservesPreReorgState(t *testing.T) {
 	}
 }
 
-// TestReorgTo_MaxReorgDepthCap asserts that a reorg whose disconnect+connect
-// span exceeds MaxReorgDepth is refused with ErrReorgTooDeep instead of
-// silently splitting the work across multiple Pebble commits (which would
-// forfeit the atomicity guarantee).
+// TestReorgTo_MaxReorgDepthCap asserts that on a PRUNED node a reorg whose
+// disconnect+connect span exceeds MaxReorgDepth is refused with ErrReorgTooDeep
+// instead of reorging deeper than the retained undo window (whose undo records
+// have been pruned away). The cap is the controlled protection for pruned nodes;
+// archive nodes have no cap (see TestReorgTo_DeepReorg_ArchiveFollows).
 //
 // We exercise this with a chain length that crosses the boundary: A-chain
 // of MaxReorgDepth+1 blocks vs B-chain of one heavier block from genesis
@@ -2928,10 +2929,20 @@ func TestReorgTo_MaxReorgDepthCap(t *testing.T) {
 	memdb := storage.NewMemDB()
 	chainDB := storage.NewChainDB(memdb)
 
+	// The chains below are 289+ blocks. Regtest halves the subsidy every 150
+	// blocks, but createSiblingBlock funds coinbases via CalcBlockSubsidy (the
+	// 210k-interval free function), so a 150-block halving would make
+	// ConnectBlock reject block 150 for over-claiming. Lift the interval above
+	// the chain length so the two agree (test-only; irrelevant to the cap).
+	params.SubsidyHalvingInterval = SubsidyHalvingInterval
+
 	cm := NewChainManager(ChainManagerConfig{
 		Params:      params,
 		HeaderIndex: idx,
 		ChainDB:     chainDB,
+		// Pruned node: the cap protects against reorging past the retained
+		// undo window.
+		PruningEnabled: true,
 	})
 
 	// Build A-chain of MaxReorgDepth+1 blocks (each with distinct extra
@@ -2990,6 +3001,89 @@ func TestReorgTo_MaxReorgDepthCap(t *testing.T) {
 	if postTipHeight != preTipHeight {
 		t.Errorf("tip height moved despite ErrReorgTooDeep: pre=%d post=%d",
 			preTipHeight, postTipHeight)
+	}
+}
+
+// TestReorgTo_DeepReorg_ArchiveFollows asserts the Core-parity behavior for an
+// ARCHIVE node (pruning disabled — the default): a reorg to a higher-work valid
+// chain whose disconnect+connect span exceeds MaxReorgDepth is FOLLOWED, not
+// refused. Bitcoin Core's ActivateBestChainStep loops to the fork point with no
+// depth cap (MIN_BLOCKS_TO_KEEP=288 is a pruning-only retention bound); refusing
+// a deep reorg on an archive node — which retains every undo record — was a
+// Class-A consensus divergence (blockbrew stayed on the lower-work minority
+// chain Core abandons). This is the same >MaxReorgDepth-span scenario as
+// TestReorgTo_MaxReorgDepthCap, differing only in PruningEnabled=false.
+func TestReorgTo_DeepReorg_ArchiveFollows(t *testing.T) {
+	if MaxReorgDepth < 4 {
+		t.Skipf("MaxReorgDepth=%d too small for this test", MaxReorgDepth)
+	}
+
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	memdb := storage.NewMemDB()
+	chainDB := storage.NewChainDB(memdb)
+
+	// See TestReorgTo_MaxReorgDepthCap: lift the halving interval above the
+	// 289-block chain length so ConnectBlock's subsidy check agrees with
+	// createSiblingBlock's CalcBlockSubsidy funding.
+	params.SubsidyHalvingInterval = SubsidyHalvingInterval
+
+	cm := NewChainManager(ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     chainDB,
+		// Archive node (default): no reorg-depth cap — follow the most-work
+		// chain to any depth like Core.
+		PruningEnabled: false,
+	})
+
+	// A-chain of MaxReorgDepth+1 blocks (the active chain, connected as bodies).
+	genesis := idx.Genesis()
+	prev := genesis
+	for i := 0; i < MaxReorgDepth+1; i++ {
+		blk := createSiblingBlock(t, params, prev, byte(0x40+(i%160)))
+		if _, err := idx.AddHeader(blk.Header, true); err != nil {
+			t.Fatalf("A%d AddHeader: %v", i+1, err)
+		}
+		if err := chainDB.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
+			t.Fatalf("A%d StoreBlock: %v", i+1, err)
+		}
+		if err := cm.ConnectBlock(blk); err != nil {
+			t.Fatalf("A%d ConnectBlock: %v", i+1, err)
+		}
+		prev = idx.GetNode(blk.Header.BlockHash())
+	}
+
+	// B-chain of MaxReorgDepth+2 blocks rooted at genesis — strictly more work.
+	// Reorging to it disconnects all MaxReorgDepth+1 A-blocks and connects all
+	// MaxReorgDepth+2 B-blocks: span 2*MaxReorgDepth+3, far exceeding the cap.
+	bPrev := genesis
+	for i := 0; i < MaxReorgDepth+2; i++ {
+		blk := createSiblingBlock(t, params, bPrev, byte(0xC0+(i%64)))
+		node, err := idx.AddHeader(blk.Header, true)
+		if err != nil {
+			t.Fatalf("B%d AddHeader: %v", i+1, err)
+		}
+		if err := chainDB.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
+			t.Fatalf("B%d StoreBlock: %v", i+1, err)
+		}
+		bPrev = node
+	}
+
+	if err := cm.ReorgTo(bPrev); err != nil {
+		t.Fatalf("archive node refused a deep higher-work reorg (span > MaxReorgDepth=%d): %v — "+
+			"Core follows the most-work chain to any depth", MaxReorgDepth, err)
+	}
+
+	// Tip must now be the deep fork's tip (B), matching Core.
+	postTipHash, postTipHeight := cm.BestBlock()
+	wantHash := bPrev.Hash
+	if postTipHash != wantHash {
+		t.Errorf("archive deep reorg did not land on the B tip: got %s want %s",
+			postTipHash.String()[:16], wantHash.String()[:16])
+	}
+	if int(postTipHeight) != MaxReorgDepth+2 {
+		t.Errorf("post-reorg height = %d, want B-tip height %d", postTipHeight, MaxReorgDepth+2)
 	}
 }
 

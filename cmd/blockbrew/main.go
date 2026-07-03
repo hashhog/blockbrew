@@ -948,8 +948,12 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		UTXOSet:         utxoSet,
 		AssumeValidHash: chainParams.AssumeValidHash,
 		ParallelScripts: cfg.ParallelScripts,
+		// Archive (default) drops the MaxReorgDepth cap so deep reorgs follow
+		// the most-work chain like Core; pruned keeps the cap as protection
+		// against reorging past the retained undo window.
+		PruningEnabled: pruner.IsEnabled(),
 	})
-	log.Printf("Chain manager initialized (parallel scripts: %v)", cfg.ParallelScripts)
+	log.Printf("Chain manager initialized (parallel scripts: %v, pruning: %v)", cfg.ParallelScripts, pruner.IsEnabled())
 
 	// Wire the wait-family-RPC tip-change notifier (Core KernelNotifications
 	// blockTip / WaitTipChanged). Pulsed by chainMgr.updateTipCache on every
