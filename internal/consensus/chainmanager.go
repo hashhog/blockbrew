@@ -1516,6 +1516,18 @@ func (cm *ChainManager) IsIBD() bool {
 	return cm.isIBD
 }
 
+// IsPruning reports whether the node is pruning block/undo data (-prune=N,
+// N>0). Fixed at construction from ChainManagerConfig.PruningEnabled, so no
+// lock is needed. The P2P fork-download descent (p2p/sync.go) consults this to
+// decide whether the MaxReorgDepth cap applies: an ARCHIVE node retains every
+// undo record and, like Bitcoin Core, follows the most-work valid chain to ANY
+// depth, so its below-tip fork download must NOT be depth-capped (else it would
+// strand on the minority chain — the same Class-A divergence ReorgTo's
+// pruning-gated cap already avoids). A PRUNED node keeps the cap.
+func (cm *ChainManager) IsPruning() bool {
+	return cm.pruningEnabled
+}
+
 // SetIBD sets the IBD mode flag.
 func (cm *ChainManager) SetIBD(isIBD bool) {
 	cm.mu.Lock()

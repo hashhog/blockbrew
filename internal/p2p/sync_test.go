@@ -1066,6 +1066,11 @@ type mockChainConnector struct {
 	// side-branch-store / reorg semantics. connectFn (if set) backs ConnectBlock.
 	processFn func(*wire.MsgBlock) error
 	connectFn func(*wire.MsgBlock) error
+
+	// pruning backs IsPruning(): zero value (false) = archive, so the
+	// fork-download descent is uncapped on a genuine below-tip reorg
+	// (Core-parity). Set true to model a pruned node that keeps the cap.
+	pruning bool
 }
 
 func (m *mockChainConnector) BestBlock() (wire.Hash256, int32) {
@@ -1098,6 +1103,7 @@ func (m *mockChainConnector) ProcessSubmittedBlock(b *wire.MsgBlock) error {
 func (m *mockChainConnector) ReloadChainState()        {}
 func (m *mockChainConnector) HasPendingRecovery() bool { return false }
 func (m *mockChainConnector) IsIBD() bool              { return !m.postIBD }
+func (m *mockChainConnector) IsPruning() bool          { return m.pruning }
 
 // TestIsIBDActive_TrueAtStartup verifies that a freshly created SyncManager
 // reports IsIBDActive()=true before any blocks have connected.
