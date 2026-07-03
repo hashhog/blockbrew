@@ -307,6 +307,13 @@ type ChainConnector interface {
 	// transient header-ambiguity burst can't drain the outbound peer pool
 	// (W15 root-cause fix).
 	IsIBD() bool
+	// IsPruning reports whether the node prunes block/undo data (-prune=N,
+	// N>0). The fork-aware download descent uses it to decide whether the
+	// MaxReorgDepth cap applies: an archive node follows the most-work chain
+	// to any depth (Core-parity, no cap on a genuine below-tip reorg); a
+	// pruned node keeps the cap (a reorg past its retained undo window is
+	// un-appliable). Mirrors ChainManager.ReorgTo's pruning gate.
+	IsPruning() bool
 }
 
 // SyncManagerConfig configures the sync manager.
@@ -1710,8 +1717,38 @@ func (sm *SyncManager) StartBlockDownload() {
 	// reorgs are refused by ReorgTo), so the gap is <= MaxReorgDepth and
 	// descendFrom stays bestTip — the fork-aware descent below the active tip is
 	// untouched (GAP2 reorg-drop invariant preserved).
+	// The MaxReorgDepth cap below serves TWO distinct roles and must only apply
+	// to the first:
+	//
+	//  (1) Forward-IBD windowing. When bestTip is a straight EXTENSION of the
+	//      active chain far ahead of the validated floor (a huge IBD gap), the
+	//      descent would otherwise collect the TOP window near the header tip,
+	//      while sequential validation needs the BOTTOM (startHeight+1). Capping
+	//      descendFrom to startHeight+MaxReorgDepth collects the bottom window;
+	//      the drain-rebuild advances it. This is pure batching — correct to keep.
+	//
+	//  (2) Below-tip reorg refusal. For a heavier fork that forks BELOW the
+	//      active tip, capping the descent stops it before it reaches the true
+	//      fork point, so the bottom bridging bodies (fork_point+1 ..) are never
+	//      enqueued → ReorgTo never sees the fork tip → the node strands on the
+	//      minority chain. Bitcoin Core (FindNextBlocksToDownload) follows the
+	//      most-work header chain to the fork point at ANY depth. The old comment
+	//      "a deeper reorg would be refused by ReorgTo" is now FALSE for an
+	//      ARCHIVE node: ReorgTo's cap is gated on pruning (chainmanager.go), so
+	//      an archive node reorgs to any depth and its download must too.
+	//
+	// Distinguish the two: bestTip is a forward extension iff its ancestor at the
+	// active tip height IS the active tip. A genuine below-tip reorg on an
+	// archive node (not pruning) must NOT be capped; every other case (forward
+	// extension, pruned node, or an unresolved active tip where we cannot prove
+	// it is a below-tip reorg) keeps the cap.
+	isForwardExtension := activeTip != nil && bestTip.GetAncestor(activeTip.Height) == activeTip
+	belowTipReorg := activeTip != nil && !isForwardExtension
+	pruning := sm.chainMgr != nil && sm.chainMgr.IsPruning()
+	capDescent := !(belowTipReorg && !pruning)
+
 	descendFrom := bestTip
-	if bestTip.Height-startHeight > consensus.MaxReorgDepth {
+	if capDescent && bestTip.Height-startHeight > consensus.MaxReorgDepth {
 		if capped := bestTip.GetAncestor(startHeight + consensus.MaxReorgDepth); capped != nil {
 			descendFrom = capped
 		}
@@ -1720,9 +1757,9 @@ func (sm *SyncManager) StartBlockDownload() {
 	node := descendFrom
 	for node != nil && needBody(node) {
 		nodes = append(nodes, node)
-		if len(nodes) >= consensus.MaxReorgDepth {
+		if capDescent && len(nodes) >= consensus.MaxReorgDepth {
 			log.Printf("sync: block-download descent hit MaxReorgDepth=%d at height %d without reaching the fork point; "+
-				"capping (a deeper reorg would be refused by ReorgTo)", consensus.MaxReorgDepth, node.Height)
+				"capping (forward-IBD window or pruned node; a below-tip reorg on an archive node descends uncapped to the fork point)", consensus.MaxReorgDepth, node.Height)
 			break
 		}
 		node = node.Parent

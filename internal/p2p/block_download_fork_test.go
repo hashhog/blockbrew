@@ -156,6 +156,141 @@ func TestStartBlockDownload_BelowTipHeavierFork(t *testing.T) {
 	}
 }
 
+// TestStartBlockDownload_DeepBelowTipFork_ArchiveUncapped is the P2P
+// fork-DEPTH-cap divergence regression. A heavier fork whose split point is MORE
+// than MaxReorgDepth (288) blocks below the active validated tip must, on an
+// ARCHIVE node, have its ENTIRE bridging span (fork_point+1 .. fork_tip)
+// enqueued — Bitcoin Core's FindNextBlocksToDownload follows the most-work
+// header chain to the fork point at any depth. Pre-fix the descent-length cap
+// (`len(nodes) >= MaxReorgDepth`) stopped the walk 288 blocks above the fork tip,
+// so the bottom bridging bodies were never enqueued, nextHeight never reached the
+// fork point, and ReorgTo never fired → the node stranded on the minority chain.
+//
+// Topology: main genesis->1..300 (active tip H=300, all bodies stored); a heavier
+// fork off F=5 of 300 blocks (heights 6..305, no bodies). Fork depth H-F = 295 >
+// 288. The fork tip (305) out-works the active tip (300). The full download set
+// MUST be the 300 fork bodies at heights 6..305, and nextHeight MUST be F+1=6.
+func TestStartBlockDownload_DeepBelowTipFork_ArchiveUncapped(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	const activeTipHeight = 300
+	const forkPointHeight = 5 // depth = 300 - 5 = 295 > MaxReorgDepth (288)
+
+	main := addChain(t, idx, idx.Genesis(), activeTipHeight, 1)
+	forkPoint := main[forkPointHeight-1] // height 5
+	activeTip := main[activeTipHeight-1] // height 300
+
+	// Active chain 1..300 is validated + stored.
+	idx.MarkDataStored(idx.Genesis().Hash)
+	for _, n := range main {
+		idx.MarkDataStored(n.Hash)
+	}
+
+	// Heavier fork off F=5: 300 blocks => heights 6..305, no bodies stored.
+	// 300 fork blocks > 295 main blocks above F => strictly more work.
+	fork := addChain(t, idx, forkPoint, 300, 2_000_000)
+	forkTip := fork[len(fork)-1]
+	if forkTip.Height != 305 {
+		t.Fatalf("fork tip height = %d, want 305", forkTip.Height)
+	}
+	if bt := idx.BestTip(); bt != forkTip {
+		t.Fatalf("expected the heavier fork tip (height %d) to be best tip, got height %d",
+			forkTip.Height, bt.Height)
+	}
+
+	if forkPointHeight > activeTipHeight-consensus.MaxReorgDepth {
+		t.Fatalf("test topology invalid: fork depth %d must exceed MaxReorgDepth %d",
+			activeTipHeight-forkPointHeight, consensus.MaxReorgDepth)
+	}
+
+	// Archive node (pruning=false): the descent must be uncapped.
+	mock := &mockChainConnector{tipHash: activeTip.Hash, tipHeight: activeTipHeight}
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:  params,
+		HeaderIndex:  idx,
+		ChainManager: mock,
+	})
+	defer close(sm.quit)
+
+	sm.StartBlockDownload()
+
+	got := queueHeights(sm)
+	// Full fork span 6..305 = 300 blocks. Pre-fix this was capped to 288.
+	want := make([]int32, 0, 300)
+	for h := int32(forkPointHeight + 1); h <= forkTip.Height; h++ {
+		want = append(want, h)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("archive deep-fork download set size = %d, want %d (pre-fix cap would give %d) — the descent is still depth-capped",
+			len(got), len(want), consensus.MaxReorgDepth)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("archive deep-fork download heights = %v, want %v", got, want)
+		}
+	}
+
+	// The bottom bridging body at F+1 (height 6) on the fork branch MUST be
+	// enqueued — the exact block the depth cap starved.
+	enqueued := map[wire.Hash256]bool{}
+	sm.mu.RLock()
+	for _, req := range sm.blockQueue {
+		enqueued[req.Hash] = true
+	}
+	nh := sm.nextHeight
+	sm.mu.RUnlock()
+	if !enqueued[fork[0].Hash] {
+		t.Fatalf("bottom bridging fork body at height %d was NOT enqueued — deep-fork descent still capped", fork[0].Height)
+	}
+	if nh != int32(forkPointHeight+1) {
+		t.Fatalf("nextHeight = %d, want %d (first block above the deep fork point)", nh, forkPointHeight+1)
+	}
+}
+
+// TestStartBlockDownload_DeepBelowTipFork_PrunedCapped is the pruning-gate guard:
+// the SAME deep below-tip fork on a PRUNED node keeps the MaxReorgDepth cap (a
+// reorg past the retained undo window is un-appliable, mirroring ReorgTo's
+// pruning gate). The enqueued set is bounded at MaxReorgDepth and does NOT reach
+// the fork point. Proves the gate keys on pruning, not depth.
+func TestStartBlockDownload_DeepBelowTipFork_PrunedCapped(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	const activeTipHeight = 300
+	const forkPointHeight = 5
+
+	main := addChain(t, idx, idx.Genesis(), activeTipHeight, 1)
+	forkPoint := main[forkPointHeight-1]
+	activeTip := main[activeTipHeight-1]
+	idx.MarkDataStored(idx.Genesis().Hash)
+	for _, n := range main {
+		idx.MarkDataStored(n.Hash)
+	}
+	fork := addChain(t, idx, forkPoint, 300, 2_000_000)
+	forkTip := fork[len(fork)-1]
+	if bt := idx.BestTip(); bt != forkTip {
+		t.Fatalf("expected heavier fork tip best, got height %d", bt.Height)
+	}
+
+	// Pruned node: keep the cap.
+	mock := &mockChainConnector{tipHash: activeTip.Hash, tipHeight: activeTipHeight, pruning: true}
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:  params,
+		HeaderIndex:  idx,
+		ChainManager: mock,
+	})
+	defer close(sm.quit)
+
+	sm.StartBlockDownload()
+
+	got := queueHeights(sm)
+	if len(got) > consensus.MaxReorgDepth {
+		t.Fatalf("pruned deep-fork download set size = %d, want <= MaxReorgDepth %d (cap must still apply when pruning)",
+			len(got), consensus.MaxReorgDepth)
+	}
+}
+
 // TestStartBlockDownload_NoForkUnchanged is the invariant guard: when the header
 // best tip is a simple extension of the active validated tip (normal IBD /
 // steady state), the enqueued set must be IDENTICAL to the pre-fix behaviour —
