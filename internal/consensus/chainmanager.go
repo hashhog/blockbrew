@@ -21,15 +21,22 @@ import (
 // bottleneck: at ~60 blk/hr the old 500-window took ~8 hr to emit one rollup.
 const PhaseStatsLogEvery = 100
 
-// MaxReorgDepth caps the disconnect+reconnect span of a single ReorgTo so the
-// resulting Pebble batch (Pattern D, multi-block atomicity) cannot grow without
-// bound. This is an implementation-specific memory-safety bound; Bitcoin Core
-// has NO reorg-depth cap and follows the most-work chain limited only by prune
-// and undo-file retention. 288 is chosen to match Core's MIN_BLOCKS_TO_KEEP
-// (the minimum pruned-node undo retention), so any reorg within the pruned
-// window is never refused. A reorg that wants more than this returns an error
-// rather than splitting across multiple batches — splitting would forfeit the
-// very atomicity this constant exists to enforce.
+// MaxReorgDepth bounds the disconnect+reconnect span of a single ReorgTo — but
+// ONLY when the node is pruning (see ChainManager.pruningEnabled). On an ARCHIVE
+// node (pruning off = the default) the cap is NOT applied: Bitcoin Core has NO
+// reorg-depth cap (ActivateBestChainStep loops to the fork point unbounded;
+// MIN_BLOCKS_TO_KEEP=288 governs PRUNED undo retention only), so it follows the
+// most-work valid chain to ANY depth. An archive node always has every rev*.dat
+// undo record on disk, so a deep reorg is physically safe; refusing it was a
+// gratuitous Class-A consensus divergence (blockbrew would stay on a lower-work
+// minority chain that Core would abandon). See CORE-PARITY-AUDIT/_loop-ledger.md
+// "288-block reorg cap".
+//
+// On a PRUNED node the retained undo window is only MIN_BLOCKS_TO_KEEP=288 deep,
+// so a reorg whose span exceeds it cannot be replayed (the undo is gone). There
+// the cap stays as controlled protection: ReorgTo returns ErrReorgTooDeep rather
+// than reorging into missing undo. 288 matches Core's MIN_BLOCKS_TO_KEEP so any
+// reorg within the retained window is never refused.
 const MaxReorgDepth = 288
 
 // cachedUTXOView wraps a UTXOView with a cache of entries that may have been
@@ -77,6 +84,14 @@ type ChainManager struct {
 	assumeValidHeight int32        // Height of assume-valid block
 	isIBD             bool         // Initial Block Download mode
 	parallelScripts   bool         // Use parallel script validation
+
+	// pruningEnabled gates the MaxReorgDepth reorg cap. false (archive, the
+	// default) = no cap: follow the most-work valid chain to any depth like
+	// Bitcoin Core, since every undo record is on disk. true (pruned) = the
+	// cap applies as protection against reorging into pruned-away undo. Set
+	// once at construction from ChainManagerConfig.PruningEnabled; read under
+	// no lock in ReorgTo (immutable after NewChainManager).
+	pruningEnabled bool
 
 	// Signature cache for faster block connection
 	sigCache *SigCache
@@ -216,6 +231,15 @@ type ChainManagerConfig struct {
 	// Default: 50,000 entries. Set to 0 to disable caching.
 	SigCacheSize int
 
+	// PruningEnabled reports whether the node is pruning block/undo data
+	// (-prune=N or -prune=1). false (the default, archive mode) removes the
+	// MaxReorgDepth reorg cap so ReorgTo follows the most-work valid chain to
+	// any depth like Bitcoin Core — safe because archive nodes retain every
+	// undo record. true keeps the cap as protection against reorging deeper
+	// than the retained (MIN_BLOCKS_TO_KEEP=288) undo window. Wired from
+	// main.go via storage.Pruner.IsEnabled().
+	PruningEnabled bool
+
 	// OnBlockDisconnected, if set, is invoked once per block popped off the
 	// active tip by DisconnectBlock (and transitively by every peel inside
 	// ReorgTo). Wired from main.go to mp.BlockDisconnected so non-coinbase
@@ -265,6 +289,7 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 		sigCache:            sigCache,
 		onBlockDisconnected: config.OnBlockDisconnected,
 		onBlockConnected:    config.OnBlockConnected,
+		pruningEnabled:      config.PruningEnabled,
 	}
 
 	// parallelScripts is already set from config.ParallelScripts in the struct
@@ -2017,9 +2042,13 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 		connectNodes[i], connectNodes[j] = connectNodes[j], connectNodes[i]
 	}
 
+	// The reorg-depth cap applies ONLY when pruning. On an archive node every
+	// undo record is on disk, so — like Bitcoin Core, which has no reorg-depth
+	// cap — we follow the most-work valid chain to any depth. On a pruned node
+	// the cap protects against reorging deeper than the retained undo window.
 	span := len(disconnectNodes) + len(connectNodes)
-	if span > MaxReorgDepth {
-		log.Printf("chainmgr: refusing reorg from %d to %d: span=%d exceeds MaxReorgDepth=%d",
+	if cm.pruningEnabled && span > MaxReorgDepth {
+		log.Printf("chainmgr: refusing reorg from %d to %d: span=%d exceeds MaxReorgDepth=%d (pruned node; undo beyond the retained window is gone)",
 			currentTip.Height, newTip.Height, span, MaxReorgDepth)
 		return fmt.Errorf("%w: span=%d limit=%d", ErrReorgTooDeep, span, MaxReorgDepth)
 	}
