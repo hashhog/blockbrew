@@ -164,6 +164,35 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int, skipPOW ...bool) 
 		return fmt.Errorf("%w: stripped weight %d > %d", ErrBlockWeightTooHigh, strippedWeight, MaxBlockWeight)
 	}
 
+	// 9. Block-wide legacy sigop-cost cap ("bad-blk-sigops").
+	// Mirrors Bitcoin Core CheckBlock (validation.cpp:3971-3977): sum the
+	// LEGACY sigop count over EVERY transaction INCLUDING the coinbase, scale
+	// by WITNESS_SCALE_FACTOR, and reject if it exceeds MAX_BLOCK_SIGOPS_COST.
+	// This underestimates the true cost (it omits P2SH and witness sigops,
+	// which need the UTXO view and are re-counted in ConnectBlock) but is a
+	// sound context-free gate. Crucially it counts the COINBASE's own sigops:
+	// ConnectBlock's first-pass loop accumulates the coinbase sigops then
+	// `continue`s before its own cap check, so a coinbase-only block whose
+	// coinbase outputs carry excessive sigops (e.g. scriptPubKey = 1001× bare
+	// OP_CHECKMULTISIG = 20020 legacy × 4 = 80080 > 80000) previously connected
+	// on BOTH the submitblock and P2P paths. Being in the context-free
+	// CheckBlockSanity, this gate runs on every path (submitblock, P2P
+	// validationWorker, ConnectBlock re-check). Legacy count uses INACCURATE
+	// CHECKMULTISIG=20, matching Core GetLegacySigOpCount → GetSigOpCount(false).
+	legacySigOps := 0
+	for _, tx := range block.Transactions {
+		for _, txIn := range tx.TxIn {
+			legacySigOps += CountSigOpsInaccurate(txIn.SignatureScript)
+		}
+		for _, txOut := range tx.TxOut {
+			legacySigOps += CountSigOpsInaccurate(txOut.PkScript)
+		}
+	}
+	if legacySigOps*WitnessScaleFactor > MaxBlockSigOpsCost {
+		return fmt.Errorf("%w: %d > %d", ErrSigOpsCostTooHigh,
+			legacySigOps*WitnessScaleFactor, MaxBlockSigOpsCost)
+	}
+
 	return nil
 }
 
