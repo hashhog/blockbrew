@@ -183,18 +183,25 @@ func TestW132_G11_G12_AllInputsFinal_BypassLocktime(t *testing.T) {
 
 // ─── G13 (P0-CDIV): tx.Version field type — int32 vs Core uint32_t ──────────
 
-// BUG-1 + BUG-2: blockbrew uses `int32 Version`; Core uses
-// `uint32_t version`. The `version < 2` guards then invert for any tx
-// with bit 31 set.
+// BUG-1 + BUG-2 (FIXED in blockbrew 75346c3, 2026-06-14): blockbrew stores
+// `int32 Version` (matching the signed wire field), but Core's BIP-68 version
+// gate compares UNSIGNED. Core has always done this: even when the field was
+// `int32_t nVersion`, tx_verify.cpp cast it — `static_cast<uint32_t>(nVersion)
+// >= 2` — with the comment "requires cast to unsigned otherwise ... half the
+// range of nVersion wouldn't support BIP 68". Core PR#29325 later changed the
+// storage type to `uint32_t version` (no consensus change). So for any tx with
+// bit 31 set, Core ENFORCES BIP-68 (unsigned >= 2), and blockbrew must too.
 //
 // This test deserializes a wire tx with version bytes 0xFEFFFFFF
 // (little-endian for uint32 = 0xFFFFFFFE = MAX_SEQUENCE_NONFINAL-style
 // value reused as version) and asserts the Go in-memory value.
 //
-// Core's invariant: an unsigned uint32 representation must yield
+// Core's invariant: an unsigned uint32 representation yields
 // `version >= 2` for any value >= 2 numerically.
-// blockbrew's defect: the int32 representation yields `version < 0`
-// for any wire-uint32 >= 0x80000000.
+// The stale bug was: a naive signed `version < 2` reads int32(0xFFFFFFFE) as
+// -2 < 2 and would SKIP BIP-68. blockbrew now casts to uint32 in both gates
+// (txvalidation.go CalculateSequenceLocks + opcodes_impl.go OP_CSV), so this
+// test now asserts Core parity (enforcement), not the old defect.
 func TestW132_G13_BUG1_TxVersion_HighBitDeserializesNegative(t *testing.T) {
 	// Build a minimal wire-serialized tx with version=0xFFFFFFFE.
 	// Layout: [4-byte version LE][varint in count=1][input (36+1+0+4)][varint out=0]... is
@@ -244,19 +251,22 @@ func TestW132_G13_BUG1_TxVersion_HighBitDeserializesNegative(t *testing.T) {
 		t.Fatal("expected blockbrew tx.Version < 2 to be TRUE for negative int32 (BUG-1/BUG-2 precondition)")
 	}
 
-	// Document the consequence in CalculateSequenceLocks (BUG-1).
-	// With a real BIP-68 height lock on the input, Core enforces and would
-	// fail the lock; blockbrew skips enforcement.
+	// BUG-1 FIXED: CalculateSequenceLocks compares the version UNSIGNED
+	// (uint32(tx.Version) < 2), exactly like Core (consensus/tx_verify.cpp:51).
+	// A high-bit version (int32 -2 == uint32 0xFFFFFFFE >= 2) therefore
+	// ENFORCES BIP-68, matching Core. With a relative height lock of 5 on an
+	// input confirmed at height 100, Core computes MinHeight = 100 + 5 - 1 = 104;
+	// blockbrew must return the same. (Previously it wrongly returned -1 — the
+	// P0-CDIV chain-split defect — because a signed `< 2` skipped enforcement.)
 	tx.TxIn[0].Sequence = 5 // relative height 5
 	lock := CalculateSequenceLocks(&tx, []int32{100}, func(int32) int64 { return 0 })
-	if lock.MinHeight != -1 || lock.MinTime != -1 {
-		t.Errorf("blockbrew with version int32(-2) is expected to SKIP BIP-68: "+
-			"got MinHeight=%d MinTime=%d, want both -1 (the bug)", lock.MinHeight, lock.MinTime)
+	const wantMinHeight = int32(100 + 5 - 1) // 104, Core parity
+	if lock.MinHeight != wantMinHeight || lock.MinTime != -1 {
+		t.Errorf("high-bit-version tx must ENFORCE BIP-68 like Core (unsigned gate): "+
+			"got MinHeight=%d MinTime=%d, want MinHeight=%d MinTime=-1",
+			lock.MinHeight, lock.MinTime, wantMinHeight)
 	}
-
-	// Core would compute MinHeight = 100 + 5 - 1 = 104. Document the divergence.
-	// (no assertion on Core's behavior — this comment is the audit trail.)
-	t.Logf("P0-CDIV BUG-1: Core would compute MinHeight=104; blockbrew returns %d", lock.MinHeight)
+	t.Logf("P0-CDIV BUG-1 RESOLVED: Core computes MinHeight=104; blockbrew returns %d (MATCH)", lock.MinHeight)
 }
 
 // G13 second half: confirm that the FIX would behave correctly.

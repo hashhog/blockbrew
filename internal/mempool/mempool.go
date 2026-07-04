@@ -1780,7 +1780,12 @@ func (mp *Mempool) checkSequenceLocksLocked(tx *wire.MsgTx) error {
 		return nil
 	}
 	// BIP-68 only applies to v2+ transactions; spare the work otherwise.
-	if tx.Version < 2 {
+	// Compare UNSIGNED to match Core (consensus/tx_verify.cpp:51, uint32_t
+	// version): a high-bit version (int32 -2 == uint32 0xFFFFFFFE >= 2) still
+	// enforces BIP-68. A signed `< 2` here would skip the mempool sequence-lock
+	// check for such a tx while block validation (chainmanager) enforces it —
+	// mempool/consensus divergence. Mirrors CalculateSequenceLocks + OP_CSV.
+	if uint32(tx.Version) < 2 {
 		return nil
 	}
 	cs := mp.config.ChainState
