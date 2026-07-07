@@ -1582,6 +1582,14 @@ func isStandardOutputScript(pkScript []byte) bool {
 	case consensus.IsNullData(pkScript):
 		// Well-formed OP_RETURN with IsPushOnly remainder.
 		return true
+	case isBareMultisig(pkScript):
+		// Bare (non-P2SH) m-of-n CHECKMULTISIG within Core's standardness
+		// bounds. Core accepts bare multisig as standard when
+		// -permitbaremultisig is true, which is the DEFAULT (policy.h
+		// DEFAULT_PERMIT_BARE_MULTISIG=true; policy.cpp IsStandardTx MULTISIG
+		// branch, n<=3). blockbrew previously rejected ALL bare multisig
+		// outright — stricter than Core; this aligns to Core's default.
+		return true
 	case len(pkScript) > 0 && pkScript[0] == 0x6a:
 		// Starts with OP_RETURN but is NOT well-formed nulldata (e.g. truncated
 		// push bytes).  Core classifies this NONSTANDARD via its Solver check.
@@ -1595,6 +1603,104 @@ func isStandardOutputScript(pkScript []byte) bool {
 		// All other script forms are nonstandard.
 		return false
 	}
+}
+
+// IsStandardOutputScript is the exported accessor for the output-script
+// standardness classifier used by the AddTransaction admission path. The
+// testmempoolaccept dry-run calls it so the RPC applies the IDENTICAL
+// output-standardness gate as real mempool submission (Core runs the same
+// IsStandardTx vout classification in PreChecks, validation.cpp:808). Pure
+// function of the script bytes — no lock, no mutation.
+func IsStandardOutputScript(pkScript []byte) bool {
+	return isStandardOutputScript(pkScript)
+}
+
+// isBareMultisig reports whether pkScript is a bare (non-P2SH) m-of-n
+// CHECKMULTISIG output that Bitcoin Core classifies as STANDARD. Core accepts
+// bare multisig when -permitbaremultisig is true (DEFAULT_PERMIT_BARE_MULTISIG
+// = true, policy.h) AND the script matches Solver's MULTISIG pattern with
+// n in [1,3] and m in [1,n] (policy.cpp IsStandard MULTISIG branch +
+// solver.cpp MatchMultisig).
+//
+// Faithful to MatchMultisig: OP_m <pubkey>...<pubkey> OP_n OP_CHECKMULTISIG,
+// where each pubkey is a canonical 33- or 65-byte push (CPubKey::ValidSize),
+// m and n are OP_1..OP_16 small integers, and n equals the number of pushed
+// keys. The extra n<=3 bound is Core's IsStandard MULTISIG standardness cap.
+func isBareMultisig(pkScript []byte) bool {
+	n := len(pkScript)
+	// Must end in OP_CHECKMULTISIG and be long enough for OP_m <key> OP_n
+	// OP_CHECKMULTISIG (minimum 1-of-1 with a 33-byte key = 37 bytes).
+	if n < 4 || pkScript[n-1] != script.OP_CHECKMULTISIG {
+		return false
+	}
+
+	pc := 0
+	// Leading OP_m (required signatures) — a small-integer opcode.
+	if pkScript[pc] < script.OP_1 || pkScript[pc] > script.OP_16 {
+		return false
+	}
+	m := int(pkScript[pc] - script.OP_1 + 1)
+	pc++
+
+	// Pubkey pushes: each a push (direct or PUSHDATA) of exactly 33 or 65
+	// bytes (CPubKey::ValidSize). Stop at the trailing OP_n small integer.
+	numKeys := 0
+	for pc < len(pkScript) {
+		op := pkScript[pc]
+		if op >= script.OP_1 && op <= script.OP_16 {
+			break // reached the trailing OP_n
+		}
+		var size int
+		switch {
+		case op >= 0x01 && op <= 0x4b:
+			size = int(op)
+			pc++
+		case op == script.OP_PUSHDATA1:
+			if pc+1 >= len(pkScript) {
+				return false
+			}
+			size = int(pkScript[pc+1])
+			pc += 2
+		case op == script.OP_PUSHDATA2:
+			if pc+2 >= len(pkScript) {
+				return false
+			}
+			size = int(pkScript[pc+1]) | int(pkScript[pc+2])<<8
+			pc += 3
+		case op == script.OP_PUSHDATA4:
+			if pc+4 >= len(pkScript) {
+				return false
+			}
+			size = int(pkScript[pc+1]) | int(pkScript[pc+2])<<8 |
+				int(pkScript[pc+3])<<16 | int(pkScript[pc+4])<<24
+			pc += 5
+		default:
+			return false
+		}
+		if size != 33 && size != 65 {
+			return false
+		}
+		if pc+size > len(pkScript) {
+			return false
+		}
+		pc += size
+		numKeys++
+	}
+
+	// After the pubkeys, exactly OP_n then OP_CHECKMULTISIG must remain.
+	if pc+2 != len(pkScript) {
+		return false
+	}
+	if pkScript[pc] < script.OP_1 || pkScript[pc] > script.OP_16 {
+		return false
+	}
+	nKeys := int(pkScript[pc] - script.OP_1 + 1)
+
+	// Solver bounds: 1 <= m <= n; IsStandard MULTISIG cap: n <= 3.
+	if nKeys != numKeys || m < 1 || m > nKeys || nKeys > 3 {
+		return false
+	}
+	return true
 }
 
 // isUnknownWitnessProgram returns true for segwit v1+ witness programs that
