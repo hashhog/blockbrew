@@ -799,10 +799,10 @@ func TestW135_AuditFramework_SolverDispatchContrast(t *testing.T) {
 			blockbrewStd: false, coreStd: true, // BUG-2 divergence
 		},
 		{
-			name:         "BareMultisig_2of3_BUG2",
+			name:         "BareMultisig_2of3_FIXED",
 			script:       buildBareMultisig(2, 3),
 			coreType:     "MULTISIG",
-			blockbrewStd: false, coreStd: true, // BUG-2 divergence
+			blockbrewStd: true, coreStd: true, // BUG-2 (bare multisig) FIXED: n<=3 bare multisig now standard, matching Core -permitbaremultisig default
 		},
 		{
 			name:         "BareMultisig_4of4_NONSTANDARD",
@@ -843,10 +843,11 @@ func TestW135_AuditFramework_SolverDispatchContrast(t *testing.T) {
 				tc.name, got, tc.coreStd, tc.coreType)
 		}
 	}
-	if divergences != 2 {
-		// BUG-2 (BarePubKey + BareMultisig_2of3) = 2 divergences.
-		// BUG-4 (WitnessV0_size5) is now FIXED, so it no longer diverges.
-		t.Logf("Expected 2 divergences (BUG-2 ×2; BUG-4 fixed), got %d. "+
+	if divergences != 1 {
+		// BUG-2 bare-multisig is now FIXED (n<=3 bare multisig standard),
+		// leaving only the bare-P2PK (PUBKEY) divergence. BUG-4
+		// (WitnessV0_size5) is also FIXED, so it no longer diverges.
+		t.Logf("Expected 1 divergence (BUG-2 bare-P2PK only; bare-multisig + BUG-4 fixed), got %d. "+
 			"Update the audit if the table changes.", divergences)
 	}
 }

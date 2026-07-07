@@ -700,6 +700,55 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			continue
 		}
 
+		// Output / tx standardness runs BEFORE input existence, matching Core.
+		//
+		// Bitcoin Core runs the FULL IsStandardTx (output-script standardness,
+		// the OP_RETURN datacarrier budget, and dust) inside PreChecks at
+		// validation.cpp:808 — BEFORE it fetches inputs or checks input
+		// existence (the m_view.HaveCoin loop at validation.cpp:857). blockbrew's
+		// dry-run previously checked input existence FIRST, so a transaction
+		// carrying a policy-violating output AND missing inputs was reported
+		// "missing-inputs" where Core reports the standardness reason. Running
+		// standardness first restores Core's PreChecks ordering.
+		//
+		// Two passes mirror IsStandardTx (policy/policy.cpp:139-166): the vout
+		// loop (output-script classification + cumulative datacarrier budget)
+		// runs to completion first, THEN the whole-tx dust check (GetDust). This
+		// preserves Core's precedence when multiple outputs each violate a
+		// different rule (script/datacarrier before dust).
+		stdReason := ""
+		datacarrierBytesUsed := 0
+		for _, txOut := range tx.TxOut {
+			if !mempool.IsStandardOutputScript(txOut.PkScript) {
+				stdReason = "scriptpubkey"
+				break
+			}
+			if consensus.IsNullData(txOut.PkScript) {
+				datacarrierBytesUsed += len(txOut.PkScript)
+				if datacarrierBytesUsed > mempool.MaxOpReturnRelay {
+					stdReason = "datacarrier"
+					break
+				}
+			}
+		}
+		if stdReason == "" {
+			for _, txOut := range tx.TxOut {
+				// Dust-output standardness. Reuse the mempool's own IsDust so the
+				// threshold is byte-identical to the AddTransaction submission
+				// path (Core IsStandardTx GetDust, policy/policy.cpp:162-164).
+				if s.mempool.IsDust(txOut) {
+					stdReason = "dust"
+					break
+				}
+			}
+		}
+		if stdReason != "" {
+			result.Allowed = false
+			result.RejectReason = stdReason
+			results = append(results, result)
+			continue
+		}
+
 		// Calculate fee by looking up inputs
 		var totalInputValue int64
 		inputsFound := true
@@ -729,26 +778,12 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			continue
 		}
 
+		// Sum output value for the fee calculation. Output standardness (script,
+		// datacarrier, dust) was already enforced above, BEFORE input existence,
+		// to match Core's PreChecks ordering (see the two-pass block above).
 		var totalOutputValue int64
-		dustOutput := false
 		for _, txOut := range tx.TxOut {
 			totalOutputValue += txOut.Value
-			// Dust-output standardness check. Mirrors Bitcoin Core IsStandardTx
-			// (policy/policy.cpp:74-76,159-161 -> reason "dust"): an output
-			// whose value is below its dust threshold is non-standard. Reuse the
-			// mempool's own IsDust so the threshold is byte-identical to the
-			// AddTransaction submission path (mempool.go:3700). Part of the
-			// genuine relay-policy floor — rejected by default Core, so the
-			// testmempoolaccept dry-run must enforce it too.
-			if s.mempool.IsDust(txOut) {
-				dustOutput = true
-			}
-		}
-		if dustOutput {
-			result.Allowed = false
-			result.RejectReason = "dust"
-			results = append(results, result)
-			continue
 		}
 
 		fee := totalInputValue - totalOutputValue
