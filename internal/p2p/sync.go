@@ -266,7 +266,45 @@ type SyncManager struct {
 	// chain work is below nMinimumChainWork, and destroyed when the sync
 	// completes, fails, or the peer disconnects.  Protected by mu.
 	peerHeadersSync map[string]*HeadersSyncState
+
+	// mempool is the tx source the sync manager uses to participate in the
+	// inv->getdata->tx relay loop: membership tests (avoid re-requesting a tx
+	// we already have) on the REQUEST side, and full-tx lookup on the SERVE
+	// side of HandleGetData.  nil disables both tx-relay paths (tests, or
+	// nodes wired without a mempool).
+	mempool MempoolTxSource
+
+	// txInflight is the minimal request-dedup set for transactions we have
+	// getdata-requested but not yet received.  Keyed by the announced hash
+	// (wtxid for wtxid-relay peers, txid for legacy peers) so the same tx is
+	// not re-requested from every peer that announces it.  Modelled on the
+	// block `inflight` map above; entries expire after txInflightExpiry so a
+	// dropped/never-served tx does not pin the slot forever (Core's
+	// TxRequestTracker expiry).  Protected by mu.
+	txInflight map[wire.Hash256]time.Time
 }
+
+// MempoolTxSource is the minimal mempool interface the sync manager needs to
+// take part in transaction relay.  internal/mempool.Mempool satisfies it via
+// HasTransaction / GetTransaction / GetTxByWTxid.  The interface is declared
+// here (rather than importing mempool) to avoid an import cycle between the
+// p2p and mempool packages and to keep HandleInv/HandleGetData unit-testable
+// with a stub.
+type MempoolTxSource interface {
+	// HasTransaction reports whether a tx with the given txid is in the pool.
+	HasTransaction(txid wire.Hash256) bool
+	// GetTransaction returns the pool tx with the given txid, or nil.
+	GetTransaction(txid wire.Hash256) *wire.MsgTx
+	// GetTxByWTxid returns the pool tx with the given witness txid, or nil.
+	GetTxByWTxid(wtxid wire.Hash256) *wire.MsgTx
+}
+
+// txInflightExpiry bounds how long a getdata-requested tx stays in the
+// txInflight dedup set before it may be re-requested.  Mirrors the spirit of
+// Bitcoin Core's TxRequestTracker per-request expiry (GETDATA_TX_INTERVAL):
+// if the announcer never serves the tx, the slot is reclaimed and another
+// announcer's inv can trigger a fresh request.
+const txInflightExpiry = 60 * time.Second
 
 // ChainConnector is the interface for connecting blocks to the chain.
 // This allows the sync manager to work with any chain manager implementation.
@@ -331,6 +369,11 @@ type SyncManagerConfig struct {
 	// HandleGetData rejects requests below the recent-288 keep window with
 	// a `notfound` reply (Core net_processing.cpp behaviour).
 	Pruner *storage.Pruner
+	// Mempool is the tx source used for the inv->getdata->tx relay loop
+	// (request unknown announced txs; serve requested txs).  Optional: when
+	// nil both tx-relay paths are disabled.  internal/mempool.Mempool
+	// satisfies MempoolTxSource.
+	Mempool MempoolTxSource
 }
 
 // NewSyncManager creates a new sync manager.
@@ -367,6 +410,8 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		lastTipUpdate:     now,
 		nextStaleTipCheck: now.Add(StaleTipCheckInterval),
 		pruner:            config.Pruner,
+		mempool:           config.Mempool,
+		txInflight:        make(map[wire.Hash256]time.Time),
 		unconnectingHeaders: make(map[string]int),
 		peerHeadersSync:     make(map[string]*HeadersSyncState),
 	}
@@ -1205,18 +1250,116 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 // Reference: Bitcoin Core net_processing.cpp ProcessMessage("inv").
 func (sm *SyncManager) HandleInv(peer *Peer, msg *MsgInv) {
 	hasBlock := false
+	var txReqs []*InvVect
 	for _, inv := range msg.InvList {
 		baseType := inv.Type &^ InvWitnessFlag
-		if baseType == InvTypeBlock {
+		switch baseType {
+		case InvTypeBlock:
 			hasBlock = true
-			break
+		case InvTypeTx, InvTypeWtx:
+			// Collect tx announcements to (maybe) request. Actual REQUEST
+			// decision (IBD gate, block-relay-only, membership, dedup) is
+			// made in maybeRequestTx below. baseType is InvTypeTx (MSG_TX=1,
+			// txid) or InvTypeWtx (MSG_WTX=5, wtxid); InvTypeWitnessTx
+			// (0x40000001) folds into InvTypeTx after stripping the witness
+			// flag and is treated as a txid announcement.
+			txReqs = append(txReqs, inv)
 		}
 	}
-	if !hasBlock {
+
+	// Block announcements → learn about the new block(s) via getheaders.
+	if hasBlock {
+		sm.sendGetHeadersTo(peer)
+	}
+
+	// Tx announcements → request any we don't already have. Reference:
+	// Bitcoin Core net_processing.cpp ProcessMessage("inv"), which feeds
+	// MSG_TX / MSG_WTX invs into the TxRequestTracker and later issues a
+	// getdata for each not-already-known tx.
+	if len(txReqs) > 0 {
+		sm.requestAnnouncedTxs(peer, txReqs)
+	}
+}
+
+// requestAnnouncedTxs issues getdata for transactions a peer announced via inv
+// that we do not already have (mempool membership) and have not already
+// requested (txInflight dedup). Mirrors Bitcoin Core's tx-inv handling:
+//   - Skip entirely during IBD — we don't relay/accept loose txs until synced
+//     (Core: `if (fInitialDownload) return;` guard around tx handling).
+//   - Skip block-relay-only connections — no tx relay on those links.
+//   - Skip txs already in the mempool or already in flight (dedup).
+//
+// The getdata reuses the exact type/hash the peer announced, which naturally
+// respects the per-peer BIP-339 wtxid negotiation: a wtxid-relay peer
+// announces MSG_WTX+wtxid (we request the same), a legacy peer announces
+// MSG_TX+txid.
+//
+// NOTE: Bitcoin Core additionally suppresses re-requests of txs in its
+// recently-rejected filter (m_recent_rejects). blockbrew has no such filter
+// yet, so a peer can re-offer a rejected tx and we will re-request it once per
+// txInflightExpiry window. Documented gap, not a correctness bug.
+func (sm *SyncManager) requestAnnouncedTxs(peer *Peer, invs []*InvVect) {
+	if sm.mempool == nil {
+		return
+	}
+	// Skip during IBD: we are not participating in loose-tx relay yet.
+	if sm.ibdActive.Load() {
+		return
+	}
+	// Skip block-relay-only connections (no tx relay on those links).
+	if peer != nil && peer.TxRelayDisabled() {
 		return
 	}
 
-	sm.sendGetHeadersTo(peer)
+	var getData []*InvVect
+	now := time.Now()
+
+	sm.mu.Lock()
+	for _, inv := range invs {
+		baseType := inv.Type &^ InvWitnessFlag
+
+		// Already in the mempool? Nothing to request. For wtxid
+		// announcements we must look up by wtxid; txid announcements by txid.
+		var have bool
+		if baseType == InvTypeWtx {
+			have = sm.mempool.GetTxByWTxid(inv.Hash) != nil
+		} else {
+			have = sm.mempool.HasTransaction(inv.Hash)
+		}
+		if have {
+			continue
+		}
+
+		// Already requested (and not yet expired)? Don't re-request.
+		if reqAt, ok := sm.txInflight[inv.Hash]; ok {
+			if now.Sub(reqAt) < txInflightExpiry {
+				continue
+			}
+			// Stale slot: fall through and re-request, refreshing the stamp.
+		}
+
+		sm.txInflight[inv.Hash] = now
+		// Request the same type/hash the peer announced (respects BIP-339).
+		getData = append(getData, &InvVect{Type: inv.Type, Hash: inv.Hash})
+	}
+	sm.mu.Unlock()
+
+	if len(getData) > 0 {
+		peer.SendMessage(&MsgGetData{InvList: getData})
+	}
+}
+
+// NotifyTxReceived clears a transaction's entry from the request-dedup set
+// once we have received (or otherwise resolved) it. Called from the tx-accept
+// path so an accepted tx's in-flight slot is reclaimed immediately rather than
+// waiting for txInflightExpiry. Both the txid and wtxid keys are cleared
+// because either could have been the announced/in-flight hash depending on the
+// announcing peer's BIP-339 negotiation.
+func (sm *SyncManager) NotifyTxReceived(txid, wtxid wire.Hash256) {
+	sm.mu.Lock()
+	delete(sm.txInflight, txid)
+	delete(sm.txInflight, wtxid)
+	sm.mu.Unlock()
 }
 
 // sendPeriodicGetHeaders sends getheaders to connected peers to discover new
@@ -1521,8 +1664,31 @@ func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
 			}
 			log.Printf("sync: serving block at %x to peer %s", inv.Hash[:4], peer.Address())
 			peer.SendMessage(&MsgBlock{Block: block})
-		case InvTypeTx:
-			// TODO: look up transaction from mempool
+		case InvTypeTx, InvTypeWtx:
+			// Serve a transaction from the mempool. Mirrors Bitcoin Core's
+			// net_processing.cpp ProcessGetData -> FindTxForGetData: look the
+			// tx up in the mempool and send it as a `tx` message, or append to
+			// `notfound` on a miss so the peer can ask elsewhere. baseType is
+			// InvTypeTx (MSG_TX / MSG_WITNESS_TX -> txid lookup) or InvTypeWtx
+			// (MSG_WTX -> wtxid lookup, BIP-339). blockbrew always serializes
+			// transactions with their witness, so both branches return the
+			// full witness tx (no separate witness-stripping like Core's
+			// legacy MSG_TX path).
+			if sm.mempool == nil {
+				notFound = append(notFound, inv)
+				continue
+			}
+			var tx *wire.MsgTx
+			if baseType == InvTypeWtx {
+				tx = sm.mempool.GetTxByWTxid(inv.Hash)
+			} else {
+				tx = sm.mempool.GetTransaction(inv.Hash)
+			}
+			if tx == nil {
+				notFound = append(notFound, inv)
+				continue
+			}
+			peer.SendMessage(&MsgTx{Tx: tx})
 		}
 	}
 	if len(notFound) > 0 {
