@@ -264,7 +264,26 @@ func VerifySchnorr(pubKeyXOnly []byte, hash [32]byte, sig []byte) bool {
 // taproot/tapscript paths always pass a 32-byte sighash, but the BIP-340
 // test vector file (added 2022-12) includes 0/1/17/100-byte messages too
 // and we want to be able to run those against this implementation.
+//
+// Backend: libsecp256k1 secp256k1_schnorrsig_verify (Bitcoin Core's
+// consensus engine), an exact BIP-340 drop-in.  Verified bit-identical to
+// the pure-Go dcrec reference (verifySchnorrMsgDcrec) over the BIP-340
+// official vectors plus reject edge cases in libsecp_diff_test.go.
 func VerifySchnorrMsg(pubKeyXOnly []byte, msg []byte, sig []byte) bool {
+	// G1 — sig length must be exactly 64.  The optional sighash-byte form
+	// (65 bytes) is split off by the caller before reaching this function.
+	if len(pubKeyXOnly) != 32 || len(sig) != 64 {
+		return false
+	}
+	return schnorrVerifyLibsecp(pubKeyXOnly, msg, sig)
+}
+
+// verifySchnorrMsgDcrec is the pure-Go dcrec reference implementation of
+// VerifySchnorrMsg, retained as the oracle for the differential-equivalence
+// test (libsecp_diff_test.go) and as a fallback if the cgo backend is ever
+// disabled.  It implements the BIP-340 verification algorithm gate-by-gate
+// (see the G-map at the top of this file).
+func verifySchnorrMsgDcrec(pubKeyXOnly []byte, msg []byte, sig []byte) bool {
 	// G1 — sig length must be exactly 64.  The optional sighash-byte form
 	// (65 bytes) is split off by the caller before reaching this function.
 	if len(pubKeyXOnly) != 32 || len(sig) != 64 {
