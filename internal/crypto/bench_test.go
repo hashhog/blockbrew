@@ -297,6 +297,67 @@ func BenchmarkECDSAVerify(b *testing.B) {
 	}
 }
 
+// Consensus-path verify benchmarks: new libsecp256k1 cgo backend vs the
+// retained pure-Go dcrec reference.  These exercise the exact functions the
+// script engine calls (VerifyECDSALax / VerifySchnorrMsg) so the numbers
+// reflect the real IBD signature-verification cost.
+
+func BenchmarkECDSALaxVerify_Libsecp(b *testing.B) {
+	key, _ := GeneratePrivateKey()
+	hash := DoubleSHA256([]byte("benchmark ecdsa lax libsecp"))
+	sig, _ := SignECDSA(key, hash) // DER-encoded, low-S
+	pub := key.PubKey()
+	if !VerifyECDSALax(pub, hash, sig) {
+		b.Fatal("setup: sig did not verify")
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		VerifyECDSALax(pub, hash, sig)
+	}
+}
+
+func BenchmarkECDSALaxVerify_Dcrec(b *testing.B) {
+	key, _ := GeneratePrivateKey()
+	hash := DoubleSHA256([]byte("benchmark ecdsa lax dcrec"))
+	sig, _ := SignECDSA(key, hash)
+	pub := key.PubKey()
+	if !verifyECDSALaxDcrec(pub, hash, sig) {
+		b.Fatal("setup: sig did not verify")
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		verifyECDSALaxDcrec(pub, hash, sig)
+	}
+}
+
+func BenchmarkSchnorrVerify_Libsecp(b *testing.B) {
+	key, _ := GeneratePrivateKey()
+	hash := DoubleSHA256([]byte("benchmark schnorr libsecp"))
+	sig, _ := SignSchnorr(key, hash)
+	xonly := SerializePubKeyXOnly(key.PubKey().key)
+	if !VerifySchnorrMsg(xonly, hash[:], sig) {
+		b.Fatal("setup: sig did not verify")
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		VerifySchnorrMsg(xonly, hash[:], sig)
+	}
+}
+
+func BenchmarkSchnorrVerify_Dcrec(b *testing.B) {
+	key, _ := GeneratePrivateKey()
+	hash := DoubleSHA256([]byte("benchmark schnorr dcrec"))
+	sig, _ := SignSchnorr(key, hash)
+	xonly := SerializePubKeyXOnly(key.PubKey().key)
+	if !verifySchnorrMsgDcrec(xonly, hash[:], sig) {
+		b.Fatal("setup: sig did not verify")
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		verifySchnorrMsgDcrec(xonly, hash[:], sig)
+	}
+}
+
 func BenchmarkSchnorrSign(b *testing.B) {
 	key, _ := GeneratePrivateKey()
 	hash := DoubleSHA256([]byte("benchmark message for schnorr signing"))

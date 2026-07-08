@@ -5,13 +5,18 @@ package crypto
 // #include <string.h>
 // #include <secp256k1.h>
 // #include <secp256k1_ellswift.h>
+// #include <secp256k1_extrakeys.h>
+// #include <secp256k1_schnorrsig.h>
 //
 // /*
-//  * Lazily-allocated context with VERIFY|SIGN flags.  ellswift_create
+//  * Lazily-allocated, process-wide libsecp256k1 context with VERIFY|SIGN
+//  * flags.  Originally introduced for ElligatorSwift; generalized to also
+//  * back consensus ECDSA + Schnorr signature verification (see
+//  * bb_ecdsa_verify_compact / bb_schnorr_verify below).  ellswift_create
 //  * performs an internal pubkey derivation that needs SIGN; ellswift_xdh
-//  * only needs VERIFY but is fine with both.  Mirrors haskoin's
-//  * cbits/secp256k1_compat.c::get_ellswift_ctx and ouroboros's reuse
-//  * of coincurve._libsecp256k1.lib.secp256k1_context_no_precomp.
+//  * and both verify paths only need VERIFY but are fine with both.  Mirrors
+//  * haskoin's cbits/secp256k1_compat.c::get_ellswift_ctx and ouroboros's
+//  * reuse of coincurve._libsecp256k1.lib.secp256k1_context_no_precomp.
 //  *
 //  * The context is seeded with 32 bytes of caller-supplied entropy via
 //  * secp256k1_context_randomize at initialisation.  Per
@@ -20,23 +25,23 @@ package crypto
 //  * multiplication that backs secp256k1_ellswift_create.  See W159
 //  * BUG-3 ("side-channel-blinding-disabled" fleet pattern).
 //  */
-// static secp256k1_context *bb_ellswift_ctx = NULL;
+// static secp256k1_context *bb_secp_ctx = NULL;
 //
 // /* Create the context and seed it with 32 bytes of entropy.  Returns 1
 //  * on success, 0 on failure (context_create or context_randomize
 //  * failed).  Must be called exactly once before bb_get_ctx().  Idempotent:
 //  * subsequent calls re-randomize the existing context (defence in depth). */
 // static int bb_init_ctx(const unsigned char *seed32) {
-//     if (bb_ellswift_ctx == NULL) {
-//         bb_ellswift_ctx = secp256k1_context_create(
+//     if (bb_secp_ctx == NULL) {
+//         bb_secp_ctx = secp256k1_context_create(
 //             SECP256K1_CONTEXT_VERIFY | SECP256K1_CONTEXT_SIGN);
-//         if (bb_ellswift_ctx == NULL) return 0;
+//         if (bb_secp_ctx == NULL) return 0;
 //     }
-//     return secp256k1_context_randomize(bb_ellswift_ctx, seed32);
+//     return secp256k1_context_randomize(bb_secp_ctx, seed32);
 // }
 //
 // static secp256k1_context *bb_get_ctx(void) {
-//     return bb_ellswift_ctx;
+//     return bb_secp_ctx;
 // }
 //
 // /* secp256k1_ellswift_create wrapper: 32-byte seckey + 32-byte aux -> 64-byte ell. */
@@ -92,6 +97,60 @@ package crypto
 //         secp256k1_ellswift_xdh_hash_function_bip324,
 //         NULL
 //     );
+// }
+//
+// /*
+//  * Consensus ECDSA verify.  The caller (Go VerifyECDSALax) has already run
+//  * the lax-DER parser + low-S normalization and hands us a 64-byte compact
+//  * (r||s, big-endian, both in [1,n) and low-S) signature, a 32-byte message
+//  * hash, and a serialized public key (33-byte compressed or 65-byte
+//  * uncompressed).  We do NOT do lax-DER parsing in-library — libsecp256k1
+//  * has no lax parser and using its strict parser here would change the
+//  * accept set (consensus hazard).  Returns 1 on valid, 0 on invalid/reject.
+//  */
+// static int bb_ecdsa_verify_compact(
+//     const unsigned char *sig64,
+//     const unsigned char *msg32,
+//     const unsigned char *pubkey_ser,
+//     size_t pubkey_len
+// ) {
+//     secp256k1_context *ctx = bb_get_ctx();
+//     if (!ctx) return 0;
+//     secp256k1_ecdsa_signature sig;
+//     /* parse_compact only fails if r or s >= n; the Go side already
+//      * rejects that range, so this is belt-and-suspenders. */
+//     if (!secp256k1_ecdsa_signature_parse_compact(ctx, &sig, sig64)) {
+//         return 0;
+//     }
+//     secp256k1_pubkey pubkey;
+//     if (!secp256k1_ec_pubkey_parse(ctx, &pubkey, pubkey_ser, pubkey_len)) {
+//         return 0;
+//     }
+//     /* secp256k1_ecdsa_verify enforces low-S (rejects high-S); the Go side
+//      * already normalized to low-S, matching Core's post-BIP66/BIP146
+//      * consensus behaviour where the engine normalizes before verify. */
+//     return secp256k1_ecdsa_verify(ctx, &sig, msg32, &pubkey);
+// }
+//
+// /*
+//  * Consensus BIP-340 Schnorr verify.  32-byte x-only pubkey, 64-byte sig,
+//  * variable-length message (Bitcoin always passes 32 bytes, but BIP-340 is
+//  * mlen-agnostic and the test vectors exercise 0/1/17/100-byte messages).
+//  * Direct drop-in for secp256k1_schnorrsig_verify.  Returns 1 valid, 0 reject.
+//  */
+// static int bb_schnorr_verify(
+//     const unsigned char *sig64,
+//     const unsigned char *msg,
+//     size_t msglen,
+//     const unsigned char *xonly32
+// ) {
+//     secp256k1_context *ctx = bb_get_ctx();
+//     if (!ctx) return 0;
+//     secp256k1_xonly_pubkey pubkey;
+//     if (!secp256k1_xonly_pubkey_parse(ctx, &pubkey, xonly32)) {
+//         return 0;
+//     }
+//     return secp256k1_schnorrsig_verify(ctx, sig64, msg, msglen, &pubkey);
 // }
 import "C"
 
@@ -332,4 +391,65 @@ func (k *EllSwiftPrivKey) ComputeBIP324ECDHSecret(theirEllSwift EllSwiftPubKey, 
 		return zero
 	}
 	return out
+}
+
+// ---------------------------------------------------------------------------
+// libsecp256k1-backed signature verification (consensus hot path).
+//
+// These two functions are the cgo half of VerifyECDSALax (ecdsa.go) and
+// VerifySchnorrMsg (schnorr.go).  They reuse the same lazily-initialised,
+// randomized secp256k1 context as the ellswift codec above.  The pure-Go
+// dcrec implementations remain in-tree (verifyECDSALaxDcrec /
+// verifySchnorrMsgDcrec) as a reference oracle for the differential-
+// equivalence tests (libsecp_diff_test.go).
+
+// ecdsaVerifyCompactLibsecp verifies a low-S-normalized 64-byte compact
+// signature (r||s, big-endian) against msgHash32 and a serialized public
+// key (33-byte compressed or 65-byte uncompressed) via libsecp256k1's
+// secp256k1_ecdsa_verify.  The DER (lax) parsing and low-S normalization
+// are performed by the Go caller before this point — libsecp256k1 has no
+// lax-DER parser, so doing it in-library would change the accept set.
+// Returns false on any parse failure or invalid signature.
+func ecdsaVerifyCompactLibsecp(pubKeySer, msgHash32, compactSig64 []byte) bool {
+	if len(compactSig64) != 64 || len(msgHash32) != 32 || len(pubKeySer) == 0 {
+		return false
+	}
+	if err := ensureCtx(); err != nil {
+		return false
+	}
+	rc := C.bb_ecdsa_verify_compact(
+		(*C.uchar)(unsafe.Pointer(&compactSig64[0])),
+		(*C.uchar)(unsafe.Pointer(&msgHash32[0])),
+		(*C.uchar)(unsafe.Pointer(&pubKeySer[0])),
+		C.size_t(len(pubKeySer)),
+	)
+	return rc == 1
+}
+
+// schnorrVerifyLibsecp verifies a 64-byte BIP-340 Schnorr signature over
+// msg (variable length) against a 32-byte x-only public key via
+// libsecp256k1's secp256k1_schnorrsig_verify.  Returns false on any parse
+// failure or invalid signature.
+func schnorrVerifyLibsecp(pubKeyXOnly32, msg, sig64 []byte) bool {
+	if len(pubKeyXOnly32) != 32 || len(sig64) != 64 {
+		return false
+	}
+	if err := ensureCtx(); err != nil {
+		return false
+	}
+	// An empty message is valid under BIP-340 (test vector 15, mlen=0).
+	// cgo requires a non-nil pointer even when msglen==0, so back it with a
+	// 1-byte stack array that libsecp256k1 will not read past msglen=0.
+	var dummy [1]byte
+	msgPtr := (*C.uchar)(unsafe.Pointer(&dummy[0]))
+	if len(msg) > 0 {
+		msgPtr = (*C.uchar)(unsafe.Pointer(&msg[0]))
+	}
+	rc := C.bb_schnorr_verify(
+		(*C.uchar)(unsafe.Pointer(&sig64[0])),
+		msgPtr,
+		C.size_t(len(msg)),
+		(*C.uchar)(unsafe.Pointer(&pubKeyXOnly32[0])),
+	)
+	return rc == 1
 }

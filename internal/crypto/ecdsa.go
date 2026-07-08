@@ -56,13 +56,17 @@ var curveN, _ = new(big.Int).SetString("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6
 // halfN is N/2, used for low-S normalization
 var halfN = new(big.Int).Rsh(curveN, 1)
 
-// VerifyECDSALax verifies a DER-encoded ECDSA signature using a lax DER parser.
-// This accepts signatures that Bitcoin Core's OpenSSL-era parser accepted but
-// that strict DER parsing rejects (e.g. extra padding, wrong sequence length).
-func VerifyECDSALax(pubKey *PublicKey, hash [32]byte, sig []byte) bool {
-	rBytes, sBytes, ok := parseDERLax(sig)
-	if !ok {
-		return false
+// parseAndNormalizeECDSA runs Bitcoin Core's lax-DER parse over sig, checks
+// that R and S are in [1, N-1], and normalizes S to low-S form.  It returns
+// the 32-byte big-endian R and S ready to feed a compact verifier, or
+// ok=false if the signature is malformed or out of range.  This is the
+// shared front-end for both the libsecp256k1 (VerifyECDSALax) and dcrec
+// (verifyECDSALaxDcrec) back-ends so their accept/reject behaviour is
+// identical up to the final curve-math step.
+func parseAndNormalizeECDSA(sig []byte) (rPad, sPad [32]byte, ok bool) {
+	rBytes, sBytes, parsed := parseDERLax(sig)
+	if !parsed {
+		return rPad, sPad, false
 	}
 
 	rInt := new(big.Int).SetBytes(rBytes)
@@ -70,10 +74,10 @@ func VerifyECDSALax(pubKey *PublicKey, hash [32]byte, sig []byte) bool {
 
 	// R and S must be in [1, N-1]
 	if rInt.Sign() <= 0 || rInt.Cmp(curveN) >= 0 {
-		return false
+		return rPad, sPad, false
 	}
 	if sInt.Sign() <= 0 || sInt.Cmp(curveN) >= 0 {
-		return false
+		return rPad, sPad, false
 	}
 
 	// Normalize S to low-S form
@@ -81,15 +85,51 @@ func VerifyECDSALax(pubKey *PublicKey, hash [32]byte, sig []byte) bool {
 		sInt.Sub(curveN, sInt)
 	}
 
-	var rScalar, sScalar secp256k1.ModNScalar
 	rB := rInt.Bytes()
 	sB := sInt.Bytes()
-
-	// Pad to 32 bytes
-	var rPad, sPad [32]byte
 	copy(rPad[32-len(rB):], rB)
 	copy(sPad[32-len(sB):], sB)
+	return rPad, sPad, true
+}
 
+// VerifyECDSALax verifies a DER-encoded ECDSA signature using a lax DER parser.
+// This accepts signatures that Bitcoin Core's OpenSSL-era parser accepted but
+// that strict DER parsing rejects (e.g. extra padding, wrong sequence length).
+//
+// Backend: libsecp256k1 secp256k1_ecdsa_verify (Bitcoin Core's consensus
+// engine).  The lax-DER parse and low-S normalization are done in Go
+// (parseAndNormalizeECDSA) because libsecp256k1 has no lax-DER parser;
+// feeding its strict parser here would change the accept set.  Verified
+// bit-identical to the dcrec reference (verifyECDSALaxDcrec) over the
+// differential corpus in libsecp_diff_test.go.
+func VerifyECDSALax(pubKey *PublicKey, hash [32]byte, sig []byte) bool {
+	rPad, sPad, ok := parseAndNormalizeECDSA(sig)
+	if !ok {
+		return false
+	}
+
+	var compact [64]byte
+	copy(compact[0:32], rPad[:])
+	copy(compact[32:64], sPad[:])
+
+	// A valid dcrec-parsed point round-trips through the uncompressed SEC
+	// encoding and secp256k1_ec_pubkey_parse without loss, so libsecp256k1
+	// verifies against the identical curve point.
+	return ecdsaVerifyCompactLibsecp(pubKey.key.SerializeUncompressed(), hash[:], compact[:])
+}
+
+// verifyECDSALaxDcrec is the pure-Go dcrec reference implementation of
+// VerifyECDSALax, retained as the oracle for the differential-equivalence
+// test (libsecp_diff_test.go) and as a fallback if the cgo backend is ever
+// disabled.  It shares parseAndNormalizeECDSA with the libsecp path so the
+// only behavioural difference under test is the final curve-math step.
+func verifyECDSALaxDcrec(pubKey *PublicKey, hash [32]byte, sig []byte) bool {
+	rPad, sPad, ok := parseAndNormalizeECDSA(sig)
+	if !ok {
+		return false
+	}
+
+	var rScalar, sScalar secp256k1.ModNScalar
 	if rScalar.SetBytes(&rPad) != 0 {
 		return false
 	}
