@@ -1488,6 +1488,14 @@ func (p *Peer) WantsTxRelay() bool {
 	return p.peerVersion.Relay
 }
 
+// TxRelayDisabled reports whether this connection is configured to not relay
+// transactions (a block-relay-only link). Used by the sync manager to skip the
+// inv->getdata tx-request path on such peers, matching Bitcoin Core, which does
+// no transaction relay on block-relay-only connections.
+func (p *Peer) TxRelayDisabled() bool {
+	return p.config.DisableRelayTx
+}
+
 // SetBanCallback sets the callback invoked when peer exceeds misbehavior threshold.
 func (p *Peer) SetBanCallback(cb func(*Peer)) {
 	p.mu.Lock()
