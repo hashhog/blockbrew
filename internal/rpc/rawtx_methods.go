@@ -11,6 +11,7 @@ import (
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
+	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -688,6 +689,25 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			continue
 		}
 
+		// Minimum non-witness serialized size (CVE-2017-12842). A tx whose
+		// stripped (no-witness) serialization is < MIN_STANDARD_TX_NONWITNESS_SIZE
+		// (65 bytes) is non-standard — this closes the 64-byte tx merkle-branch
+		// confusion. Context-free, so it runs with the other standardness gates
+		// BEFORE input lookup, mirroring the real accept path's
+		// checkStandardnessLocked (mempool.go MinStandardTxNonWitnessSize). The
+		// pre-fix dry-run only checked the UPPER weight bound ("tx-size") and thus
+		// false-accepted sub-65-byte txs. Core reject token: tx-size-small.
+		{
+			var nwBuf bytes.Buffer
+			_ = tx.SerializeNoWitness(&nwBuf)
+			if nwBuf.Len() < mempool.MinStandardTxNonWitnessSize {
+				result.Allowed = false
+				result.RejectReason = "tx-size-small"
+				results = append(results, result)
+				continue
+			}
+		}
+
 		// Calculate vsize
 		weight := consensus.CalcTxWeight(tx)
 		vsize := (weight + 3) / 4
@@ -749,31 +769,131 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			continue
 		}
 
-		// Calculate fee by looking up inputs
+		// IsFinalTx (BIP-113): reject non-final transactions. Context-free (no
+		// inputs required), so it runs here — before input lookup — mirroring the
+		// real accept path (mempool.go PreChecks 5c), which evaluates finality
+		// against tipHeight+1 and the chain MTP. nextHeight/mtp come from the SAME
+		// ChainState the real path uses (Mempool.TipContextForAccept); when no
+		// ChainState is wired the check is skipped, exactly as AddTransactionFrom
+		// skips it. The pre-fix dry-run had no finality check at all and thus
+		// false-accepted non-final txs. Core reject token: non-final.
+		if nextHeight, mtp, ok := s.mempool.TipContextForAccept(); ok {
+			if !consensus.IsFinalTx(tx, nextHeight, mtp) {
+				result.Allowed = false
+				result.RejectReason = "non-final"
+				results = append(results, result)
+				continue
+			}
+		}
+
+		// Look up each input's UTXO, building a prevout VIEW (outpoint -> full
+		// entry: scriptPubKey, amount, height, coinbase flag). The pre-fix dry-run
+		// summed only .Amount here and discarded the rest, which is exactly the
+		// metadata the sigops / input-standardness / coinbase-maturity gates below
+		// need. Feeding this view to the SAME consensus helpers the real accept
+		// path calls (GetTransactionSigOpCost, the P2SH/legacy sigop gates,
+		// CoinbaseMaturity) keeps the dry-run from re-drifting.
+		prevoutView := consensus.NewInMemoryUTXOView()
 		var totalInputValue int64
 		inputsFound := true
 		for _, txIn := range tx.TxIn {
-			// Check UTXO set
+			var utxo *consensus.UTXOEntry
+			// Check UTXO set first, then the mempool (which also consults the
+			// underlying chainstate view), preserving the pre-fix lookup order.
 			if s.chainMgr != nil {
-				utxo := s.chainMgr.UTXOSet().GetUTXO(txIn.PreviousOutPoint)
-				if utxo != nil {
-					totalInputValue += utxo.Amount
-					continue
-				}
+				utxo = s.chainMgr.UTXOSet().GetUTXO(txIn.PreviousOutPoint)
 			}
-			// Check mempool
-			mempoolUtxo := s.mempool.GetUTXO(txIn.PreviousOutPoint)
-			if mempoolUtxo != nil {
-				totalInputValue += mempoolUtxo.Amount
-				continue
+			if utxo == nil {
+				utxo = s.mempool.GetUTXO(txIn.PreviousOutPoint)
 			}
-			inputsFound = false
-			break
+			if utxo == nil {
+				inputsFound = false
+				break
+			}
+			totalInputValue += utxo.Amount
+			prevoutView.AddUTXO(txIn.PreviousOutPoint, utxo)
 		}
 
 		if !inputsFound {
 			result.Allowed = false
 			result.RejectReason = "missing-inputs"
+			results = append(results, result)
+			continue
+		}
+
+		// --- Input-dependent gates (need the prevout view). Order mirrors the
+		// real accept path: per-tx sigops cost, then input-standardness sigops,
+		// then coinbase maturity (mempool.go PreChecks 5d gates 1-3, then step 6). ---
+
+		// Per-tx BIP141 sigops cost (MAX_STANDARD_TX_SIGOPS_COST = 16000). Reuses
+		// the exact helper the real path calls so P2SH redeem-script + witness
+		// sigops are counted accurately against the prevout view. The pre-fix
+		// dry-run never counted sigops. Core reject token: bad-txns-too-many-sigops.
+		if consensus.GetTransactionSigOpCost(tx, prevoutView) > consensus.MaxStandardTxSigOpsCost {
+			result.Allowed = false
+			result.RejectReason = "bad-txns-too-many-sigops"
+			results = append(results, result)
+			continue
+		}
+
+		// Input standardness — P2SH per-input redeemScript sigops (MAX_P2SH_SIGOPS
+		// = 15) and total non-witness (legacy) sigops (BIP54 MAX_TX_LEGACY_SIGOPS
+		// = 2500). Both surface as bad-txns-nonstandard-inputs in Core. Mirrors
+		// mempool.go PreChecks 5d gates 2 & 3 (ValidateInputsStandardness). The
+		// pre-fix dry-run validated no input standardness.
+		nonstdReason := ""
+		for _, txIn := range tx.TxIn {
+			utxo := prevoutView.GetUTXO(txIn.PreviousOutPoint)
+			if utxo == nil || !script.IsP2SH(utxo.PkScript) {
+				continue
+			}
+			if consensus.CountScriptSigOps(txIn.SignatureScript) > consensus.MaxP2SHSigOpsPerInput {
+				nonstdReason = "bad-txns-nonstandard-inputs"
+				break
+			}
+		}
+		if nonstdReason == "" {
+			var legacySigops int
+			for _, txIn := range tx.TxIn {
+				legacySigops += consensus.CountSigOpsAccurate(txIn.SignatureScript)
+				if utxo := prevoutView.GetUTXO(txIn.PreviousOutPoint); utxo != nil {
+					legacySigops += consensus.CountScriptPubKeySigOps(utxo.PkScript, txIn.SignatureScript)
+				}
+				if legacySigops > consensus.MaxTxLegacySigOps {
+					nonstdReason = "bad-txns-nonstandard-inputs"
+					break
+				}
+			}
+		}
+		if nonstdReason != "" {
+			result.Allowed = false
+			result.RejectReason = nonstdReason
+			results = append(results, result)
+			continue
+		}
+
+		// Coinbase maturity: a spent confirmed coinbase output must have at least
+		// CoinbaseMaturity (100) confirmations. Spend height is tipHeight+1 (the
+		// block the mempool builds for), matching mempool.go step 6. Skipped when
+		// no ChainState is wired (same guard as the real path). The pre-fix dry-run
+		// had no maturity check. Core reject token:
+		// bad-txns-premature-spend-of-coinbase.
+		immatureCoinbase := false
+		if nextHeight, _, ok := s.mempool.TipContextForAccept(); ok {
+			for _, txIn := range tx.TxIn {
+				utxo := prevoutView.GetUTXO(txIn.PreviousOutPoint)
+				if utxo == nil || !utxo.IsCoinbase {
+					continue
+				}
+				if nextHeight-utxo.Height < consensus.CoinbaseMaturity {
+					immatureCoinbase = true
+					break
+				}
+			}
+		}
+		if immatureCoinbase {
+			result.Allowed = false
+			result.RejectReason = "bad-txns-premature-spend-of-coinbase"
 			results = append(results, result)
 			continue
 		}

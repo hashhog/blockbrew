@@ -1402,6 +1402,27 @@ func (mp *Mempool) GetUTXO(outpoint wire.OutPoint) *consensus.UTXOEntry {
 	return mp.lookupOutputLocked(outpoint)
 }
 
+// TipContextForAccept returns the (nextHeight, mtp) pair the mempool's
+// admission path uses for context-sensitive checks — IsFinalTx (BIP-113) and
+// coinbase maturity. nextHeight is the tip height + 1 (the block the mempool is
+// building for) and mtp is the tip's median-time-past. ok is false when no
+// ChainState is wired (legacy/test callers), in which case callers must SKIP
+// the context-sensitive checks, exactly as AddTransactionFrom guards them
+// behind its `config.ChainState != nil` test (mempool.go PreChecks 5c / step 6).
+//
+// This exists so read-only twins of the accept path (e.g. testmempoolaccept)
+// derive nextHeight/mtp from the SAME ChainState the real path uses, rather than
+// re-deriving them from a separately-wired chain handle and drifting.
+func (mp *Mempool) TipContextForAccept() (nextHeight int32, mtp uint32, ok bool) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	if mp.config.ChainState == nil {
+		return 0, 0, false
+	}
+	cs := mp.config.ChainState
+	return cs.TipHeight() + 1, uint32(cs.TipMTP()), true
+}
+
 // mempoolUTXOView is a thin consensus.UTXOView adapter that calls
 // mp.lookupOutputLocked without acquiring mp.mu. It is only valid to use
 // while mp.mu is already held (e.g. inside AddTransaction).
