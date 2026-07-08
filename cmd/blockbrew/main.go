@@ -1497,6 +1497,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		PeerManager:  nil, // Will be set below after peerMgr is created
 		ChainManager: chainMgr,
 		Pruner:       pruner,
+		Mempool:      mp,
 		OnSyncComplete: func() {
 			log.Printf("Header synchronization complete, starting block download")
 			// Re-resolve the chain tip now that headers are available.
@@ -1549,6 +1550,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		}
 		txHash := msg.Tx.TxHash()
 		wtxHash := msg.Tx.WTxHash()
+		// Clear the request-dedup slot now that the announced tx has arrived,
+		// so a fresh announcement can be re-requested if this one is later
+		// evicted (rather than waiting out txInflightExpiry).
+		syncMgr.NotifyTxReceived(txHash, wtxHash)
 		entry := mp.GetEntry(txHash)
 		if entry != nil {
 			peerMgr.RelayTransaction(txHash, wtxHash, entry.Fee, entry.Size, peer.Address())
