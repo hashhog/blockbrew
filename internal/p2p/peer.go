@@ -322,6 +322,53 @@ func (p *Peer) takeAddrTokens(requested int) int {
 	return admit
 }
 
+// v2FallbackCacheMax bounds the v1-only address cache. Kept small: it only
+// needs to remember peers we recently tried v2 against and failed, so we don't
+// re-probe (and re-redial) them on every reconnect. Mirrors rustoshi's
+// V2_FALLBACK_CACHE_MAX (network/src/peer.rs).
+const v2FallbackCacheMax = 256
+
+var (
+	v1OnlyMu    sync.Mutex
+	v1OnlyCache = make(map[string]struct{})
+)
+
+// isV1Only reports whether addr was previously observed to NOT speak BIP-324
+// v2 (the v2 handshake timed out or the peer answered our ellswift pubkey with
+// v1 magic). Outbound dials to such addresses skip the v2 probe and go straight
+// to v1, avoiding a guaranteed-failed handshake plus a fresh redial every time.
+func isV1Only(addr string) bool {
+	v1OnlyMu.Lock()
+	defer v1OnlyMu.Unlock()
+	_, ok := v1OnlyCache[addr]
+	return ok
+}
+
+// markV1Only records addr as v1-only. Bounded to v2FallbackCacheMax entries;
+// when full it evicts one arbitrary entry (Go map iteration order is
+// randomized, giving an effectively random eviction like rustoshi's HashSet).
+func markV1Only(addr string) {
+	v1OnlyMu.Lock()
+	defer v1OnlyMu.Unlock()
+	if _, ok := v1OnlyCache[addr]; ok {
+		return
+	}
+	if len(v1OnlyCache) >= v2FallbackCacheMax {
+		for victim := range v1OnlyCache {
+			delete(v1OnlyCache, victim)
+			break
+		}
+	}
+	v1OnlyCache[addr] = struct{}{}
+}
+
+// clearV1OnlyCache resets the v1-only cache. Test-only helper.
+func clearV1OnlyCache() {
+	v1OnlyMu.Lock()
+	defer v1OnlyMu.Unlock()
+	v1OnlyCache = make(map[string]struct{})
+}
+
 // NewOutboundPeer creates a new outbound peer and initiates the TCP connection.
 func NewOutboundPeer(addr string, config PeerConfig) (*Peer, error) {
 	// Generate our local nonce for self-connection detection
@@ -342,6 +389,11 @@ func NewOutboundPeer(addr string, config PeerConfig) (*Peer, error) {
 		compactBlockState: NewCompactBlockState(),
 	}
 
+	// Decide whether to probe BIP-324 v2. Skip the probe for addresses already
+	// known to be v1-only, so we don't pay a doomed handshake + fresh redial
+	// on every reconnect to a v1-only peer.
+	tryV2 := config.PreferV2 && !isV1Only(addr)
+
 	// Connect with timeout
 	conn, err := net.DialTimeout("tcp", addr, ConnectTimeout)
 	if err != nil {
@@ -352,12 +404,28 @@ func NewOutboundPeer(addr string, config PeerConfig) (*Peer, error) {
 	p.setupConn()
 
 	// Negotiate transport (v1 or v2)
-	if config.PreferV2 {
+	if tryV2 {
 		transport, err := NegotiateTransport(conn, config.Network, true, true)
 		if err != nil {
-			// Fall back to v1 on error
-			log.Printf("v2 transport negotiation failed, using v1: %v", err)
-			p.transport = NewV1Transport(conn, config.Network)
+			// The v2 handshake failed. We have already written our ellswift
+			// pubkey (64 bytes) + garbage to this socket, so a v1-only peer
+			// has consumed those bytes as garbage v1 data and this socket is
+			// now poisoned for a v1 handshake. Close it and DIAL A FRESH TCP
+			// socket, then run v1 on the clean connection — mirroring Bitcoin
+			// Core (net.cpp: v2 failure reconnects with use_v2transport=false)
+			// and rustoshi's fresh-socket fallback (network/src/peer.rs). Also
+			// mark the address v1-only so subsequent dials skip the v2 probe.
+			log.Printf("v2 transport negotiation failed for %s, redialing fresh socket for v1: %v", addr, err)
+			conn.Close()
+			markV1Only(addr)
+
+			fresh, derr := net.DialTimeout("tcp", addr, ConnectTimeout)
+			if derr != nil {
+				return nil, fmt.Errorf("v1 fallback redial to %s: %w", addr, derr)
+			}
+			p.conn = fresh
+			p.setupConn()
+			p.transport = NewV1Transport(fresh, config.Network)
 		} else {
 			p.transport = transport
 			p.v2Transport = transport.IsEncrypted()
