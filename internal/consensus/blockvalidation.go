@@ -605,6 +605,18 @@ func CheckBlockTimestamp(blockTimestamp uint32, medianTimePast uint32) error {
 	return nil
 }
 
+// CheckWitnessCommitment runs the context-free segwit witness-commitment /
+// malleation gate (Core CheckWitnessMalleation, "bad-witness-merkle-match")
+// as an exported entry point. It is the same check CheckBlockContext runs when
+// segwit is active; exposed so the submitblock RPC side-branch store path can
+// enforce it before persisting a non-tip-extending block (Core runs CheckBlock
+// — which subsumes this via IsBlockMutated — in ProcessNewBlock before storage;
+// see CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md). Callers
+// must only invoke this when segwit is active for the block's height.
+func CheckWitnessCommitment(block *wire.MsgBlock) error {
+	return checkWitnessCommitment(block)
+}
+
 // IsBlockMutated returns true if the block's merkle root or witness commitment
 // is inconsistent with its transactions, indicating a possible short-ID collision
 // or block malleation.
