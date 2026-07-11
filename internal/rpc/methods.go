@@ -2181,7 +2181,8 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	// client / miner) that has NOT passed through the PRESYNC pipeline.
 	// AddHeader will enforce the MinimumChainWork gate itself.
 	hash := block.Header.BlockHash()
-	if _, err := s.headerIndex.AddHeader(block.Header, false); err != nil {
+	hdrNode, err := s.headerIndex.AddHeader(block.Header, false)
+	if err != nil {
 		// If duplicate, that's OK — return "duplicate" per BIP-22
 		if errors.Is(err, consensus.ErrDuplicateHeader) {
 			return "duplicate", nil
@@ -2217,6 +2218,22 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	// the side-branch-stored arm needs the body durable for a future reorg
 	// dispatch when a sibling extends this branch past tip work.
 	if !isActiveTip && s.chainDB != nil {
+		// Context-free witness-commitment gate on the side-branch store path.
+		// CheckBlockSanity (above) covers PoW/merkle/weight/legacy-sigops but
+		// NOT the segwit witness commitment — Core keeps that in
+		// CheckWitnessMalleation, which its ProcessNewBlock->CheckBlock
+		// (IsBlockMutated) runs on EVERY submitblock before storage, including
+		// a non-tip-extending sibling. Without this the side-branch is stored
+		// with a corrupted witness commitment (bad-witness-merkle-match) that
+		// Core rejects outright. The active-tip arm already validates it via
+		// ProcessSubmittedBlock->ConnectBlock->CheckBlockContext, so this only
+		// closes the store-and-return-inconclusive gap.
+		// See CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md.
+		if hdrNode != nil && hdrNode.Height >= s.chainParams.SegwitHeight {
+			if werr := consensus.CheckWitnessCommitment(block); werr != nil {
+				return bip22ResultString(werr), nil
+			}
+		}
 		if err := s.chainDB.StoreBlock(hash, block); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to store block: %v", err)}
 		}
