@@ -346,7 +346,7 @@ func (v *InMemoryUTXOView) ApplyTxInUndo(undo *UTXOEntry, outpoint wire.OutPoint
 // empty scripts on the assumption "an empty script can never appear on a real
 // chain"; that assumption is false. Mainnet block 230926 tx 62
 // (7bd54def72825008b4ca0f4aeff13e6be2c5fe0f23430629a9d484a1ac2a29b8) vout 0 has
-// an empty scriptPubKey (value 40960 sats) and is spent at block 231021 tx 192.
+// an empty scriptPubKey (value 4096 sats) and is spent at block 231021 tx 192.
 // Dropping it here left the coin absent from the UTXO set, so connecting 231021
 // failed "missing UTXO" and the from-genesis assumevalid=0 replay wedged at
 // height 231020. This now mirrors Core (script.h:563 CScript::IsUnspendable)
