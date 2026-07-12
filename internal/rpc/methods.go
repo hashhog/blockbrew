@@ -113,6 +113,18 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		ibd = s.syncMgr.IsIBDActive()
 	}
 
+	// size_on_disk: total bytes of the flat-file block + undo data. Mirrors
+	// Bitcoin Core rpc/blockchain.cpp, which reports
+	// chainman.m_blockman.CalculateCurrentUsage() (sum of nSize + nUndoSize
+	// over every block file). We reuse the identical BlockStore accessor the
+	// pruner uses, so the value tracks the same accounting Core exposes.
+	var sizeOnDisk int64
+	if s.chainDB != nil {
+		if bs := s.chainDB.BlockStore(); bs != nil {
+			sizeOnDisk = int64(bs.CalculateCurrentUsage())
+		}
+	}
+
 	// Pruning fields. Core's rpc/blockchain.cpp emits `pruned` always,
 	// `pruneheight` and `automatic_pruning` only when pruning is on, and
 	// `prune_target_size` only when automatic_pruning is on. We follow
@@ -144,6 +156,7 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		VerificationProgress: verificationProgress,
 		InitialBlockDownload: ibd,
 		ChainWork:            chainWorkHex,
+		SizeOnDisk:           sizeOnDisk,
 		Pruned:               pruned,
 		PruneHeight:          pruneHeight,
 		AutomaticPruning:     automaticPruning,
@@ -2059,6 +2072,14 @@ func bip22ResultString(err error) string {
 	// Sigops budget
 	case errors.Is(err, consensus.ErrSigOpsCostTooHigh):
 		return "bad-blk-sigops"
+	// Block size gate (non-witness size × WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT).
+	// Core CheckBlock validation.cpp:3948: state.Invalid(..., "bad-blk-length").
+	case errors.Is(err, consensus.ErrBlockLengthTooHigh):
+		return "bad-blk-length"
+	// Witness-inclusive block weight gate (GetBlockWeight > MAX_BLOCK_WEIGHT).
+	// Core ContextualCheckBlock validation.cpp:4180: state.Invalid(..., "bad-blk-weight").
+	case errors.Is(err, consensus.ErrBlockWeightTooHigh):
+		return "bad-blk-weight"
 	// Missing or already-spent prevout (ConnectBlock input check, CVE-2012-2459 path)
 	case errors.Is(err, consensus.ErrMissingInput):
 		return "bad-txns-inputs-missingorspent"
