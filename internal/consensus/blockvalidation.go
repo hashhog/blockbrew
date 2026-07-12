@@ -27,7 +27,18 @@ var (
 	// the legitimate (un-mutated) form has the same block hash and is
 	// still potentially valid. Bitcoin Core uses BLOCK_MUTATED for this
 	// (validation.cpp:3850-3858, "bad-txns-duplicate").
-	ErrBlockMutated             = errors.New("block merkle tree mutated (CVE-2012-2459)")
+	ErrBlockMutated = errors.New("block merkle tree mutated (CVE-2012-2459)")
+	// ErrBlockLengthTooHigh is the context-free CheckBlock size gate: the
+	// non-witness serialized size × WITNESS_SCALE_FACTOR exceeds
+	// MAX_BLOCK_WEIGHT. Bitcoin Core reports this as "bad-blk-length"
+	// (validation.cpp:3947-3948, CheckBlock — "size limits failed"). Kept
+	// distinct from ErrBlockWeightTooHigh so the submitblock BIP-22 reason
+	// string matches Core's two separate tokens (length vs. weight).
+	ErrBlockLengthTooHigh = errors.New("block base size exceeds maximum")
+	// ErrBlockWeightTooHigh is the witness-inclusive weight gate applied in
+	// ContextualCheckBlock after the witness commitment is verified. Bitcoin
+	// Core reports this as "bad-blk-weight" (validation.cpp:4179-4180 —
+	// "weight limit failed").
 	ErrBlockWeightTooHigh       = errors.New("block weight exceeds maximum")
 	ErrTimestampTooFar          = errors.New("block timestamp too far in the future")
 	ErrBlockVersionTooLow       = errors.New("block version too low for height")
@@ -110,6 +121,26 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int, skipPOW ...bool) 
 		return ErrNoTransactions
 	}
 
+	// 8b. Block size gate: non-witness serialized size × WITNESS_SCALE_FACTOR
+	// must not exceed MaxBlockWeight. Mirrors Bitcoin Core CheckBlock
+	// (validation.cpp:3947-3948, "bad-blk-length", "size limits failed"). Core
+	// runs this "size limits" gate BEFORE the coinbase-shape checks and the
+	// per-transaction CheckTransaction loop, so an oversize block built from a
+	// single huge transaction reports bad-blk-length rather than the per-tx
+	// oversize reason. We match that ordering so the reject-reason token equals
+	// Core's on this path. Decision is unchanged: an oversize block is rejected
+	// regardless of which gate fires, and a within-size block passes this gate
+	// and proceeds to every subsequent check exactly as before. The witness-
+	// inclusive weight check ("bad-blk-weight") stays deferred to
+	// CheckBlockContext (after CheckWitnessMalleation) so a witness-padded block
+	// sharing its hash with a legitimate block is not permanently failed before
+	// witness integrity is verified (Core ContextualCheckBlock, validation.cpp:
+	// 4173-4181).
+	strippedWeight := CalcStrippedBlockWeight(block)
+	if strippedWeight > MaxBlockWeight {
+		return fmt.Errorf("%w: stripped weight %d > %d", ErrBlockLengthTooHigh, strippedWeight, MaxBlockWeight)
+	}
+
 	// 3. First transaction must be coinbase
 	if !IsCoinbaseTx(block.Transactions[0]) {
 		return ErrFirstTxNotCoinbase
@@ -150,19 +181,8 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int, skipPOW ...bool) 
 	if mutated {
 		return ErrBlockMutated
 	}
-
-	// 7. Stripped block weight must not exceed MaxBlockWeight.
-	// Uses the non-witness serialized size × WITNESS_SCALE_FACTOR, mirroring
-	// Bitcoin Core's CheckBlock (validation.cpp:3947):
-	//   GetSerializeSize(TX_NO_WITNESS(block)) * WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT
-	// The witness-inclusive weight check is deferred to CheckBlockContext (after
-	// CheckWitnessMalleation), so a witness-padded block that shares its hash with
-	// a legitimate block cannot be permanently rejected before witness integrity is
-	// verified. See Bitcoin Core ContextualCheckBlock comment (validation.cpp:4173-4178).
-	strippedWeight := CalcStrippedBlockWeight(block)
-	if strippedWeight > MaxBlockWeight {
-		return fmt.Errorf("%w: stripped weight %d > %d", ErrBlockWeightTooHigh, strippedWeight, MaxBlockWeight)
-	}
+	// (The block size gate "bad-blk-length" runs earlier, as step 8b above,
+	// to match Bitcoin Core's CheckBlock ordering — see that comment.)
 
 	// 9. Block-wide legacy sigop-cost cap ("bad-blk-sigops").
 	// Mirrors Bitcoin Core CheckBlock (validation.cpp:3971-3977): sum the

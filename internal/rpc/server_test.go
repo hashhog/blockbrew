@@ -1035,7 +1035,7 @@ func TestGetRawTransactionFromMempool(t *testing.T) {
 	// Provide a UTXO set with OP_1 (anyone-can-spend) and enough value for fees.
 	utxoView := consensus.NewInMemoryUTXOView()
 	utxoView.AddUTXO(tx.TxIn[0].PreviousOutPoint, &consensus.UTXOEntry{
-		Amount:   1_100_000,     // fee = 1_100_000 - 0 = 1_100_000 sat
+		Amount:   1_100_000,    // fee = 1_100_000 - 0 = 1_100_000 sat
 		PkScript: []byte{0x51}, // OP_1 (anyone-can-spend)
 		Height:   1,
 	})
@@ -1848,6 +1848,13 @@ func TestBIP22ResultString(t *testing.T) {
 		{consensus.ErrBadCoinbaseValue, "bad-cb-amount"},
 		// Sigops
 		{consensus.ErrSigOpsCostTooHigh, "bad-blk-sigops"},
+		// Block size gate (Core CheckBlock "bad-blk-length") vs. witness-inclusive
+		// weight gate (Core ContextualCheckBlock "bad-blk-weight"): two distinct
+		// tokens for two distinct MAX_BLOCK_WEIGHT enforcement points.
+		{consensus.ErrBlockLengthTooHigh, "bad-blk-length"},
+		{consensus.ErrBlockWeightTooHigh, "bad-blk-weight"},
+		// Wrapped stripped-size form (as produced by CheckBlockSanity)
+		{fmt.Errorf("%w: stripped weight 4205736 > 4000000", consensus.ErrBlockLengthTooHigh), "bad-blk-length"},
 		// Duplicate transactions (BIP-30)
 		{consensus.ErrDuplicateTx, "bad-txns-duplicate"},
 		{consensus.ErrDuplicateCoinbase, "bad-txns-duplicate"},
