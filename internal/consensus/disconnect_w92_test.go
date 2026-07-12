@@ -93,7 +93,7 @@ func TestW92_AddTxOutputs_SkipsOversized(t *testing.T) {
 // Regression: an EMPTY scriptPubKey is spendable and MUST enter the UTXO set.
 // Mainnet block 230926 tx 62
 // (7bd54def72825008b4ca0f4aeff13e6be2c5fe0f23430629a9d484a1ac2a29b8) vout 0 has
-// an empty scriptPubKey (40960 sats) and is spent at block 231021 tx 192. The
+// an empty scriptPubKey (4096 sats) and is spent at block 231021 tx 192. The
 // old IsUnspendable returned true for empty scripts, so AddTxOutputs dropped the
 // coin; connecting 231021 then failed "missing UTXO" and the from-genesis
 // assumevalid=0 replay wedged at height 231020. Core (script.h:563) treats empty
@@ -112,7 +112,7 @@ func TestEmptyScriptOutputIsSpendable(t *testing.T) {
 			{PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF}, Sequence: 0xFFFFFFFF},
 		},
 		TxOut: []*wire.TxOut{
-			{Value: 40960, PkScript: []byte{}},   // empty script — MUST be added
+			{Value: 4096, PkScript: []byte{}},    // empty script — MUST be added
 			{Value: 149495904, PkScript: []byte{0x76, 0xa9, 0x14}}, // p2pkh stub — added
 		},
 		LockTime: 0,
