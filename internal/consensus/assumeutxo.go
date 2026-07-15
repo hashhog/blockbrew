@@ -768,23 +768,57 @@ var Testnet4AssumeUTXOParams = AssumeUTXOParams{
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Regtest AssumeUTXO whitelist (runtime-registerable).
+// Regtest AssumeUTXO whitelist (Core-parity table + runtime-registerable).
 //
 // Core's regtest chainparams DOES carry m_assumeutxo_data entries
 // (bitcoin-core/src/kernel/chainparams.cpp:607-628, heights 110 / 200 / 299,
 // explicitly "for use by test/functional/feature_assumeutxo.py" and the
-// snapshot fuzz target). Those Core values are pinned to Core's deterministic
-// regtest mining chain; blockbrew's snapshot tests build their own short
-// regtest chains, so the regtest table is REGISTERABLE at runtime — exactly
-// mirroring how Core's regtest is a mockable chain whose assumeutxo data is
-// purpose-built for the snapshot tests rather than a permanent network
-// commitment.
+// snapshot fuzz target). Those three quadruples are pinned to Core's OWN
+// deterministic regtest mining chain (the exact chain
+// tools/boot-smoke-fixtures/make-fixture.py reproduces), so they are always
+// present below in RegtestCoreParityAssumeUTXOData — pure Core parity, copied
+// verbatim, never mutated. blockbrew's own snapshot tests build their OWN
+// short synthetic regtest chains with different base blocks, so those stay on
+// the REGISTERABLE-at-runtime whitelist beneath it — exactly mirroring how
+// Core's regtest is a mockable chain whose assumeutxo data is purpose-built
+// per-consumer rather than a single permanent network commitment.
+// RegtestAssumeUTXOParams() below merges both: the Core-parity table first,
+// then whatever has been runtime-registered. No collision is possible in
+// practice — test-registered entries use heights from their own short chains,
+// not 110/200/299 — but even a same-height registration cannot shadow a
+// Core-parity BlockHash lookup (ForBlockHash matches on hash, not height).
 //
 // This table is NEVER consulted for mainnet/testnet4 (their whitelists remain
 // the hardcoded, immutable MainnetAssumeUTXOParams / Testnet4AssumeUTXOParams
-// above); it only gates the regtest snapshot test path. Cross-impl reference:
-// camlcoin 3140ab9 (register_regtest_assumeutxo, lib/assume_utxo.ml) and
-// lunarblock a39dd42.
+// above); it only gates the regtest snapshot test/boot path. Cross-impl
+// reference: camlcoin 3140ab9 (register_regtest_assumeutxo,
+// lib/assume_utxo.ml) and lunarblock a39dd42.
+var RegtestCoreParityAssumeUTXOData = []AssumeUTXOData{
+	{
+		// Core comment: "For use by unit tests"
+		Height:         110,
+		HashSerialized: mustParseHash("b952555c8ab81fec46f3d4253b7af256d766ceb39fb7752b9d18cdf4a0141327"),
+		ChainTxCount:   111,
+		BlockHash:      mustParseHash("6affe030b7965ab538f820a56ef56c8149b7dc1d1c144af57113be080db7c397"),
+	},
+	{
+		// Core comment: "For use by fuzz target src/test/fuzz/utxo_snapshot.cpp"
+		Height:         200,
+		HashSerialized: mustParseHash("17dcc016d188d16068907cdeb38b75691a118d43053b8cd6a25969419381d13a"),
+		ChainTxCount:   201,
+		BlockHash:      mustParseHash("385901ccbd69dff6bbd00065d01fb8a9e464dede7cfe0372443884f9b1dcf6b9"),
+	},
+	{
+		// Core comment: "For use by test/functional/feature_assumeutxo.py and
+		// test/functional/tool_bitcoin_chainstate.py" — this is the entry
+		// tools/boot-smoke.sh's fixture (fixture-meta.json) matches.
+		Height:         299,
+		HashSerialized: mustParseHash("d2b051ff5e8eef46520350776f4100dd710a63447a8e01d917e92e79751a63e2"),
+		ChainTxCount:   334,
+		BlockHash:      mustParseHash("7cc695046fec709f8c9394b6f928f81e81fd3ac20977bb68760fa1faa7916ea2"),
+	},
+}
+
 var (
 	regtestAssumeUTXOMu   sync.Mutex
 	regtestAssumeUTXOData []AssumeUTXOData
@@ -816,14 +850,39 @@ func ClearRegtestAssumeUTXO() {
 }
 
 // RegtestAssumeUTXOParams returns a snapshot of the current regtest whitelist
-// as an *AssumeUTXOParams (ForBlockHash / ForHeight consumers). The returned
-// params is a copy — mutating the live whitelist afterwards does not affect it.
+// as an *AssumeUTXOParams (ForBlockHash / ForHeight consumers): Core's
+// always-present RegtestCoreParityAssumeUTXOData (heights 110/200/299) merged
+// with whatever has been runtime-registered via RegisterRegtestAssumeUTXO.
+// The returned params is a copy — mutating the live whitelist afterwards does
+// not affect it.
 func RegtestAssumeUTXOParams() *AssumeUTXOParams {
 	regtestAssumeUTXOMu.Lock()
 	defer regtestAssumeUTXOMu.Unlock()
-	cp := make([]AssumeUTXOData, len(regtestAssumeUTXOData))
-	copy(cp, regtestAssumeUTXOData)
+	cp := make([]AssumeUTXOData, 0, len(RegtestCoreParityAssumeUTXOData)+len(regtestAssumeUTXOData))
+	cp = append(cp, RegtestCoreParityAssumeUTXOData...)
+	cp = append(cp, regtestAssumeUTXOData...)
 	return &AssumeUTXOParams{Data: cp}
+}
+
+// AssumeUTXOParamsForNetwork returns the EFFECTIVE AssumeUTXO whitelist for
+// params: for regtest, RegtestAssumeUTXOParams() (the Core-parity table plus
+// anything runtime-registered/campaign-appended); for every other network,
+// params.AssumeUTXO itself (nil if that network has none, e.g. testnet3/
+// signet today). This is the single canonical chokepoint every AssumeUTXO
+// consumer (RPC loadtxoutset/dumptxoutset, the CLI -load-snapshot boot path,
+// LoadCampaignAssumeUTXO) MUST route through — a consumer that reads
+// params.AssumeUTXO directly bypasses the regtest Core-parity table AND any
+// campaign-appended entries (this bit blockbrew's own CLI -load-snapshot path
+// before the fix: it read params.AssumeUTXO directly, which is always nil on
+// regtest, independent of RegtestAssumeUTXOParams()).
+func AssumeUTXOParamsForNetwork(params *ChainParams) *AssumeUTXOParams {
+	if params == nil {
+		return nil
+	}
+	if params.Name == "regtest" {
+		return RegtestAssumeUTXOParams()
+	}
+	return params.AssumeUTXO
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
