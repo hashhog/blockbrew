@@ -524,6 +524,16 @@ func main() {
 		log.Fatalf("Unknown network: %s", cfg.Network)
 	}
 
+	// HASHHOG_CAMPAIGN_ASSUMEUTXO: read exactly once, right after network-params
+	// selection and before anything (RPC, -load-snapshot) consults AssumeUTXO
+	// data. Unset/empty is a single os.Getenv and nothing else runs — see
+	// consensus.LoadCampaignAssumeUTXO for the full contract.
+	if n, err := consensus.LoadCampaignAssumeUTXO(chainParams); err != nil {
+		log.Fatalf("%s: %v", consensus.CampaignAssumeUTXOEnvVar, err)
+	} else if n > 0 {
+		log.Printf("campaign assumeutxo: %d entries appended to %s allowlist", n, chainParams.Name)
+	}
+
 	// Apply the -assumevalid override (Core parity). "0" disables assume-valid
 	// so all history is fully script-verified; a hex value sets a custom block.
 	if err := chainParams.ApplyAssumeValidOverride(cfg.AssumeValid); err != nil {
@@ -2519,8 +2529,14 @@ func loadSnapshotFromFile(
 		return consensus.ErrNetworkMismatch
 	}
 
-	// --- Step 2: verify network supports AssumeUTXO.
-	if params.AssumeUTXO == nil {
+	// --- Step 2: verify network supports AssumeUTXO. Routed through
+	// consensus.AssumeUTXOParamsForNetwork so regtest sees the Core-parity
+	// table (heights 110/200/299) and any campaign-appended entries — reading
+	// params.AssumeUTXO directly here would always fail on regtest, since
+	// that field is nil there by design (regtest's table lives in the
+	// runtime-registerable whitelist, not the ChainParams struct).
+	auParams := consensus.AssumeUTXOParamsForNetwork(params)
+	if auParams == nil {
 		return fmt.Errorf("network %q has no AssumeUTXO params; snapshot loading not supported", params.Name)
 	}
 
@@ -2535,7 +2551,7 @@ func loadSnapshotFromFile(
 	// calls PopulateAndValidateSnapshot after a successful lookup. Without this
 	// guard the UTXOSet gets polluted with up to 165M untrusted coins before the
 	// lookup fails with ErrUnknownSnapshotHeight.
-	expected := params.AssumeUTXO.ForBlockHash(meta.BlockHash)
+	expected := auParams.ForBlockHash(meta.BlockHash)
 	if expected == nil {
 		return fmt.Errorf("snapshot block hash %s not recognised in AssumeUTXO params",
 			meta.BlockHash.String())
@@ -2549,7 +2565,7 @@ func loadSnapshotFromFile(
 	// (SnapshotMetadata contains BlockHash but not a standalone height; the table
 	// entry height IS the authoritative source. The cross-check confirms
 	// ForBlockHash and ForHeight agree on the same entry.)
-	if byHeight := params.AssumeUTXO.ForHeight(expected.Height); byHeight == nil ||
+	if byHeight := auParams.ForHeight(expected.Height); byHeight == nil ||
 		byHeight.BlockHash != expected.BlockHash {
 		return fmt.Errorf("%w: table entry at height %d has unexpected block hash",
 			consensus.ErrSnapshotHeightMismatch, expected.Height)

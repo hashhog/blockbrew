@@ -2827,9 +2827,13 @@ func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 			return nil, rerr
 		}
 	case snapshotType == "rollback":
-		// Default: highest assumeutxo height <= current tip.
-		if s.chainParams == nil || s.chainParams.AssumeUTXO == nil ||
-			len(s.chainParams.AssumeUTXO.Data) == 0 {
+		// Default: highest assumeutxo height <= current tip. Routed through
+		// the same AssumeUTXOParamsForNetwork chokepoint as loadtxoutset/
+		// -load-snapshot so this sees the regtest Core-parity table and any
+		// campaign-appended entries too (not just the immutable mainnet/
+		// testnet4 chainparams table).
+		auParams := consensus.AssumeUTXOParamsForNetwork(s.chainParams)
+		if auParams == nil || len(auParams.Data) == 0 {
 			return nil, &RPCError{
 				Code:    RPCErrInvalidParams,
 				Message: "No assumeutxo snapshot heights available for this network",
@@ -2837,8 +2841,8 @@ func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 		}
 		var bestHeight int32 = -1
 		var bestData *consensus.AssumeUTXOData
-		for i := range s.chainParams.AssumeUTXO.Data {
-			d := &s.chainParams.AssumeUTXO.Data[i]
+		for i := range auParams.Data {
+			d := &auParams.Data[i]
 			if d.Height <= originalTipHeight && d.Height > bestHeight {
 				bestHeight = d.Height
 				bestData = d
@@ -3151,13 +3155,7 @@ func (s *Server) writeUtxoSnapshotFile(
 // consensus.RegtestAssumeUTXOParams). Returns nil if the network has no table
 // (e.g. testnet3/signet with AssumeUTXO==nil).
 func (s *Server) assumeUTXOParamsForNetwork() *consensus.AssumeUTXOParams {
-	if s.chainParams != nil && s.chainParams.Name == "regtest" {
-		return consensus.RegtestAssumeUTXOParams()
-	}
-	if s.chainParams != nil {
-		return s.chainParams.AssumeUTXO
-	}
-	return nil
+	return consensus.AssumeUTXOParamsForNetwork(s.chainParams)
 }
 
 // snapshotGetBlockByHeight returns a getBlock(height)->block closure over the
