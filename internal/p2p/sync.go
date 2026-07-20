@@ -1989,6 +1989,57 @@ func (sm *SyncManager) StartBlockDownload() {
 	}
 }
 
+// healGappedBlockQueue breaks the GEN-BREW-665671 block-download livelock: a
+// state where nextHeight points at a block that is ABSENT from the queue
+// because the queue's lowest height is strictly above nextHeight, leaving the
+// gap [nextHeight, floor-1] that requestBlocks can never close (it only
+// requests blocks that are IN the queue) with nothing in flight to close it.
+// The scheduler then spins forever logging "stall ... NOT IN QUEUE" while the
+// node burns CPU and never advances (observed 3.5 days at height 665671, and
+// again at 444235: queue floor 444247, tip 444234, so [444235,444246] absent).
+//
+// Root cause: StartBlockDownload builds the queue once and pins it; its only
+// rebuild trigger is a STALE queue whose floor is already on the validated
+// chain (floor <= tip). It has no handling for a floor ABOVE tip+1, so a queue
+// that starts past the block we need to connect next is never rebuilt. Bitcoin
+// Core avoids this entirely — FindNextBlocksToDownload (net_processing.cpp)
+// recomputes the download window from the current tip on every pass, so it can
+// never leave a permanent gap below the window.
+//
+// The heal: when floor > nextHeight with nothing in flight, drop the gapped
+// queue + its inflight bookkeeping and return true. The caller's drain check
+// (len(blockQueue)==0 && len(inflight)==0 with headers past the tip) then
+// rebuilds the queue from the validated tip via the already-tested
+// StartBlockDownload path. Returns false — leaving the queue untouched — for
+// the legitimate below-tip heavier-fork case, whose floor is <= the validated
+// tip < nextHeight and so is NOT above nextHeight; this preserves the
+// reorg-drop invariant (TestConnectPendingBlocks_BelowTipHeavierForkReorgs).
+//
+// Caller MUST hold sm.mu.
+func (sm *SyncManager) healGappedBlockQueue(nextHeight int32, inflightLen int) bool {
+	if inflightLen != 0 || len(sm.blockQueue) == 0 {
+		return false
+	}
+	minQ := sm.blockQueue[0].Height
+	for _, req := range sm.blockQueue {
+		if req.Height < minQ {
+			minQ = req.Height
+		}
+	}
+	if minQ <= nextHeight {
+		return false
+	}
+	log.Printf("sync: block download WEDGE at height %d — queue floor is %d, so heights "+
+		"[%d,%d] are absent from the queue and nothing is in flight; dropping the gapped "+
+		"queue to force a rebuild from the validated tip (GEN-BREW-665671 self-heal)",
+		nextHeight, minQ, nextHeight, minQ-1)
+	for _, req := range sm.blockQueue {
+		delete(sm.inflight, req.Hash)
+	}
+	sm.blockQueue = nil
+	return true
+}
+
 // blockDownloadLoop is the main loop for requesting blocks during IBD.
 func (sm *SyncManager) blockDownloadLoop() {
 	// Release the single-loop guard on EVERY exit path (quit, drained queue,
@@ -2090,6 +2141,19 @@ func (sm *SyncManager) blockDownloadLoop() {
 							"— the startup consistency probe will roll back to the last known-good tip and "+
 							"report if chaindata/ must be removed for a full re-sync.",
 							nh, stallDuration.Round(time.Second))
+					}
+
+					// GEN-BREW-665671 self-heal: if the "NOT IN QUEUE" is because
+					// the queue floor sits ABOVE nextHeight (an unfillable gap
+					// below the queue, nothing in flight), drop the gapped queue
+					// so the drain check below rebuilds from the validated tip.
+					// This turns the forever-spin into a self-recovery; the
+					// [SYNC-WEDGE] escalation above stays as a fallback for the
+					// distinct on-disk-corruption cause (floor == nextHeight but
+					// the block itself is unreadable), which a rebuild can't fix.
+					if sm.healGappedBlockQueue(nh, inflightLen) {
+						sm.wedgeStallCount = 0
+						sm.lastWedgeHeight = 0
 					}
 				}
 
