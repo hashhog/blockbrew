@@ -561,6 +561,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetBlockHash(params)
 	case "getblockcount":
 		return s.handleGetBlockCount()
+	case "flushchainstate":
+		return s.handleFlushChainState()
 	case "getbestblockhash":
 		return s.handleGetBestBlockHash()
 	case "getblockheader":

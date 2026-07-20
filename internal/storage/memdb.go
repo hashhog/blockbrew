@@ -118,6 +118,9 @@ func (m *MemDB) NewIterator(prefix []byte) Iterator {
 }
 
 // Close closes the database.
+// Flush is a no-op for the in-memory backend — there is nothing to persist.
+func (m *MemDB) Flush() error { return nil }
+
 func (m *MemDB) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

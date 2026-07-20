@@ -34,6 +34,13 @@ type DB interface {
 
 	// Close closes the database.
 	Close() error
+
+	// Flush durably persists buffered writes (the memtable) to disk. On the
+	// pebble backend this issues a synchronous DB.Flush so the chainstate is
+	// written to an sstable and fsync'd; the flushchainstate RPC calls it before
+	// a graceful stop so pebble.Close() (and thus the SIGKILL-fallback window)
+	// has less to write. No-op on in-memory backends.
+	Flush() error
 }
 
 // Batch is an atomic write batch.

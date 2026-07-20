@@ -2477,6 +2477,26 @@ func (s *Server) handleStop() (interface{}, *RPCError) {
 	return "blockbrew server stopping", nil
 }
 
+// handleFlushChainState durably flushes the chainstate memtable to disk and
+// returns null on success. NOT a Bitcoin Core RPC — Core flushes internally via
+// FlushStateToDisk (on shutdown, gettxoutsetinfo, etc.) and exposes no
+// flushchainstate RPC. This is the hashhog convention used by
+// tools/stop_mainnet.sh, which pipes flushchainstate -> SIGTERM -> (SIGKILL
+// fallback). Flushing first shrinks pebble's memtable so the subsequent
+// graceful Close() writes less, narrowing the window in which the SIGKILL
+// fallback could land mid-write and corrupt the chainstate (missing sstables —
+// see receipts/GEN-BREW-pebble-corruption-sigkill.md). Same RPC-parity gap
+// previously noted for rustoshi/lunarblock.
+func (s *Server) handleFlushChainState() (interface{}, *RPCError) {
+	if s.chainDB == nil {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "chain database unavailable"}
+	}
+	if err := s.chainDB.Flush(); err != nil {
+		return nil, &RPCError{Code: RPCErrMisc, Message: fmt.Sprintf("flushchainstate failed: %v", err)}
+	}
+	return nil, nil
+}
+
 func (s *Server) handleUptime() (interface{}, *RPCError) {
 	return int64(time.Since(s.startTime).Seconds()), nil
 }

@@ -35,6 +35,12 @@ func (c *ChainDB) DB() DB {
 	return c.db
 }
 
+// Flush durably flushes the underlying database's buffered writes (memtable) to
+// disk. Called by the flushchainstate RPC before a graceful stop.
+func (c *ChainDB) Flush() error {
+	return c.db.Flush()
+}
+
 // SetBlockStore attaches a flat-file block store. After this call,
 // StoreBlock writes block bodies to blk*.dat files (and a 6-byte position
 // index in Pebble) instead of inlining them under the "B" prefix.
