@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 // TestBlockDownloadLoopRebuildsQueueOnDrain is a regression test for the
@@ -67,4 +68,102 @@ func TestBlockDownloadLoopRebuildsQueueOnDrain(t *testing.T) {
 	t.Fatalf("block queue not rebuilt on drain: length=%d, want %d "+
 		"(blockDownloadLoop must rebuild from the current header tip instead of exiting)",
 		sm.BlockQueueLength(), want)
+}
+
+// TestHealGappedBlockQueue is a regression test for the GEN-BREW-665671
+// block-download livelock: the scheduler spins forever logging
+// "stall ... NOT IN QUEUE" because the block queue's lowest height sits ABOVE
+// nextHeight, leaving a gap [nextHeight, floor-1] that requestBlocks can never
+// fill (it only requests queued blocks) with nothing in flight to close it.
+// Observed for 3.5 days at height 665671 and again at 444235 (queue floor
+// 444247, connected tip 444234, so [444235,444246] absent).
+//
+// healGappedBlockQueue must detect that gap and DROP the queue (so the loop's
+// drain check rebuilds from the validated tip), while leaving the queue intact
+// for the two states that are NOT this bug: a below-tip heavier fork (floor
+// <= nextHeight) and any state with blocks still in flight.
+func TestHealGappedBlockQueue(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	newSM := func() *SyncManager {
+		return NewSyncManager(SyncManagerConfig{ChainParams: params, HeaderIndex: idx})
+	}
+
+	// --- Case 1: the wedge. floor (447) > nextHeight (435), inflight empty. ---
+	// Must heal: return true and clear the gapped queue.
+	{
+		sm := newSM()
+		sm.mu.Lock()
+		sm.blockQueue = nil
+		for h := int32(447); h <= 488; h++ { // 42 queued blocks, floor 447
+			sm.blockQueue = append(sm.blockQueue, &blockRequest{
+				Hash: wire.Hash256{byte(h), byte(h >> 8)}, Height: h, State: BlockDownloadPending,
+			})
+		}
+		healed := sm.healGappedBlockQueue(435, 0) // nextHeight 435, inflight 0
+		queueLen := len(sm.blockQueue)
+		sm.mu.Unlock()
+		if !healed {
+			t.Fatalf("Case 1 (gap floor 447 > nextHeight 435, inflight 0): healGappedBlockQueue=false, want true")
+		}
+		if queueLen != 0 {
+			t.Fatalf("Case 1: gapped queue not dropped: len=%d, want 0", queueLen)
+		}
+	}
+
+	// --- Case 2: below-tip heavier fork. floor (435) <= nextHeight (435). ---
+	// Must NOT heal: floor is not above nextHeight, so the queue is legitimate
+	// (reorg-drop invariant) and must be left intact.
+	{
+		sm := newSM()
+		sm.mu.Lock()
+		sm.blockQueue = nil
+		for h := int32(435); h <= 460; h++ {
+			sm.blockQueue = append(sm.blockQueue, &blockRequest{
+				Hash: wire.Hash256{byte(h), byte(h >> 8)}, Height: h, State: BlockDownloadPending,
+			})
+		}
+		healed := sm.healGappedBlockQueue(435, 0)
+		queueLen := len(sm.blockQueue)
+		sm.mu.Unlock()
+		if healed {
+			t.Fatalf("Case 2 (floor 435 == nextHeight 435): healGappedBlockQueue=true, want false — must not drop a non-gapped queue")
+		}
+		if queueLen == 0 {
+			t.Fatalf("Case 2: non-gapped queue was wrongly dropped")
+		}
+	}
+
+	// --- Case 3: gap present BUT blocks in flight. Must NOT heal (something is ---
+	// coming that may advance the tip / close the gap; don't tear down mid-flight).
+	{
+		sm := newSM()
+		sm.mu.Lock()
+		sm.blockQueue = nil
+		for h := int32(447); h <= 460; h++ {
+			sm.blockQueue = append(sm.blockQueue, &blockRequest{
+				Hash: wire.Hash256{byte(h), byte(h >> 8)}, Height: h, State: BlockDownloadPending,
+			})
+		}
+		healed := sm.healGappedBlockQueue(435, 3) // inflightLen 3
+		queueLen := len(sm.blockQueue)
+		sm.mu.Unlock()
+		if healed {
+			t.Fatalf("Case 3 (gap but inflight=3): healGappedBlockQueue=true, want false")
+		}
+		if queueLen == 0 {
+			t.Fatalf("Case 3: queue dropped while blocks in flight")
+		}
+	}
+
+	// --- Case 4: empty queue. Must NOT heal (nothing to drop). ---
+	{
+		sm := newSM()
+		sm.mu.Lock()
+		healed := sm.healGappedBlockQueue(435, 0)
+		sm.mu.Unlock()
+		if healed {
+			t.Fatalf("Case 4 (empty queue): healGappedBlockQueue=true, want false")
+		}
+	}
 }
