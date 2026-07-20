@@ -2209,7 +2209,26 @@ func (sm *SyncManager) blockDownloadLoop() {
 			if headerH > connectedH {
 				log.Printf("sync: block queue drained at height %d but headers extend to %d — rebuilding block queue",
 					connectedH, headerH)
-				sm.StartBlockDownload() // rebuilds queue (empty now) + launches a fresh blockDownloadLoop
+				sm.StartBlockDownload() // rebuilds the queue; THIS loop keeps servicing it (see below)
+				// GEN-BREW-444534: do NOT return here. We are still inside the
+				// loop, so our deferred blockDownloadLoopRunning.Store(false) has
+				// NOT fired — StartBlockDownload's launch CAS therefore sees the
+				// loop as "still running" and deliberately does NOT spawn a
+				// second loop ("rebuilt queue handed to it"). If we returned, the
+				// rebuilt queue would be left with NO loop to service it: queue
+				// populated, inflight=0, tip frozen forever (observed live at
+				// 444533->444534: 288 queued, 0 inflight, ~1h, tip stuck). So
+				// continue THIS loop to drain the rebuilt queue.
+				sm.mu.RLock()
+				rebuilt := len(sm.blockQueue)
+				sm.mu.RUnlock()
+				if rebuilt > 0 {
+					continue
+				}
+				// Rebuild produced nothing (should not happen when headers lead
+				// the connected tip) — exit cleanly rather than spin; the next
+				// header arrival relaunches via StartBlockDownload's CAS, which
+				// now succeeds because this loop has exited.
 				return
 			}
 			// Block queue drained AND the connected tip has reached the header

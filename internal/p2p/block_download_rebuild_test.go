@@ -167,3 +167,71 @@ func TestHealGappedBlockQueue(t *testing.T) {
 		}
 	}
 }
+
+// TestBlockDownloadLoopStaysAliveAfterDrainRebuild is a regression test for
+// GEN-BREW-444534: the drain-rebuild path left the rebuilt queue with no loop
+// to service it, so the tip froze (observed live at 444533->444534: 288 queued,
+// 0 inflight, ~1h, no progress).
+//
+// The drain branch calls StartBlockDownload from INSIDE the running loop. That
+// call's launch CAS sees blockDownloadLoopRunning still true (the loop's
+// deferred Store(false) hasn't fired) and deliberately does NOT spawn a second
+// loop. The old code then `return`ed, so the loop exited and the just-rebuilt
+// queue had nobody to download it — a permanent stall.
+//
+// This test reproduces the production condition the existing drain test misses:
+// it sets blockDownloadLoopRunning=true BEFORE launching (as the real
+// StartBlockDownload does), so the drain's re-entrant CAS fails exactly as in
+// production. Pre-fix: the loop exits (running flips to false) and the rebuilt
+// queue is abandoned. Post-fix: the loop `continue`s and keeps servicing it
+// (running stays true).
+func TestBlockDownloadLoopStaysAliveAfterDrainRebuild(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	prevNode := idx.Genesis()
+	for i := 1; i <= 50; i++ {
+		h := createTestBlockHeader(prevNode.Hash, prevNode.Header.Timestamp+600, uint32(i))
+		node, err := idx.AddHeader(h, true)
+		if err != nil {
+			t.Fatalf("add header %d: %v", i, err)
+		}
+		prevNode = node
+	}
+
+	const connectedH = 20
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:  params,
+		HeaderIndex:  idx,
+		ChainManager: &mockChainConnector{tipHeight: connectedH},
+	})
+
+	// Simulate the real launch path: StartBlockDownload sets the running flag
+	// true before the loop goroutine starts. This is what makes the drain
+	// branch's re-entrant StartBlockDownload CAS fail (as in production).
+	sm.blockDownloadLoopRunning.Store(true)
+	go sm.blockDownloadLoop()
+	defer close(sm.quit)
+
+	// Wait for the drain-rebuild to occur.
+	want := int(50 - connectedH)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && sm.BlockQueueLength() != want {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if sm.BlockQueueLength() != want {
+		t.Fatalf("queue not rebuilt on drain: length=%d, want %d", sm.BlockQueueLength(), want)
+	}
+
+	// The loop must STILL be alive to service the rebuilt queue. Pre-fix it
+	// exited right after the rebuild (running -> false); post-fix it continues.
+	// Give the old code's return+defer time to flip the flag if it were going to.
+	time.Sleep(300 * time.Millisecond)
+	if !sm.blockDownloadLoopRunning.Load() {
+		t.Fatalf("block-download loop exited after drain-rebuild — the rebuilt queue "+
+			"(len %d) has no loop to service it (GEN-BREW-444534 stall). The drain "+
+			"branch must continue the loop, not return.", sm.BlockQueueLength())
+	}
+	if sm.BlockQueueLength() != want {
+		t.Fatalf("queue changed unexpectedly after rebuild: %d, want %d", sm.BlockQueueLength(), want)
+	}
+}
