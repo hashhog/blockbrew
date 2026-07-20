@@ -169,20 +169,20 @@ type SyncManager struct {
 	headerIndex   *consensus.HeaderIndex
 	chainDB       *storage.ChainDB
 	peerMgr       *PeerManager
-	syncPeer      *Peer  // Current peer we're syncing headers from
-	headersSynced bool   // Whether we've caught up with headers
+	syncPeer      *Peer // Current peer we're syncing headers from
+	headersSynced bool  // Whether we've caught up with headers
 	quit          chan struct{}
 	wg            sync.WaitGroup
 
 	// Callbacks for external integration
-	onSyncComplete   func()                                    // Called when header sync completes
-	onBlockConnected func(block *wire.MsgBlock, height int32)  // Called after block connected
+	onSyncComplete   func()                                   // Called when header sync completes
+	onBlockConnected func(block *wire.MsgBlock, height int32) // Called after block connected
 
 	// Block download state
-	blockQueue     []*blockRequest              // Ordered list of blocks to download
+	blockQueue     []*blockRequest // Ordered list of blocks to download
 	inflight       map[wire.Hash256]*blockRequest
-	downloadWindow int                           // Max concurrent downloads
-	nextHeight     int32                         // Next height to connect
+	downloadWindow int   // Max concurrent downloads
+	nextHeight     int32 // Next height to connect
 
 	// IBD pipeline channels
 	validationChan chan *blockWithRequest
@@ -207,12 +207,24 @@ type SyncManager struct {
 	// once the chain tip has a timestamp within MaxTipAge of wall-clock
 	// time.  This means header sync is correctly reported as IBD, not
 	// just block download.  See updateIBDStatus().
-	ibdActive    atomic.Bool // True while in IBD (header sync OR block download)
-	peerRoundIdx int         // Round-robin index for peer selection
+	ibdActive atomic.Bool // True while in IBD (header sync OR block download)
+	// blockDownloadLoopRunning guards the single blockDownloadLoop goroutine.
+	// StartBlockDownload can legitimately re-enter (drain/rebuild branch, peer
+	// churn, periodic getheaders) and used to `go sm.blockDownloadLoop()`
+	// unconditionally — but the existing loop only exits on quit or a drained
+	// queue, so a rebuild spawned a SECOND loop while the first was still
+	// alive. Each leaked loop carries its own request/stale/stall tickers:
+	// duplicated getdata traffic, duplicated stall handling, and N× CPU.
+	// Observed 2026-07-16..19 on genesis-blockbrew (GEN-BREW-665671): 207% CPU
+	// and 733k identical "stall ... NOT IN QUEUE" lines logged MICROSECONDS
+	// apart — the signature of many goroutines ticking together, not one loop
+	// spinning. CompareAndSwap admits exactly one; the loop clears it on exit.
+	blockDownloadLoopRunning atomic.Bool
+	peerRoundIdx             int // Round-robin index for peer selection
 
 	// Stale tip detection (Bitcoin Core: CheckForStaleTipAndEvictPeers)
-	lastTipUpdate      time.Time // When our chain tip last advanced
-	nextStaleTipCheck  time.Time // When to next check for stale tip
+	lastTipUpdate     time.Time // When our chain tip last advanced
+	nextStaleTipCheck time.Time // When to next check for stale tip
 
 	// lastRequeueLog holds the UnixNano timestamp of the last
 	// "connection channel saturated, re-queued" message so
@@ -232,11 +244,11 @@ type SyncManager struct {
 	// around 12 s.  This probe attributes that to ConnectBlock wall
 	// time so we can decide whether the lever is UTXO cache, RocksDB
 	// batch flush, script validation, or lock contention.
-	connStatsN        int64         // blocks in current window
-	connStatsTotalNs  int64         // summed ConnectBlock latency (ns)
-	connStatsMaxNs    int64         // max ConnectBlock latency in window (ns)
-	connStatsTotalTxs int64         // summed tx count across window
-	connStatsLifetime int64         // cumulative count since process start
+	connStatsN        int64 // blocks in current window
+	connStatsTotalNs  int64 // summed ConnectBlock latency (ns)
+	connStatsMaxNs    int64 // max ConnectBlock latency in window (ns)
+	connStatsTotalTxs int64 // summed tx count across window
+	connStatsLifetime int64 // cumulative count since process start
 
 	// chainstateCorrupted latches when connectPendingBlocks hits a
 	// genuine validation failure during IBD (presumed chainstate
@@ -394,24 +406,24 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 
 	now := time.Now()
 	sm := &SyncManager{
-		chainParams:       config.ChainParams,
-		headerIndex:       config.HeaderIndex,
-		chainDB:           config.ChainDB,
-		peerMgr:           config.PeerManager,
-		quit:              make(chan struct{}),
-		onSyncComplete:    config.OnSyncComplete,
-		onBlockConnected:  config.OnBlockConnected,
-		inflight:          make(map[wire.Hash256]*blockRequest),
-		downloadWindow:    downloadWindow,
-		validationChan:    make(chan *blockWithRequest, downloadWindow),
-		connectionChan:    make(chan *blockWithRequest, downloadWindow),
-		peerStallTimeout:  make(map[string]time.Duration),
-		chainMgr:          config.ChainManager,
-		lastTipUpdate:     now,
-		nextStaleTipCheck: now.Add(StaleTipCheckInterval),
-		pruner:            config.Pruner,
-		mempool:           config.Mempool,
-		txInflight:        make(map[wire.Hash256]time.Time),
+		chainParams:         config.ChainParams,
+		headerIndex:         config.HeaderIndex,
+		chainDB:             config.ChainDB,
+		peerMgr:             config.PeerManager,
+		quit:                make(chan struct{}),
+		onSyncComplete:      config.OnSyncComplete,
+		onBlockConnected:    config.OnBlockConnected,
+		inflight:            make(map[wire.Hash256]*blockRequest),
+		downloadWindow:      downloadWindow,
+		validationChan:      make(chan *blockWithRequest, downloadWindow),
+		connectionChan:      make(chan *blockWithRequest, downloadWindow),
+		peerStallTimeout:    make(map[string]time.Duration),
+		chainMgr:            config.ChainManager,
+		lastTipUpdate:       now,
+		nextStaleTipCheck:   now.Add(StaleTipCheckInterval),
+		pruner:              config.Pruner,
+		mempool:             config.Mempool,
+		txInflight:          make(map[wire.Hash256]time.Time),
 		unconnectingHeaders: make(map[string]int),
 		peerHeadersSync:     make(map[string]*HeadersSyncState),
 	}
@@ -1962,12 +1974,24 @@ func (sm *SyncManager) StartBlockDownload() {
 	log.Printf("sync: starting block download from height %d to %d (%d blocks, startHeight=%d)",
 		sm.nextHeight, bestTip.Height, len(sm.blockQueue), startHeight)
 
-	// Start requesting blocks
-	go sm.blockDownloadLoop()
+	// Start requesting blocks — exactly one loop at a time (see
+	// blockDownloadLoopRunning). A re-entrant StartBlockDownload whose loop is
+	// still alive just feeds the rebuilt queue to that loop.
+	if sm.blockDownloadLoopRunning.CompareAndSwap(false, true) {
+		go sm.blockDownloadLoop()
+	} else {
+		log.Printf("sync: block-download loop already running — rebuilt queue handed to it (no second loop)")
+	}
 }
 
 // blockDownloadLoop is the main loop for requesting blocks during IBD.
 func (sm *SyncManager) blockDownloadLoop() {
+	// Release the single-loop guard on EVERY exit path (quit, drained queue,
+	// IBD complete, panic) so a later StartBlockDownload can legitimately
+	// relaunch. Without this the first exit would wedge block download
+	// permanently — a worse failure than the leak it prevents.
+	defer sm.blockDownloadLoopRunning.Store(false)
+
 	requestTicker := time.NewTicker(100 * time.Millisecond)
 	defer requestTicker.Stop()
 
