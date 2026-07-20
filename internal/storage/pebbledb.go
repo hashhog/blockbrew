@@ -277,6 +277,14 @@ func (p *PebbleDB) NewIterator(prefix []byte) Iterator {
 }
 
 // Close closes the database and releases resources.
+// Flush synchronously flushes the memtable to a durable L0 sstable (pebble
+// DB.Flush fsyncs before returning). Used by the flushchainstate RPC so a
+// pre-stop flush shrinks what Close() must write, narrowing the window in which
+// a SIGKILL fallback could land mid-write (see GEN-BREW-pebble-corruption).
+func (p *PebbleDB) Flush() error {
+	return p.db.Flush()
+}
+
 func (p *PebbleDB) Close() error {
 	err := p.db.Close()
 	if p.cache != nil {
