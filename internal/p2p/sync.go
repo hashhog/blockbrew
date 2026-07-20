@@ -220,7 +220,12 @@ type SyncManager struct {
 	// apart — the signature of many goroutines ticking together, not one loop
 	// spinning. CompareAndSwap admits exactly one; the loop clears it on exit.
 	blockDownloadLoopRunning atomic.Bool
-	peerRoundIdx             int // Round-robin index for peer selection
+	// Wedge escalation bookkeeping for the stall detector's "block NOT IN
+	// QUEUE" branch (GEN-BREW-665671). Guarded by sm.mu like the rest of the
+	// stall-check state.
+	lastWedgeHeight int32
+	wedgeStallCount int
+	peerRoundIdx    int // Round-robin index for peer selection
 
 	// Stale tip detection (Bitcoin Core: CheckForStaleTipAndEvictPeers)
 	lastTipUpdate     time.Time // When our chain tip last advanced
@@ -2060,6 +2065,32 @@ func (sm *SyncManager) blockDownloadLoop() {
 					// This shouldn't happen if nextH points to it. Log for debugging.
 					log.Printf("sync: stall at height %d but block NOT IN QUEUE, inflight=%d queue=%d",
 						nh, inflightLen, len(sm.blockQueue))
+
+					// ESCALATION (GEN-BREW-665671): this branch is an invariant
+					// violation — nextHeight points at a block the queue does
+					// not contain — and it does NOT self-heal: requestBlocks
+					// has nothing to request, so the same line repeats forever
+					// while the node looks "busy". On genesis-blockbrew it ran
+					// 3.5 days (underlying cause: unreadable blocks behind a
+					// corrupt pebble sstable). Mirror the [CHAINSTATE-CORRUPTION]
+					// idiom: after a minute of the SAME height, say so once,
+					// loudly, with the operator action — then rate-limit.
+					// Silence-by-repetition is what hid the real failure.
+					if nh == sm.lastWedgeHeight {
+						sm.wedgeStallCount++
+					} else {
+						sm.lastWedgeHeight = nh
+						sm.wedgeStallCount = 1
+					}
+					if sm.wedgeStallCount == 6 { // 6 x 10s ticker = ~1 min
+						log.Printf("[SYNC-WEDGE] block download is STUCK at height %d: the block is absent "+
+							"from the queue and cannot be re-requested, so this will not recover on its own "+
+							"(%v with no tip advance). Common cause: block data is unreadable on disk (check "+
+							"the log for 'pebble' / checksum errors above). Operator action: restart the node "+
+							"— the startup consistency probe will roll back to the last known-good tip and "+
+							"report if chaindata/ must be removed for a full re-sync.",
+							nh, stallDuration.Round(time.Second))
+					}
 				}
 
 				// Also reset any blocks in non-pending states near nextHeight
