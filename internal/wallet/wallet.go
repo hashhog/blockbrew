@@ -283,6 +283,18 @@ const MaxRelockSleepSeconds int64 = 100000000
 // DefaultGapLimit is the default number of unused addresses to maintain.
 const DefaultGapLimit = 20
 
+// coinbaseWalletMatureConfs is the confirmation count at which a coinbase
+// output becomes mature in the WALLET layer (getbalance, coin selection,
+// tx categorisation). Bitcoin Core's wallet requires COINBASE_MATURITY+1
+// confirmations — one MORE than the consensus spendability rule — see
+// wallet.cpp:3342 GetTxBlocksToMaturity: max(0, (COINBASE_MATURITY+1) -
+// chain_depth), where chain_depth is confirmations (tip-H+1). Using the bare
+// consensus CoinbaseMaturity (100) over-reports getbalance by exactly one
+// coinbase at the maturity boundary (e.g. 100 BTC where Core reports 50 BTC
+// at regtest tip 101). Consensus validation (txvalidation.go, mempool.go)
+// keeps the bare CoinbaseMaturity — this +1 margin is wallet-only.
+const coinbaseWalletMatureConfs = consensus.CoinbaseMaturity + 1
+
 // BIP125RBFSequence is the largest nSequence value that opts a transaction
 // in to BIP-125 replaceability. Mirrors Bitcoin Core's
 // `MAX_BIP125_RBF_SEQUENCE = 0xfffffffd` (bitcoin-core/src/policy/rbf.h:18,
@@ -452,6 +464,12 @@ func (w *Wallet) coinType() uint32 {
 // NewAddress generates a new receiving address using the default address type.
 func (w *Wallet) NewAddress() (string, error) {
 	return w.NewAddressOfType(w.config.AddressType)
+}
+
+// DefaultAddressType returns the wallet's configured default output type, used
+// when a getnewaddress caller does not request an explicit address_type.
+func (w *Wallet) DefaultAddressType() WalletAddressType {
+	return w.config.AddressType
 }
 
 // NewAddressOfType generates a new receiving address of the specified type.
@@ -777,7 +795,7 @@ func (w *Wallet) GetBalances(tipHeight int32) Balances {
 		}
 		if utxo.IsCoinbase {
 			confirmations := tipHeight - utxo.Height + 1
-			if confirmations < consensus.CoinbaseMaturity {
+			if confirmations < coinbaseWalletMatureConfs {
 				b.Immature += utxo.Amount
 				continue
 			}
@@ -799,7 +817,7 @@ func (w *Wallet) GetSpendableBalance(tipHeight int32) (spendable, immature int64
 		}
 		if utxo.IsCoinbase {
 			confirmations := tipHeight - utxo.Height + 1
-			if confirmations < consensus.CoinbaseMaturity {
+			if confirmations < coinbaseWalletMatureConfs {
 				immature += utxo.Amount
 				continue
 			}
@@ -816,7 +834,7 @@ func (w *Wallet) IsUTXOSpendable(utxo *WalletUTXO, tipHeight int32) bool {
 	}
 	if utxo.IsCoinbase {
 		confirmations := tipHeight - utxo.Height + 1
-		return confirmations >= consensus.CoinbaseMaturity
+		return confirmations >= coinbaseWalletMatureConfs
 	}
 	return true
 }
@@ -846,7 +864,7 @@ func (w *Wallet) ListSpendable(tipHeight int32) []*WalletUTXO {
 		}
 		if utxo.IsCoinbase {
 			confirmations := tipHeight - utxo.Height + 1
-			if confirmations < consensus.CoinbaseMaturity {
+			if confirmations < coinbaseWalletMatureConfs {
 				continue
 			}
 		}
@@ -1169,7 +1187,7 @@ func (w *Wallet) CreateTransactionWithTip(destAddr string, amount int64, feeRate
 		}
 		if utxo.IsCoinbase {
 			confirmations := tipHeight - utxo.Height + 1
-			if confirmations < consensus.CoinbaseMaturity {
+			if confirmations < coinbaseWalletMatureConfs {
 				continue // Skip immature coinbase
 			}
 		}

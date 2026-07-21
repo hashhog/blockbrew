@@ -233,8 +233,15 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 	selectedTxs, txSigOpsCost, totalFees, totalSigOps := selectTransactions(
 		tg.mp, availableWeight, maxSigOps, newHeight, uint32(mtp), config.MinTxFeeRate, utxoView)
 
-	// 5. Calculate the subsidy
-	subsidy := consensus.CalcBlockSubsidy(newHeight)
+	// 5. Calculate the subsidy. Use the NETWORK-AWARE halving interval from
+	// chain params (regtest halves every 150 blocks, not the mainnet 210,000)
+	// — CalcBlockSubsidy hardcodes the mainnet interval, so past a regtest/
+	// signet halving height the miner would over-claim (e.g. 50 BTC at regtest
+	// height 150 where validation caps it at 25 BTC), producing a coinbase its
+	// OWN validation rejects with "coinbase value exceeds allowed subsidy".
+	// Mirrors Bitcoin Core GetBlockSubsidy(nHeight, consensusParams) reading
+	// consensusParams.nSubsidyHalvingInterval (validation.cpp:1839-1841).
+	subsidy := consensus.CalcBlockSubsidyForInterval(newHeight, tg.chainParams.SubsidyHalvingInterval)
 	coinbaseValue := subsidy + totalFees
 
 	// 6. Build the witness commitment (if segwit is active)
