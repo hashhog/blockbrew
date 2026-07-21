@@ -735,7 +735,7 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 
 	// Wallet RPCs (require wallet context)
 	case "getnewaddress":
-		return s.handleGetNewAddressWithWallet(walletName)
+		return s.handleGetNewAddressWithWallet(params, walletName)
 	case "getbalance":
 		return s.handleGetBalanceWithWallet(walletName)
 	case "listunspent":
