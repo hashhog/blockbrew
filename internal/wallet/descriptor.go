@@ -1671,12 +1671,30 @@ func GetDescriptorInfo(desc string, net address.Network) (*DescriptorInfo, error
 		return nil, err
 	}
 
-	// Get the normalized descriptor string
+	// Get the normalized descriptor string. The canonical `Descriptor` field
+	// carries the checksum OF the canonical form (Core returns
+	// descs.at(0)->ToString(), which self-appends its own checksum).
 	normalized := parsed.stringWithoutChecksum()
-	checksum := DescriptorChecksum(normalized)
+	canonicalChecksum := DescriptorChecksum(normalized)
+
+	// Core (bitcoin-core/src/rpc/output_script.cpp:215) sets the top-level
+	// `checksum` field to GetDescriptorChecksum(request.params[0]) — the
+	// checksum computed over the RAW INPUT descriptor (with any existing
+	// #checksum suffix stripped), NOT over the canonical/normalized form.
+	// The two differ whenever the input spelling differs from canonical —
+	// e.g. hardened markers `h` vs `'` yield different BIP-380 checksums
+	// (see CheckChecksum in bitcoin-core/src/script/descriptor.cpp:2838).
+	// Computing over the normalized form is the "checksum-of-canonical" bug
+	// class: it silently returns a checksum that does not match Core's for
+	// any non-canonical (but valid) input.
+	inputPayload := desc
+	if idx := strings.LastIndex(inputPayload, "#"); idx != -1 {
+		inputPayload = inputPayload[:idx]
+	}
+	checksum := DescriptorChecksum(inputPayload)
 
 	return &DescriptorInfo{
-		Descriptor:     normalized + "#" + checksum,
+		Descriptor:     normalized + "#" + canonicalChecksum,
 		Checksum:       checksum,
 		IsRange:        parsed.IsRange(),
 		IsSolvable:     parsed.IsSolvable(),

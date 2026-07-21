@@ -1187,10 +1187,20 @@ func TestCoinbaseMaturity(t *testing.T) {
 		t.Error("Coinbase should be immature at 99 confirmations")
 	}
 
-	// At tip=199 (100 confirmations: 199-100+1=100), coinbase becomes mature
+	// At tip=199 (100 confirmations: 199-100+1=100), coinbase is STILL immature.
+	// Bitcoin Core's WALLET matures a coinbase at COINBASE_MATURITY+1 (101)
+	// confirmations (wallet.cpp:3342 GetTxBlocksToMaturity), one more than the
+	// consensus spendability rule — verified against a Core regtest oracle
+	// (getbalance = 50 BTC at tip 101, 100 BTC at tip 102).
 	tipHeight = 199
+	if w.IsUTXOSpendable(coinbaseUTXO, tipHeight) {
+		t.Error("Coinbase should be immature at 100 confirmations (Core wallet requires 101)")
+	}
+
+	// At tip=200 (101 confirmations: 200-100+1=101), coinbase becomes mature
+	tipHeight = 200
 	if !w.IsUTXOSpendable(coinbaseUTXO, tipHeight) {
-		t.Error("Coinbase should be mature at 100 confirmations")
+		t.Error("Coinbase should be mature at 101 confirmations")
 	}
 
 	spendable, immature = w.GetSpendableBalance(tipHeight)
@@ -1261,16 +1271,24 @@ func TestListSpendable(t *testing.T) {
 		t.Errorf("ListSpendable(148) = %d, want 1 (only regular UTXO)", len(spendable))
 	}
 
-	// At tip=149, coinbase at height 50 becomes mature (100 confirmations)
+	// At tip=149 the coinbase at height 50 has 100 confirmations — still
+	// immature under Core's 101-confirmation wallet maturity rule; only the
+	// regular UTXO is spendable.
 	spendable = w.ListSpendable(149)
-	if len(spendable) != 2 {
-		t.Errorf("ListSpendable(149) = %d, want 2", len(spendable))
+	if len(spendable) != 1 {
+		t.Errorf("ListSpendable(149) = %d, want 1", len(spendable))
 	}
 
-	// At tip=199, all should be spendable
-	spendable = w.ListSpendable(199)
+	// At tip=150, coinbase at height 50 becomes mature (101 confirmations)
+	spendable = w.ListSpendable(150)
+	if len(spendable) != 2 {
+		t.Errorf("ListSpendable(150) = %d, want 2", len(spendable))
+	}
+
+	// At tip=200, coinbase at height 100 also matures (101 confs); all spendable
+	spendable = w.ListSpendable(200)
 	if len(spendable) != 3 {
-		t.Errorf("ListSpendable(199) = %d, want 3", len(spendable))
+		t.Errorf("ListSpendable(200) = %d, want 3", len(spendable))
 	}
 }
 
@@ -1305,8 +1323,10 @@ func TestCreateTransactionWithImmatureCoinbase(t *testing.T) {
 		t.Errorf("Expected ErrInsufficientFunds for immature coinbase, got %v", err)
 	}
 
-	// At tip=199 (100 confirmations: 199-100+1=100), should succeed
-	tx, err := w.CreateTransactionWithTip("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", 1000000, 1.0, 199)
+	// At tip=200 (101 confirmations: 200-100+1=101), should succeed. Core's
+	// wallet matures a coinbase at COINBASE_MATURITY+1 confirmations, so tip=199
+	// (100 confs) is still immature; tip=200 is the first spendable height.
+	tx, err := w.CreateTransactionWithTip("bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", 1000000, 1.0, 200)
 	if err != nil {
 		t.Fatalf("CreateTransactionWithTip should succeed at maturity: %v", err)
 	}

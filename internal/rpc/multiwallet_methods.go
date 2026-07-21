@@ -16,8 +16,11 @@ import (
 // walletCoinbaseMaturity is the confirmation threshold below which a coinbase
 // credit renders as "immature" rather than "generate" in listtransactions /
 // gettransaction, matching the wallet's spendability rule
-// (GetSpendableBalance) and Core's IsTxImmatureCoinBase.
-const walletCoinbaseMaturity = consensus.CoinbaseMaturity
+// (GetSpendableBalance) and Core's IsTxImmatureCoinBase. Core's wallet uses
+// COINBASE_MATURITY+1 confirmations (wallet.cpp:3342 GetTxBlocksToMaturity),
+// one more than the consensus rule — keep this in lockstep with the wallet
+// package's coinbaseWalletMatureConfs.
+const walletCoinbaseMaturity = consensus.CoinbaseMaturity + 1
 
 // ============================================================================
 // Wallet Management RPCs
@@ -334,18 +337,60 @@ func (s *Server) handleBackupWallet(params json.RawMessage, walletName string) (
 // Wallet RPCs with wallet context (multi-wallet support)
 // ============================================================================
 
-func (s *Server) handleGetNewAddressWithWallet(walletName string) (interface{}, *RPCError) {
+func (s *Server) handleGetNewAddressWithWallet(params json.RawMessage, walletName string) (interface{}, *RPCError) {
 	w, rpcErr := s.getWalletForRPC(walletName)
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
 
-	addr, err := w.NewAddress()
+	// getnewaddress ( "label" "address_type" ). params[0] is the label
+	// (blockbrew does not persist a label here); params[1] selects the output
+	// type. Absent/empty → the wallet default. An unknown type is a -5 error,
+	// byte-matching Core (wallet/rpc/addresses.cpp:57 "Unknown address type").
+	// Previously BOTH params were ignored, so every call returned the default
+	// P2WPKH type — a request for bech32m/legacy/p2sh-segwit silently yielded a
+	// wrong-type address (a taproot-receive funds trap).
+	var args []interface{}
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &args); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+		}
+	}
+
+	addrType := w.DefaultAddressType()
+	if len(args) >= 2 {
+		if raw, ok := args[1].(string); ok && raw != "" {
+			parsed, ok := parseWalletAddressType(raw)
+			if !ok {
+				return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: fmt.Sprintf("Unknown address type '%s'", raw)}
+			}
+			addrType = parsed
+		}
+	}
+
+	addr, err := w.NewAddressOfType(addrType)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
 	}
 
 	return addr, nil
+}
+
+// parseWalletAddressType maps a Bitcoin Core output-type string to blockbrew's
+// WalletAddressType. Values mirror ParseOutputType (src/outputtype.cpp:17-20).
+func parseWalletAddressType(s string) (wallet.WalletAddressType, bool) {
+	switch s {
+	case "legacy":
+		return wallet.AddressTypeP2PKH, true
+	case "p2sh-segwit":
+		return wallet.AddressTypeP2SH_P2WPKH, true
+	case "bech32":
+		return wallet.AddressTypeP2WPKH, true
+	case "bech32m":
+		return wallet.AddressTypeP2TR, true
+	default:
+		return 0, false
+	}
 }
 
 func (s *Server) handleGetBalanceWithWallet(walletName string) (interface{}, *RPCError) {
