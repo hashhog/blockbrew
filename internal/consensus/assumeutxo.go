@@ -757,6 +757,17 @@ var MainnetAssumeUTXOParams = AssumeUTXOParams{
 			ChainTxCount:   1334000000,
 			BlockHash:      mustParseHash("0000000000000000000146180a1603839d0e9ac6c00d17a5ab45323398ced817"),
 		},
+		{
+			// Track-B WINDOWED replay base: block 481823, last pre-segwit block
+			// (segwit activates at 481824). NOT a Bitcoin Core chainparams entry —
+			// hash_serialized + chain_tx_count from the boundary-snapshot result JSON
+			// (Core dumptxoutset rollback=481823). Consulted ONLY via -load-snapshot /
+			// loadtxoutset / dumptxoutset RPC; INERT for normal boot + validation.
+			Height:         481823,
+			HashSerialized: mustParseHash("25429c30cfa0b6051106c29d15b188d746d8e7ecd184bf34fae1cebe2ea447f4"),
+			ChainTxCount:   249036369,
+			BlockHash:      mustParseHash("000000000000000000cbeff0b533f8e1189cf09dfbebf57a8ebe349362811b80"),
+		},
 	},
 }
 
