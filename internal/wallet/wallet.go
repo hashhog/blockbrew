@@ -502,14 +502,34 @@ func (w *Wallet) NewP2TRAddress() (string, error) {
 // newAddressOfTypeLocked generates a new address (caller must hold lock).
 // isChange indicates whether this is a change address (internal) or receiving (external).
 func (w *Wallet) newAddressOfTypeLocked(addrType WalletAddressType, isChange bool) (string, error) {
-	// Order matters: a locked, encrypted wallet has masterKey == nil because
-	// the cleartext key is wiped on Lock(). Surface the user-facing reason
-	// (locked) rather than the implementation detail (no master key).
-	if w.locked {
+	// A keyless wallet (no HD master seed) holds its keys via imported
+	// descriptors. Change (internal) and receive addresses then come from the
+	// descriptor keypool rather than HD derivation — mirroring Core's
+	// descriptor-SPKM reservedest path (wallet/rpc/spend.cpp FundTransaction ->
+	// reservedest -> DescriptorScriptPubKeyMan::GetReservedDestination). Imported
+	// keys are stored directly and are NOT gated by the mnemonic-lock, so this
+	// path is available even when a blank wallet still carries the NewWallet
+	// locked=true default (there is no HD master to unlock). Before this, that
+	// stale flag spuriously reported "wallet is locked" for change derivation on
+	// a blank imported-descriptor wallet (walletdiff PSBT slice, phase_import).
+	if w.masterKey == nil {
+		if !w.encrypted {
+			if addr, ok, err := w.nextDescriptorAddressLocked(addrType, isChange); err != nil {
+				return "", err
+			} else if ok {
+				return addr, nil
+			}
+			// Keyless wallet with no matching active descriptor to derive from.
+			return "", ErrNoMasterKey
+		}
+		// Encrypted wallet with the cleartext master key wiped: genuinely locked.
 		return "", ErrWalletLocked
 	}
-	if w.masterKey == nil {
-		return "", ErrNoMasterKey
+
+	// HD derivation requires the wallet be unlocked (encrypted-passphrase lock
+	// OR blockbrew's unencrypted mnemonic Lock()).
+	if w.locked {
+		return "", ErrWalletLocked
 	}
 
 	coinType := w.coinType()
@@ -602,6 +622,78 @@ func (w *Wallet) NewChangeAddressOfType(addrType WalletAddressType) (string, err
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return w.newAddressOfTypeLocked(addrType, true)
+}
+
+// nextDescriptorAddressLocked hands out the next unused address from the active
+// imported descriptor of the requested kind (isChange=true → internal/change
+// descriptor, false → external/receive), advancing that descriptor's keypool
+// cursor and registering the freshly expanded script as owned. This is the
+// analog of Core's DescriptorScriptPubKeyMan::GetReservedDestination: change
+// and receive addresses for a keyless (blank + imported-descriptor) wallet are
+// derived from the descriptor keypool rather than an HD master seed.
+//
+// Returns (addr, true, nil) on success; ("", false, nil) when the wallet has no
+// matching active descriptor (the caller falls back to ErrNoMasterKey); and
+// ("", false, err) on a genuine derivation failure (exhausted keypool /
+// unexpandable descriptor). Caller must hold w.mu (write lock).
+func (w *Wallet) nextDescriptorAddressLocked(addrType WalletAddressType, isChange bool) (string, bool, error) {
+	var chosen *importedDescriptor
+	for _, rec := range w.importedDescriptors {
+		if !rec.Active || rec.Internal != isChange || len(rec.expandedAddrs) == 0 {
+			continue
+		}
+		// Prefer an active descriptor whose output type matches the requested
+		// address type (Core picks the change SPKM by OutputType); otherwise
+		// keep the first active descriptor of the right kind as a fallback.
+		if rec.addrTypeOK && rec.addrType == addrType {
+			chosen = rec
+			break
+		}
+		if chosen == nil {
+			chosen = rec
+		}
+	}
+	if chosen == nil {
+		return "", false, nil
+	}
+
+	idx := int(chosen.NextIndex - chosen.RangeStart)
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(chosen.expandedAddrs) {
+		return "", false, fmt.Errorf("descriptor keypool exhausted (imported range [%d,%d])", chosen.RangeStart, chosen.RangeEnd)
+	}
+	addr := chosen.expandedAddrs[idx]
+	if addr == "" {
+		return "", false, errors.New("change descriptor produced a non-address script")
+	}
+
+	// The script was registered as owned (watchedScripts) and, where the
+	// descriptor carried private keys, spendable (importedKeys) at import time,
+	// so no re-registration is needed here — just advance the keypool cursor.
+	chosen.NextIndex = chosen.RangeStart + int32(idx) + 1
+	w.markDirtyLocked()
+	return addr, true, nil
+}
+
+// classifyDescriptorAddrType maps a descriptor's top-level output template to a
+// wallet address type. Used to pick the change/receive descriptor whose output
+// type matches the request, mirroring Core's per-OutputType change SPKM select.
+func classifyDescriptorAddrType(d *Descriptor) (WalletAddressType, bool) {
+	switch d.Type {
+	case DescPKH:
+		return AddressTypeP2PKH, true
+	case DescWPKH:
+		return AddressTypeP2WPKH, true
+	case DescTR:
+		return AddressTypeP2TR, true
+	case DescSH:
+		if d.Subdesc != nil && d.Subdesc.Type == DescWPKH {
+			return AddressTypeP2SH_P2WPKH, true
+		}
+	}
+	return 0, false
 }
 
 // pubKeyToAddress converts an HD key to a P2WPKH address string (for compatibility).
@@ -3219,7 +3311,12 @@ func (w *Wallet) Unlock(mnemonic, passphrase string) error {
 	return nil
 }
 
-// IsLocked returns whether the wallet is locked.
+// IsLocked returns whether the wallet is locked. The lock gates access to the
+// HD master key (both the encrypted-wallet passphrase lock and blockbrew's
+// pre-encryption mnemonic Lock()/Unlock() of an unencrypted wallet). Note it
+// does NOT gate imported keys: importprivkey / imported-descriptor keys are
+// stored directly (importedKeys) and remain spendable regardless of the lock —
+// see GetKeyForAddress, which returns them before consulting the lock.
 func (w *Wallet) IsLocked() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
@@ -3450,6 +3547,18 @@ type importedDescriptor struct {
 	RangeEnd   int32
 	NextIndex  int32
 	Timestamp  int64
+
+	// In-memory keypool cache, populated by registerDescriptorLocked at import
+	// AND on reload — NOT persisted (rebuilt from the descriptor each load).
+	// expandedAddrs[i] is the receive/change address at position RangeStart+i,
+	// captured while the private descriptor is available (Desc is the canonical
+	// PUBLIC form, which cannot re-derive hardened children). Change/receive
+	// handout for a keyless imported-descriptor wallet indexes into this rather
+	// than re-parsing Desc. addrType/addrTypeOK classify the descriptor's output
+	// type so the change SPKM can be picked by type, mirroring Core.
+	expandedAddrs []string
+	addrType      WalletAddressType
+	addrTypeOK    bool
 }
 
 // watchedScriptMeta is the derived per-script ownership record for one
@@ -3568,6 +3677,12 @@ func (w *Wallet) registerDescriptorLocked(desc *Descriptor, rec *importedDescrip
 	}
 	anyPriv := descriptorHasAnyPrivateKeys(desc)
 
+	// Record the descriptor's output type + one address per position so the
+	// change/receive keypool can be handed out later without re-parsing the
+	// (public) canonical string. rec.NextIndex indexes RangeStart-relative.
+	rec.addrType, rec.addrTypeOK = classifyDescriptorAddrType(desc)
+	rec.expandedAddrs = rec.expandedAddrs[:0]
+
 	var addrs []string
 	for pos := start; pos <= end; pos++ {
 		scripts, err := desc.Expand(uint32(pos))
@@ -3575,6 +3690,16 @@ func (w *Wallet) registerDescriptorLocked(desc *Descriptor, rec *importedDescrip
 			// Core backup.cpp:238-239.
 			return nil, fmt.Errorf("Cannot expand descriptor. Probably because of hardened derivations without private keys provided (%v)", err)
 		}
+		// First script of the position is the keypool entry for that index.
+		posAddr := ""
+		if len(scripts) > 0 {
+			if desc.Type == DescAddr {
+				posAddr = desc.AddrStr
+			} else {
+				posAddr = w.scriptToAddress(scripts[0])
+			}
+		}
+		rec.expandedAddrs = append(rec.expandedAddrs, posAddr)
 		for _, spk := range scripts {
 			addr := ""
 			if desc.Type == DescAddr {
