@@ -413,9 +413,17 @@ func (s *Server) handleWalletProcessPSBT(params json.RawMessage) (interface{}, *
 		}
 	}
 
-	// sighashtype (optional, default ALL)
-	// bip32derivs (optional, default true)
-	// finalize (optional, default true)
+	// sighashtype (arg[2], optional, default ALL) — not yet plumbed
+	// bip32derivs (arg[3], optional, default true) — not yet plumbed
+	// finalize (arg[4], optional, default true): also finalize inputs where
+	// possible so `complete` reflects a fully-signed, extractable tx — Core's
+	// walletprocesspsbt default (wallet/rpc/spend.cpp:1624, FillPSBT finalize).
+	finalize := true
+	if len(args) >= 5 {
+		if f, ok := args[4].(bool); ok {
+			finalize = f
+		}
+	}
 
 	// Decode PSBT
 	psbt, err := wallet.DecodePSBTBase64(psbtStr)
@@ -431,8 +439,32 @@ func (s *Server) handleWalletProcessPSBT(params json.RawMessage) (interface{}, *
 		}
 	}
 
-	// Check if complete
+	// `complete` mirrors Core: it is true when every input is fully signed and
+	// finalizable, NOT merely when the PSBT already carries final witnesses.
+	// IsComplete() only reports the latter, so after a signing pass that adds
+	// partial signatures it returned false even for a fully-signed single-sig
+	// tx — making the caller believe signing failed. Determine finalizability
+	// on a decoded COPY (a trial finalize) so `complete` is accurate without
+	// mutating the returned PSBT when finalize=false.
 	complete := psbt.IsComplete()
+	if !complete {
+		if b, eerr := psbt.EncodeBase64(); eerr == nil {
+			if trial, derr := wallet.DecodePSBTBase64(b); derr == nil {
+				if done, ferr := wallet.FinalizePSBT(trial); ferr == nil && done {
+					complete = true
+				}
+			}
+		}
+	}
+
+	// When finalize is requested (Core default) and the PSBT is complete, return
+	// the finalized PSBT (final witnesses in place), matching Core's in-place
+	// finalize so a subsequent finalizepsbt/extract sees a ready tx.
+	if finalize && complete {
+		if _, ferr := wallet.FinalizePSBT(psbt); ferr != nil {
+			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to finalize PSBT: %v", ferr)}
+		}
+	}
 
 	// Encode result
 	encoded, err := psbt.EncodeBase64()

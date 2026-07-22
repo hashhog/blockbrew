@@ -243,9 +243,14 @@ func (s *WalletPSBTSigner) SignPSBTInput(psbt *PSBT, idx int) (bool, error) {
 		return false, errors.New("no wallet configured")
 	}
 
-	if s.wallet.IsLocked() {
-		return false, ErrWalletLocked
-	}
+	// Note: a locked wallet is NOT rejected outright here. HD-master-key
+	// derivation (the BIP32-derivation loops below) is gated on !IsLocked(), but
+	// the address-based fallback can still sign inputs owned via imported keys —
+	// which are stored directly and not protected by the mnemonic-lock. This
+	// lets a keyless imported-descriptor wallet (whose blank state carries the
+	// NewWallet locked=true default) spend, while a locked HD wallet's own
+	// master-derived inputs correctly stay unsigned.
+	locked := s.wallet.IsLocked()
 
 	input := &psbt.Inputs[idx]
 
@@ -280,64 +285,96 @@ func (s *WalletPSBTSigner) SignPSBTInput(psbt *PSBT, idx int) (bool, error) {
 	// Try to find a key we can sign with
 	signed := false
 
-	// Check BIP32 derivation paths for keys we own
-	for pubKeyStr, deriv := range input.BIP32Derivation {
-		pubKeyBytes := []byte(pubKeyStr)
+	// HD-master-key signing via PSBT-carried BIP32 derivations — only when the
+	// wallet is unlocked (deriveKey reads the master key, which the mnemonic-lock
+	// protects). Imported keys are handled by the fallback below regardless.
+	if !locked {
+		// Check BIP32 derivation paths for keys we own
+		for pubKeyStr, deriv := range input.BIP32Derivation {
+			pubKeyBytes := []byte(pubKeyStr)
 
-		// Check if this fingerprint matches our master key
-		fingerprint, err := s.wallet.GetMasterFingerprint()
-		if err != nil {
-			continue
-		}
-		if deriv.Fingerprint != fingerprint {
-			continue
+			// Check if this fingerprint matches our master key
+			fingerprint, err := s.wallet.GetMasterFingerprint()
+			if err != nil {
+				continue
+			}
+			if deriv.Fingerprint != fingerprint {
+				continue
+			}
+
+			// Derive the key at this path
+			privKey, err := s.deriveKey(deriv.Path)
+			if err != nil {
+				continue
+			}
+
+			// Verify the pubkey matches
+			derivedPubKey := privKey.PubKey().SerializeCompressed()
+			if !bytes.Equal(derivedPubKey, pubKeyBytes) {
+				continue
+			}
+
+			// Sign based on script type
+			err = s.signInputWithKey(psbt, idx, input, utxo, privKey, pubKeyBytes)
+			if err != nil {
+				return false, err
+			}
+			signed = true
 		}
 
-		// Derive the key at this path
-		privKey, err := s.deriveKey(deriv.Path)
-		if err != nil {
-			continue
-		}
+		// Also check taproot BIP32 derivations
+		for xonlyStr, deriv := range input.TapBIP32Derivation {
+			xonlyBytes := []byte(xonlyStr)
 
-		// Verify the pubkey matches
-		derivedPubKey := privKey.PubKey().SerializeCompressed()
-		if !bytes.Equal(derivedPubKey, pubKeyBytes) {
-			continue
-		}
+			// Check fingerprint
+			fingerprint, err := s.wallet.GetMasterFingerprint()
+			if err != nil {
+				continue
+			}
+			if deriv.Fingerprint != fingerprint {
+				continue
+			}
 
-		// Sign based on script type
-		err = s.signInputWithKey(psbt, idx, input, utxo, privKey, pubKeyBytes)
-		if err != nil {
-			return false, err
+			// Derive the key
+			privKey, err := s.deriveKey(deriv.Path)
+			if err != nil {
+				continue
+			}
+
+			// For taproot, we need to sign with the tweaked key
+			err = s.signTaprootInput(psbt, idx, input, utxo, privKey, xonlyBytes)
+			if err != nil {
+				return false, err
+			}
+			signed = true
 		}
-		signed = true
 	}
 
-	// Also check taproot BIP32 derivations
-	for xonlyStr, deriv := range input.TapBIP32Derivation {
-		xonlyBytes := []byte(xonlyStr)
-
-		// Check fingerprint
-		fingerprint, err := s.wallet.GetMasterFingerprint()
-		if err != nil {
-			continue
+	// Fallback: sign any input whose scriptPubKey the wallet owns directly,
+	// looking up the key by address (HD-derived OR imported). PSBTs produced by
+	// the wallet's own walletcreatefundedpsbt do not carry BIP32 key-origin
+	// derivations, and imported-descriptor keys have no HD master fingerprint to
+	// match — so the derivation-driven loops above find nothing even though the
+	// wallet holds the key. Core's descriptor SPKMs sign owned inputs
+	// regardless of PSBT-carried derivations (wallet/scriptpubkeyman.cpp
+	// FillPSBT signs whatever IsMine resolves); this mirrors that.
+	if !signed {
+		if addr := s.wallet.scriptToAddress(utxo.PkScript); addr != "" {
+			if privKey, kerr := s.wallet.GetKeyForAddress(addr); kerr == nil && privKey != nil {
+				if input.PartialSigs == nil {
+					input.PartialSigs = make(map[string][]byte)
+				}
+				pubKey := privKey.PubKey().SerializeCompressed()
+				if isP2TR(utxo.PkScript) {
+					if err := s.signTaprootInput(psbt, idx, input, utxo, privKey, pubKey[1:33]); err != nil {
+						return false, err
+					}
+				} else if err := s.signInputWithKey(psbt, idx, input, utxo, privKey, pubKey); err != nil {
+					return false, err
+				}
+				signed = true
+			}
 		}
-		if deriv.Fingerprint != fingerprint {
-			continue
-		}
-
-		// Derive the key
-		privKey, err := s.deriveKey(deriv.Path)
-		if err != nil {
-			continue
-		}
-
-		// For taproot, we need to sign with the tweaked key
-		err = s.signTaprootInput(psbt, idx, input, utxo, privKey, xonlyBytes)
-		if err != nil {
-			return false, err
-		}
-		signed = true
 	}
 
 	return signed, nil

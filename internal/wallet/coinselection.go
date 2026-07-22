@@ -496,11 +496,15 @@ func EstimateTxVSize(numInputs int, inputScripts [][]byte, numOutputs int, outpu
 	baseSize := 10
 
 	// Add input sizes
+	hasWitness := false
 	for i := 0; i < numInputs; i++ {
+		var s []byte
 		if i < len(inputScripts) {
-			baseSize += estimateInputVSize(inputScripts[i])
-		} else {
-			baseSize += 68 // default P2WPKH
+			s = inputScripts[i]
+		}
+		baseSize += estimateInputVSize(s)
+		if inputIsWitness(s) {
+			hasWitness = true
 		}
 	}
 
@@ -513,7 +517,48 @@ func EstimateTxVSize(numInputs int, inputScripts [][]byte, numOutputs int, outpu
 		}
 	}
 
+	// Segwit overhead. The per-input vbyte estimates above do not include the
+	// transaction-level witness marker+flag (2 weight units), and a
+	// component-wise vbyte sum drops the final weight→vsize ceil rounding that
+	// Core's GetVirtualTransactionSize applies (vsize = ceil(weight/4),
+	// bitcoin-core/src/consensus/validation.h / policy). Together these make a
+	// segwit tx's true vsize ~1 vbyte larger than the naive sum, so without
+	// this the estimated fee lands just below the requested feerate — the
+	// walletcreatefundedpsbt off-by-10-sat that failed wallet-diff PSBT parity.
+	// Add it back so the estimate never underpays the target (Core rounds up).
+	if hasWitness {
+		baseSize++
+	}
+
 	return baseSize
+}
+
+// inputIsWitness reports whether an input spending pkScript contributes witness
+// data (and thus makes the tx a segwit tx). An empty/unknown script defaults to
+// P2WPKH, matching estimateInputVSize. P2SH is treated as P2SH-P2WPKH (segwit),
+// consistent with estimateInputVSize's 91-vbyte assumption.
+func inputIsWitness(pkScript []byte) bool {
+	if len(pkScript) == 0 {
+		return true // default P2WPKH
+	}
+	// P2WPKH: OP_0 <20>
+	if len(pkScript) == 22 && pkScript[0] == 0x00 && pkScript[1] == 0x14 {
+		return true
+	}
+	// P2WSH: OP_0 <32>
+	if len(pkScript) == 34 && pkScript[0] == 0x00 && pkScript[1] == 0x20 {
+		return true
+	}
+	// P2TR: OP_1 <32>
+	if len(pkScript) == 34 && pkScript[0] == 0x51 && pkScript[1] == 0x20 {
+		return true
+	}
+	// P2SH: assumed P2SH-P2WPKH (nested segwit), matching estimateInputVSize.
+	if len(pkScript) == 23 && pkScript[0] == 0xa9 {
+		return true
+	}
+	// P2PKH and everything else: legacy, no witness.
+	return false
 }
 
 // EstimateChangeOutputFee estimates the fee for adding a change output.

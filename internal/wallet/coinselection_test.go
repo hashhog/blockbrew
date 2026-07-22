@@ -241,8 +241,13 @@ func TestEstimateTxVSize(t *testing.T) {
 
 	vsize := EstimateTxVSize(2, inputs, 2, outputs)
 
-	// Expected: 10 base + 68*2 inputs + 31*2 outputs = 208
-	expected := 10 + 68*2 + 31*2
+	// Expected: 10 base + 68*2 inputs + 31*2 outputs + 1 segwit overhead = 209.
+	// The +1 accounts for the witness marker+flag (2 weight units) and the
+	// weight->vsize ceil rounding that a component-wise vbyte sum drops; the
+	// true vsize of this 2-in/2-out P2WPKH tx is ceil(834 weight / 4) = 209.
+	// Without it the estimate under-counts by 1 vbyte and walletcreatefundedpsbt
+	// underpays the requested feerate (wallet-diff PSBT parity regression).
+	expected := 10 + 68*2 + 31*2 + 1
 	if vsize != expected {
 		t.Errorf("EstimateTxVSize() = %d, want %d", vsize, expected)
 	}
