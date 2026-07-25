@@ -852,6 +852,20 @@ func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMe
 		return connectGateResult{reason: verr.Error()}
 	}
 
+	// WAVE B: derive the block's script flags ONCE, up front, off the block
+	// HASH — the same call production makes at chainmanager.go:700. Hoisted
+	// above the tx loop because the sigop counters below are FLAG-GATED and
+	// must see the identical flag set the script pass uses.
+	//
+	// This used to be computed only inside the `if !skipScripts` block at the
+	// bottom, leaving the sigop counters flag-BLIND: they counted P2SH and
+	// witness sigops unconditionally while production (chainmanager.go:968-969,
+	// fixed in 30c97b4) gates both. At the BIP-16 exception block 170,060 Core's
+	// flags are SCRIPT_VERIFY_NONE and it counts ZERO of each, so the harness
+	// over-counted exactly where Wave B makes the exception load-bearing. Same
+	// bug shape as the hash-blind beamchain shim.
+	blockScriptFlags := consensus.GetBlockScriptFlags(height, params, block.Header.BlockHash())
+
 	// (2) Contextual checks at this height. A synthetic prevHeader (its only use
 	// would be a difficulty recheck that CheckBlockContext skips). prevMTP feeds
 	// the block's median-time-past context for time-based locks.
@@ -981,8 +995,16 @@ func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMe
 		for _, txOut := range tx.TxOut {
 			nSigOpsCost += consensus.CountSigOpsInaccurate(txOut.PkScript) * consensus.WitnessScaleFactor
 		}
-		nSigOpsCost += consensus.CountP2SHSigOps(tx, view)
-		nSigOpsCost += consensus.CountWitnessSigOps(tx, view)
+		// FLAG-GATED, exactly as production does at chainmanager.go:968-969.
+		// Core: `if (flags & SCRIPT_VERIFY_P2SH)` (consensus/tx_verify.cpp:150-152)
+		// and CountWitnessSigOps returns 0 when SCRIPT_VERIFY_WITNESS is clear
+		// (script/interpreter.cpp:2141-2143).
+		if blockScriptFlags&script.ScriptVerifyP2SH != 0 {
+			nSigOpsCost += consensus.CountP2SHSigOps(tx, view)
+		}
+		if blockScriptFlags&script.ScriptVerifyWitness != 0 {
+			nSigOpsCost += consensus.CountWitnessSigOps(tx, view)
+		}
 		if nSigOpsCost > consensus.MaxBlockSigOpsCost {
 			return connectGateResult{
 				reason: fmt.Sprintf("bad-blk-sigops: %d > %d", nSigOpsCost, consensus.MaxBlockSigOpsCost),
@@ -998,10 +1020,10 @@ func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMe
 	// Script validation over the NON-spending scriptView (skipped iff
 	// skipScripts) — it retains every external + intra-block prevout.
 	if !skipScripts {
-		blockHash := block.Header.BlockHash()
-		flags := consensus.GetBlockScriptFlags(height, params, blockHash)
+		// Reuse the SAME flag set the sigop counters above were gated on —
+		// recomputing here risked the two drifting apart.
 		sigCache := consensus.NewSigCache(0)
-		if verr := consensus.ParallelScriptValidationCached(block, scriptView, flags, sigCache); verr != nil {
+		if verr := consensus.ParallelScriptValidationCached(block, scriptView, blockScriptFlags, sigCache); verr != nil {
 			return connectGateResult{reason: "block-script-verify-flag-failed", fee: totalFees}
 		}
 	}
