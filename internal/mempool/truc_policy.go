@@ -131,7 +131,9 @@ func IsTRUCSiblingEviction(err error) (wire.Hash256, bool) {
 func (mp *Mempool) trucSigopVsize(tx *wire.MsgTx) int64 {
 	weight := consensus.CalcTxWeight(tx)
 	view := &mempoolUTXOView{mp: mp}
-	sigOpCost := consensus.GetTransactionSigOpCost(tx, view)
+	// Flags gate P2SH/witness sigops in Core (tx_verify.cpp:150-152,
+	// interpreter.cpp:2141-2143); mempool uses the tip's consensus flags.
+	sigOpCost := consensus.GetTransactionSigOpCost(tx, view, mp.getConsensusScriptFlags())
 	return consensus.GetVirtualTransactionSize(weight, sigOpCost, consensus.DefaultBytesPerSigOp)
 }
 

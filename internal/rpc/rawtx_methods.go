@@ -829,7 +829,7 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		// the exact helper the real path calls so P2SH redeem-script + witness
 		// sigops are counted accurately against the prevout view. The pre-fix
 		// dry-run never counted sigops. Core reject token: bad-txns-too-many-sigops.
-		if consensus.GetTransactionSigOpCost(tx, prevoutView) > consensus.MaxStandardTxSigOpsCost {
+		if consensus.GetTransactionSigOpCost(tx, prevoutView, s.mempool.ConsensusScriptFlags()) > consensus.MaxStandardTxSigOpsCost {
 			result.Allowed = false
 			result.RejectReason = "bad-txns-too-many-sigops"
 			results = append(results, result)

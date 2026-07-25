@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -965,8 +966,23 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		for _, txOut := range tx.TxOut {
 			nSigOpsCost += CountSigOpsInaccurate(txOut.PkScript) * WitnessScaleFactor
 		}
-		nSigOpsCost += CountP2SHSigOps(tx, cachedView)
-		nSigOpsCost += CountWitnessSigOps(tx, cachedView)
+		// P2SH and witness sigops are FLAG-GATED in Core, using the same
+		// GetBlockScriptFlags result computed at the top of this function — so
+		// the per-block script_flag_exceptions reach sigop accounting too.
+		// Core: `if (flags & SCRIPT_VERIFY_P2SH)` (consensus/tx_verify.cpp:150-152),
+		// and CountWitnessSigOps returns 0 when SCRIPT_VERIFY_WITNESS is clear
+		// (script/interpreter.cpp:2141-2143).
+		// At the BIP-16 exception block (170060) Core's flags are
+		// SCRIPT_VERIFY_NONE and it counts ZERO of both; counting them
+		// unconditionally over-counts and can false-reject. These lines are not
+		// under the skipScripts guard, so they run on every connect — IBD with
+		// assumevalid, reorg replay and the import tool included.
+		if flags&script.ScriptVerifyP2SH != 0 {
+			nSigOpsCost += CountP2SHSigOps(tx, cachedView)
+		}
+		if flags&script.ScriptVerifyWitness != 0 {
+			nSigOpsCost += CountWitnessSigOps(tx, cachedView)
+		}
 		if nSigOpsCost > MaxBlockSigOpsCost {
 			rollbackUTXOs()
 			return fmt.Errorf("%w: %d > %d", ErrSigOpsCostTooHigh, nSigOpsCost, MaxBlockSigOpsCost)
