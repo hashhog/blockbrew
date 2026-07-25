@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -343,11 +344,11 @@ func TestCheckTransactionInputs(t *testing.T) {
 	})
 
 	tests := []struct {
-		name      string
-		tx        *wire.MsgTx
-		txHeight  int32
-		wantErr   error
-		wantFee   int64
+		name     string
+		tx       *wire.MsgTx
+		txHeight int32
+		wantErr  error
+		wantFee  int64
 	}{
 		{
 			name: "valid transaction",
@@ -531,14 +532,14 @@ func TestCalcBlockSubsidyHalvings(t *testing.T) {
 		height  int32
 		subsidy int64
 	}{
-		{0, 5000000000},          // Genesis block: 50 BTC
-		{1, 5000000000},          // Block 1: 50 BTC
-		{209999, 5000000000},     // Last block before first halving: 50 BTC
-		{210000, 2500000000},     // First halving: 25 BTC
-		{420000, 1250000000},     // Second halving: 12.5 BTC
-		{630000, 625000000},      // Third halving: 6.25 BTC
-		{840000, 312500000},      // Fourth halving: 3.125 BTC
-		{13440000, 0},            // After 64 halvings: 0 (64 * 210000 = 13440000)
+		{0, 5000000000},      // Genesis block: 50 BTC
+		{1, 5000000000},      // Block 1: 50 BTC
+		{209999, 5000000000}, // Last block before first halving: 50 BTC
+		{210000, 2500000000}, // First halving: 25 BTC
+		{420000, 1250000000}, // Second halving: 12.5 BTC
+		{630000, 625000000},  // Third halving: 6.25 BTC
+		{840000, 312500000},  // Fourth halving: 3.125 BTC
+		{13440000, 0},        // After 64 halvings: 0 (64 * 210000 = 13440000)
 	}
 
 	for _, tt := range tests {
@@ -697,15 +698,15 @@ func TestEncodeBIP34Height(t *testing.T) {
 		height   int32
 		expected []byte
 	}{
-		{0, []byte{0x00}},                         // OP_0
-		{1, []byte{0x51}},                         // OP_1
-		{16, []byte{0x60}},                        // OP_16
-		{17, []byte{0x01, 0x11}},                  // 1-byte push
-		{127, []byte{0x01, 0x7f}},                 // no sign pad
-		{128, []byte{0x02, 0x80, 0x00}},           // sign pad at 0x80
-		{32768, []byte{0x03, 0x00, 0x80, 0x00}},   // sign pad at 0x8000
-		{500000, []byte{0x03, 0x20, 0xa1, 0x07}},  // 3-byte push
-		{227931, []byte{0x03, 0x5b, 0x7a, 0x03}},  // mainnet BIP34 (0x37A5B LE)
+		{0, []byte{0x00}},                        // OP_0
+		{1, []byte{0x51}},                        // OP_1
+		{16, []byte{0x60}},                       // OP_16
+		{17, []byte{0x01, 0x11}},                 // 1-byte push
+		{127, []byte{0x01, 0x7f}},                // no sign pad
+		{128, []byte{0x02, 0x80, 0x00}},          // sign pad at 0x80
+		{32768, []byte{0x03, 0x00, 0x80, 0x00}},  // sign pad at 0x8000
+		{500000, []byte{0x03, 0x20, 0xa1, 0x07}}, // 3-byte push
+		{227931, []byte{0x03, 0x5b, 0x7a, 0x03}}, // mainnet BIP34 (0x37A5B LE)
 	}
 	for _, tt := range tests {
 		got := encodeBIP34Height(tt.height)
@@ -729,12 +730,12 @@ func TestCountSigOps(t *testing.T) {
 		},
 		{
 			name:     "P2PKH output script",
-			script:   []byte{0x76, 0xa9, 0x14, /* 20 bytes pubkeyhash */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac},
+			script:   []byte{0x76, 0xa9, 0x14 /* 20 bytes pubkeyhash */, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x88, 0xac},
 			expected: 1, // OP_CHECKSIG
 		},
 		{
 			name:     "bare multisig 2-of-3",
-			script:   []byte{0x52, /* OP_2 */ 0x21, /* push 33 */ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x53, /* OP_3 */ 0xae /* OP_CHECKMULTISIG */},
+			script:   []byte{0x52 /* OP_2 */, 0x21 /* push 33 */, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x53 /* OP_3 */, 0xae /* OP_CHECKMULTISIG */},
 			expected: 3, // 3 pubkeys
 		},
 	}
@@ -861,116 +862,288 @@ func TestIsCoinbaseTx(t *testing.T) {
 }
 
 // TestGetBlockScriptFlags tests script flag generation for different heights.
+//
+// WAVE B: P2SH | WITNESS | TAPROOT are UNCONDITIONAL for every block at every
+// height (Core validation.cpp:2262 — no BIP16Height, no taprootHeight, and
+// SegwitHeight does NOT gate SCRIPT_VERIFY_WITNESS). Only DERSIG / CLTV / CSV /
+// NULLDUMMY remain height-gated (validation.cpp:2268-2286). Before Wave B this
+// table gated WITNESS on SegwitHeight and TAPROOT on an invented TaprootHeight;
+// those expectations were a real divergence from Core, not a test convention.
 func TestGetBlockScriptFlags(t *testing.T) {
 	params := MainnetParams()
 
 	tests := []struct {
-		height              int32
-		expectP2SH          bool
-		expectBIP66         bool
-		expectBIP65         bool
-		expectCSV           bool
-		expectSegwit        bool
-		expectNullFail      bool
-		expectWitnessPubKey bool
+		name string
+		// height under test
+		height int32
+		// height-gated flags — the ONLY ones that vary
+		expectBIP66     bool
+		expectBIP65     bool
+		expectCSV       bool
+		expectNullDummy bool
 	}{
+		{name: "genesis", height: 0},
+		{name: "BIP66 activation", height: params.BIP66Height, expectBIP66: true},
+		{name: "BIP66-1", height: params.BIP66Height - 1},
+		{name: "BIP65 activation", height: params.BIP65Height, expectBIP66: true, expectBIP65: true},
+		{name: "CSV activation", height: params.CSVHeight, expectBIP66: true, expectBIP65: true, expectCSV: true},
 		{
-			height:              0,
-			expectP2SH:          true,
-			expectBIP66:         false,
-			expectBIP65:         false,
-			expectCSV:           false,
-			expectSegwit:        false,
-			expectNullFail:      false,
-			expectWitnessPubKey: false,
+			name: "segwit activation", height: params.SegwitHeight,
+			expectBIP66: true, expectBIP65: true, expectCSV: true, expectNullDummy: true,
 		},
 		{
-			height:              params.BIP66Height,
-			expectP2SH:          true,
-			expectBIP66:         true,
-			expectBIP65:         false,
-			expectCSV:           false,
-			expectSegwit:        false,
-			expectNullFail:      false,
-			expectWitnessPubKey: false,
+			name: "segwit-1", height: params.SegwitHeight - 1,
+			expectBIP66: true, expectBIP65: true, expectCSV: true,
 		},
 		{
-			height:              params.BIP65Height,
-			expectP2SH:          true,
-			expectBIP66:         true,
-			expectBIP65:         true,
-			expectCSV:           false,
-			expectSegwit:        false,
-			expectNullFail:      false,
-			expectWitnessPubKey: false,
+			// Below Core's real taproot activation (709632) the trio is STILL on.
+			name: "taproot-1", height: 709631,
+			expectBIP66: true, expectBIP65: true, expectCSV: true, expectNullDummy: true,
 		},
 		{
-			height:              params.CSVHeight,
-			expectP2SH:          true,
-			expectBIP66:         true,
-			expectBIP65:         true,
-			expectCSV:           true,
-			expectSegwit:        false,
-			expectNullFail:      false,
-			expectWitnessPubKey: false,
-		},
-		{
-			height:              params.SegwitHeight,
-			expectP2SH:          true,
-			expectBIP66:         true,
-			expectBIP65:         true,
-			expectCSV:           true,
-			expectSegwit:        true,
-			expectNullFail:      false, // NULLFAIL is policy-only (not consensus)
-			expectWitnessPubKey: false, // WITNESS_PUBKEYTYPE is policy-only (not consensus)
-		},
-		{
-			height:              params.SegwitHeight - 1,
-			expectP2SH:          true,
-			expectBIP66:         true,
-			expectBIP65:         true,
-			expectCSV:           true,
-			expectSegwit:        false,
-			expectNullFail:      false, // NULLFAIL not active (policy-only regardless)
-			expectWitnessPubKey: false, // WITNESS_PUBKEYTYPE not active (policy-only regardless)
+			name: "post-taproot", height: 900000,
+			expectBIP66: true, expectBIP65: true, expectCSV: true, expectNullDummy: true,
 		},
 	}
 
 	for _, tt := range tests {
-		t.Run("", func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			// Use a zero hash — tests are for height-based flag logic, not exceptions
 			var zeroHash wire.Hash256
 			flags := GetBlockScriptFlags(tt.height, params, zeroHash)
 
-			// Note: We import script package for ScriptFlags constants
-			hasP2SH := flags&0x01 != 0
-			hasSegwit := flags&0x02 != 0
-			hasDERSig := flags&0x08 != 0
-			hasCLTV := flags&0x200 != 0
-			hasCSV := flags&0x400 != 0
-			hasNullFail := flags&0x800 != 0    // ScriptVerifyNullFail = 1 << 11
-			hasWitnessPubKey := flags&0x2000 != 0 // ScriptVerifyWitnessPubKeyType = 1 << 13
+			has := func(f script.ScriptFlags) bool { return flags&f != 0 }
 
-			if hasP2SH != tt.expectP2SH {
-				t.Errorf("P2SH at height %d: got %v, want %v", tt.height, hasP2SH, tt.expectP2SH)
+			// --- WAVE B: unconditional trio, at EVERY height ---
+			if !has(script.ScriptVerifyP2SH) {
+				t.Errorf("P2SH at height %d: want unconditionally set, flags=%#x", tt.height, flags)
 			}
-			if hasDERSig != tt.expectBIP66 {
-				t.Errorf("BIP66 at height %d: got %v, want %v", tt.height, hasDERSig, tt.expectBIP66)
+			if !has(script.ScriptVerifyWitness) {
+				t.Errorf("WITNESS at height %d: want unconditionally set (Core validation.cpp:2262 "+
+					"does NOT gate it on SegwitHeight), flags=%#x", tt.height, flags)
 			}
-			if hasCLTV != tt.expectBIP65 {
-				t.Errorf("BIP65 at height %d: got %v, want %v", tt.height, hasCLTV, tt.expectBIP65)
+			if !has(script.ScriptVerifyTaproot) {
+				t.Errorf("TAPROOT at height %d: want unconditionally set (Core has no taprootHeight "+
+					"in the script-flag path), flags=%#x", tt.height, flags)
 			}
-			if hasCSV != tt.expectCSV {
-				t.Errorf("CSV at height %d: got %v, want %v", tt.height, hasCSV, tt.expectCSV)
+
+			// --- height-gated four ---
+			if got := has(script.ScriptVerifyDERSig); got != tt.expectBIP66 {
+				t.Errorf("BIP66/DERSIG at height %d: got %v, want %v", tt.height, got, tt.expectBIP66)
 			}
-			if hasSegwit != tt.expectSegwit {
-				t.Errorf("Segwit at height %d: got %v, want %v", tt.height, hasSegwit, tt.expectSegwit)
+			if got := has(script.ScriptVerifyCLTV); got != tt.expectBIP65 {
+				t.Errorf("BIP65/CLTV at height %d: got %v, want %v", tt.height, got, tt.expectBIP65)
 			}
-			if hasNullFail != tt.expectNullFail {
-				t.Errorf("NullFail at height %d: got %v, want %v", tt.height, hasNullFail, tt.expectNullFail)
+			if got := has(script.ScriptVerifyCSV); got != tt.expectCSV {
+				t.Errorf("CSV at height %d: got %v, want %v", tt.height, got, tt.expectCSV)
 			}
-			if hasWitnessPubKey != tt.expectWitnessPubKey {
-				t.Errorf("WitnessPubKeyType at height %d: got %v, want %v", tt.height, hasWitnessPubKey, tt.expectWitnessPubKey)
+			if got := has(script.ScriptVerifyNullDummy); got != tt.expectNullDummy {
+				t.Errorf("NULLDUMMY at height %d: got %v, want %v", tt.height, got, tt.expectNullDummy)
+			}
+
+			// --- policy-only flags must NEVER appear in block flags ---
+			if has(script.ScriptVerifyNullFail) {
+				t.Errorf("NULLFAIL at height %d: policy-only, must not be in block flags", tt.height)
+			}
+			if has(script.ScriptVerifyWitnessPubKeyType) {
+				t.Errorf("WITNESS_PUBKEYTYPE at height %d: policy-only, must not be in block flags", tt.height)
+			}
+			if has(script.ScriptVerifyStrictEncoding) {
+				t.Errorf("STRICTENC at height %d: policy-only, must not be in block flags", tt.height)
+			}
+		})
+	}
+}
+
+// ---------------------------------------------------------------------------
+// W-B0 NEGATIVE CONTROL — the BYTE-REVERSED exception hash must NOT match.
+// ---------------------------------------------------------------------------
+// Asserting the flag set at an exception block is VACUOUS on its own: at
+// height 170,060 "the exception fired and returned SCRIPT_VERIFY_NONE" and
+// "no exception fired and every flag is off by height" give the SAME answer.
+// A byte-order slip anywhere in the chain (the stored constant,
+// wire.NewHash256FromHex, or the block-hash producer) would therefore pass the
+// entire positive suite while the lookup never fires on a real block — the
+// silently-inert table the Wave B call-site census was hunting for.
+//
+// The control feeds the BYTE-REVERSED exception hash and proves it is NOT
+// treated as an exception. Per entry:
+//
+//	(a) reversed == a known-non-exception control hash at the same height
+//	    (compared structurally against a control, never against a hard-coded
+//	    by-height answer, so it survives the Wave B base-trio flip);
+//	(b) non-vacuity guard — the CORRECT hash must differ from the control at
+//	    that height, otherwise (a) proves nothing;
+//	(c) at a height where P2SH|WITNESS|TAPROOT are all live, the reversed hash
+//	    carries the FULL trio while the correct hash still returns the
+//	    override. That pair is what a byte-order slip cannot fake.
+//
+// Bitcoin Core: validation.cpp:2262 (unconditional P2SH|WITNESS|TAPROOT),
+// kernel/chainparams.cpp:85-88 + :210-211 (hash-keyed script_flag_exceptions).
+
+// reverseHash256 returns h with its 32 bytes in the opposite order. This is
+// exactly the slip under test: display-order bytes handed to a lookup that
+// expects internal order, or vice versa.
+func reverseHash256(h wire.Hash256) wire.Hash256 {
+	var r wire.Hash256
+	for i := 0; i < len(h); i++ {
+		r[i] = h[len(h)-1-i]
+	}
+	return r
+}
+
+// TestScriptFlagExceptionByteReversedHashDoesNotFire is the fleet-wide W-B0
+// negative control for blockbrew's GetBlockScriptFlags exception table.
+func TestScriptFlagExceptionByteReversedHashDoesNotFire(t *testing.T) {
+	const trio = script.ScriptVerifyP2SH | script.ScriptVerifyWitness | script.ScriptVerifyTaproot
+
+	tests := []struct {
+		name string
+		// params under test
+		params *ChainParams
+		// canonical Core display hex of the exception block hash
+		displayHex string
+		// same hash byte-reversed, in display hex (guards the reversal helper)
+		reversedDisplayHex string
+		// the block's own height (where the positive assertion is vacuous)
+		violatorHeight int32
+		// a height at which the four height-gated flags are all live
+		trioLiveHeight int32
+		// Core's override value for this entry (the REPLACE value)
+		override script.ScriptFlags
+		// WAVE B: the full expected flag set at violatorHeight, i.e.
+		// override | (height-gated flags active at violatorHeight).
+		// Hard-coded rather than recomputed so it cannot go tautological.
+		wantAtViolator script.ScriptFlags
+		// Same at trioLiveHeight.
+		wantAtTrioLive script.ScriptFlags
+	}{
+		{
+			name:               "mainnet BIP16 violator (height 170060)",
+			params:             MainnetParams(),
+			displayHex:         "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22",
+			reversedDisplayHex: "229c4fac88bab194eb08f1a528cc308ded2397f4f4eb6e75dc02000000000000",
+			violatorHeight:     170060,
+			trioLiveHeight:     800000,
+			override:           script.ScriptFlags(0), // SCRIPT_VERIFY_NONE
+			// 170060 < BIP66(363725) — none of the four are active yet.
+			wantAtViolator: 0,
+			// At 800000 all four are active and survive the REPLACE.
+			wantAtTrioLive: script.ScriptVerifyDERSig | script.ScriptVerifyCLTV |
+				script.ScriptVerifyCSV | script.ScriptVerifyNullDummy,
+		},
+		{
+			name:               "mainnet taproot violator (height 692261)",
+			params:             MainnetParams(),
+			displayHex:         "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad",
+			reversedDisplayHex: "ad95e3a15ee5ffd585c5e81d44b56a981e842d5bc3140f000000000000000000",
+			violatorHeight:     692261,
+			trioLiveHeight:     800000,
+			override:           script.ScriptVerifyP2SH | script.ScriptVerifyWitness,
+			// 692261 > SegwitHeight(481824): all four active. This is THE case
+			// the old early-return got wrong — it returned the bare override and
+			// silently dropped DERSIG|CLTV|CSV|NULLDUMMY on a real mainnet block.
+			wantAtViolator: script.ScriptVerifyP2SH | script.ScriptVerifyWitness |
+				script.ScriptVerifyDERSig | script.ScriptVerifyCLTV |
+				script.ScriptVerifyCSV | script.ScriptVerifyNullDummy,
+			wantAtTrioLive: script.ScriptVerifyP2SH | script.ScriptVerifyWitness |
+				script.ScriptVerifyDERSig | script.ScriptVerifyCLTV |
+				script.ScriptVerifyCSV | script.ScriptVerifyNullDummy,
+		},
+		{
+			name:               "testnet3 BIP16 violator (height 514)",
+			params:             TestnetParams(),
+			displayHex:         "00000000dd30457c001f4095d208cc1296b0eed002427aa599874af7a432b105",
+			reversedDisplayHex: "05b132a4f74a8799a57a4202d0eeb09612cc08d295401f007c4530dd00000000",
+			violatorHeight:     514,
+			trioLiveHeight:     2100000, // > testnet3 SegwitHeight 834624
+			override:           script.ScriptFlags(0),
+			wantAtViolator:     0,
+			wantAtTrioLive: script.ScriptVerifyDERSig | script.ScriptVerifyCLTV |
+				script.ScriptVerifyCSV | script.ScriptVerifyNullDummy,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			correct, err := wire.NewHash256FromHex(tt.displayHex)
+			if err != nil {
+				t.Fatalf("NewHash256FromHex(%s): %v", tt.displayHex, err)
+			}
+			reversed := reverseHash256(correct)
+			if reversed == correct {
+				t.Fatalf("exception hash must not be a byte-order palindrome")
+			}
+			if got := reversed.String(); got != tt.reversedDisplayHex {
+				t.Fatalf("byte-reversed hash drifted: got %s, want %s", got, tt.reversedDisplayHex)
+			}
+
+			// The control: a hash that is definitively not in any table.
+			var control wire.Hash256
+
+			// (a) At the violator's own height the reversed hash must be ordinary.
+			gotRev := GetBlockScriptFlags(tt.violatorHeight, tt.params, reversed)
+			wantRev := GetBlockScriptFlags(tt.violatorHeight, tt.params, control)
+			if gotRev != wantRev {
+				t.Errorf("byte-reversed hash HIT the exception table at height %d: got flags %#x, control %#x",
+					tt.violatorHeight, gotRev, wantRev)
+			}
+
+			// (b) Non-vacuity: the correct hash must differ from the control there.
+			gotCorrect := GetBlockScriptFlags(tt.violatorHeight, tt.params, correct)
+			if gotCorrect != tt.wantAtViolator {
+				t.Errorf("exception did not fire at height %d: got flags %#x, want %#x",
+					tt.violatorHeight, gotCorrect, tt.wantAtViolator)
+			}
+			if gotCorrect == wantRev {
+				t.Errorf("vacuous positive at height %d: exception flags %#x equal the non-exception control %#x — "+
+					"this assertion cannot distinguish a fired exception from height-gating",
+					tt.violatorHeight, gotCorrect, wantRev)
+			}
+
+			// (c) At a height where the base trio is live, reversed => FULL trio,
+			//     correct => the override (still missing whatever the override drops).
+			hiRev := GetBlockScriptFlags(tt.trioLiveHeight, tt.params, reversed)
+			if hiRev&trio != trio {
+				t.Errorf("byte-reversed hash at height %d must carry the full P2SH|WITNESS|TAPROOT trio: got %#x",
+					tt.trioLiveHeight, hiRev)
+			}
+			hiCorrect := GetBlockScriptFlags(tt.trioLiveHeight, tt.params, correct)
+			if hiCorrect != tt.wantAtTrioLive {
+				t.Errorf("exception did not fire at height %d: got flags %#x, want %#x",
+					tt.trioLiveHeight, hiCorrect, tt.wantAtTrioLive)
+			}
+			if hiCorrect&trio == trio {
+				t.Errorf("exception at height %d still carries the full trio %#x — override %#x is not being applied",
+					tt.trioLiveHeight, hiCorrect, tt.override)
+			}
+
+			// (d) WAVE B APPLICATION ORDER — Core REPLACES the flag set on an
+			//     exception hit and THEN ORs the four height-gated flags on top
+			//     (validation.cpp:2263-2286). The old shape here early-returned
+			//     the bare override, which silently dropped step 3.
+			//
+			//     Discriminator: at trioLiveHeight every one of DERSIG / CLTV /
+			//     CSV / NULLDUMMY is active, so an exception block MUST still
+			//     carry all four. An early-return implementation returns exactly
+			//     tt.override and fails this.
+			const heightGated = script.ScriptVerifyDERSig | script.ScriptVerifyCLTV |
+				script.ScriptVerifyCSV | script.ScriptVerifyNullDummy
+			if hiCorrect&heightGated != heightGated {
+				t.Errorf("REPLACE-THEN-OR violated at height %d: exception flags %#x are missing "+
+					"height-gated bits %#x (early-return would yield exactly the override %#x). "+
+					"Core validation.cpp:2263-2286 ORs DERSIG|CLTV|CSV|NULLDUMMY on top of the override.",
+					tt.trioLiveHeight, hiCorrect, hiCorrect&heightGated^heightGated, tt.override)
+			}
+			// ...and the override's own bits must survive the OR untouched.
+			if hiCorrect&tt.override != tt.override {
+				t.Errorf("override bits lost at height %d: got %#x, override %#x",
+					tt.trioLiveHeight, hiCorrect, tt.override)
+			}
+			// ...and no trio bit the override drops may be reintroduced.
+			if dropped := trio &^ tt.override; hiCorrect&dropped != 0 {
+				t.Errorf("exception at height %d reintroduced trio bits %#x that override %#x drops "+
+					"— OR-instead-of-REPLACE", tt.trioLiveHeight, hiCorrect&dropped, tt.override)
 			}
 		})
 	}
@@ -1333,10 +1506,10 @@ func TestBIP68TimeLockGranularity(t *testing.T) {
 		sequenceValue uint16
 		expectedDelta int64 // Expected delta from base MTP
 	}{
-		{1, (1 << 9) - 1},      // 511 seconds
-		{2, (2 << 9) - 1},      // 1023 seconds
-		{10, (10 << 9) - 1},    // 5119 seconds
-		{100, (100 << 9) - 1},  // 51199 seconds
+		{1, (1 << 9) - 1},       // 511 seconds
+		{2, (2 << 9) - 1},       // 1023 seconds
+		{10, (10 << 9) - 1},     // 5119 seconds
+		{100, (100 << 9) - 1},   // 51199 seconds
 		{1000, (1000 << 9) - 1}, // ~8.5 hours
 	}
 
@@ -2085,7 +2258,10 @@ func TestWitnessCommitment_Gate3_LastOccurrence(t *testing.T) {
 		s := make([]byte, 38)
 		s[0] = 0x6a
 		s[1] = 0x24
-		s[2] = 0xaa; s[3] = 0x21; s[4] = 0xa9; s[5] = 0xed
+		s[2] = 0xaa
+		s[3] = 0x21
+		s[4] = 0xa9
+		s[5] = 0xed
 		copy(s[6:], hash)
 		return s
 	}
@@ -2100,7 +2276,7 @@ func TestWitnessCommitment_Gate3_LastOccurrence(t *testing.T) {
 		}},
 		TxOut: []*wire.TxOut{
 			{Value: 50_0000_0000, PkScript: []byte{0x51}},
-			{Value: 0, PkScript: makeCommitScript(wrongHash)},   // FIRST — wrong
+			{Value: 0, PkScript: makeCommitScript(wrongHash)},            // FIRST — wrong
 			{Value: 0, PkScript: makeCommitScript(correctCommitment[:])}, // LAST — correct
 		},
 		LockTime: 0,
@@ -2128,7 +2304,7 @@ func TestWitnessCommitment_Gate3_LastOccurrence(t *testing.T) {
 	coinbase2.TxOut = []*wire.TxOut{
 		{Value: 50_0000_0000, PkScript: []byte{0x51}},
 		{Value: 0, PkScript: makeCommitScript(correctCommitment[:])}, // FIRST — correct
-		{Value: 0, PkScript: makeCommitScript(wrongHash)},             // LAST — wrong
+		{Value: 0, PkScript: makeCommitScript(wrongHash)},            // LAST — wrong
 	}
 	txid2 := coinbase2.TxHash()
 	block2 := &wire.MsgBlock{
@@ -2191,9 +2367,9 @@ func TestWitnessCommitment_Gate6_NonceSizeValidation(t *testing.T) {
 	params := buildSegwitParams()
 
 	tests := []struct {
-		name        string
+		name         string
 		witnessStack [][]byte
-		wantErr     bool
+		wantErr      bool
 	}{
 		{
 			name:         "valid: exactly 1 element of 32 bytes",
