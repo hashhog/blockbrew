@@ -2638,6 +2638,12 @@ func (c *countingDB) Delete(key []byte) error {
 func (c *countingDB) NewIterator(prefix []byte) storage.Iterator {
 	return c.inner.NewIterator(prefix)
 }
+// Flush delegates to the backend. Added to keep countingDB satisfying
+// storage.DB after Flush was introduced on the interface — without it this
+// whole test package failed to COMPILE, which silently disabled every test
+// in it (classic fixture rot: the gate looks green because it never ran).
+func (c *countingDB) Flush() error { return c.inner.Flush() }
+
 func (c *countingDB) Close() error { return c.inner.Close() }
 func (c *countingDB) NewBatch() storage.Batch {
 	c.mu.Lock()

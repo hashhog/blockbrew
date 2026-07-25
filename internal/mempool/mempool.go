@@ -1000,7 +1000,7 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
 	// and witness sigops are counted accurately (requires prevout scriptPubKey).
 	{
 		mempoolView := &mempoolUTXOView{mp: mp}
-		txSigOpsCost := consensus.GetTransactionSigOpCost(tx, mempoolView)
+		txSigOpsCost := consensus.GetTransactionSigOpCost(tx, mempoolView, mp.getConsensusScriptFlags())
 		if txSigOpsCost > consensus.MaxStandardTxSigOpsCost {
 			return fmt.Errorf("%w: cost %d > %d",
 				ErrTxSigOpsCostTooHigh, txSigOpsCost, consensus.MaxStandardTxSigOpsCost)
@@ -1777,6 +1777,15 @@ func (mp *Mempool) getStandardScriptFlags() script.ScriptFlags {
 func (mp *Mempool) getConsensusScriptFlags() script.ScriptFlags {
 	var zeroHash wire.Hash256
 	return consensus.GetBlockScriptFlags(mp.chainHeight, mp.config.ChainParams, zeroHash)
+}
+
+// ConsensusScriptFlags exposes the mempool's consensus script flags to callers
+// outside this package (testmempoolaccept), so a dry-run gates P2SH/witness
+// sigop counting exactly as real acceptance does rather than re-deriving them.
+// The zero hash is correct here: the mempool is not validating a block, so no
+// script_flag_exception can apply.
+func (mp *Mempool) ConsensusScriptFlags() script.ScriptFlags {
+	return mp.getConsensusScriptFlags()
 }
 
 // validateScriptsLocked validates transaction scripts.
