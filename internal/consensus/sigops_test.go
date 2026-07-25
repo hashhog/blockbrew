@@ -576,7 +576,7 @@ func TestW74Gate9GetTransactionSigOpCost(t *testing.T) {
 		&UTXOEntry{Amount: 1000, PkScript: []byte{script.OP_CHECKSIG}, Height: 1},
 	)
 
-	cost := GetTransactionSigOpCost(tx, utxoView)
+	cost := GetTransactionSigOpCost(tx, utxoView, script.ScriptVerifyP2SH|script.ScriptVerifyWitness)
 	// legacy: (1 CHECKSIG in scriptSig + 1 CHECKSIG in vout) × 4 = 8
 	// P2SH: prevout is not P2SH → 0
 	// witness: no witness → 0
@@ -594,7 +594,7 @@ func TestW74Gate9GetTransactionSigOpCost(t *testing.T) {
 		}},
 		TxOut: []*wire.TxOut{{Value: 5_000_000_000, PkScript: []byte{script.OP_CHECKSIG}}},
 	}
-	cbCost := GetTransactionSigOpCost(coinbaseTx, utxoView)
+	cbCost := GetTransactionSigOpCost(coinbaseTx, utxoView, script.ScriptVerifyP2SH|script.ScriptVerifyWitness)
 	// Coinbase: legacy = (1 + 1) × 4 = 8; P2SH/witness skipped.
 	if cbCost != 8 {
 		t.Errorf("Gate12 coinbase cost: got %d, want 8 (legacy only, P2SH+witness skipped)", cbCost)
@@ -610,7 +610,7 @@ func TestW74Gate9GetTransactionSigOpCost(t *testing.T) {
 		}},
 		TxOut: []*wire.TxOut{{Value: 900, PkScript: []byte{0x51 /* OP_1 */, script.OP_CHECKSIG}}},
 	}
-	multisigCost := GetTransactionSigOpCost(txMultisig, utxoView)
+	multisigCost := GetTransactionSigOpCost(txMultisig, utxoView, script.ScriptVerifyP2SH|script.ScriptVerifyWitness)
 	// inaccurate: scriptSig=20, vout=1 → legacy=(20+1)×4=84
 	if multisigCost != 84 {
 		t.Errorf("Gate9 inaccurate CHECKMULTISIG: got %d, want 84 (20 inaccurate × 4 + 1 × 4)", multisigCost)
@@ -809,5 +809,57 @@ func TestW74CountScriptPubKeySigOps(t *testing.T) {
 	badScriptSig := append([]byte{0x61 /* OP_NOP > OP_16 */, byte(len(redeemScript))}, redeemScript...)
 	if got := CountScriptPubKeySigOps(p2shPubKey, badScriptSig); got != 0 {
 		t.Errorf("P2SH non-push-only scriptSig: got %d, want 0", got)
+	}
+}
+
+// TestGetTransactionSigOpCostFlagGating pins Core's flag gating of P2SH sigops —
+// the behaviour that was missing until the Wave-B call-site census found it.
+//
+// Core counts P2SH sigops only when SCRIPT_VERIFY_P2SH is set
+// (consensus/tx_verify.cpp:150-152), and CountWitnessSigOps returns 0 when
+// SCRIPT_VERIFY_WITNESS is clear (script/interpreter.cpp:2141-2143). This is
+// load-bearing at the script_flag_exceptions blocks: at the BIP-16 exception
+// (170060) Core's flags are SCRIPT_VERIFY_NONE, so it counts ZERO of both.
+// Counting them regardless over-counts and can false-reject the block.
+func TestGetTransactionSigOpCostFlagGating(t *testing.T) {
+	// Spend a P2SH prevout whose redeem script carries a CHECKSIG, so the P2SH
+	// contribution is non-zero and the gate is observable.
+	// P2SH shape only: sigop counting parses the pushed redeem script and does
+	// NOT verify the hash (Core's GetP2SHSigOpCount does the same), so an
+	// arbitrary 20-byte hash is sufficient here.
+	var redeemHash [20]byte
+	p2shScript := append(append([]byte{script.OP_HASH160, 0x14}, redeemHash[:]...), script.OP_EQUAL)
+
+	prevHash := wire.Hash256{0x07}
+	tx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: prevHash, Index: 0},
+			// Push the redeem script so CountP2SHSigOps can parse it.
+			SignatureScript: []byte{0x01, script.OP_CHECKSIG},
+			Sequence:        0xffffffff,
+		}},
+		TxOut: []*wire.TxOut{{Value: 900, PkScript: []byte{script.OP_CHECKSIG}}},
+	}
+	utxoView := NewInMemoryUTXOView()
+	utxoView.AddUTXO(
+		wire.OutPoint{Hash: prevHash, Index: 0},
+		&UTXOEntry{Amount: 1000, PkScript: p2shScript, Height: 1},
+	)
+
+	noFlags := GetTransactionSigOpCost(tx, utxoView, 0)
+	withP2SH := GetTransactionSigOpCost(tx, utxoView, script.ScriptVerifyP2SH)
+	withBoth := GetTransactionSigOpCost(tx, utxoView, script.ScriptVerifyP2SH|script.ScriptVerifyWitness)
+
+	// Flags may only ever ADD sigops.
+	if noFlags > withP2SH || withP2SH > withBoth {
+		t.Fatalf("sigop cost must be monotonic in flags: none=%d p2sh=%d both=%d",
+			noFlags, withP2SH, withBoth)
+	}
+	// The gate must be observable — otherwise it is not wired at all, which is
+	// exactly the defect this test exists to prevent regressing.
+	if noFlags == withP2SH {
+		t.Fatalf("SCRIPT_VERIFY_P2SH is not gating P2SH sigops: both %d "+
+			"(a SCRIPT_VERIFY_NONE exception block would be over-counted)", noFlags)
 	}
 }

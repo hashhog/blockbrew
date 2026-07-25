@@ -220,12 +220,25 @@ func CountScriptPubKeySigOps(scriptPubKey []byte, scriptSig []byte) int {
 //     using INACCURATE counting (CHECKMULTISIG = 20 always), matching
 //     GetLegacySigOpCount which calls GetSigOpCount(false).
 //   - coinbase: return after legacy, skip P2SH + witness
-//   - P2SH redeem-script sigops × WITNESS_SCALE_FACTOR (accurate)
-//   - witness sigops (unscaled, ×1) (accurate)
+//   - P2SH redeem-script sigops × WITNESS_SCALE_FACTOR (accurate), ONLY when
+//     SCRIPT_VERIFY_P2SH is set (tx_verify.cpp:150-152)
+//   - witness sigops (unscaled, ×1) (accurate), ONLY when SCRIPT_VERIFY_WITNESS
+//     is set — Core's CountWitnessSigOps returns 0 otherwise
+//     (script/interpreter.cpp:2141-2143)
+//
+// The `flags` argument is REQUIRED and load-bearing: Core passes the
+// GetBlockScriptFlags result here, so the per-block script_flag_exceptions reach
+// sigop accounting. At the BIP-16 exception block (170060) Core's flags are
+// SCRIPT_VERIFY_NONE and it therefore counts ZERO P2SH and witness sigops;
+// counting them anyway over-counts and can false-reject. This parameter was
+// previously missing while this comment already claimed to mirror tx_verify.cpp
+// — the parity claim was false.
 //
 // Used for both the per-tx mempool policy gate (MAX_STANDARD_TX_SIGOPS_COST=16000)
 // and the per-tx contribution to the block-level gate (MAX_BLOCK_SIGOPS_COST=80000).
-func GetTransactionSigOpCost(tx *wire.MsgTx, utxoView UTXOView) int64 {
+// Mempool/RPC callers pass StandardScriptVerifyFlags (P2SH|WITNESS both set),
+// matching Core's use of STANDARD_SCRIPT_VERIFY_FLAGS on that path.
+func GetTransactionSigOpCost(tx *wire.MsgTx, utxoView UTXOView, flags script.ScriptFlags) int64 {
 	// Legacy sigops: count in every vin scriptSig and every vout scriptPubKey,
 	// scale by WITNESS_SCALE_FACTOR.
 	// Core: GetLegacySigOpCount calls GetSigOpCount(fAccurate=false) →
@@ -247,9 +260,16 @@ func GetTransactionSigOpCost(tx *wire.MsgTx, utxoView UTXOView) int64 {
 
 	if utxoView != nil {
 		// P2SH sigops: already scaled inside CountP2SHSigOps.
-		cost += int64(CountP2SHSigOps(tx, utxoView))
+		// Core: `if (flags & SCRIPT_VERIFY_P2SH)` (tx_verify.cpp:150-152).
+		if flags&script.ScriptVerifyP2SH != 0 {
+			cost += int64(CountP2SHSigOps(tx, utxoView))
+		}
 		// Witness sigops: unscaled (×1).
-		cost += int64(CountWitnessSigOps(tx, utxoView))
+		// Core: CountWitnessSigOps returns 0 when SCRIPT_VERIFY_WITNESS is clear
+		// (script/interpreter.cpp:2141-2143), so the gate lives here.
+		if flags&script.ScriptVerifyWitness != 0 {
+			cost += int64(CountWitnessSigOps(tx, utxoView))
+		}
 	}
 
 	return cost
