@@ -2,21 +2,57 @@
 package mempool
 
 import (
-	"fmt"
+	"errors"
 	"math/bits"
 	"sort"
 
+	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
-// MaxClusterSize is the maximum number of transactions allowed in a cluster.
-// Matches Bitcoin Core's DEFAULT_CLUSTER_LIMIT (src/policy/policy.h:72).
-// Larger clusters are rejected to ensure linearization remains fast.
-const MaxClusterSize = 64
+// MaxClusterCount is the maximum number of transactions allowed in a cluster.
+// Matches Bitcoin Core's DEFAULT_CLUSTER_LIMIT (src/policy/policy.h:72), which
+// is handed to TxGraph as max_cluster_count (txmempool.cpp:180) and compared
+// with a STRICT ">" in TxGraphImpl (txgraph.cpp:2059):
+//
+//	if (total_count > m_max_cluster_count || total_size > m_max_cluster_size)
+//
+// so a 64-transaction cluster is accepted and a 65th transaction is rejected.
+const MaxClusterCount = 64
 
-// ErrClusterTooLarge is returned when a transaction would create a cluster
-// exceeding MaxClusterSize.
-var ErrClusterTooLarge = fmt.Errorf("cluster would exceed maximum size of %d", MaxClusterSize)
+// MaxClusterSize is a legacy alias for MaxClusterCount. Despite the name it has
+// always been a transaction COUNT, never a byte or weight size. Retained so
+// existing callers keep compiling; new code should name what it means —
+// MaxClusterCount for the count cap, MaxClusterSizeWeight for the size cap.
+const MaxClusterSize = MaxClusterCount
+
+// MaxClusterSizeWeight is the maximum total size of a cluster, in WEIGHT units.
+// Core derives it in two steps:
+//
+//	kernel/mempool_limits.h:22  cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1'000
+//	txmempool.cpp:181           max_cluster_size    = cluster_size_vbytes * WITNESS_SCALE_FACTOR
+//
+// = 101 * 1000 * 4 = 404_000 weight units.
+//
+// The per-transaction quantity summed into this total is the UNROUNDED
+// sigop-adjusted weight: txmempool.cpp:1017 feeds
+// GetSigOpsAdjustedWeight(GetTransactionWeight(tx), sigops_cost, nBytesPerSigOp)
+// straight into TxGraph. It is NOT ceil(weight/4) vbytes. Summing per-tx
+// ceilinged vbytes against 101_000 would be systematically STRICTER than Core
+// (because Σ⌈wᵢ/4⌉ ≥ (Σwᵢ)/4, always in the same direction) — up to 48 vB of
+// spurious slack over a 64-transaction cluster. Do not "port" this limit by
+// swapping the constant while still rounding per transaction.
+const MaxClusterSizeWeight int64 = DefaultClusterSizeLimitKvB * vbytesPerKvB * consensus.WitnessScaleFactor
+
+// ErrClusterTooLarge is returned when a transaction would push its cluster past
+// either cluster limit — the transaction count (MaxClusterCount) or the total
+// sigop-adjusted weight (MaxClusterSizeWeight).
+//
+// Core signals both with a single reject token, "too-large-cluster", and an
+// EMPTY debug string (validation.cpp:1024, :1116, :1343, :1521). The sentinel
+// text is therefore exactly that token, and it is deliberately never wrapped
+// with detail so the surfaced reason stays byte-identical to Core's.
+var ErrClusterTooLarge = errors.New("too-large-cluster")
 
 // ============================================================================
 // FeeFrac - Precise fee/size fraction for feerate comparison
@@ -503,6 +539,56 @@ func (g *DepGraph) GetConnectedComponent(todo BitSet, tx int) BitSet {
 	return result
 }
 
+// ComponentAfterRemoval returns the connected component that would contain
+// seeds if every position outside survivors were removed from the graph.
+// Read-only: it does not touch the graph.
+//
+// It deliberately does NOT reuse GetConnectedComponent. That walks the
+// TRANSITIVE Ancestors/Descendants sets, which still contain the to-be-removed
+// transactions' closure, so for a chain A → R → B with R removed it would union
+// A and B into one component. RemoveTransactions rebuilds each survivor's
+// ancestor set from its GetReducedParents edges (cluster.go RemoveTransactions),
+// which leaves A and B genuinely disconnected, and splitCluster then puts them
+// in different clusters. Walking the same reduced-parent edges here reproduces
+// the post-removal component exactly, so a probe built on this agrees with the
+// mutating gate that runs after the removal actually happens.
+func (g *DepGraph) ComponentAfterRemoval(survivors BitSet, seeds []int) BitSet {
+	// Undirected adjacency over direct (reduced-parent) edges, restricted to
+	// survivors. Bounded by MaxClusterCount positions.
+	adj := make(map[int]BitSet, survivors.Count())
+	survivors.ForEach(func(i int) {
+		parents := g.GetReducedParents(i).Intersection(survivors)
+		if parents.None() {
+			return
+		}
+		child := adj[i]
+		adj[i] = child.Union(parents)
+		parents.ForEach(func(p int) {
+			pEdges := adj[p]
+			pEdges.Set(i)
+			adj[p] = pEdges
+		})
+	})
+
+	var frontier BitSet
+	for _, s := range seeds {
+		if survivors.Has(s) {
+			frontier.Set(s)
+		}
+	}
+
+	var result BitSet
+	for frontier.Any() {
+		result = result.Union(frontier)
+		var next BitSet
+		frontier.ForEach(func(i int) {
+			next = next.Union(adj[i])
+		})
+		frontier = next.Intersection(survivors).Difference(result)
+	}
+	return result
+}
+
 // FindConnectedComponent finds a connected component within todo.
 func (g *DepGraph) FindConnectedComponent(todo BitSet) BitSet {
 	if todo.None() {
@@ -881,8 +967,15 @@ func (d FeerateDiagram) feeAtSize(size int64) int64 {
 
 // ClusterManager tracks clusters and provides cluster-based operations.
 type ClusterManager struct {
-	clusters      map[uint64]*Cluster         // clusterID -> Cluster
-	txToCluster   map[wire.Hash256]uint64     // txid -> clusterID
+	clusters    map[uint64]*Cluster     // clusterID -> Cluster
+	txToCluster map[wire.Hash256]uint64 // txid -> clusterID
+	// txAdjWeight is the per-transaction quantity Core sums into a cluster's
+	// size: max(tx_weight, sigops_cost * DEFAULT_BYTES_PER_SIGOP), in WEIGHT
+	// units, unrounded (policy.cpp:390 GetSigOpsAdjustedWeight, as passed to
+	// TxGraph at txmempool.cpp:1017). Kept alongside txToCluster rather than
+	// inside Cluster so it survives merges and splits, which move transactions
+	// between clusters but never change a transaction's own contribution.
+	txAdjWeight   map[wire.Hash256]int64
 	nextClusterID uint64
 }
 
@@ -891,15 +984,174 @@ func NewClusterManager() *ClusterManager {
 	return &ClusterManager{
 		clusters:      make(map[uint64]*Cluster),
 		txToCluster:   make(map[wire.Hash256]uint64),
+		txAdjWeight:   make(map[wire.Hash256]int64),
 		nextClusterID: 1,
 	}
+}
+
+// clusterAdjWeight returns the total sigop-adjusted weight of a cluster: the
+// plain sum of its members' contributions, with NO per-transaction division and
+// NO per-transaction rounding. Mirrors TxGraph's Cluster::GetTotalTxSize()
+// accumulation (txgraph.cpp:2051).
+func (cm *ClusterManager) clusterAdjWeight(c *Cluster) int64 {
+	var total int64
+	for txHash := range c.Transactions {
+		total += cm.txAdjWeight[txHash]
+	}
+	return total
+}
+
+// ClusterSizeWeight returns the total sigop-adjusted weight, in weight units,
+// of the cluster containing txHash, or 0 if the transaction is not clustered.
+// Exposed for tests and diagnostics; the live gate uses clusterAdjWeight.
+func (cm *ClusterManager) ClusterSizeWeight(txHash wire.Hash256) int64 {
+	c := cm.GetCluster(txHash)
+	if c == nil {
+		return 0
+	}
+	return cm.clusterAdjWeight(c)
+}
+
+// ProspectiveCluster returns the (count, weight) the cluster containing a
+// candidate transaction WOULD have if that candidate were admitted, without
+// touching a single byte of ClusterManager state.
+//
+// adjWeight is the candidate's own sigop-adjusted weight contribution;
+// parentTxids are its in-mempool parents. removals is the set of transactions
+// the caller will evict as part of the SAME atomic change — the RBF conflicts
+// and their in-mempool descendants — or nil when there are none.
+//
+// Core models exactly this with a ChangeSet: ReplacementChecks stages the
+// conflicts for removal (validation.cpp:1019) and stages the candidate for
+// addition (validation.cpp:927), both against TxGraph's STAGING level, and
+// CheckMemPoolPolicyLimits then asks IsOversized(Level::TOP)
+// (txmempool.cpp:1072-1080). The removals are therefore already discounted when
+// the limit is evaluated; a probe that ignored them would reject ordinary
+// replacements into a near-full cluster that Core accepts.
+func (cm *ClusterManager) ProspectiveCluster(adjWeight int64, parentTxids []wire.Hash256, removals map[wire.Hash256]bool) (int, int64) {
+	// Group the candidate's surviving in-mempool parents by current cluster.
+	// A cluster with no resolvable parent index still registers (with a nil
+	// index list): txToCluster pointing at a cluster that does not list the
+	// transaction is a bookkeeping bug, and the conservative reading — the
+	// whole cluster merges in — is the one the mutating gate has always taken.
+	parentIndices := make(map[uint64][]int)
+	for _, parentTxid := range parentTxids {
+		if removals[parentTxid] {
+			// The parent is leaving with the same change, so it cannot anchor
+			// the candidate to its cluster. (Core rejects this shape outright
+			// as "bad-txns-spends-conflicting-tx", validation.cpp:1358.)
+			continue
+		}
+		clusterID, ok := cm.txToCluster[parentTxid]
+		if !ok {
+			continue
+		}
+		cluster := cm.clusters[clusterID]
+		if cluster == nil {
+			// Stale txToCluster entry — never deref nil.
+			continue
+		}
+		idxs := parentIndices[clusterID]
+		if idx, ok := cluster.Transactions[parentTxid]; ok {
+			idxs = append(idxs, idx)
+		}
+		parentIndices[clusterID] = idxs
+	}
+
+	totalCount := 1          // the candidate itself
+	totalWeight := adjWeight // the candidate's own contribution
+
+	for clusterID, idxs := range parentIndices {
+		cluster := cm.clusters[clusterID]
+
+		// Fast path — nothing in this cluster is being removed, so the whole
+		// cluster merges in. This is every non-RBF admission.
+		survivors, anyRemoved := cm.survivingPositions(cluster, removals)
+		if !anyRemoved {
+			totalCount += cluster.Size()
+			totalWeight += cm.clusterAdjWeight(cluster)
+			continue
+		}
+
+		// Something in this cluster is going away, which may disconnect it.
+		// Only the component the candidate actually re-anchors to counts, and
+		// that component is defined over DIRECT edges — the same reduced-parent
+		// edges DepGraph.RemoveTransactions rebuilds from and splitCluster then
+		// walks — so this reproduces the post-eviction cluster exactly.
+		//
+		// With no resolvable anchor (the bookkeeping bug above) fall back to
+		// every survivor, which is the largest the component can be.
+		component := survivors
+		if len(idxs) > 0 {
+			component = cluster.DepGraph.ComponentAfterRemoval(survivors, idxs)
+		}
+		for txHash, idx := range cluster.Transactions {
+			if component.Has(idx) {
+				totalCount++
+				totalWeight += cm.txAdjWeight[txHash]
+			}
+		}
+	}
+
+	return totalCount, totalWeight
+}
+
+// CheckLimits is the READ-ONLY cluster gate. It reports whether admitting a
+// candidate would breach either Core cluster limit — the transaction count
+// (MaxClusterCount) or the total sigop-adjusted weight (MaxClusterSizeWeight) —
+// using Core's strict ">" on each axis (txgraph.cpp:2059). It mutates nothing.
+//
+// This exists so the rejection decision can be made BEFORE any mempool state is
+// destroyed. Core's ordering is load-bearing, not incidental:
+// AcceptSingleTransactionInternal runs ReplacementChecks, then
+// CheckMemPoolPolicyLimits and `return Failure` (validation.cpp:1341-1345), and
+// only then FinalizeSubpackage (validation.cpp:1393) — and FinalizeSubpackage is
+// the ONLY place conflicting transactions are actually removed from the pool
+// (validation.cpp:1198-1238). Deciding after the eviction instead turns a
+// cluster-limit rejection into a free eviction primitive: the attacker's
+// transaction is rejected, pays nothing, and the transactions it "replaced" are
+// gone anyway.
+//
+// See ProspectiveCluster for the meaning of the arguments.
+func (cm *ClusterManager) CheckLimits(adjWeight int64, parentTxids []wire.Hash256, removals map[wire.Hash256]bool) error {
+	count, weight := cm.ProspectiveCluster(adjWeight, parentTxids, removals)
+	if count > MaxClusterCount || weight > MaxClusterSizeWeight {
+		return ErrClusterTooLarge
+	}
+	return nil
+}
+
+// survivingPositions returns the cluster's depgraph positions minus the
+// positions of any member listed in removals, plus whether anything was
+// actually dropped. Read-only.
+func (cm *ClusterManager) survivingPositions(c *Cluster, removals map[wire.Hash256]bool) (BitSet, bool) {
+	survivors := c.DepGraph.Positions()
+	if len(removals) == 0 {
+		return survivors, false
+	}
+	anyRemoved := false
+	for txHash, idx := range c.Transactions {
+		if removals[txHash] {
+			survivors.Reset(idx)
+			anyRemoved = true
+		}
+	}
+	return survivors, anyRemoved
 }
 
 // AddTransaction adds a transaction to the appropriate cluster(s).
 // If the transaction has parents in multiple clusters, those clusters are merged.
 // parentTxids are the mempool transaction IDs that this transaction depends on.
 // Returns the cluster the transaction was added to.
-func (cm *ClusterManager) AddTransaction(txHash wire.Hash256, fee int64, size int32, parentTxids []wire.Hash256) (*Cluster, error) {
+// adjWeight is the transaction's own contribution to its cluster's size, in
+// WEIGHT units: max(tx_weight, sigops_cost * DEFAULT_BYTES_PER_SIGOP). See
+// MaxClusterSizeWeight for why this must not be pre-divided into vbytes.
+//
+// This is the MUTATING gate: it still enforces both limits before committing
+// anything, but by the time a caller reaches it the pool may already have been
+// changed. Callers that evict conflicts must run CheckLimits first — see the
+// comment there.
+func (cm *ClusterManager) AddTransaction(txHash wire.Hash256, fee int64, size int32, adjWeight int64, parentTxids []wire.Hash256) (*Cluster, error) {
 	// Find which clusters the parents are in
 	parentClusters := make(map[uint64]bool)
 	parentIndices := make(map[uint64][]int) // clusterID -> parent indices in that cluster
@@ -917,6 +1169,31 @@ func (cm *ClusterManager) AddTransaction(txHash wire.Hash256, fee int64, size in
 				parentIndices[clusterID] = append(parentIndices[clusterID], idx)
 			}
 		}
+	}
+
+	// ---------------------------------------------------------------------
+	// Cluster limit gate. Runs BEFORE any mutation.
+	//
+	// When a transaction joins several parent clusters they are merged into
+	// one, so the resulting cluster is the union of every parent cluster plus
+	// the candidate. Clusters are disjoint (txToCluster is a function), so the
+	// union's count and weight are plain sums over the distinct parent
+	// cluster IDs.
+	//
+	// Core's comparison is STRICT ">" on both axes (txgraph.cpp:2059), applied
+	// to the would-be merged group before it is committed. Evaluating it here,
+	// ahead of mergeClusters, is what makes a rejection side-effect free: the
+	// previous ordering merged first and checked after, and returned the error
+	// without rolling back, so a single rejected transaction permanently fused
+	// its parents' clusters and inflated every later cluster check. It also
+	// guarantees the adds below cannot overflow Cluster.AddTransaction.
+	//
+	// The rule itself lives in CheckLimits so there is exactly one definition
+	// of it. No removals are passed: by the time this runs, any conflicts the
+	// caller intended to evict are already gone from the ClusterManager.
+	// ---------------------------------------------------------------------
+	if err := cm.CheckLimits(adjWeight, parentTxids, nil); err != nil {
+		return nil, err
 	}
 
 	var targetCluster *Cluster
@@ -943,12 +1220,8 @@ func (cm *ClusterManager) AddTransaction(txHash wire.Hash256, fee int64, size in
 		}
 	}
 
-	// Check cluster size before adding
-	if targetCluster.Size() >= MaxClusterSize {
-		return nil, ErrClusterTooLarge
-	}
-
-	// Add the transaction
+	// Add the transaction. The gate above already proved there is room, so
+	// this cannot fail on a limit; a non-nil error here is a bookkeeping bug.
 	fr := FeeFrac{Fee: fee, Size: size}
 	allParentIndices := parentIndices[targetCluster.ID]
 	_, err := targetCluster.AddTransaction(txHash, fr, allParentIndices)
@@ -957,6 +1230,7 @@ func (cm *ClusterManager) AddTransaction(txHash wire.Hash256, fee int64, size in
 	}
 
 	cm.txToCluster[txHash] = targetCluster.ID
+	cm.txAdjWeight[txHash] = adjWeight
 	return targetCluster, nil
 }
 
@@ -1007,10 +1281,13 @@ func (cm *ClusterManager) mergeClusters(clusterIDs map[uint64]bool) *Cluster {
 			if idx >= 0 {
 				cm.txToCluster[txHash] = targetCluster.ID
 			} else {
-				// Tx did not fit into the target cluster — drop its stale
+				// Unreachable now that AddTransaction gates the merged group
+				// before calling mergeClusters, but kept defensively: the tx
+				// did not fit into the target cluster, so drop its stale
 				// mapping so it does not dangle when the source cluster is
 				// deleted below (a dangling entry nil-derefs AddTransaction).
 				delete(cm.txToCluster, txHash)
+				delete(cm.txAdjWeight, txHash)
 			}
 		}
 
@@ -1030,6 +1307,7 @@ func (cm *ClusterManager) RemoveTransaction(txHash wire.Hash256) {
 	}
 
 	delete(cm.txToCluster, txHash)
+	delete(cm.txAdjWeight, txHash)
 	cluster := cm.clusters[clusterID]
 
 	needsSplit := cluster.RemoveTransaction(txHash)
@@ -1141,6 +1419,7 @@ func (cm *ClusterManager) CountDistinctClusters(txids []wire.Hash256) int {
 func (cm *ClusterManager) Clear() {
 	cm.clusters = make(map[uint64]*Cluster)
 	cm.txToCluster = make(map[wire.Hash256]uint64)
+	cm.txAdjWeight = make(map[wire.Hash256]int64)
 }
 
 // ============================================================================

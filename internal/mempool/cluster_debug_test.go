@@ -14,13 +14,13 @@ func TestClusterRemovalDebug(t *testing.T) {
 	hashB := makeTestHash2(2)
 	hashC := makeTestHash2(3)
 
-	cm.AddTransaction(hashA, 1000, 100, nil)
+	cm.AddTransaction(hashA, 1000, 100, 400, nil)
 	t.Logf("After adding A: cluster=%v", cm.txToCluster)
 
-	cm.AddTransaction(hashB, 1000, 100, []wire.Hash256{hashA})
+	cm.AddTransaction(hashB, 1000, 100, 400, []wire.Hash256{hashA})
 	t.Logf("After adding B: cluster=%v", cm.txToCluster)
 
-	cm.AddTransaction(hashC, 1000, 100, []wire.Hash256{hashB})
+	cm.AddTransaction(hashC, 1000, 100, 400, []wire.Hash256{hashB})
 	t.Logf("After adding C: cluster=%v", cm.txToCluster)
 
 	// Check initial cluster
