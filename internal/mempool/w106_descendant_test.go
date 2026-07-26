@@ -377,112 +377,9 @@ func TestW106_G6_CountDescendantsSelfInclusive(t *testing.T) {
 // G7 — checkChainLimitsWithSizeLocked: ancestor count cap
 // ============================================================================
 
-// TestW106_G7_AncestorCountLimit verifies that adding a transaction that would
-// exceed DefaultAncestorLimit (25) is rejected with ErrTooManyAncestors.
-// Core uses > limit semantics; with DefaultAncestorLimit=25 we need 25 in-pool
-// ancestors so that candidate's selfPlusAncestors = 26 > 25.
-func TestW106_G7_AncestorCountLimit(t *testing.T) {
-	const chainLen = DefaultAncestorLimit // seed exactly 25 txs; candidate = 26th
-
-	mp, ops := setupFundedMempool(1)
-	utxos := mp.utxoSet.(*testUTXOSet)
-
-	// Build a linear chain of chainLen transactions in the pool.
-	prevOp := ops[0]
-	var prevHash wire.Hash256
-	prevHash = ops[0].Hash // placeholder; overwritten below
-
-	for i := 0; i < chainLen; i++ {
-		tx := makeTx([]wire.OutPoint{prevOp}, 9_500_000-int64(i)*100, 0xffffffff)
-		txHash := tx.TxHash()
-		entry := &TxEntry{
-			Tx: tx, TxHash: txHash,
-			Fee:  100,
-			Size: 200,
-			AncestorFee:  int64(i+1) * 100,
-			AncestorSize: int64(i+1) * 200,
-			DescendantFee:  100,
-			DescendantSize: 200,
-		}
-		seedEntry(mp, entry)
-		prevHash = txHash
-		prevOp = wire.OutPoint{Hash: txHash, Index: 0}
-		// Add the output to utxoSet so chain resolution works for further additions.
-		utxos.AddUTXO(prevOp, &consensus.UTXOEntry{Amount: 9_500_000 - int64(i)*100 - 100, PkScript: make([]byte, 22), Height: 1})
-	}
-
-	// The candidate would have chainLen in-pool ancestors + self = 26 > 25.
-	candidateTx := makeTx([]wire.OutPoint{prevOp}, 9_400_000, 0xffffffff)
-
-	mp.mu.RLock()
-	err := mp.checkChainLimitsWithSizeLocked(candidateTx, 200)
-	mp.mu.RUnlock()
-
-	if !errors.Is(err, ErrTooManyAncestors) {
-		t.Errorf("G7: expected ErrTooManyAncestors for chain length %d+1, got %v", chainLen, err)
-	}
-
-	_ = prevHash // silence unused warning
-}
-
 // ============================================================================
 // G8 — Descendant count limit enforced
 // ============================================================================
-
-// TestW106_G8_DescendantCountLimit verifies that when adding a new descendant
-// would push a mempool ancestor beyond DefaultDescendantLimit (25), the add
-// is rejected with ErrTooManyDescendants.
-func TestW106_G8_DescendantCountLimit(t *testing.T) {
-	mp, ops := setupFundedMempool(1)
-	utxos := mp.utxoSet.(*testUTXOSet)
-
-	// Root tx.
-	rootTx := makeTx([]wire.OutPoint{ops[0]}, 9_000_000, 0xffffffff)
-	rootEntry := &TxEntry{
-		Tx: rootTx, TxHash: rootTx.TxHash(),
-		Fee: 100, Size: 200,
-		DescendantFee: 100, DescendantSize: 200,
-	}
-	seedEntry(mp, rootEntry)
-	rootOutPoint := wire.OutPoint{Hash: rootEntry.TxHash, Index: 0}
-
-	// Add DefaultDescendantLimit-1 children to root — filling the descendant
-	// budget (root + 24 children = 25, which is the limit).
-	prevTxHash := rootEntry.TxHash
-	prevOp := rootOutPoint
-	for i := 0; i < DefaultDescendantLimit-2; i++ {
-		childTx := makeTx([]wire.OutPoint{prevOp}, 8_000_000-int64(i)*100, 0xffffffff)
-		childHash := childTx.TxHash()
-		childEntry := &TxEntry{
-			Tx: childTx, TxHash: childHash,
-			Fee: 100, Size: 200,
-			DescendantFee: 100, DescendantSize: 200,
-		}
-		seedEntry(mp, childEntry)
-		// Wire SpentBy on prev
-		mp.mu.Lock()
-		if prev, ok := mp.pool[prevTxHash]; ok {
-			prev.SpentBy = append(prev.SpentBy, childHash)
-		}
-		mp.mu.Unlock()
-		prevTxHash = childHash
-		prevOp = wire.OutPoint{Hash: childHash, Index: 0}
-		utxos.AddUTXO(prevOp, &consensus.UTXOEntry{
-			Amount: 8_000_000 - int64(i)*100 - 100, PkScript: make([]byte, 22), Height: 1,
-		})
-	}
-
-	// One more child would push root's descendants to DefaultDescendantLimit+1.
-	overflowTx := makeTx([]wire.OutPoint{prevOp}, 7_000_000, 0xffffffff)
-
-	mp.mu.RLock()
-	err := mp.checkChainLimitsWithSizeLocked(overflowTx, 200)
-	mp.mu.RUnlock()
-
-	if !errors.Is(err, ErrTooManyDescendants) {
-		t.Errorf("G8: expected ErrTooManyDescendants, got %v", err)
-	}
-}
 
 // ============================================================================
 // G9 — BlockConnected: removeSingleTx leaves children dangling
@@ -905,6 +802,7 @@ func seedEntryWithCluster(mp *Mempool, entry *TxEntry, parentTxids []wire.Hash25
 		entry.TxHash,
 		entry.Fee,
 		int32(entry.Size),
+		entry.Size*4,
 		parentTxids,
 	)
 }

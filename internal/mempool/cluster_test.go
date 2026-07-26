@@ -435,7 +435,7 @@ func TestClusterManager(t *testing.T) {
 
 	// Add first transaction (creates new cluster)
 	hashA := makeTestHash(1)
-	clusterA, err := cm.AddTransaction(hashA, 1000, 100, nil)
+	clusterA, err := cm.AddTransaction(hashA, 1000, 100, 400, nil)
 	if err != nil {
 		t.Fatalf("AddTransaction failed: %v", err)
 	}
@@ -445,7 +445,7 @@ func TestClusterManager(t *testing.T) {
 
 	// Add second independent transaction (creates new cluster)
 	hashB := makeTestHash(2)
-	clusterB, err := cm.AddTransaction(hashB, 2000, 100, nil)
+	clusterB, err := cm.AddTransaction(hashB, 2000, 100, 400, nil)
 	if err != nil {
 		t.Fatalf("AddTransaction failed: %v", err)
 	}
@@ -456,7 +456,7 @@ func TestClusterManager(t *testing.T) {
 
 	// Add third transaction that depends on A (joins cluster A)
 	hashC := makeTestHash(3)
-	clusterC, err := cm.AddTransaction(hashC, 500, 50, []wire.Hash256{hashA})
+	clusterC, err := cm.AddTransaction(hashC, 500, 50, 200, []wire.Hash256{hashA})
 	if err != nil {
 		t.Fatalf("AddTransaction failed: %v", err)
 	}
@@ -467,7 +467,7 @@ func TestClusterManager(t *testing.T) {
 
 	// Add fourth transaction that depends on both A and B (merges clusters)
 	hashD := makeTestHash(4)
-	clusterD, err := cm.AddTransaction(hashD, 1500, 100, []wire.Hash256{hashA, hashB})
+	clusterD, err := cm.AddTransaction(hashD, 1500, 100, 400, []wire.Hash256{hashA, hashB})
 	if err != nil {
 		t.Fatalf("AddTransaction failed: %v", err)
 	}
@@ -496,9 +496,9 @@ func TestClusterRemoval(t *testing.T) {
 	hashB := makeTestHash(2)
 	hashC := makeTestHash(3)
 
-	cm.AddTransaction(hashA, 1000, 100, nil)
-	cm.AddTransaction(hashB, 1000, 100, []wire.Hash256{hashA})
-	cm.AddTransaction(hashC, 1000, 100, []wire.Hash256{hashB})
+	cm.AddTransaction(hashA, 1000, 100, 400, nil)
+	cm.AddTransaction(hashB, 1000, 100, 400, []wire.Hash256{hashA})
+	cm.AddTransaction(hashC, 1000, 100, 400, []wire.Hash256{hashB})
 
 	// All should be in same cluster
 	if cm.CountDistinctClusters([]wire.Hash256{hashA, hashB, hashC}) != 1 {
@@ -535,7 +535,7 @@ func TestClusterSizeLimit(t *testing.T) {
 		if i > 0 {
 			parents = []wire.Hash256{lastHash}
 		}
-		_, err := cm.AddTransaction(hash, 1000, 100, parents)
+		_, err := cm.AddTransaction(hash, 1000, 100, 400, parents)
 		if err != nil {
 			t.Fatalf("AddTransaction %d failed: %v", i, err)
 		}
@@ -544,7 +544,7 @@ func TestClusterSizeLimit(t *testing.T) {
 
 	// Try to add one more - should fail
 	hash := makeTestHash(MaxClusterSize + 1)
-	_, err := cm.AddTransaction(hash, 1000, 100, []wire.Hash256{lastHash})
+	_, err := cm.AddTransaction(hash, 1000, 100, 400, []wire.Hash256{lastHash})
 	if err == nil {
 		t.Error("Should reject transaction that would exceed cluster size")
 	}
@@ -558,8 +558,8 @@ func TestMiningChunks(t *testing.T) {
 	hashA := makeTestHash(1)
 	hashB := makeTestHash(2)
 
-	cm.AddTransaction(hashA, 1000, 100, nil) // 10 sat/vB
-	cm.AddTransaction(hashB, 500, 100, nil)  // 5 sat/vB
+	cm.AddTransaction(hashA, 1000, 100, 400, nil) // 10 sat/vB
+	cm.AddTransaction(hashB, 500, 100, 400, nil)  // 5 sat/vB
 
 	chunks := cm.GetChunksForMining()
 
@@ -580,8 +580,8 @@ func TestEvictionChunk(t *testing.T) {
 	hashA := makeTestHash(1)
 	hashB := makeTestHash(2)
 
-	cm.AddTransaction(hashA, 1000, 100, nil) // 10 sat/vB
-	cm.AddTransaction(hashB, 100, 100, nil)  // 1 sat/vB
+	cm.AddTransaction(hashA, 1000, 100, 400, nil) // 10 sat/vB
+	cm.AddTransaction(hashB, 100, 100, 400, nil)  // 1 sat/vB
 
 	cluster, chunk := cm.GetWorstChunkForEviction()
 

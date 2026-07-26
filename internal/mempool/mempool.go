@@ -121,14 +121,12 @@ var (
 	// Core: policy.cpp:188 (CheckSigopsBIP54), reason "bad-txns-nonstandard-inputs".
 	ErrTxLegacySigOpsTooMany = errors.New("non-witness sigops exceed BIP54 limit (2500)")
 
-	// Ancestor/descendant chain limits (Core DEFAULT_ANCESTOR_LIMIT/DEFAULT_DESCENDANT_LIMIT).
-	ErrTooManyAncestors   = errors.New("too many unconfirmed ancestors")
-	ErrTooManyDescendants = errors.New("too many descendants for an unconfirmed parent")
-
-	// Ancestor/descendant size limits in kvB
-	// (Core DEFAULT_ANCESTOR_SIZE_LIMIT_KVB / DEFAULT_DESCENDANT_SIZE_LIMIT_KVB, both 101).
-	ErrAncestorSizeTooLarge   = errors.New("exceeds ancestor size limit")
-	ErrDescendantSizeTooLarge = errors.New("exceeds descendant size limit")
+	// NOTE: ErrTooManyAncestors / ErrTooManyDescendants /
+	// ErrAncestorSizeTooLarge / ErrDescendantSizeTooLarge were removed with the
+	// ancestor/descendant limits themselves. Their Core counterpart reason
+	// string, "too-long-mempool-chain", occurs zero times in Core's source as
+	// of v31. Cluster-limit rejections use ErrClusterTooLarge (cluster.go),
+	// whose text is Core's replacement token "too-large-cluster".
 
 	// BIP-125 Rule 2 (MempoolFullRBF disabled): replacement must not introduce
 	// new unconfirmed inputs that were not already in the original conflicting
@@ -265,45 +263,39 @@ const (
 // Ancestor/descendant/cluster chain limits matching Bitcoin Core
 // (src/policy/policy.h, src/kernel/mempool_limits.h).
 const (
-	// DefaultAncestorLimit is the maximum number of in-mempool ancestors a tx
-	// may have (including itself). Matches Core DEFAULT_ANCESTOR_LIMIT=25
-	// (src/policy/policy.h:76).
+	// DefaultAncestorLimit mirrors Core DEFAULT_ANCESTOR_LIMIT=25
+	// (src/policy/policy.h:76). NOT ENFORCED at mempool admission. Core v31
+	// describes -limitancestorcount as "Deprecated setting ... replaced by
+	// cluster limits (see -limitclustercount) and only used by wallet for coin
+	// selection" (init.cpp:650); the value reaches nothing but getPackageLimits
+	// (node/interfaces.cpp:709-716). Retained for the same wallet/RPC-surface
+	// reason Core retains it.
 	DefaultAncestorLimit = 25
 
-	// DefaultDescendantLimit is the maximum number of in-mempool descendants
-	// a tx may have (including itself). Matches Core DEFAULT_DESCENDANT_LIMIT=25
-	// (src/policy/policy.h:78).
+	// DefaultDescendantLimit mirrors Core DEFAULT_DESCENDANT_LIMIT=25
+	// (src/policy/policy.h:78). NOT ENFORCED at admission — same deprecation as
+	// DefaultAncestorLimit (init.cpp:656).
 	DefaultDescendantLimit = 25
 
-	// DefaultAncestorSizeLimitKvB caps the total virtual size (kvB) of a
-	// transaction's in-mempool ancestor set, including itself. Matches
-	// Core's historical DEFAULT_ANCESTOR_SIZE_LIMIT_KVB = 101. A short chain of
-	// large transactions may respect the count cap and still violate this.
-	DefaultAncestorSizeLimitKvB = 101
-
-	// DefaultDescendantSizeLimitKvB caps the total virtual size (kvB) of
-	// any in-mempool ancestor's descendant set, including itself. Matches
-	// Core's historical DEFAULT_DESCENDANT_SIZE_LIMIT_KVB = 101.
-	DefaultDescendantSizeLimitKvB = 101
-
-	// DefaultClusterSizeLimitKvB is the maximum total virtual size (kvB) of a
-	// cluster. Matches Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101
-	// (src/policy/policy.h:74). The cluster count limit is MaxClusterSize=64
-	// (cluster.go, matching Core DEFAULT_CLUSTER_LIMIT=64, policy.h:72).
+	// DefaultClusterSizeLimitKvB is the maximum total size of a cluster in
+	// virtual kilobytes. Matches Core DEFAULT_CLUSTER_SIZE_LIMIT_KVB=101
+	// (src/policy/policy.h:74) and kernel/mempool_limits.h:22's
+	// cluster_size_vbytes = DEFAULT_CLUSTER_SIZE_LIMIT_KVB * 1'000.
+	//
+	// This is the kvB-denominated form Core reports over RPC as
+	// `limitclustersize` (rpc/mempool.cpp:1062 reports cluster_size_vbytes,
+	// i.e. 101_000 VBYTES). Enforcement, however, happens in WEIGHT units:
+	// txmempool.cpp:181 multiplies by WITNESS_SCALE_FACTOR before handing the
+	// bound to TxGraph. The enforced constant is MaxClusterSizeWeight
+	// (cluster.go) = this value * vbytesPerKvB * 4 = 404_000 WU. The cluster
+	// COUNT limit is MaxClusterCount=64 (cluster.go, Core policy.h:72).
 	DefaultClusterSizeLimitKvB = 101
 
-	// ExtraDescendantTxSizeLimit is the maximum vsize (vbytes) of an extra
-	// descendant that qualifies for the CPFP carve-out exemption. A single
-	// transaction with exactly one in-mempool ancestor and vsize ≤ this value
-	// may enter the mempool even when the descendant count or size limit is
-	// otherwise exceeded. Matches Core EXTRA_DESCENDANT_TX_SIZE_LIMIT=10000
-	// (src/policy/policy.h:90).
-	//
-	// NOTE: Core 27+ dropped the per-tx ancestor/descendant limits in favour
-	// of cluster-based limits (DEFAULT_CLUSTER_LIMIT / DEFAULT_CLUSTER_SIZE_LIMIT_KVB).
-	// The carve-out is therefore deprecated in cluster-mempool mode but the
-	// constant is preserved for documentation and future -limitancestorcount
-	// command-line compatibility.
+	// ExtraDescendantTxSizeLimit mirrors Core EXTRA_DESCENDANT_TX_SIZE_LIMIT
+	// =10000 (src/policy/policy.h:90), the old CPFP carve-out allowance. Core
+	// still declares the constant but no longer references it anywhere, because
+	// the descendant limits the carve-out exempted from no longer exist. Kept
+	// here for the same reason: documentation parity, zero enforcement.
 	ExtraDescendantTxSizeLimit = 10_000
 
 	// vbytesPerKvB is the byte/vbyte conversion factor used by the kvB-
@@ -345,22 +337,16 @@ type Config struct {
 	ChainState ChainState
 
 	// AncestorLimit overrides DefaultAncestorLimit when > 0.
-	// Set to math.MaxInt to disable the ancestor count check (NoLimits mode).
-	// Matches Core -limitancestorcount (src/node/mempool_args.cpp:39).
+	// Matches Core -limitancestorcount (src/node/mempool_args.cpp:39), which
+	// Core v31 marks deprecated: it no longer affects mempool admission and is
+	// read only by wallet coin selection. Accepted here for CLI compatibility
+	// and ignored by the accept path, exactly as in Core.
 	AncestorLimit int
 
 	// DescendantLimit overrides DefaultDescendantLimit when > 0.
-	// Set to math.MaxInt to disable the descendant count check.
-	// Matches Core -limitdescendantcount (src/node/mempool_args.cpp:41).
+	// Matches Core -limitdescendantcount (src/node/mempool_args.cpp:41); same
+	// deprecation and same lack of admission effect as AncestorLimit.
 	DescendantLimit int
-
-	// AncestorSizeLimitKvB overrides DefaultAncestorSizeLimitKvB when > 0.
-	// Set to math.MaxInt to disable the ancestor size check.
-	AncestorSizeLimitKvB int
-
-	// DescendantSizeLimitKvB overrides DefaultDescendantSizeLimitKvB when > 0.
-	// Set to math.MaxInt to disable the descendant size check.
-	DescendantSizeLimitKvB int
 
 	// MempoolFullRBF mirrors Bitcoin Core's `-mempoolfullrbf` flag
 	// (`src/init.cpp`; default `DEFAULT_MEMPOOL_FULL_RBF=true` since v28).
@@ -396,16 +382,18 @@ func DefaultConfig() Config {
 	}
 }
 
-// NoLimitsConfig returns a Config with all chain-length limits disabled.
-// Equivalent to Bitcoin Core's CTxMemPool::Limits::NoLimits()
-// (src/kernel/mempool_limits.h:31). Intended for test-only use — production
-// mempools MUST use default or tighter limits.
+// NoLimitsConfig returns a Config with the deprecated ancestor/descendant
+// count knobs set to their unbounded values, matching Bitcoin Core's
+// CTxMemPool::Limits::NoLimits() (src/kernel/mempool_limits.h:31).
+//
+// NOTE: since Core v31 this no longer relaxes anything at mempool admission —
+// neither Core nor blockbrew consults these values there. The cluster limits
+// (MaxClusterCount / MaxClusterSizeWeight) still apply and are not
+// configurable. Intended for test-only use.
 func NoLimitsConfig() Config {
 	cfg := DefaultConfig()
 	cfg.AncestorLimit = math.MaxInt
 	cfg.DescendantLimit = math.MaxInt
-	cfg.AncestorSizeLimitKvB = math.MaxInt
-	cfg.DescendantSizeLimitKvB = math.MaxInt
 	return cfg
 }
 
@@ -998,14 +986,22 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
 	//
 	// We build a thin UTXOView over mp.lookupOutputLocked so P2SH redeem-script
 	// and witness sigops are counted accurately (requires prevout scriptPubKey).
+	var txSigOpsCost int64
 	{
 		mempoolView := &mempoolUTXOView{mp: mp}
-		txSigOpsCost := consensus.GetTransactionSigOpCost(tx, mempoolView, mp.getConsensusScriptFlags())
+		txSigOpsCost = consensus.GetTransactionSigOpCost(tx, mempoolView, mp.getConsensusScriptFlags())
 		if txSigOpsCost > consensus.MaxStandardTxSigOpsCost {
 			return fmt.Errorf("%w: cost %d > %d",
 				ErrTxSigOpsCostTooHigh, txSigOpsCost, consensus.MaxStandardTxSigOpsCost)
 		}
 	}
+
+	// This transaction's contribution to its cluster's size, in WEIGHT units.
+	// Core: GetSigOpsAdjustedWeight(GetTransactionWeight(tx), sigops_cost,
+	// nBytesPerSigOp) = max(weight, sigops*20), handed to TxGraph unrounded
+	// (policy.cpp:390, txmempool.cpp:1017). Deliberately NOT the ceilinged
+	// `vsize` above — see MaxClusterSizeWeight.
+	clusterAdjWeight := consensus.GetSigOpsAdjustedWeight(weight, txSigOpsCost, consensus.DefaultBytesPerSigOp)
 
 	// Gate 2 — per-P2SH-input redeemScript sigop limit (MAX_P2SH_SIGOPS=15).
 	// For every input spending a P2SH output the redeemScript (last push in
@@ -1235,13 +1231,49 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
 		return err
 	}
 
-	// 10c. Ancestor/descendant count + size limits (Core
-	//      DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT = 25 and
-	//      DEFAULT_{ANCESTOR,DESCENDANT}_SIZE_LIMIT_KVB = 101). Reject
-	//      before mutating cluster/pool state so a rejection is
-	//      side-effect free.
-	if err := mp.checkChainLimitsWithSizeLocked(tx, vsize); err != nil {
-		return err
+	// 10c. Cluster limits — count (MaxClusterCount=64) and total sigop-adjusted
+	//      weight (MaxClusterSizeWeight=404_000 WU), Core's strict ">" on each
+	//      axis (txgraph.cpp:2059), reject token "too-large-cluster".
+	//
+	//      These REPLACE the ancestor/descendant count + size limits that used
+	//      to stand here. Core v31 deleted that enforcement wholesale: the
+	//      surviving DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT are
+	//      documented as "Deprecated ... replaced by cluster limits ... only
+	//      used by wallet for coin selection" (init.cpp:650, :656) and reach
+	//      validation only through getPackageLimits (node/interfaces.cpp:
+	//      709-716); the ancestor/descendant SIZE limits were removed outright
+	//      and "too-long-mempool-chain" no longer occurs anywhere in Core's
+	//      source. TRUC's 2/2 (step 10d) is the only surviving
+	//      ancestor/descendant enforcement.
+	//
+	//      THE POSITION OF THIS GATE IS LOAD-BEARING. It is a READ-ONLY probe
+	//      and it runs BEFORE the RBF conflict eviction at step 11. Core's
+	//      ordering is the same and for the same reason: ReplacementChecks
+	//      stages the conflicts for removal but does not apply them,
+	//      CheckMemPoolPolicyLimits then returns Failure on a breach
+	//      (validation.cpp:1341-1345), and only FinalizeSubpackage — the sole
+	//      place conflicts actually leave the pool (validation.cpp:1198-1238) —
+	//      runs afterwards, at validation.cpp:1393.
+	//
+	//      Deciding this after the eviction instead is a free eviction
+	//      primitive. An attacker builds a cluster just under the cap, and any
+	//      transaction that conflicts with a victim in it gets the victim
+	//      deleted and is then rejected "too-large-cluster" — paying nothing,
+	//      since a rejected transaction is never in the pool and never pays a
+	//      fee. The mutating gate inside ClusterManager.AddTransaction stays as
+	//      a belt-and-braces check after insertion, but it is no longer the
+	//      decision point.
+	//
+	//      The conflicts ARE discounted here, exactly as Core discounts them:
+	//      StageRemoval takes them out of TxGraph's staging level before
+	//      IsOversized is asked (txmempool.cpp:1072-1080). Ignoring them would
+	//      false-reject ordinary replacements into a near-full cluster.
+	{
+		removals := mp.replacementRemovalSetLocked(conflictingTxs)
+		parents := mp.mempoolParentsLocked(tx)
+		if err := mp.clusters.CheckLimits(clusterAdjWeight, parents, removals); err != nil {
+			return err
+		}
 	}
 
 	// 10d. BIP-431 TRUC (version=3) policy checks. Runs before script
@@ -1339,9 +1371,23 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
 	}
 	mp.totalSize += vsize
 
-	// Add to cluster manager
+	// Register with the cluster manager. This enforces both Core cluster limits
+	// again — count (MaxClusterCount=64) and total sigop-adjusted weight
+	// (MaxClusterSizeWeight=404_000 WU), strict ">" on each axis — but it is NO
+	// LONGER the decision point. Step 10c already answered the same question
+	// read-only, against the same cluster minus the same removals, before the
+	// eviction above ran. The two agree by construction: CheckLimits computes
+	// the post-eviction component over the very reduced-parent edges
+	// DepGraph.RemoveTransactions rebuilds from and splitCluster then walks.
+	//
+	// So this is a belt-and-braces assertion, kept because it is the last line
+	// of defence for any future caller that reaches here without probing (and
+	// because the ClusterManager must stay safe on its own terms). Reaching the
+	// error branch means step 10c and the ClusterManager disagreed, which is a
+	// bug — and the unwind below is exactly the eviction-after-decision shape
+	// this wave removed, so it must never fire in practice.
 	parentTxids := entry.Depends
-	_, clusterErr := mp.clusters.AddTransaction(txHash, fee, int32(vsize), parentTxids)
+	_, clusterErr := mp.clusters.AddTransaction(txHash, fee, int32(vsize), clusterAdjWeight, parentTxids)
 	if clusterErr != nil {
 		// Cluster too large - remove the transaction we just added.
 		// SIZELIMIT classifies the bookkeeping unwind for subscribers (Core
@@ -1879,6 +1925,45 @@ func (mp *Mempool) collectAncestorsLocked(txHash wire.Hash256, visited map[wire.
 	return result
 }
 
+// mempoolParentsLocked returns the in-mempool transactions tx spends from, in
+// the same shape TxEntry.Depends carries — one entry per spent output, so a tx
+// spending two outputs of the same parent yields that parent twice. Read-only;
+// exists so the cluster gate can be evaluated before TxEntry is built and
+// before any pool state is touched. Must be called with mu held.
+func (mp *Mempool) mempoolParentsLocked(tx *wire.MsgTx) []wire.Hash256 {
+	var parents []wire.Hash256
+	for _, in := range tx.TxIn {
+		if parentEntry, ok := mp.pool[in.PreviousOutPoint.Hash]; ok {
+			parents = append(parents, parentEntry.TxHash)
+		}
+	}
+	return parents
+}
+
+// replacementRemovalSetLocked returns every transaction that executing the RBF
+// replacement would remove: each direct conflict plus all of its in-mempool
+// descendants. That is precisely what the eviction loop does (one
+// removeWithDescendantsLocked per conflict) and what Core stages for removal in
+// ReplacementChecks, whose GetEntriesForConflicts expands each conflict to its
+// descendant set before StageRemoval (validation.cpp:998, :1019).
+//
+// Returns nil when there are no conflicts, so the common non-RBF path allocates
+// nothing. Read-only. Must be called with mu held.
+func (mp *Mempool) replacementRemovalSetLocked(conflicts map[wire.Hash256]bool) map[wire.Hash256]bool {
+	if len(conflicts) == 0 {
+		return nil
+	}
+	removals := make(map[wire.Hash256]bool, len(conflicts))
+	for conflictHash := range conflicts {
+		removals[conflictHash] = true
+		visited := make(map[wire.Hash256]bool)
+		for _, descHash := range mp.collectDescendantsLocked(conflictHash, visited) {
+			removals[descHash] = true
+		}
+	}
+	return removals
+}
+
 // collectDescendantsLocked collects all descendant transaction hashes.
 // Must be called with mu held.
 func (mp *Mempool) collectDescendantsLocked(txHash wire.Hash256, visited map[wire.Hash256]bool) []wire.Hash256 {
@@ -1963,135 +2048,14 @@ func (mp *Mempool) checkSequenceLocksLocked(tx *wire.MsgTx) error {
 	return nil
 }
 
-// checkChainLimitsLocked enforces ancestor/descendant count + size limits
-// when adding a new transaction. Mirrors Bitcoin Core's
-// CalculateMemPoolAncestors failure path
-// (DEFAULT_ANCESTOR_LIMIT / DEFAULT_DESCENDANT_LIMIT, both 25;
-// DEFAULT_ANCESTOR_SIZE_LIMIT_KVB / DEFAULT_DESCENDANT_SIZE_LIMIT_KVB,
-// both 101 kvB = 101_000 vB).
-//
-// Counts and sizes include the transaction itself (Core's
-// "ancestor count = 1 + parent count" / "descendant count = 1 + child count"
-// semantics). The candidate's vsize is supplied via candidateVSize; when
-// the caller does not yet know it (legacy callers) it may pass 0 and the
-// size cap will be evaluated against ancestors only — count caps still
-// apply. Must be called with mu held.
-func (mp *Mempool) checkChainLimitsLocked(tx *wire.MsgTx) error {
-	return mp.checkChainLimitsWithSizeLocked(tx, 0)
-}
-
-func (mp *Mempool) checkChainLimitsWithSizeLocked(tx *wire.MsgTx, candidateVSize int64) error {
-	// Resolve effective limits: Config fields override defaults when > 0.
-	// math.MaxInt in a Config field disables that check entirely (NoLimits mode).
-	ancestorLimit := DefaultAncestorLimit
-	if mp.config.AncestorLimit > 0 {
-		ancestorLimit = mp.config.AncestorLimit
-	}
-	descendantLimit := DefaultDescendantLimit
-	if mp.config.DescendantLimit > 0 {
-		descendantLimit = mp.config.DescendantLimit
-	}
-	ancestorSizeKvB := DefaultAncestorSizeLimitKvB
-	if mp.config.AncestorSizeLimitKvB > 0 {
-		ancestorSizeKvB = mp.config.AncestorSizeLimitKvB
-	}
-	descendantSizeKvB := DefaultDescendantSizeLimitKvB
-	if mp.config.DescendantSizeLimitKvB > 0 {
-		descendantSizeKvB = mp.config.DescendantSizeLimitKvB
-	}
-
-	// Ancestor limit: candidate + union of ancestor-sets of its mempool parents.
-	// Build the union by visiting each parent, then expanding via Depends.
-	ancestorSet := make(map[wire.Hash256]bool)
-	var addAncestors func(hash wire.Hash256)
-	addAncestors = func(hash wire.Hash256) {
-		if ancestorSet[hash] {
-			return
-		}
-		entry, ok := mp.pool[hash]
-		if !ok {
-			return
-		}
-		ancestorSet[hash] = true
-		for _, parent := range entry.Depends {
-			addAncestors(parent)
-		}
-	}
-	for _, in := range tx.TxIn {
-		addAncestors(in.PreviousOutPoint.Hash)
-	}
-	// |ancestorSet| is the number of distinct in-mempool ancestors. +1 for self.
-	// Matches Core CalculateMemPoolAncestors self-counts-as-ancestor convention.
-	selfPlusAncestors := len(ancestorSet) + 1
-	if selfPlusAncestors > ancestorLimit {
-		return fmt.Errorf("%w: %d > %d", ErrTooManyAncestors,
-			selfPlusAncestors, ancestorLimit)
-	}
-
-	// Ancestor SIZE limit (Core DEFAULT_ANCESTOR_SIZE_LIMIT_KVB, 101 kvB):
-	// sum of vsizes of all ancestors plus the candidate.
-	// Use math.MaxInt64 sentinel when the KvB limit is math.MaxInt (NoLimits mode)
-	// to avoid int64 overflow from int64(math.MaxInt)*1000.
-	var maxAncestorBytes int64
-	if ancestorSizeKvB >= math.MaxInt/vbytesPerKvB {
-		maxAncestorBytes = math.MaxInt64
-	} else {
-		maxAncestorBytes = int64(ancestorSizeKvB) * vbytesPerKvB
-	}
-	var ancestorBytes int64
-	for ancHash := range ancestorSet {
-		if entry, ok := mp.pool[ancHash]; ok {
-			ancestorBytes += entry.Size
-		}
-	}
-	totalAncestorBytes := ancestorBytes + candidateVSize
-	if maxAncestorBytes < math.MaxInt64 && totalAncestorBytes > maxAncestorBytes {
-		return fmt.Errorf("%w: %d vB > %d vB",
-			ErrAncestorSizeTooLarge, totalAncestorBytes, maxAncestorBytes)
-	}
-
-	// Descendant limit: for each in-mempool ancestor of the candidate, adding
-	// the candidate would push that ancestor's descendant-set by one. Core
-	// counts descendants-including-self; the candidate is a new descendant.
-	// Matches Core CalculateMemPoolDescendants recursive walk.
-	var maxDescendantBytes int64
-	if descendantSizeKvB >= math.MaxInt/vbytesPerKvB {
-		maxDescendantBytes = math.MaxInt64
-	} else {
-		maxDescendantBytes = int64(descendantSizeKvB) * vbytesPerKvB
-	}
-	for ancHash := range ancestorSet {
-		descVisited := make(map[wire.Hash256]bool)
-		descs := mp.collectDescendantsLocked(ancHash, descVisited)
-		// descs excludes ancHash itself. After adding candidate, the count
-		// including self becomes len(descs) + 1 (self) + 1 (new candidate).
-		selfPlusDescs := len(descs) + 2
-		if selfPlusDescs > descendantLimit {
-			return fmt.Errorf("%w: ancestor %s would have %d descendants > %d",
-				ErrTooManyDescendants, ancHash, selfPlusDescs,
-				descendantLimit)
-		}
-
-		// Descendant SIZE limit: ancestor.Size + sum(descendant vsizes) + candidate.
-		if maxDescendantBytes < math.MaxInt64 {
-			var descBytes int64
-			if anc, ok := mp.pool[ancHash]; ok {
-				descBytes = anc.Size
-			}
-			for _, dHash := range descs {
-				if d, ok := mp.pool[dHash]; ok {
-					descBytes += d.Size
-				}
-			}
-			descBytes += candidateVSize
-			if descBytes > maxDescendantBytes {
-				return fmt.Errorf("%w: ancestor %s would have descendant size %d vB > %d vB",
-					ErrDescendantSizeTooLarge, ancHash, descBytes, maxDescendantBytes)
-			}
-		}
-	}
-	return nil
-}
+// NOTE: checkChainLimitsLocked / checkChainLimitsWithSizeLocked were removed
+// here. They enforced the pre-v31 ancestor/descendant count (25/25) and size
+// (101 kvB/101 kvB) caps. Core v31 deleted that enforcement entirely in favour
+// of the cluster limits; the ancestor/descendant SIZE constants no longer
+// exist in Core at all, and the count constants survive only as deprecated
+// wallet coin-selection hints (init.cpp:650, :656). The replacement gate lives
+// in ClusterManager.AddTransaction (cluster.go) and is reached from both
+// admission paths: AddTransactionFrom and addTransactionLocked.
 
 // RemoveTransaction removes a transaction and all its descendants from the
 // mempool. The reason classifies the removal for OnTxEvicted subscribers
@@ -4181,10 +4145,9 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 		return 0, 0, err
 	}
 
-	// Ancestor/descendant chain limits (count + size).
-	if err := mp.checkChainLimitsWithSizeLocked(tx, vsize); err != nil {
-		return 0, 0, err
-	}
+	// (removed) Ancestor/descendant chain limits — see the note in
+	// AddTransactionFrom step 10c. Cluster limits replace them, and for this
+	// path they are enforced in addTransactionLocked.
 
 	// BIP-431 TRUC checks (single-tx path, no package context).
 	// Core: SingleTRUCChecks (truc_policy.cpp:171-261).
@@ -4199,6 +4162,23 @@ func (mp *Mempool) validateTransactionLocked(tx *wire.MsgTx, packageMode bool) (
 // Must be called with mu held.
 func (mp *Mempool) addTransactionLocked(tx *wire.MsgTx, fee, vsize int64) error {
 	txHash := tx.TxHash()
+
+	// Cluster contribution, computed before the pool is mutated so the sigop
+	// count is taken against the same view the single-tx path sees.
+	clusterAdjWeight := mp.clusterAdjWeightLocked(tx)
+
+	// Cluster limits, as a READ-ONLY probe, before ANY pool mutation. The
+	// mutating gate further down still runs, but on its own it only rejects
+	// after the entry has been inserted, unwinding through removeSingleTxLocked
+	// — which fires OnTxEvicted(SIZELIMIT) for a transaction subscribers were
+	// never told about, and leaves this path's rejection only as-good-as the
+	// unwind. Core rejects before anything is applied (validation.cpp:1115 for
+	// the package path, before FinalizeSubpackage at :1253). This path has no
+	// conflicts to evict — RBF eviction happens only in AddTransactionFrom — so
+	// there is no removal set to discount.
+	if err := mp.clusters.CheckLimits(clusterAdjWeight, mp.mempoolParentsLocked(tx), nil); err != nil {
+		return err
+	}
 
 	entry := &TxEntry{
 		Tx:             tx,
@@ -4233,7 +4213,35 @@ func (mp *Mempool) addTransactionLocked(tx *wire.MsgTx, fee, vsize int64) error 
 	}
 	mp.totalSize += vsize
 
+	// Register with the cluster manager and enforce the cluster caps. Before
+	// this the package path (submitpackage / 1p1c relay) never touched the
+	// ClusterManager: package members' cluster membership went untracked and
+	// neither cluster cap applied to them. The single-tx path's gate is the
+	// same call, so both admission paths now share one enforcement point.
+	if _, err := mp.clusters.AddTransaction(txHash, fee, int32(vsize), clusterAdjWeight, entry.Depends); err != nil {
+		// Unwind the insertion above; the package rollback only covers the
+		// members added strictly before this one.
+		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonSizeLimit)
+		return err
+	}
+
 	return nil
+}
+
+// clusterAdjWeightLocked returns the per-transaction quantity Core sums into a
+// cluster's size: max(tx_weight, sigops_cost * DEFAULT_BYTES_PER_SIGOP), in
+// WEIGHT units, with no per-transaction division and no per-transaction
+// rounding.
+//
+// Core: GetSigOpsAdjustedWeight (policy/policy.cpp:390) as passed to
+// TxGraph::AddTransaction (txmempool.cpp:1017).
+//
+// Must be called with mp.mu held (uses mempoolUTXOView → lookupOutputLocked).
+func (mp *Mempool) clusterAdjWeightLocked(tx *wire.MsgTx) int64 {
+	weight := consensus.CalcTxWeight(tx)
+	view := &mempoolUTXOView{mp: mp}
+	sigOpCost := consensus.GetTransactionSigOpCost(tx, view, mp.getConsensusScriptFlags())
+	return consensus.GetSigOpsAdjustedWeight(weight, sigOpCost, consensus.DefaultBytesPerSigOp)
 }
 
 // rollbackPackageLocked removes transactions that were added as part of a failed package.
