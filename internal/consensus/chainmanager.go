@@ -2045,6 +2045,16 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 	cm.reorgMu.Lock()
 	defer cm.reorgMu.Unlock()
 
+	return cm.reorgToLocked(newTip)
+}
+
+// reorgToLocked is ReorgTo's body. The caller MUST already hold cm.reorgMu.
+//
+// This split exists so the other chain-rewinding entry points —
+// InvalidateBlock and ReconsiderBlock — can hold cm.reorgMu across their
+// WHOLE operation (see the incident note on InvalidateBlock) and still reorg
+// internally, without deadlocking on Go's non-reentrant mutex.
+func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 	cm.mu.Lock()
 	currentTip := cm.tipNode
 	cm.mu.Unlock()
@@ -2383,6 +2393,36 @@ func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
 		return fmt.Errorf("genesis block cannot be invalidated")
 	}
 
+	// Serialize against every other chain mutator for the WHOLE operation.
+	//
+	// The disconnect loop below releases cm.mu around each DisconnectBlock (it
+	// must — DisconnectBlock takes cm.mu itself). Without cm.reorgMu that
+	// window let the P2P/sync path run a full ReorgTo *into the middle of a
+	// rollback*, because ReorgTo serialises only against other ReorgTo calls
+	// and this loop was not participating.
+	//
+	// That is not hypothetical. genesis-blockbrew, mainnet, 2026-07-27, while
+	// rolling back for a UTXO-set capture:
+	//
+	//   21:59:55 sync: received block height=959908 from 127.0.0.1:8333
+	//   21:59:55 chainmgr: reorg from height 959898 to 959908
+	//            (fork at 959898, disconnect=0 connect=10)
+	//   22:00:11 chainmgr: DisconnectBlock unclean for ... at h=959908
+	//            (BIP-30 aftermath or undo-mismatch)
+	//
+	// InvalidateBlock had walked the tip down to 959898; the sync goroutine
+	// connected 10 blocks on top of the half-rolled-back state. The resulting
+	// UTXO set matched NEITHER tip, the shutdown flush persisted it, and the
+	// node came back with an unrecoverable [CHAINSTATE-CORRUPTION] wedge at
+	// 959906 ("references missing UTXO"). It cost an 83-hour from-genesis
+	// datadir. Note the reorg also connected blocks this call had just marked
+	// invalid, so the invalid-flag filter did not save us either.
+	//
+	// Holding reorgMu here makes rollback and reorg mutually exclusive, which
+	// is the invariant the disconnect loop always assumed it had.
+	cm.reorgMu.Lock()
+	defer cm.reorgMu.Unlock()
+
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
@@ -2432,9 +2472,11 @@ func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
 	// If the new best tip has more work than current tip, reorg to it
 	bestTip := cm.headerIndex.BestTip()
 	if bestTip != nil && !bestTip.Status.IsInvalid() && bestTip.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
-		// Need to activate the best valid chain
+		// Need to activate the best valid chain.
+		// reorgToLocked, not ReorgTo: we already hold cm.reorgMu for the whole
+		// of InvalidateBlock, and Go mutexes are not reentrant.
 		cm.mu.Unlock()
-		err := cm.ReorgTo(bestTip)
+		err := cm.reorgToLocked(bestTip)
 		cm.mu.Lock()
 		if err != nil {
 			log.Printf("chainmgr: failed to reorg to best chain after invalidation: %v", err)
