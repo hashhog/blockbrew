@@ -2072,6 +2072,12 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// bounded thread join).
 	shutdownDone := make(chan struct{})
 	const shutdownDeadline = 30 * time.Second
+
+	// Budget for proving the chain is at rest before the chainstate flush.
+	// Deliberately inside shutdownDeadline so a stuck mutation cannot push the
+	// process past the 30s hard exit — if the chain has not quiesced by then
+	// we skip the flush entirely rather than persist a torn chainstate.
+	const chainQuiesceTimeout = 20 * time.Second
 	watchdog := time.AfterFunc(shutdownDeadline, func() {
 		log.Printf("shutdown deadline (%s) exceeded, forcing exit", shutdownDeadline)
 		// Best-effort DB close so we don't leave the LSM in a corrupt state.
@@ -2155,22 +2161,48 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// h=938360 wedge (and lunarblock's Apr 28 h=938344 wedge).  After
 		// this fix there is no on-disk state where UTXOs reflect height
 		// N+M but chain_tip still says height N.
+		// Before touching the chainstate, prove the chain is AT REST.
+		//
+		// rpcServer.Stop() above does not wait for in-flight handlers — it
+		// returned "context deadline exceeded" on 2026-07-27 while an
+		// invalidateblock rollback was still rewinding, and shutdown flushed
+		// and closed Pebble anyway. That persisted a tip (959906) which did
+		// not match the partially rolled-back UTXO set, and the node came back
+		// with an unrecoverable [CHAINSTATE-CORRUPTION] wedge. An 83-hour
+		// from-genesis datadir was lost.
+		//
+		// Declining to flush is the safe branch: the node replays from the
+		// last atomic flush on restart, so the cost is replay time, never
+		// correctness.
+		chainAtRest := chainMgr.QuiesceForShutdown(chainQuiesceTimeout)
+		if !chainAtRest {
+			log.Printf("WARNING: chain did not quiesce within %s — a chain-mutating "+
+				"operation is STILL IN FLIGHT. SKIPPING the chainstate flush: "+
+				"persisting a tip that disagrees with the in-memory UTXO set is what "+
+				"corrupts the datadir. The node will replay from the last atomic "+
+				"flush on restart.", chainQuiesceTimeout)
+		}
+
 		bestHash, bestHeight := chainMgr.BestBlock()
-		log.Printf("flushing chainstate atomically at height %d", bestHeight)
-		shutBatch := chainDB.NewBatch()
-		if err := utxoSet.FlushBatch(shutBatch); err != nil {
-			log.Printf("Warning: UTXO flush-batch failed: %v", err)
+		if chainAtRest {
+			log.Printf("flushing chainstate atomically at height %d", bestHeight)
 		}
-		if bestHeight > 0 {
-			chainDB.SetChainStateBatch(shutBatch, &storage.ChainState{
-				BestHash:   bestHash,
-				BestHeight: bestHeight,
-			})
-		}
-		if err := shutBatch.Write(); err != nil {
-			log.Printf("Warning: atomic chainstate-flush batch failed: %v", err)
-		} else {
-			log.Printf("Chainstate flushed atomically (UTXO + tip) at height %d", bestHeight)
+		if chainAtRest {
+			shutBatch := chainDB.NewBatch()
+			if err := utxoSet.FlushBatch(shutBatch); err != nil {
+				log.Printf("Warning: UTXO flush-batch failed: %v", err)
+			}
+			if bestHeight > 0 {
+				chainDB.SetChainStateBatch(shutBatch, &storage.ChainState{
+					BestHash:   bestHash,
+					BestHeight: bestHeight,
+				})
+			}
+			if err := shutBatch.Write(); err != nil {
+				log.Printf("Warning: atomic chainstate-flush batch failed: %v", err)
+			} else {
+				log.Printf("Chainstate flushed atomically (UTXO + tip) at height %d", bestHeight)
+			}
 		}
 
 		// Flush + close the flat-file block store BEFORE the Pebble DB.
