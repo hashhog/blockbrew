@@ -892,28 +892,72 @@ func (idx *HeaderIndex) RecalculateBestTip() {
 func (idx *HeaderIndex) recalculateBestTipLocked() {
 	var bestCandidate *BlockNode
 
+	// G3 memo: hasFullData[n] == "n and every ancestor of n has StatusDataStored".
+	//
+	// The G3 check below used to re-walk the whole ancestor chain to genesis for
+	// EVERY node in the index, making this function O(nodes x height). At mainnet
+	// height that is ~960k x ~480k = ~4.6e11 pointer chases on one goroutine, and
+	// it runs while holding idx.mu — and, via ChainManager.InvalidateBlock, cm.mu
+	// as well. The observable effect is a wedged node: invalidateblock/
+	// reconsiderblock never return and block processing stops behind cm.mu.
+	// Measured on genesis-blockbrew (mainnet, tip 959902): still spinning at 100%
+	// of one core 11 minutes in, with no progress.
+	//
+	// Core does not have this problem for two reasons: it iterates only
+	// setBlockIndexCandidates rather than the whole index, and its walk stops as
+	// soon as it reaches a block already on the active chain
+	// (validation.cpp:3131 `while (pindexTest && !m_chain.Contains(pindexTest))`,
+	// commented there as "an optimization, as we know all blocks in it are valid
+	// already"). The doc comment above already claimed to walk "back toward the
+	// active tip"; the code walked to genesis.
+	//
+	// Memoising makes each chain walked at most once, so the pass is O(nodes)
+	// amortised. This is deliberately a pure speedup: the predicate computed is
+	// bit-for-bit the one G1+G3 computed before, so tip SELECTION is unchanged.
+	// A memo (rather than adopting Core's active-chain stop) is what makes that
+	// equivalence provable without reasoning about whether pruned active-chain
+	// blocks retain StatusDataStored.
+	hasFullData := make(map[*BlockNode]bool, len(idx.nodes))
+
+	// fullDataToGenesis walks up from n, caching the verdict for every node on
+	// the path. A walk terminates on one of three conditions: an already-memoised
+	// node (reuse), a node missing data (false for the whole path), or running
+	// past genesis (true for the whole path).
+	fullDataToGenesis := func(n *BlockNode) bool {
+		var path []*BlockNode
+		result := true
+		for cur := n; ; cur = cur.Parent {
+			if cur == nil {
+				// Walked past genesis with data on every link.
+				break
+			}
+			if v, ok := hasFullData[cur]; ok {
+				result = v
+				break
+			}
+			if cur.Status&StatusDataStored == 0 {
+				result = false
+				break
+			}
+			path = append(path, cur)
+		}
+		// Every node on path had data itself and shares cur's ancestry verdict.
+		for _, p := range path {
+			hasFullData[p] = result
+		}
+		return result
+	}
+
 	for _, node := range idx.nodes {
 		// Skip invalid blocks (FAILED_MASK filter — G2, already correct).
 		if node.Status.IsInvalid() {
 			continue
 		}
 
-		// G1: skip candidates that have no block body data stored.
-		if node.Status&StatusDataStored == 0 {
-			continue
-		}
-
-		// G3: walk the ancestor chain to verify BLOCK_HAVE_DATA on every link.
-		// Stop when we reach the genesis node (nil Parent) — genesis always has data.
-		// If any ancestor is missing data, skip this candidate.
-		missingAncestorData := false
-		for anc := node.Parent; anc != nil; anc = anc.Parent {
-			if anc.Status&StatusDataStored == 0 {
-				missingAncestorData = true
-				break
-			}
-		}
-		if missingAncestorData {
+		// G1 (candidate has data) + G3 (every ancestor has data), together.
+		// Note the memo tracks data presence ONLY, never validity, so it is
+		// safe to share entries across nodes reached from invalid candidates.
+		if !fullDataToGenesis(node) {
 			continue
 		}
 
