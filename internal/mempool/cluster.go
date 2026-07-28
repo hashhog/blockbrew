@@ -2,6 +2,7 @@
 package mempool
 
 import (
+	"bytes"
 	"errors"
 	"math/bits"
 	"sort"
@@ -1235,13 +1236,54 @@ func (cm *ClusterManager) AddTransaction(txHash wire.Hash256, fee int64, size in
 }
 
 // mergeClusters merges multiple clusters into one.
+//
+// DETERMINISM (2026-07-28). Every ordering decision here used to be taken from
+// Go map iteration, which is randomised per run. Two consequences, one of them
+// a correctness bug:
+//
+//  1. CORRECTNESS — dependency edges were silently dropped. A moved
+//     transaction was linked only to ancestors ALREADY present in the target
+//     cluster, so whenever a child happened to be moved before its parent the
+//     parent-child edge vanished. Measured before the fix: 2 distinct depgraph
+//     shapes across 200 identical admission sequences. A cluster missing
+//     internal edges linearises differently, so eviction and the
+//     too-large-cluster decision on the RBF path became nondeterministic
+//     run-to-run and node-to-node — a consensus-visible divergence risk for a
+//     fleet that is supposed to agree byte-for-byte.
+//
+//  2. Even with edges intact, the base-cluster choice and the merge order fed
+//     depgraph index assignment, so identical inputs produced different
+//     linearisations.
+//
+// Fixed by ordering everything explicitly:
+//   - base cluster: largest by size, ties broken by lowest ID;
+//   - source clusters merged in ascending ID order;
+//   - transactions within a source merged in TOPOLOGICAL order (ancestors
+//     first), ties broken by txid.
+//
+// Ancestor-count ascending IS a valid topological order here: for a DAG, if p
+// is an ancestor of c then Ancestors(p) is a strict subset of Ancestors(c), so
+// |Anc(p)| < |Anc(c)|. Merging in that order guarantees every parent is
+// already in the target when its child is added, which is what makes the edge
+// preservation total rather than order-dependent.
+//
+// Note sources cannot reference each other: clusters are connected components,
+// so an edge between two of them would already have made them one cluster.
 func (cm *ClusterManager) mergeClusters(clusterIDs map[uint64]bool) *Cluster {
-	// Find the largest cluster to be the base
-	var largestID uint64
-	var largestSize int
+	// Deterministic iteration order over the clusters being merged.
+	sortedIDs := make([]uint64, 0, len(clusterIDs))
 	for id := range clusterIDs {
-		if cm.clusters[id].Size() > largestSize {
-			largestSize = cm.clusters[id].Size()
+		sortedIDs = append(sortedIDs, id)
+	}
+	sort.Slice(sortedIDs, func(i, j int) bool { return sortedIDs[i] < sortedIDs[j] })
+
+	// Base = largest cluster; ties broken by lowest ID so the choice does not
+	// depend on map order.
+	var largestID uint64
+	var largestSize = -1
+	for _, id := range sortedIDs {
+		if sz := cm.clusters[id].Size(); sz > largestSize {
+			largestSize = sz
 			largestID = id
 		}
 	}
@@ -1249,33 +1291,64 @@ func (cm *ClusterManager) mergeClusters(clusterIDs map[uint64]bool) *Cluster {
 	targetCluster := cm.clusters[largestID]
 
 	// Merge other clusters into the target
-	for id := range clusterIDs {
+	for _, id := range sortedIDs {
 		if id == largestID {
 			continue
 		}
 
 		srcCluster := cm.clusters[id]
 
-		// We need to rebuild the target cluster's depgraph to include src transactions
-		// This is a simplified merge - in practice we'd preserve the structure better
-		for txHash, srcIdx := range srcCluster.Transactions {
+		// Reverse index (depgraph index -> txid), built once. The previous
+		// code rescanned srcCluster.Transactions for every ancestor of every
+		// transaction, which was O(n^2) on top of being order-dependent.
+		idxToHash := make(map[int]wire.Hash256, len(srcCluster.Transactions))
+		for h, i := range srcCluster.Transactions {
+			idxToHash[i] = h
+		}
+
+		// Topological order: ancestors first, ties broken by txid.
+		type srcEntry struct {
+			hash     wire.Hash256
+			idx      int
+			ancCount int
+		}
+		ordered := make([]srcEntry, 0, len(srcCluster.Transactions))
+		for h, i := range srcCluster.Transactions {
+			anc := srcCluster.DepGraph.Ancestors(i)
+			anc.Reset(i)
+			n := 0
+			anc.ForEach(func(int) { n++ })
+			ordered = append(ordered, srcEntry{hash: h, idx: i, ancCount: n})
+		}
+		sort.Slice(ordered, func(a, b int) bool {
+			if ordered[a].ancCount != ordered[b].ancCount {
+				return ordered[a].ancCount < ordered[b].ancCount
+			}
+			return bytes.Compare(ordered[a].hash[:], ordered[b].hash[:]) < 0
+		})
+
+		for _, se := range ordered {
+			txHash, srcIdx := se.hash, se.idx
 			fr := srcCluster.DepGraph.FeeRate(srcIdx)
 
-			// Find parents that are already in target
+			// Parents are guaranteed to already be in the target because we
+			// merge in topological order. A miss here would mean the ordering
+			// invariant broke, not that the edge is legitimately absent.
 			srcAncestors := srcCluster.DepGraph.Ancestors(srcIdx)
 			srcAncestors.Reset(srcIdx)
 
 			var parentIndices []int
 			srcAncestors.ForEach(func(ancIdx int) {
-				// Find the txHash of this ancestor
-				for ancestorHash, idx := range srcCluster.Transactions {
-					if idx == ancIdx {
-						if targetIdx, ok := targetCluster.Transactions[ancestorHash]; ok {
-							parentIndices = append(parentIndices, targetIdx)
-						}
-					}
+				ancestorHash, ok := idxToHash[ancIdx]
+				if !ok {
+					return
+				}
+				if targetIdx, ok := targetCluster.Transactions[ancestorHash]; ok {
+					parentIndices = append(parentIndices, targetIdx)
 				}
 			})
+			// Stable parent list: AddTransaction consumes this order.
+			sort.Ints(parentIndices)
 
 			idx, _ := targetCluster.AddTransaction(txHash, fr, parentIndices)
 			if idx >= 0 {

@@ -141,6 +141,14 @@ type ChainManager struct {
 	// without recursive-lock issues).
 	reorgMu sync.Mutex
 
+	// mutationWG counts chain-mutating operations currently in flight, and
+	// quiescing latches once shutdown has begun. Together they let shutdown
+	// prove the chain is at rest BEFORE it flushes chainstate and closes the
+	// DB. See QuiesceForShutdown for why persisting a chainstate while a
+	// mutation is running is unsafe.
+	mutationWG sync.WaitGroup
+	quiescing  atomic.Bool
+
 	// reorgBatch, when non-nil, redirects all per-block persistence writes
 	// inside ConnectBlock / DisconnectBlock into the named batch instead of
 	// committing to disk per-block. Set by ReorgTo for the duration of a
@@ -584,6 +592,11 @@ func (cm *ChainManager) shouldSkipScripts(node *BlockNode) bool {
 
 // ConnectBlock validates and connects a block to the active chain.
 func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
+	if !cm.beginMutation() {
+		return ErrShuttingDown
+	}
+	defer cm.endMutation()
+
 	hash := block.Header.BlockHash()
 	node := cm.headerIndex.GetNode(hash)
 	if node == nil {
@@ -1789,6 +1802,11 @@ func (cm *ChainManager) CurrentReorgBatch() storage.Batch {
 // _mempool-refill-on-reorg-fleet-result-2026-05-05.md) and Bitcoin Core's
 // MaybeUpdateMempoolForReorg in validation.cpp.
 func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
+	if !cm.beginMutation() {
+		return ErrShuttingDown
+	}
+	defer cm.endMutation()
+
 	// disconnectedBlock and disconnectedHeight are captured under the lock
 	// and used to fire the OnBlockDisconnected callback after the lock is
 	// released. Zero values mean "no callback fire" (early-return path).
@@ -2011,6 +2029,70 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	return nil
 }
 
+// ErrShuttingDown is returned by chain-mutating entry points once shutdown has
+// begun. Callers should treat it as "the node is going away", not as a
+// validation failure.
+var ErrShuttingDown = errors.New("chain manager is shutting down")
+
+// beginMutation registers an in-flight chain mutation. It returns false when
+// the node is quiescing for shutdown, in which case the caller MUST return
+// without touching chain state.
+//
+// The flag is re-checked after the Add: QuiesceForShutdown latches the flag
+// before it waits, so a mutation that slipped past the first check but landed
+// after Wait() returned would otherwise escape the barrier entirely.
+func (cm *ChainManager) beginMutation() bool {
+	if cm.quiescing.Load() {
+		return false
+	}
+	cm.mutationWG.Add(1)
+	if cm.quiescing.Load() {
+		cm.mutationWG.Done()
+		return false
+	}
+	return true
+}
+
+// endMutation retires an in-flight chain mutation.
+func (cm *ChainManager) endMutation() { cm.mutationWG.Done() }
+
+// QuiesceForShutdown latches out new chain mutations and waits for in-flight
+// ones to finish. It reports whether the chain reached rest within timeout.
+//
+// A FALSE RETURN MEANS A MUTATION IS STILL RUNNING, AND THE CALLER MUST NOT
+// FLUSH CHAINSTATE. A rollback or reorg caught mid-flight has an in-memory
+// UTXO set and a tip pointer that disagree; persisting that pair produces a
+// chainstate which validates against neither height.
+//
+// That is not a theoretical concern. On 2026-07-27 genesis-blockbrew took
+// SIGTERM while an InvalidateBlock rollback was in flight. Shutdown gave up on
+// the RPC ("RPC server stop error: context deadline exceeded"), flushed
+// "chainstate atomically (UTXO + tip) at height 959906" anyway, and closed
+// Pebble — whereupon the still-running disconnect loop hit the closed DB and
+// died with `fatal error: sync: Unlock of unlocked RWMutex`. The node came
+// back with an unrecoverable [CHAINSTATE-CORRUPTION] wedge and an 83-hour
+// from-genesis datadir was lost.
+//
+// Declining to flush is always the safe branch: blockbrew recovers by
+// replaying from the last atomic flush, so the cost of a false return is
+// replay time, never correctness.
+func (cm *ChainManager) QuiesceForShutdown(timeout time.Duration) bool {
+	cm.quiescing.Store(true)
+
+	done := make(chan struct{})
+	go func() {
+		cm.mutationWG.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
 // ErrReorgTooDeep is returned by ReorgTo when the requested reorg span
 // (disconnect_count + connect_count) exceeds MaxReorgDepth. Splitting a
 // reorg across multiple Pebble commits would forfeit the multi-block
@@ -2037,6 +2119,11 @@ var ErrReorgTooDeep = errors.New("reorg span exceeds MaxReorgDepth")
 // mirror that by parking the batch on cm.reorgBatch and having the per-block
 // helpers read it under cm.mu.
 func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
+	if !cm.beginMutation() {
+		return ErrShuttingDown
+	}
+	defer cm.endMutation()
+
 	// Serialize against any concurrent ReorgTo. Two reorgs would otherwise
 	// share cm.reorgBatch and tangle their writes; the chainstate write at
 	// the end would race and one of the new-tip key chains would land
@@ -2383,6 +2470,11 @@ func (cm *ChainManager) UTXOSet() UpdatableUTXOView {
 // blocks built on top of it, and the best valid chain will be activated.
 // Descendants of the invalid block are marked with StatusInvalidChild.
 func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
+	if !cm.beginMutation() {
+		return ErrShuttingDown
+	}
+	defer cm.endMutation()
+
 	node := cm.headerIndex.GetNode(hash)
 	if node == nil {
 		return fmt.Errorf("block not found")
@@ -2529,6 +2621,11 @@ func (cm *ChainManager) isAncestorOfTip(node *BlockNode) bool {
 // allowing them to be reconsidered for chain selection.
 // This implements the reconsiderblock RPC behavior.
 func (cm *ChainManager) ReconsiderBlock(hash wire.Hash256) error {
+	if !cm.beginMutation() {
+		return ErrShuttingDown
+	}
+	defer cm.endMutation()
+
 	node := cm.headerIndex.GetNode(hash)
 	if node == nil {
 		return fmt.Errorf("block not found")
@@ -2593,6 +2690,11 @@ func (cm *ChainManager) clearDescendantInvalidFlags(node *BlockNode) {
 // This is ephemeral - the preference is lost on restart.
 // Only the last PreciousBlock call matters (new calls override previous).
 func (cm *ChainManager) PreciousBlock(hash wire.Hash256) error {
+	if !cm.beginMutation() {
+		return ErrShuttingDown
+	}
+	defer cm.endMutation()
+
 	node := cm.headerIndex.GetNode(hash)
 	if node == nil {
 		return fmt.Errorf("block not found")
