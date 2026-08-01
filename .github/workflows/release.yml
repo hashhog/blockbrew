@@ -16,12 +16,25 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
+          # darwin targets removed: internal/crypto binds libsecp256k1 via
+          # cgo (ellswift / ECDSA / schnorr), so CGO_ENABLED=0 cross-builds
+          # fail to compile. Re-add with an osxcross toolchain + darwin
+          # libsecp256k1 if desktop releases are needed.
     steps:
       - uses: actions/checkout@v4
+      # Same as ci.yml: Ubuntu's libsecp256k1-dev lacks secp256k1_ellswift.h;
+      # build v0.7.1 from source.
+      - name: Build libsecp256k1 from source
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential autoconf automake libtool pkg-config git
+          git clone --depth 1 --branch v0.7.1 https://github.com/bitcoin-core/secp256k1 /tmp/secp256k1
+          cd /tmp/secp256k1
+          ./autogen.sh
+          ./configure
+          make -j"$(nproc)"
+          sudo make install
+          sudo ldconfig
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

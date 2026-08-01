@@ -343,11 +343,21 @@ func TestPruneFloorConstant(t *testing.T) {
 }
 
 // TestParsePruneFlagAcceptsValid spot-checks that valid -prune values
-// (0 and any value >= 550) are accepted by the in-process binary. We
+// (0, 1 = manual mode, and any value >= 550) are accepted by the
+// in-process binary. We
 // cannot directly call parseFlags() — it uses flag.Parse() with global
 // state and os.Exit on failure — so we shell out to the test binary in
 // a subprocess and check that it accepts the flag without immediately
 // exiting.
+//
+// Note: -prune=1 is VALID — Bitcoin Core's manual prune mode
+// (init.cpp:524 / blockmanager_args.cpp:22: in prune mode, but
+// auto-prune never fires; only the pruneblockchain RPC sweeps). It
+// must carry --version like the other valid cases: without it the
+// binary would start the node and this test would hang until the
+// 10-minute `go test` alarm (CI run 30679650210 did exactly that; the
+// case only ever passed locally because a pre-existing ~/.blockbrew
+// datadir made the child exit non-zero for the wrong reason).
 //
 // Skipped under -short to keep `go test ./...` fast.
 func TestParsePruneFlagAcceptsValid(t *testing.T) {
@@ -367,10 +377,10 @@ func TestParsePruneFlagAcceptsValid(t *testing.T) {
 		wantErr bool
 	}{
 		{"prune zero (archive)", []string{"-prune=0", "--version"}, false},
+		{"prune one MiB (manual mode)", []string{"-prune=1", "--version"}, false},
 		{"prune at floor", []string{"-prune=550", "--version"}, false},
 		{"prune above floor", []string{"-prune=2048", "--version"}, false},
 		{"prune below floor", []string{"-prune=100"}, true},
-		{"prune one MiB", []string{"-prune=1"}, true},
 		{"prune negative", []string{"-prune=-5"}, true},
 	}
 	for _, tt := range tests {

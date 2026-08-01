@@ -56,8 +56,12 @@ func TestHandleMempoolRequest_SmallBatch(t *testing.T) {
 		t.Fatalf("expected 5 inv vectors, got %d", len(invs[0].InvList))
 	}
 	for i, iv := range invs[0].InvList {
-		if iv.Type != InvTypeWitnessTx {
-			t.Errorf("inv[%d].Type = 0x%x, want InvTypeWitnessTx (0x%x)", i, iv.Type, InvTypeWitnessTx)
+		// Legacy (non-wtxidrelay) peer: Core's BIP-35 response is
+		// CInv{MSG_TX, txid} (net_processing.cpp; MSG_WTX=5 is sent only to
+		// wtxid-relay peers). MSG_WITNESS_TX=0x40000001 is a BIP-144 getdata
+		// flag and never appears in inv announcements.
+		if iv.Type != InvTypeTx {
+			t.Errorf("inv[%d].Type = 0x%x, want InvTypeTx (0x%x)", i, iv.Type, InvTypeTx)
 		}
 		if iv.Hash != hashes[i] {
 			t.Errorf("inv[%d].Hash mismatch", i)
