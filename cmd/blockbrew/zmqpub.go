@@ -210,12 +210,22 @@ func (p *zmqPublisher) sendTopic(topic, addr string, body []byte) error {
 // callback. It serialises the block once (if rawblock is enabled) and
 // fans the payload out to hashblock / rawblock / sequence as applicable.
 //
+// Per-tx fan-out: mirroring Core's CZMQNotificationInterface::BlockConnected
+// (zmqnotificationinterface.cpp:180-196), every transaction in the block is
+// first announced on hashtx / rawtx (NotifyTransaction per tx) — no
+// sequence(A) and no mempool_sequence bump, those belong to mempool
+// acceptance only. Without this, pubhashtx subscribers (wallets awaiting
+// confirmation) never see confirmation events and must poll RPC.
+//
 // If serialisation fails the block-connect path is *not* aborted — we
 // log and skip just the rawblock topic, since ZMQ failures must never
 // stall consensus progression.
 func (p *zmqPublisher) PublishBlockConnected(block *wire.MsgBlock, height int32) {
 	if p == nil || p.stopped.Load() {
 		return
+	}
+	for _, tx := range block.Transactions {
+		p.publishTx(tx)
 	}
 	hash := block.Header.BlockHash()
 	if p.cfg.HashBlock != "" {
@@ -245,12 +255,10 @@ func (p *zmqPublisher) PublishBlockConnected(block *wire.MsgBlock, height int32)
 	_ = height
 }
 
-// PublishTxAccepted is the hook for new txs entering the mempool. Serialises
-// the tx once, fans out to hashtx / rawtx / sequence(A).
-func (p *zmqPublisher) PublishTxAccepted(tx *wire.MsgTx) {
-	if p == nil || p.stopped.Load() {
-		return
-	}
+// publishTx fans a single transaction out to hashtx / rawtx (Core's
+// NotifyTransaction). Used for both mempool acceptance and per-tx block
+// connect announcements; sequence framing is the caller's concern.
+func (p *zmqPublisher) publishTx(tx *wire.MsgTx) {
 	hash := tx.TxHash()
 	if p.cfg.HashTx != "" {
 		if err := p.sendTopic(zmqTopicHashTx, p.cfg.HashTx, hash[:]); err != nil {
@@ -265,8 +273,18 @@ func (p *zmqPublisher) PublishTxAccepted(tx *wire.MsgTx) {
 			log.Printf("[zmq] rawtx send failed: %v", err)
 		}
 	}
+}
+
+// PublishTxAccepted is the hook for new txs entering the mempool. Serialises
+// the tx once, fans out to hashtx / rawtx / sequence(A).
+func (p *zmqPublisher) PublishTxAccepted(tx *wire.MsgTx) {
+	if p == nil || p.stopped.Load() {
+		return
+	}
+	p.publishTx(tx)
 	if p.cfg.Sequence != "" {
 		mseq := atomic.AddUint64(&p.mempoolSeq, 1) - 1
+		hash := tx.TxHash()
 		body := make([]byte, 32+1+8)
 		copy(body[:32], hash[:])
 		body[32] = zmqSeqLabelTxAccept

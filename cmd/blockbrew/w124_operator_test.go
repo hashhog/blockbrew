@@ -595,8 +595,26 @@ func TestW124_G_NoNotifyHooks_BUG16(t *testing.T) {
 // G17 — BUG-17: no verifychain RPC / -checkblocks / -checklevel.
 // ────────────────────────────────────────────────────────────────────────
 
-func TestW124_G_NoVerifyChainRPC_BUG17(t *testing.T) {
-	hits := w124Grep(t, "checkblocks\\|checklevel\\|verifychain", "cmd/", "internal/rpc/")
+func TestW124_G_VerifyChainRPC_PRESENT(t *testing.T) {
+	// BUG-17 (verifychain half) is FIXED: internal/rpc/verifychain_methods.go
+	// implements handleVerifyChain as a faithful port of Core
+	// rpc/blockchain.cpp::verifychain -> CVerifyDB::VerifyDB, and server.go
+	// registers the "verifychain" dispatch. Positive regression: the dispatch
+	// case and the handler must both exist.
+	hits := w124Grep(t, `"verifychain"`, "internal/rpc/")
+	if !strings.Contains(hits, `"verifychain"`) {
+		t.Error("verifychain RPC dispatch missing from internal/rpc (BUG-17 regression)")
+	}
+	if !strings.Contains(w124Grep(t, "handleVerifyChain", "internal/rpc/"), "handleVerifyChain") {
+		t.Error("handleVerifyChain handler missing from internal/rpc (BUG-17 regression)")
+	}
+}
+
+// G17b — the -checkblocks / -checklevel startup dials from the original
+// BUG-17 remain unimplemented (VerifyChainstateConsistency depth is still
+// hardcoded to 200 in main.go).
+func TestW124_G_NoCheckBlocksCheckLevelFlags_BUG17(t *testing.T) {
+	hits := w124Grep(t, "checkblocks\\|checklevel", "cmd/")
 	prodHits := []string{}
 	for _, line := range strings.Split(hits, "\n") {
 		if line == "" {
@@ -608,11 +626,11 @@ func TestW124_G_NoVerifyChainRPC_BUG17(t *testing.T) {
 		prodHits = append(prodHits, line)
 	}
 	if len(prodHits) > 0 {
-		t.Fatalf("BUG-17 may be fixed: verifychain refs in production code:\n%s",
+		t.Fatalf("BUG-17 (CLI half) may be fixed: checkblocks/checklevel refs in production code:\n%s",
 			strings.Join(prodHits, "\n"))
 	}
-	t.Skip("BUG-17 (P2 MISSING): VerifyChainstateConsistency depth is hardcoded " +
-		"to 200 (main.go:1115); no operator dial. Core has -checkblocks (default 6), " +
-		"-checklevel (default 3), and the verifychain RPC. blockbrew has none. Fix: " +
-		"add the three knobs, expose verifychain RPC backed by the existing engine.")
+	t.Skip("BUG-17 (P2 PARTIAL): verifychain RPC is implemented, but the " +
+		"-checkblocks (Core default 6) / -checklevel (Core default 3) startup " +
+		"dials are not — VerifyChainstateConsistency depth is hardcoded to 200. " +
+		"Fix: add the two CLI flags and wire them into the startup probe.")
 }

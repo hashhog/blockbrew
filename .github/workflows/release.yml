@@ -16,12 +16,14 @@ jobs:
         include:
           - goos: linux
             goarch: amd64
-          - goos: darwin
-            goarch: amd64
-          - goos: darwin
-            goarch: arm64
+          # darwin targets removed: internal/crypto binds libsecp256k1 via
+          # cgo (ellswift / ECDSA / schnorr), so CGO_ENABLED=0 cross-builds
+          # fail to compile. Re-add with an osxcross toolchain + darwin
+          # libsecp256k1 if desktop releases are needed.
     steps:
       - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libsecp256k1-dev pkg-config
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

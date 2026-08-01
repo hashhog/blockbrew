@@ -1,6 +1,8 @@
 package p2p
 
 import (
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -78,7 +80,9 @@ func TestPeerHandshakeOutbound(t *testing.T) {
 	peer.Disconnect()
 	wg.Wait()
 
-	if serverErr != nil {
+	// A write racing with Disconnect's pipe close (io.ErrClosedPipe) is
+	// benign: the handshake had already completed successfully.
+	if serverErr != nil && !errors.Is(serverErr, io.ErrClosedPipe) {
 		t.Errorf("server error: %v", serverErr)
 	}
 }
@@ -133,7 +137,8 @@ func TestPeerHandshakeInbound(t *testing.T) {
 	peer.Disconnect()
 	wg.Wait()
 
-	if clientErr != nil {
+	// Same Disconnect race as the outbound variant above.
+	if clientErr != nil && !errors.Is(clientErr, io.ErrClosedPipe) {
 		t.Errorf("client error: %v", clientErr)
 	}
 }

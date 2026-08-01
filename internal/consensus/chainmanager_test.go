@@ -895,6 +895,12 @@ func TestPreciousBlock(t *testing.T) {
 		t.Fatalf("failed to add B1 header: %v", err)
 	}
 	db.StoreBlock(blockB1.Header.BlockHash(), blockB1)
+	// Mirror the production invariant: a side-branch body on disk is always
+	// paired with MarkDataStored (P2P: sync.go StoreBlockAt arm; RPC:
+	// handleSubmitBlock side-branch arm) so recalculateBestTipLocked's G1
+	// gate (Core's BLOCK_HAVE_DATA in FindMostWorkChain) admits the node
+	// as a chain-selection candidate.
+	idx.MarkDataStored(blockB1.Header.BlockHash())
 
 	// Currently on chain A (it was connected first)
 	tipHash, _ := cm.BestBlock()

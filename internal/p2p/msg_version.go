@@ -33,7 +33,7 @@ type MsgVersion struct {
 	AddrRecv        NetAddress // Address of receiving node
 	AddrFrom        NetAddress // Address of sending node
 	Nonce           uint64     // Random nonce for detecting self-connections
-	UserAgent       string     // User agent string (e.g., "/blockbrew:0.1.0/")
+	UserAgent       string     // User agent string (e.g., "/blockbrew:1.0.0/")
 	StartHeight     int32      // Best block height of the sender
 	Relay           bool       // Whether to relay transactions (BIP37)
 }
