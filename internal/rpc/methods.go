@@ -1589,7 +1589,7 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 
 	return &NetworkInfo{
 		Version:            250000,
-		SubVersion:         "/blockbrew:0.1.0/",
+		SubVersion:         "/blockbrew:1.0.0/",
 		ProtocolVersion:    70016,
 		LocalServices:      fmt.Sprintf("%016x", localServices),
 		LocalServicesNames: serviceFlagNames(localServices),
@@ -2258,6 +2258,13 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		if err := s.chainDB.StoreBlock(hash, block); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to store block: %v", err)}
 		}
+		// Mirror the P2P arm (sync.go StoreBlockAt → MarkDataStored): the
+		// body is durable, so set StatusDataStored (Core's BLOCK_HAVE_DATA,
+		// set by ReceivedBlockTransactions in AcceptBlock) on the in-memory
+		// node. Without this, recalculateBestTipLocked's G1 gate skips the
+		// node forever and preciousblock / post-invalidate tip recalculation
+		// can never select an RPC-submitted side branch.
+		s.headerIndex.MarkDataStored(hash)
 	}
 
 	// Add header to index before connecting (ignore duplicate — headers may

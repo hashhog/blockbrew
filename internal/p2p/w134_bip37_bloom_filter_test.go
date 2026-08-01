@@ -532,8 +532,7 @@ func TestW134_G30a_PeerStructHasNoBloomState(t *testing.T) {
 	// suggests bloom-filter state.  This is a structural guard; a
 	// future implementation could add one and break this test
 	// (which is fine — flip to a positive check at that time).
-	var p Peer
-	tp := reflect.TypeOf(p)
+	tp := reflect.TypeOf((*Peer)(nil)).Elem()
 	for i := 0; i < tp.NumField(); i++ {
 		name := tp.Field(i).Name
 		lower := []byte(name)

@@ -215,35 +215,56 @@ func TestW141_A6_NoMempoolRemovalFanOut_BUG5(t *testing.T) {
 		"from every removeSingleTxLocked(...) call site in internal/mempool.")
 }
 
-// G_A7 BUG-6 — no per-tx fan-out on block connect (Core fires hashtx/rawtx for each).
-func TestW141_A7_NoPerTxFanOutOnBlockConnect_BUG6(t *testing.T) {
-	src := w141ReadFile(t, "cmd/blockbrew/main.go")
-	// At the onBlockConnected hook (~line 1076), confirm there's a call to
-	// zmqPub.PublishBlockConnected but NO loop over block.Transactions calling
-	// per-tx publish.
-	idx := strings.Index(src, "zmqPub.PublishBlockConnected(block, height)")
-	if idx < 0 {
-		t.Fatalf("PublishBlockConnected wire site moved; re-audit")
+// G_A7 BUG-6 — FIXED: per-tx fan-out on block connect is present. Core
+// zmqnotificationinterface.cpp:180-196 iterates pblock->vtx and fires
+// NotifyTransaction (hashtx + rawtx) for each confirmed tx before the
+// block-level topics. Positive regression: zmqpub.go's
+// PublishBlockConnected must loop block.Transactions calling publishTx,
+// and publishTx must send hashtx + rawtx (no sequence(A) — that stays
+// exclusive to PublishTxAccepted).
+func TestW141_A7_PerTxFanOutOnBlockConnect_PRESENT(t *testing.T) {
+	src := w141ReadFile(t, "cmd/blockbrew/zmqpub.go")
+
+	// The per-tx loop must live inside PublishBlockConnected.
+	fnIdx := strings.Index(src, "func (p *zmqPublisher) PublishBlockConnected")
+	if fnIdx < 0 {
+		t.Fatal("PublishBlockConnected not found in zmqpub.go")
 	}
-	// Check immediate vicinity.
-	region := src[idx:]
-	if len(region) > 1500 {
-		region = region[:1500]
+	endIdx := strings.Index(src[fnIdx:], "\nfunc ")
+	if endIdx < 0 {
+		t.Fatal("PublishBlockConnected appears to be the last func; unexpected")
 	}
-	// A future fix would add a tx loop near the block-connect callback.
-	if strings.Contains(region, "PublishTxConfirmedInBlock") ||
-		strings.Contains(region, "for _, tx := range block.Transactions") &&
-			strings.Contains(region, "zmqPub.Publish") {
-		t.Fatalf("BUG-6 may be fixed: per-tx ZMQ fan-out detected near block-connect")
+	body := src[fnIdx : fnIdx+endIdx]
+	if !strings.Contains(body, "for _, tx := range block.Transactions") {
+		t.Error("PublishBlockConnected does not iterate block.Transactions — " +
+			"BUG-6 regression: per-tx fan-out missing")
 	}
-	t.Skip("BUG-6 (P1 MISSING): cmd/blockbrew/main.go:1076-1079 calls only " +
-		"PublishBlockConnected; Core zmqnotificationinterface.cpp:180-196 also " +
-		"iterates pblock->vtx and fires hashtx + rawtx for each confirmed tx. " +
-		"Confirmation events never reach pubhashtx subscribers, so wallets " +
-		"awaiting confirmation must fall back to RPC polling. Fix: in the " +
-		"connect-block callback loop block.Transactions and call " +
-		"PublishTxConfirmedInBlock(tx) (hashtx + rawtx only — no sequence(A), no " +
-		"mempool_sequence bump).")
+	if !strings.Contains(body, "publishTx(tx)") {
+		t.Error("PublishBlockConnected tx loop does not call publishTx(tx)")
+	}
+	// The tx loop must come before the block-level hashblock send (Core
+	// order: NotifyTransaction per tx, then NotifyBlockConnect).
+	if strings.Index(body, "block.Transactions") > strings.Index(body, "zmqTopicHashBlock") {
+		t.Error("per-tx fan-out must precede block-level topics (Core order)")
+	}
+
+	// publishTx must cover hashtx + rawtx and nothing sequence-shaped.
+	txIdx := strings.Index(src, "func (p *zmqPublisher) publishTx")
+	if txIdx < 0 {
+		t.Fatal("publishTx helper not found in zmqpub.go")
+	}
+	txEnd := strings.Index(src[txIdx:], "\nfunc ")
+	if txEnd < 0 {
+		t.Fatal("publishTx appears to be the last func; unexpected")
+	}
+	txBody := src[txIdx : txIdx+txEnd]
+	if !strings.Contains(txBody, "zmqTopicHashTx") || !strings.Contains(txBody, "zmqTopicRawTx") {
+		t.Error("publishTx must send both hashtx and rawtx")
+	}
+	if strings.Contains(txBody, "zmqTopicSequence") || strings.Contains(txBody, "mempoolSeq") {
+		t.Error("publishTx must not emit sequence(A) / bump mempool_seq — " +
+			"block-connect txs are confirmations, not mempool acceptances")
+	}
 }
 
 // G_A8 BUG-7 — no IBD gating on UpdatedBlockTip / PublishBlockConnected.
