@@ -1564,7 +1564,34 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// so a fresh announcement can be re-requested if this one is later
 		// evicted (rather than waiting out txInflightExpiry).
 		syncMgr.NotifyTxReceived(txHash, wtxHash)
+		// AcceptToMemoryPool succeeded, but the entry can ALREADY BE GONE by the
+		// time we look it up: another goroutine may have evicted it for size,
+		// replaced it via RBF, or expired it between the accept and this read.
+		// mp.GetEntry therefore returns nil on a live node under load, and every
+		// use of `entry` below must be inside the nil guard.
+		//
+		// It was not. The log at the end of this handler dereferenced
+		// entry.Fee/entry.Size OUTSIDE the guard, five lines after the code had
+		// already established the value can be nil. On mainnet that crashed the
+		// node roughly every 40 minutes:
+		//
+		//   panic: runtime error: invalid memory address or nil pointer dereference
+		//   [signal SIGSEGV: code=0x1 addr=0x28]
+		//   main.run.func7(...)  cmd/blockbrew/main.go:1580
+		//   p2p.(*Peer).handleMessage  internal/p2p/peer.go:785
+		//   p2p.(*Peer).readHandler    internal/p2p/peer.go:678
+		//
+		// 86 panics were recorded in a single day (systemd NRestarts=37 on the
+		// live unit) and it went unnoticed because the restart is fast enough
+		// that the node reports "active" and at-tip between crashes.
 		entry := mp.GetEntry(txHash)
+
+		// ZMQ fan-out: hashtx / rawtx / sequence(A). Cheap no-op when no
+		// -zmqpub* endpoint is configured. Independent of the entry lookup —
+		// the transaction was accepted, so subscribers should hear about it
+		// whether or not it survived long enough for us to read it back.
+		zmqPub.PublishTxAccepted(msg.Tx)
+
 		if entry != nil {
 			peerMgr.RelayTransaction(txHash, wtxHash, entry.Fee, entry.Size, peer.Address())
 			// FIX-47 BUG-21: wire FeeEstimator.RegisterTransaction so the tx
@@ -1572,12 +1599,15 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			// (same unit as FeeEstimator).  entry.Height is the chain height
 			// at which the tx entered the mempool.
 			feeEstimator.RegisterTransaction(txHash, entry.FeeRate, entry.Height)
+			log.Printf("[mempool] Accepted tx %s from %s (fee: %d, size: %d)",
+				txHash, peer.Address(), entry.Fee, entry.Size)
+		} else {
+			// Accepted then immediately gone. Worth a line — a high rate here
+			// means the mempool is thrashing — but it must not carry fee/size,
+			// because there is no entry to read them from.
+			log.Printf("[mempool] Accepted tx %s from %s (evicted before readback)",
+				txHash, peer.Address())
 		}
-		// ZMQ fan-out: hashtx / rawtx / sequence(A). Cheap no-op
-		// when no -zmqpub* endpoint is configured.
-		zmqPub.PublishTxAccepted(msg.Tx)
-		log.Printf("[mempool] Accepted tx %s from %s (fee: %d, size: %d)",
-			txHash, peer.Address(), entry.Fee, entry.Size)
 	}
 
 	// BIP35 "mempool" handler: peer requests our mempool contents → respond
