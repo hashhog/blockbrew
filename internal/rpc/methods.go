@@ -2255,6 +2255,42 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 				return bip22ResultString(werr), nil
 			}
 		}
+
+		// bad-version gate on the side-branch store path.
+		//
+		// Core runs the block-version rules inside ContextualCheckBlockHeader
+		// (validation.cpp:4112-4118) for EVERY header, so a v3 block past the
+		// BIP65/CLTV height is rejected before it can be stored at all.
+		// blockbrew instead enforces version in CheckBlockContext at
+		// block-connect time, and AddHeader deliberately passes
+		// checkVersion=false (headerindex.go:430-432). That is fine for a block
+		// that will be connected — but a side-branch block is stored and
+		// answered "inconclusive" WITHOUT ever connecting, so the gate never
+		// runs and blockbrew keeps a block Core rejects outright.
+		//
+		// Found by the full corpus sweep, 2026-08-02: entry
+		// submitblock-sidebranch/bad-version-v3, Core
+		// reject:bad-version(0x00000003) vs blockbrew "inconclusive"
+		// (receipts/corpus-sweep-2026-08-02.md). ouroboros had the same class
+		// of gap on its own side-branch path.
+		//
+		// Only the store path is changed; the active-tip arm still reaches
+		// CheckBlockContext as before, and the P2P header path is untouched.
+		// The reason string is built here rather than routed through
+		// bip22ResultString because Core embeds the offending version inline —
+		// strprintf("bad-version(0x%08x)", block.nVersion) at
+		// validation.cpp:4116 — so it cannot be a fixed token. Routing it
+		// through the mapper would reject correctly but report the generic
+		// "rejected", turning a fixed consensus split into a pointless
+		// error-code divergence.
+		if hdrNode != nil {
+			if verr := consensus.CheckBlockHeaderVersion(
+				block.Header.Version, hdrNode.Height, s.chainParams,
+			); verr != nil {
+				return fmt.Sprintf("bad-version(0x%08x)",
+					uint32(block.Header.Version)), nil
+			}
+		}
 		if err := s.chainDB.StoreBlock(hash, block); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to store block: %v", err)}
 		}
