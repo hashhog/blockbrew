@@ -2066,6 +2066,21 @@ func bip22ResultString(err error) string {
 	// Coinbase scriptSig length (consensus/tx_check.cpp:49 — 2..100 bytes)
 	case errors.Is(err, consensus.ErrCoinbaseScriptSize):
 		return "bad-cb-length"
+	// First transaction is not a coinbase. Core CheckBlock
+	// (validation.cpp:3952) emits "bad-cb-missing" / "first tx is not
+	// coinbase". This arm was absent, so the error fell through to the
+	// generic "rejected" default.
+	//
+	// Found by the 2026-08-02 corpus sweep, entry F-coinbase-prevout-nonnull:
+	// a coinbase whose prevout is non-null fails IsCoinBase(), so Core reports
+	// bad-cb-missing. SEVEN of ten impls answered the generic form on this
+	// entry — only beamchain and rustoshi were correct — so this is a shared
+	// gap, not a blockbrew quirk.
+	//
+	// Decision is unchanged (the block is rejected either way): R2
+	// reason-code parity, not a chain-split fix.
+	case errors.Is(err, consensus.ErrFirstTxNotCoinbase):
+		return "bad-cb-missing"
 	// Coinbase value / subsidy
 	case errors.Is(err, consensus.ErrBadCoinbaseValue):
 		return "bad-cb-amount"
