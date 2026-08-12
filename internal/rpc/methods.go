@@ -2053,10 +2053,25 @@ func bip22ResultString(err error) string {
 	// Merkle root
 	case errors.Is(err, consensus.ErrBadMerkleRoot):
 		return "bad-txnmrklroot"
-	// Witness commitment (BIP-141)
-	case errors.Is(err, consensus.ErrBadWitnessCommitment),
-		errors.Is(err, consensus.ErrMissingWitnessCommitment):
+	// Witness commitment hash mismatch (BIP-141). Core CheckWitnessMalleation
+	// validation.cpp:3896: "bad-witness-merkle-match". (A block with witness
+	// data but NO commitment output is ErrUnexpectedWitnessInBlock below, not
+	// this — Core has no missing-commitment reason.)
+	case errors.Is(err, consensus.ErrBadWitnessCommitment):
 		return "bad-witness-merkle-match"
+	// Witness reserved value shape: coinbase scriptWitness must be exactly one
+	// 32-byte stack element, checked BEFORE the commitment-hash compare.
+	// Core CheckWitnessMalleation validation.cpp:3883: "bad-witness-nonce-size".
+	// This arm was absent, so corpus entry C7-reserved-nonce-31-bytes fell
+	// through to the generic "rejected".
+	case errors.Is(err, consensus.ErrBadWitnessNonceSize):
+		return "bad-witness-nonce-size"
+	// Witness data present in a block that does not commit to witness data
+	// (no commitment output post-segwit, or any witness pre-segwit).
+	// Core CheckWitnessMalleation validation.cpp:3910: "unexpected-witness"
+	// (corpus entries C2-witness-tx-no-commitment / C10-commitment-truncated-37b).
+	case errors.Is(err, consensus.ErrUnexpectedWitnessInBlock):
+		return "unexpected-witness"
 	// Negative output value (consensus/tx_check.cpp::CheckTransaction — Core parity)
 	case errors.Is(err, consensus.ErrNegativeOutput):
 		return "bad-txns-vout-negative"
@@ -2081,6 +2096,12 @@ func bip22ResultString(err error) string {
 	// reason-code parity, not a chain-split fix.
 	case errors.Is(err, consensus.ErrFirstTxNotCoinbase):
 		return "bad-cb-missing"
+	// More than one coinbase in the block. Core CheckBlock validation.cpp:3955
+	// emits "bad-cb-multiple" / "more than one coinbase". This arm was absent,
+	// so corpus entries A5-two-coinbases / A6-coinbase-at-index2 fell through
+	// to the generic "rejected". Decision unchanged; reason-code parity only.
+	case errors.Is(err, consensus.ErrMultipleCoinbase):
+		return "bad-cb-multiple"
 	// Coinbase value / subsidy
 	case errors.Is(err, consensus.ErrBadCoinbaseValue):
 		return "bad-cb-amount"
@@ -2089,7 +2110,12 @@ func bip22ResultString(err error) string {
 		return "bad-blk-sigops"
 	// Block size gate (non-witness size × WITNESS_SCALE_FACTOR > MAX_BLOCK_WEIGHT).
 	// Core CheckBlock validation.cpp:3948: state.Invalid(..., "bad-blk-length").
-	case errors.Is(err, consensus.ErrBlockLengthTooHigh):
+	// An EMPTY block (zero transactions) is part of the SAME Core check —
+	// "block.vtx.empty() || ... size limits failed" — so ErrNoTransactions maps
+	// to bad-blk-length too (corpus entry A2-empty-block; previously fell
+	// through to the generic "rejected").
+	case errors.Is(err, consensus.ErrBlockLengthTooHigh),
+		errors.Is(err, consensus.ErrNoTransactions):
 		return "bad-blk-length"
 	// Witness-inclusive block weight gate (GetBlockWeight > MAX_BLOCK_WEIGHT).
 	// Core ContextualCheckBlock validation.cpp:4180: state.Invalid(..., "bad-blk-weight").

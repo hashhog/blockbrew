@@ -1841,9 +1841,13 @@ func TestBIP22ResultString(t *testing.T) {
 		{consensus.ErrBadDifficulty, "bad-diffbits"},
 		// Merkle root
 		{consensus.ErrBadMerkleRoot, "bad-txnmrklroot"},
-		// Witness commitment
+		// Witness commitment / malleation (Core CheckWitnessMalleation,
+		// validation.cpp:3880-3913): nonce-size checked before the hash
+		// compare; witness data without a commitment is unexpected-witness
+		// (Core has no missing-commitment reason).
 		{consensus.ErrBadWitnessCommitment, "bad-witness-merkle-match"},
-		{consensus.ErrMissingWitnessCommitment, "bad-witness-merkle-match"},
+		{consensus.ErrBadWitnessNonceSize, "bad-witness-nonce-size"},
+		{consensus.ErrUnexpectedWitnessInBlock, "unexpected-witness"},
 		// Coinbase value
 		{consensus.ErrBadCoinbaseValue, "bad-cb-amount"},
 		// Sigops
@@ -1888,8 +1892,13 @@ func TestBIP22ResultString(t *testing.T) {
 		// (validation.cpp:3952). Mapper arm added 2026-08-02; this expectation
 		// was left stale at "rejected".
 		{consensus.ErrFirstTxNotCoinbase, "bad-cb-missing"},
-		// Catch-all
-		{consensus.ErrNoTransactions, "rejected"},
+		// More than one coinbase — Core CheckBlock "bad-cb-multiple"
+		// (validation.cpp:3955).
+		{consensus.ErrMultipleCoinbase, "bad-cb-multiple"},
+		// Empty block — part of Core's size-limits check ("block.vtx.empty()
+		// || ..."), so it reports "bad-blk-length" (validation.cpp:3948),
+		// not a generic rejection.
+		{consensus.ErrNoTransactions, "bad-blk-length"},
 	}
 
 	for _, tc := range tests {
