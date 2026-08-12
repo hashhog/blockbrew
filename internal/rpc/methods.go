@@ -2098,10 +2098,40 @@ func bip22ResultString(err error) string {
 	// Missing or already-spent prevout (ConnectBlock input check, CVE-2012-2459 path)
 	case errors.Is(err, consensus.ErrMissingInput):
 		return "bad-txns-inputs-missingorspent"
-	// Duplicate tx within block (BIP-30)
+	// Empty output vector (CheckTransaction vout.empty()).
+	// Core consensus/tx_check.cpp:17: state.Invalid(..., "bad-txns-vout-empty").
+	// This fires before the coinbase-specific scriptSig-length check, so a
+	// coinbase with an empty vout also reports bad-txns-vout-empty (corpus
+	// entries coinbase-empty-vout / empty-vout).
+	case errors.Is(err, consensus.ErrNoOutputs):
+		return "bad-txns-vout-empty"
+	// Empty input vector (CheckTransaction vin.empty()).
+	// Core consensus/tx_check.cpp:15: state.Invalid(..., "bad-txns-vin-empty").
+	case errors.Is(err, consensus.ErrNoInputs):
+		return "bad-txns-vin-empty"
+	// Duplicate inputs within one transaction (same outpoint spent twice).
+	// Core consensus/tx_check.cpp:44: state.Invalid(..., "bad-txns-inputs-duplicate").
+	// Distinct from BIP-30 (ErrDuplicateTx) below: this is CheckTransaction's
+	// intra-tx dup-vin gate, not ConnectBlock's dup-txid-over-UTXO gate
+	// (corpus entry dup-inputs-within-tx).
+	case errors.Is(err, consensus.ErrDuplicateInput):
+		return "bad-txns-inputs-duplicate"
+	// Non-coinbase transaction with a null prevout.
+	// Core consensus/tx_check.cpp:56: state.Invalid(..., "bad-txns-prevout-null").
+	case errors.Is(err, consensus.ErrNullInput):
+		return "bad-txns-prevout-null"
+	// BIP-30 duplicate txid: a transaction whose txid collides with an
+	// existing unspent output (would overwrite a live UTXO). Core ConnectBlock
+	// validation.cpp:2471: state.Invalid(..., "bad-txns-BIP30"). blockbrew's
+	// ErrDuplicateTx/ErrDuplicateCoinbase are raised only from CheckBIP30
+	// (blockvalidation.go), so they map to the BIP30 token — NOT the merkle
+	// CVE-2012-2459 dup case, which is ErrBlockMutated (corpus entry
+	// bip30-duplicate-txid). Previously reported the generic
+	// "bad-txns-duplicate" (CheckTransaction's dup-vin token), which is the
+	// wrong stage.
 	case errors.Is(err, consensus.ErrDuplicateTx),
 		errors.Is(err, consensus.ErrDuplicateCoinbase):
-		return "bad-txns-duplicate"
+		return "bad-txns-BIP30"
 	// BIP-34 coinbase height encoding
 	case errors.Is(err, consensus.ErrBadBIP34Height):
 		return "bad-cb-height"
@@ -2146,6 +2176,25 @@ func bip22ResultString(err error) string {
 		}
 		return "rejected"
 	}
+}
+
+// bip22ResultStringForBlock is bip22ResultString extended with the reject
+// reasons that embed a field taken from the block itself. Core's
+// ContextualCheckBlockHeader emits strprintf("bad-version(0x%08x)",
+// block.nVersion) (validation.cpp:4116) for the mandatory-version-bump gate
+// (buried BIP34/66/65), so that rejection carries the offending nVersion inline
+// and cannot be a fixed token. blockbrew enforces the same gate in
+// CheckBlockContext (ErrBlockVersionTooLow); routing the connect/active-tip
+// reject path through this helper produces the exact bad-version(0x%08x) form
+// instead of the generic "rejected". The %08x is on the UNSIGNED reinterpret of
+// the int32 nVersion, so high-bit (0x80000000) and -1 (0xffffffff) print
+// correctly. The side-branch store path already formats this directly (see
+// handleSubmitBlock); this keeps the two paths byte-identical.
+func bip22ResultStringForBlock(block *wire.MsgBlock, err error) string {
+	if errors.Is(err, consensus.ErrBlockVersionTooLow) {
+		return fmt.Sprintf("bad-version(0x%08x)", uint32(block.Header.Version))
+	}
+	return bip22ResultString(err)
 }
 
 func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, rpcErr *RPCError) {
@@ -2209,7 +2258,7 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	// CheckBlockSanity covers PoW, merkle root, weight, sigops, etc.
 	// Failures are mapped to BIP-22 result strings (not RPC errors) per spec.
 	if err := consensus.CheckBlockSanity(block, s.chainParams.PowLimit); err != nil {
-		return bip22ResultString(err), nil
+		return bip22ResultStringForBlock(block, err), nil
 	}
 
 	// Add header to index.
@@ -2223,7 +2272,7 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		if errors.Is(err, consensus.ErrDuplicateHeader) {
 			return "duplicate", nil
 		}
-		return bip22ResultString(err), nil
+		return bip22ResultStringForBlock(block, err), nil
 	}
 
 	// Active-tip vs side-branch discrimination (mirrors the P2P
@@ -2315,7 +2364,7 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	// already be present from P2P header sync).
 	if s.chainMgr != nil {
 		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header, false); err != nil && !errors.Is(err, consensus.ErrDuplicateHeader) {
-			return bip22ResultString(err), nil
+			return bip22ResultStringForBlock(block, err), nil
 		}
 
 		// ProcessSubmittedBlock decouples block storage from active-chain
@@ -2340,7 +2389,7 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 			if errors.Is(err, consensus.ErrSideBranchAccepted) {
 				return "inconclusive", nil
 			}
-			return bip22ResultString(err), nil
+			return bip22ResultStringForBlock(block, err), nil
 		}
 
 		// Core re-evaluates the IBD latch in ConnectTip on every block connect,

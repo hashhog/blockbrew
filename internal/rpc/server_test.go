@@ -1855,9 +1855,21 @@ func TestBIP22ResultString(t *testing.T) {
 		{consensus.ErrBlockWeightTooHigh, "bad-blk-weight"},
 		// Wrapped stripped-size form (as produced by CheckBlockSanity)
 		{fmt.Errorf("%w: stripped weight 4205736 > 4000000", consensus.ErrBlockLengthTooHigh), "bad-blk-length"},
-		// Duplicate transactions (BIP-30)
-		{consensus.ErrDuplicateTx, "bad-txns-duplicate"},
-		{consensus.ErrDuplicateCoinbase, "bad-txns-duplicate"},
+		// BIP-30 duplicate txid (would overwrite a live UTXO). Core ConnectBlock
+		// emits "bad-txns-BIP30" (validation.cpp:2471), distinct from the
+		// CheckTransaction intra-tx dup-vin token "bad-txns-inputs-duplicate".
+		{consensus.ErrDuplicateTx, "bad-txns-BIP30"},
+		{consensus.ErrDuplicateCoinbase, "bad-txns-BIP30"},
+		// Wrapped BIP-30 (as produced by CheckBIP30 → ConnectBlock)
+		{fmt.Errorf("%w: output abcd:0 already exists", consensus.ErrDuplicateTx), "bad-txns-BIP30"},
+		// CheckTransaction sanity tokens (consensus/tx_check.cpp).
+		{consensus.ErrNoOutputs, "bad-txns-vout-empty"},
+		{consensus.ErrNoInputs, "bad-txns-vin-empty"},
+		{consensus.ErrDuplicateInput, "bad-txns-inputs-duplicate"},
+		{consensus.ErrNullInput, "bad-txns-prevout-null"},
+		// Wrapped forms as produced by CheckBlockSanity ("transaction %d: %w").
+		{fmt.Errorf("transaction 0: %w", consensus.ErrNoOutputs), "bad-txns-vout-empty"},
+		{fmt.Errorf("transaction 1: %w", consensus.ErrDuplicateInput), "bad-txns-inputs-duplicate"},
 		// BIP-34 height
 		{consensus.ErrBadBIP34Height, "bad-cb-height"},
 		// Non-final transaction (IsFinalTx)
@@ -1872,9 +1884,12 @@ func TestBIP22ResultString(t *testing.T) {
 		{consensus.ErrSequenceLockNotMet, "bad-txns-nonfinal"},
 		// Also wrapped (ConnectBlock path)
 		{fmt.Errorf("tx 1: %w", consensus.ErrSequenceLockNotMet), "bad-txns-nonfinal"},
+		// First tx not a coinbase — Core CheckBlock "bad-cb-missing"
+		// (validation.cpp:3952). Mapper arm added 2026-08-02; this expectation
+		// was left stale at "rejected".
+		{consensus.ErrFirstTxNotCoinbase, "bad-cb-missing"},
 		// Catch-all
 		{consensus.ErrNoTransactions, "rejected"},
-		{consensus.ErrFirstTxNotCoinbase, "rejected"},
 	}
 
 	for _, tc := range tests {
@@ -1884,5 +1899,48 @@ func TestBIP22ResultString(t *testing.T) {
 				t.Errorf("bip22ResultString(%v) = %q, want %q", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestBIP22ResultStringForBlock verifies the block-aware reason wrapper embeds
+// the offending nVersion in Core's strprintf("bad-version(0x%08x)", ...) form
+// (validation.cpp:4116). The %08x is on the UNSIGNED reinterpret of the int32
+// nVersion, so high-bit (0x80000000) and -1 (0xffffffff) must print correctly
+// — the discriminating cases from the version-dup corpus.
+func TestBIP22ResultStringForBlock(t *testing.T) {
+	mkBlock := func(v int32) *wire.MsgBlock {
+		b := &wire.MsgBlock{}
+		b.Header.Version = v
+		return b
+	}
+	// Wrapped exactly as CheckBlockContext → ConnectBlock produces it.
+	verr := func(v int32) error {
+		return fmt.Errorf("block context check failed: %w",
+			fmt.Errorf("%w: version %d, need >= 4 for BIP65",
+				consensus.ErrBlockVersionTooLow, v))
+	}
+	cases := []struct {
+		name string
+		v    int32
+		want string
+	}{
+		{"v1", 1, "bad-version(0x00000001)"},
+		{"v2", 2, "bad-version(0x00000002)"},
+		{"v3", 3, "bad-version(0x00000003)"},
+		{"highbit", -2147483648, "bad-version(0x80000000)"},
+		{"neg1", -1, "bad-version(0xffffffff)"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := bip22ResultStringForBlock(mkBlock(tc.v), verr(tc.v))
+			if got != tc.want {
+				t.Errorf("bip22ResultStringForBlock(v=%d) = %q, want %q", tc.v, got, tc.want)
+			}
+		})
+	}
+
+	// Non-version errors must fall through to the plain mapper unchanged.
+	if got := bip22ResultStringForBlock(mkBlock(4), consensus.ErrNoOutputs); got != "bad-txns-vout-empty" {
+		t.Errorf("fallthrough = %q, want bad-txns-vout-empty", got)
 	}
 }
