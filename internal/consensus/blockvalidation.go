@@ -44,8 +44,7 @@ var (
 	ErrBlockVersionTooLow       = errors.New("block version too low for height")
 	ErrTimestampBeforeMTP       = errors.New("block timestamp before median time past")
 	ErrBadBIP34Height           = errors.New("coinbase does not contain valid block height")
-	ErrMissingWitnessCommitment = errors.New("segwit block missing witness commitment")
-	ErrBadWitnessCommitment     = errors.New("witness commitment mismatch")
+	ErrBadWitnessCommitment = errors.New("witness commitment mismatch")
 	// ErrBadWitnessNonceSize signals that the coinbase scriptWitness does not
 	// contain exactly one 32-byte element. Bitcoin Core: "bad-witness-nonce-size"
 	// (validation.cpp:3880-3885, CheckWitnessMalleation).
@@ -345,23 +344,24 @@ func checkWitnessCommitment(block *wire.MsgBlock) error {
 		}
 	}
 
-	// Check if any transaction has witness data
-	hasWitness := false
-	for _, tx := range block.Transactions {
-		if tx.HasWitness() {
-			hasWitness = true
-			break
-		}
-	}
-
-	// If no witness data, commitment is optional
-	if !hasWitness && witnessCommitment == nil {
-		return nil
-	}
-
-	// If there's witness data, commitment is required
+	// No commitment present: no witness data is allowed anywhere in the block.
+	// Core's CheckWitnessMalleation falls through to its trailing "no witness
+	// data is allowed in blocks that don't commit to witness data" loop and
+	// rejects with "unexpected-witness" (validation.cpp:3905-3913). Core has no
+	// missing-commitment reject reason at all — the previous
+	// ErrMissingWitnessCommitment here surfaced as bad-witness-merkle-match via
+	// BIP22ValidationResult, diverging from Core on corpus entries
+	// C2-witness-tx-no-commitment and C10-commitment-truncated-37b (a 37-byte
+	// commitment output is below the 38-byte minimum, so no commitment is
+	// found). Decision is unchanged (reject either way); reason-code parity
+	// only. A commitment-less block with no witness data anywhere is valid.
 	if witnessCommitment == nil {
-		return ErrMissingWitnessCommitment
+		for _, tx := range block.Transactions {
+			if tx.HasWitness() {
+				return ErrUnexpectedWitnessInBlock
+			}
+		}
+		return nil
 	}
 
 	// Validate witness reserved value: coinbase input[0] scriptWitness must have
