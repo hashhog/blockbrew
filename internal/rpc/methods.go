@@ -2053,6 +2053,17 @@ func bip22ResultString(err error) string {
 	// Merkle root
 	case errors.Is(err, consensus.ErrBadMerkleRoot):
 		return "bad-txnmrklroot"
+	// Merkle tree malleability (CVE-2012-2459): the txid list contains a
+	// duplicated adjacent pair/subtree, so the (matching) merkle root could
+	// have come from a different transaction list. Core CheckMerkleRoot
+	// (validation.cpp:3850-3857) reports this as "bad-txns-duplicate" /
+	// "duplicate transaction" — distinct from bad-txnmrklroot (root mismatch)
+	// above and from bad-txns-BIP30 (dup txid over UTXO) below. This arm was
+	// absent, so corpus entries reject-leaf-dup / reject-subtree-dup fell
+	// through to the generic "rejected". Decision unchanged; R2 reason-code
+	// parity only.
+	case errors.Is(err, consensus.ErrBlockMutated):
+		return "bad-txns-duplicate"
 	// Witness commitment hash mismatch (BIP-141). Core CheckWitnessMalleation
 	// validation.cpp:3896: "bad-witness-merkle-match". (A block with witness
 	// data but NO commitment output is ErrUnexpectedWitnessInBlock below, not
