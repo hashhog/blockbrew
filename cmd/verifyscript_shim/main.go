@@ -123,6 +123,15 @@ type request struct {
 	// checkblock as the height the FULL block is being connected at.
 	SpendHeight int32 `json:"spend_height"`
 
+	// sighash op fields. HashType is the RAW SIGNED int from Core's
+	// sighash.json (InsecureRand32 cast to int) — passed through to the
+	// impl untouched; the int64->uint32 truncation at the call site is the
+	// same bit pattern Core's int32 nHashType serializes as its 4-byte LE
+	// footer.
+	ScriptHex  string `json:"script_hex"`
+	InputIndex int    `json:"input_index"`
+	HashType   int64  `json:"hashtype"`
+
 	// checkblock op fields. The FINAL (already-mutated) block bytes are
 	// validated AS-IS — the shim does NOT recompute the merkle root.
 	BlockHex    string `json:"block_hex"`
@@ -356,6 +365,8 @@ func process(line []byte) string {
 		return processVerifyScript(&req)
 	case "verifytx":
 		return processVerifyTx(&req)
+	case "sighash":
+		return processSighash(&req)
 	case "checktx":
 		return processCheckTx(&req)
 	case "connecttx":
@@ -1312,6 +1323,57 @@ func processVerifyTx(req *request) string {
 	}
 
 	return `{"valid":true}`
+}
+
+// processSighash: byte-exact legacy SignatureHash conformance (Core
+// sighash.json). Calls blockbrew's REAL legacy sighash —
+// script.CalcSignatureHash (internal/script/sighash.go:38), the exact
+// function the interpreter's pre-segwit CHECKSIG / CHECKMULTISIG path
+// invokes (internal/script/opcodes_impl.go:674, :931): opcode-aware
+// OP_CODESEPARATOR strip, ANYONECANPAY / NONE / SINGLE serialization
+// incl. the SIGHASH_SINGLE nIn>=nOuts "hash of one" bug (0x01 + 31 zero
+// bytes internal), and the uint32-masked nHashType 4-byte LE footer.
+// The shim reimplements NOTHING: tx_hex goes through the same
+// wire.MsgTx.Deserialize the verifytx op uses, the SIGNED hashtype is
+// handed to the impl raw (the Go int64->uint32 conversion is bitwise
+// identical to Core serializing its int32 nHashType), and the INTERNAL
+// 32-byte digest is reversed exactly ONCE — via wire.Hash256.String()
+// (internal/wire/types.go:58) — to Core's GetHex/display order. Prevout
+// txids inside the tx stay internal; the returned digest is the only
+// thing reversed.
+//
+//	request:  {"op":"sighash","tx_hex":"...","script_hex":"...",
+//	           "input_index":N,"hashtype":<signed int>}
+//	response: {"sighash":"<64-hex, Core GetHex/display order>"}
+//	          {"error":"..."}                  (could not deserialize)
+func processSighash(req *request) string {
+	txBytes, err := hex.DecodeString(req.TxHex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("tx_hex: "+err.Error()))
+	}
+
+	var tx wire.MsgTx
+	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("tx deserialize: "+err.Error()))
+	}
+
+	scriptCode, err := hex.DecodeString(req.ScriptHex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("script_hex: "+err.Error()))
+	}
+
+	// Entrypoint: internal/script/sighash.go:38 CalcSignatureHash — the
+	// interpreter's own legacy path (opcodes_impl.go:674), not a wallet
+	// helper.
+	digest, err := script.CalcSignatureHash(
+		scriptCode, script.SigHashType(uint32(req.HashType)), &tx, req.InputIndex)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%s}`, jsonString("CalcSignatureHash: "+err.Error()))
+	}
+
+	// digest is INTERNAL byte order; Hash256.String() reverses it to the
+	// display order sighash.json expects.
+	return fmt.Sprintf(`{"sighash":%s}`, jsonString(wire.Hash256(digest).String()))
 }
 
 // reorgMaxDepth mirrors blockbrew's production reorg-span cap
