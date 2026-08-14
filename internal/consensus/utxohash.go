@@ -127,20 +127,37 @@ type sortedCoin struct {
 //
 // Returns the digest, the number of coins iterated, and an error.
 func ComputeHashSerialized(utxoSet *UTXOSet) (wire.Hash256, uint64, error) {
-	coins := collectAndSortCacheCoins(utxoSet)
-
+	// FULL-SET cursor, not the cache (2026-08-14). The previous
+	// collectAndSortCacheCoins implementation hashed ONLY the in-memory
+	// cache — on a freshly-booted node it hashed whatever few coins RPC
+	// reads happened to pull in (observed live: 3 coins on the genesis R4
+	// rig, where the real set holds ~166M). ScanUTXOs flushes the cache and
+	// iterates the persisted set in pebble key order ("U"+txid+BE-vout),
+	// which is byte-identical to the old txid-then-index sort order, so the
+	// order-dependent hash_serialized_3 stream is unchanged for a complete
+	// cache. Shares the exact per-coin serialization with
+	// ComputeUTXOSetInfo (the gettxoutsetinfo path, correct all along).
 	h := sha256.New()
-	for _, c := range coins {
-		if err := WriteTxOutSer(h, c.outpoint, c.entry); err != nil {
-			return wire.Hash256{}, 0, err
+	var werr error
+	count, err := utxoSet.ScanUTXOs(func(op wire.OutPoint, entry *UTXOEntry) bool {
+		if e := WriteTxOutSer(h, op, entry); e != nil {
+			werr = e
+			return false
 		}
+		return true
+	})
+	if err != nil {
+		return wire.Hash256{}, 0, err
+	}
+	if werr != nil {
+		return wire.Hash256{}, 0, werr
 	}
 	// HashWriter::GetHash() = SHA256d. Single SHA256 first, then SHA256 again.
 	first := h.Sum(nil)
 	second := sha256.Sum256(first)
 	var out wire.Hash256
 	copy(out[:], second[:])
-	return out, uint64(len(coins)), nil
+	return out, count, nil
 }
 
 // GetBogoSize returns Core's "database-independent, meaningless metric"

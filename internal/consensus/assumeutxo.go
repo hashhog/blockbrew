@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"math"
-	"sort"
 	"sync"
 
 	"github.com/hashhog/blockbrew/internal/storage"
@@ -245,39 +244,28 @@ func NewSnapshotWriter(w io.Writer, networkMagic [4]byte) *SnapshotWriter {
 
 // WriteSnapshot writes the entire UTXO set to a snapshot file.
 // The UTXOs are written in deterministic order (sorted by outpoint).
+//
+// 2026-08-14 rewrite: iterate the PERSISTED set via ScanUTXOs (flush-then-
+// cursor), not the in-memory cache. The original implementation carried its
+// own confession — "Collect from cache (in production, would use DB cursor)"
+// — and shipped that way: dumptxoutset emitted whatever happened to be
+// cached (observed live on the genesis R4 rig: a 3-coin snapshot of a ~166M
+// coin set, the 3 being coins pulled into cache by prior gettxout probes).
+// Two passes over the cursor: pass 1 counts (CoinsCount is a header field),
+// pass 2 streams the grouped records. No in-memory collection — a full
+// mainnet set (~166M coins) must never be materialized as a slice. The
+// cursor's pebble key order ("U"+txid+BE-vout) IS the old sort order.
+// Callers must ensure no blocks connect between the passes (dumptxoutset
+// runs with block acceptance paused / a quiescent node).
 func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networkMagic [4]byte) (*SnapshotStats, error) {
 	stats := &SnapshotStats{}
 
-	// Collect all UTXOs for deterministic ordering
-	// Note: In production, this would iterate the database directly with a cursor
-	utxoSet.mu.RLock()
-	coins := make([]struct {
-		outpoint wire.OutPoint
-		entry    *UTXOEntry
-	}, 0)
-
-	// Collect from cache (in production, would use DB cursor)
-	for op, entry := range utxoSet.cache {
-		if entry != nil {
-			coins = append(coins, struct {
-				outpoint wire.OutPoint
-				entry    *UTXOEntry
-			}{op, entry})
-		}
+	// Pass 1: count coins (ScanUTXOs flushes the cache first, so the
+	// database holds the complete current set for both passes).
+	coinsCount, err := utxoSet.ScanUTXOs(func(op wire.OutPoint, entry *UTXOEntry) bool { return true })
+	if err != nil {
+		return nil, fmt.Errorf("failed to count UTXOs: %w", err)
 	}
-	utxoSet.mu.RUnlock()
-
-	// Sort by outpoint for deterministic ordering
-	sort.Slice(coins, func(i, j int) bool {
-		// Compare txid first
-		for k := 0; k < 32; k++ {
-			if coins[i].outpoint.Hash[k] != coins[j].outpoint.Hash[k] {
-				return coins[i].outpoint.Hash[k] < coins[j].outpoint.Hash[k]
-			}
-		}
-		// Then by output index
-		return coins[i].outpoint.Index < coins[j].outpoint.Index
-	})
 
 	// Write metadata
 	metadata := &SnapshotMetadata{
@@ -285,7 +273,7 @@ func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networ
 		Version:      SnapshotVersion,
 		NetworkMagic: networkMagic,
 		BlockHash:    blockHash,
-		CoinsCount:   uint64(len(coins)),
+		CoinsCount:   coinsCount,
 	}
 	if err := metadata.Serialize(w); err != nil {
 		return nil, fmt.Errorf("failed to write metadata: %w", err)
@@ -326,23 +314,41 @@ func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networ
 		return nil
 	}
 
-	for _, coin := range coins {
-		if coin.outpoint.Hash != lastTxid && len(txCoins) > 0 {
-			if err := flushTxCoins(); err != nil {
-				return nil, err
+	// Pass 2: stream the grouped per-txid records straight off the cursor.
+	var scanErr error
+	written, err := utxoSet.ScanUTXOs(func(op wire.OutPoint, entry *UTXOEntry) bool {
+		if op.Hash != lastTxid && len(txCoins) > 0 {
+			if e := flushTxCoins(); e != nil {
+				scanErr = e
+				return false
 			}
 			txCoins = txCoins[:0]
 		}
-		lastTxid = coin.outpoint.Hash
+		lastTxid = op.Hash
 		txCoins = append(txCoins, struct {
 			vout  uint32
 			entry *UTXOEntry
-		}{coin.outpoint.Index, coin.entry})
+		}{op.Index, entry})
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	if scanErr != nil {
+		return nil, scanErr
 	}
 	// Flush remaining coins
 	if err := flushTxCoins(); err != nil {
 		return nil, err
 	}
+	if stats.CoinsWritten != coinsCount {
+		// The set changed between the passes (blocks connected mid-dump) —
+		// the header's CoinsCount no longer matches the body. Refuse rather
+		// than emit a snapshot that readers will mis-parse.
+		return nil, fmt.Errorf("UTXO set changed during dump: header count %d, wrote %d",
+			coinsCount, stats.CoinsWritten)
+	}
+	_ = written
 
 	stats.BlockHash = blockHash
 	stats.Height = -1 // Caller should set this
