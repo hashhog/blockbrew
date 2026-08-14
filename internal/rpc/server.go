@@ -335,8 +335,14 @@ func (s *Server) Start() error {
 	s.httpServer = &http.Server{
 		Addr:         s.config.ListenAddr,
 		Handler:      mux,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 30 * time.Second,
+		ReadTimeout: 30 * time.Second,
+		// WriteTimeout must accommodate legitimately long RPCs: a full
+		// gettxoutsetinfo / dumptxoutset scan over ~166M coins runs for
+		// many minutes, and a 30s deadline silently killed the connection
+		// mid-compute (empty reply, work wasted) — the w140 test note
+		// called this out. 1h matches the slowest observed full-set scan
+		// with generous margin; Core has no write deadline at all.
+		WriteTimeout: 3600 * time.Second,
 	}
 
 	tlsEnabled := certSet && keySet

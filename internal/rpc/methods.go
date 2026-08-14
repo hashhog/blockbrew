@@ -3144,6 +3144,12 @@ func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 	if dumpErr != nil {
 		return nil, dumpErr
 	}
+	// Log the result too: a multi-minute dump outlives impatient HTTP
+	// clients (and any write deadline), and the operator needs the hash
+	// even when the response connection is gone (2026-08-14 R4 capture).
+	log.Printf("rpc: dumptxoutset COMPLETE path=%s coins=%d base_height=%d base_hash=%s txoutset_hash=%s",
+		dumpResult.Path, dumpResult.CoinsWritten, dumpResult.BaseHeight,
+		dumpResult.BaseHash, dumpResult.TxOutSetHash)
 	return dumpResult, nil
 }
 
