@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"math/rand/v2"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -154,6 +155,30 @@ type blockRequest struct {
 	// the same peer, gets the same notfound, and produces millions of log
 	// lines of spam (observed haskoin flooding ~50k/min).
 	FailedPeers map[string]struct{}
+	// NextRetryAt gates re-requests after a stall reset or notfound:
+	// requestBlocks skips this entry until the deadline passes. Exponential
+	// (2s << StallResets, capped 60s). Without it the stall handler's
+	// 30s reset + the 100ms request tick + a peer that GENUINELY lacks the
+	// block (capped replay feeder) formed a hot retry loop — observed
+	// 1037% CPU for six days on the genesis R4 rig (2026-08-14).
+	NextRetryAt time.Time
+	// StallResets counts stall-handler resets for this entry (backoff
+	// exponent). Deliberately separate from RetryCount, which drives
+	// peer rotation and is zeroed by design on a pending-reset.
+	StallResets int
+}
+
+// stallBackoff returns the re-request delay after the nth stall reset:
+// 2s, 4s, 8s, 16s, 32s, then capped at 60s.
+func stallBackoff(resets int) time.Duration {
+	if resets > 5 {
+		return 60 * time.Second
+	}
+	d := time.Duration(2<<uint(resets)) * time.Second
+	if d > 60*time.Second {
+		return 60 * time.Second
+	}
+	return d
 }
 
 // blockWithRequest pairs a received block with its request metadata.
@@ -328,6 +353,10 @@ const txInflightExpiry = 60 * time.Second
 type ChainConnector interface {
 	// ConnectBlock validates and connects a block to the active chain.
 	ConnectBlock(block *wire.MsgBlock) error
+	// AdoptAppliedBlock advances the tip over a block whose UTXO effects are
+	// already in the persisted set (marker-lag repair; see
+	// consensus.ChainManager.AdoptAppliedBlock).
+	AdoptAppliedBlock(block *wire.MsgBlock) error
 	// ProcessSubmittedBlock connects a block via the side-branch-aware path:
 	// it extends the active tip (fast ConnectBlock path) when the block's
 	// parent IS the tip, reorgs when the block is a heavier side branch, and
@@ -1631,6 +1660,15 @@ func (sm *SyncManager) HandleNotFound(peer *Peer, msg *MsgNotFound) {
 		req.State = BlockDownloadPending
 		req.RetryCount++
 		// Keep req.Peer so requestBlocks can avoid this peer
+		// If EVERY connected peer has said notfound for this block, back
+		// off before re-asking anyone: they cannot answer, and immediate
+		// re-requests form a hot loop (the capped-replay-feeder finish-line
+		// spin, 2026-08-14: 1037% CPU for six days asking one peer for a
+		// block it declared it does not have).
+		if sm.peerMgr != nil && len(req.FailedPeers) >= len(sm.peerMgr.ConnectedPeers()) {
+			req.NextRetryAt = time.Now().Add(stallBackoff(req.StallResets))
+			req.StallResets++
+		}
 	}
 }
 
@@ -2089,10 +2127,12 @@ func (sm *SyncManager) blockDownloadLoop() {
 							// This happens when all peers are busy or disconnected.
 							// Force a re-request by logging and letting requestBlocks
 							// pick it up on next tick. Also reset peer to allow any peer.
-							log.Printf("sync: block %d is pending but not downloading, clearing peer restriction",
-								nh)
+							log.Printf("sync: block %d is pending but not downloading, clearing peer restriction (backoff %s)",
+								nh, stallBackoff(req.StallResets))
 							req.Peer = nil
 							req.RetryCount = 0
+							req.NextRetryAt = time.Now().Add(stallBackoff(req.StallResets))
+							req.StallResets++
 							// W48: state invariant says Pending blocks must not be in
 							// sm.inflight; otherwise requestBlocks skips them and the
 							// stall never clears. Sibling branches (line ~1014, ~1034)
@@ -2102,9 +2142,12 @@ func (sm *SyncManager) blockDownloadLoop() {
 						} else if req.State != BlockDownloadPending {
 							// Block is in some intermediate state (InFlight, Received, Validated).
 							// It may be stuck in the pipeline. Reset to pending.
-							log.Printf("sync: block %d stuck in state %d, resetting to pending", nh, req.State)
+							log.Printf("sync: block %d stuck in state %d, resetting to pending (backoff %s)",
+								nh, req.State, stallBackoff(req.StallResets))
 							req.State = BlockDownloadPending
 							req.Peer = nil
+							req.NextRetryAt = time.Now().Add(stallBackoff(req.StallResets))
+							req.StallResets++
 							// Also remove from inflight if it's there
 							delete(sm.inflight, req.Hash)
 						}
@@ -2303,6 +2346,11 @@ func (sm *SyncManager) requestBlocks() {
 
 	for _, req := range sm.blockQueue {
 		if req.State != BlockDownloadPending {
+			continue
+		}
+		// Stall/notfound backoff: don't re-request before the deadline.
+		// (Zero value = no backoff; see blockRequest.NextRetryAt.)
+		if !req.NextRetryAt.IsZero() && time.Now().Before(req.NextRetryAt) {
 			continue
 		}
 		if len(sm.inflight) >= sm.downloadWindow {
@@ -3236,6 +3284,39 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				// wipe chaindata/.  The block is NOT marked invalid in
 				// the header index, so a recovered restart can validate
 				// it cleanly.
+				// MARKER-LAG REPAIR (2026-08-15, GEN-BREW T2-3 capture
+				// post-mortem): a "missing UTXO" during in-order connect
+				// has TWO causes with opposite remedies:
+				//   (a) marker lag — the block was ALREADY APPLIED in a
+				//       prior session (its spend is why the input is
+				//       "missing"); chain_tip just lags the flushed
+				//       coins. Remedy: adopt, do not re-apply.
+				//   (b) lost UTXO writes — real corruption. Remedy: halt.
+				// AdoptAppliedBlock distinguishes them with positive
+				// evidence (one of the block's OWN outputs present in the
+				// set proves its batch committed; false positives are
+				// impossible). Only provable (a) is adopted; everything
+				// else still halts. The 2026-08-14 false alarm advised
+				// deleting a VALID 10.9-day from-genesis chainstate.
+				if bwr.block != nil &&
+					strings.Contains(connectErr.Error(), "references missing UTXO") {
+					if adoptErr := sm.chainMgr.AdoptAppliedBlock(bwr.block); adoptErr == nil {
+						log.Printf("sync: MARKER-LAG repaired at height %d — block already applied in a prior session; tip adopted",
+							nextHeight)
+						bwr.req.State = BlockDownloadConnected
+						delete(pending, nextHeight)
+						sm.mu.Lock()
+						sm.removeFromQueue(bwr.req.Hash)
+						sm.nextHeight = nextHeight + 1
+						sm.mu.Unlock()
+						nextHeight++
+						continue
+					} else if !errors.Is(adoptErr, consensus.ErrNoAdoptionEvidence) {
+						log.Printf("sync: marker-lag adoption failed at height %d: %v (falling through to halt)",
+							nextHeight, adoptErr)
+					}
+				}
+
 				// Latch the flag + rate-limit the warning. First print is
 				// always emitted; subsequent retries print at most once
 				// per minute. Both lines fire on the first hit so the
@@ -3248,12 +3329,14 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 					log.Printf("[CHAINSTATE-CORRUPTION] sync: GENUINE validation failure at height %d hash=%s: %v",
 						nextHeight, bwr.req.Hash.String()[:16], connectErr)
 					if firstHit {
-						log.Printf("[CHAINSTATE-CORRUPTION] this is almost certainly a chainstate-corruption " +
-							"wedge (UTXO writes lost in a prior crash window). The broken \"skip-and-advance\" " +
-							"loop has been removed; halting block connection here. Restart the node to run " +
-							"the startup consistency probe, which auto-rolls-back the tip to the last known-good " +
-							"height. If the wedge recurs after restart, stop the node and remove the chaindata/ " +
-							"directory to force a full re-sync (-reindex is honest-deferred).")
+						log.Printf("[CHAINSTATE-CORRUPTION] halting block connection here (adopt-probe found no " +
+							"evidence this block was already applied, so this is NOT provable marker lag). " +
+							"Restart the node to run the startup consistency probe, which auto-rolls-back the " +
+							"tip to the last known-good height. If the wedge recurs after a restart, do NOT " +
+							"delete the datadir on this advice alone — the 2026-08-14 incident proved this " +
+							"message can fire on a repairable state. Probe first: gettxout on the coinbase " +
+							"outputs of blocks ABOVE the reported height (present => marker lag; file a bug). " +
+							"Only a confirmed-corrupt state warrants a re-sync.")
 					}
 				}
 

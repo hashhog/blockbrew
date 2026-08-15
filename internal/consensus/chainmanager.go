@@ -7,6 +7,7 @@ import (
 	"log"
 	"math"
 	"math/big"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -530,12 +531,12 @@ func getBlockProofEquivalentTime(bestHeader, pindex *BlockNode, params *ChainPar
 //
 //  1. assumevalid is configured (assumeValidHash != zero hash).
 //  2. The assumevalid block hash is present in our block index.
-//  3a. node is an ANCESTOR OF (or equal to) the assumevalid block
-//      (avNode.GetAncestor(node.Height) == node). A fork block at height ≤
-//      av_height fails here because it is NOT on the av block's ancestry chain.
-//  3b. node is on the BEST-HEADER CHAIN
-//      (bestHeader.GetAncestor(node.Height) == node). Ensures avNode is
-//      itself on our best-known chain.
+//     3a. node is an ANCESTOR OF (or equal to) the assumevalid block
+//     (avNode.GetAncestor(node.Height) == node). A fork block at height ≤
+//     av_height fails here because it is NOT on the av block's ancestry chain.
+//     3b. node is on the BEST-HEADER CHAIN
+//     (bestHeader.GetAncestor(node.Height) == node). Ensures avNode is
+//     itself on our best-known chain.
 //  4. bestHeader.TotalWork >= MinimumChainWork (eclipse-attack defense).
 //  5. getBlockProofEquivalentTime(bestHeader, node) > 1209600 s (2 weeks,
 //     DoS defense: blocks mined too recently are always script-verified).
@@ -591,6 +592,91 @@ func (cm *ChainManager) shouldSkipScripts(node *BlockNode) bool {
 }
 
 // ConnectBlock validates and connects a block to the active chain.
+// AdoptAppliedBlock advances the chain tip over a block whose UTXO effects
+// are ALREADY in the persisted set from a prior session — the marker-lag
+// case (2026-08-14 genesis-blockbrew: coins flushed through height 958,794
+// while chain_tip recorded 958,000; replaying 958,001 then hit its own
+// already-applied spend as "missing UTXO" and the corruption-halt advised
+// deleting a VALID 10.9-day chainstate).
+//
+// Safety: adoption requires POSITIVE evidence that this exact block's
+// connect batch committed — at least one of the block's own outputs is
+// present in the UTXO set. An outpoint (txid,vout) can only enter the set
+// via that block's connect, so presence is proof of application; a false
+// positive is impossible. Absence proves nothing (outputs may have been
+// spent by later already-applied blocks), so a fully-spent block yields
+// ErrNoAdoptionEvidence and the caller falls back to the halt path —
+// fail-closed, exactly like the old behavior, just with the false alarm
+// removed for every provable case.
+//
+// The tip bookkeeping mirrors ConnectBlock's persistence (height map row +
+// chain_tip batch) WITHOUT touching the UTXO set, block store, or undo
+// store — those were all written by the prior session (per-block atomic
+// batches; the height row rewrite is idempotent).
+func (cm *ChainManager) AdoptAppliedBlock(block *wire.MsgBlock) error {
+	if !cm.beginMutation() {
+		return ErrShuttingDown
+	}
+	defer cm.endMutation()
+
+	hash := block.Header.BlockHash()
+	node := cm.headerIndex.GetNode(hash)
+	if node == nil {
+		return fmt.Errorf("block %s not found in header index", hash.String())
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if block.Header.PrevBlock != cm.tipNode.Hash {
+		return fmt.Errorf("adopt: block %s does not connect to tip %s",
+			hash.String()[:16], cm.tipNode.Hash.String()[:16])
+	}
+
+	// Positive already-applied evidence: any of this block's own outputs
+	// present in the UTXO set. Coinbase first (within the 100-block
+	// maturity window it cannot have been spent), then every other output.
+	applied := false
+probe:
+	for _, tx := range block.Transactions {
+		txid := tx.TxHash()
+		for vout := range tx.TxOut {
+			if cm.utxoSet.GetUTXO(wire.OutPoint{Hash: txid, Index: uint32(vout)}) != nil {
+				applied = true
+				break probe
+			}
+		}
+	}
+	if !applied {
+		return ErrNoAdoptionEvidence
+	}
+
+	cm.tipNode = node
+	cm.tipHeight = node.Height
+	cm.updateTipCache(node.Hash, node.Height)
+	node.Status |= StatusFullyValid | StatusDataStored
+
+	if cm.chainDB != nil {
+		batch := cm.chainDB.NewBatch()
+		cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
+		cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+			BestHash:   hash,
+			BestHeight: node.Height,
+		})
+		if err := batch.Write(); err != nil {
+			return fmt.Errorf("adopt: failed to persist tip advance: %w", err)
+		}
+	}
+
+	log.Printf("chainmgr: ADOPTED already-applied block height=%d hash=%s (marker-lag repair; UTXO effects were committed by a prior session)",
+		node.Height, hash.String()[:16])
+	return nil
+}
+
+// ErrNoAdoptionEvidence: AdoptAppliedBlock found none of the block's outputs
+// in the UTXO set — cannot prove the block was already applied.
+var ErrNoAdoptionEvidence = errors.New("no adoption evidence: none of the block's outputs are in the UTXO set")
+
 func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	if !cm.beginMutation() {
 		return ErrShuttingDown
@@ -1701,6 +1787,21 @@ func (cm *ChainManager) RecoverFromPersistedBlocks() (int, error) {
 			}
 		}
 		if err := cm.ConnectBlock(block); err != nil {
+			// MARKER-LAG REPAIR (2026-08-15): "missing UTXO" here usually
+			// means this block was ALREADY APPLIED in a prior session and
+			// only the chainstate pointer lagged (the 2026-08-14 genesis
+			// rig: coins flushed through 958,794, pointer at 958,000 — the
+			// replay then hit its own already-applied spends and the old
+			// code halted with a false corruption verdict). Adopt on
+			// positive evidence (one of the block's own outputs present in
+			// the set proves its batch committed); anything unprovable
+			// still stops the replay exactly as before.
+			if strings.Contains(err.Error(), "references missing UTXO") {
+				if adoptErr := cm.AdoptAppliedBlock(block); adoptErr == nil {
+					replayed++
+					continue
+				}
+			}
 			log.Printf("chainmgr: recovery: ConnectBlock at height %d failed (%v); stopping replay", next, err)
 			break
 		}
