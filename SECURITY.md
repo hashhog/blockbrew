@@ -60,9 +60,11 @@ fix + disclosure timeline and credit you if you wish.
 
 ## Custody caveats (not consensus, but real — for the fund track, not this validator tag)
 
-⟦at tag⟧ Record any funds-safety caveats surfaced by the release audit here (the other
-flagships filed items like default-wallet backup traps and `prevtxs`-ignoring signing).
-These gate fund-capability (P2), not the watchtower-validator tag.
+No custody audit has been run for v0.1.0-rc1 — it is deliberately deferred to
+the fund track. This tag's scope is validator-only; do not hold funds with this
+software. (When the fund-track audit runs, its caveats get recorded here — the
+other flagships filed items like default-wallet backup traps and
+`prevtxs`-ignoring signing.)
 
 ## Out of scope
 
