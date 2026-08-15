@@ -13,14 +13,18 @@ wrapper (see `SECURITY.md` and `../receipts/PRODUCTION-GATE.md` "three bars").
 |---|---|
 | Commit | `2846653` (HEAD at the time of this note) |
 | Binary | `blockbrew/blockbrew` |
-| **sha256** | `d16de08bfec805360fa3c1dd257476935d095b1fa7a6c4ae77e76b9b1b2810e5` |
+| Commit | `e7d0afe` (v0.1.0-rc1) |
+| **sha256** | `241f779c1fdc286bc524af6328ae7c7da4c033b60af7ca1dfb4520232c3823df` |
 | Toolchain | `go 1.24.1 linux/amd64` |
 | Target | `Linux amd64` |
 | Build | `go build -o blockbrew ./...` |
 
-> At tag time, re-record this table for the pinned rc commit, and confirm the
-> genesis-blockbrew binary that produced the C(958794) lineage matches it
-> (`sha256sum blockbrew/blockbrew`).
+> Recorded at tag time (2026-08-15) for v0.1.0-rc1 = `e7d0afe`. LINEAGE NOTE:
+> the from-genesis C(958794) validation ran on the `103ea46`-era binary; the
+> consensus delta `103ea46..e7d0afe` is one Core-parity witness-commitment
+> restructure (zero-split-verified) plus reason-token maps and the
+> capture/recovery tooling fixes included in this tag. Evidence + independent
+> hash cross-check: `receipts/r4-blockbrew-t2-3-2026-08-14.md` (T2-3).
 
 ## Build
 
