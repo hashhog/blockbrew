@@ -8,7 +8,7 @@ cross-validate each other and Bitcoin Core.
 > tag. Its genesis (`--assumevalid=0`) from-genesis validation lineage is in progress;
 > the tag (`v0.1.0-rc1`) is cut once it reproduces the **C(958794)** UTXO commitment
 > byte-for-byte (see `../receipts/NODE4-BLOCKBREW-T2-CAPTURE-RUNBOOK.md`). Evidence
-> specifics marked ⟦at tag⟧ are recorded when the T2 capture verifies.
+> specifics recorded 2026-08-15 at tag time (T2 capture verified 2026-08-14).
 
 ## Project maturity — read this first
 
@@ -17,7 +17,8 @@ Bitcoin Core in watchtower mode, and trust to track consensus. Its live-fleet in
 tracks the Core mainnet tip byte-for-byte (`fleet-snapshot.sh` agreement), and its
 correctness rests on an **`--assumevalid=0` genesis lineage** that re-derives the UTXO
 set from block 0 with scripts on, reproducing the reference Core UTXO commitment
-`C(958794)` (`hash_serialized_3 = 29692050…`) byte-for-byte ⟦at tag⟧ — trusting no
+`C(958794)` (`hash_serialized_3 = 29692050…`) byte-for-byte — VERIFIED 2026-08-14,
+T2-3, independently cross-checked (receipts/r4-blockbrew-t2-3-2026-08-14.md) — trusting no
 checkpoint.
 
 **It is NOT fund-capable for general custody.** The intended trust model for this
@@ -28,7 +29,7 @@ There are no fund-grade guarantees. Run from a pinned commit.
 
 | Version | Supported |
 |---------|-----------|
-| `v0.1.0-rc1` (pinned ⟦at tag⟧) | Validator RC — best-effort; no security SLA until the final `v0.1.0` |
+| `v0.1.0-rc1` (= `e7d0afe`, tagged 2026-08-15) | Validator RC — best-effort; no security SLA until the final `v0.1.0` |
 | pre-release (`master`) | Best-effort |
 
 ## Reporting a vulnerability
