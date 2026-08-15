@@ -1102,6 +1102,13 @@ func (m *mockChainConnector) ProcessSubmittedBlock(b *wire.MsgBlock) error {
 
 func (m *mockChainConnector) ReloadChainState()        {}
 func (m *mockChainConnector) HasPendingRecovery() bool { return false }
+
+// AdoptAppliedBlock: the mock has no persisted-set state to probe, so it
+// reports no adoption evidence — connect failures in tests exercise the
+// halt path exactly as before the marker-lag repair existed.
+func (m *mockChainConnector) AdoptAppliedBlock(b *wire.MsgBlock) error {
+	return consensus.ErrNoAdoptionEvidence
+}
 func (m *mockChainConnector) IsIBD() bool              { return !m.postIBD }
 func (m *mockChainConnector) IsPruning() bool          { return m.pruning }
 
