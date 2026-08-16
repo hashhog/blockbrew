@@ -636,19 +636,90 @@ func (cm *ChainManager) AdoptAppliedBlock(block *wire.MsgBlock) error {
 	// Positive already-applied evidence: any of this block's own outputs
 	// present in the UTXO set. Coinbase first (within the 100-block
 	// maturity window it cannot have been spent), then every other output.
-	applied := false
-probe:
+	// ── Evidence probe: DURABLE reads only. ─────────────────────────────────
+	//
+	// An outpoint is unique to the block that created it (the txid commits to
+	// the whole transaction, which exists only in this block), so ANY of this
+	// block's own outputs found ON DISK proves the prior session committed its
+	// batch. False positives are impossible — as long as the read is durable.
+	//
+	// It MUST NOT go through GetUTXO/HasUTXO: those consult the cache and would
+	// confirm this session's own in-flight writes, including the residue of the
+	// connect attempt that just failed. nimrod shipped that exact mistake and
+	// it "proved" a block applied off in-memory residue.
+	//
+	// Outputs spent LATER WITHIN this same block are legitimately absent after a
+	// full apply, so they are excluded from the probe set rather than counted as
+	// missing evidence.
+	dview, ok := cm.utxoSet.(durableUTXOView)
+	if !ok {
+		return ErrNoDurableUTXOView
+	}
+
+	spentInBlock := make(map[wire.OutPoint]struct{})
+	for i, tx := range block.Transactions {
+		if i == 0 {
+			continue // coinbase has no real inputs
+		}
+		for _, in := range tx.TxIn {
+			spentInBlock[in.PreviousOutPoint] = struct{}{}
+		}
+	}
+
+	evidence, probed := 0, 0
 	for _, tx := range block.Transactions {
 		txid := tx.TxHash()
 		for vout := range tx.TxOut {
-			if cm.utxoSet.GetUTXO(wire.OutPoint{Hash: txid, Index: uint32(vout)}) != nil {
-				applied = true
-				break probe
+			op := wire.OutPoint{Hash: txid, Index: uint32(vout)}
+			if _, ok := spentInBlock[op]; ok {
+				continue
+			}
+			probed++
+			if dview.HasUTXODurable(op) {
+				evidence++
 			}
 		}
 	}
-	if !applied {
+	if evidence == 0 {
 		return ErrNoAdoptionEvidence
+	}
+	log.Printf("chainmgr: adoption evidence (durable) height=%d hash=%s evidence=%d/%d",
+		node.Height, hash.String()[:16], evidence, probed)
+
+	// ── Tolerant roll-forward (Core validation.cpp::RollforwardBlock). ──────
+	//
+	// The durable state may hold only a PREFIX of this block's mutations — a
+	// crash can land mid-flush. Merely advancing the tip (the original
+	// behaviour here) freezes that partial state under a tip claiming the block
+	// is complete, and every later block spending a missing output then fails
+	// forever. Worse, it is SILENT: the chain looks healthy and the UTXO set is
+	// simply wrong.
+	//
+	// That is not hypothetical. On 2026-08-15 this function adopted its way to
+	// C(958794) on the genesis rig and produced 166,180,926 coins against the
+	// pinned 166,180,925 — exactly one un-applied spend — with a correct block
+	// hash (receipts/T2-capture-blockbrew-20260815T125623Z.md).
+	//
+	// So re-apply every mutation instead. Both directions are safe to repeat:
+	// SpendUTXO on an already-spent outpoint is a no-op, and AddUTXO rewrites
+	// an identical value (an output is created once and never mutated before it
+	// is spent). Prefix, complete, and partially-poisoned states all converge to
+	// the exact post-block state.
+	for i, tx := range block.Transactions {
+		if i > 0 {
+			for _, in := range tx.TxIn {
+				cm.utxoSet.SpendUTXO(in.PreviousOutPoint)
+			}
+		}
+		txid := tx.TxHash()
+		for vout, out := range tx.TxOut {
+			cm.utxoSet.AddUTXO(wire.OutPoint{Hash: txid, Index: uint32(vout)}, &UTXOEntry{
+				Amount:     out.Value,
+				PkScript:   bytes.Clone(out.PkScript),
+				Height:     node.Height,
+				IsCoinbase: i == 0,
+			})
+		}
 	}
 
 	cm.tipNode = node
@@ -658,6 +729,15 @@ probe:
 
 	if cm.chainDB != nil {
 		batch := cm.chainDB.NewBatch()
+		// Stage the rolled-forward UTXO mutations into the SAME batch as the
+		// tip pointer. Adoption exists precisely because a previous crash left
+		// the coins and the tip out of step; committing them atomically is what
+		// stops this repair from re-creating the condition it repairs. (The old
+		// code wrote only the tip, leaving the re-apply — when there was one —
+		// in volatile cache.)
+		if err := dview.FlushBatch(batch); err != nil {
+			return fmt.Errorf("adopt: failed to stage rolled-forward UTXOs: %w", err)
+		}
 		cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
 		cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
 			BestHash:   hash,
@@ -668,7 +748,7 @@ probe:
 		}
 	}
 
-	log.Printf("chainmgr: ADOPTED already-applied block height=%d hash=%s (marker-lag repair; UTXO effects were committed by a prior session)",
+	log.Printf("chainmgr: ADOPTED already-applied block height=%d hash=%s (marker-lag repair; block re-applied by tolerant roll-forward, committed atomically with the tip)",
 		node.Height, hash.String()[:16])
 	return nil
 }
@@ -676,6 +756,26 @@ probe:
 // ErrNoAdoptionEvidence: AdoptAppliedBlock found none of the block's outputs
 // in the UTXO set — cannot prove the block was already applied.
 var ErrNoAdoptionEvidence = errors.New("no adoption evidence: none of the block's outputs are in the UTXO set")
+
+// ErrNoDurableUTXOView: AdoptAppliedBlock was called against a UTXO view with
+// no durable backing store. Marker-lag repair is only meaningful for the real
+// DB-backed set — it must read what a PRIOR session committed to disk and must
+// commit its roll-forward atomically. Fail closed so the caller keeps the
+// ordinary reject path.
+var ErrNoDurableUTXOView = errors.New("adoption requires a durable (DB-backed) UTXO view")
+
+// durableUTXOView is the optional capability AdoptAppliedBlock needs. It is
+// deliberately NOT folded into UpdatableUTXOView: that interface is also
+// implemented by intra-block scratch views used during validation, which have
+// no database and could only satisfy these methods by lying.
+type durableUTXOView interface {
+	// HasUTXODurable reports on-disk presence, bypassing cache and pending
+	// deletes.
+	HasUTXODurable(outpoint wire.OutPoint) bool
+	// FlushBatch stages all pending UTXO mutations into the caller's batch so
+	// they commit atomically with the tip pointer.
+	FlushBatch(batch storage.Batch) error
+}
 
 func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	if !cm.beginMutation() {
