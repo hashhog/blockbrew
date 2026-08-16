@@ -12,7 +12,7 @@ import (
 
 // UTXO set errors.
 var (
-	ErrUTXONotFound   = errors.New("utxo not found")
+	ErrUTXONotFound     = errors.New("utxo not found")
 	ErrUTXOAlreadySpent = errors.New("utxo already spent")
 )
 
@@ -41,7 +41,7 @@ type UTXOSet struct {
 	mu    sync.RWMutex
 	db    *storage.ChainDB
 	cache map[wire.OutPoint]*UTXOEntry // In-memory cache for performance
-	dirty map[wire.OutPoint]bool        // Modified entries needing flush
+	dirty map[wire.OutPoint]bool       // Modified entries needing flush
 	// Track deletions separately since deleted entries should be flushed too
 	deleted map[wire.OutPoint]bool
 	// FRESH flag: entries created since the last flush that have never been
@@ -50,13 +50,13 @@ type UTXOSet struct {
 	fresh map[wire.OutPoint]bool
 
 	// Performance tracking
-	cacheBytes   int64  // Approximate memory usage of cache
-	maxCacheBytes int64 // Maximum cache size in bytes
-	hits         uint64 // Cache hits
-	misses       uint64 // Cache misses
-	flushes      uint64 // Number of flush operations
-	freshHits    uint64 // Spends of FRESH entries (saved a write+delete)
-	blocksSinceFlush int // Blocks connected since last flush
+	cacheBytes       int64  // Approximate memory usage of cache
+	maxCacheBytes    int64  // Maximum cache size in bytes
+	hits             uint64 // Cache hits
+	misses           uint64 // Cache misses
+	flushes          uint64 // Number of flush operations
+	freshHits        uint64 // Spends of FRESH entries (saved a write+delete)
+	blocksSinceFlush int    // Blocks connected since last flush
 
 	// reorgJournal, when non-nil, records the pre-mutation state of every
 	// outpoint touched since BeginReorgJournal (first-write-wins). It lets a
@@ -266,6 +266,31 @@ func (u *UTXOSet) HasUTXO(outpoint wire.OutPoint) bool {
 		return false
 	}
 
+	key := storage.MakeUTXOKey(outpoint)
+	exists, err := u.db.DB().Has(key)
+	return err == nil && exists
+}
+
+// HasUTXODurable reports whether an outpoint is present in the DURABLE (on-disk)
+// UTXO set, deliberately bypassing both the in-memory cache and the pending
+// `deleted` set.
+//
+// This exists for crash-state evidence probes (AdoptAppliedBlock). Those probes
+// must attest what a PRIOR session actually committed to disk, and the cached
+// view is contaminated by the CURRENT session's own in-flight work — including
+// the residue of the very connect attempt that just failed. A probe reading
+// through HasUTXO/GetUTXO will happily confirm its own uncommitted writes,
+// turning the evidence gate into a false-positive machine (nimrod hit exactly
+// this: its first-cut probe read the cached view, "proved" a block was applied
+// off in-memory residue, and wedged the next block).
+//
+// Do NOT use this for consensus reads — it ignores pending spends and will
+// report already-spent-this-session coins as present. It answers precisely one
+// question: "is this outpoint on disk right now?"
+func (u *UTXOSet) HasUTXODurable(outpoint wire.OutPoint) bool {
+	if u.db == nil {
+		return false
+	}
 	key := storage.MakeUTXOKey(outpoint)
 	exists, err := u.db.DB().Has(key)
 	return err == nil && exists
@@ -865,9 +890,9 @@ func DecompressScript(compressed []byte) []byte {
 		}
 		// Reconstruct: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
 		script := make([]byte, 25)
-		script[0] = 0x76  // OP_DUP
-		script[1] = 0xa9  // OP_HASH160
-		script[2] = 0x14  // Push 20 bytes
+		script[0] = 0x76 // OP_DUP
+		script[1] = 0xa9 // OP_HASH160
+		script[2] = 0x14 // Push 20 bytes
 		copy(script[3:23], data)
 		script[23] = 0x88 // OP_EQUALVERIFY
 		script[24] = 0xac // OP_CHECKSIG
