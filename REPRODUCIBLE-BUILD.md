@@ -3,28 +3,45 @@
 How to build the blockbrew validator and verify it. Part of the tagged-validator release
 wrapper (see `SECURITY.md` and `../receipts/PRODUCTION-GATE.md` "three bars").
 
-> **STAGED PRE-DRAFT (2026-07-24).** Written ahead of the first tag. The pinned release
-> commit + its authoritative sha256 are recorded when `v0.1.0-rc1` is cut (after the
-> C(958794) T2 capture — see `../receipts/NODE4-BLOCKBREW-T2-CAPTURE-RUNBOOK.md`).
+> **⚠ DO NOT BUILD `v0.1.0-rc1`.** That tag contains `e7d0afe`, whose
+> `AdoptAppliedBlock` advances the chain tip without re-applying the block's UTXO
+> mutations, silently corrupting a partially-committed chainstate (measured in the
+> wild: C(958794) with the correct block hash but 166,180,926 coins against the
+> pinned 166,180,925). Superseded by **`v0.1.0-rc2`**. Details:
+> `../receipts/cache-accounting-and-adoption-rollforward-2026-08-16.md`.
 
-## Reference build (current `master`)
+## Reference build (`v0.1.0-rc2`)
 
 | | |
 |---|---|
-| Commit | `2846653` (HEAD at the time of this note) |
+| Commit | `bb1ffcf` (v0.1.0-rc2) |
 | Binary | `blockbrew/blockbrew` |
-| Commit | `e7d0afe` (v0.1.0-rc1) |
-| **sha256** | `241f779c1fdc286bc524af6328ae7c7da4c033b60af7ca1dfb4520232c3823df` |
+| **sha256** | `7dc2bbe6ce57bcdb59db2c1574f0f6ed06a239e89e2f18e80d2ed1713f0f5021` |
 | Toolchain | `go 1.24.1 linux/amd64` |
 | Target | `Linux amd64` |
-| Build | `go build -o blockbrew ./...` |
+| Build | `./build-all.sh blockbrew` (canonical; wraps `go build -o blockbrew ./...`) |
 
-> Recorded at tag time (2026-08-15) for v0.1.0-rc1 = `e7d0afe`. LINEAGE NOTE:
-> the from-genesis C(958794) validation ran on the `103ea46`-era binary; the
-> consensus delta `103ea46..e7d0afe` is one Core-parity witness-commitment
-> restructure (zero-split-verified) plus reason-token maps and the
-> capture/recovery tooling fixes included in this tag. Evidence + independent
-> hash cross-check: `receipts/r4-blockbrew-t2-3-2026-08-14.md` (T2-3).
+> Recorded at tag time (2026-08-16) for v0.1.0-rc2 = `bb1ffcf`, from the
+> canonical `build-all.sh` rebuild.
+>
+> LINEAGE NOTE (unchanged from rc1): the from-genesis C(958794) validation ran
+> on the `103ea46`-era binary; the consensus delta `103ea46..e7d0afe` is one
+> Core-parity witness-commitment restructure (zero-split-verified) plus
+> reason-token maps and the capture/recovery tooling fixes. Evidence +
+> independent hash cross-check: `receipts/r4-blockbrew-t2-3-2026-08-14.md`
+> (T2-3). That capture predates the rc1 adoption defect by ~24h and was taken
+> from a chainstate built entirely by ordinary connects, so the T2-3 result
+> stands on its own evidence.
+>
+> Superseding delta `e7d0afe..bb1ffcf`: adoption now performs a tolerant
+> roll-forward off a durable-only evidence probe, committed atomically with the
+> tip (Core `validation.cpp::RollforwardBlock` semantics).
+
+## Previous tags
+
+| tag | commit | status |
+|---|---|---|
+| `v0.1.0-rc1` | `16c68b0` | **WITHDRAWN — do not build.** Chainstate-corrupting adoption path (see banner above). Tag left in place because it was published; it is superseded, not deleted. |
 
 ## Build
 
