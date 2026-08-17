@@ -2305,11 +2305,48 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	hash := block.Header.BlockHash()
 	hdrNode, err := s.headerIndex.AddHeader(block.Header, false)
 	if err != nil {
-		// If duplicate, that's OK — return "duplicate" per BIP-22
 		if errors.Is(err, consensus.ErrDuplicateHeader) {
-			return "duplicate", nil
+			// A known HEADER is not a duplicate BLOCK.
+			//
+			// Core answers "duplicate" only when the block DATA was already
+			// known AND accepted — `if (!new_block && accepted)` after an
+			// UNCONDITIONAL ProcessNewBlock (rpc/mining.cpp:1094-1098). It
+			// looks up only the PARENT hash beforehand, and solely to run
+			// UpdateUncommittedBlockStructures. The header-lookup early-return
+			// at mining.cpp:742-749 belongs to getblocktemplate "proposal"
+			// mode, NOT to submitblock.
+			//
+			// Returning here on a known header meant a block whose header had
+			// already arrived — via submitheader, or over P2P ahead of its
+			// body — could never be submitted at all: the body was never
+			// stored and ProcessSubmittedBlock never ran, while the caller was
+			// told "duplicate". Proven directly: with a prior submitheader,
+			// submitblock answered "duplicate" and getblockcount stayed 0;
+			// without it, the same blocks connected and getblockcount reached
+			// 2.
+			//
+			// It also silently defeated boot-smoke's own mitigation —
+			// feed_bodies counts BIP-22 "duplicate" as accepted, so the gate
+			// reported "bodies via submitblock: 299" while ZERO bodies were
+			// stored. blockbrew was added to BODY_FEED_IMPLS on 2026-07-15 to
+			// fix exactly the bg-validator "failed to get block at height 1"
+			// error that this bug then re-created; the mitigation has been
+			// inert since the day it landed.
+			//
+			// StatusDataStored mirrors Core's BLOCK_HAVE_DATA, so it is the
+			// faithful analogue of Core's `!new_block`.
+			existing := s.headerIndex.GetNode(hash)
+			if existing == nil {
+				return bip22ResultStringForBlock(block, err), nil
+			}
+			if existing.Status&consensus.StatusDataStored != 0 {
+				return "duplicate", nil
+			}
+			// Header known, body not — fall through and process the block.
+			hdrNode = existing
+		} else {
+			return bip22ResultStringForBlock(block, err), nil
 		}
-		return bip22ResultStringForBlock(block, err), nil
 	}
 
 	// Active-tip vs side-branch discrimination (mirrors the P2P
