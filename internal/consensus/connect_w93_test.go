@@ -341,10 +341,39 @@ func TestW93_DisconnectBlockUTXOs_ClonesPkScript(t *testing.T) {
 		},
 	}
 
-	// An empty block with no transactions — DisconnectBlockUTXOs only walks
-	// outputs and undo entries; we want to exercise just the undo branch.
-	emptyBlock := &wire.MsgBlock{Transactions: nil}
-	if err := u.DisconnectBlockUTXOs(emptyBlock, undo); err != nil {
+	// A minimal block whose non-coinbase tx spends `op`, so the disconnect
+	// restores it. This used to pass an EMPTY block and rely on
+	// DisconnectBlockUTXOs restoring undo entries in a second pass detached
+	// from the transactions — which was the two-pass bug itself (a phantom
+	// UTXO for any intra-block chain, then BIP-30 on reconnect). The undo
+	// records are now reached through the inputs that produced them, so the
+	// block has to contain that spend. The assertion below is unchanged: the
+	// restored entry must own its PkScript bytes.
+	coinbaseTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x04, 0x01, 0x02, 0x03, 0x04},
+			Sequence:         0xFFFFFFFF,
+		}},
+		TxOut:    []*wire.TxOut{{Value: 50_00000000, PkScript: []byte{0x51}}},
+		LockTime: 0,
+	}
+	spendingTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: op,
+			SignatureScript:  []byte{0x00},
+			Sequence:         0xFFFFFFFF,
+		}},
+		TxOut:    []*wire.TxOut{{Value: 400, PkScript: []byte{0x52}}},
+		LockTime: 0,
+	}
+	block := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1},
+		Transactions: []*wire.MsgTx{coinbaseTx, spendingTx},
+	}
+	if err := u.DisconnectBlockUTXOs(block, undo); err != nil {
 		t.Fatalf("DisconnectBlockUTXOs: %v", err)
 	}
 
@@ -658,5 +687,101 @@ func TestW93_RollbackRestoresUTXOExactly(t *testing.T) {
 	}
 	if !bytes.Equal(after.PkScript, beforeScript) {
 		t.Errorf("restored PkScript mismatch: got %x want %x", after.PkScript, beforeScript)
+	}
+}
+
+// Intra-block chain on the DISCONNECT side.
+//
+// Block: coinbase, txA (spends external X, creates P), txB (spends P).
+// Once connected the UTXO set holds coinbase:0 and txB:0 — NOT P, which was
+// created and spent inside the same block.
+//
+// Core (validation.cpp:2205-2241) walks txs in reverse and does both halves
+// per tx, so txB restores P before txA removes it. Two separate passes leave P
+// behind as a phantom, and the winning branch's copy of txA then fails BIP-30
+// on the reconnect — the mainnet failure rustoshi hit at 963853 (d086a76).
+func TestDisconnectBlockUTXOs_IntraBlockChainLeavesNoPhantom(t *testing.T) {
+	db := storage.NewChainDB(storage.NewMemDB())
+	u := NewUTXOSet(db)
+
+	const height = 10
+
+	external := wire.OutPoint{Hash: wire.Hash256{0x33}, Index: 0}
+	externalEntry := UTXOEntry{
+		Amount: 1000, PkScript: []byte{0x51}, Height: 5, IsCoinbase: false,
+	}
+
+	coinbaseTx := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x04, 0x01, 0x02, 0x03, 0x04},
+			Sequence:         0xFFFFFFFF,
+		}},
+		TxOut:    []*wire.TxOut{{Value: 50_00000000, PkScript: []byte{0x51}}},
+		LockTime: 0,
+	}
+	txA := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: external, SignatureScript: []byte{0x00}, Sequence: 0xFFFFFFFF,
+		}},
+		TxOut:    []*wire.TxOut{{Value: 900, PkScript: []byte{0x52}}},
+		LockTime: 0,
+	}
+	p := wire.OutPoint{Hash: txA.TxHash(), Index: 0}
+	txB := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: p, SignatureScript: []byte{0x00}, Sequence: 0xFFFFFFFF,
+		}},
+		TxOut:    []*wire.TxOut{{Value: 800, PkScript: []byte{0x53}}},
+		LockTime: 0,
+	}
+	q := wire.OutPoint{Hash: txB.TxHash(), Index: 0}
+
+	block := &wire.MsgBlock{
+		Header:       wire.BlockHeader{Version: 1},
+		Transactions: []*wire.MsgTx{coinbaseTx, txA, txB},
+	}
+
+	// Undo carries every spent coin, including the intra-block one. txB spent
+	// P, which this same block created, so P's record is at this height.
+	undo := &UndoBlock{SpentOutputs: []SpentOutput{
+		{OutPoint: external, Entry: externalEntry},
+		{OutPoint: p, Entry: UTXOEntry{
+			Amount: 900, PkScript: []byte{0x52}, Height: height, IsCoinbase: false,
+		}},
+	}}
+
+	// Post-connect state: coinbase:0 and Q present, P absent.
+	u.AddUTXO(wire.OutPoint{Hash: coinbaseTx.TxHash(), Index: 0}, &UTXOEntry{
+		Amount: 50_00000000, PkScript: []byte{0x51}, Height: height, IsCoinbase: true,
+	})
+	u.AddUTXO(q, &UTXOEntry{
+		Amount: 800, PkScript: []byte{0x53}, Height: height, IsCoinbase: false,
+	})
+	if u.HasUTXO(p) {
+		t.Fatal("precondition: P must be absent after connect")
+	}
+
+	if err := u.DisconnectBlockUTXOs(block, undo); err != nil {
+		t.Fatalf("DisconnectBlockUTXOs: %v", err)
+	}
+
+	// The load-bearing assertion: no phantom P survives the disconnect.
+	if u.HasUTXO(p) {
+		t.Error("PHANTOM UTXO: P was created and spent inside this block, so " +
+			"disconnecting must leave it absent — leaving it behind makes the " +
+			"winning branch's copy of txA fail BIP-30")
+	}
+	if !u.HasUTXO(external) {
+		t.Error("external coin spent by txA must be restored")
+	}
+	if u.HasUTXO(q) {
+		t.Error("Q must be removed")
+	}
+	if u.HasUTXO(wire.OutPoint{Hash: coinbaseTx.TxHash(), Index: 0}) {
+		t.Error("coinbase output must be removed")
 	}
 }

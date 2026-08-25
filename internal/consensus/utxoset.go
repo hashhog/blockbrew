@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/hashhog/blockbrew/internal/storage"
@@ -1207,30 +1208,77 @@ func (u *UTXOSet) ConnectBlockUTXOs(block *wire.MsgBlock, height int32) (*UndoBl
 // DisconnectBlockUTXOs reverses the effects of ConnectBlockUTXOs.
 // It removes outputs created by the block and restores spent UTXOs from undo data.
 func (u *UTXOSet) DisconnectBlockUTXOs(block *wire.MsgBlock, undo *UndoBlock) error {
-	// Process transactions in reverse order
+	// Index the undo records by outpoint. SpentOutput carries its own
+	// OutPoint, so the flat list is self-describing and each tx can pick out
+	// its own inputs inside the reverse walk below.
+	spent := make(map[wire.OutPoint]*SpentOutput, len(undo.SpentOutputs))
+	for i := range undo.SpentOutputs {
+		spent[undo.SpentOutputs[i].OutPoint] = &undo.SpentOutputs[i]
+	}
+	restored := 0
+
+	// Process transactions in reverse order, and for EACH tx remove its
+	// created outputs and THEN restore its spent inputs before moving on —
+	// Core validation.cpp:2205-2241.
+	//
+	// The per-tx interleave is load-bearing. This function previously removed
+	// every tx's outputs in one pass and then restored every tx's inputs in a
+	// second. That breaks on an intra-block chain (txA creates P, a later txB
+	// in the same block spends it, so P is absent once the block is
+	// connected): txA's removal of P finds nothing, and the later input pass
+	// re-adds P and leaves it behind. The phantom coin then fails BIP-30 when
+	// the winning branch re-creates it, refusing the reorg. rustoshi shipped
+	// exactly this two-pass shape and sat wedged on mainnet at 963853 for ~19h
+	// refusing the block the rest of the network had already accepted
+	// (rustoshi d086a76).
+	//
+	// blockbrew's PRODUCTION disconnect is ChainManager.DisconnectBlock
+	// (chainmanager.go:2005), which has always interleaved correctly. This
+	// function has no production caller and is exercised only by tests — but a
+	// second, wrong implementation of consensus-critical logic is precisely the
+	// trap that produced four of this week's defects, so it is corrected rather
+	// than left as a loaded gun for whoever wires it up next.
 	for i := len(block.Transactions) - 1; i >= 0; i-- {
 		tx := block.Transactions[i]
 		txHash := tx.TxHash()
 
-		// Remove outputs created by this transaction
+		// Remove outputs created by this transaction.
 		for idx := range tx.TxOut {
 			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(idx)}
 			u.SpendUTXO(outpoint)
 		}
+
+		// Coinbase (i == 0) has no inputs to restore.
+		if i == 0 {
+			continue
+		}
+
+		// Restore this tx's inputs in REVERSE order (Core:2233-2239).
+		for j := len(tx.TxIn) - 1; j >= 0; j-- {
+			outpoint := tx.TxIn[j].PreviousOutPoint
+			so, ok := spent[outpoint]
+			if !ok {
+				return fmt.Errorf("disconnect: no undo record for %s:%d",
+					outpoint.Hash.String()[:16], outpoint.Index)
+			}
+			// W93 fix #6 (PkScript aliasing on UTXO restore — W82/W92
+			// pattern): `entry := so.Entry` shallow-copies the struct but its
+			// PkScript slice header still points at the undo record's backing
+			// array. Cloning ensures the restored cache entry holds its own
+			// buffer so later mutations of `undo` cannot corrupt the UTXOSet.
+			// Mirrors the clone discipline used by AddTxOutputs.
+			entry := so.Entry // shallow copy
+			entry.PkScript = bytes.Clone(entry.PkScript)
+			u.AddUTXO(outpoint, &entry)
+			restored++
+		}
 	}
 
-	// Restore all spent UTXOs from undo data.
-	//
-	// W93 fix #6 (PkScript aliasing on UTXO restore — W82/W92 pattern):
-	// `entry := so.Entry` shallow-copies the struct but its PkScript slice
-	// header still points at undo.SpentOutputs[i].Entry.PkScript's backing
-	// array. Cloning the slice ensures the restored cache entry holds its
-	// own buffer so subsequent mutations of `undo` cannot corrupt the
-	// UTXOSet. Mirrors the clone discipline used by AddTxOutputs.
-	for _, so := range undo.SpentOutputs {
-		entry := so.Entry // shallow copy
-		entry.PkScript = bytes.Clone(entry.PkScript)
-		u.AddUTXO(so.OutPoint, &entry)
+	// Every undo record belongs to some input of some non-coinbase tx; if the
+	// walk did not consume them all, block and undo disagree.
+	if restored != len(undo.SpentOutputs) {
+		return fmt.Errorf("disconnect: restored %d of %d undo records "+
+			"(block and undo data disagree)", restored, len(undo.SpentOutputs))
 	}
 
 	return nil
