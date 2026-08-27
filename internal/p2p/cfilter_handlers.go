@@ -61,7 +61,7 @@ type PeerDisconnector interface {
 // CFilterMessageSender is the minimal Peer surface used to push cfilter /
 // cfheaders / cfcheckpt responses back to the peer.
 type CFilterMessageSender interface {
-	SendMessage(msg Message)
+	SendMessage(msg Message) bool
 }
 
 // CFilterRequestPeer combines the disconnect + send surfaces.

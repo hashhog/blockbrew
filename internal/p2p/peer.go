@@ -1274,14 +1274,26 @@ func (p *Peer) Disconnect() {
 }
 
 // SendMessage queues a message for sending.
-func (p *Peer) SendMessage(msg Message) {
+// SendMessage queues msg for delivery. Returns true if the message was
+// queued, false if it was DROPPED (send queue full, or peer quitting).
+//
+// #73/#74 (2026-08-27): the drop used to be SILENT — the exact
+// silent-null hot path that produced blockbrew's chronic tip stalls:
+// requestBlocks marked a block InFlight, SendMessage dropped the getdata
+// on a mempool-relay-saturated queue, no peer ever answered a request
+// that never left the box, and the stall detector looped. Callers with
+// delivery-critical messages MUST check the return; the drop is now also
+// logged (rate-limited by Go's log throughput — acceptable: drops are
+// rare and each one used to cost a 30s+ stall).
+func (p *Peer) SendMessage(msg Message) bool {
 	select {
 	case p.sendQueue <- msg:
-		// Message queued successfully
+		return true
 	case <-p.quit:
-		// Peer is disconnecting
+		return false
 	default:
-		// Queue is full - drop message (could log this)
+		log.Printf("p2p: send queue FULL for %s — dropping %s", p.Address(), msg.Command())
+		return false
 	}
 }
 

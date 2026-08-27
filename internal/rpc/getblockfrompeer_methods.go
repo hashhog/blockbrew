@@ -39,7 +39,7 @@ import (
 // unit-testable without a live socket.
 type fetchPeer interface {
 	IsConnected() bool
-	SendMessage(msg p2p.Message)
+	SendMessage(msg p2p.Message) bool
 }
 
 // fetchPeerLister enumerates the connected peers in the same order and with

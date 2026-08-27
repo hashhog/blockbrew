@@ -18,7 +18,7 @@ type mockFetchPeer struct {
 }
 
 func (m *mockFetchPeer) IsConnected() bool           { return m.connected }
-func (m *mockFetchPeer) SendMessage(msg p2p.Message) { m.sent = append(m.sent, msg) }
+func (m *mockFetchPeer) SendMessage(msg p2p.Message) bool { m.sent = append(m.sent, msg); return true }
 
 // mockFetchLister returns a fixed peer slice in a deterministic order, exactly
 // mirroring how peerMgr.ConnectedPeers() feeds getpeerinfo's `id: i` indexing.

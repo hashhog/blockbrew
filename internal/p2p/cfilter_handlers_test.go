@@ -92,7 +92,7 @@ func (p *mockPeer) Misbehaving(score int, reason string) bool {
 }
 
 func (p *mockPeer) Disconnect()              { p.disconnected = true }
-func (p *mockPeer) SendMessage(msg Message)  { p.sent = append(p.sent, msg) }
+func (p *mockPeer) SendMessage(msg Message) bool { p.sent = append(p.sent, msg); return true }
 
 // ----------------------------------------------------------------------------
 // Chain construction helpers.

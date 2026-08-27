@@ -2479,7 +2479,28 @@ func (sm *SyncManager) requestBlocks() {
 			if end > len(invList) {
 				end = len(invList)
 			}
-			peer.SendMessage(&MsgGetData{InvList: invList[start:end]})
+			batch := invList[start:end]
+			if !peer.SendMessage(&MsgGetData{InvList: batch}) {
+				// #73/#74: the getdata never left the box (send queue full
+				// or peer quitting). Revert these requests IMMEDIATELY —
+				// leaving them InFlight against a request that was never
+				// sent is exactly the chronic 30s+ tip stall (964241,
+				// 964255: peers "never delivered" blocks they were never
+				// asked for). Short retry backoff; requestBlocks' round-
+				// robin picks a different peer next tick.
+				sm.mu.Lock()
+				for _, inv := range batch {
+					if req, ok := sm.inflight[inv.Hash]; ok && req.Peer == peer {
+						req.State = BlockDownloadPending
+						req.Peer = nil
+						req.NextRetryAt = time.Now().Add(2 * time.Second)
+						delete(sm.inflight, inv.Hash)
+					}
+				}
+				sm.mu.Unlock()
+				log.Printf("sync: getdata batch of %d DROPPED for %s — requests reverted to pending",
+					len(batch), peer.Address())
+			}
 		}
 	}
 
