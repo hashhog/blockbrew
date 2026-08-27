@@ -735,8 +735,16 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 		return
 	}
 
-	// Ignore headers from non-sync peers during initial sync
-	if sm.syncPeer != nil && peer != sm.syncPeer {
+	// Ignore headers from non-sync peers during INITIAL sync only.  The
+	// comment always said "during initial sync" but the code applied the
+	// gate unconditionally, so at tip a new block announced by any peer
+	// other than the (single) sync peer was DROPPED — the "late learning"
+	// half of the recurring at-tip lag (task #75; blocks learned 30s-15m
+	// late, then fetched via notfound-cycling).  Core processes headers
+	// from ANY peer (net_processing.cpp:4728).  Keep the single-peer
+	// discipline for IBD (deliberate blockbrew design); at tip
+	// (headersSynced) accept announcements from every peer.
+	if sm.syncPeer != nil && peer != sm.syncPeer && !sm.headersSynced {
 		return
 	}
 

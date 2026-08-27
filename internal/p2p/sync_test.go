@@ -421,12 +421,52 @@ func TestSyncManagerIgnoresNonSyncPeer(t *testing.T) {
 
 	msg := &MsgHeaders{Headers: headers}
 
-	// Handle from non-sync peer
+	// Handle from non-sync peer DURING INITIAL SYNC (headersSynced=false,
+	// the fixture default): the single-peer IBD discipline still ignores it.
 	sm.HandleHeaders(otherPeer, msg)
 
 	// Should NOT have added headers
 	if idx.BestHeight() != 0 {
 		t.Errorf("best height = %d, want 0 (headers from non-sync peer should be ignored)",
+			idx.BestHeight())
+	}
+}
+
+// AT TIP, headers from ANY peer must be processed — Core runs
+// ProcessHeadersMessage for every peer (net_processing.cpp:4728).  The old
+// gate applied the initial-sync single-peer discipline unconditionally, so a
+// new block announced by a non-sync peer was silently dropped (the "late
+// learning" half of task #75's recurring at-tip lag).  FAILS AT PARENT.
+func TestSyncManagerAcceptsNonSyncPeerHeadersWhenSynced(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	syncPeer := createMockPeer("1.2.3.4:8333", 100)
+	sm.mu.Lock()
+	sm.syncPeer = syncPeer
+	sm.headersSynced = true // at tip
+	sm.mu.Unlock()
+
+	otherPeer := createMockPeer("5.6.7.8:8333", 200)
+
+	headers := make([]wire.BlockHeader, 5)
+	prevHash := params.GenesisHash
+	prevTimestamp := params.GenesisBlock.Header.Timestamp
+	for i := 0; i < 5; i++ {
+		headers[i] = createTestBlockHeader(prevHash, prevTimestamp+600, uint32(i+1))
+		prevHash = headers[i].BlockHash()
+		prevTimestamp = headers[i].Timestamp
+	}
+
+	sm.HandleHeaders(otherPeer, &MsgHeaders{Headers: headers})
+
+	if idx.BestHeight() != 5 {
+		t.Errorf("best height = %d, want 5 (at tip, headers from any peer must be processed)",
 			idx.BestHeight())
 	}
 }

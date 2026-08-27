@@ -524,8 +524,14 @@ func CalculateSequenceLocks(tx *wire.MsgTx, prevHeights []int32, getMTP MTPLooku
 
 		seq := in.Sequence
 
-		// If the disable flag is set, skip this input.
+		// If the disable flag is set, skip this input.  Core ALSO zeroes
+		// prevheights[txinIndex] (consensus/tx_verify.cpp:50) so later
+		// consumers of the slice never see a stale height for a
+		// lock-disabled input.  Latent here today (both callers rebuild
+		// prevHeights per tx), but the divergence was pinned by w132 G16
+		// and a future caller that reuses the slice would inherit it.
 		if seq&SequenceLockTimeDisabledFlag != 0 {
+			prevHeights[i] = 0
 			continue
 		}
 

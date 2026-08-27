@@ -327,7 +327,7 @@ func TestW132_G15_DisableFlag_SkipsInput(t *testing.T) {
 
 // G16: Core zeroes prevHeights[i] on DISABLE_FLAG. blockbrew does NOT.
 // BUG-3 — latent (no caller iterates prevHeights post-call today).
-func TestW132_G16_BUG3_DisableFlag_DoesNotZeroPrevHeights(t *testing.T) {
+func TestW132_G16_DisableFlagZeroesPrevHeights(t *testing.T) {
 	tx := &wire.MsgTx{
 		Version: 2,
 		TxIn: []*wire.TxIn{
@@ -345,12 +345,12 @@ func TestW132_G16_BUG3_DisableFlag_DoesNotZeroPrevHeights(t *testing.T) {
 	prevHeights := []int32{9_999_999, 50}
 	_ = CalculateSequenceLocks(tx, prevHeights, func(int32) int64 { return 0 })
 
-	// blockbrew bug: prevHeights[0] is still 9_999_999, NOT zeroed.
-	// Core would have set prevHeights[0] = 0.
-	if prevHeights[0] == 0 {
-		t.Fatal("BUG-3 closed? prevHeights[0] is 0, expected 9_999_999 (current blockbrew behavior)")
+	// FLIPPED (was BUG-3's lock-in): Core zeroes prevheights[txinIndex]
+	// for a lock-disabled input (consensus/tx_verify.cpp:50) and so do we.
+	// FAILS AT PARENT (parent left 9_999_999 in place).
+	if prevHeights[0] != 0 {
+		t.Fatalf("prevHeights[0] = %d, want 0 (Core zeroes disabled inputs)", prevHeights[0])
 	}
-	t.Logf("BUG-3 confirmed: prevHeights[0]=%d (Core zeroes to 0)", prevHeights[0])
 	// prevHeights[1] should be untouched (50) in both Core and blockbrew.
 	if prevHeights[1] != 50 {
 		t.Errorf("prevHeights[1] should be 50, got %d", prevHeights[1])

@@ -1286,6 +1286,17 @@ func (p *Peer) Disconnect() {
 // logged (rate-limited by Go's log throughput — acceptable: drops are
 // rare and each one used to cost a 30s+ stall).
 func (p *Peer) SendMessage(msg Message) bool {
+	// Check quit FIRST, deterministically.  A single select with both the
+	// queue and the closed quit channel ready picks RANDOMLY, so a message
+	// to a quitting peer reported "queued" about half the time — the #74
+	// contract (false = dropped, caller reverts) needs the drop to be
+	// reliable.  Its own pin (TestSendMessageReportsDrop) was the flake
+	// that exposed this.
+	select {
+	case <-p.quit:
+		return false
+	default:
+	}
 	select {
 	case p.sendQueue <- msg:
 		return true
