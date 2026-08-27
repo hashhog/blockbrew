@@ -1134,6 +1134,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				// W69d: Direct cache read — populated above, same UTXOs.
 				if utxo, ok := cachedView.cache[in.PreviousOutPoint]; ok && utxo != nil {
 					prevHeights[j] = utxo.Height
+				} else {
+					// #53 (2026-08-27): a miss here means the input coin was
+					// created by an earlier tx IN THIS BLOCK (intra-block
+					// chain) or a bookkeeping bug. Core assigns such coins
+					// the containing block's height (CalculateSequenceLocks:
+					// MEMPOOL_HEIGHT coins -> tip+1). The old zero default
+					// made every BIP-68 height lock on the input TRIVIALLY
+					// SATISFIED — fail-open on a chain-derived value (the
+					// fabrication family). The mempool caller already uses
+					// the conservative height; the connect path now matches.
+					prevHeights[j] = node.Height
 				}
 			}
 			// Create MTP lookup function using header index
