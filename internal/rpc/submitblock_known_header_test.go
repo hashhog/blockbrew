@@ -98,3 +98,49 @@ func TestSubmitBlockGenuineDuplicateStillDuplicate(t *testing.T) {
 			`"duplicate" (Core: !new_block && accepted), got %v`, res2)
 	}
 }
+
+// TestSubmitBlockDuplicateStillActivates pins #73 layer B — the 964241 wedge's
+// blocked repair path, reconstructed exactly as observed live on mainnet
+// 2026-08-27: header known, body on disk, StatusDataStored set, but the block
+// NEVER CONNECTED. Core's submitblock answers "duplicate" for such a block but
+// still runs ProcessNewBlock unconditionally (rpc/mining.cpp:1094-1098), whose
+// ActivateBestChain connects a stored-but-unconnected best-chain block. Our
+// StatusDataStored early-return skipped that, so submitblock(964241) answered
+// "duplicate" while the tip stayed put — the manual repair path was
+// permanently gated. The BIP-22 answer stays "duplicate"; the ACTIVATION must
+// happen anyway.
+func TestSubmitBlockDuplicateStillActivates(t *testing.T) {
+	rig := newSubmitBlockRig(t, 2)
+
+	tip := rig.tips[len(rig.tips)-1]
+	blk := buildRegtestBlock(t, rig.params, tip)
+	hash := blk.Header.BlockHash()
+
+	// Strand the block: header + body + StatusDataStored, no connect.
+	if _, err := rig.idx.AddHeader(blk.Header, false); err != nil {
+		t.Fatalf("pre-seeding header: %v", err)
+	}
+	if err := rig.db.StoreBlock(hash, blk); err != nil {
+		t.Fatalf("pre-storing body: %v", err)
+	}
+	rig.idx.MarkDataStored(hash)
+
+	_, beforeH := rig.cm.BestBlock()
+
+	res, rpcErr := rig.submitBlock(t, blk)
+	if rpcErr != nil {
+		t.Fatalf("submitblock errored: %v", rpcErr)
+	}
+	if s, _ := res.(string); s != "duplicate" {
+		t.Errorf(`stored-block resubmission must still answer "duplicate" `+
+			`(Core: !new_block && accepted), got %v`, res)
+	}
+
+	_, afterH := rig.cm.BestBlock()
+	if afterH != beforeH+1 {
+		t.Fatalf("stored-but-unconnected block was NOT activated by submitblock: "+
+			"tip height %d -> %d (want %d). This is the #73 strand: \"duplicate\" "+
+			"without Core's unconditional ProcessNewBlock leaves the node wedged "+
+			"behind a block it already holds.", beforeH, afterH, beforeH+1)
+	}
+}

@@ -2340,6 +2340,29 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 				return bip22ResultStringForBlock(block, err), nil
 			}
 			if existing.Status&consensus.StatusDataStored != 0 {
+				// #73: a stored body is NOT proof the block was ever
+				// CONNECTED. Core's submitblock answers "duplicate" for a
+				// known block but STILL runs ProcessNewBlock unconditionally
+				// (rpc/mining.cpp:1094-1098), whose ActivateBestChain will
+				// connect a stored-but-unconnected best-chain block. Our
+				// early return skipped that, so "duplicate" permanently
+				// blocked the manual repair path for the 964241 strand
+				// (submitblock(964241)="duplicate", tip stayed 964240).
+				// Match Core: if the block is not on the active chain at
+				// its height, attempt activation before answering.
+				onActive := false
+				if s.chainDB != nil {
+					if ah, herr := s.chainDB.GetBlockHashByHeight(existing.Height); herr == nil && ah == hash {
+						onActive = true
+					}
+				}
+				if !onActive && s.chainMgr != nil {
+					if perr := s.chainMgr.ProcessSubmittedBlock(block); perr != nil &&
+						!errors.Is(perr, consensus.ErrSideBranchAccepted) {
+						log.Printf("rpc: submitblock duplicate-activation of %s (h=%d) failed: %v",
+							hash.String()[:16], existing.Height, perr)
+					}
+				}
 				return "duplicate", nil
 			}
 			// Header known, body not — fall through and process the block.

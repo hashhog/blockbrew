@@ -166,6 +166,11 @@ type blockRequest struct {
 	// exponent). Deliberately separate from RetryCount, which drives
 	// peer rotation and is zeroed by design on a pending-reset.
 	StallResets int
+
+	// FastPathFailed latches when fastPathDispatch's disk read failed for
+	// this request despite HasBlock=true; requestBlocks then stops
+	// diverting it from the network (#73 layer D).
+	FastPathFailed bool
 }
 
 // stallBackoff returns the re-request delay after the nth stall reset:
@@ -179,6 +184,18 @@ func stallBackoff(resets int) time.Duration {
 		return 60 * time.Second
 	}
 	return d
+}
+
+// stallShouldRearm reports whether the stall handler may (re)arm the retry
+// backoff for a Pending request. A Pending request whose NextRetryAt is
+// still in the future must be left alone: requestBlocks will act the moment
+// the armed backoff expires, and resetting it on every stall pass starves
+// that gate forever (#73).
+func stallShouldRearm(req *blockRequest, now time.Time) bool {
+	if req.State != BlockDownloadPending {
+		return true
+	}
+	return req.NextRetryAt.IsZero() || !now.Before(req.NextRetryAt)
 }
 
 // blockWithRequest pairs a received block with its request metadata.
@@ -2122,7 +2139,19 @@ func (sm *SyncManager) blockDownloadLoop() {
 						log.Printf("sync: stall detected at height %d: state=%d, inflight=%d, peer=%v, retries=%d, stallDuration=%v",
 							nh, req.State, inflightLen, req.Peer != nil, req.RetryCount, stallDuration)
 
-						if req.State == BlockDownloadPending {
+						if req.State == BlockDownloadPending && !stallShouldRearm(req, time.Now()) {
+							// A retry backoff is already armed and still ticking.
+							// LEAVE IT ALONE. Re-arming NextRetryAt on every stall
+							// pass (10s ticker) pushes the deadline perpetually
+							// into the future once the backoff length exceeds the
+							// pass interval, so requestBlocks' backoff gate never
+							// opens and the block is never requested again — the
+							// permanence half of the 964241 tip wedge (#73;
+							// timeline: backoff 16s->32s->60s re-armed every
+							// 5-15s for 12+ minutes, zero requests issued).
+							log.Printf("sync: block %d stalled, backoff already armed (%s left) — waiting it out",
+								nh, time.Until(req.NextRetryAt).Round(time.Second))
+						} else if req.State == BlockDownloadPending {
 							// Block is pending but not being downloaded.
 							// This happens when all peers are busy or disconnected.
 							// Force a re-request by logging and letting requestBlocks
@@ -2362,7 +2391,7 @@ func (sm *SyncManager) requestBlocks() {
 		// over indexed blocks), skip the network round-trip and queue
 		// it for validation directly. Closes the gap the requeue comment
 		// at requeueForRedownload has long claimed was already in place.
-		if sm.chainDB != nil && sm.chainDB.HasBlock(req.Hash) {
+		if sm.chainDB != nil && !req.FastPathFailed && sm.chainDB.HasBlock(req.Hash) {
 			alreadyHave = append(alreadyHave, req)
 			continue
 		}
@@ -2904,6 +2933,16 @@ func (sm *SyncManager) fastPathDispatch(req *blockRequest) {
 	}
 	block, err := sm.chainDB.GetBlock(req.Hash)
 	if err != nil {
+		// LOUD, and route around: HasBlock said the body exists but the
+		// read failed (torn write / flatfile-index mismatch). Silence here
+		// left the request diverted from the network every 100ms with no
+		// trace — a silent-null hot path (#73 layer D). Flag the request
+		// so requestBlocks stops diverting it and fetches from a peer.
+		log.Printf("sync: FAST-PATH READ FAILED for block %s (h=%d) despite HasBlock=true: %v — falling back to network fetch",
+			req.Hash.String()[:16], req.Height, err)
+		sm.mu.Lock()
+		req.FastPathFailed = true
+		sm.mu.Unlock()
 		return
 	}
 
