@@ -895,6 +895,14 @@ func TestPreciousBlock(t *testing.T) {
 		t.Fatalf("failed to add B1 header: %v", err)
 	}
 	db.StoreBlock(blockB1.Header.BlockHash(), blockB1)
+	// Flag B1's node as having block data on disk — exactly what real
+	// side-branch receipt does (the flush path sets StatusDataStored), and
+	// what the sibling assumevalid_gate tests do.  Without it,
+	// RecalculateBestTip's data-to-genesis guard skips B1, so the precious
+	// reorg has no selectable candidate.  (This was the pre-existing
+	// TestPreciousBlock failure — a test-setup omission, not a node bug:
+	// production correctly refuses to precious a block whose data it lacks.)
+	nodeB1.Status |= StatusDataStored
 
 	// Currently on chain A (it was connected first)
 	tipHash, _ := cm.BestBlock()

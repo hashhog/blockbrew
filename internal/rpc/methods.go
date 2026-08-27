@@ -778,23 +778,44 @@ func (s *Server) handleGetChainTips() (interface{}, *RPCError) {
 		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
 	}
 
-	// Get the best tip
-	bestTip := s.headerIndex.BestTip()
-	if bestTip == nil {
+	// The ACTIVE tip is the VALIDATED chain tip (block data connected), not
+	// the header-index best tip.  Core's getchaintips reports the
+	// active-chain tip (m_chain.Tip(), which requires BLOCK_VALID_TRANSACTIONS)
+	// as "active"; a header-only tip is reported separately as "headers-only".
+	// The old code labelled headerIndex.BestTip() "active" even when the
+	// header chain was ahead of the validated chain (normal mid-IBD / bodies
+	// pending) — a header-tip-as-active divergence (#43).
+	validated := s.chainMgr.BestBlockNode()
+	if validated == nil {
 		return []ChainTip{}, nil
 	}
-
 	tips := []ChainTip{
 		{
-			Height:    bestTip.Height,
-			Hash:      bestTip.Hash.String(),
+			Height:    validated.Height,
+			Hash:      validated.Hash.String(),
 			BranchLen: 0,
 			Status:    "active",
 		},
 	}
 
-	// TODO: For a complete implementation, we would traverse the header index
-	// to find all chain tips (nodes with no children that aren't on the main chain)
+	// If the best HEADER tip is ahead of the validated tip on the same
+	// lineage (headers-first sync with bodies still pending), report it as a
+	// distinct "headers-only" tip — its BranchLen is the count of headers
+	// above the validated tip.  (Full enumeration of sibling side-branch
+	// tips remains a completeness gap — Core walks every leaf; documented.)
+	headerTip := s.headerIndex.BestTip()
+	if headerTip != nil && headerTip.Hash != validated.Hash &&
+		headerTip.Height > validated.Height {
+		anc := headerTip.GetAncestor(validated.Height)
+		if anc != nil && anc.Hash == validated.Hash {
+			tips = append(tips, ChainTip{
+				Height:    headerTip.Height,
+				Hash:      headerTip.Hash.String(),
+				BranchLen: headerTip.Height - validated.Height,
+				Status:    "headers-only",
+			})
+		}
+	}
 
 	return tips, nil
 }
