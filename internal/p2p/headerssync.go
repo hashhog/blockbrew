@@ -392,12 +392,41 @@ func (s *HeadersSyncState) NextLocator(bestTip func(height int32) wire.Hash256) 
 		locator = append(locator, s.redownloadBufferLastHash)
 	}
 
-	// G18: append chain_start locator (exponential step-back from chain_start).
-	// We keep it simple: include chain_start hash. The peer will use the first
-	// matching entry. This mirrors Core's LocatorEntries(&m_chain_start) call.
-	locator = append(locator, s.chainStartHash)
+	// G18: append chain_start locator entries — Core's
+	// LocatorEntries(&m_chain_start) (chain.cpp:26-43): chain_start's own
+	// hash, then exponentially spaced ancestors down to and including
+	// genesis. A bare chain_start hash is the 2-hash anti-pattern this
+	// fleet has hit three times (nimrod 4deead0, camlcoin's PRESYNC
+	// unwedge, clearbit 7b97bce): if nothing in the locator is known to
+	// the peer, it serves from genesis and the sync tears down forever.
+	locator = append(locator, chainStartLocatorEntries(s.chainStartHeight, s.chainStartHash, bestTip)...)
 
 	return locator
+}
+
+// chainStartLocatorEntries mirrors Core's LocatorEntries (chain.cpp:26-43)
+// anchored at chain_start: its own hash first, then exponentially spaced
+// ancestors resolved through bestTip, terminating at genesis (height 0).
+// Heights bestTip cannot resolve (zero hash) are skipped — the header
+// index can be sparse — but genesis is still always attempted, so the
+// locator never loses its anchor.
+func chainStartLocatorEntries(startHeight int32, startHash wire.Hash256, bestTip func(height int32) wire.Hash256) []wire.Hash256 {
+	entries := []wire.Hash256{startHash}
+	step := int32(1)
+	height := startHeight
+	for height > 0 {
+		height -= step
+		if height < 0 {
+			height = 0
+		}
+		if len(entries) > 10 {
+			step *= 2
+		}
+		if h := bestTip(height); h != (wire.Hash256{}) {
+			entries = append(entries, h)
+		}
+	}
+	return entries
 }
 
 // validateAndStoreHeadersCommitments validates the batch in PRESYNC mode,

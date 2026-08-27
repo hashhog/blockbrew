@@ -21,7 +21,7 @@ package p2p
 //   G15 NextLocator FINAL → nil
 //   G16 NextLocator PRESYNC → last header hash as first entry
 //   G17 NextLocator REDOWNLOAD → redownloadBufferLastHash as first entry
-//   G18 NextLocator always appends chainStartHash
+//   G18 NextLocator always appends chain_start LocatorEntries (exp walk → genesis)
 //   G19 connectivity check in PRESYNC
 //   G20 per-header validation loop
 //   G21 PRESYNC → REDOWNLOAD transition on work threshold
@@ -742,5 +742,57 @@ func TestProcessNextHeaders_RedownloadNonFull(t *testing.T) {
 	// State should be finalized (G14).
 	if hss.phase != HeadersSyncFinal {
 		t.Error("state should be FINAL after non-full REDOWNLOAD (G14)")
+	}
+}
+
+// TestNextLocator_ChainStartEntries pins the 2026-08-27 G18 fix: the
+// locator must append Core's LocatorEntries(&m_chain_start) — chain_start's
+// hash followed by exponentially spaced ancestors down to and INCLUDING
+// genesis (chain.cpp:26-43) — not the bare chain_start hash. With only
+// [last_header, chain_start], a peer that recognizes neither hash serves
+// from genesis and the sync tears down forever: the nimrod 4deead0 /
+// camlcoin PRESYNC-unwedge / clearbit 7b97bce anti-pattern.
+func TestNextLocator_ChainStartEntries(t *testing.T) {
+	// Standalone chain_start node at height 1000 (MTP walk is nil-safe).
+	cs := &consensus.BlockNode{
+		Header: wire.BlockHeader{
+			Version:   1,
+			Timestamp: uint32(1_700_000_000),
+			Bits:      0x207fffff,
+		},
+		Height:    1000,
+		TotalWork: big.NewInt(1000),
+	}
+	cs.Hash = cs.Header.BlockHash()
+	hss := buildHSSForTest(t, cs, new(big.Int).Lsh(big.NewInt(1), 250))
+
+	// bestTip resolves every height to a distinct synthetic hash.
+	genesisHash := wire.Hash256{0xEE}
+	bestTipFn := func(h int32) wire.Hash256 {
+		if h == 0 {
+			return genesisHash
+		}
+		var out wire.Hash256
+		out[0] = 0xE0
+		out[1] = byte(h)
+		out[2] = byte(h >> 8)
+		return out
+	}
+
+	loc := hss.NextLocator(bestTipFn)
+
+	// Pre-fix behavior: exactly [lastHeaderReceived, chainStartHash].
+	if len(loc) <= 2 {
+		t.Fatalf("locator has %d entries — the bare 2-hash chain_start shape (want a real LocatorEntries walk)", len(loc))
+	}
+	if loc[1] != cs.Hash {
+		t.Errorf("locator[1] = %v, want chain_start hash %v", loc[1], cs.Hash)
+	}
+	if loc[len(loc)-1] != genesisHash {
+		t.Errorf("locator does not terminate at genesis: last = %v", loc[len(loc)-1])
+	}
+	// ~1000 heights under a doubling step must compress far below 1000.
+	if len(loc) > 64 {
+		t.Errorf("locator has %d entries — the walk is not exponential", len(loc))
 	}
 }
