@@ -27,9 +27,26 @@ import (
 // "sequence" (rawtransaction_util.cpp:57-66).
 type createRawTxInput struct {
 	TxID        string
+	Hash        wire.Hash256
 	Vout        uint32
 	Sequence    uint32
 	HasSequence bool
+}
+
+// isJSONNumber reports whether a raw JSON value is a NUMBER token, which is
+// Go's answer to univalue's UniValue::isNum().
+//
+// Core guards several argument reads with isNum() and takes NO else branch, so
+// "present but not a number" has to be distinguishable from "present and
+// numeric but out of range" — encoding/json's unmarshal error collapses those
+// two into one. A JSON number is the only value that can begin with '-' or a
+// digit; every other type starts with 't', 'f', 'n', '"', '{' or '['.
+func isJSONNumber(raw json.RawMessage) bool {
+	b := bytes.TrimSpace(raw)
+	if len(b) == 0 {
+		return false
+	}
+	return b[0] == '-' || (b[0] >= '0' && b[0] <= '9')
 }
 
 func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}, *RPCError) {
@@ -55,6 +72,27 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 		if err := json.Unmarshal(ri["txid"], &in.TxID); err != nil {
 			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, missing txid key"}
 		}
+		// Core runs ParseHashO FIRST in AddInputs (rawtransaction_util.cpp:38),
+		// before it so much as looks at "vout", and ParseHashV
+		// (rpc/util.cpp:117-125) has TWO distinct messages at -8:
+		//
+		//   wrong length : "txid must be of length 64 (not 3, for 'abc')"
+		//   right length, bad hex chars:
+		//                  "txid must be hexadecimal string (not '<the string>')"
+		//
+		// blockbrew answered -32602 "Invalid txid: abc" for both, from a
+		// NewHash256FromHex call further down — after the outputs had already
+		// been parsed. That is wrong twice: the CODE (-32602 says the request
+		// envelope is malformed; Core says -8, two well-formed arguments are
+		// invalid) and the ORDER (a malformed txid alongside a bad address or a
+		// negative vout must report the TXID, which the live Core node
+		// confirms). Reuse the package's existing ParseHashV port rather than
+		// re-deriving the messages here.
+		hash, herr := parseHashV(in.TxID, "txid")
+		if herr != nil {
+			return nil, herr
+		}
+		in.Hash = hash
 		voutRaw, ok := ri["vout"]
 		if !ok {
 			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, missing vout key"}
@@ -80,10 +118,40 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, vout cannot be negative"}
 		}
 		in.Vout = uint32(vout)
-		if seqRaw, ok := ri["sequence"]; ok {
+		// Core guards the ENTIRE sequence read with `if (sequenceObj.isNum())`
+		// and offers no else (rawtransaction_util.cpp:57-65):
+		//
+		//   const UniValue& sequenceObj = o.find_value("sequence");
+		//   if (sequenceObj.isNum()) {
+		//       int64_t seqNr64 = sequenceObj.getInt<int64_t>();
+		//       if (seqNr64 < 0 || seqNr64 > CTxIn::SEQUENCE_FINAL) throw ...;
+		//       else nSequence = (uint32_t)seqNr64;
+		//   }
+		//
+		// So a "sequence" that is PRESENT but NOT a number — a string, bool,
+		// object, array or null — is IGNORED and the default computed below
+		// still applies. Core ACCEPTS such a call; blockbrew rejected it with
+		// -8 "Invalid parameter, sequence number is out of range", a message
+		// that is wrong twice over: nothing was out of range, and the value was
+		// not a number to have a range in the first place.
+		//
+		// HasSequence stays false in that case, which is what routes the input
+		// back to sequenceForLocktime. With `replaceable` absent that default
+		// is MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD), so the built transaction is
+		// REPLACEABLE — falling through to SEQUENCE_FINAL would also "accept"
+		// while quietly producing a non-replaceable transaction, which is the
+		// other side of the same trap.
+		//
+		// The isNum() test has to be made on the RAW TOKEN because
+		// encoding/json reports one error for "not a number" and for "a number
+		// that will not fit an int64", and Core answers those differently: a
+		// NUMERIC token that getInt<int64_t> cannot convert (1.5, 1e30,
+		// 99999999999999999999) is -1 "JSON integer out of range" on the live
+		// Core node, not -8 and not ignored.
+		if seqRaw, ok := ri["sequence"]; ok && isJSONNumber(seqRaw) {
 			var seq int64
 			if err := json.Unmarshal(seqRaw, &seq); err != nil {
-				return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, sequence number is out of range"}
+				return nil, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
 			}
 			if seq < 0 || seq > 0xFFFFFFFF {
 				return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, sequence number is out of range"}
@@ -181,10 +249,9 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 
 	// Add inputs
 	for _, in := range inputs {
-		txid, err := wire.NewHash256FromHex(in.TxID)
-		if err != nil {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid txid: %s", in.TxID)}
-		}
+		// Already validated and decoded by parseHashV during input parsing,
+		// which is where Core does it (AddInputs, before AddOutputs).
+		txid := in.Hash
 
 		// Core AddInputs (rawtransaction_util.cpp:47-66): the default sequence is
 		// computed from (replaceable, locktime); an EXPLICIT "sequence" in the

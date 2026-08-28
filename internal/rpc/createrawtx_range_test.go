@@ -34,6 +34,8 @@ package rpc
 
 import (
 	"encoding/hex"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -468,5 +470,229 @@ func TestCreateRawTx_ExplicitJSONNullReplaceableBehavesAsAbsent(t *testing.T) {
 	}
 	if got := crtSeqsOf(t, resp); len(got) != 1 || got[0] != 0xFFFFFFFD {
 		t.Errorf("null replaceable must default to the RBF sequence (rbf.value_or(true)): got %#x, want [0xfffffffd]", got)
+	}
+}
+
+// ============================================================================
+// createrawtransaction: a PRESENT but NON-NUMERIC `sequence` must be IGNORED
+// ============================================================================
+//
+// Core guards the ENTIRE read with a type test and takes no else branch
+// (bitcoin-core/src/rpc/rawtransaction_util.cpp:57-65):
+//
+//	const UniValue& sequenceObj = o.find_value("sequence");
+//	if (sequenceObj.isNum()) {
+//	    int64_t seqNr64 = sequenceObj.getInt<int64_t>();
+//	    if (seqNr64 < 0 || seqNr64 > CTxIn::SEQUENCE_FINAL) {
+//	        throw JSONRPCError(RPC_INVALID_PARAMETER,
+//	            "Invalid parameter, sequence number is out of range");
+//	    } else { nSequence = (uint32_t)seqNr64; }
+//	}
+//
+// A string, bool, object, array or null never enters the branch, so the default
+// chosen a few lines above survives and Core ACCEPTS the call. blockbrew
+// answered -8 "Invalid parameter, sequence number is out of range" — a message
+// wrong twice over: nothing was out of range, and the value was not a number to
+// have a range in the first place.
+//
+// THE ASSERTIONS ARE ON THE EMITTED SEQUENCE, NOT ON MERE ACCEPTANCE. This is a
+// two-sided trap. With `replaceable` absent, rbf.value_or(true) is TRUE, so the
+// surviving default is MAX_BIP125_RBF_SEQUENCE (0xFFFFFFFD) and the transaction
+// is REPLACEABLE. An implementation that fell through to SEQUENCE_FINAL would
+// also "accept" — while quietly handing back a NON-replaceable transaction.
+// rustoshi originally did exactly that.
+//
+// The rows below were captured from the LIVE Core node on 2026-08-28:
+//
+//	sequence "nope" / true / false / null / {} / []   ACCEPT, emits 0xFFFFFFFD
+//	the same, with replaceable=false                  ACCEPT, emits 0xFFFFFFFF
+//	sequence 1.5 / 1e30 / 99999999999999999999        REJECT -1 JSON int out of range
+//	sequence 4294967296 / -1  (NUMERIC, in int64)     REJECT -8  (unchanged)
+func TestCreateRawTx_NonNumericSequenceIsIgnored(t *testing.T) {
+	const maxBIP125RBFSequence = uint32(0xFFFFFFFD)
+
+	for _, tc := range []struct {
+		name string
+		seq  interface{}
+	}{
+		{"string", "nope"},
+		{"bool_true", true},
+		{"bool_false", false},
+		// An unset optional serialised as JSON null is the realistic client
+		// bug this row protects. encoding/json also leaves an int64 target
+		// untouched on null, so a handler without the isNum() guard sees 0 —
+		// a valid sequence — instead of "absent".
+		{"null", nil},
+		{"object", map[string]interface{}{}},
+		{"array", []interface{}{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := crtCall(t, map[string]interface{}{
+				"txid": crtTxid, "vout": float64(0), "sequence": tc.seq,
+			})
+			if resp.Error != nil {
+				t.Fatalf("expected the non-numeric sequence to be IGNORED, got error %d %q",
+					resp.Error.Code, resp.Error.Message)
+			}
+			if got := crtSeqsOf(t, resp); len(got) != 1 || got[0] != maxBIP125RBFSequence {
+				t.Errorf("sequence in the tx bytes = %#x, want %#x (the RBF default; "+
+					"emitting SEQUENCE_FINAL would also 'accept' while building a "+
+					"NON-replaceable transaction)", got, maxBIP125RBFSequence)
+			}
+		})
+	}
+}
+
+// The ignored field must leave the REAL default computation in charge, not a
+// hard-coded 0xFFFFFFFD: with replaceable explicitly false and locktime 0,
+// AddInputs picks SEQUENCE_FINAL.
+func TestCreateRawTx_IgnoredSequenceStillHonoursReplaceableFalse(t *testing.T) {
+	resp := crtCall(t, map[string]interface{}{
+		"txid": crtTxid, "vout": float64(0), "sequence": "nope",
+	}, float64(0), false)
+	if resp.Error != nil {
+		t.Fatalf("expected success, got error %d %q", resp.Error.Code, resp.Error.Message)
+	}
+	if got := crtSeqsOf(t, resp); len(got) != 1 || got[0] != 0xFFFFFFFF {
+		t.Errorf("sequence in the tx bytes = %#x, want 0xffffffff", got)
+	}
+}
+
+// A NUMERIC token that univalue's getInt<int64_t> cannot convert is neither
+// ignored nor -8: from_chars stops at the '.' or the 'e', or overflows, and
+// Core reports RPC_MISC_ERROR. Verified against the live Core node.
+func TestCreateRawTx_NumericSequenceThatIsNotAnIntegerIsMiscError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seq  interface{}
+	}{
+		{"1.5_fractional", 1.5},
+		{"1e30_exponent", 1e30},
+		// Integral, but wider than int64 — sent as a raw token so Go's float64
+		// cannot round it on the way out.
+		{"beyond_int64", json.Number("99999999999999999999")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := crtCall(t, map[string]interface{}{
+				"txid": crtTxid, "vout": float64(0), "sequence": tc.seq,
+			})
+			crtExpectError(t, resp, RPCErrMiscError, "JSON integer out of range")
+		})
+	}
+}
+
+// CONTROLS for the isNum() guard. Without these the change above is satisfiable
+// by dropping the range check outright, or by ignoring EVERY sequence including
+// the valid ones.
+func TestCreateRawTx_NumericSequenceBranchIsUntouched(t *testing.T) {
+	t.Run("out_of_range_still_rejected", func(t *testing.T) {
+		for _, seq := range []float64{4294967296, -1} {
+			resp := crtCall(t, map[string]interface{}{
+				"txid": crtTxid, "vout": float64(0), "sequence": seq,
+			})
+			crtExpectError(t, resp, RPCErrInvalidParameter,
+				"Invalid parameter, sequence number is out of range")
+		}
+	})
+	t.Run("ordinary_sequence_still_assigned", func(t *testing.T) {
+		resp := crtCall(t, map[string]interface{}{
+			"txid": crtTxid, "vout": float64(0), "sequence": float64(12345),
+		})
+		if resp.Error != nil {
+			t.Fatalf("expected success, got error %d %q", resp.Error.Code, resp.Error.Message)
+		}
+		if got := crtSeqsOf(t, resp); len(got) != 1 || got[0] != 12345 {
+			t.Errorf("sequence in the tx bytes = %v, want [12345]", got)
+		}
+	})
+}
+
+// ============================================================================
+// createrawtransaction: a malformed txid uses ParseHashV's code and wording
+// ============================================================================
+//
+// blockbrew answered -32602 "Invalid txid: abc" from a bare NewHash256FromHex
+// call, and it did so only AFTER the outputs had already been parsed. Core uses
+// ParseHashV (bitcoin-core/src/rpc/util.cpp:117-125), which has TWO distinct
+// messages at RPC_INVALID_PARAMETER (-8):
+//
+//	wrong length:  "txid must be of length 64 (not 3, for 'abc')"
+//	right length, non-hex chars:
+//	               "txid must be hexadecimal string (not '<the string>')"
+//
+// The CODE matters as much as the text: -32602 ("Invalid params") tells a client
+// the request envelope was malformed, so a client that switches on the code to
+// decide whether the ARGUMENTS need fixing gets the wrong answer.
+//
+// The ORDER matters too. Core calls ParseHashO as the first statement of
+// AddInputs, before the vout check and before AddOutputs runs at all, so a
+// request that is wrong in several places must report the TXID. Confirmed on
+// the live Core node (2026-08-28): `txid "abc"` alongside a bad address, and
+// alongside vout -1, both answer the txid error.
+func TestCreateRawTx_MalformedTxidUsesParseHashVWording(t *testing.T) {
+	t.Run("wrong_length", func(t *testing.T) {
+		resp := crtCall(t, map[string]interface{}{"txid": "abc", "vout": float64(0)})
+		crtExpectError(t, resp, RPCErrInvalidParameter,
+			"txid must be of length 64 (not 3, for 'abc')")
+	})
+	t.Run("right_length_non_hex", func(t *testing.T) {
+		bad := strings.Repeat("z", 64)
+		resp := crtCall(t, map[string]interface{}{"txid": bad, "vout": float64(0)})
+		crtExpectError(t, resp, RPCErrInvalidParameter,
+			"txid must be hexadecimal string (not '"+bad+"')")
+	})
+	t.Run("empty_string_reports_length_zero", func(t *testing.T) {
+		resp := crtCall(t, map[string]interface{}{"txid": "", "vout": float64(0)})
+		crtExpectError(t, resp, RPCErrInvalidParameter,
+			"txid must be of length 64 (not 0, for '')")
+	})
+}
+
+// ParseHashO runs FIRST in AddInputs, so the txid error outranks both a bad
+// vout in the same input and a bad output. Pins the placement: parsing the
+// txid down in the build loop (where it used to happen, after AddOutputs)
+// silently changes which error the caller sees.
+func TestCreateRawTx_MalformedTxidOutranksLaterErrors(t *testing.T) {
+	const want = "txid must be of length 64 (not 3, for 'abc')"
+
+	t.Run("beats_negative_vout", func(t *testing.T) {
+		resp := crtCall(t, map[string]interface{}{"txid": "abc", "vout": float64(-1)})
+		crtExpectError(t, resp, RPCErrInvalidParameter, want)
+	})
+	t.Run("beats_bad_output_address", func(t *testing.T) {
+		resp := testRPCRequest(t, crtServer().handleRPC, "createrawtransaction",
+			[]interface{}{
+				[]interface{}{map[string]interface{}{"txid": "abc", "vout": float64(0)}},
+				map[string]interface{}{"notanaddress": 0.1},
+			}, "", "")
+		crtExpectError(t, resp, RPCErrInvalidParameter, want)
+	})
+}
+
+// CONTROL: a well-formed txid must still reach the transaction bytes, in
+// DISPLAY order reversed to internal order exactly as before. Without this the
+// ParseHashV rows above are satisfiable by a handler that rejects every txid.
+func TestCreateRawTx_ControlValidTxidStillLandsInTheBytes(t *testing.T) {
+	const txidHex = "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+	resp := crtCall(t, map[string]interface{}{"txid": txidHex, "vout": float64(3)})
+	if resp.Error != nil {
+		t.Fatalf("expected success, got error %d %q", resp.Error.Code, resp.Error.Message)
+	}
+	raw, err := hex.DecodeString(resp.Result.(string))
+	if err != nil {
+		t.Fatalf("hex: %v", err)
+	}
+	want, err := hex.DecodeString(txidHex)
+	if err != nil {
+		t.Fatalf("hex: %v", err)
+	}
+	// Wire order is the reverse of display order.
+	for i := 0; i < 32; i++ {
+		if raw[5+i] != want[31-i] {
+			t.Fatalf("txid bytes in the tx do not match the requested txid (byte %d)", i)
+		}
+	}
+	if got := voutOf(t, resp); got != 3 {
+		t.Errorf("vout in the tx bytes = %d, want 3", got)
 	}
 }
