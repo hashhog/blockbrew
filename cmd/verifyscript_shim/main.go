@@ -138,6 +138,17 @@ type request struct {
 	SkipPOW     bool   `json:"skip_pow"`
 	SkipScripts bool   `json:"skip_scripts"`
 
+	// checkblock chain-time context (OPTIONAL — all absent keeps the exact
+	// no-MTP behavior: BIP-113 finality falls back to the raw header
+	// timestamp and time-based BIP-68 locks fail closed). PrevMTP is the
+	// median-time-past of the block's PARENT (drives the BIP-113 final-tx
+	// cutoff, block-time-vs-MTP, and the block-MTP arm of
+	// EvaluateSequenceLocks). Timestamps are the raw times of the 11
+	// ancestors (median == prev_mtp); used to derive prev_mtp when only the
+	// window is supplied.
+	PrevMTP    int64   `json:"prev_mtp"`
+	Timestamps []int64 `json:"timestamps"`
+
 	// nextwork op fields.
 	Network   string       `json:"network"`
 	Height    int32        `json:"height"`
@@ -232,6 +243,13 @@ type prevoutSpec struct {
 	ValueSats  int64 `json:"value_sats"`
 	Height     int32 `json:"height"`
 	IsCoinbase bool  `json:"is_coinbase"`
+
+	// checkblock OPTIONAL lock-start MTP for this coin — the value Core's
+	// CalculateSequenceLocks reads as the base of a time-based BIP-68 lock:
+	// GetAncestor(coin_height-1)->GetMedianTimePast(). 0/absent =
+	// unavailable (the shared engine then falls back to the block-level
+	// prev MTP — exact for same-block coins, conservative otherwise).
+	MTP int64 `json:"mtp"`
 }
 
 // buildFlags maps the 22 Core flag tokens (interpreter.cpp:2168
@@ -549,9 +567,11 @@ var maxPowLimit = func() *big.Int {
 //	    body gate ran.
 //	(2) CheckBlockContext(block, &synthPrevHeader, spend_height, MainnetParams):
 //	    BIP34/66/65 version gates + BIP34 coinbase-height + segwit witness
-//	    commitment/malleation + final-tx. MTP is left at the zero variadic
-//	    default (skipped) — no chain history is available in the shim and the
-//	    corpus carries no MTP-dependent mutant. A synthetic prevHeader is passed
+//	    commitment/malleation + final-tx. MTP comes from the OPTIONAL request
+//	    prev_mtp / timestamps fields (parent-block median-time-past; drives
+//	    BIP-113 finality + block-time-vs-MTP + BIP-68 time locks with the
+//	    per-prevout "mtp" lock-start values); absent -> the zero variadic
+//	    default (skipped), exactly as before. A synthetic prevHeader is passed
 //	    (its only consensus use here would be a difficulty re-check, which
 //	    CheckBlockContext deliberately skips — see its comment).
 //	(3) ConnectBlock gates RE-EXPRESSED in Core order over the seeded view:
@@ -609,8 +629,25 @@ func processCheckBlock(req *request) string {
 	// be gone. Core keeps the prevouts available to its script-check pass the
 	// same way (the CCoinsViewCache retains spent coins until flush). Both views
 	// are seeded identically from the external prevouts.
+	// Chain-time context (OPTIONAL). prev_mtp = the parent block's MTP; when
+	// only the raw 11-ancestor timestamps arrive, derive the median exactly
+	// as BlockNode.GetMedianTimePast does (sort ascending, middle element).
+	// Both absent -> prevMTP stays 0 and every gate behaves as before.
+	prevMTP := req.PrevMTP
+	if prevMTP == 0 && len(req.Timestamps) > 0 {
+		ts := append([]int64(nil), req.Timestamps...)
+		sort.Slice(ts, func(i, j int) bool { return ts[i] < ts[j] })
+		prevMTP = ts[len(ts)/2]
+	}
+
 	view := consensus.NewInMemoryUTXOView()
 	scriptView := consensus.NewInMemoryUTXOView()
+	// coinMTPs maps the height CalculateSequenceLocks will query for a
+	// time-based lock (coin_height-1, clamped at 0 exactly like its own
+	// clamp) to the driver-supplied per-prevout lock-start MTP. Stays nil
+	// when no prevout carries one -> the engine's getMTP falls back to
+	// prevMTP unchanged.
+	var coinMTPs map[int32]int64
 	for _, p := range req.Prevouts {
 		h, err := wire.NewHash256FromHex(p.Txid)
 		if err != nil {
@@ -633,13 +670,24 @@ func processCheckBlock(req *request) string {
 			Height:     p.Height,
 			IsCoinbase: p.IsCoinbase,
 		})
+		if p.MTP != 0 {
+			if coinMTPs == nil {
+				coinMTPs = make(map[int32]int64)
+			}
+			mtpHeight := p.Height - 1
+			if mtpHeight < 0 {
+				mtpHeight = 0
+			}
+			coinMTPs[mtpHeight] = p.MTP
+		}
 	}
 
 	// Gates (1)-(3) run via the shared connect-block driver. checkblock uses the
 	// MAINNET halving interval (its corpus computes coinbase amounts on the
-	// mainnet schedule) and MTP omitted (no MTP-dependent corpus mutant).
+	// mainnet schedule); MTP context is the driver-supplied prev_mtp +
+	// per-prevout coin MTPs (0/nil when absent — the old no-MTP behavior).
 	res := runConnectBlockGates(&block, view, scriptView, params, height,
-		consensus.SubsidyHalvingInterval, 0, req.SkipPOW, req.SkipScripts)
+		consensus.SubsidyHalvingInterval, uint32(prevMTP), coinMTPs, req.SkipPOW, req.SkipScripts)
 	if !res.ok {
 		return fmt.Sprintf(`{"valid":false,"reason":%s}`, jsonString(res.reason))
 	}
@@ -837,6 +885,9 @@ type connectGateResult struct {
 //	(2) CheckBlockContext(block, synthPrevHeader, height, params, prevMTP):
 //	    BIP34/66/65 + segwit commitment + final-tx. prevMTP feeds the block's
 //	    median-time-past context (0 = unavailable; height-based locks still run).
+//	    coinMTPs (nil = none) optionally maps a queried MTP height
+//	    (coin_height-1) to that coin's lock-start MTP for time-based BIP-68;
+//	    a miss falls back to prevMTP.
 //	(3) ConnectBlock economic + sigop + script + coinbase-value gates over the
 //	    seeded `view`: per non-coinbase tx CheckTransactionInputs accumulating
 //	    fees; block-wide sigop cost cap; ParallelScriptValidationCached at
@@ -856,7 +907,7 @@ type connectGateResult struct {
 // CalcBlockSubsidyForInterval and reports their verdict.
 func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMemoryUTXOView,
 	params *consensus.ChainParams, height int32, halvingInterval int32, prevMTP uint32,
-	skipPow, skipScripts bool) connectGateResult {
+	coinMTPs map[int32]int64, skipPow, skipScripts bool) connectGateResult {
 
 	// (1) Context-free sanity (PoW gated by skipPow).
 	if verr := consensus.CheckBlockSanity(block, maxPowLimit, skipPow); verr != nil {
@@ -984,14 +1035,24 @@ func runConnectBlockGates(block *wire.MsgBlock, view, scriptView *consensus.InMe
 					prevHeights[j] = utxo.Height
 				}
 			}
-			// MTP lookup for TIME-based locks (bit-22). This corpus is HEIGHT-based
-			// only, so the height-type branch never reads getMTP; the supplied
-			// prevMTP (block median-time-past; 0 when unavailable) is passed to
-			// EvaluateSequenceLocks as the block MTP exactly as production does
-			// (chainmanager.go:794 uses int64(mtp)). For a height-only lock
-			// lock.MinTime == -1, so the MTP comparison can never trip — time-based
-			// enforcement is a SEPARATE deferred gate, intentionally not exercised here.
-			getMTP := func(int32) int64 { return int64(prevMTP) }
+			// MTP lookup for TIME-based locks (bit-22). CalculateSequenceLocks
+			// queries getMTP(coin_height-1); production resolves that via
+			// GetAncestor(h).GetMedianTimePast() (chainmanager.go BIP-68 gate).
+			// The shim has no chain, so the checkblock driver supplies the same
+			// value per prevout (coinMTPs, keyed by the queried height); a miss
+			// falls back to prevMTP — EXACT for same-block coins (the queried
+			// GetAncestor(height-1) IS the parent whose MTP prev_mtp carries)
+			// and conservative otherwise (MTP is monotonic non-decreasing, so
+			// the parent's MTP >= any ancestor's; fail-closed). prevMTP is also
+			// passed to EvaluateSequenceLocks as the block MTP exactly as
+			// production does (int64(mtp)). With neither supplied (both 0/nil)
+			// the old fail-closed no-MTP behavior is preserved bit-for-bit.
+			getMTP := func(h int32) int64 {
+				if v, ok := coinMTPs[h]; ok {
+					return v
+				}
+				return int64(prevMTP)
+			}
 			seqLock := consensus.CalculateSequenceLocks(tx, prevHeights, getMTP)
 			if !consensus.EvaluateSequenceLocks(seqLock, height, int64(prevMTP)) {
 				// Core maps ErrSequenceLockNotMet -> "bad-txns-nonfinal"
@@ -1724,7 +1785,7 @@ func processReorg(req *request) string {
 		// after the prior connect blocks' net effect).
 		scriptView := snapshotView(view)
 		res := runConnectBlockGates(&block, view, scriptView, params, c.Height,
-			params.SubsidyHalvingInterval, c.PrevMTP, true /*skipPow*/, neuterScripts)
+			params.SubsidyHalvingInterval, c.PrevMTP, nil /*coinMTPs*/, true /*skipPow*/, neuterScripts)
 		if !res.ok {
 			// STOP at the first reject (R9: MUST NOT skip ahead to a later valid
 			// block). The view carries every block connected so far + this
