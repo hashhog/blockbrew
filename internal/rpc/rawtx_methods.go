@@ -53,27 +53,40 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 	for _, ri := range rawInputs {
 		var in createRawTxInput
 		if err := json.Unmarshal(ri["txid"], &in.TxID); err != nil {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, missing txid key"}
+			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, missing txid key"}
 		}
 		voutRaw, ok := ri["vout"]
 		if !ok {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, missing vout key"}
+			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, missing vout key"}
 		}
 		var vout int64
 		if err := json.Unmarshal(voutRaw, &vout); err != nil {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, missing vout key"}
+			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, missing vout key"}
+		}
+		// Core reads vout with getInt<int>() -- a 32-BIT int -- so the RANGE
+		// check fires BEFORE the sign test, and an out-of-int32 value surfaces
+		// as univalue's own "JSON integer out of range" at RPC_MISC_ERROR
+		// rather than a vout-specific error. That ordering is Core's, not the
+		// obvious one (rawtransaction_util.cpp AddInputs:41-45).
+		//
+		// Without the upper bound, `uint32(vout)` below TRUNCATED: on the live
+		// mainnet node vout 2^32 AND vout 2^33 both became vout 0, so a
+		// request to spend one outpoint silently became a request to spend a
+		// DIFFERENT, probably real one -- returned as success, no log line.
+		if vout < math.MinInt32 || vout > math.MaxInt32 {
+			return nil, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
 		}
 		if vout < 0 {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, vout cannot be negative"}
+			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, vout cannot be negative"}
 		}
 		in.Vout = uint32(vout)
 		if seqRaw, ok := ri["sequence"]; ok {
 			var seq int64
 			if err := json.Unmarshal(seqRaw, &seq); err != nil {
-				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, sequence number is out of range"}
+				return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, sequence number is out of range"}
 			}
 			if seq < 0 || seq > 0xFFFFFFFF {
-				return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter, sequence number is out of range"}
+				return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, sequence number is out of range"}
 			}
 			in.Sequence = uint32(seq)
 			in.HasSequence = true
@@ -92,13 +105,26 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 		return nil, oerr
 	}
 
-	// Parse optional locktime
+	// Parse optional locktime.
+	//
+	// This was `var lt float64` with the unmarshal error SWALLOWED (`err ==
+	// nil` gating) and no range check at all, so `uint32(lt)` truncated: on the
+	// live mainnet node locktime -1 came back as nLockTime 0xFFFFFFFF -- the
+	// MAXIMUM locktime -- with no error. Core rejects it with -8 "Invalid
+	// parameter, locktime out of range" (ConstructTransaction:151-155), and
+	// checks it BEFORE parsing inputs. LOCKTIME_MAX is 0xFFFFFFFF.
 	locktime := uint32(0)
-	if len(args) >= 3 {
-		var lt float64
-		if err := json.Unmarshal(args[2], &lt); err == nil {
-			locktime = uint32(lt)
+	if len(args) >= 3 && string(args[2]) != "null" {
+		var lt int64
+		if err := json.Unmarshal(args[2], &lt); err != nil {
+			// Core: getInt<int64_t>() on a non-number / non-integer throws
+			// from univalue, which the RPC layer reports as RPC_MISC_ERROR.
+			return nil, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
 		}
+		if lt < 0 || lt > 0xFFFFFFFF {
+			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, locktime out of range"}
+		}
+		locktime = uint32(lt)
 	}
 
 	// Parse optional replaceable flag. Core's `rbf` is std::optional<bool> and

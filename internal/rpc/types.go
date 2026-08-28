@@ -12,6 +12,7 @@ const (
 	RPCErrMethodNotFound         = -32601 // The method does not exist
 	RPCErrInvalidParams          = -32602 // Invalid method parameter(s)
 	RPCErrInternal               = -32603 // Internal JSON-RPC error
+	RPCErrMiscError              = -1     // Generic application error (Core protocol.h RPC_MISC_ERROR)
 	RPCErrTypeError              = -3     // Unexpected type was passed as parameter
 	RPCErrInvalidAddressOrKey    = -5     // Invalid address or key
 	RPCErrInvalidParameter       = -8     // Invalid, missing or duplicate parameter
