@@ -130,11 +130,33 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 	// Parse optional replaceable flag. Core's `rbf` is std::optional<bool> and
 	// AddInputs uses rbf.value_or(true): when the arg is ABSENT the default is
 	// TRUE (BIP-125 opt-in RBF). An explicit `false` disables it.
+	//
+	// The optional must keep its EMPTINESS, not just its value. Core's
+	// createrawtransaction (rawtransaction.cpp:398-401) builds
+	// `std::optional<bool> rbf` that stays nullopt while the param isNull(),
+	// and its two consumers read it DIFFERENTLY:
+	//
+	//   - AddInputs                      uses rbf.value_or(true)
+	//   - the contradiction check below  uses rbf.has_value() && rbf.value()
+	//
+	// So an ABSENT (or JSON-null) argument still defaults to TRUE for the
+	// purpose of CHOOSING the sequence, yet suppresses the contradiction check
+	// entirely. That asymmetry is deliberate in Core: only a caller who
+	// literally typed `replaceable=true` has stated an intent that a final
+	// sequence can contradict. Collapsing both readings into one bool — which
+	// this handler did — makes `createrawtransaction` with no replaceable arg
+	// and sequence 0xFFFFFFFF wrongly REJECT.
+	//
+	// JSON null is treated as absent, exactly as `locktime` is above
+	// (params[3].isNull() in Core). Note encoding/json leaves a `bool` target
+	// UNCHANGED on a null, so the pre-fix code silently read null as `false`.
 	replaceable := true
-	if len(args) >= 4 {
+	replaceableExplicit := false
+	if len(args) >= 4 && string(args[3]) != "null" {
 		var r bool
 		if err := json.Unmarshal(args[3], &r); err == nil {
 			replaceable = r
+			replaceableExplicit = true
 		}
 	}
 
@@ -252,6 +274,51 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 				Value:    satoshis,
 				PkScript: addr.ScriptPubKey(),
 			})
+		}
+	}
+
+	// BIP-125 CONTRADICTION CHECK. Core ConstructTransaction
+	// (rawtransaction_util.cpp:166-168), the LAST thing it does, after both
+	// AddInputs AND AddOutputs:
+	//
+	//	if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+	//	    !SignalsOptInRBF(CTransaction(rawTx)))
+	//	    throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+	//	        combination: Sequence number(s) contradict replaceable option");
+	//
+	// The caller asked, explicitly, for a replaceable transaction and then
+	// handed us sequence numbers that make it UNREPLACEABLE. Nine of the ten
+	// nodes in this repo (blockbrew included, until now) silently ACCEPT that
+	// contradiction: they resolve it in favour of the sequence, hand back a
+	// transaction that can never be fee-bumped, and say nothing. The caller
+	// discovers it later, at bumpfee time, on a stuck transaction. Core refuses
+	// to guess which of the two mutually exclusive requests was meant.
+	//
+	// All THREE conjuncts matter, and each is a distinct oracle row:
+	//
+	//  1. replaceableExplicit — has_value(). Absent/null does NOT arm the
+	//     check even though it still defaults the sequence to RBF (see the
+	//     asymmetry note at the parse site above).
+	//  2. len(tx.TxIn) > 0 — a zero-input transaction signals nothing, and
+	//     Core lets it through rather than calling it a contradiction.
+	//  3. !SignalsOptInRBF — util/rbf.cpp: ANY input with
+	//     nSequence <= MAX_BIP125_RBF_SEQUENCE (0xfffffffd) signals for the
+	//     WHOLE transaction, so a mixed tx with one signaling input is fine.
+	//     Note this is `<=` 0xfffffffd, NOT `< SEQUENCE_FINAL`: 0xfffffffe
+	//     (the anti-fee-snipe value) does NOT signal and DOES contradict.
+	//
+	// mempool.SignalsRBFForRPC is the node's existing port of Core's
+	// SignalsOptInRBF (mempool.go signalsRBF, MaxBIP125RBFSequence =
+	// 0xFFFFFFFD) — reused here so the two can never drift apart.
+	//
+	// Placement is Core's, not the convenient one: this runs AFTER the output
+	// loop above, so an output-parsing error (bad address, duplicate key, bad
+	// amount) still wins over this one, exactly as in Core where AddOutputs
+	// throws before ConstructTransaction reaches line 166.
+	if replaceableExplicit && replaceable && len(tx.TxIn) > 0 && !mempool.SignalsRBFForRPC(tx) {
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParameter,
+			Message: "Invalid parameter combination: Sequence number(s) contradict replaceable option",
 		}
 	}
 

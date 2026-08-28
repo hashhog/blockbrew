@@ -189,3 +189,284 @@ func TestCreateRawTx_ValidInputStillBuildsTheTransaction(t *testing.T) {
 		t.Errorf("locktime = %d, want 0 (absent locktime defaults to 0)", got)
 	}
 }
+
+// ============================================================================
+// createrawtransaction: an EXPLICIT replaceable=true that the sequence numbers
+// CONTRADICT is an error, not a silent preference for the sequence.
+// ============================================================================
+//
+// Core's ConstructTransaction ends with a check blockbrew did not have
+// (bitcoin-core/src/rpc/rawtransaction_util.cpp:166-168):
+//
+//	if (rbf.has_value() && rbf.value() && rawTx.vin.size() > 0 &&
+//	    !SignalsOptInRBF(CTransaction(rawTx)))
+//	    throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter
+//	        combination: Sequence number(s) contradict replaceable option");
+//
+// The caller has asked for two mutually exclusive things: "make this
+// replaceable" and "use a sequence number that makes it unreplaceable".
+// Nine of the ten nodes in this repo — blockbrew until this change — resolve
+// that silently in favour of the sequence and return a perfectly valid-looking
+// transaction that can NEVER be fee-bumped, with no error and no log line.
+// The caller finds out at bumpfee time, on a stuck transaction, when the fee
+// market has already moved. Core refuses to guess.
+//
+// SignalsOptInRBF (bitcoin-core/src/util/rbf.cpp) is a per-TRANSACTION
+// predicate: ANY input with nSequence <= MAX_BIP125_RBF_SEQUENCE (0xfffffffd,
+// util/rbf.h) makes the whole transaction signaling. It is `<=` 0xfffffffd and
+// NOT `< SEQUENCE_FINAL`, so 0xfffffffe — the anti-fee-snipe value many wallets
+// use with no RBF intent — does NOT signal and DOES contradict.
+//
+// THE ASYMMETRY, which is the easiest part to get wrong: an ABSENT replaceable
+// argument still DEFAULTS to true for choosing the sequence, yet does NOT arm
+// this check. Core carries `std::optional<bool> rbf` that stays nullopt while
+// params[3].isNull() (rawtransaction.cpp:398-401); AddInputs reads it as
+// rbf.value_or(true) while the contradiction check reads it as
+// rbf.has_value() && rbf.value(). Only a caller who literally typed
+// replaceable=true has stated an intent a final sequence can contradict.
+// blockbrew collapsed both readings into one bool, so preserving that
+// distinction is the production change these tests pin.
+//
+// The rows below are the LIVE-CORE ORACLE, every one reproduced against a
+// running Bitcoin Core node. The four ACCEPT rows are controls and matter as
+// much as the rejects: an over-eager check that fires on rows 1, 5, 6 or 7
+// would break ordinary RBF usage, and rows 1 and 6 are precisely the ones a
+// naive "replaceable && !signaling" implementation gets wrong.
+//
+// References:
+//
+//	bitcoin-core/src/rpc/rawtransaction_util.cpp ConstructTransaction:147-171
+//	bitcoin-core/src/rpc/rawtransaction.cpp      createrawtransaction:398-402
+//	bitcoin-core/src/util/rbf.cpp                SignalsOptInRBF
+//	bitcoin-core/src/util/rbf.h                  MAX_BIP125_RBF_SEQUENCE 0xfffffffd
+//	internal/mempool/mempool.go                  signalsRBF / SignalsRBFForRPC
+//	internal/rpc/fix70_sequence_default_test.go  the DEFAULT-sequence guards
+//	                                             (that file pins which sequence
+//	                                             is chosen; this one pins when a
+//	                                             supplied sequence is refused)
+
+// crtRBFRejectMsg is Core's message, verbatim. Any drift in wording is a
+// divergence a client string-matching on it would see.
+const crtRBFRejectMsg = "Invalid parameter combination: Sequence number(s) contradict replaceable option"
+
+// crtRBFCall drives the REAL handler (via handleRPC, the same path the rest of
+// this file uses) with an arbitrary input list and a replaceable argument that
+// is either ABSENT (rbf == nil — the argument is not sent at all) or explicitly
+// present. Locktime is only sent when replaceable is, since it is positionally
+// required to reach argument 4; it is always 0, so it never influences the
+// default sequence (sequenceForLocktime only consults locktime when
+// !replaceable).
+func crtRBFCall(t *testing.T, inputs []interface{}, rbf *bool) *RPCResponse {
+	t.Helper()
+	args := []interface{}{inputs, map[string]interface{}{}}
+	if rbf != nil {
+		args = append(args, float64(0), *rbf)
+	}
+	return testRPCRequest(t, crtServer().handleRPC, "createrawtransaction", args, "", "")
+}
+
+// crtSeqsOf decodes EVERY input's nSequence straight out of the returned hex,
+// in the same manual-offset style as voutOf above, so the assertions are on
+// what was actually SERIALIZED rather than on the handler's intent.
+// createrawtransaction never emits a witness or a non-empty scriptSig, so the
+// layout is fixed: version(4) | varint vin count | vin[i]{ txid(32) | vout(4) |
+// 0x00 | sequence(4) }. Decoding by hand rather than through decodeTxHex also
+// lets the ZERO-INPUT row be inspected: a 0-input transaction collides with the
+// segwit marker and does not round-trip through the deserializer.
+func crtSeqsOf(t *testing.T, resp *RPCResponse) []uint32 {
+	t.Helper()
+	s, ok := resp.Result.(string)
+	if !ok {
+		t.Fatalf("expected a transaction, got error %#v", resp.Error)
+	}
+	raw, err := hex.DecodeString(s)
+	if err != nil {
+		t.Fatalf("hex: %v", err)
+	}
+	if len(raw) < 5 {
+		t.Fatalf("transaction too short to hold an input count: %s", s)
+	}
+	n := int(raw[4])
+	if n >= 0xfd {
+		t.Fatalf("input count varint %#x is multi-byte; this helper assumes < 0xfd", raw[4])
+	}
+	seqs := make([]uint32, 0, n)
+	for i, off := 0, 5; i < n; i, off = i+1, off+41 {
+		if off+41 > len(raw) {
+			t.Fatalf("input %d runs past the end of %s", i, s)
+		}
+		if raw[off+36] != 0x00 {
+			t.Fatalf("input %d has a non-empty scriptSig; helper assumes createrawtransaction leaves it empty", i)
+		}
+		b := off + 37
+		seqs = append(seqs, uint32(raw[b])|uint32(raw[b+1])<<8|uint32(raw[b+2])<<16|uint32(raw[b+3])<<24)
+	}
+	return seqs
+}
+
+// crtIn builds one input object. A negative sequence means "omit the sequence
+// key entirely", which is how the handler learns to apply its own default.
+func crtIn(vout int, sequence int64) map[string]interface{} {
+	in := map[string]interface{}{"txid": crtTxid, "vout": float64(vout)}
+	if sequence >= 0 {
+		in["sequence"] = float64(sequence)
+	}
+	return in
+}
+
+func TestCreateRawTx_ReplaceableContradictsSequence(t *testing.T) {
+	yes, no := true, false
+
+	tests := []struct {
+		name string
+		// oracle is the row number in the live-Core table this reproduces.
+		oracle   int
+		inputs   []interface{}
+		rbf      *bool // nil => argument ABSENT
+		wantMsg  string
+		wantSeqs []uint32 // asserted only when wantMsg is empty
+		why      string
+	}{
+		{
+			name:     "1_absent_rbf_with_final_sequence_is_accepted",
+			oracle:   1,
+			inputs:   []interface{}{crtIn(0, 0xFFFFFFFF)},
+			rbf:      nil,
+			wantSeqs: []uint32{0xFFFFFFFF},
+			why: "rbf.has_value() is FALSE, so the check never arms — even though an " +
+				"absent argument still defaults to replaceable for the sequence choice. " +
+				"An implementation that folds absent into true rejects this.",
+		},
+		{
+			name:     "2_explicit_true_with_signaling_sequence_is_accepted",
+			oracle:   2,
+			inputs:   []interface{}{crtIn(0, 0xFFFFFFFD)},
+			rbf:      &yes,
+			wantSeqs: []uint32{0xFFFFFFFD},
+			why:      "0xfffffffd == MAX_BIP125_RBF_SEQUENCE, and the predicate is <=, so it signals.",
+		},
+		{
+			name:    "3_explicit_true_with_anti_fee_snipe_sequence_is_rejected",
+			oracle:  3,
+			inputs:  []interface{}{crtIn(0, 0xFFFFFFFE)},
+			rbf:     &yes,
+			wantMsg: crtRBFRejectMsg,
+			why: "0xfffffffe is non-final but does NOT signal RBF. A check written as " +
+				"`sequence < SEQUENCE_FINAL` instead of `<= MAX_BIP125_RBF_SEQUENCE` " +
+				"wrongly accepts this row.",
+		},
+		{
+			name:    "4_explicit_true_with_final_sequence_is_rejected",
+			oracle:  4,
+			inputs:  []interface{}{crtIn(0, 0xFFFFFFFF)},
+			rbf:     &yes,
+			wantMsg: crtRBFRejectMsg,
+			why:     "The plainest contradiction: SEQUENCE_FINAL under an explicit replaceable=true.",
+		},
+		{
+			name:     "5_explicit_true_with_no_inputs_is_accepted",
+			oracle:   5,
+			inputs:   []interface{}{},
+			rbf:      &yes,
+			wantSeqs: []uint32{},
+			why: "vin.size() > 0 fails. A transaction with no inputs signals nothing, and " +
+				"Core lets it through rather than calling that a contradiction.",
+		},
+		{
+			name:     "6_explicit_true_with_one_signaling_input_of_two_is_accepted",
+			oracle:   6,
+			inputs:   []interface{}{crtIn(0, 0xFFFFFFFF), crtIn(1, 0)},
+			rbf:      &yes,
+			wantSeqs: []uint32{0xFFFFFFFF, 0},
+			why: "SignalsOptInRBF is per-TRANSACTION: one signaling input makes the whole " +
+				"transaction signaling. A per-input loop that rejects on the FIRST " +
+				"non-signaling input wrongly rejects this row.",
+		},
+		{
+			name:     "7_explicit_false_with_final_sequence_is_accepted",
+			oracle:   7,
+			inputs:   []interface{}{crtIn(0, 0xFFFFFFFF)},
+			rbf:      &no,
+			wantSeqs: []uint32{0xFFFFFFFF},
+			why:      "rbf.value() is FALSE. Asking for non-replaceable and getting it is no contradiction.",
+		},
+		{
+			name:     "8_explicit_true_with_defaulted_sequence_is_accepted",
+			oracle:   8,
+			inputs:   []interface{}{crtIn(0, -1)},
+			rbf:      &yes,
+			wantSeqs: []uint32{0xFFFFFFFD},
+			why: "With no explicit sequence the handler's own default IS the RBF sequence " +
+				"(AddInputs, rawtransaction_util.cpp:47-50), so the ordinary replaceable=true " +
+				"call must keep working. This is the row a naively-placed check breaks.",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := crtRBFCall(t, tc.inputs, tc.rbf)
+
+			if tc.wantMsg != "" {
+				crtExpectError(t, resp, RPCErrInvalidParameter, tc.wantMsg)
+				return
+			}
+
+			if resp.Error != nil {
+				t.Fatalf("oracle row %d expected ACCEPT, got error %d %q.\nwhy: %s",
+					tc.oracle, resp.Error.Code, resp.Error.Message, tc.why)
+			}
+			got := crtSeqsOf(t, resp)
+			if len(got) != len(tc.wantSeqs) {
+				t.Fatalf("oracle row %d: got %d inputs %#x, want %d %#x",
+					tc.oracle, len(got), got, len(tc.wantSeqs), tc.wantSeqs)
+			}
+			for i := range got {
+				if got[i] != tc.wantSeqs[i] {
+					t.Errorf("oracle row %d: input %d serialized sequence = 0x%08x, want 0x%08x.\nwhy: %s",
+						tc.oracle, i, got[i], tc.wantSeqs[i], tc.why)
+				}
+			}
+		})
+	}
+}
+
+// TestCreateRawTx_ExplicitJSONNullReplaceableBehavesAsAbsent is NOT one of the
+// eight live-Core oracle rows; it pins the source-level behaviour of
+// createrawtransaction's `if (!request.params[3].isNull())` guard
+// (rawtransaction.cpp:399), which leaves `rbf` empty for a JSON null exactly as
+// for a missing argument. Both consequences are asserted:
+//
+//   - the contradiction check stays disarmed (a final sequence is accepted), and
+//   - the DEFAULT sequence is still the RBF one, because AddInputs reads
+//     rbf.value_or(true).
+//
+// This is a real behaviour change, not just a new error path: encoding/json
+// leaves a bool target UNCHANGED when it unmarshals null, so before this fix an
+// explicit null read as replaceable=FALSE and produced SEQUENCE_FINAL —
+// silently the opposite of Core.
+func TestCreateRawTx_ExplicitJSONNullReplaceableBehavesAsAbsent(t *testing.T) {
+	args := []interface{}{
+		[]interface{}{crtIn(0, 0xFFFFFFFF)},
+		map[string]interface{}{},
+		float64(0),
+		nil, // JSON null
+	}
+	resp := testRPCRequest(t, crtServer().handleRPC, "createrawtransaction", args, "", "")
+	if resp.Error != nil {
+		t.Fatalf("null replaceable must behave as absent (no contradiction check), got %d %q",
+			resp.Error.Code, resp.Error.Message)
+	}
+	if got := crtSeqsOf(t, resp); len(got) != 1 || got[0] != 0xFFFFFFFF {
+		t.Errorf("explicit sequence must survive: got %#x, want [0xffffffff]", got)
+	}
+
+	// Same call, no explicit sequence: value_or(true) still picks the RBF default.
+	args[0] = []interface{}{crtIn(0, -1)}
+	resp = testRPCRequest(t, crtServer().handleRPC, "createrawtransaction", args, "", "")
+	if resp.Error != nil {
+		t.Fatalf("null replaceable + defaulted sequence: %d %q", resp.Error.Code, resp.Error.Message)
+	}
+	if got := crtSeqsOf(t, resp); len(got) != 1 || got[0] != 0xFFFFFFFD {
+		t.Errorf("null replaceable must default to the RBF sequence (rbf.value_or(true)): got %#x, want [0xfffffffd]", got)
+	}
+}
