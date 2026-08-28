@@ -78,3 +78,60 @@ func TestStallStarvationScenario(t *testing.T) {
 		t.Fatal("with stallShouldRearm gating, the backoff must eventually expire and the retry gate open")
 	}
 }
+
+// #75 (2026-08-28): the stall handler must distinguish a request that was TRIED
+// AND FAILED from one that was NEVER ISSUED.
+//
+// Live evidence: blockbrew sat at height 964413 with state=Pending, inflight=0,
+// peer=false, retries=0 — nothing outstanding, nothing attempted — and served
+// out an escalating backoff for 5m43s, logging "backoff already armed — waiting
+// it out" until a peer sent the block unsolicited. Several such blocks in a row
+// produced a 4-5 block lag while every other node stayed at the tip.
+//
+// The escalating penalty must be reserved for attempts that actually happened;
+// otherwise the node punishes itself for work it never did.
+func TestStallRecoveryPlan_NeverIssuedDoesNotEscalate(t *testing.T) {
+	req := &blockRequest{
+		State:       BlockDownloadPending,
+		Peer:        nil,
+		RetryCount:  0,
+		StallResets: 4, // a high prior count must NOT be charged to a fresh attempt
+	}
+	backoff, escalate := stallRecoveryPlan(req, false)
+	if escalate {
+		t.Error("a never-issued request (no peer, no retries, not in flight) has no " +
+			"failed attempt to penalise — it must not escalate")
+	}
+	if backoff != stallBackoff(0) {
+		t.Errorf("backoff = %v, want the BASE %v: a request that was never dispatched "+
+			"must be retried promptly, not made to serve the accumulated penalty",
+			backoff, stallBackoff(0))
+	}
+	if backoff >= stallBackoff(4) {
+		t.Errorf("backoff %v is not shorter than the escalated %v — the fix would have "+
+			"no effect on the observed 5m43s stall", backoff, stallBackoff(4))
+	}
+}
+
+// The other direction: a request that WAS dispatched keeps the escalating
+// penalty. Without this, a peer that cannot serve us would be re-asked in a hot
+// loop — the failure mode the backoff exists to prevent.
+func TestStallRecoveryPlan_TriedAndFailedStillEscalates(t *testing.T) {
+	// Dispatched and retried.
+	retried := &blockRequest{State: BlockDownloadPending, RetryCount: 2, StallResets: 3}
+	if backoff, escalate := stallRecoveryPlan(retried, false); !escalate ||
+		backoff != stallBackoff(3) {
+		t.Errorf("a retried request must keep the escalating penalty: got backoff=%v escalate=%v",
+			backoff, escalate)
+	}
+	// Assigned to a peer (dispatch in progress).
+	assigned := &blockRequest{State: BlockDownloadPending, Peer: &Peer{}, StallResets: 1}
+	if _, escalate := stallRecoveryPlan(assigned, false); !escalate {
+		t.Error("a request already assigned to a peer counts as attempted")
+	}
+	// Still in flight.
+	inflight := &blockRequest{State: BlockDownloadPending, StallResets: 1}
+	if _, escalate := stallRecoveryPlan(inflight, true); !escalate {
+		t.Error("a request still in flight counts as attempted")
+	}
+}

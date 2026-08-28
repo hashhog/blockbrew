@@ -191,6 +191,32 @@ func stallBackoff(resets int) time.Duration {
 // still in the future must be left alone: requestBlocks will act the moment
 // the armed backoff expires, and resetting it on every stall pass starves
 // that gate forever (#73).
+// stallRecoveryPlan decides how the stall handler should re-arm a Pending
+// request: how long to wait before it may be requested again, and whether that
+// wait counts as an escalation.
+//
+// #75: a request that was NEVER ISSUED — no assigned peer, no retries, nothing
+// in flight — has no failed attempt to penalise.  Charging it the escalating
+// stallBackoff(StallResets) makes the node serve out a growing penalty for work
+// it never attempted; observed on mainnet 2026-08-28 as ~5m43s per block at the
+// tip, cleared only when a peer sent the block unsolicited.  Such a request gets
+// the BASE backoff and does not escalate, so it is retried promptly on a fresh
+// peer.
+//
+// A request that WAS dispatched and failed keeps the escalating penalty — that
+// is what stops a hot re-request loop against a peer that cannot serve us.
+//
+// This does not weaken #73: the caller only reaches this decision when no
+// backoff is currently ticking (see stallShouldRearm), so the perpetual-re-arm
+// starvation that wedged 964241 for 12+ minutes remains impossible.
+func stallRecoveryPlan(req *blockRequest, inFlight bool) (time.Duration, bool) {
+	neverIssued := req.RetryCount == 0 && req.Peer == nil && !inFlight
+	if neverIssued {
+		return stallBackoff(0), false
+	}
+	return stallBackoff(req.StallResets), true
+}
+
 func stallShouldRearm(req *blockRequest, now time.Time) bool {
 	if req.State != BlockDownloadPending {
 		return true
@@ -2164,12 +2190,16 @@ func (sm *SyncManager) blockDownloadLoop() {
 							// This happens when all peers are busy or disconnected.
 							// Force a re-request by logging and letting requestBlocks
 							// pick it up on next tick. Also reset peer to allow any peer.
-							log.Printf("sync: block %d is pending but not downloading, clearing peer restriction (backoff %s)",
-								nh, stallBackoff(req.StallResets))
+							_, inFlight := sm.inflight[req.Hash]
+							backoff, escalate := stallRecoveryPlan(req, inFlight)
+							log.Printf("sync: block %d is pending but not downloading, clearing peer restriction (backoff %s, escalate=%v)",
+								nh, backoff, escalate)
 							req.Peer = nil
 							req.RetryCount = 0
-							req.NextRetryAt = time.Now().Add(stallBackoff(req.StallResets))
-							req.StallResets++
+							req.NextRetryAt = time.Now().Add(backoff)
+							if escalate {
+								req.StallResets++
+							}
 							// W48: state invariant says Pending blocks must not be in
 							// sm.inflight; otherwise requestBlocks skips them and the
 							// stall never clears. Sibling branches (line ~1014, ~1034)
