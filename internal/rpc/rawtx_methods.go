@@ -195,6 +195,43 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 		locktime = uint32(lt)
 	}
 
+	// Parse optional version (Core's 5th argument, rpc/rawtransaction.cpp:122).
+	//
+	// This handler hardcoded Version: 2 and IGNORED the argument entirely, so a
+	// caller asking for version 3 got a version 2 transaction and a success
+	// reply -- and version 4, which Core rejects, was accepted. Version 3 is
+	// TRUC (BIP 431) and carries different policy rules, so this is not
+	// cosmetic.
+	//
+	// Core reads it as self.Arg<uint32_t>("version") -- UNSIGNED 32-bit, unlike
+	// the int32 used for vout -- then bounds it to
+	// [TxMinStandardVersion, TxMaxStandardVersion] = [1, 3]
+	// (policy/policy.h:152-153) inside ConstructTransaction
+	// (rawtransaction_util.cpp:158-161). The unsigned width is what decides the
+	// error: 2147483648 fits a uint32, survives the conversion and reaches the
+	// DOMAIN error (-8), while -1 and 4294967296 fail the CONVERSION first (-1).
+	//
+	// int64 target, not uint32: encoding/json rejects a negative into an
+	// unsigned target with its own message, which would leak a Go error string
+	// where Core says "JSON integer out of range".
+	txVersion := int32(2) // Core's DEFAULT_RAWTX_VERSION (CURRENT_VERSION)
+	if len(args) >= 5 && string(args[4]) != "null" {
+		var v int64
+		if err := json.Unmarshal(args[4], &v); err != nil {
+			return nil, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
+		}
+		if v < 0 || v > 0xFFFFFFFF {
+			return nil, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
+		}
+		if v < int64(mempool.TxMinStandardVersion) || v > int64(mempool.TxMaxStandardVersion) {
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParameter,
+				Message: "Invalid parameter, version out of range(1~3)",
+			}
+		}
+		txVersion = int32(v)
+	}
+
 	// Parse optional replaceable flag. Core's `rbf` is std::optional<bool> and
 	// AddInputs uses rbf.value_or(true): when the arg is ABSENT the default is
 	// TRUE (BIP-125 opt-in RBF). An explicit `false` disables it.
@@ -243,7 +280,7 @@ func (s *Server) handleCreateRawTransaction(params json.RawMessage) (interface{}
 
 	// Build the transaction
 	tx := &wire.MsgTx{
-		Version:  2,
+		Version:  txVersion,
 		LockTime: locktime,
 	}
 
