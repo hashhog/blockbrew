@@ -2305,7 +2305,27 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 
 	block := &wire.MsgBlock{}
 	if err := block.Deserialize(bytes.NewReader(blockBytes)); err != nil {
-		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Block decode failed: %v", err)}
+		// Core-exact decode-failure surface.  bitcoin-core
+		// rpc/mining.cpp:1080 throws JSONRPCError(RPC_DESERIALIZATION_ERROR,
+		// "Block decode failed") — a FIXED string.  The underlying
+		// std::ios_base::failure ("non-canonical ReadCompactSize()",
+		// serialize.h:344/350/356) never reaches the client, because
+		// DecodeHexBlk swallows it and returns a bare bool.
+		//
+		// Appending ": %v" here leaked blockbrew's internal decoder text
+		// into the message, which is R2 reason-token divergence: the
+		// diff-test normalizer extracts the "non-canonical" substring and
+		// reports reject:non-canonical against Core's
+		// reject:block-decode-failed (corpus
+		// _tierc-guards-2026-07-06/C1-noncanonical-compactsize, 4/4 rows).
+		// The decision was always identical (both REJECT, tip unchanged) —
+		// only the reason string differed.
+		//
+		// The detail is still worth having, so log it rather than throwing
+		// it away (same call the camlcoin handler makes before collapsing
+		// to a BIP-22 token).
+		log.Printf("rpc: submitblock decode failed: %v", err)
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Block decode failed"}
 	}
 
 	// Validate block sanity
