@@ -3,6 +3,7 @@ package rpc
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -66,6 +67,13 @@ func parseWaitTimeout(v interface{}) (int64, *RPCError) {
 		}
 	}
 	ms := int64(f)
+	// Core reads the timeout with getInt<int>, and the WIDTH check lives inside
+	// that conversion -- so it fires BEFORE the negative-timeout test, and an
+	// out-of-int32 timeout is -1 "JSON integer out of range", not
+	// -1 "Negative timeout" and not a silently narrowed wait.
+	if ms < math.MinInt32 || ms > math.MaxInt32 {
+		return 0, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
+	}
 	if ms < 0 {
 		return 0, &RPCError{Code: RPCErrMisc, Message: "Negative timeout"}
 	}
@@ -87,6 +95,12 @@ func parseWaitHeight(v interface{}) (int32, *RPCError) {
 			Code:    RPCErrTypeError,
 			Message: fmt.Sprintf("JSON value of type %s is not of expected type number", jsonTypeName(v)),
 		}
+	}
+	// getInt<int> is a 32-BIT parse. Without this bound the `int32(f)`
+	// conversion below is implementation-defined for out-of-range values, so a
+	// hostile height silently became some other height to wait for.
+	if n := int64(f); n < math.MinInt32 || n > math.MaxInt32 {
+		return 0, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
 	}
 	return int32(f), nil
 }

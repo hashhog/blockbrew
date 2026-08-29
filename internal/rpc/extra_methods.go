@@ -41,6 +41,14 @@ func (s *Server) handleGetTxOut(params json.RawMessage) (interface{}, *RPCError)
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid vout"}
 	}
+	// Core reads n as getInt<uint32_t> (rpc/blockchain.cpp): std::from_chars
+	// accepts no sign for an unsigned destination, so a NEGATIVE vout fails the
+	// CONVERSION with -1 -- the same error as one above 2^32-1. Without this,
+	// `uint32(voutFloat)` narrowed and the node answered `null` (a
+	// legitimate-looking "no such output") for arguments Core refuses.
+	if voutFloat != float64(int64(voutFloat)) || voutFloat < 0 || voutFloat > 4294967295 {
+		return nil, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
+	}
 	vout := uint32(voutFloat)
 
 	includeMempool := true

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"net"
 	"net/http"
@@ -2667,7 +2668,40 @@ func (s *Server) handleEstimateSmartFee(params json.RawMessage) (interface{}, *R
 	confTarget := 6 // Default
 	if len(args) >= 1 {
 		if v, ok := args[0].(float64); ok {
+			// Core: ParseConfirmTarget (rpc/util.cpp) reads conf_target with
+			// getInt<int> and then REJECTS anything outside
+			// [1, HighestTargetTracked] -- it does not clamp, and it does not
+			// substitute a default. Answering for a target the caller never
+			// asked about, as a success, is the fabrication this closes.
+			if v != float64(int64(v)) || v < math.MinInt32 || v > math.MaxInt32 {
+				return nil, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
+			}
 			confTarget = int(v)
+		}
+	}
+	if confTarget < 1 || confTarget > 1008 {
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParameter,
+			Message: "Invalid conf_target, must be between 1 and 1008",
+		}
+	}
+	// estimate_mode (positional 1): Core validates it with FeeModeFromString
+	// (common/messages.cpp), case-insensitively, and rejects anything else.
+	if len(args) >= 2 && args[1] != nil {
+		mode, ok := args[1].(string)
+		if !ok {
+			return nil, &RPCError{
+				Code:    RPCErrTypeError,
+				Message: fmt.Sprintf("JSON value of type %s is not of expected type string", jsonTypeName(args[1])),
+			}
+		}
+		switch strings.ToUpper(mode) {
+		case "UNSET", "ECONOMICAL", "CONSERVATIVE":
+		default:
+			return nil, &RPCError{
+				Code:    RPCErrInvalidParameter,
+				Message: `Invalid estimate_mode parameter, must be one of: "unset", "economical", "conservative"`,
+			}
 		}
 	}
 

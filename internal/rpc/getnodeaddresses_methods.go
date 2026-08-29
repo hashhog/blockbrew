@@ -3,6 +3,7 @@ package rpc
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"net"
 	"strings"
 	"time"
@@ -102,6 +103,12 @@ func (s *Server) handleGetNodeAddresses(params json.RawMessage) (interface{}, *R
 		cf, ok := args[0].(float64)
 		if !ok {
 			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "count must be a number"}
+		}
+		// Core: getInt<int> BEFORE the handler's own -8 range test, so an
+		// out-of-int32 count fails the CONVERSION (-1) while an in-range
+		// negative one reaches the domain error (-8).
+		if cf < math.MinInt32 || cf > math.MaxInt32 {
+			return nil, &RPCError{Code: RPCErrMiscError, Message: "JSON integer out of range"}
 		}
 		count = int(cf)
 	}
