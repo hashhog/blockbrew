@@ -1267,10 +1267,57 @@ func (p *Peer) signalDisconnect() {
 	})
 }
 
-// Disconnect gracefully shuts down the peer connection and waits for cleanup.
+// disconnectJoinTimeout bounds how long Disconnect waits for a peer's own
+// goroutines to exit. It is a BACKSTOP, not a design: the correct caller from
+// a peer-message path is DisconnectAsync (below). See the deadlock note there.
+const disconnectJoinTimeout = 5 * time.Second
+
+// Disconnect shuts down the peer connection and waits for its goroutines.
+//
+// NEVER CALL THIS FROM A PEER'S OWN GOROUTINE, OR WHILE HOLDING A LOCK THAT A
+// PEER GOROUTINE NEEDS TO EXIT. p.wg joins readHandler, writeHandler and
+// pingHandler, so a call from inside any of them waits for itself and never
+// returns. On 2026-08-30 that wedged the live mainnet node for 3h22m:
+//
+//	Peer.readHandler -> handleMessage -> SyncManager.HandleHeaders
+//	  -> addValidatedHeaders -> Peer.Disconnect -> wg.Wait   [forever]
+//
+// and because the SyncManager mutex was held across it, 22 more goroutines
+// queued behind the lock. The node stayed up, answered RPC, kept
+// NRestarts=0 — and never synced another block. Handler paths must use
+// DisconnectAsync.
+//
+// The wait is bounded so that a caller which gets this wrong degrades into a
+// 5-second stall and a loud log line instead of a permanent, silent wedge.
 func (p *Peer) Disconnect() {
 	p.signalDisconnect()
-	p.wg.Wait()
+
+	done := make(chan struct{})
+	go func() {
+		p.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(disconnectJoinTimeout):
+		log.Printf("peer %s: Disconnect() timed out after %s waiting for its "+
+			"goroutines — caller is joining from a peer goroutine or under a "+
+			"lock a peer goroutine needs; use DisconnectAsync from message "+
+			"handlers", p.Address(), disconnectJoinTimeout)
+	}
+}
+
+// DisconnectAsync signals the peer to shut down and returns IMMEDIATELY,
+// without joining its goroutines.
+//
+// This is the form every message handler must use. The peer's own goroutines
+// observe the closed quit channel (and the closed socket) and unwind on their
+// own; PeerManager reaps the entry afterwards. Signalling is all a handler
+// ever needs — it has no reason to wait for its own unwinding, and waiting is
+// exactly what deadlocks it.
+func (p *Peer) DisconnectAsync() {
+	p.signalDisconnect()
 }
 
 // SendMessage queues a message for sending.

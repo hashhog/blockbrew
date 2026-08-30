@@ -795,7 +795,8 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 			log.Printf("headerssync: pipeline failure with peer=%s, disconnecting", addr)
 			delete(sm.peerHeadersSync, addr)
 			peer.Misbehaving(ScoreHeadersDontConnect, "headerssync pipeline failure")
-			peer.Disconnect()
+			// ASYNC: peer goroutine + sm.mu held. See Peer.Disconnect.
+			peer.DisconnectAsync()
 			sm.syncPeer = nil
 			go sm.startHeaderSync()
 			return
@@ -963,7 +964,9 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 						addr, MaxNumUnconnectingHeadersMsgs)
 					peer.Misbehaving(ScoreHeadersDontConnect,
 						fmt.Sprintf("too many unconnecting headers (count=%d)", count))
-					peer.Disconnect()
+					// ASYNC: this runs on the peer's own readHandler goroutine
+					// and holds sm.mu — joining here waits for itself forever.
+					peer.DisconnectAsync()
 					delete(sm.unconnectingHeaders, addr)
 					sm.syncPeer = nil
 					go sm.startHeaderSync()
@@ -1026,7 +1029,9 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 				}
 			}
 			peer.Misbehaving(score, fmt.Sprintf("invalid header: %v", err))
-			peer.Disconnect()
+			// ASYNC: peer goroutine + sm.mu held. This is the exact line that
+			// wedged mainnet on 2026-08-30 (bad-PoW header at 964713).
+			peer.DisconnectAsync()
 			sm.syncPeer = nil
 			go sm.startHeaderSync() // Try another peer
 			return
@@ -1631,7 +1636,9 @@ func (sm *SyncManager) checkStaleTip() {
 		if worstPeer != nil && worstPeer != bestPeer && worstHeight < ourHeight {
 			log.Printf("sync: disconnecting stale peer %s (height %d, ours %d)",
 				worstPeer.Address(), worstHeight, ourHeight)
-			worstPeer.Disconnect()
+			// ASYNC: checkStaleTip runs on the sync loop; joining here can
+			// block on a peer goroutine that is itself waiting for sm.mu.
+			worstPeer.DisconnectAsync()
 		}
 
 		// Request headers from the best peer
