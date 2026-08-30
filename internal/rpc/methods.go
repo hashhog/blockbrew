@@ -259,7 +259,13 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 	verbosity := 1 // Default verbosity
 	if len(args) >= 2 {
 		if v, ok := args[1].(float64); ok {
-			verbosity = int(v)
+			// Conversion before the block lookup: this answered -5
+			// "Block not found" for a value Core refuses with -1.
+			n, rpcErr := coreGetIntArg(v)
+			if rpcErr != nil {
+				return nil, rpcErr
+			}
+			verbosity = n
 		}
 	}
 
@@ -488,7 +494,13 @@ func (s *Server) handleGetBlockHash(params json.RawMessage) (interface{}, *RPCEr
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid height"}
 	}
-	height := int32(heightF)
+	// The conversion runs BEFORE the height domain test: an out-of-int32
+	// value is -1, and int32(heightF) on such a value is implementation-
+	// defined -- the -8 below was being decided on a truncated number.
+	height, rpcErr := coreGetInt32(heightF)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
 
 	// Primary path: walk the in-memory active chain from tip to ancestor
 	// at `height`.  Matches Core's `active_chain[nHeight]` semantics.
@@ -849,7 +861,13 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 				verbosity = 1
 			}
 		} else if v, ok := args[1].(float64); ok {
-			verbosity = int(v)
+			// Conversion before the tx lookup: this answered -5
+			// "No such mempool transaction" where Core answers -1.
+			n, rpcErr := coreGetIntArg(v)
+			if rpcErr != nil {
+				return nil, rpcErr
+			}
+			verbosity = n
 		}
 	}
 

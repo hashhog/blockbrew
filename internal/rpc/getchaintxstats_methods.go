@@ -116,7 +116,13 @@ func (s *Server) handleGetChainTxStats(params json.RawMessage) (interface{}, *RP
 		if !ok {
 			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "nblocks must be a number"}
 		}
-		blockcount = int(nblocksF)
+		// getInt<int> fails in the CONVERSION, so an out-of-int32 nblocks
+		// never reaches the domain test below -- which answered -8.
+		bc, rpcErr := coreGetIntArg(nblocksF)
+		if rpcErr != nil {
+			return nil, rpcErr
+		}
+		blockcount = bc
 		// Core: blockcount < 0 || (blockcount > 0 && blockcount >= pindex->nHeight).
 		if blockcount < 0 || (blockcount > 0 && blockcount >= int(pindex.Height)) {
 			return nil, &RPCError{

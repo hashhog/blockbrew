@@ -1214,6 +1214,19 @@ func (s *Server) handleDisconnectNode(params json.RawMessage) (interface{}, *RPC
 		return s.disconnectByAddress(v)
 	case float64:
 		return s.disconnectByNodeID(int(v))
+	case nil:
+		// Core: "to disconnect by nodeid, either set `address` to the empty
+		// string, or call using the named `nodeid` argument only"
+		// (rpc/net.cpp). blockbrew handled the empty-string spelling but not
+		// a NULL address, so `disconnectnode(null, <id>)` -- what a Core
+		// client sends when it omits the first positional argument -- fell
+		// to this default and answered -32602 where Core answers -29.
+		if len(args) >= 2 {
+			if nodeID, ok := args[1].(float64); ok {
+				return s.disconnectByNodeID(int(nodeID))
+			}
+		}
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Either address or nodeid must be specified"}
 	default:
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameter type"}
 	}
