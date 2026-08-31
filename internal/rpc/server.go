@@ -333,8 +333,8 @@ func (s *Server) Start() error {
 	mux.HandleFunc("/", s.handleRPC)
 
 	s.httpServer = &http.Server{
-		Addr:         s.config.ListenAddr,
-		Handler:      mux,
+		Addr:        s.config.ListenAddr,
+		Handler:     mux,
 		ReadTimeout: 30 * time.Second,
 		// WriteTimeout must accommodate legitimately long RPCs: a full
 		// gettxoutsetinfo / dumptxoutset scan over ~166M coins runs for
@@ -555,6 +555,11 @@ func (s *Server) sendError(w http.ResponseWriter, id interface{}, code int, mess
 // dispatch routes method names to handlers.
 // walletName is the wallet name from URL path (empty if not specified).
 func (s *Server) dispatch(method string, params json.RawMessage, walletName string) (interface{}, *RPCError) {
+	// Core validates argument count centrally before any handler runs
+	// (rpc/util.cpp:644). See core_arity.go.
+	if rpcErr := checkCoreArity(method, params); rpcErr != nil {
+		return nil, rpcErr
+	}
 	switch method {
 	// Blockchain RPCs
 	case "getblockchaininfo":
