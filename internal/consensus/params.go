@@ -2,8 +2,14 @@ package consensus
 
 // Consensus constants for Bitcoin.
 const (
-	// MaxBlockSize is the maximum size of a legacy block in bytes.
+	// MaxBlockSize is the maximum size of a legacy (pre-segwit) block in bytes.
 	MaxBlockSize = 1_000_000
+
+	// MaxBlockSerializedSize is the maximum serialized size of a block
+	// including witness data (Core consensus/consensus.h:13
+	// MAX_BLOCK_SERIALIZED_SIZE = 4000000). It is what getblocktemplate
+	// reports as "sizelimit" post-segwit (Core rpc/mining.cpp:1008).
+	MaxBlockSerializedSize = 4_000_000
 
 	// MaxBlockWeight is the maximum weight of a block (BIP141).
 	MaxBlockWeight = 4_000_000

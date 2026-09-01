@@ -2063,7 +2063,7 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 		Mutable:                  []string{"time", "transactions", "prevblock"},
 		NonceRange:               "00000000ffffffff",
 		SigOpLimit:               consensus.MaxBlockSigOpsCost,
-		SizeLimit:                consensus.MaxBlockSize,
+		SizeLimit:                consensus.MaxBlockSerializedSize, // Core rpc/mining.cpp:1008 MAX_BLOCK_SERIALIZED_SIZE (segwit buried everywhere -> no /4)
 		WeightLimit:              consensus.MaxBlockWeight,
 		CurTime:                  int64(template.Block.Header.Timestamp),
 		Bits:                     fmt.Sprintf("%08x", template.Block.Header.Bits),

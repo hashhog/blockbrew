@@ -385,19 +385,17 @@ func TestW106_G6_CountDescendantsSelfInclusive(t *testing.T) {
 // G9 — BlockConnected: removeSingleTx leaves children dangling
 // ============================================================================
 
-// TestW106_G9_BlockConnectedLeavesChildrenDangling verifies the BUG where
-// BlockConnected calls removeSingleTxLocked (which does NOT remove descendants)
-// on confirmed transactions.  A child of a confirmed tx should either be:
-//   (a) also confirmed (also in the block) — handled by the loop
-//   (b) evicted, because its parent input is now spent by a confirmed tx
+// TestW106_G9_BlockConnectedLeavesChildrenDangling pins Core's removeForBlock
+// semantics (txmempool.cpp:405-421): the confirmed parent is removed with
+// removeUnchecked(BLOCK) — NOT recursively — and removeConflicts only evicts
+// mempool txs spending the SAME prevouts as the block tx. A child spending the
+// confirmed parent's OUTPUT therefore stays in the mempool (its input is now
+// a chain UTXO), but its parent set must no longer name the confirmed tx.
 //
-// Core's removeForBlock iterates all txids in the block and calls
-// removeConflicts → removeWithDescendants for any tx whose input is spent.
-// blockbrew's BlockConnected calls removeSingleTxLocked for each block tx,
-// leaving children in the mempool with Depends pointing to missing entries.
-//
-// BUG (HIGH): after BlockConnected, an unconfirmed child of a confirmed parent
-// remains in mp.pool with a broken Depends reference.
+// The original audit asserted the child is evicted; that was wrong (Core keeps
+// it). The real defect was the dangling Depends entry, which getmempoolentry
+// (extra_methods.go:113) reported as an in-mempool parent. removeSingleTxLocked
+// now prunes children's Depends on removal.
 func TestW106_G9_BlockConnectedLeavesChildrenDangling(t *testing.T) {
 	mp, ops := setupFundedMempool(1)
 	utxos := mp.utxoSet.(*testUTXOSet)
@@ -440,10 +438,16 @@ func TestW106_G9_BlockConnectedLeavesChildrenDangling(t *testing.T) {
 		t.Error("G9: parent tx should be removed after BlockConnected")
 	}
 
-	// BUG: child is still in the mempool with a broken Depends reference.
-	// Core would evict the child too (removeForBlock → removeConflicts).
-	if mp.HasTransaction(childEntry.TxHash) {
-		t.Errorf("BUG G9: child tx still in mempool after parent was confirmed — dangling Depends reference")
+	// Core keeps the child (txmempool.cpp removeForBlock does not recurse).
+	child := mp.GetEntry(childEntry.TxHash)
+	if child == nil {
+		t.Fatal("G9: child tx must remain in mempool after its parent confirms (Core txmempool.cpp:405-421)")
+	}
+	// ...but the confirmed parent must be gone from the child's parent set.
+	if containsHash(child.Depends, parentEntry.TxHash) {
+		t.Errorf("G9: child.Depends still names the confirmed parent %s — dangling reference "+
+			"(getmempoolentry would report a confirmed txid as an in-mempool parent)",
+			parentEntry.TxHash.String()[:16])
 	}
 }
 

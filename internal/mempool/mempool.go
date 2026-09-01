@@ -2127,6 +2127,20 @@ func (mp *Mempool) removeSingleTxLocked(txHash wire.Hash256, reason MemPoolRemov
 		}
 	}
 
+	// Update direct children's Depends lists. A child survives a BLOCK
+	// removal of its parent (Core txmempool.cpp:405-421 removeForBlock takes
+	// only the confirmed tx; removeConflicts only evicts spenders of the SAME
+	// prevouts), and from then on its parent set must not name the confirmed
+	// tx: Core's entry parent links drop it on removal, and getmempoolentry
+	// "depends" / ancestorcount are read straight off that set
+	// (rpc/mempool.cpp entryToJSON). Before this, extra_methods.go:113 could
+	// report a confirmed txid as an in-mempool parent.
+	for _, childHash := range entry.SpentBy {
+		if child, ok := mp.pool[childHash]; ok {
+			child.Depends = removeHash(child.Depends, txHash)
+		}
+	}
+
 	// Decrement DescendantFee/Size on ALL transitive ancestors, not just
 	// direct parents.  Core delegates this to TxGraph which re-linearises
 	// the full cluster on every removal; we replicate the same accounting
@@ -3629,6 +3643,13 @@ func IsConsistentPackage(txns []*wire.MsgTx) bool {
 
 	for _, tx := range txns {
 		txid := tx.TxHash()
+
+		// Core policy/packages.cpp:52-57: consistency is judged on inputs, so a
+		// tx with no inputs cannot be judged and the package is rejected outright
+		// (unconfirmed txs are never allowed to have an empty vin anyway).
+		if len(tx.TxIn) == 0 {
+			return false
+		}
 
 		// Check for duplicate txids
 		if txids[txid] {

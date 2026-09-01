@@ -57,6 +57,41 @@ func gbtRulesTestSetup(t *testing.T, params *consensus.ChainParams) *Server {
 	return server
 }
 
+// gbtSegwitRequest is the minimal template_request Core accepts:
+// {"rules":["segwit"]} (rpc/mining.cpp:627-640, "rules" is Optional::NO).
+func gbtSegwitRequest() []interface{} {
+	return []interface{}{map[string]interface{}{"rules": []string{"segwit"}}}
+}
+
+// TestW108_G12_GBTSizeLimitIsMaxBlockSerializedSize pins the emitted
+// "sizelimit" to Core's MAX_BLOCK_SERIALIZED_SIZE (consensus/consensus.h:13,
+// rpc/mining.cpp:1008/1016). The mining-package G12/G23 tests pin the
+// constant; this one proves the RPC handler actually reads it.
+func TestW108_G12_GBTSizeLimitIsMaxBlockSerializedSize(t *testing.T) {
+	params := consensus.RegtestParams()
+	server := gbtRulesTestSetup(t, params)
+
+	resp := testRPCRequest(t, server.handleRPC, "getblocktemplate", gbtSegwitRequest(), "", "")
+	if resp.Error != nil {
+		t.Fatalf("G12: getblocktemplate returned error: %v", resp.Error)
+	}
+	resultMap, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("G12: result has unexpected type %T", resp.Result)
+	}
+	sizeLimit, ok := resultMap["sizelimit"].(float64)
+	if !ok {
+		t.Fatalf("G12: sizelimit missing or not numeric: %v", resultMap["sizelimit"])
+	}
+	if int64(sizeLimit) != 4_000_000 {
+		t.Errorf("G12: sizelimit = %d, want 4000000 (Core MAX_BLOCK_SERIALIZED_SIZE, mining.cpp:1008)", int64(sizeLimit))
+	}
+	weightLimit, ok := resultMap["weightlimit"].(float64)
+	if !ok || int64(weightLimit) != 4_000_000 {
+		t.Errorf("G12: weightlimit = %v, want 4000000 (Core MAX_BLOCK_WEIGHT)", resultMap["weightlimit"])
+	}
+}
+
 // ---------------------------------------------------------------------------
 // TestW108_G6_RulesInGBTResponse — GBT response includes correct "rules" array.
 //

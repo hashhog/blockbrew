@@ -341,27 +341,28 @@ func TestW108_G11_SigOpLimitValue(t *testing.T) {
 // ---------------------------------------------------------------------------
 // G12 – GBT "sizelimit" must be MAX_BLOCK_SERIALIZED_SIZE (4_000_000) post-segwit.
 // Core mining.cpp:1008: nSizeLimit = MAX_BLOCK_SERIALIZED_SIZE (4_000_000).
-// blockbrew: emits consensus.MaxBlockSize = 1_000_000 — WRONG post-segwit.
+// blockbrew used to emit consensus.MaxBlockSize = 1_000_000 (the legacy limit);
+// the GBT handler now emits consensus.MaxBlockSerializedSize (rpc/methods.go),
+// pinned at the RPC level by TestW108_G12_GBTSizeLimitIsMaxBlockSerializedSize.
 // Core's MAX_BLOCK_SERIALIZED_SIZE is 4_000_000 (consensus/consensus.h:13).
-// consensus.MaxBlockSize = 1_000_000 is the legacy block limit, not the same.
 // ---------------------------------------------------------------------------
 func TestW108_G12_SizeLimitShouldBe4MBPostSegwit(t *testing.T) {
 	// Core: MAX_BLOCK_SERIALIZED_SIZE = 4_000_000.
-	// blockbrew emits consensus.MaxBlockSize = 1_000_000 in the sizelimit field.
 	const coreMaxBlockSerializedSize = int64(4_000_000)
-	blockbrewSizeLimit := int64(consensus.MaxBlockSize)
+	blockbrewSizeLimit := int64(consensus.MaxBlockSerializedSize)
 
-	if blockbrewSizeLimit == coreMaxBlockSerializedSize {
-		t.Log("G12: sizelimit now correctly uses 4_000_000 post-segwit")
-		return
+	if blockbrewSizeLimit != coreMaxBlockSerializedSize {
+		// sizelimit = 1_000_000 would constrain pools to legacy block sizes.
+		t.Errorf("G12 BUG: consensus.MaxBlockSerializedSize = %d, "+
+			"want %d (Core consensus.h:13 MAX_BLOCK_SERIALIZED_SIZE).",
+			blockbrewSizeLimit, coreMaxBlockSerializedSize)
 	}
-
-	// BUG: sizelimit = 1_000_000 constrains pools to legacy block sizes.
-	// Mining pools building segwit blocks can use up to 4 MB serialized.
-	t.Errorf("G12 BUG: GBT sizelimit = %d (consensus.MaxBlockSize = legacy 1MB), "+
-		"want %d (Core MAX_BLOCK_SERIALIZED_SIZE for post-segwit nodes). "+
-		"Core consensus.h:13: MAX_BLOCK_SERIALIZED_SIZE = 4_000_000.",
-		blockbrewSizeLimit, coreMaxBlockSerializedSize)
+	// The legacy constant must stay the legacy value: Core's fPreSegWit path
+	// (mining.cpp:1009-1014) is MAX_BLOCK_SERIALIZED_SIZE / WITNESS_SCALE_FACTOR.
+	if consensus.MaxBlockSize != coreMaxBlockSerializedSize/consensus.WitnessScaleFactor {
+		t.Errorf("G12: consensus.MaxBlockSize = %d, want %d (pre-segwit = serialized/4)",
+			consensus.MaxBlockSize, coreMaxBlockSerializedSize/consensus.WitnessScaleFactor)
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -658,16 +659,13 @@ func TestW108_G22_SubmitBlockDuplicateInvalidInconclusive(t *testing.T) {
 // ---------------------------------------------------------------------------
 func TestW108_G23_SizeLimitConstantWrong(t *testing.T) {
 	// Core consensus/consensus.h:13: MAX_BLOCK_SERIALIZED_SIZE = 4_000_000
-	// This is what GBT should return as "sizelimit" post-segwit.
-	// blockbrew uses consensus.MaxBlockSize = 1_000_000 (legacy limit).
+	// This is what GBT returns as "sizelimit" post-segwit (mining.cpp:1008).
+	// Fixed: consensus.MaxBlockSerializedSize exists and the GBT handler uses it.
 	const coreMaxBlockSerializedSize = 4_000_000
-	if consensus.MaxBlockSize == coreMaxBlockSerializedSize {
-		return // Already fixed
+	if consensus.MaxBlockSerializedSize != coreMaxBlockSerializedSize {
+		t.Errorf("G23 BUG: consensus.MaxBlockSerializedSize = %d but Core MAX_BLOCK_SERIALIZED_SIZE = %d.",
+			consensus.MaxBlockSerializedSize, coreMaxBlockSerializedSize)
 	}
-	t.Errorf("G23 BUG: consensus.MaxBlockSize = %d but Core MAX_BLOCK_SERIALIZED_SIZE = %d. "+
-		"GBT 'sizelimit' must be %d post-segwit (not the legacy 1_000_000 limit). "+
-		"Fix: add a MaxBlockSerializedSize = 4_000_000 constant and use it in GBT response.",
-		consensus.MaxBlockSize, coreMaxBlockSerializedSize, coreMaxBlockSerializedSize)
 }
 
 // ---------------------------------------------------------------------------
