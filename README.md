@@ -7,6 +7,7 @@ A Bitcoin full node written from scratch in Go. Part of the [Hashhog](https://gi
 ### Build from Source
 
 ```bash
+# Requires Go 1.24.0 or newer (pinned in go.mod); no cgo or system libraries beyond build-essential.
 # Install dependencies (Debian/Ubuntu)
 sudo apt-get install -y build-essential
 
