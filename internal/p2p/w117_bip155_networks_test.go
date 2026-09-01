@@ -269,12 +269,17 @@ func TestW117_G5_TorV2DroppedFromMixedAddrv2(t *testing.T) {
 // G1-G4 / BUG-2: Tor v3 connectivity MISSING ENTIRELY
 // ---------------------------------------------------------------------------
 
-// TestW117_G1_TorV3AddrStoredInAddrBook verifies that received Tor v3 addrv2
-// entries can be stored for future connection use (BUG-2).
+// TestW117_G1_TorV3AddrStoredInAddrBook pins what Core does with a Tor v3
+// addrv2 entry when no onion transport is configured: it is NOT stored.
+// net_processing.cpp:5687-5695 keeps an address only if
+// g_reachable_nets.Contains(addr) ("Do not store addresses outside our
+// network"), and init.cpp:1800 removes NET_ONION from the reachable set
+// unless -onion/-proxy is given. blockbrew has no Tor transport at all
+// (PeerManagerConfig has no OnionProxy field — see G2), so dropping is the
+// Core-faithful behaviour; storing would queue undialable peers.
 //
-// Current: AddAddressV2 silently discards NetTorV3 via the TODO path.
-// Correct: Tor v3 addresses should be stored in a separate per-network
-// address book so they can be dialled when -onion is configured.
+// The original audit asserted storage; that was the wrong remedy. The real
+// gap (a Tor v3 transport + -onion, BUG-2) is a feature, not a unit-test fix.
 func TestW117_G1_TorV3AddrStoredInAddrBook(t *testing.T) {
 	ab := NewAddressBook()
 
@@ -293,12 +298,14 @@ func TestW117_G1_TorV3AddrStoredInAddrBook(t *testing.T) {
 
 	ab.AddAddressV2(addr, "test")
 
-	// BUG-2: Tor v3 address is silently dropped; address book stays at 0.
-	if ab.Size() == 0 {
-		t.Errorf("BUG-2 (MISSING: Tor v3 connectivity): AddAddressV2(NetTorV3) "+
-			"silently discarded the address; Tor v3 peers cannot be connected to "+
-			"because no Tor proxy / SOCKS5 dialer is implemented")
+	// Core without -onion: NET_ONION unreachable -> not stored.
+	if ab.Size() != 0 {
+		t.Errorf("AddAddressV2(NetTorV3) stored an address on an unreachable "+
+			"network (size=%d); Core net_processing.cpp:5693 stores only "+
+			"g_reachable_nets, and blockbrew has no Tor transport to dial it", ab.Size())
 	}
+	t.Log("BUG-2 (MISSING feature, out of unit scope): no Tor v3 transport / -onion; " +
+		"until one exists, dropping matches Core-without-proxy")
 }
 
 // TestW117_G2_NoOnionFlag documents that blockbrew has no -onion proxy flag
@@ -319,8 +326,12 @@ func TestW117_G2_NoOnionFlag(t *testing.T) {
 // G11-G16 / BUG-3: I2P connectivity MISSING ENTIRELY
 // ---------------------------------------------------------------------------
 
-// TestW117_G11_I2PAddrStoredInAddrBook verifies I2P addrv2 entries are stored
-// for future use when an I2P SAM bridge is configured (BUG-3).
+// TestW117_G11_I2PAddrStoredInAddrBook pins Core's handling of an I2P addrv2
+// entry with no SAM bridge configured: NOT stored. init.cpp:2245 removes
+// NET_I2P from g_reachable_nets without -i2psam, and net_processing.cpp:5693
+// stores only reachable addresses. blockbrew has no I2P transport (G12), so
+// dropping is Core-faithful. The audit's "should be stored" was the wrong
+// remedy; the feature gap (BUG-3) is out of unit-test scope.
 func TestW117_G11_I2PAddrStoredInAddrBook(t *testing.T) {
 	ab := NewAddressBook()
 
@@ -339,19 +350,22 @@ func TestW117_G11_I2PAddrStoredInAddrBook(t *testing.T) {
 
 	ab.AddAddressV2(addr, "test")
 
-	// BUG-3: I2P address is silently dropped.
-	if ab.Size() == 0 {
-		t.Errorf("BUG-3 (MISSING: I2P connectivity): AddAddressV2(NetI2P) " +
-			"silently discarded the address; I2P SAM bridge not implemented")
+	// Core without -i2psam: NET_I2P unreachable -> not stored.
+	if ab.Size() != 0 {
+		t.Errorf("AddAddressV2(NetI2P) stored an address on an unreachable network "+
+			"(size=%d); Core init.cpp:2245 + net_processing.cpp:5693 drop it", ab.Size())
 	}
+	t.Log("BUG-3 (MISSING feature, out of unit scope): no I2P SAM transport / -i2psam")
 }
 
-// TestW117_G14_I2PPortMustBeZero verifies that I2P addresses with non-zero
-// port are rejected on deserialize (BUG-9).
-//
-// BIP155: I2P addresses do not use ports (I2P has its own routing layer).
-// Core enforces port==0 for I2P peers. A non-zero port in an I2P addrv2
-// entry is malformed and should cause a parse error.
+// TestW117_G14_I2PPortMustBeZero pins that an I2P addrv2 entry with a
+// non-zero port deserializes faithfully. Core has NO deserialize-time port
+// check: CService's serializer reads the port verbatim (netaddress.h:562-565)
+// and SetNetFromBIP155Network validates only the address LENGTH
+// (netaddress.cpp:76-82). The port is only refused at CONNECT time
+// (i2p.cpp:225-226, "connection refused due to arbitrary port"). The audit's
+// "should cause a parse error" would have made blockbrew reject addr
+// messages Core accepts.
 func TestW117_G14_I2PPortMustBeZero(t *testing.T) {
 	i2pBytes := make([]byte, I2PAddrSize)
 
@@ -369,13 +383,16 @@ func TestW117_G14_I2PPortMustBeZero(t *testing.T) {
 	}
 
 	var decoded NetAddressV2
-	err := decoded.Deserialize(&buf)
-
-	// BUG-9: blockbrew accepts I2P addresses with non-zero port.
-	// The Bitcoin Core I2P address handler enforces port==0.
-	if err == nil && decoded.Port != 0 {
-		t.Errorf("BUG-9: Deserialize accepted I2P address with port=%d; "+
-			"BIP155 / Core require port==0 for I2P addresses", decoded.Port)
+	if err := decoded.Deserialize(&buf); err != nil {
+		t.Fatalf("Deserialize rejected an I2P addrv2 with port=8080: %v; Core "+
+			"netaddress.cpp:76-82 checks only the address length", err)
+	}
+	if decoded.NetworkID != NetI2P || decoded.Port != 8080 {
+		t.Errorf("round-trip: got net=%d port=%d, want net=%d port=8080 (Core reads the port verbatim, netaddress.h:564)",
+			decoded.NetworkID, decoded.Port, NetI2P)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("stream not fully consumed: %d bytes left", buf.Len())
 	}
 }
 
@@ -393,8 +410,11 @@ func TestW117_G12_I2PNoSAMBridge(t *testing.T) {
 // G17-G20 / BUG-4: CJDNS connection support MISSING ENTIRELY
 // ---------------------------------------------------------------------------
 
-// TestW117_G17_CJDNSAddrStoredInAddrBook verifies CJDNS addrv2 entries are
-// stored for future use when -cjdnsreachable is configured (BUG-4).
+// TestW117_G17_CJDNSAddrStoredInAddrBook pins Core's handling of a CJDNS
+// addrv2 entry without -cjdnsreachable: NOT stored. init.cpp:1546 removes
+// NET_CJDNS from g_reachable_nets unless the flag is set, and
+// net_processing.cpp:5693 stores only reachable addresses. blockbrew has no
+// -cjdnsreachable (G18), so dropping is Core-faithful.
 func TestW117_G17_CJDNSAddrStoredInAddrBook(t *testing.T) {
 	ab := NewAddressBook()
 
@@ -416,12 +436,12 @@ func TestW117_G17_CJDNSAddrStoredInAddrBook(t *testing.T) {
 
 	ab.AddAddressV2(addr, "test")
 
-	// BUG-4: CJDNS address is silently dropped.
-	if ab.Size() == 0 {
-		t.Errorf("BUG-4 (MISSING: CJDNS connectivity): AddAddressV2(NetCJDNS) "+
-			"silently discarded the address; -cjdnsreachable not implemented, "+
-			"CJDNS connections MISSING ENTIRELY")
+	// Core without -cjdnsreachable: NET_CJDNS unreachable -> not stored.
+	if ab.Size() != 0 {
+		t.Errorf("AddAddressV2(NetCJDNS) stored an address on an unreachable network "+
+			"(size=%d); Core init.cpp:1546 + net_processing.cpp:5693 drop it", ab.Size())
 	}
+	t.Log("BUG-4 (MISSING feature, out of unit scope): no -cjdnsreachable")
 }
 
 // TestW117_G18_NoCJDNSReachableFlag documents that -cjdnsreachable is absent
@@ -501,47 +521,10 @@ func TestW117_G22_OutboundDiversityIPv4IPv6Only(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// G29 / BUG-5: getnetworkinfo missing "i2p" and "cjdns" network entries
+// G29 / BUG-5: getnetworkinfo networks — TestW117_G29_GetNetworkInfoMissingI2PAndCJDNS
+// lives in internal/rpc/w117_network_rpc_test.go, where it can call
+// handleGetNetworkInfo instead of a hardcoded copy of its output.
 // ---------------------------------------------------------------------------
-
-// TestW117_G29_GetNetworkInfoMissingI2PAndCJDNS verifies that getnetworkinfo
-// returns entries for all 5 BIP155 networks (BUG-5).
-//
-// Core returns: ipv4, ipv6, onion, i2p, cjdns (5 entries).
-// blockbrew returns: ipv4, ipv6, onion (3 entries — missing i2p and cjdns).
-func TestW117_G29_GetNetworkInfoMissingI2PAndCJDNS(t *testing.T) {
-	// Reflect on the hardcoded Networks slice in handleGetNetworkInfo.
-	// We can't call the RPC handler directly without a full server, but
-	// we can verify the expected set of networks via the NetworkEntry type.
-	//
-	// The reference list from Bitcoin Core GetNetworksInfo() (rpc/net.cpp:610):
-	//   NET_IPV4  → "ipv4"
-	//   NET_IPV6  → "ipv6"
-	//   NET_ONION → "onion"
-	//   NET_I2P   → "i2p"
-	//   NET_CJDNS → "cjdns"
-	wantNetworks := []string{"ipv4", "ipv6", "onion", "i2p", "cjdns"}
-
-	// This is the hardcoded list from methods.go handleGetNetworkInfo:
-	gotNetworks := []string{"ipv4", "ipv6", "onion"} // as of audit
-
-	wantSet := make(map[string]bool)
-	for _, n := range wantNetworks {
-		wantSet[n] = true
-	}
-	gotSet := make(map[string]bool)
-	for _, n := range gotNetworks {
-		gotSet[n] = true
-	}
-
-	for _, n := range wantNetworks {
-		if !gotSet[n] {
-			t.Errorf("BUG-5: getnetworkinfo Networks missing entry for %q; "+
-				"Core returns %v, blockbrew returns %v",
-				n, wantNetworks, gotNetworks)
-		}
-	}
-}
 
 // ---------------------------------------------------------------------------
 // G30 / BUG-6: getnodeaddresses RPC missing
@@ -566,42 +549,10 @@ func TestW117_G30_GetNodeAddressesMissing(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// G8/G9 / BUG-8: getpeerinfo "network" field hardcoded to "ipv4"
+// G8/G9 / BUG-8: getpeerinfo "network" — TestW117_G9_GetPeerInfoNetworkFieldHardcoded
+// lives in internal/rpc/w117_network_rpc_test.go, where it can call
+// peerNetworkFromAddr (the production derivation) instead of a literal.
 // ---------------------------------------------------------------------------
-
-// TestW117_G9_GetPeerInfoNetworkFieldHardcoded verifies that the PeerInfo
-// "network" field is derived from the actual peer address, not hardcoded (BUG-8).
-//
-// An IPv6 peer should report network="ipv6". Core derives this dynamically
-// from the peer's CNetAddr::GetNetClass() (rpc/net.cpp:233-247).
-func TestW117_G9_GetPeerInfoNetworkFieldHardcoded(t *testing.T) {
-	// Test helper: determine expected network string from address string.
-	// Core logic: if address is IPv6 → "ipv6", if .onion → "onion", etc.
-
-	type peerAddrCase struct {
-		addr    string
-		wantNet string
-	}
-	cases := []peerAddrCase{
-		{"1.2.3.4:8333", "ipv4"},
-		{"[2001:db8::1]:8333", "ipv6"},
-	}
-
-	for _, tc := range cases {
-		// Simulate what handleGetPeerInfo does today:
-		// it always returns "ipv4" regardless of address.
-		gotNet := "ipv4" // hardcoded in current implementation
-
-		if gotNet != tc.wantNet {
-			t.Errorf("BUG-8: getpeerinfo network field: addr=%s got=%q want=%q; "+
-				"network type should be derived from peer address dynamically",
-				tc.addr, gotNet, tc.wantNet)
-		} else if tc.wantNet != "ipv4" {
-			// If the test passes for a non-ipv4 case, the hardcoding is gone.
-			t.Logf("BUG-8 FIXED for addr=%s: network=%q", tc.addr, gotNet)
-		}
-	}
-}
 
 // ---------------------------------------------------------------------------
 // G25-G28: IsRoutable / IsLocal / subnet handling (passing / informational)

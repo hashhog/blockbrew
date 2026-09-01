@@ -596,23 +596,33 @@ func TestW124_G_NoNotifyHooks_BUG16(t *testing.T) {
 // ────────────────────────────────────────────────────────────────────────
 
 func TestW124_G_NoVerifyChainRPC_BUG17(t *testing.T) {
-	hits := w124Grep(t, "checkblocks\\|checklevel\\|verifychain", "cmd/", "internal/rpc/")
+	// Half of BUG-17 landed: the verifychain RPC is dispatched
+	// (internal/rpc/server.go `case "verifychain"`) and implemented in
+	// internal/rpc/verifychain_methods.go as a port of Core
+	// rpc/blockchain.cpp::verifychain. Pin it so it cannot silently rot.
+	hits := w124Grep(t, "case \"verifychain\"", "internal/rpc/")
+	if !strings.Contains(hits, "internal/rpc/server.go") {
+		t.Fatalf("BUG-17 REGRESSION: verifychain no longer dispatched in internal/rpc/server.go; grep output:\n%s", hits)
+	}
+
+	// The other half — the -checkblocks / -checklevel startup knobs (Core
+	// init.cpp DEFAULT_CHECKBLOCKS=6 / DEFAULT_CHECKLEVEL=3, driving
+	// VerifyDB at startup) — is still absent from the launcher.
+	knobs := w124Grep(t, "checkblocks\\|checklevel", "cmd/")
 	prodHits := []string{}
-	for _, line := range strings.Split(hits, "\n") {
-		if line == "" {
-			continue
-		}
-		if strings.Contains(line, "_test.go:") {
+	for _, line := range strings.Split(knobs, "\n") {
+		if line == "" || strings.Contains(line, "_test.go:") {
 			continue
 		}
 		prodHits = append(prodHits, line)
 	}
 	if len(prodHits) > 0 {
-		t.Fatalf("BUG-17 may be fixed: verifychain refs in production code:\n%s",
+		t.Fatalf("BUG-17 knobs may be fixed: checkblocks/checklevel refs in cmd/:\n%s"+
+			"\nRe-audit and turn this skip into a positive test.",
 			strings.Join(prodHits, "\n"))
 	}
-	t.Skip("BUG-17 (P2 MISSING): VerifyChainstateConsistency depth is hardcoded " +
-		"to 200 (main.go:1115); no operator dial. Core has -checkblocks (default 6), " +
-		"-checklevel (default 3), and the verifychain RPC. blockbrew has none. Fix: " +
-		"add the three knobs, expose verifychain RPC backed by the existing engine.")
+	t.Skip("GAP W124-BUG17-KNOBS (P2 MISSING): verifychain RPC exists, but the " +
+		"startup VerifyChainstateConsistency depth is still hardcoded (main.go) with " +
+		"no -checkblocks (Core default 6) / -checklevel (Core default 3) operator " +
+		"dials. Fix: add the two flags and run the verifychain engine at startup.")
 }

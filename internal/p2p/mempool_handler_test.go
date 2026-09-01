@@ -44,24 +44,41 @@ func TestHandleMempoolRequest_NilProvider(t *testing.T) {
 	}
 }
 
+// Core net_processing.cpp:6007-6009: the BIP35 mempool reply announces
+// MSG_WTX for wtxid-relay peers and MSG_TX for legacy peers. MSG_WITNESS_TX
+// (0x40000001) is a BIP-144 getdata flag and never appears in an inv.
 func TestHandleMempoolRequest_SmallBatch(t *testing.T) {
-	peer := &Peer{addr: "127.0.0.1:8333"}
-	hashes := makeHashes(5)
-	provider := &fakeMempoolProvider{hashes: hashes}
-	invs := HandleMempoolRequest(peer, provider)
-	if len(invs) != 1 {
-		t.Fatalf("expected 1 inv, got %d", len(invs))
+	cases := []struct {
+		name     string
+		peer     *Peer
+		wantType InvType
+	}{
+		{"legacy peer -> MSG_TX", &Peer{addr: "127.0.0.1:8333"}, InvTypeTx},
+		{"wtxid-relay peer -> MSG_WTX", &Peer{addr: "127.0.0.1:8333", wtxidRelaySupported: true}, InvTypeWtx},
 	}
-	if len(invs[0].InvList) != 5 {
-		t.Fatalf("expected 5 inv vectors, got %d", len(invs[0].InvList))
-	}
-	for i, iv := range invs[0].InvList {
-		if iv.Type != InvTypeWitnessTx {
-			t.Errorf("inv[%d].Type = 0x%x, want InvTypeWitnessTx (0x%x)", i, iv.Type, InvTypeWitnessTx)
-		}
-		if iv.Hash != hashes[i] {
-			t.Errorf("inv[%d].Hash mismatch", i)
-		}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hashes := makeHashes(5)
+			provider := &fakeMempoolProvider{hashes: hashes}
+			invs := HandleMempoolRequest(tc.peer, provider)
+			if len(invs) != 1 {
+				t.Fatalf("expected 1 inv, got %d", len(invs))
+			}
+			if len(invs[0].InvList) != 5 {
+				t.Fatalf("expected 5 inv vectors, got %d", len(invs[0].InvList))
+			}
+			for i, iv := range invs[0].InvList {
+				if iv.Type != tc.wantType {
+					t.Errorf("inv[%d].Type = 0x%x, want 0x%x (Core net_processing.cpp:6007)", i, iv.Type, tc.wantType)
+				}
+				if iv.Type == InvTypeWitnessTx {
+					t.Errorf("inv[%d] carries MSG_WITNESS_TX, a getdata-only flag Core rejects in inv", i)
+				}
+				if iv.Hash != hashes[i] {
+					t.Errorf("inv[%d].Hash mismatch", i)
+				}
+			}
+		})
 	}
 }
 

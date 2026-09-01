@@ -230,13 +230,23 @@ func TestW141_A7_NoPerTxFanOutOnBlockConnect_BUG6(t *testing.T) {
 	if len(region) > 1500 {
 		region = region[:1500]
 	}
-	// A future fix would add a tx loop near the block-connect callback.
-	if strings.Contains(region, "PublishTxConfirmedInBlock") ||
-		strings.Contains(region, "for _, tx := range block.Transactions") &&
-			strings.Contains(region, "zmqPub.Publish") {
-		t.Fatalf("BUG-6 may be fixed: per-tx ZMQ fan-out detected near block-connect")
+	// A future fix would add a tx loop near the block-connect callback that
+	// calls a per-tx publisher. The region necessarily contains
+	// "zmqPub.PublishBlockConnected" (it starts there) and, since the txindex
+	// write loop moved next to it, "for _, tx := range block.Transactions" —
+	// neither of which is a per-tx ZMQ fan-out. Look for an actual per-tx
+	// publish call instead: any zmqPub.Publish* OTHER than the block one.
+	perTxPublish := false
+	for _, name := range []string{"PublishTxConfirmedInBlock", "PublishTxAccepted(tx", "PublishTxConfirmed("} {
+		if strings.Contains(region, "zmqPub."+name) {
+			perTxPublish = true
+		}
 	}
-	t.Skip("BUG-6 (P1 MISSING): cmd/blockbrew/main.go:1076-1079 calls only " +
+	if perTxPublish {
+		t.Fatalf("BUG-6 may be fixed: per-tx ZMQ fan-out detected near block-connect; " +
+			"re-audit and turn this skip into a positive test")
+	}
+	t.Skip("BUG-6 (P1 MISSING): cmd/blockbrew/main.go calls only " +
 		"PublishBlockConnected; Core zmqnotificationinterface.cpp:180-196 also " +
 		"iterates pblock->vtx and fires hashtx + rawtx for each confirmed tx. " +
 		"Confirmation events never reach pubhashtx subscribers, so wallets " +

@@ -928,10 +928,11 @@ func TestInvalidParams(t *testing.T) {
 		WithHeaderIndex(idx),
 	)
 
-	// getblockhash with missing height
+	// getblockhash with missing height -> -1: Core rpc/util.cpp:644
+	// IsValidNumArgs -> HelpResult -> RPC_MISC_ERROR (rpc/server.cpp:355).
 	resp := testRPCRequest(t, server.handleRPC, "getblockhash", []interface{}{}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected invalid params error for getblockhash without height")
+	if resp.Error == nil || resp.Error.Code != RPCErrMisc {
+		t.Errorf("expected -1 RPC_MISC_ERROR (Core arity) for getblockhash without height, got %v", resp.Error)
 	}
 
 	// getblock with malformed hash -> -8 RPC_INVALID_PARAMETER at Core's
@@ -1325,10 +1326,11 @@ func TestGetRawTransactionFromTxIndex(t *testing.T) {
 func TestGetRawTransactionInvalidParams(t *testing.T) {
 	server := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0"})
 
-	// Missing txid
+	// Missing txid -> -1: Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult
+	// -> RPC_MISC_ERROR (rpc/server.cpp:355).
 	resp := testRPCRequest(t, server.handleRPC, "getrawtransaction", []interface{}{}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected invalid params error for missing txid")
+	if resp.Error == nil || resp.Error.Code != RPCErrMisc {
+		t.Errorf("expected -1 RPC_MISC_ERROR (Core arity) for missing txid, got %v", resp.Error)
 	}
 
 	// Malformed txid -> -8 RPC_INVALID_PARAMETER at Core's ParseHashV
@@ -1458,10 +1460,11 @@ func TestPreciousBlockRPC(t *testing.T) {
 		WithChainDB(db),
 	)
 
-	// Missing blockhash parameter
+	// Missing blockhash parameter -> -1: Core rpc/util.cpp:644 IsValidNumArgs
+	// -> HelpResult -> RPC_MISC_ERROR (rpc/server.cpp:355).
 	resp := testRPCRequest(t, server.handleRPC, "preciousblock", []interface{}{}, "", "")
-	if resp.Error == nil || resp.Error.Code != RPCErrInvalidParams {
-		t.Error("expected error for missing blockhash")
+	if resp.Error == nil || resp.Error.Code != RPCErrMisc {
+		t.Errorf("expected -1 RPC_MISC_ERROR (Core arity) for missing blockhash, got %v", resp.Error)
 	}
 
 	// Invalid blockhash format

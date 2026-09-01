@@ -1,10 +1,13 @@
 // Package rpc — W125 RPC error code parity audit (DISCOVERY).
 //
 // See audit/w125_rpc_error_parity.md for the full audit. This file
-// implements 30 xfail tests pinning down current blockbrew behavior
-// for each of the 30 audit gates. Tests assert the **actual**
-// emitted error code/message; a future fix wave should flip the
-// assertions to the Core-correct value.
+// implements 30 tests pinning down blockbrew behavior for each of the
+// 30 audit gates. Tests originally asserted the **actual** emitted error
+// code/message as xfail pins; the missing-required-arg gates were flipped
+// to Core's value once the dispatcher arity check landed (0af8bce,
+// core_arity.go): Core rpc/util.cpp:644 IsValidNumArgs throws HelpResult,
+// surfacing as -1 RPC_MISC_ERROR (rpc/server.cpp:355) -- NOT -8 as the
+// original audit assumed. Remaining -32602 pins are still xfail.
 //
 // Reference: bitcoin-core/src/rpc/protocol.h (canonical RPCErrorCode enum)
 // Precedent: FIX-80 (668244f) — getblockhash -5 → -8 alignment.
@@ -113,8 +116,8 @@ func TestW125_Gate01_GetBlockHash_OutOfRange_Present(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-2 — getblockhash missing height arg (MISSING).
-// Core: -8 RPC_INVALID_PARAMETER
-// blockbrew: -32602 RPCErrInvalidParams
+// Core: -1 RPC_MISC_ERROR (arity, rpc/util.cpp:644)
+// blockbrew: -1 since 0af8bce (core_arity.go)
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_02_GetBlockHash_MissingArg(t *testing.T) {
@@ -126,15 +129,18 @@ func TestW125_BUG_02_GetBlockHash_MissingArg(t *testing.T) {
 	}
 	// CURRENT (xfail) — blockbrew emits -32602.
 	// FUTURE FIX — should be RPCErrInvalidParameter (-8) per Core.
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-3 — getblockheader missing hash arg.
-// Core: -8 ; blockbrew: -32602
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 (arity)
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_03_GetBlockHeader_MissingArg(t *testing.T) {
@@ -144,9 +150,12 @@ func TestW125_BUG_03_GetBlockHeader_MissingArg(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
@@ -175,7 +184,7 @@ func TestW125_BUG_01_GetRawTransaction_InvalidTxidHex(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-4 — getrawtransaction missing txid arg.
-// Core: -8 ; blockbrew: -32602
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 (arity)
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_04_GetRawTransaction_MissingArg(t *testing.T) {
@@ -185,16 +194,19 @@ func TestW125_BUG_04_GetRawTransaction_MissingArg(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-5 — gettxout missing args.
-// Core: -8 for missing-arg, -8 for txid parse-fail.
-// blockbrew: -32602 for all.
+// Core: -1 (arity, rpc/util.cpp:644) for missing-arg, -8 for txid parse-fail.
+// blockbrew: -1 for missing args (arity); -32602 for the rest.
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_05a_GetTxOut_MissingArgs(t *testing.T) {
@@ -204,9 +216,12 @@ func TestW125_BUG_05a_GetTxOut_MissingArgs(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
@@ -286,7 +301,7 @@ func TestW125_BUG_08_GetMempoolAncestors_InvalidTxidHex(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-9 — submitblock missing hex arg.
-// Core: -8 ; blockbrew: -32602.
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 (arity).
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_09_SubmitBlock_MissingHex(t *testing.T) {
@@ -296,9 +311,12 @@ func TestW125_BUG_09_SubmitBlock_MissingHex(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
@@ -523,7 +541,7 @@ func TestW125_BUG_14_DisconnectNode_NoArgs(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-15 — prioritisetransaction missing arg.
-// Core: -8 ; blockbrew: -32602 for missing args (but -8 for dummy!=0).
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 for missing args (arity), -8 for dummy!=0.
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_15a_Prioritise_MissingArgs(t *testing.T) {
@@ -533,9 +551,12 @@ func TestW125_BUG_15a_Prioritise_MissingArgs(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
@@ -557,7 +578,7 @@ func TestW125_BUG_15b_Prioritise_DummyNotZero_Present(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-16 — verifymessage missing args.
-// Core: -8 ; blockbrew: -32602.
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 (arity).
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_16_VerifyMessage_MissingArgs(t *testing.T) {
@@ -567,9 +588,12 @@ func TestW125_BUG_16_VerifyMessage_MissingArgs(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
@@ -593,7 +617,7 @@ func TestW125_BUG_17_SignMessage_MissingArgs(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-18 — signmessagewithprivkey missing args.
-// Core: -8 ; blockbrew: -32602.
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 (arity).
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_18_SignMessageWithPrivKey_MissingArgs(t *testing.T) {
@@ -603,15 +627,18 @@ func TestW125_BUG_18_SignMessageWithPrivKey_MissingArgs(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-19 — validateaddress missing arg.
-// Core: -8 ; blockbrew: -32602.
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 (arity).
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_19_ValidateAddress_MissingArg(t *testing.T) {
@@ -621,16 +648,19 @@ func TestW125_BUG_19_ValidateAddress_MissingArg(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-20 — createmultisig validation errors.
-// Core: -8 for nrequired/pubkeys bounds, -5 for pubkey hex/address_type.
-// blockbrew: -32602 for all.
+// Core: -1 (arity) for missing args, -8 for nrequired/pubkeys bounds, -5 for pubkey hex/address_type.
+// blockbrew: -1 for missing args (arity); -32602 for the rest.
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_20a_CreateMultisig_MissingArgs(t *testing.T) {
@@ -640,9 +670,12 @@ func TestW125_BUG_20a_CreateMultisig_MissingArgs(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
@@ -747,7 +780,7 @@ func TestW125_BUG_22_SendToAddress_NoWallet(t *testing.T) {
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-23 — gettxoutproof missing args.
-// Core: -8 ; blockbrew: -32602.
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 (arity).
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_23_GetTxOutProof_MissingArg(t *testing.T) {
@@ -757,15 +790,18 @@ func TestW125_BUG_23_GetTxOutProof_MissingArg(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // BUG-24 — PSBT family missing args.
-// Core: -8 ; blockbrew: -32602 for all PSBT arg-shape errors.
+// Core: -1 (arity, rpc/util.cpp:644) ; blockbrew: -1 for missing args (arity); -32602 for other PSBT arg-shape errors.
 // ─────────────────────────────────────────────────────────────────────
 
 func TestW125_BUG_24a_DecodePsbt_MissingArg(t *testing.T) {
@@ -775,9 +811,12 @@ func TestW125_BUG_24a_DecodePsbt_MissingArg(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 
@@ -788,9 +827,12 @@ func TestW125_BUG_24b_FinalizePsbt_MissingArg(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	// Core rpc/util.cpp:644 IsValidNumArgs -> HelpResult -> -1 RPC_MISC_ERROR
+	// (rpc/server.cpp:355). A missing REQUIRED arg is an arity violation caught
+	// by the dispatcher (core_arity.go), never -8 and no longer -32602.
+	if resp.Error.Code != RPCErrMisc {
+		t.Errorf("code = %d, want %d (Core rpc/util.cpp:644 IsValidNumArgs -> -1)",
+			resp.Error.Code, RPCErrMisc)
 	}
 }
 

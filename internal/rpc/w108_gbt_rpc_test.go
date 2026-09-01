@@ -107,7 +107,9 @@ func TestW108_G6_RulesInGBTResponse(t *testing.T) {
 	params := consensus.RegtestParams()
 	server := gbtRulesTestSetup(t, params)
 
-	resp := testRPCRequest(t, server.handleRPC, "getblocktemplate", []interface{}{}, "", "")
+	// Core rpc/mining.cpp:627: template_request is RPCArg::Optional::NO, so
+	// a bare call is an arity error (-1); pass the segwit rules object.
+	resp := testRPCRequest(t, server.handleRPC, "getblocktemplate", gbtSegwitRequest(), "", "")
 	if resp.Error != nil {
 		t.Fatalf("G6: getblocktemplate returned error: %v", resp.Error)
 	}
@@ -199,7 +201,9 @@ func TestW108_G7_VbAvailableInGBTResponse(t *testing.T) {
 	params := consensus.RegtestParams()
 	server := gbtRulesTestSetup(t, params)
 
-	resp := testRPCRequest(t, server.handleRPC, "getblocktemplate", []interface{}{}, "", "")
+	// Core rpc/mining.cpp:627: template_request is RPCArg::Optional::NO, so
+	// a bare call is an arity error (-1); pass the segwit rules object.
+	resp := testRPCRequest(t, server.handleRPC, "getblocktemplate", gbtSegwitRequest(), "", "")
 	if resp.Error != nil {
 		t.Fatalf("G7: getblocktemplate returned error: %v", resp.Error)
 	}
@@ -292,7 +296,9 @@ func TestW108_G7_VbAvailableStartedDeployment(t *testing.T) {
 		WithTemplateGenerator(tg),
 	)
 
-	resp := testRPCRequest(t, server.handleRPC, "getblocktemplate", []interface{}{}, "", "")
+	// Core rpc/mining.cpp:627: template_request is RPCArg::Optional::NO, so
+	// a bare call is an arity error (-1); pass the segwit rules object.
+	resp := testRPCRequest(t, server.handleRPC, "getblocktemplate", gbtSegwitRequest(), "", "")
 	if resp.Error != nil {
 		t.Fatalf("G7 started: getblocktemplate returned error: %v", resp.Error)
 	}
