@@ -77,6 +77,28 @@ type UTXOSet struct {
 	appliedHeight int32
 	appliedSet    bool
 
+	// appliedFloorHeight is a raise-only LOWER BOUND on the block height the
+	// PERSISTED set may already reflect, held separately from
+	// appliedHash/appliedHeight because "how much is on disk" and "which block
+	// is on disk" are different questions with different evidence.
+	//
+	// The second question can be unanswerable while the first still has a
+	// sound answer. When an interrupted multi-batch coin flush is recorded
+	// (storage.CoinsFlushKey, Core's DB_HEAD_BLOCKS — txdb.cpp:128-129), the
+	// on-disk marker names a block that does NOT describe the set, so nothing
+	// may be adopted from it; but the two ends of the recorded window are
+	// still hard evidence that the set may contain mutations up to the higher
+	// of them. Discarding that evidence — which is what leaving appliedSet
+	// false does — switches off AdvanceAppliedTip's raise-only guard in
+	// precisely the failure case the guard exists for.
+	//
+	// So the floor is installed even when the marker is refused, and
+	// AdvanceAppliedTip refuses to publish a marker at or below it. It is
+	// RESET (not raised) by SetAppliedTip, the authoritative restatement:
+	// those four callers know the whole answer, including a genuine rewind.
+	appliedFloorHeight int32
+	appliedFloorSet    bool
+
 	// reorgJournal, when non-nil, records the pre-mutation state of every
 	// outpoint touched since BeginReorgJournal (first-write-wins). It lets a
 	// multi-block reorg that fails partway (ChainManager.ReorgTo) restore the
@@ -337,6 +359,42 @@ func (u *UTXOSet) SetAppliedTip(hash wire.Hash256, height int32) {
 	u.appliedHash = hash
 	u.appliedHeight = height
 	u.appliedSet = true
+	// An authoritative restatement RESETS the floor rather than raising it.
+	// A DisconnectBlock or a ReorgTo rollback genuinely removes coins, so a
+	// floor left standing above the restated tip would block every subsequent
+	// forward advance and strand the marker BELOW its own coins — the exact
+	// corruption the floor exists to prevent, arrived at from the other side.
+	u.appliedFloorHeight = height
+	u.appliedFloorSet = true
+}
+
+// RaiseAppliedFloor records that the PERSISTED set may already reflect blocks
+// up to `height`, without naming the block. Raise-only: a floor is a lower
+// bound and evidence only ever accumulates. Reports whether the floor moved.
+//
+// This is the half of Core's boot-time coins-database reading that survives an
+// unusable marker. Core repairs that state instead (ReplayBlocks,
+// validation.cpp:4773, rolls forward to hashHeads[0] — it never publishes a
+// best block below the recorded window); blockbrew has no ReplayBlocks, fails
+// closed on adoption, and keeps the bound so the monotonicity guard still has
+// something to stand on.
+func (u *UTXOSet) RaiseAppliedFloor(height int32) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.appliedFloorSet && height <= u.appliedFloorHeight {
+		return false
+	}
+	u.appliedFloorHeight = height
+	u.appliedFloorSet = true
+	return true
+}
+
+// AppliedFloor reports the raise-only lower bound on what the persisted set
+// may reflect, and whether one has ever been installed.
+func (u *UTXOSet) AppliedFloor() (int32, bool) {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.appliedFloorHeight, u.appliedFloorSet
 }
 
 // AdvanceAppliedTip raises the applied-through marker to (hash, height) and
@@ -358,6 +416,13 @@ func (u *UTXOSet) AdvanceAppliedTip(hash wire.Hash256, height int32) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.appliedSet && height <= u.appliedHeight {
+		return false
+	}
+	// The floor is the SAME refusal standing on weaker evidence. appliedSet
+	// is false on exactly the boots where the marker could not be trusted, so
+	// the guard above cannot fire there — and those are the boots where the
+	// persisted set is most likely to lead the tip. Refuse on the bound too.
+	if u.appliedFloorSet && height <= u.appliedFloorHeight {
 		return false
 	}
 	u.appliedHash = hash

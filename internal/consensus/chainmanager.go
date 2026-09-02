@@ -784,6 +784,46 @@ type appliedTipTracker interface {
 	AdvanceAppliedTip(hash wire.Hash256, height int32) bool
 }
 
+// appliedFloorTracker is the optional capability a UTXO view exposes when it
+// can hold a raise-only LOWER BOUND on what the persisted set may already
+// reflect, separately from the named block. Kept apart from appliedTipTracker
+// so scratch views (and third-party fakes) that only implement the marker keep
+// compiling and keep working.
+type appliedFloorTracker interface {
+	RaiseAppliedFloor(height int32) bool
+	AppliedFloor() (int32, bool)
+}
+
+// raiseAppliedFloor records that the persisted set may already reflect blocks
+// up to `height`, without naming the block. No-op on views that cannot hold a
+// floor.
+func (cm *ChainManager) raiseAppliedFloor(height int32) {
+	if t, ok := cm.utxoSet.(appliedFloorTracker); ok {
+		t.RaiseAppliedFloor(height)
+	}
+}
+
+// viewAppliedTip reports the IN-MEMORY applied-through marker of the UTXO view
+// this manager mutates — what the connect path's own view reflects right now,
+// as opposed to what disk reflects. Zero value when the view cannot track one.
+func (cm *ChainManager) viewAppliedTip() (wire.Hash256, int32, bool) {
+	type appliedTipReader interface {
+		AppliedTip() (wire.Hash256, int32, bool)
+	}
+	if t, ok := cm.utxoSet.(appliedTipReader); ok {
+		return t.AppliedTip()
+	}
+	return wire.Hash256{}, 0, false
+}
+
+// appliedFloor reports the view's raise-only lower bound, if it holds one.
+func (cm *ChainManager) appliedFloor() (int32, bool) {
+	if t, ok := cm.utxoSet.(appliedFloorTracker); ok {
+		return t.AppliedFloor()
+	}
+	return 0, false
+}
+
 // setAppliedTip tells the UTXO view which block its mutations now reflect.
 //
 // Call it AFTER the block's mutations have been applied to the view (or, for
@@ -838,12 +878,85 @@ func (cm *ChainManager) advanceAppliedTip(hash wire.Hash256, height int32) {
 // authoritative from this moment on either way.
 func (cm *ChainManager) seedAppliedTipFromMarker() {
 	hash, height, ok := cm.durableCoinsTip()
+	if ok {
+		cm.setAppliedTip(hash, height)
+		log.Printf("chainmgr: coins marker on disk: the persisted UTXO set reflects %s@%d",
+			hash.String()[:16], height)
+		return
+	}
+
+	// FAIL-CLOSED, NOT GUARD-OFF (2026-09-02).
+	//
+	// durableCoinsTip refuses the marker whenever it cannot NAME the block the
+	// persisted set reflects: an interrupted multi-batch flush is recorded, the
+	// marker is missing, or the height map disagrees with it. Returning here
+	// used to leave UTXOSet.appliedSet false — and AdvanceAppliedTip's
+	// raise-only guard is conditioned on appliedSet, so failing closed silently
+	// DISABLED the monotonicity guard on exactly the boots that need it most.
+	// A guard that switches itself off in its own failure case is not a guard.
+	//
+	// "Which block does the set reflect?" and "how much can the set already
+	// reflect?" are different questions. The first is unanswerable here. The
+	// second is not: the refused marker and both ends of a recorded flush
+	// window are hard on-disk evidence of an upper extent, and the guard needs
+	// nothing more than that bound. Install it as a floor. Adoption stays
+	// refused — nothing below is allowed to skip work on a floor.
+	//
+	// Core reaches the same place by repairing instead of bounding: it records
+	// both ends of the window in DB_HEAD_BLOCKS (txdb.cpp:128-129), erases it
+	// with the new DB_BEST_BLOCK in the final batch (txdb.cpp:157-159), and
+	// ReplayBlocks (validation.cpp:4773) rolls forward to hashHeads[0] before
+	// LoadChainTip (validation.cpp:4546) is ever allowed to read the marker.
+	// It never publishes a best block below the window. Neither may we.
+	floor, ok := cm.durableCoinsFloor()
 	if !ok {
 		return
 	}
-	cm.setAppliedTip(hash, height)
-	log.Printf("chainmgr: coins marker on disk: the persisted UTXO set reflects %s@%d",
-		hash.String()[:16], height)
+	cm.raiseAppliedFloor(floor)
+	log.Printf("chainmgr: the coins marker is unusable, but on-disk evidence says the "+
+		"persisted UTXO set may already reflect blocks up to height %d; the "+
+		"applied-through marker will NOT be published at or below that height "+
+		"until a block above it is genuinely connected", floor)
+}
+
+// durableCoinsFloor reports a LOWER BOUND on the block height the persisted
+// coin set may already reflect, and whether any on-disk evidence exists for
+// one. It deliberately asks a WEAKER question than durableCoinsTip and so
+// answers in cases where that one must refuse.
+//
+// The bound is the highest height any on-disk record mentions:
+//
+//   - the coins marker itself (storage.CoinsTipKey), even when it failed the
+//     height-map cross-check — a marker that is not on THIS chain is still
+//     proof that some flush stamped that height over this set;
+//   - both ends of a recorded interrupted flush (storage.CoinsFlushKey,
+//     Core's DB_HEAD_BLOCKS): the set is somewhere between them, so it may
+//     contain mutations up to the higher end.
+//
+// Taking the maximum is the conservative direction for a FLOOR whose only use
+// is to refuse marker publication. Over-estimating it can at worst withhold a
+// marker that would have been legitimate (recovery then re-connects, which is
+// safe); under-estimating it re-opens the resurrection.
+func (cm *ChainManager) durableCoinsFloor() (int32, bool) {
+	if cm.chainDB == nil {
+		return 0, false
+	}
+	floor := int32(-1)
+	if rec, err := cm.chainDB.GetCoinsFlushWindow(); err == nil && rec != nil {
+		if rec.From != nil && rec.From.BestHeight > floor {
+			floor = rec.From.BestHeight
+		}
+		if rec.To != nil && rec.To.BestHeight > floor {
+			floor = rec.To.BestHeight
+		}
+	}
+	if marker, err := cm.chainDB.GetCoinsTip(); err == nil && marker != nil && marker.BestHeight > floor {
+		floor = marker.BestHeight
+	}
+	if floor < 0 {
+		return 0, false
+	}
+	return floor, true
 }
 
 // durableCoinsTip reports the on-disk coins marker (Core's DB_BEST_BLOCK)
@@ -921,23 +1034,115 @@ func (cm *ChainManager) AdoptIfAlreadyFlushed(block *wire.MsgBlock) (bool, error
 	if node == nil {
 		return false, nil
 	}
-	_, markerHeight, ok := cm.durableCoinsTip()
+	// THE VIEW THIS CONNECT WOULD MUTATE MUST ITSELF ALREADY COVER THE BLOCK.
+	//
+	// The coins marker describes the PERSISTED set; the connect path mutates
+	// the IN-MEMORY view, and the two are not the same statement. DisconnectBlock
+	// and ReorgTo's rollback restate the view DOWNWARD (setAppliedTip) without
+	// flushing, so between such a restatement and the next flush the on-disk
+	// marker is stale-HIGH: it still names a block whose coins the view has
+	// already undone. An invalidateblock / reconsiderblock / resubmit round trip
+	// is enough — no crash required. Adopting there would advance the tip over a
+	// block whose mutations the view genuinely lacks, which is the
+	// silent-corruption direction.
+	//
+	// This is also the cheap test, and it goes first: every ordinary connect —
+	// IBD, a new tip off the wire, a freshly mined block — arrives ABOVE the
+	// view's applied tip and is rejected without a single database read. That
+	// matters now that every block-connecting caller runs through this gate.
+	_, viewHeight, viewSet := cm.viewAppliedTip()
+	if !viewSet || node.Height > viewHeight {
+		return false, nil
+	}
+
+	markerHash, markerHeight, ok := cm.durableCoinsTip()
 	if !ok || node.Height > markerHeight {
 		return false, nil
 	}
-	// The marker covers this HEIGHT; require that it covers this BLOCK. The
-	// persisted height map is the same map durableCoinsTip validated the
-	// marker against, so agreement here means the block is an ancestor-or-self
-	// of the marker on the persisted chain. A competing block at the same
-	// height is emphatically NOT in the set and must go the connect route.
-	onChain, err := cm.chainDB.GetBlockHashByHeight(node.Height)
-	if err != nil || onChain != hash {
+
+	// The marker covers this HEIGHT; require that it covers this BLOCK.
+	if !cm.provablyCoveredByMarker(node, hash, markerHash) {
 		return false, nil
 	}
 	if err := cm.AdoptFlushedBlock(block); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+// provablyCoveredByMarker reports whether `node`/`hash` is an ancestor-or-self
+// of the block the coins marker names, i.e. whether the persisted set already
+// reflects it. Caller must have established node.Height <= markerHeight and
+// that the marker itself is trustworthy (durableCoinsTip).
+//
+// Two independent proofs, in order of cost:
+//
+//  1. The persisted height->hash map. It is the same map durableCoinsTip
+//     validated the marker against, so agreement means ancestor-or-self on the
+//     persisted chain. Disagreement names a COMPETING block at that height,
+//     whose mutations are emphatically not in the set — refuse.
+//
+//  2. When the height ROW IS MISSING, the header index's prev-hash chain.
+//     This case is not exotic: a hole in the height map is precisely what makes
+//     RecoverFromPersistedBlocks halt below the marker (its replay loop breaks
+//     on the first GetBlockHashByHeight failure), and the halt is what leaves
+//     later callers connecting blocks the set already contains. A gate whose
+//     only proof is the height map therefore cannot fire in the case it exists
+//     for. The marker NAMES a block; the set reflects that block's mutations,
+//     which are applied on top of every ancestor's, so an ancestor of the
+//     marker block at this height is covered by construction. That ancestry is
+//     cryptographic — each node's Parent is resolved through the header's
+//     PrevBlock — so unlike a height table it cannot be rewritten by a later
+//     reorg. Core answers exactly this question exactly this way
+//     (CBlockIndex::GetAncestor, src/chain.cpp), never from a height table.
+//
+// Anything else — a real read error, a marker block absent from the header
+// index, an ancestry walk that cannot reach the height — is not evidence and
+// refuses. Refusing costs a re-connect; a wrong "yes" skips work that was
+// never done.
+func (cm *ChainManager) provablyCoveredByMarker(node *BlockNode, hash, markerHash wire.Hash256) bool {
+	onChain, err := cm.chainDB.GetBlockHashByHeight(node.Height)
+	switch {
+	case err == nil:
+		return onChain == hash
+	case errors.Is(err, storage.ErrNotFound):
+		markerNode := cm.headerIndex.GetNode(markerHash)
+		if markerNode == nil {
+			return false
+		}
+		anc := markerNode.GetAncestor(node.Height)
+		return anc != nil && anc.Hash == hash
+	default:
+		return false
+	}
+}
+
+// ConnectOrAdoptBlock is the ONE entry point every block-connecting caller
+// uses. It asks the durable coins marker whether the persisted UTXO set
+// already reflects `block` and, if it provably does, advances the tip WITHOUT
+// re-applying the block; otherwise it connects normally.
+//
+// The gate used to be wired into the P2P connect loop alone (p2p/sync.go).
+// Every other caller — submitblock, submitblock batch, generatetoaddress, the
+// miner — connected unconditionally, which is safe only while the boot walk
+// leaves the tip at the marker. A halted recovery is exactly the state where
+// it does not: the tip sits BELOW the marker, and the next block any of those
+// callers connects is one the set already contains. Re-applying a coinbase-only
+// block there re-adds a coinbase a later block already spent (the 2026-08-15
+// signature), with no error raised anywhere, because a block with no inputs has
+// nothing to trip over.
+//
+// Core has no equivalent split: every path lands in ActivateBestChain over a
+// chainstate whose tip came FROM the coins marker (validation.cpp:4546).
+func (cm *ChainManager) ConnectOrAdoptBlock(block *wire.MsgBlock) error {
+	adopted, err := cm.AdoptIfAlreadyFlushed(block)
+	if err != nil {
+		return err
+	}
+	if adopted {
+		return nil
+	}
+	return cm.ConnectBlock(block)
 }
 
 // AdoptFlushedBlock advances the chain tip over a block the DURABLE coins
@@ -1978,9 +2183,13 @@ func (cm *ChainManager) ProcessSubmittedBlock(block *wire.MsgBlock) error {
 	tipWork := cm.tipNode.TotalWork
 	cm.mu.RUnlock()
 
-	// Happy path: block extends current active tip → connect inline.
+	// Happy path: block extends current active tip → connect inline, THROUGH
+	// THE MARKER GATE. submitblock, submitblock batch and the post-IBD P2P
+	// connect loop all land here, and "extends the active tip" is not the same
+	// claim as "is not already in the persisted UTXO set" whenever the tip sits
+	// below the coins marker (a halted recovery). See ConnectOrAdoptBlock.
 	if newNode.Parent == tipNode {
-		return cm.ConnectBlock(block)
+		return cm.ConnectOrAdoptBlock(block)
 	}
 
 	// Side-branch: parent is in the header index but not the active tip.
@@ -2845,6 +3054,14 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 	}
 
 	// Connect blocks from fork to new tip.
+	//
+	// DELIBERATELY NOT THROUGH ConnectOrAdoptBlock. The disconnect loop above
+	// has just UNDONE mutations in the in-memory view without flushing, so the
+	// on-disk coins marker is stale-HIGH here by construction: it still names
+	// the pre-reorg tip. Adopting on it would skip re-applying blocks the view
+	// genuinely no longer contains. (AdoptIfAlreadyFlushed refuses this on its
+	// own — it requires the view's applied tip to be at or above the marker —
+	// but a reorg must not depend on a downstream guard to stay correct.)
 	for _, node := range connectNodes {
 		block, err := cm.chainDB.GetBlock(node.Hash)
 		if err != nil {
@@ -2937,6 +3154,10 @@ func (cm *ChainManager) reorgInMemoryFallback(
 		}
 	}
 	for _, node := range connectNodes {
+		// Raw ConnectBlock, for the same reason as the batched reorg path:
+		// the disconnect loop above has already undone these heights in the
+		// view, so the coins marker cannot speak for it.
+		//
 		// Without chainDB we cannot resolve block bodies; this matches the
 		// pre-existing behavior (such tests stash blocks elsewhere or skip
 		// the connect phase entirely).

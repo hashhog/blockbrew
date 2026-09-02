@@ -726,6 +726,10 @@ func (m *mockBlockConnector) BestBlock() (wire.Hash256, int32) {
 	return m.tipHash, m.tipHeight
 }
 
+func (m *mockBlockConnector) ConnectOrAdoptBlock(block *wire.MsgBlock) error {
+	return m.ConnectBlock(block)
+}
+
 func (m *mockBlockConnector) ConnectBlock(block *wire.MsgBlock) error {
 	hash := block.Header.BlockHash()
 	m.blocks = append(m.blocks, block)

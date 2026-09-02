@@ -2514,7 +2514,14 @@ func handleImportBlocks(args []string) {
 			log.Fatalf("Error adding header at height %d: %v", frameHeight, err)
 		}
 
-		// Connect the block
+		// Connect the block.
+		//
+		// Raw ConnectBlock is correct HERE only because prepareImportChain
+		// above already fails closed on the state the marker gate exists for:
+		// if the coins marker leads the chain-tip pointer after recovery, it
+		// REFUSES to import at all rather than connect across the gap. That is
+		// a stronger answer than adoption — the import stream has no way to
+		// prove which of its blocks the set already holds.
 		if err := chainMgr.ConnectBlock(&block); err != nil {
 			log.Fatalf("Error connecting block at height %d: %v", frameHeight, err)
 		}

@@ -567,6 +567,11 @@ type BlockMiner struct {
 // BlockConnector is the interface for connecting mined blocks to the chain.
 type BlockConnector interface {
 	ConnectBlock(block *wire.MsgBlock) error
+	// ConnectOrAdoptBlock connects the block unless the durable coins marker
+	// PROVES the persisted UTXO set already reflects it, in which case it
+	// advances the tip without re-applying it. See
+	// consensus.ChainManager.ConnectOrAdoptBlock.
+	ConnectOrAdoptBlock(block *wire.MsgBlock) error
 	BestBlock() (wire.Hash256, int32)
 }
 
@@ -706,7 +711,14 @@ func (m *BlockMiner) GenerateBlock(coinbaseScript []byte, txs []*wire.MsgTx, max
 	}
 
 	if m.chainMgr != nil {
-		if err := m.chainMgr.ConnectBlock(block); err != nil {
+		// Through the marker gate. A freshly assembled block is normally
+		// unknown to the persisted set and the gate is a proven no-op (its
+		// first test rejects anything above the view's applied tip without a
+		// database read). It is wired anyway because "normally" stops being
+		// true after a halted recovery: the tip then sits below the coins
+		// marker, and generatetoaddress on regtest can re-assemble a block
+		// the set already contains. Re-applying it re-adds a coinbase.
+		if err := m.chainMgr.ConnectOrAdoptBlock(block); err != nil {
 			return wire.Hash256{}, err
 		}
 	}

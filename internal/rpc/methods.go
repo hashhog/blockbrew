@@ -2661,7 +2661,12 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interfac
 				results[i] = fmt.Sprintf("failed to add header: %v", err)
 				continue
 			}
-			if err := s.chainMgr.ConnectBlock(block); err != nil {
+			// Through the marker gate (ConnectOrAdoptBlock), not raw
+			// ConnectBlock: after a halted recovery the tip sits below the
+			// coins marker and a submitted block may already be in the
+			// persisted UTXO set, where re-applying it re-adds coins later
+			// blocks already spent.
+			if err := s.chainMgr.ConnectOrAdoptBlock(block); err != nil {
 				results[i] = fmt.Sprintf("block connection failed: %v", err)
 				continue
 			}
@@ -4182,7 +4187,8 @@ func (s *Server) handleGenerateBlock(params json.RawMessage) (interface{}, *RPCE
 	}
 
 	if s.chainMgr != nil {
-		if err := s.chainMgr.ConnectBlock(block); err != nil {
+		// Through the marker gate, for the same reason as handleSubmitBlockBatch.
+		if err := s.chainMgr.ConnectOrAdoptBlock(block); err != nil {
 			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Block connection failed: %v", err)}
 		}
 	}
