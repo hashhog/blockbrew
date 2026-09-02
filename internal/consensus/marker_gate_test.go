@@ -201,12 +201,33 @@ func TestAdvanceAppliedTip_FloorRefusesWithoutANamedTip(t *testing.T) {
 	if !u.AdvanceAppliedTip(wire.Hash256{0xcc}, 122) {
 		t.Errorf("the floor refused a genuine raise 121 -> 122")
 	}
-	// An authoritative restatement (DisconnectBlock / ReorgTo rollback) really
-	// does remove coins, so it RESETS the floor rather than being blocked by it.
+	// CORRECTED 2026-09-02 (see marker_floor_test.go). This assertion used to
+	// read "SetAppliedTip RESETS the floor to the restated height", which is
+	// the defect, not the invariant: it hands a DisconnectBlock the power to
+	// switch the bound off in the one state the bound exists for. A
+	// restatement lowers the IN-MEMORY applied tip, because the undo really
+	// did remove those coins from the view. It changes nothing on disk, so the
+	// bound on what the PERSISTED set may already reflect must stand.
 	u.SetAppliedTip(wire.Hash256{0xdd}, 100)
-	if f, _ := u.AppliedFloor(); f != 100 {
-		t.Errorf("SetAppliedTip left the floor at %d; an authoritative rewind must reset "+
-			"it to 100 or every later connect is blocked from publishing", f)
+	if _, h, set := u.AppliedTip(); !set || h != 100 {
+		t.Errorf("SetAppliedTip left the applied tip at %d (set=%v); the restatement of "+
+			"the in-memory view must go through", h, set)
+	}
+	if f, ok := u.AppliedFloor(); !ok || f != 121 {
+		t.Errorf("SetAppliedTip moved the floor to %d (set=%v): a disconnect removes coins "+
+			"from the VIEW, not from DISK, so the bound on what the persisted set may "+
+			"already reflect must still be 121", f, ok)
+	}
+	// And the flush must not publish that restated marker either: 100 claims
+	// less than the persisted set may already hold.
+	if err := u.Flush(); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if st, err := u.db.GetCoinsTip(); err != nil && err != storage.ErrNotFound {
+		t.Fatalf("GetCoinsTip: %v", err)
+	} else if st != nil {
+		t.Errorf("a flush published the coins marker at height %d over a view whose floor "+
+			"says the persisted set may already reflect 121", st.BestHeight)
 	}
 }
 

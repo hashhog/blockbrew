@@ -93,9 +93,30 @@ type UTXOSet struct {
 	// precisely the failure case the guard exists for.
 	//
 	// So the floor is installed even when the marker is refused, and
-	// AdvanceAppliedTip refuses to publish a marker at or below it. It is
-	// RESET (not raised) by SetAppliedTip, the authoritative restatement:
-	// those four callers know the whole answer, including a genuine rewind.
+	// AdvanceAppliedTip refuses to publish a marker at or below it.
+	//
+	// WHAT MAY MOVE IT, AND IN WHICH DIRECTION (2026-09-02). The applied TIP
+	// and the floor answer questions about two different artefacts, so they
+	// move on different events:
+	//
+	//   - the applied tip names the block the IN-MEMORY view reflects.
+	//     DisconnectBlock and ReorgTo's rollback legitimately LOWER it: the
+	//     undo genuinely removed those coins from the view.
+	//   - the floor bounds what the PERSISTED set on disk may already
+	//     reflect. Removing coins from the in-memory view does not change one
+	//     byte on disk. So the floor may NOT fall at the moment of a
+	//     disconnect — only when a flush has actually made the lower state
+	//     durable.
+	//
+	// Hence: SetAppliedTip does not touch the floor at all (an earlier
+	// version reset it to the restated height, which switched the guard back
+	// off in exactly the state it exists for — a single DisconnectBlock after
+	// a fail-closed boot dropped the floor from 121 to 48 and the next flush
+	// published a marker of 48 over a set that may reflect 121). The floor is
+	// raised only by RaiseAppliedFloor, on fresh on-disk evidence, and is
+	// dropped only by subsumeAppliedFloorLocked, when a completed flush has
+	// published a marker at or above it — at which point the marker itself is
+	// the stronger statement and the bound has nothing left to add.
 	appliedFloorHeight int32
 	appliedFloorSet    bool
 
@@ -353,19 +374,58 @@ func (u *UTXOSet) HasUTXODurable(outpoint wire.OutPoint) bool {
 // persisted set still reflects a HIGHER block is corruption, not caution: the
 // next boot re-applies blocks the set already contains, and a coinbase-only
 // block among them resurrects a coin a later block already spent.
+//
+// IT DOES NOT TOUCH THE FLOOR. The restatement is authoritative about the
+// IN-MEMORY view — the undo really did remove those coins from the cache — and
+// says nothing whatever about disk, which is unchanged until a flush runs. An
+// earlier version reset the floor to the restated height on the reasoning that
+// a real rewind must not be blocked by a stale-high bound. That conflated the
+// two quantities: it re-opened the regression in the one state the floor
+// exists for (after a fail-closed boot the view sits at the halt height while
+// the persisted set may reflect far more; one DisconnectBlock reset the floor
+// to the view's own idea of extent, which is precisely what is known to be
+// wrong there, and the next flush published a marker below the coins on disk).
+//
+// The concern behind that reset is nonetheless real — a floor that could never
+// fall would eventually strand the marker ABOVE the view, which is the same
+// corruption from the other side. It is answered where it belongs: a flush
+// that publishes a marker at or above the floor drops the floor
+// (subsumeAppliedFloorLocked), because at that moment the coin removals are
+// durable and the published marker is the stronger statement.
 func (u *UTXOSet) SetAppliedTip(hash wire.Hash256, height int32) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.appliedHash = hash
 	u.appliedHeight = height
 	u.appliedSet = true
-	// An authoritative restatement RESETS the floor rather than raising it.
-	// A DisconnectBlock or a ReorgTo rollback genuinely removes coins, so a
-	// floor left standing above the restated tip would block every subsequent
-	// forward advance and strand the marker BELOW its own coins — the exact
-	// corruption the floor exists to prevent, arrived at from the other side.
-	u.appliedFloorHeight = height
-	u.appliedFloorSet = true
+}
+
+// subsumeAppliedFloorLocked drops the floor once a flush has published a
+// marker at or above it. Callers MUST hold u.mu and MUST have just staged the
+// marker (stageAppliedTip returned true).
+//
+// This is the ONLY event that lowers the bound, and it is the honest one: the
+// flush wrote every pending add and delete together with the marker, so the
+// persisted set now reflects exactly appliedHeight. A bound saying "disk may
+// already reflect up to F" where F <= appliedHeight is no longer evidence of
+// anything the named marker does not state better, and AdvanceAppliedTip's
+// appliedSet guard (height <= appliedHeight) is at least as strict from here
+// on. Keeping it instead would be the opposite failure: a floor that can never
+// fall refuses to publish the true, lower marker after a legitimate reorg, and
+// a marker stranded ABOVE the view makes the next boot skip blocks whose
+// coins have genuinely been undone.
+func (u *UTXOSet) subsumeAppliedFloorLocked() {
+	if !u.appliedFloorSet || !u.appliedSet {
+		return
+	}
+	if u.appliedHeight < u.appliedFloorHeight {
+		return
+	}
+	log.Printf("utxoset: a completed flush published the coins marker at height %d, at "+
+		"or above the %d the persisted set was bounded to; the bound is subsumed by "+
+		"the marker and is dropped", u.appliedHeight, u.appliedFloorHeight)
+	u.appliedFloorHeight = 0
+	u.appliedFloorSet = false
 }
 
 // RaiseAppliedFloor records that the PERSISTED set may already reflect blocks
@@ -439,18 +499,41 @@ func (u *UTXOSet) AppliedTip() (wire.Hash256, int32, bool) {
 	return u.appliedHash, u.appliedHeight, u.appliedSet
 }
 
-// stageAppliedTip stages the applied-through marker into a batch. Callers
-// MUST already hold u.mu, and MUST stage it into the SAME batch as the coin
-// writes it describes. Mirrors Core txdb.cpp:159, which writes DB_BEST_BLOCK
-// into the final CDBBatch of CCoinsViewDB::BatchWrite.
-func (u *UTXOSet) stageAppliedTip(batch storage.Batch) {
+// stageAppliedTip stages the applied-through marker into a batch, and reports
+// whether it staged one. Callers MUST already hold u.mu, and MUST stage it
+// into the SAME batch as the coin writes it describes. Mirrors Core
+// txdb.cpp:159, which writes DB_BEST_BLOCK into the final CDBBatch of
+// CCoinsViewDB::BatchWrite.
+//
+// It REFUSES to publish a marker below the floor. That is the last line of the
+// bound: SetAppliedTip may restate the in-memory view downward at any time
+// (DisconnectBlock, a failed reorg's rollback), and if the persisted set is
+// bounded HIGHER than the restated height — which is what a floor surviving a
+// fail-closed boot says — then stamping that height would publish a marker
+// below its own coins and the next boot would re-apply the span, resurrecting
+// coinbases later blocks already spent. Refusing leaves the previous on-disk
+// marker in place; the evidence that installed the floor (the recorded flush
+// window) is still on disk too, so the next boot fails closed again rather
+// than trusting a marker it should not.
+//
+// Publishing AT the floor is allowed: a marker equal to the bound claims
+// exactly what the bound permits.
+func (u *UTXOSet) stageAppliedTip(batch storage.Batch) bool {
 	if !u.appliedSet {
-		return
+		return false
+	}
+	if u.appliedFloorSet && u.appliedHeight < u.appliedFloorHeight {
+		log.Printf("[CHAINSTATE-CORRUPTION] utxoset: refusing to publish the coins marker "+
+			"at height %d — on-disk evidence bounds the persisted set at %d, so that "+
+			"marker would claim less than the set may already hold; leaving the "+
+			"previous marker in place", u.appliedHeight, u.appliedFloorHeight)
+		return false
 	}
 	batch.Put(storage.CoinsTipKey, (&storage.ChainState{
 		BestHash:   u.appliedHash,
 		BestHeight: u.appliedHeight,
 	}).Serialize())
+	return true
 }
 
 // flushMaxBatchBytes caps each coin-flush batch around 2 GiB, leaving plenty
@@ -611,9 +694,15 @@ func (u *UTXOSet) flushLocked() error {
 	if tornWindow {
 		batch.Delete(storage.CoinsFlushKey)
 	}
-	u.stageAppliedTip(batch)
+	published := u.stageAppliedTip(batch)
 	if err := flushChunk(); err != nil {
 		return err
+	}
+	// The write landed: every pending add and delete is durable, alongside the
+	// marker just published. Only now — never at the moment of a disconnect —
+	// may the floor come down.
+	if published {
+		u.subsumeAppliedFloorLocked()
 	}
 
 	// Clear dirty, deleted, and fresh tracking (pre-size for next batch)
@@ -763,8 +852,14 @@ func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 	// The applied-through marker rides the caller's batch, atomically with
 	// the coins it describes (Core: txdb.cpp:158-159). ChainManager passes
 	// the same batch that carries the block body, the height row and the
-	// chain-tip pointer, so all four commit or none do.
-	u.stageAppliedTip(batch)
+	// chain-tip pointer, so all four commit or none do. Same floor discipline
+	// as flushLocked: the marker is refused below the bound, and the bound is
+	// subsumed once one is published at or above it. The clearing is
+	// optimistic here because the caller writes the batch — exactly as the
+	// dirty/deleted maps below have always been cleared.
+	if u.stageAppliedTip(batch) {
+		u.subsumeAppliedFloorLocked()
+	}
 
 	// Clear dirty, deleted, and fresh tracking (caller will write the batch)
 	u.dirty = make(map[wire.OutPoint]bool, 100_000)
