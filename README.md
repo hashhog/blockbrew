@@ -101,6 +101,27 @@ accepted. The block hash and tip stay correct, so the node looks healthy. This
 is pre-existing, not a regression; the marker work in `f369d96`/`dd791f6`
 made it visible.
 
+**Two more instances of the same family, found 2026-09-02 by adversarial
+review of the coins-floor work and recorded here rather than patched:**
+
+- `internal/consensus/utxoset.go` `FlushBatch` subsumes the durability floor
+  *optimistically* — it clears the bound before the CALLER writes the batch, so
+  a failed `batch.Write()` leaves the floor gone while disk still holds the
+  older state. Reproduced by probe. Its own comment acknowledges the optimism
+  ("the caller writes the batch"), reasoning by analogy to the dirty/deleted
+  maps; but losing a dirty map loses work, whereas losing the floor removes the
+  bound that prevents a later flush publishing a marker under a set that
+  reflects more.
+- `flushLocked` erases the interrupted-flush window unconditionally when that
+  flush opened one. Reasoned from code, NOT reproduced — the trigger needs a
+  single flush carrying more than 2 GiB of deletes.
+
+Both are the same shape as the race above: durability bookkeeping that is not
+transactional with the write it describes. Fixing them properly means the same
+transaction boundary, which is why they are listed here instead of becoming a
+fifth round of patches. Four rounds each closed their named paths and a
+reviewer found the next instance; that is the signature of a design gap.
+
 Closing it needs a transaction boundary between "flush the coin set" and
 "connect a block" — a design change rather than a patch. Two rounds of
 path-by-path fixes each closed their named paths and exposed the next one,
