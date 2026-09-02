@@ -26,3 +26,17 @@ vendor/
 # Project-meta audit artifacts live in the meta-repo (audit-archive/).
 audit/
 CORE-PARITY-AUDIT/
+
+# Build artifacts must not be tracked. Five stale copies of the node binary
+# (blockbrew.w13, .w13b, .pre-w13, .pre-w13-recovery, .462c233-deployed) plus
+# two shim binaries were committed here — 156 MB that every clone pays for,
+# and an incidental `go build` rewriting a tracked binary trips
+# promote_mainnet.sh's dirty-tree refusal at deploy time. Pinned deploy
+# binaries belong in deploy/ via tools/promote_mainnet.sh, not in the source
+# tree. (Untracking does not shrink an existing clone — the blobs are still in
+# history — but it stops the growth and unblocks the deploy gate.)
+blockbrew.w13
+blockbrew.w13b
+blockbrew.pre-w13
+blockbrew.pre-w13-recovery
+blockbrew.462c233-deployed
