@@ -2,6 +2,68 @@
 
 A Bitcoin full node written from scratch in Go. Part of the [Hashhog](https://github.com/hashhog/hashhog) project.
 
+## Status — v1.0.0
+
+**Label: "Validated — reproduced Core's UTXO set from genesis with all scripts
+verified"** (`receipts/RELEASE-v1.0-SCORECARD.md`, §What each label means). That
+label means one specific thing: blockbrew connected every mainnet block from block 0
+to height 958,794 with its assumevalid gate off, serialized its entire UTXO set,
+and produced the byte string
+`29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over
+166,180,925 coins — the same value Bitcoin Core's `dumptxoutset` produced at that
+height. A single wrong coin anywhere in fifteen years changes that hash. The git
+tag `v0.1.0-rc2` (`receipts/RELEASE-v1.0-FREEZE.md`) marks the same bar: `rc` in this
+project certifies that reproduction and nothing else
+(`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
+or fund-custody readiness — see `SECURITY.md`.
+
+**But two committed artifacts disagree about whether blockbrew has actually done
+that, and nothing in the repository resolves them** — the release scorecard
+reports both rather than picking one:
+
+- `receipts/TRUST-ANCHOR.md:143` records a MATCH — 2026-08-14T18:20:25Z, height
+  958794, `hash_serialized_3`
+  `29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0`,
+  166,180,925 coins. `receipts/r4-blockbrew-t2-3-2026-08-14.md` narrates it.
+- `receipts/T2-capture-blockbrew-20260815T125623Z.md`, dated one day later, says
+  "blockbrew does NOT reproduce C(958794). Do NOT tag." with
+  `24ec9202799b6eafbee0a931fb6f4ac543c0e520652cbae594cec6c3168e7a5a` and
+  166,180,926 coins — one coin more than the anchor.
+
+The committed genesis → 250000 replay ledger
+(`CORE-PARITY-AUDIT/replay-ledgers/blockbrew-av0-danger-ledger.txt`) is the
+**pre-fix** run and ends `overall=FAIL@250000`, wedged at height 231020 on the
+empty-`scriptPubKey` bug fixed in `fa082e8`. The post-fix pass to 250000 exists
+only as prose in `receipts/bug-ledger.md:1298` and `docs/METHODOLOGY.md:154`; no
+post-fix ledger file was ever committed.
+
+**Operator RPC parity: 58 of Bitcoin Core's 85.** From the 103-method R5
+operator probe run 2026-09-01
+(`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`): blockbrew 58 PASS /
+27 FAIL, Bitcoin Core 85 PASS on the same probe, 18 methods unmeasured
+(`SKIP-REGTEST`) for every node including Core. Most failures are error-code
+mismatches (e.g. `getblockstats` on a missing block returns `-1` where Core
+returns `-5`).
+
+**Known gaps in this repo** (`receipts/UNIT-BASELINE-v1.0.md`, 2026-09-01): the
+unit suite went 31 failing → 0, but two gaps are carried as explicit skips —
+`GAP W124-BUG17-KNOBS` (`verifychain` `-checkblocks`/`-checklevel` knobs) and
+`BUG-6` (per-transaction ZMQ fan-out; `zmqpub.go` has only
+`PublishBlockConnected`/`PublishTxAccepted`). Separately, the assumeUTXO
+snapshot-boot gate: `receipts/boot-smoke-4-red-triaged-2026-08-16.md:28-45` found
+`loadtxoutset` deserialising into a throwaway in-memory DB and returning success
+without activating the snapshot, while `CORE-PARITY-AUDIT/_loop-ledger.md`
+(2026-08-21) records that `ActivateSnapshotWithBackground` was wired to that
+handler in `a38b4c1` *before* the receipt was written, and concludes the finding
+needs an empirical re-run of `tools/boot-smoke.sh` to settle. Treat assumeUTXO
+activation as unsettled.
+
+**Fleet-wide comparison:** `receipts/RELEASE-v1.0-SCORECARD.md` in the
+[hashhog meta-repo](https://github.com/hashhog/hashhog).
+
+> Paths beginning `receipts/`, `tools/`, `docs/` and `CORE-PARITY-AUDIT/` refer to
+> the hashhog meta-repo, not to this repository.
+
 ## Quick Start
 
 ### Build from Source
@@ -42,7 +104,7 @@ make build
 - Address labels (setlabel, listlabels, getaddressesbylabel)
 - PSBT support (BIP-174/370: create, decode, combine, finalize, analyze, join, convert, wallet process, utxo update)
 - Output descriptors (getdescriptorinfo, deriveaddresses)
-- assumeUTXO (dumptxoutset, loadtxoutset, getchainstates)
+- assumeUTXO (dumptxoutset, loadtxoutset, getchainstates) — snapshot *activation* is disputed between two committed receipts; see Status above
 - Block indexes (txindex, BIP-157/158 blockfilterindex via getblockfilter, getindexinfo)
 - Chain management RPCs (invalidateblock, reconsiderblock, preciousblock)
 - Checkpoint verification with fork rejection during header sync
@@ -79,6 +141,11 @@ make build
 | `-version` | Print version and exit | |
 
 ## RPC API
+
+> **Parity note.** These methods are modelled on Bitcoin Core's, but shape parity is not
+> behaviour parity. On the 2026-09-01 operator probe blockbrew answers 58 of the 103
+> probed methods correctly against Core's 85, and 27 probes fail — mostly on error
+> codes (`tools/diff-test-artifacts/r5-probe/20260901T182642Z.json`).
 
 ### Blockchain
 
@@ -236,7 +303,7 @@ The `consensus` package contains block and transaction validation, the chain man
 
 The `storage` package provides the Pebble database backend, chosen for its write-optimized LSM-tree design that handles Bitcoin's heavy write workload during IBD. The `p2p` package manages peer connections with TCP version/verack handshakes, DNS seed discovery, misbehavior scoring, and ban lists. Headers-first sync with checkpoint verification rejects forks below known-good heights. Block download runs in parallel with stall detection.
 
-The `mempool` package implements transaction pool management with fee tracking, Child-Pays-For-Parent (CPFP), an orphan pool for transactions with missing inputs, and eviction policies. The `mining` package constructs block templates by selecting transactions for optimal feerate and generating witness commitments. The `rpc` package exposes a Bitcoin Core-compatible JSON-RPC server with HTTP Basic Auth, supporting batch requests, wallet operations, PSBT workflows, and a REST API for block/tx queries in JSON, hex, and binary formats.
+The `mempool` package implements transaction pool management with fee tracking, Child-Pays-For-Parent (CPFP), an orphan pool for transactions with missing inputs, and eviction policies. The `mining` package constructs block templates by selecting transactions for optimal feerate and generating witness commitments. The `rpc` package exposes a JSON-RPC server with HTTP Basic Auth that follows Bitcoin Core's method names and response shapes, supporting batch requests, wallet operations, PSBT workflows, and a REST API for block/tx queries in JSON, hex, and binary formats. Shape parity is not behaviour parity — the 2026-09-01 operator probe scores blockbrew 58 against Core's 85, with most failures on error codes.
 
 The `wallet` package provides BIP-32/39/84 HD key derivation with P2WPKH address generation, multi-wallet support (create, load, unload, backup), passphrase encryption, and address labeling. Go's goroutine model provides the concurrency backbone: each peer connection runs in its own goroutine, and IBD leverages goroutine pools for parallel script validation while maintaining single-goroutine UTXO state updates.
 
