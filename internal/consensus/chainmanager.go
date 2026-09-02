@@ -320,6 +320,11 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 	// Try to load chain state from database
 	if config.ChainDB != nil {
 		cm.loadChainState()
+		// ...and, before anything can move the tip, tell the UTXO view what
+		// the ON-DISK coin set already reflects. Core's LoadChainTip
+		// (validation.cpp:4546) takes the tip from the coins database's own
+		// best block for exactly this reason. See seedAppliedTipFromMarker.
+		cm.seedAppliedTipFromMarker()
 	}
 
 	// Resolve assume-valid height
@@ -727,8 +732,11 @@ func (cm *ChainManager) AdoptAppliedBlock(block *wire.MsgBlock) error {
 	cm.updateTipCache(node.Hash, node.Height)
 	node.Status |= StatusFullyValid | StatusDataStored
 	// The roll-forward above applied this block's mutations, so the coins
-	// marker staged by FlushBatch below must name this block.
-	cm.setAppliedTip(hash, node.Height)
+	// marker staged by FlushBatch below must name this block — but ADVANCE
+	// only: the persisted set may already reflect blocks above this one (that
+	// lag is the very condition that routed us here), and lowering the marker
+	// to this height would make the next boot re-apply them.
+	cm.advanceAppliedTip(hash, node.Height)
 
 	if cm.chainDB != nil {
 		batch := cm.chainDB.NewBatch()
@@ -773,6 +781,7 @@ var ErrNoDurableUTXOView = errors.New("adoption requires a durable (DB-backed) U
 // during validation do not, and for them setAppliedTip is a no-op.
 type appliedTipTracker interface {
 	SetAppliedTip(hash wire.Hash256, height int32)
+	AdvanceAppliedTip(hash wire.Hash256, height int32) bool
 }
 
 // setAppliedTip tells the UTXO view which block its mutations now reflect.
@@ -790,6 +799,53 @@ func (cm *ChainManager) setAppliedTip(hash wire.Hash256, height int32) {
 	}
 }
 
+// advanceAppliedTip raises the coins marker to (hash, height) and REFUSES to
+// lower it. Every forward path uses this — ConnectBlock, AdoptAppliedBlock,
+// AdoptFlushedBlock — because none of them can prove the persisted set does
+// not already reflect something higher.
+//
+// The refusal closes the hole the first version of this fix left open. Crash
+// recovery walks the tip UP from the chain-state pointer, which is only a
+// LOWER bound on the persisted set. Adopting block 9 out of a set that is
+// durable through 121 must leave the marker at 121; stamping it down to 9
+// publishes a marker BELOW its own coins, and the next boot re-applies
+// 10..121 — re-adding coinbases that later blocks in that same span already
+// spent. Core cannot reach this state at all: it takes the tip FROM the
+// marker on boot (validation.cpp:4546 LoadChainTip) and only ever rolls
+// FORWARD from it (validation.cpp:4773 ReplayBlocks).
+func (cm *ChainManager) advanceAppliedTip(hash wire.Hash256, height int32) {
+	if t, ok := cm.utxoSet.(appliedTipTracker); ok {
+		t.AdvanceAppliedTip(hash, height)
+	}
+}
+
+// seedAppliedTipFromMarker teaches the in-memory UTXO view what the ON-DISK
+// coin set already reflects, before anything is allowed to move the tip.
+//
+// This is blockbrew's Chainstate::LoadChainTip (validation.cpp:4546), which
+// takes the chainstate tip from `coins_cache.GetBestBlock()` — the coins
+// database's own best block, not the chain-tip pointer. Without it the
+// in-memory applied tip starts unset, the first thing that touches it (a
+// recovery adopt, a connect) becomes the marker, and the next flush publishes
+// that value over a set that reflects far more. Every other guarantee in this
+// file is built on the view knowing what disk already holds.
+//
+// blockbrew differs from Core in ONE respect, deliberately: it does not move
+// cm.tipNode to the marker here. The header index is not yet hydrated at
+// construction time, so the marker's node usually does not exist; instead
+// RecoverFromPersistedBlocks walks the tip up to the marker over the persisted
+// height map, adopting (never re-applying) each block. The marker itself is
+// authoritative from this moment on either way.
+func (cm *ChainManager) seedAppliedTipFromMarker() {
+	hash, height, ok := cm.durableCoinsTip()
+	if !ok {
+		return
+	}
+	cm.setAppliedTip(hash, height)
+	log.Printf("chainmgr: coins marker on disk: the persisted UTXO set reflects %s@%d",
+		hash.String()[:16], height)
+}
+
 // durableCoinsTip reports the on-disk coins marker (Core's DB_BEST_BLOCK)
 // and whether it is trustworthy for THIS chain.
 //
@@ -803,6 +859,20 @@ func (cm *ChainManager) durableCoinsTip() (wire.Hash256, int32, bool) {
 	if cm.chainDB == nil {
 		return wire.Hash256{}, 0, false
 	}
+	// An interrupted multi-batch coin flush (Core's DB_HEAD_BLOCKS,
+	// txdb.cpp:128-129) means the persisted set is somewhere BETWEEN two
+	// markers and neither describes it. Fail closed: refuse the marker and
+	// say so loudly. blockbrew has no ReplayBlocks to repair the window, and
+	// guessing is exactly the failure mode this whole mechanism removes.
+	if rec, err := cm.chainDB.GetCoinsFlushWindow(); err == nil && rec != nil {
+		log.Printf("[CHAINSTATE-CORRUPTION] chainmgr: an interrupted coin flush is "+
+			"recorded (set is between %s@%d and %s@%d); the coins marker cannot be "+
+			"trusted and no block will be adopted from it",
+			rec.From.BestHash.String()[:16], rec.From.BestHeight,
+			rec.To.BestHash.String()[:16], rec.To.BestHeight)
+		return wire.Hash256{}, 0, false
+	}
+
 	marker, err := cm.chainDB.GetCoinsTip()
 	if err != nil || marker == nil || marker.BestHeight < 0 {
 		return wire.Hash256{}, 0, false
@@ -815,6 +885,59 @@ func (cm *ChainManager) durableCoinsTip() (wire.Hash256, int32, bool) {
 		return wire.Hash256{}, 0, false
 	}
 	return marker.BestHash, marker.BestHeight, true
+}
+
+// DurableCoinsTip reports the on-disk coins marker (Core's DB_BEST_BLOCK) and
+// whether it is trustworthy for this chain. Exported so the boot paths that do
+// NOT go through RecoverFromPersistedBlocks — import-blocks in particular — can
+// ask the same question before they re-apply anything.
+func (cm *ChainManager) DurableCoinsTip() (wire.Hash256, int32, bool) {
+	return cm.durableCoinsTip()
+}
+
+// AdoptIfAlreadyFlushed advances the tip over `block` WITHOUT touching the
+// UTXO set, when the durable coins marker PROVES the persisted set already
+// reflects it. Reports whether it did.
+//
+// This is the single place the "is this block already applied?" question is
+// answered, so every connect path can ask it the same way. It is a pure
+// no-op — no state change, no error — whenever the answer is not provable:
+// no marker, an untrustworthy marker, a block above the marker, or a block
+// that is not the one the persisted height map puts at that height.
+//
+// The alternative every caller used before was to connect first and infer
+// "already applied" from a "references missing UTXO" error. That inference is
+// structurally blind to coinbase-only blocks: with no inputs they can never
+// raise the error, so they were always re-applied, and AddUTXO put a coinbase
+// back that a later block had already spent. Core never asks the question that
+// way — it takes the tip from the coins marker (validation.cpp:4546) and rolls
+// forward only above it (validation.cpp:4773).
+func (cm *ChainManager) AdoptIfAlreadyFlushed(block *wire.MsgBlock) (bool, error) {
+	if cm.chainDB == nil || block == nil {
+		return false, nil
+	}
+	hash := block.Header.BlockHash()
+	node := cm.headerIndex.GetNode(hash)
+	if node == nil {
+		return false, nil
+	}
+	_, markerHeight, ok := cm.durableCoinsTip()
+	if !ok || node.Height > markerHeight {
+		return false, nil
+	}
+	// The marker covers this HEIGHT; require that it covers this BLOCK. The
+	// persisted height map is the same map durableCoinsTip validated the
+	// marker against, so agreement here means the block is an ancestor-or-self
+	// of the marker on the persisted chain. A competing block at the same
+	// height is emphatically NOT in the set and must go the connect route.
+	onChain, err := cm.chainDB.GetBlockHashByHeight(node.Height)
+	if err != nil || onChain != hash {
+		return false, nil
+	}
+	if err := cm.AdoptFlushedBlock(block); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AdoptFlushedBlock advances the chain tip over a block the DURABLE coins
@@ -854,14 +977,32 @@ func (cm *ChainManager) AdoptFlushedBlock(block *wire.MsgBlock) error {
 			hash.String()[:16], cm.tipNode.Hash.String()[:16])
 	}
 
+	// NEVER adopt a block the index has marked invalid, and never stamp it
+	// FullyValid. The marker only says the coin set reflects this block's
+	// mutations — it says nothing about whether the block is still WANTED on
+	// the active chain. A standalone DisconnectBlock (invalidateblock) drops
+	// the tip pointer below a block whose coins are still on disk without
+	// flushing the undo, so recovery legitimately meets a marker that covers
+	// a deliberately-disconnected block. Walking the tip back over it and
+	// re-stamping StatusFullyValid would silently un-invalidate it. Mirrors
+	// Core, which excludes invalid nodes from chain selection entirely
+	// (validation.cpp InvalidChainFound / setBlockIndexCandidates).
+	if node.Status.IsInvalid() {
+		return fmt.Errorf("adopt-flushed: refusing to adopt block %s at height %d — "+
+			"the header index marks it invalid", hash.String()[:16], node.Height)
+	}
+
 	cm.tipNode = node
 	cm.tipHeight = node.Height
 	cm.updateTipCache(node.Hash, node.Height)
 	node.Status |= StatusFullyValid | StatusDataStored
-	// The in-memory view now reflects this block for the same reason the
-	// on-disk one does: the marker says so. Keep them in step so a later
-	// flush re-stamps a marker that is still true.
-	cm.setAppliedTip(hash, node.Height)
+	// ADVANCE ONLY. This block is at-or-below the marker by construction, so
+	// this is normally a no-op — and that is the whole point. Stamping the
+	// marker DOWN to this block, while the set on disk reflects everything up
+	// to the marker, is what made the previous version of this fix publish a
+	// marker of 9 over a set durable through 121 and resurrect a coin on the
+	// next boot.
+	cm.advanceAppliedTip(hash, node.Height)
 
 	if cm.chainDB != nil {
 		// Height row + tip pointer only. Deliberately NO UTXO write: there is
@@ -1051,7 +1192,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		cm.tipHeight = node.Height
 		cm.updateTipCache(node.Hash, node.Height)
 		node.Status |= StatusFullyValid | StatusDataStored
-		cm.setAppliedTip(hash, node.Height)
+		cm.advanceAppliedTip(hash, node.Height)
 		if cm.chainDB != nil {
 			batch := cm.chainDB.NewBatch()
 			// #126 (2026-05-27): fold the block body into the genesis batch
@@ -1459,9 +1600,14 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// This block's UTXO mutations are now applied to the in-memory set, so
 	// the coins marker any subsequent flush stamps must name this block.
 	// Set on the success path only: every failure path above returns after
-	// rollbackUTXOs(), leaving the marker where it was. A marker that lags
-	// costs a re-connect on recovery; one that leads loses coins.
-	cm.setAppliedTip(hash, node.Height)
+	// rollbackUTXOs(), leaving the marker where it was.
+	//
+	// ADVANCE only. A connect at or below the marker means we just re-applied
+	// a block the persisted set already reflects — a bug upstream, not here —
+	// and republishing the marker downwards would turn that into durable
+	// corruption on the next boot. Hold the marker and let the set's true
+	// high-water mark stand.
+	cm.advanceAppliedTip(hash, node.Height)
 	// G1/G3 fix (W101): set StatusFullyValid so recalculateBestTipLocked can
 	// filter invalid-marked nodes. StatusDataStored is set further down,
 	// AFTER batch.Write succeeds — see the persistence block below for why.
@@ -2078,8 +2224,14 @@ func (cm *ChainManager) RecoverFromPersistedBlocks() (int, error) {
 		// durableCoinsTip validated the marker against, so next <= coinsHeight
 		// means this block is an ancestor-or-self of the marker on this chain.
 		if haveCoinsMarker && next <= coinsHeight {
-			if err := cm.AdoptFlushedBlock(block); err != nil {
+			adopted, err := cm.AdoptIfAlreadyFlushed(block)
+			if err != nil {
 				log.Printf("chainmgr: recovery: AdoptFlushedBlock at height %d failed (%v); stopping replay", next, err)
+				break
+			}
+			if !adopted {
+				log.Printf("chainmgr: recovery: coins marker covers height %d but the block "+
+					"there is not provably the one it covers; stopping replay", next)
 				break
 			}
 			replayed++
@@ -2661,6 +2813,21 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 		if j, ok := cm.utxoSet.(utxoReorgJournal); ok {
 			j.RollbackReorgJournal()
 		}
+		// The journal just put the coin set back exactly as it was at
+		// currentTip, so the coins marker must be restated to currentTip too —
+		// the tip and the marker have to move together or the pair lies.
+		//
+		// Without this the marker is left wherever the failed reorg abandoned
+		// it: the disconnect loop rewound it to the FORK POINT, the partial
+		// connect loop may have pushed it onto branch blocks that no longer
+		// exist in the set. Either way the next flush publishes it, and no
+		// crash is needed — an RPC invalidateblock/reconsiderblock round trip
+		// that fails partway is enough. An authoritative restatement (not an
+		// advance): the correct value can be below where the partial connect
+		// left it. Core has no equivalent hole because ActivateBestChainStep
+		// connects against a throwaway CCoinsViewCache and only ever flushes
+		// on success (validation.cpp:3191-3262).
+		cm.setAppliedTip(currentTip.Hash, currentTip.Height)
 	}
 
 	// Begin recording UTXO pre-images so any failure below can be unwound

@@ -1107,6 +1107,10 @@ type mockChainConnector struct {
 	processFn func(*wire.MsgBlock) error
 	connectFn func(*wire.MsgBlock) error
 
+	// adoptFlushedFn, when set, backs AdoptIfAlreadyFlushed: it models a
+	// datadir whose durable coins marker already covers the block.
+	adoptFlushedFn func(*wire.MsgBlock) (bool, error)
+
 	// pruning backs IsPruning(): zero value (false) = archive, so the
 	// fork-download descent is uncapped on a genuine below-tip reorg
 	// (Core-parity). Set true to model a pruned node that keeps the cap.
@@ -1148,6 +1152,16 @@ func (m *mockChainConnector) HasPendingRecovery() bool { return false }
 // halt path exactly as before the marker-lag repair existed.
 func (m *mockChainConnector) AdoptAppliedBlock(b *wire.MsgBlock) error {
 	return consensus.ErrNoAdoptionEvidence
+}
+
+// AdoptIfAlreadyFlushed: backed by adoptFlushedFn when a test models a datadir
+// whose coins marker leads the chain-tip pointer. Default (nil) = no marker,
+// so the connect loop behaves exactly as it did before marker-first routing.
+func (m *mockChainConnector) AdoptIfAlreadyFlushed(b *wire.MsgBlock) (bool, error) {
+	if m.adoptFlushedFn != nil {
+		return m.adoptFlushedFn(b)
+	}
+	return false, nil
 }
 func (m *mockChainConnector) IsIBD() bool              { return !m.postIBD }
 func (m *mockChainConnector) IsPruning() bool          { return m.pruning }

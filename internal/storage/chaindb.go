@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -337,6 +338,41 @@ func (c *ChainDB) GetCoinsTip() (*ChainState, error) {
 		return nil, ErrNotFound
 	}
 	return DeserializeChainState(data)
+}
+
+// CoinsFlushWindow is the recorded span of an INTERRUPTED multi-batch coin
+// flush: the marker the persisted set was at (From) and the one the flush was
+// moving to (To). Core's DB_HEAD_BLOCKS (txdb.cpp:128-129). Its presence means
+// the persisted coin set is somewhere between the two and NEITHER marker
+// describes it.
+type CoinsFlushWindow struct {
+	From *ChainState
+	To   *ChainState
+}
+
+// GetCoinsFlushWindow returns the interrupted-coin-flush record, or (nil, nil)
+// when no flush was interrupted. Callers MUST fail closed on a non-nil result:
+// the coins marker is not trustworthy while this record exists.
+func (c *ChainDB) GetCoinsFlushWindow() (*CoinsFlushWindow, error) {
+	data, err := c.db.Get(CoinsFlushKey)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
+	}
+	if len(data) < 72 {
+		return nil, fmt.Errorf("interrupted-flush record too short: %d bytes", len(data))
+	}
+	from, err := DeserializeChainState(data[:36])
+	if err != nil {
+		return nil, err
+	}
+	to, err := DeserializeChainState(data[36:72])
+	if err != nil {
+		return nil, err
+	}
+	return &CoinsFlushWindow{From: from, To: to}, nil
 }
 
 // SetCoinsTipBatch stages the coins-database best block into an existing

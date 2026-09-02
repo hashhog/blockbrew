@@ -64,6 +64,28 @@ var (
 	// height). Absent on datadirs written before this key existed; readers
 	// MUST treat absence as "unknown" and fall back, never as height 0.
 	CoinsTipKey = []byte("coinstip")
+
+	// CoinsFlushKey marks an INTERRUPTED multi-batch coin flush — Bitcoin
+	// Core's DB_HEAD_BLOCKS ('H' in txdb.cpp:25), written by
+	// CCoinsViewDB::BatchWrite in the FIRST batch (txdb.cpp:128-129) and
+	// erased in the LAST (txdb.cpp:157-159) so an interrupted flush is
+	// DETECTABLE rather than guessed at.
+	//
+	// blockbrew writes it only for the one tear it cannot repair by
+	// re-connecting: a coin flush whose DELETES alone exceed the per-batch
+	// cap and therefore have to span batches. If some deletes land while the
+	// marker stays at its old (lower) value, re-connecting that span re-adds
+	// a coinbase whose spend is already durable — the resurrection signature.
+	// Every other tear is safe by construction: UTXOSet.flushLocked puts all
+	// deletes in the SAME batch as the marker, so a torn add phase leaves
+	// only re-addable entries behind.
+	//
+	// Value: two serialized ChainStates back to back, 72 bytes — the marker
+	// the set was at (bytes 0..35) and the one the flush was moving to
+	// (bytes 36..71). Presence alone means "the persisted coin set is
+	// somewhere between these two and the marker cannot be trusted";
+	// readers MUST fail closed.
+	CoinsFlushKey = []byte("coinsflush")
 )
 
 // MakeBlockHeaderKey creates a key for a block header.

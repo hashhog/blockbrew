@@ -400,6 +400,13 @@ type ChainConnector interface {
 	// already in the persisted set (marker-lag repair; see
 	// consensus.ChainManager.AdoptAppliedBlock).
 	AdoptAppliedBlock(block *wire.MsgBlock) error
+	// AdoptIfAlreadyFlushed advances the tip over a block the DURABLE coins
+	// marker proves the persisted UTXO set already reflects, without touching
+	// the set, and reports whether it did. A pure no-op whenever that is not
+	// provable. Asked BEFORE ConnectBlock so the connect loop never re-applies
+	// a block the set already holds — see
+	// consensus.ChainManager.AdoptIfAlreadyFlushed.
+	AdoptIfAlreadyFlushed(block *wire.MsgBlock) (bool, error)
 	// ProcessSubmittedBlock connects a block via the side-branch-aware path:
 	// it extends the active tip (fast ConnectBlock path) when the block's
 	// parent IS the tip, reorgs when the block is a heavier side branch, and
@@ -3188,6 +3195,41 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 
 		// Connect the block
 		if sm.chainMgr != nil {
+			// MARKER FIRST (2026-09-02). Ask the durable coins marker whether
+			// this block's effects are ALREADY in the persisted UTXO set
+			// before attempting to apply them again.
+			//
+			// This loop used to learn that only from a failed connect: it
+			// called ConnectBlock and routed to AdoptAppliedBlock when the
+			// error contained "references missing UTXO" (the branch further
+			// down). That inference cannot see a coinbase-only block — no
+			// inputs, so no such error — and re-applying one puts its coinbase
+			// output back even when a later block already spent it. Reachable
+			// in normal operation, no crash required: any recovery that halts
+			// below the coins marker leaves the tip low and this loop resumes
+			// at tip+1 over blocks the persisted set already reflects.
+			//
+			// Core routes by the marker, never by an error: the tip comes FROM
+			// coins_cache.GetBestBlock() (validation.cpp:4546 LoadChainTip) and
+			// only blocks above it are rolled forward (validation.cpp:4773
+			// ReplayBlocks). The error-string branch below stays as the
+			// evidence-based repair for datadirs with no usable marker.
+			if adopted, adoptErr := sm.chainMgr.AdoptIfAlreadyFlushed(bwr.block); adoptErr != nil {
+				log.Printf("sync: marker-first adopt at height %d failed: %v (falling through to connect)",
+					nextHeight, adoptErr)
+			} else if adopted {
+				log.Printf("sync: height %d is already reflected in the persisted UTXO set "+
+					"(coins marker); tip adopted, block NOT re-applied", nextHeight)
+				bwr.req.State = BlockDownloadConnected
+				delete(pending, nextHeight)
+				sm.mu.Lock()
+				sm.removeFromQueue(bwr.req.Hash)
+				sm.nextHeight = nextHeight + 1
+				sm.mu.Unlock()
+				nextHeight++
+				continue
+			}
+
 			// Recover from panics in ConnectBlock
 			var connectErr error
 			// sideBranchAccepted latches when the connect routed through the

@@ -2455,7 +2455,10 @@ func handleImportBlocks(args []string) {
 		ParallelScripts: *parallelScripts,
 	})
 
-	_, tipHeight := chainMgr.BestBlock()
+	tipHeight, err := prepareImportChain(chainMgr)
+	if err != nil {
+		log.Fatalf("import-blocks: %v", err)
+	}
 	log.Printf("Chain tip at height %d, starting import from stdin", tipHeight)
 
 	// Read framed blocks from stdin
@@ -2538,6 +2541,55 @@ func handleImportBlocks(args []string) {
 	rate := float64(imported) / elapsed
 	log.Printf("import-blocks complete: imported=%d skipped=%d elapsed=%.1fs rate=%.1f blk/s",
 		imported, skipped, elapsed, rate)
+}
+
+// prepareImportChain brings an existing datadir to a state where import-blocks
+// may safely re-connect blocks, and reports the height above which frames must
+// actually be applied.
+//
+// import-blocks used to gate purely on the chain-tip POINTER: any frame at or
+// below it was skipped, everything above was handed to ConnectBlock. That
+// pointer is only a LOWER bound on what the persisted UTXO set reflects —
+// coins are also flushed without advancing it (cache pressure, scantxoutset,
+// the IBD cadence), which is exactly the marker-lag state the 2026-08-15
+// genesis rig booted into (coins durable through 958,794, pointer at 958,000).
+// On such a datadir every frame in (pointer, marker] was re-applied: the
+// input-bearing ones died on log.Fatalf, and the coinbase-only ones silently
+// re-added a coinbase a later block had already spent.
+//
+// import-blocks is also the one boot path that never ran crash recovery —
+// RecoverFromPersistedBlocks has a single call site, the normal daemon
+// startup. So do both here: run recovery (which walks the tip up to the coins
+// marker by ADOPTING, never re-applying), then refuse to proceed if the marker
+// still leads the tip. Refusing is the honest answer — there is no block body
+// to adopt over the gap, and connecting across it is the corruption this whole
+// mechanism exists to prevent.
+func prepareImportChain(chainMgr *consensus.ChainManager) (int32, error) {
+	if n, err := chainMgr.RecoverFromPersistedBlocks(); err != nil {
+		return 0, fmt.Errorf("crash recovery failed: %w", err)
+	} else if n > 0 {
+		log.Printf("import-blocks: crash recovery replayed %d block(s) before import", n)
+	}
+
+	_, tipHeight := chainMgr.BestBlock()
+
+	markerHash, markerHeight, ok := chainMgr.DurableCoinsTip()
+	if !ok {
+		// No marker (pre-marker datadir) or an untrustworthy one. Nothing more
+		// can be proven here; the tip pointer is all there is.
+		return tipHeight, nil
+	}
+	if markerHeight > tipHeight {
+		return 0, fmt.Errorf(
+			"refusing to import: the persisted UTXO set already reflects %s@%d but the "+
+				"chain tip pointer is at %d, and crash recovery could not close the gap "+
+				"(missing block bodies for heights %d..%d). Importing would re-apply blocks "+
+				"the coin set already contains, resurrecting coinbases later blocks have "+
+				"already spent. Supply the missing block bodies, or start the node normally "+
+				"so it can recover, before importing",
+			markerHash.String()[:16], markerHeight, tipHeight, tipHeight+1, markerHeight)
+	}
+	return tipHeight, nil
 }
 
 // loadSnapshotFromFile imports a Bitcoin Core-format UTXO snapshot

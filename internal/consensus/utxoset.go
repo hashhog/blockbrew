@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/hashhog/blockbrew/internal/storage"
@@ -314,16 +315,55 @@ func (u *UTXOSet) HasUTXODurable(outpoint wire.OutPoint) bool {
 	return err == nil && exists
 }
 
-// SetAppliedTip records the block through which this set's mutations are
-// reflected. Callers MUST call it only after the block's mutations have been
-// applied to the set, and MUST lower it when blocks are disconnected —
-// a marker that leads the set is what lets recovery skip real work.
+// SetAppliedTip RESTATES, authoritatively, the block through which this set's
+// mutations are reflected. It may move the marker in EITHER direction, so it
+// is reserved for the four callers that genuinely know the whole answer:
+//
+//   - boot seeding from the durable on-disk marker (ChainManager's
+//     seedAppliedTipFromMarker — Core's Chainstate::LoadChainTip taking the
+//     tip from coins_cache.GetBestBlock(), validation.cpp:4546);
+//   - DisconnectBlock, whose undo removed a block's mutations (a real rewind);
+//   - ReorgTo's rollbackToOriginalTip, which restores the journal to the
+//     pre-reorg tip (a real restatement, up OR down);
+//   - -load-snapshot, where the set IS the snapshot's base block.
+//
+// Everything else must use AdvanceAppliedTip. Lowering this marker while the
+// persisted set still reflects a HIGHER block is corruption, not caution: the
+// next boot re-applies blocks the set already contains, and a coinbase-only
+// block among them resurrects a coin a later block already spent.
 func (u *UTXOSet) SetAppliedTip(hash wire.Hash256, height int32) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.appliedHash = hash
 	u.appliedHeight = height
 	u.appliedSet = true
+}
+
+// AdvanceAppliedTip raises the applied-through marker to (hash, height) and
+// REFUSES to lower it. It is the only mutator the forward paths may use —
+// ConnectBlock, AdoptAppliedBlock, AdoptFlushedBlock — because none of them
+// can prove the set does not already reflect something higher.
+//
+// The refusal is the point. Crash recovery walks the tip UP from the
+// chain-state pointer, which is only a LOWER bound on what the persisted set
+// reflects (coins are flushed without advancing it: cache pressure,
+// scantxoutset, the IBD cadence). Adopting block 9 out of a set that is
+// durable through 121 must leave the marker at 121; stamping 9 would publish
+// a marker BELOW the coins it describes, and the next boot would re-apply
+// blocks 10..121 — the resurrection this whole mechanism exists to prevent
+// (see ChainManager.AdoptFlushedBlock).
+//
+// Returns true when the marker moved.
+func (u *UTXOSet) AdvanceAppliedTip(hash wire.Hash256, height int32) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.appliedSet && height <= u.appliedHeight {
+		return false
+	}
+	u.appliedHash = hash
+	u.appliedHeight = height
+	u.appliedSet = true
+	return true
 }
 
 // AppliedTip reports the in-memory applied-through marker, and whether one
@@ -347,6 +387,14 @@ func (u *UTXOSet) stageAppliedTip(batch storage.Batch) {
 		BestHeight: u.appliedHeight,
 	}).Serialize())
 }
+
+// flushMaxBatchBytes caps each coin-flush batch around 2 GiB, leaving plenty
+// of slack under Pebble's 4 GiB ErrBatchTooLarge limit. With typical ~50-100
+// byte serialized entries that is tens of millions of entries per batch — fast
+// for normal IBD flushes (which fit in one batch) and chunked-but-bounded for
+// snapshot imports. A var, not a const, so the flush-ordering tests can shrink
+// it and exercise the multi-batch paths without allocating gigabytes.
+var flushMaxBatchBytes = 2 * 1024 * 1024 * 1024 // 2 GiB
 
 // Flush writes all dirty entries to the database.
 func (u *UTXOSet) Flush() error {
@@ -374,13 +422,6 @@ func (u *UTXOSet) flushLocked() error {
 		return nil
 	}
 
-	// Cap each batch around 2 GiB to leave plenty of slack under Pebble's
-	// 4 GiB ErrBatchTooLarge limit. With typical ~50-100 byte serialized
-	// entries that's tens of millions of entries per batch — fast for
-	// normal IBD flushes (small batches still fit in one chunk) and
-	// chunked-but-bounded for snapshot imports.
-	const maxBatchBytes = 2 * 1024 * 1024 * 1024 // 2 GiB
-
 	batch := u.db.DB().NewBatch()
 	chunks := 0
 	flushChunk := func() error {
@@ -396,7 +437,13 @@ func (u *UTXOSet) flushLocked() error {
 	}
 	approxBatchBytes := 0
 
-	// Write all dirty entries
+	// PHASE 1 — adds and updates. These MAY span batches.
+	//
+	// A tear in this phase is repairable by construction: no delete has
+	// landed yet, so the persisted set is the old set plus a prefix of the
+	// new entries. The marker is still at its old (lower) value, recovery
+	// re-connects that span, every AddUTXO re-writes the same key with the
+	// same bytes, and every SpendUTXO still finds its coin present.
 	for outpoint := range u.dirty {
 		entry := u.cache[outpoint]
 		if entry != nil {
@@ -407,7 +454,7 @@ func (u *UTXOSet) flushLocked() error {
 			// entry on top of len(key)+len(value). Over-estimate
 			// slightly to stay well below the 4 GiB hard cap.
 			approxBatchBytes += len(key) + len(data) + 16
-			if approxBatchBytes >= maxBatchBytes {
+			if approxBatchBytes >= flushMaxBatchBytes {
 				if err := flushChunk(); err != nil {
 					return err
 				}
@@ -416,12 +463,76 @@ func (u *UTXOSet) flushLocked() error {
 		}
 	}
 
-	// Delete all deleted entries
+	// Close the add phase so the deletes start on a batch of their own.
+	if err := flushChunk(); err != nil {
+		return err
+	}
+	approxBatchBytes = 0
+
+	// PHASE 2 — deletes (spends) AND the applied-through marker, together,
+	// in ONE batch. This ordering is what makes "a marker that lags the set
+	// is safe" TRUE rather than merely hoped for.
+	//
+	// The unrepairable tear is a landed DELETE under a marker that still
+	// names a lower block: recovery then re-connects the span, and a
+	// coinbase-only block in it re-adds an output whose spend is already
+	// durable — 166,180,925 -> 166,180,926, the live signature this
+	// mechanism exists to prevent. Keeping every delete in the same atomic
+	// batch as the marker makes that combination unrepresentable.
+	//
+	// Core reaches the same guarantee differently: it lets BatchWrite span
+	// CDBBatches but records the window in DB_HEAD_BLOCKS first
+	// (txdb.cpp:128-129) and erases it in the last batch (txdb.cpp:157-159),
+	// so an interrupted flush is detected on boot and repaired by
+	// ReplayBlocks (validation.cpp:4773). blockbrew does not have a
+	// ReplayBlocks, so it removes the tear instead of repairing it — except
+	// in the one case where it cannot (below).
+	deleteBytes := 0
+	if n := len(u.deleted); n > 0 {
+		var probe wire.OutPoint
+		for op := range u.deleted {
+			probe = op
+			break
+		}
+		deleteBytes = n * (len(storage.MakeUTXOKey(probe)) + 16)
+	}
+
+	// The escape hatch: if the deletes ALONE cannot fit one batch, the tear
+	// is unavoidable, so make it DETECTABLE — Core's DB_HEAD_BLOCKS. Written
+	// before the first delete lands, erased in the same batch as the final
+	// marker. A boot that finds it fails closed (durableCoinsTip refuses the
+	// marker and recovery refuses to guess) instead of silently re-applying
+	// over a half-deleted set. In practice unreachable during IBD: a 2000-
+	// block flush stages a few million deletes, ~2 orders of magnitude under
+	// the cap, and a snapshot import has no deletes at all.
+	tornWindow := deleteBytes >= flushMaxBatchBytes && u.appliedSet
+	if tornWindow {
+		old, err := u.db.DB().Get(storage.CoinsTipKey)
+		if err != nil {
+			return fmt.Errorf("coins flush: read previous coins marker: %w", err)
+		}
+		if old == nil {
+			old = (&storage.ChainState{}).Serialize()
+		}
+		rec := append(append([]byte{}, old...), (&storage.ChainState{
+			BestHash:   u.appliedHash,
+			BestHeight: u.appliedHeight,
+		}).Serialize()...)
+		batch.Put(storage.CoinsFlushKey, rec)
+		log.Printf("utxoset: coin flush deletes (%d entries, ~%d bytes) exceed the "+
+			"per-batch cap and must span batches; recording an interrupted-flush "+
+			"window (Core DB_HEAD_BLOCKS) so a crash here is detected, not guessed at",
+			len(u.deleted), deleteBytes)
+		if err := flushChunk(); err != nil {
+			return err
+		}
+	}
+
 	for outpoint := range u.deleted {
 		key := storage.MakeUTXOKey(outpoint)
 		batch.Delete(key)
 		approxBatchBytes += len(key) + 16
-		if approxBatchBytes >= maxBatchBytes {
+		if tornWindow && approxBatchBytes >= flushMaxBatchBytes {
 			if err := flushChunk(); err != nil {
 				return err
 			}
@@ -429,12 +540,12 @@ func (u *UTXOSet) flushLocked() error {
 		}
 	}
 
-	// Final partial chunk. The applied-through marker rides THIS batch, the
-	// last one — exactly as Core writes DB_BEST_BLOCK only in the final
-	// CDBBatch (txdb.cpp:157-159). A crash between chunks therefore leaves
-	// the marker at its OLD (lower) value over a partially-written set:
-	// recovery re-applies that span instead of trusting it. Staging the
-	// marker in the first chunk would invert that into the unsafe direction.
+	// Final chunk: the marker, and (when one was opened) the erasure of the
+	// interrupted-flush record — exactly as Core writes DB_BEST_BLOCK and
+	// erases DB_HEAD_BLOCKS in the same, last CDBBatch (txdb.cpp:157-159).
+	if tornWindow {
+		batch.Delete(storage.CoinsFlushKey)
+	}
 	u.stageAppliedTip(batch)
 	if err := flushChunk(); err != nil {
 		return err
