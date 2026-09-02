@@ -80,7 +80,7 @@ activation as unsettled.
 ## Known limitations
 
 **GAP-BB-FLUSH-RACE — the UTXO flush is not serialised against block
-connection.** Found 2026-09-02 by adversarial review; reproduced by four
+connection.** Found 2026-09-02 by adversarial review; reproduced by five
 probes committed at `internal/consensus/flush_race_gap_test.go` (skipped, with
 the reason in the file header).
 
