@@ -77,6 +77,41 @@ activation as unsettled.
 > gitignored (`.gitignore:43  *.log`). Paths under `receipts/`, `docs/` and
 > `CORE-PARITY-AUDIT/` are tracked, but in the **meta-repo**, not here.
 
+## Known limitations
+
+**GAP-BB-FLUSH-RACE — the UTXO flush is not serialised against block
+connection.** Found 2026-09-02 by adversarial review; reproduced by four
+probes committed at `internal/consensus/flush_race_gap_test.go` (skipped, with
+the reason in the file header).
+
+The coins-database marker that says which block the on-disk UTXO set reflects
+is enforced only *inside* a flush call. Nothing prevents a flush from running
+concurrently with a connect or a reorg, so:
+
+- A `scantxoutset`-driven flush during a **rejected** `ConnectBlock` makes that
+  block's spends durable. `rollbackUTXOs` undoes them in memory only.
+- The same during a **failed reorg** is permanent and needs no crash, despite
+  the reorg path's own comment claiming the on-disk state is untouched until
+  its final batch write.
+
+**What this means if you run this node:** under concurrent `scantxoutset` (or
+any other RPC that drives a UTXO scan) at the moment a block is rejected or a
+reorg fails, the persisted coin set can end up reflecting state that was never
+accepted. The block hash and tip stay correct, so the node looks healthy. This
+is pre-existing, not a regression; the marker work in `f369d96`/`dd791f6`
+made it visible.
+
+Closing it needs a transaction boundary between "flush the coin set" and
+"connect a block" — a design change rather than a patch. Two rounds of
+path-by-path fixes each closed their named paths and exposed the next one,
+which is why this is written down instead of patched again. The reasoning is
+in the meta-repo at `CORE-PARITY-AUDIT/_loop-ledger.md`.
+
+**Related, and closed:** crash recovery used to re-apply already-applied
+coinbase-only blocks, resurrecting a coinbase a later block had already spent.
+That is fixed and pinned (`internal/consensus/coins_marker_invariant_test.go`);
+it is what led to the review that found the race above.
+
 ## Quick Start
 
 ### Build from Source
