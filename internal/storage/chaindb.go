@@ -323,6 +323,29 @@ func (c *ChainDB) SetChainStateBatch(batch Batch, state *ChainState) {
 	batch.Put(ChainStateKey, state.Serialize())
 }
 
+// GetCoinsTip retrieves the coins-database best block: the block through
+// which the ON-DISK UTXO set is reflected (Core's DB_BEST_BLOCK, txdb.cpp:87
+// CCoinsViewDB::GetBestBlock). Returns ErrNotFound on a datadir written
+// before the marker existed — callers must treat that as "unknown", not as
+// height 0.
+func (c *ChainDB) GetCoinsTip() (*ChainState, error) {
+	data, err := c.db.Get(CoinsTipKey)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, ErrNotFound
+	}
+	return DeserializeChainState(data)
+}
+
+// SetCoinsTipBatch stages the coins-database best block into an existing
+// batch. It MUST ride the same batch as the coin writes it describes —
+// that atomicity is the whole guarantee (Core: txdb.cpp:158-159).
+func (c *ChainDB) SetCoinsTipBatch(batch Batch, state *ChainState) {
+	batch.Put(CoinsTipKey, state.Serialize())
+}
+
 // SetBlockHeightBatch adds a height->hash mapping to an existing batch (for atomic writes).
 func (c *ChainDB) SetBlockHeightBatch(batch Batch, height int32, hash wire.Hash256) {
 	key := MakeBlockHeightKey(height)

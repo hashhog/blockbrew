@@ -59,6 +59,23 @@ type UTXOSet struct {
 	freshHits        uint64 // Spends of FRESH entries (saved a write+delete)
 	blocksSinceFlush int    // Blocks connected since last flush
 
+	// appliedHash/appliedHeight name the block through which THIS set's
+	// mutations are reflected — the in-memory analogue of Core's
+	// CCoinsViewCache::GetBestBlock (coins.h). Every flush writes it into
+	// the same batch as the coins (see flushLocked / FlushBatch), so the
+	// on-disk marker always describes exactly the on-disk set: Core's
+	// DB_BEST_BLOCK discipline (txdb.cpp:158-159).
+	//
+	// appliedSet stays false until a caller supplies a tip, so a set that
+	// nobody tracks writes no marker at all rather than claiming genesis.
+	// The value is only ever advanced by ChainManager AFTER a block's
+	// mutations have been applied to this set, so it can lag the true state
+	// (harmless: recovery then re-connects) but never lead it (which would
+	// let recovery skip a block that was never applied).
+	appliedHash   wire.Hash256
+	appliedHeight int32
+	appliedSet    bool
+
 	// reorgJournal, when non-nil, records the pre-mutation state of every
 	// outpoint touched since BeginReorgJournal (first-write-wins). It lets a
 	// multi-block reorg that fails partway (ChainManager.ReorgTo) restore the
@@ -297,6 +314,40 @@ func (u *UTXOSet) HasUTXODurable(outpoint wire.OutPoint) bool {
 	return err == nil && exists
 }
 
+// SetAppliedTip records the block through which this set's mutations are
+// reflected. Callers MUST call it only after the block's mutations have been
+// applied to the set, and MUST lower it when blocks are disconnected —
+// a marker that leads the set is what lets recovery skip real work.
+func (u *UTXOSet) SetAppliedTip(hash wire.Hash256, height int32) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.appliedHash = hash
+	u.appliedHeight = height
+	u.appliedSet = true
+}
+
+// AppliedTip reports the in-memory applied-through marker, and whether one
+// has ever been set.
+func (u *UTXOSet) AppliedTip() (wire.Hash256, int32, bool) {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.appliedHash, u.appliedHeight, u.appliedSet
+}
+
+// stageAppliedTip stages the applied-through marker into a batch. Callers
+// MUST already hold u.mu, and MUST stage it into the SAME batch as the coin
+// writes it describes. Mirrors Core txdb.cpp:159, which writes DB_BEST_BLOCK
+// into the final CDBBatch of CCoinsViewDB::BatchWrite.
+func (u *UTXOSet) stageAppliedTip(batch storage.Batch) {
+	if !u.appliedSet {
+		return
+	}
+	batch.Put(storage.CoinsTipKey, (&storage.ChainState{
+		BestHash:   u.appliedHash,
+		BestHeight: u.appliedHeight,
+	}).Serialize())
+}
+
 // Flush writes all dirty entries to the database.
 func (u *UTXOSet) Flush() error {
 	if u.db == nil {
@@ -378,7 +429,13 @@ func (u *UTXOSet) flushLocked() error {
 		}
 	}
 
-	// Final partial chunk.
+	// Final partial chunk. The applied-through marker rides THIS batch, the
+	// last one — exactly as Core writes DB_BEST_BLOCK only in the final
+	// CDBBatch (txdb.cpp:157-159). A crash between chunks therefore leaves
+	// the marker at its OLD (lower) value over a partially-written set:
+	// recovery re-applies that span instead of trusting it. Staging the
+	// marker in the first chunk would invert that into the unsafe direction.
+	u.stageAppliedTip(batch)
 	if err := flushChunk(); err != nil {
 		return err
 	}
@@ -526,6 +583,12 @@ func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 		key := storage.MakeUTXOKey(outpoint)
 		batch.Delete(key)
 	}
+
+	// The applied-through marker rides the caller's batch, atomically with
+	// the coins it describes (Core: txdb.cpp:158-159). ChainManager passes
+	// the same batch that carries the block body, the height row and the
+	// chain-tip pointer, so all four commit or none do.
+	u.stageAppliedTip(batch)
 
 	// Clear dirty, deleted, and fresh tracking (caller will write the batch)
 	u.dirty = make(map[wire.OutPoint]bool, 100_000)

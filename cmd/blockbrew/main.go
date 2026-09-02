@@ -2689,6 +2689,15 @@ func loadSnapshotFromFile(
 	// we no longer need the cache populated since the coins are now
 	// durable in chainDB and the active utxoSet (which shares the
 	// same chainDB) will read them on demand.
+	//
+	// Stamp the coins marker BEFORE the flush so it rides the same write as
+	// the coins it describes: after this flush the persisted set reflects
+	// exactly the snapshot's base block. Without it a snapshot-started node
+	// carries no marker (or a stale one from a previous datadir), and crash
+	// recovery falls back to connect-first — the path that re-applies
+	// coinbase-only blocks. Core sets the equivalent best-block on the
+	// snapshot chainstate in ActivateSnapshot (validation.cpp).
+	loaded.SetAppliedTip(stats.BlockHash, expected.Height)
 	if err := loaded.Flush(); err != nil {
 		return fmt.Errorf("flush snapshot UTXOs: %w", err)
 	}
