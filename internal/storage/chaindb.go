@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/big"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -373,6 +374,54 @@ func (c *ChainDB) GetCoinsFlushWindow() (*CoinsFlushWindow, error) {
 		return nil, err
 	}
 	return &CoinsFlushWindow{From: from, To: to}, nil
+}
+
+// SnapshotBase is the assumeUTXO snapshot base a datadir was bootstrapped
+// from. See SnapshotBaseKey for why blockbrew has to persist it and Bitcoin
+// Core does not.
+type SnapshotBase struct {
+	Hash      wire.Hash256
+	Height    int32
+	Chainwork *big.Int // cumulative chain work AT the base (never nil once read back)
+}
+
+// SetSnapshotBase records the snapshot base. Written once, by the
+// -load-snapshot / loadtxoutset activation path, in the same startup as the
+// coin import it describes.
+func (c *ChainDB) SetSnapshotBase(sb *SnapshotBase) error {
+	if sb == nil || sb.Chainwork == nil {
+		return errors.New("SetSnapshotBase: nil record or nil chainwork")
+	}
+	work := sb.Chainwork.Bytes() // big-endian, minimal
+	buf := make([]byte, 0, 32+4+len(work))
+	buf = append(buf, sb.Hash[:]...)
+	var h [4]byte
+	binary.LittleEndian.PutUint32(h[:], uint32(sb.Height))
+	buf = append(buf, h[:]...)
+	buf = append(buf, work...)
+	return c.db.Put(SnapshotBaseKey, buf)
+}
+
+// GetSnapshotBase returns the recorded snapshot base, or ErrNotFound when the
+// datadir was not bootstrapped from a snapshot (the overwhelmingly common
+// case). Callers MUST treat ErrNotFound as "no snapshot", never as height 0.
+func (c *ChainDB) GetSnapshotBase() (*SnapshotBase, error) {
+	data, err := c.db.Get(SnapshotBaseKey)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, ErrNotFound
+	}
+	if len(data) < 36 {
+		return nil, fmt.Errorf("snapshot-base record too short: %d bytes", len(data))
+	}
+	sb := &SnapshotBase{
+		Height:    int32(binary.LittleEndian.Uint32(data[32:36])),
+		Chainwork: new(big.Int).SetBytes(data[36:]),
+	}
+	copy(sb.Hash[:], data[:32])
+	return sb, nil
 }
 
 // SetCoinsTipBatch stages the coins-database best block into an existing

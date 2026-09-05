@@ -86,6 +86,24 @@ var (
 	// somewhere between these two and the marker cannot be trusted";
 	// readers MUST fail closed.
 	CoinsFlushKey = []byte("coinsflush")
+
+	// SnapshotBaseKey records the assumeUTXO snapshot base this datadir was
+	// bootstrapped from: the base block hash, its height, and its cumulative
+	// chain work.
+	//
+	// Bitcoin Core never needs this. ActivateSnapshot refuses a snapshot whose
+	// base header is not already linked into the headers chain
+	// (validation.cpp:5611-5616), so in Core the base always has a real pprev
+	// chain back to genesis and the block index on disk carries it. blockbrew's
+	// -load-snapshot boot materialises NO pre-base headers, so the only record
+	// that a detached header band exists — and the only source for the base's
+	// real cumulative work, which cannot be derived from the band alone — is
+	// this key.
+	//
+	// Value: 32-byte hash + int32 LE height + big-endian chain work (variable
+	// length, no leading zero bytes). Absent on every non-snapshot datadir;
+	// readers MUST treat absence as "not snapshot-bootstrapped".
+	SnapshotBaseKey = []byte("snapshotbase")
 )
 
 // MakeBlockHeaderKey creates a key for a block header.

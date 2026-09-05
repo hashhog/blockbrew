@@ -257,6 +257,13 @@ type HeaderIndex struct {
 	// Lock-free best height cache for RPC reads (updated atomically when best tip changes).
 	// This avoids RLock contention with header validation during rapid header sync in IBD.
 	cachedBestHeight atomic.Int32
+
+	// snapshotBase is the assumeUTXO snapshot base grafted by
+	// GraftSnapshotBase, or nil on an ordinary genesis-rooted index. Its
+	// ancestry stops at a detached root rather than at genesis, so the
+	// "every ancestor must have a body" rule in recalculateBestTipLocked has
+	// to stop there too — see the comment at its use site.
+	snapshotBase *BlockNode
 }
 
 // Ensure HeaderIndex implements BlockProvider
@@ -931,6 +938,16 @@ func (idx *HeaderIndex) recalculateBestTipLocked() {
 				// Walked past genesis with data on every link.
 				break
 			}
+			if idx.snapshotBase != nil && cur.Height < idx.snapshotBase.Height {
+				// Below an assumeUTXO snapshot base. Core's snapshot chainstate
+				// does not require block bodies below its base either — those
+				// belong to the background chainstate, and until it catches up
+				// the snapshot chain's ancestry legitimately has no data
+				// (validation.cpp ActivateSnapshot / the background+snapshot
+				// pair). Without this stop, one invalidateblock call would
+				// disqualify the snapshot tip and reset bestTip to genesis.
+				break
+			}
 			if v, ok := hasFullData[cur]; ok {
 				result = v
 				break
@@ -1033,4 +1050,194 @@ func (idx *HeaderIndex) GetAllTips() []*BlockNode {
 	}
 
 	return tips
+}
+
+// SnapshotBase returns the grafted assumeUTXO snapshot base node, or nil when
+// this index is an ordinary genesis-rooted one.
+func (idx *HeaderIndex) SnapshotBase() *BlockNode {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.snapshotBase
+}
+
+// GraftSnapshotBase links an assumeUTXO snapshot base — and, when supplied,
+// the real pre-base header band ending at it — into the index as a DETACHED
+// sub-chain whose oldest node has no Parent.
+//
+// WHY THIS EXISTS. Bitcoin Core refuses to activate a snapshot whose base
+// header is not already in the headers chain:
+//
+//	snapshot_start_block = m_blockman.LookupBlockIndex(base_blockhash);
+//	if (!snapshot_start_block) { return util::Error{... "The base block header
+//	    (%s) must appear in the headers chain..."}; }
+//	                                       (bitcoin-core validation.cpp:5611-5616)
+//
+// so by the time Core reaches
+// `snapshot_chainstate.m_chain.SetTip(*snapshot_start_block)`
+// (validation.cpp:5917) the base already has a full pprev chain and becoming
+// the active chain view is a one-liner. blockbrew's -load-snapshot boot
+// deliberately does NOT require synced headers (that is the whole point of the
+// range-validation ladder), so the base block is unknown to this index and the
+// chain manager cannot resolve the saved tip: loadChainState falls into
+// pendingRecovery and every RPC height view keeps answering genesis even
+// though the coins, the coins marker and the chainstate pointer all say 6299.
+// Grafting the base is what closes that gap.
+//
+// The band gives the nodes ABOVE the base real ancestors, which they need for
+// consensus: median-time-past for [base+1, base+11] and the retarget ancestor
+// walk at the next difficulty adjustment both read pre-base headers. A
+// campaign band is 2027 headers for exactly that reason (2016 + 11).
+//
+// headers must be ASCENDING and its LAST element must be the base's own
+// header; baseHeight is that header's height; baseWork is the cumulative chain
+// work AT the base (it cannot be derived from the band, whose predecessors are
+// absent). Every header is re-verified here — linkage and proof-of-work — so a
+// corrupt or hostile fixture cannot splice arbitrary nodes into the index.
+// Contextual gates (difficulty transition, MTP) are deliberately NOT re-run:
+// their inputs live below the band by construction, which is precisely the
+// state this function exists to represent.
+//
+// Idempotent: if the base is already present (a real header sync got there
+// first, or a restart re-grafts), the existing node is returned untouched.
+func (idx *HeaderIndex) GraftSnapshotBase(headers []wire.BlockHeader, baseHeight int32, baseWork *big.Int) (*BlockNode, error) {
+	if len(headers) == 0 {
+		return nil, errors.New("graft snapshot base: no headers supplied")
+	}
+	if baseHeight < 0 || int(baseHeight) < len(headers)-1 {
+		return nil, fmt.Errorf("graft snapshot base: %d headers do not fit below height %d",
+			len(headers), baseHeight)
+	}
+	if baseWork == nil || baseWork.Sign() <= 0 {
+		return nil, errors.New("graft snapshot base: cumulative chain work at the base is unknown")
+	}
+
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	baseHash := headers[len(headers)-1].BlockHash()
+	if existing, ok := idx.nodes[baseHash]; ok {
+		if idx.snapshotBase == nil {
+			idx.snapshotBase = existing
+		}
+		return existing, nil
+	}
+
+	// Re-verify the band before anything is mutated: linkage + PoW.
+	for i := range headers {
+		h := headers[i].BlockHash()
+		if err := CheckProofOfWork(h, headers[i].Bits, idx.params.PowLimit); err != nil {
+			return nil, fmt.Errorf("graft snapshot base: header %d (%s): %w",
+				i, h.String()[:16], ErrInvalidPoW)
+		}
+		if i > 0 && headers[i].PrevBlock != headers[i-1].BlockHash() {
+			return nil, fmt.Errorf("graft snapshot base: header %d does not link to %d", i, i-1)
+		}
+	}
+
+	// Cumulative work descends from the base: work[i] = work[i+1] - CalcWork(bits[i+1]).
+	firstHeight := baseHeight - int32(len(headers)-1)
+	totals := make([]*big.Int, len(headers))
+	totals[len(headers)-1] = new(big.Int).Set(baseWork)
+	for i := len(headers) - 2; i >= 0; i-- {
+		t := new(big.Int).Sub(totals[i+1], CalcWork(headers[i+1].Bits))
+		if t.Sign() <= 0 {
+			return nil, fmt.Errorf("graft snapshot base: supplied chain work %s is too small for a %d-header band",
+				baseWork.Text(16), len(headers))
+		}
+		totals[i] = t
+	}
+
+	var parent *BlockNode
+	var base *BlockNode
+	for i := range headers {
+		hash := headers[i].BlockHash()
+		height := firstHeight + int32(i)
+
+		if node, ok := idx.nodes[hash]; ok {
+			// Already known (partial re-graft): adopt it as the parent link and
+			// leave its recorded state alone.
+			parent = node
+			base = node
+			continue
+		}
+
+		// Status: the base is what the snapshot asserts a validated,
+		// body-present tip — the same flags ConnectBlock sets — because the
+		// snapshot IS its post-state. The pre-base band is header-only and says
+		// so; those bodies are never fetched (they are ancestors of the active
+		// tip, so p2p/sync.go's needBody already skips them).
+		status := StatusHeaderValid
+		if i == len(headers)-1 {
+			status |= StatusDataStored | StatusFullyValid
+		}
+
+		node := &BlockNode{
+			Hash:      hash,
+			Header:    headers[i],
+			Height:    height,
+			Parent:    parent,
+			TotalWork: totals[i],
+			Status:    status,
+		}
+		node.buildSkip()
+		if parent != nil {
+			parent.Children = append(parent.Children, node)
+		}
+		idx.nodes[hash] = node
+		parent = node
+		base = node
+	}
+
+	idx.snapshotBase = base
+	if base.TotalWork.Cmp(idx.bestTip.TotalWork) > 0 {
+		idx.bestTip = base
+		idx.cachedBestHeight.Store(base.Height)
+	}
+	return base, nil
+}
+
+// HydrateSnapshotBaseFromDB re-grafts a snapshot base band that a previous run
+// persisted, so a RESTART on a snapshot-bootstrapped datadir presents the same
+// active chain view as the boot that imported the snapshot.
+//
+// It walks backward from baseHash through the persisted headers (the band
+// written at activation time), stopping at the first header the DB does not
+// hold, then grafts what it collected. HydrateFromDB cannot do this job: it
+// requires the walk to reach genesis or an already-indexed header and returns
+// (0, nil) otherwise — correct for its own case (a partial genesis-rooted chain
+// would only orphan) and exactly wrong for a band that is detached by design.
+//
+// Returns the number of headers grafted.
+func (idx *HeaderIndex) HydrateSnapshotBaseFromDB(src PersistedHeaderSource, baseHash wire.Hash256, baseHeight int32, baseWork *big.Int) (int, error) {
+	if idx.HasHeader(baseHash) {
+		return 0, nil
+	}
+
+	// Collect base-first, bounded by the base height (a band can never reach
+	// below genesis) — a corrupt/cyclic header store cannot spin here.
+	desc := make([]wire.BlockHeader, 0, 2048)
+	h := baseHash
+	for int32(len(desc)) <= baseHeight {
+		hdr, err := src.GetBlockHeader(h)
+		if err != nil || hdr == nil {
+			break
+		}
+		desc = append(desc, *hdr)
+		h = hdr.PrevBlock
+		if idx.HasHeader(h) {
+			break
+		}
+	}
+	if len(desc) == 0 {
+		return 0, fmt.Errorf("snapshot base header %s is not in the chain DB", baseHash.String())
+	}
+
+	asc := make([]wire.BlockHeader, len(desc))
+	for i := range desc {
+		asc[len(desc)-1-i] = desc[i]
+	}
+	if _, err := idx.GraftSnapshotBase(asc, baseHeight, baseWork); err != nil {
+		return 0, err
+	}
+	return len(asc), nil
 }

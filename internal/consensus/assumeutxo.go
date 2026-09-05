@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/big"
 	"os"
 	"strconv"
 	"strings"
@@ -110,6 +111,35 @@ type AssumeUTXOData struct {
 	HashSerialized wire.Hash256 // SHA256 hash of the serialized UTXO set
 	ChainTxCount   uint64       // Total transactions in the chain up to this block
 	BlockHash      wire.Hash256 // The block hash at this height
+
+	// --- Optional snapshot-base ancestry (campaign fixtures only) ---
+	//
+	// Bitcoin Core needs neither field: ActivateSnapshot refuses a snapshot
+	// whose base header is not already in the headers chain
+	// (validation.cpp:5611-5616), so the base block's CBlockIndex always has a
+	// real pprev chain and PopulateAndValidateSnapshot can simply do
+	// `snapshot_chainstate.m_chain.SetTip(*snapshot_start_block)`
+	// (validation.cpp:5917) to make the snapshot the active chain view.
+	//
+	// blockbrew's -load-snapshot boot materialises NO pre-base headers, so
+	// without these the snapshot base is unknown to the header index, the
+	// chain manager cannot resolve the saved tip to a *BlockNode, and every
+	// RPC height view keeps reporting genesis. See
+	// HeaderIndex.GraftSnapshotBase.
+
+	// BaseTailHeaders is a real, link-verified band of mainnet headers in
+	// ASCENDING order whose LAST element is the base block's own header.
+	// Campaign fixtures ship 2027 of them: 2016 (so the next retarget
+	// boundary's ancestor walk lands on a real header) + 11 (the
+	// median-time-past window). Empty for the built-in production entries,
+	// which are only ever activated on a node that has already synced headers.
+	BaseTailHeaders []wire.BlockHeader
+
+	// Chainwork is the cumulative chain work AT the base block. It cannot be
+	// derived from BaseTailHeaders alone (the work below the band is missing),
+	// so a grafted snapshot tip that has to be compared against a
+	// genesis-rooted header chain needs it supplied. Nil when unknown.
+	Chainwork *big.Int
 }
 
 // AssumeUTXOParams maps heights to known-good snapshot data.

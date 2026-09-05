@@ -913,6 +913,30 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// to walk, so it loads 0 headers and the node falls back to network sync.
 	if chainState != nil && chainState.BestHeight > 0 {
 		hStart := time.Now()
+
+		// 3b-i. Re-graft the assumeUTXO snapshot base FIRST, when this datadir
+		// was bootstrapped from one. The band below a snapshot base is detached
+		// by design (a -load-snapshot boot never materialises genesis..base), and
+		// HydrateFromDB refuses a chain that does not reach genesis or an
+		// already-indexed header — correctly, since a partial genesis-rooted
+		// chain would only orphan. Grafting first gives the ordinary hydration
+		// below an anchor to stop at, so blocks connected ABOVE the base
+		// rehydrate normally. Without this the node re-loses its tip on every
+		// restart: the DB still says height N, the header index says genesis.
+		if sb, sErr := chainDB.GetSnapshotBase(); sErr == nil && sb != nil {
+			n, gErr := headerIndex.HydrateSnapshotBaseFromDB(chainDB, sb.Hash, sb.Height, sb.Chainwork)
+			if gErr != nil {
+				log.Printf("WARNING: snapshot base %s@%d recorded for this datadir but could not be "+
+					"re-grafted: %v (the node will report genesis until header sync reaches it)",
+					sb.Hash.String(), sb.Height, gErr)
+			} else if n > 0 {
+				log.Printf("Snapshot base re-grafted from disk: %s@%d with %d pre-base headers",
+					sb.Hash.String(), sb.Height, n)
+			}
+		} else if sErr != nil && !errors.Is(sErr, storage.ErrNotFound) {
+			log.Printf("WARNING: reading the snapshot-base record failed: %v", sErr)
+		}
+
 		loaded, herr := headerIndex.HydrateFromDB(chainDB, chainState.BestHash, chainState.BestHeight)
 		if herr != nil {
 			log.Printf("Header index hydration stopped early after %d headers: %v "+
@@ -2818,6 +2842,96 @@ func loadSnapshotFromFile(
 
 	log.Printf("[snapshot] loaded %d coins; tip=%s height=%d hash_serialized=%s",
 		stats.CoinsLoaded, stats.BlockHash.String(), expected.Height, computed.String())
+
+	// --- Step 11: make the snapshot base the ACTIVE chain view.
+	//
+	// Steps 8-10 promote the snapshot in the DATABASE — coins, coins marker,
+	// chainstate pointer, height index. None of that reaches the running node's
+	// chain view, because ChainManager.loadChainState resolves the saved tip
+	// hash through the HEADER INDEX and a -load-snapshot boot has only genesis
+	// in it. The tip stays at genesis, the manager parks in pendingRecovery,
+	// and getblockcount / getbestblockhash / getchainstates all keep answering
+	// genesis on a node whose UTXO set is the snapshot's.
+	//
+	// Core never has this problem: ActivateSnapshot REFUSES a snapshot whose
+	// base header is not already in the headers chain (validation.cpp:5611-5616),
+	// so `m_chain.SetTip(*snapshot_start_block)` (validation.cpp:5917) is all it
+	// takes there. blockbrew accepts the snapshot without synced headers by
+	// design, so it has to materialise the base itself — from the base-tail
+	// header band the campaign fixture carries.
+	if err := activateSnapshotChainView(chainDB, headerIndex, expected, stats.BlockHash); err != nil {
+		return err
+	}
+	return nil
+}
+
+// activateSnapshotChainView grafts a freshly-loaded snapshot's base block into
+// the header index (so the chain manager can adopt it as the tip) and persists
+// the band + a snapshot-base record so a RESTART can re-graft it.
+//
+// Degrades loudly, not silently: with no base-tail ancestry in the entry there
+// is nothing to graft, and the node stays in the pre-existing
+// "deferring recovery until headers are re-synced" state — correct, just not
+// useful — so say so at WARNING volume rather than leaving an operator to
+// discover it through an RPC that answers 0.
+func activateSnapshotChainView(
+	chainDB *storage.ChainDB,
+	headerIndex *consensus.HeaderIndex,
+	expected *consensus.AssumeUTXOData,
+	baseHash wire.Hash256,
+) error {
+	if headerIndex == nil {
+		return nil
+	}
+	band := expected.BaseTailHeaders
+	if len(band) == 0 {
+		log.Printf("WARNING: [snapshot] base %s@%d has no base_tail_headers/base_header in its "+
+			"assumeutxo entry: the snapshot coins are loaded and durable, but the base block "+
+			"cannot be placed in the header index, so the node will report genesis until "+
+			"header sync reaches height %d",
+			baseHash.String(), expected.Height, expected.Height)
+		return nil
+	}
+	if got := band[len(band)-1].BlockHash(); got != baseHash {
+		return fmt.Errorf("snapshot base ancestry: entry band ends at %s but the snapshot file's base is %s",
+			got.String(), baseHash.String())
+	}
+	work := expected.Chainwork
+	if work == nil || work.Sign() <= 0 {
+		return fmt.Errorf("snapshot base ancestry: assumeutxo entry for %s@%d carries base headers "+
+			"but no chainwork; the grafted tip's cumulative work cannot be faked "+
+			"(it decides every future best-chain comparison)",
+			baseHash.String(), expected.Height)
+	}
+
+	base, err := headerIndex.GraftSnapshotBase(band, expected.Height, work)
+	if err != nil {
+		return fmt.Errorf("snapshot base ancestry: %w", err)
+	}
+
+	// Persist the band (header + height index) and the snapshot-base record so
+	// the next start can rebuild the same detached view without the fixture.
+	firstHeight := expected.Height - int32(len(band)-1)
+	for i := range band {
+		h := band[i].BlockHash()
+		if err := chainDB.StoreBlockHeader(h, &band[i]); err != nil {
+			return fmt.Errorf("persist snapshot base band header %d: %w", firstHeight+int32(i), err)
+		}
+		if err := chainDB.SetBlockHeight(firstHeight+int32(i), h); err != nil {
+			return fmt.Errorf("persist snapshot base band height %d: %w", firstHeight+int32(i), err)
+		}
+	}
+	if err := chainDB.SetSnapshotBase(&storage.SnapshotBase{
+		Hash:      baseHash,
+		Height:    expected.Height,
+		Chainwork: work,
+	}); err != nil {
+		return fmt.Errorf("persist snapshot base record: %w", err)
+	}
+
+	log.Printf("[snapshot] grafted base %s@%d into the header index with %d pre-base headers "+
+		"(%d..%d), chainwork=%s: the snapshot is now the active chain view",
+		base.Hash.String(), base.Height, len(band), firstHeight, expected.Height, work.Text(16))
 	return nil
 }
 

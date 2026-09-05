@@ -1,10 +1,14 @@
 package consensus
 
 import (
+	"bytes"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/big"
 	"os"
+	"strings"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -23,19 +27,22 @@ const CampaignAssumeUTXOEnvVar = "HASHHOG_CAMPAIGN_ASSUMEUTXO"
 // hex is in Core DISPLAY order, exactly as Core's kernel/chainparams.cpp
 // prints it — parseCampaignAssumeUTXO converts to blockbrew's internal byte
 // order via wire.NewHash256FromHex, the same conversion mustParseHash and the
-// mainnet/regtest tables above use. base_mtp/base_header/chainwork are
-// accepted (the shared fixture carries them for OTHER impls that need them
-// to avoid wedging the chain at the snapshot base — rustoshi's bad-txns-
-// nonfinal issue, see the spec) but blockbrew's AssumeUTXOData has no slot
-// for them, so they are parsed and discarded here.
+// mainnet/regtest tables above use.
+//
+// base_header/base_tail_headers/chainwork ARE consumed: they are what lets a
+// -load-snapshot boot present the snapshot base as the active chain view (see
+// AssumeUTXOData.BaseTailHeaders and HeaderIndex.GraftSnapshotBase). base_mtp
+// is still parsed and discarded — blockbrew derives median-time-past from the
+// grafted header band itself rather than from a pinned scalar.
 type campaignAssumeUTXOEntry struct {
-	Height         int32  `json:"height"`
-	BlockHash      string `json:"blockhash"`
-	HashSerialized string `json:"hash_serialized"`
-	ChainTxCount   uint64 `json:"m_chain_tx_count"`
-	BaseMTP        *int64 `json:"base_mtp,omitempty"`
-	BaseHeader     string `json:"base_header,omitempty"`
-	Chainwork      string `json:"chainwork,omitempty"`
+	Height          int32    `json:"height"`
+	BlockHash       string   `json:"blockhash"`
+	HashSerialized  string   `json:"hash_serialized"`
+	ChainTxCount    uint64   `json:"m_chain_tx_count"`
+	BaseMTP         *int64   `json:"base_mtp,omitempty"`
+	BaseHeader      string   `json:"base_header,omitempty"`
+	Chainwork       string   `json:"chainwork,omitempty"`
+	BaseTailHeaders []string `json:"base_tail_headers,omitempty"`
 }
 
 // LoadCampaignAssumeUTXO implements the HASHHOG_CAMPAIGN_ASSUMEUTXO flag.
@@ -164,12 +171,91 @@ func parseCampaignAssumeUTXOEntries(rawEntries []campaignAssumeUTXOEntry) ([]Ass
 		seenHeight[re.Height] = true
 		seenHash[blockHash] = true
 
+		// Optional snapshot-base ancestry. Validated structurally here
+		// (well-formed hex, 80-byte headers, prev-hash linkage, last header
+		// hashes to this entry's blockhash); proof-of-work is checked later,
+		// in HeaderIndex.GraftSnapshotBase, which has the network's PowLimit.
+		tail, err := parseCampaignBaseTail(re, blockHash)
+		if err != nil {
+			return nil, fmt.Errorf("entry %d: %w", i, err)
+		}
+
+		var chainwork *big.Int
+		if re.Chainwork != "" {
+			cw, ok := new(big.Int).SetString(strings.TrimPrefix(re.Chainwork, "0x"), 16)
+			if !ok || cw.Sign() < 0 {
+				return nil, fmt.Errorf("entry %d: chainwork: not a hex integer", i)
+			}
+			chainwork = cw
+		}
+
 		entries = append(entries, AssumeUTXOData{
-			Height:         re.Height,
-			HashSerialized: hashSerialized,
-			ChainTxCount:   re.ChainTxCount,
-			BlockHash:      blockHash,
+			Height:          re.Height,
+			HashSerialized:  hashSerialized,
+			ChainTxCount:    re.ChainTxCount,
+			BlockHash:       blockHash,
+			BaseTailHeaders: tail,
+			Chainwork:       chainwork,
 		})
 	}
 	return entries, nil
+}
+
+// parseCampaignBaseTail decodes an entry's base-tail header band.
+//
+// The band is ASCENDING and its LAST header is the snapshot base's own header.
+// When only `base_header` is supplied (the original spec's shape) the band is
+// that single header. When both are supplied they must agree: `base_tail_headers`
+// already ends with the base header, so a mismatch means the fixture is
+// internally inconsistent and is refused rather than silently preferred one way.
+//
+// Structural invariants enforced (all of them, because this is consensus-
+// critical input that will be spliced straight into the header index):
+//   - every element is exactly 80 bytes of hex and deserialises;
+//   - each header's PrevBlock equals the double-SHA256 of its predecessor;
+//   - the last header hashes to the entry's declared blockhash;
+//   - the band is no longer than the base height allows (heights stay >= 0).
+//
+// Returns nil (no error) when the entry carries no ancestry at all — legacy
+// fixtures stay loadable, they just cannot present the snapshot tip.
+func parseCampaignBaseTail(re campaignAssumeUTXOEntry, baseHash wire.Hash256) ([]wire.BlockHeader, error) {
+	raw := re.BaseTailHeaders
+	if len(raw) == 0 {
+		if re.BaseHeader == "" {
+			return nil, nil
+		}
+		raw = []string{re.BaseHeader}
+	} else if re.BaseHeader != "" && !strings.EqualFold(raw[len(raw)-1], re.BaseHeader) {
+		return nil, fmt.Errorf("base_header does not match the last base_tail_headers entry")
+	}
+
+	if int64(len(raw))-1 > int64(re.Height) {
+		return nil, fmt.Errorf("base_tail_headers has %d entries but base height is only %d",
+			len(raw), re.Height)
+	}
+
+	headers := make([]wire.BlockHeader, 0, len(raw))
+	for i, h := range raw {
+		b, err := hex.DecodeString(h)
+		if err != nil {
+			return nil, fmt.Errorf("base_tail_headers[%d]: %w", i, err)
+		}
+		if len(b) != 80 {
+			return nil, fmt.Errorf("base_tail_headers[%d]: got %d bytes, want 80", i, len(b))
+		}
+		var hdr wire.BlockHeader
+		if err := hdr.Deserialize(bytes.NewReader(b)); err != nil {
+			return nil, fmt.Errorf("base_tail_headers[%d]: %w", i, err)
+		}
+		if i > 0 && hdr.PrevBlock != headers[i-1].BlockHash() {
+			return nil, fmt.Errorf("base_tail_headers[%d]: prev-hash does not link to [%d]", i, i-1)
+		}
+		headers = append(headers, hdr)
+	}
+
+	if got := headers[len(headers)-1].BlockHash(); got != baseHash {
+		return nil, fmt.Errorf("last base_tail_headers entry hashes to %s, not the entry blockhash %s",
+			got.String(), baseHash.String())
+	}
+	return headers, nil
 }
