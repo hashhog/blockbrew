@@ -9,6 +9,9 @@ import (
 	"io"
 	"log"
 	"math"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/hashhog/blockbrew/internal/storage"
@@ -900,6 +903,56 @@ func AssumeUTXOParamsForNetwork(params *ChainParams) *AssumeUTXOParams {
 		return RegtestAssumeUTXOParams()
 	}
 	return params.AssumeUTXO
+}
+
+// UnsafeSnapshotHeightEnv names the DEVELOPMENT-ONLY environment variable that
+// relaxes the assumeutxo chainparams whitelist. See UnsafeSnapshotHeight.
+const UnsafeSnapshotHeightEnv = "HASHHOG_UNSAFE_SNAPSHOT_HEIGHT"
+
+// UnsafeSnapshotHeight reads HASHHOG_UNSAFE_SNAPSHOT_HEIGHT.
+//
+// WHY this escape hatch exists: loadtxoutset is a TRUST SHORTCUT for end users
+// — they get a usable chain tip without validating the history behind it —
+// which is precisely why Core hardcodes the assumeutxo anchors in chainparams
+// and refuses any snapshot whose base block hash is not one of them. This
+// project has a different need: it validates arbitrary block ranges in
+// PARALLEL, each range starting from a locally generated snapshot ladder whose
+// base hashes will never appear in anybody's chainparams. Correctness there is
+// NOT established by trusting the input snapshot; it is established by checking
+// each range's OUTPUT utxo hash against an independent commitment. The
+// whitelist is the wrong gate for that workflow, and only for that workflow.
+//
+// UNSET (the shipped default) returns set=false and every caller behaves
+// byte-for-byte as it does today — production trust semantics are untouched.
+// When SET, a caller may accept a snapshot whose base block hash is absent from
+// the assumeutxo table, using the returned height as the snapshot's base height
+// (the whitelist entry is normally what supplies that height, so under a bypass
+// it has to come from somewhere). NOTHING else is relaxed: snapshot magic,
+// version, network magic, coin count, per-coin guards (BUG-W102-01..03),
+// trailing-byte check (04) and the base-block preconditions (05..07) all still
+// run exactly as before.
+func UnsafeSnapshotHeight() (height int32, set bool, err error) {
+	raw, ok := os.LookupEnv(UnsafeSnapshotHeightEnv)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return 0, false, nil
+	}
+	v, perr := strconv.ParseInt(strings.TrimSpace(raw), 10, 32)
+	if perr != nil || v < 0 {
+		return 0, true, fmt.Errorf("%s=%q is not a valid block height", UnsafeSnapshotHeightEnv, raw)
+	}
+	return int32(v), true, nil
+}
+
+// LogUnsafeSnapshotBypass emits the loud warning that MUST accompany every
+// actual use of the UnsafeSnapshotHeight bypass, so an operator who reaches
+// this state by accident sees it in the node's normal log.
+func LogUnsafeSnapshotBypass(baseHash wire.Hash256, height int32) {
+	log.Printf("[snapshot] ***************** UNVERIFIED SNAPSHOT *****************")
+	log.Printf("[snapshot] WARNING: %s=%d is set, so the assumeutxo chainparams whitelist was BYPASSED.", UnsafeSnapshotHeightEnv, height)
+	log.Printf("[snapshot] WARNING: base blockhash %s is NOT a chainparams trust anchor.", baseHash.String())
+	log.Printf("[snapshot] WARNING: this snapshot is UNVERIFIED — no hardcoded hash_serialized commitment backs its contents.")
+	log.Printf("[snapshot] WARNING: DEVELOPMENT USE ONLY. NEVER run a production node this way.")
+	log.Printf("[snapshot] ******************************************************")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

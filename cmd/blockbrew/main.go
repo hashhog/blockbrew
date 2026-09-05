@@ -2657,7 +2657,21 @@ func loadSnapshotFromFile(
 	// that field is nil there by design (regtest's table lives in the
 	// runtime-registerable whitelist, not the ChainParams struct).
 	auParams := consensus.AssumeUTXOParamsForNetwork(params)
-	if auParams == nil {
+
+	// HASHHOG_UNSAFE_SNAPSHOT_HEIGHT — DEVELOPMENT-ONLY escape from the
+	// whitelist. Loading a snapshot is a trust shortcut for end users, which is
+	// why Core hardcodes the anchors. This project needs to validate arbitrary
+	// block ranges in parallel from a locally generated snapshot ladder;
+	// correctness there is established by checking each range's OUTPUT utxo
+	// hash against an independent commitment, not by trusting the input
+	// snapshot. Unset (the shipped default) keeps production trust semantics
+	// intact — the rejections below fire exactly as they do today.
+	// See consensus.UnsafeSnapshotHeight.
+	unsafeHeight, unsafeSet, unsafeErr := consensus.UnsafeSnapshotHeight()
+	if unsafeErr != nil {
+		return unsafeErr
+	}
+	if auParams == nil && !unsafeSet {
 		return fmt.Errorf("network %q has no AssumeUTXO params; snapshot loading not supported", params.Name)
 	}
 
@@ -2672,10 +2686,24 @@ func loadSnapshotFromFile(
 	// calls PopulateAndValidateSnapshot after a successful lookup. Without this
 	// guard the UTXOSet gets polluted with up to 165M untrusted coins before the
 	// lookup fails with ErrUnknownSnapshotHeight.
-	expected := auParams.ForBlockHash(meta.BlockHash)
-	if expected == nil {
+	var expected *consensus.AssumeUTXOData
+	if auParams != nil {
+		expected = auParams.ForBlockHash(meta.BlockHash)
+	}
+	if expected == nil && !unsafeSet {
 		return fmt.Errorf("snapshot block hash %s not recognised in AssumeUTXO params",
 			meta.BlockHash.String())
+	}
+	// unsafeBypass is true only when the base hash was NOT found in the table
+	// AND the env var authorised proceeding anyway. It relaxes exactly two
+	// things: whitelist membership (here) and the hardcoded hash_serialized
+	// comparison (step 9). Steps 5-8 and 10 still run unchanged.
+	unsafeBypass := expected == nil
+	if unsafeBypass {
+		consensus.LogUnsafeSnapshotBypass(meta.BlockHash, unsafeHeight)
+		// The whitelist entry is normally what supplies the base height, so
+		// synthesise a stand-in entry from the env-supplied height.
+		expected = &consensus.AssumeUTXOData{Height: unsafeHeight, BlockHash: meta.BlockHash}
 	}
 
 	// --- Step 5 (BUG-W102-14): cross-check file metadata height vs table entry.
@@ -2686,10 +2714,13 @@ func loadSnapshotFromFile(
 	// (SnapshotMetadata contains BlockHash but not a standalone height; the table
 	// entry height IS the authoritative source. The cross-check confirms
 	// ForBlockHash and ForHeight agree on the same entry.)
-	if byHeight := auParams.ForHeight(expected.Height); byHeight == nil ||
-		byHeight.BlockHash != expected.BlockHash {
-		return fmt.Errorf("%w: table entry at height %d has unexpected block hash",
-			consensus.ErrSnapshotHeightMismatch, expected.Height)
+	// (Meaningless under the bypass: there is no table entry to cross-check.)
+	if !unsafeBypass {
+		if byHeight := auParams.ForHeight(expected.Height); byHeight == nil ||
+			byHeight.BlockHash != expected.BlockHash {
+			return fmt.Errorf("%w: table entry at height %d has unexpected block hash",
+				consensus.ErrSnapshotHeightMismatch, expected.Height)
+		}
 	}
 
 	// --- Step 6 (BUG-W102-05): base block must not be BLOCK_FAILED_VALID.
@@ -2734,7 +2765,11 @@ func loadSnapshotFromFile(
 	if err != nil {
 		return fmt.Errorf("ComputeHashSerialized: %w", err)
 	}
-	if computed != expected.HashSerialized {
+	// Under the bypass there is no committed hash to compare against — that
+	// single comparison is what HASHHOG_UNSAFE_SNAPSHOT_HEIGHT gives up. The
+	// computed hash is still logged below (step 10) so the caller can check it
+	// against its own independent commitment.
+	if !unsafeBypass && computed != expected.HashSerialized {
 		return fmt.Errorf("snapshot UTXO hash mismatch: expected %s, got %s",
 			expected.HashSerialized.String(), computed.String())
 	}

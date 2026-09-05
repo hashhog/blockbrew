@@ -3581,19 +3581,51 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 
 	// --- Step 2: AssumeUTXO table lookup by base block hash (BEFORE coin I/O).
 	auParams := s.assumeUTXOParamsForNetwork()
-	if auParams == nil {
+
+	// HASHHOG_UNSAFE_SNAPSHOT_HEIGHT — DEVELOPMENT-ONLY escape from the
+	// whitelist. loadtxoutset is a trust shortcut for end users, which is why
+	// Core hardcodes the anchors. This project needs to validate arbitrary
+	// block ranges in parallel from a locally generated snapshot ladder;
+	// correctness there is established by checking each range's OUTPUT utxo
+	// hash against an independent commitment, not by trusting the input
+	// snapshot. Unset (the shipped default) keeps production trust semantics
+	// intact — the rejections below fire exactly as they do today.
+	// See consensus.UnsafeSnapshotHeight.
+	unsafeHeight, unsafeSet, unsafeErr := consensus.UnsafeSnapshotHeight()
+	if unsafeErr != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: unsafeErr.Error()}
+	}
+
+	if auParams == nil && !unsafeSet {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("network %q has no AssumeUTXO params; snapshot loading not supported", s.chainParams.Name)}
 	}
-	expected := auParams.ForBlockHash(meta.BlockHash)
-	if expected == nil {
+	var expected *consensus.AssumeUTXOData
+	if auParams != nil {
+		expected = auParams.ForBlockHash(meta.BlockHash)
+	}
+	if expected == nil && !unsafeSet {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
 			"assumeutxo block hash in snapshot metadata not recognized (hash: %s). The following snapshot heights are available: %v",
 			meta.BlockHash.String(), auParams.AvailableHeights())}
 	}
-	// Cross-check metadata/table height agreement (BUG-W102-14).
-	if byHeight := auParams.ForHeight(expected.Height); byHeight == nil || byHeight.BlockHash != expected.BlockHash {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
-			"%v: table entry at height %d has unexpected block hash", consensus.ErrSnapshotHeightMismatch, expected.Height)}
+	// unsafeBypass is true only when the base hash was NOT found in the table
+	// AND the env var authorised proceeding anyway. It relaxes exactly two
+	// things: whitelist membership (here) and the hardcoded hash_serialized
+	// comparison (step 4). Every other guard below still runs.
+	unsafeBypass := expected == nil
+	if unsafeBypass {
+		consensus.LogUnsafeSnapshotBypass(meta.BlockHash, unsafeHeight)
+		// The whitelist entry is normally what supplies the base height, so
+		// synthesise a stand-in entry from the env-supplied height.
+		expected = &consensus.AssumeUTXOData{Height: unsafeHeight, BlockHash: meta.BlockHash}
+	}
+	// Cross-check metadata/table height agreement (BUG-W102-14). Meaningless
+	// under the bypass: there is no table entry to cross-check against.
+	if !unsafeBypass {
+		if byHeight := auParams.ForHeight(expected.Height); byHeight == nil || byHeight.BlockHash != expected.BlockHash {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
+				"%v: table entry at height %d has unexpected block hash", consensus.ErrSnapshotHeightMismatch, expected.Height)}
+		}
 	}
 
 	// --- Step 3: preconditions.
@@ -3638,13 +3670,23 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Unable to compute snapshot UTXO hash: %v", err)}
 	}
-	if computed != expected.HashSerialized {
+	if !unsafeBypass && computed != expected.HashSerialized {
 		// Load-time authentication failure (the file's own coins don't hash to
 		// the committed value). Core returns an error from ActivateSnapshot in
 		// this synchronous phase; surface it as an RPC error.
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf(
 			"%v: expected %s, got %s", consensus.ErrSnapshotHashMismatch,
 			expected.HashSerialized.String(), computed.String())}
+	}
+	if unsafeBypass {
+		// No chainparams commitment exists for this base hash, so there is
+		// nothing to authenticate the file against at load time — that single
+		// comparison is what the bypass gives up. Adopt the file's own computed
+		// hash as the background validator's target so step 5's independent
+		// genesis->base re-derivation still runs and still has to agree.
+		// (`expected` here is the locally synthesised entry, never a pointer
+		// into the chainparams table, so this mutates nothing global.)
+		expected.HashSerialized = computed
 	}
 	// Persist the authenticated snapshot coins durably in the snapshot store so
 	// the snapshot chainstate serves the loaded coins on demand.
