@@ -33,8 +33,13 @@ import (
 // (HeaderIndex.GetNode for the parent lookup, HeaderIndex.AddHeader for the real
 // PoW + contextual validation and index insertion). No parallel validator is
 // introduced — the path is identical to the one submitblock and P2P header sync
-// drive (minPowChecked=false, the external-caller convention; AddHeader enforces
-// the MinimumChainWork gate itself, mirroring Core validation.cpp:4229).
+// drive. minPowChecked=TRUE, matching Core's
+// ProcessNewBlockHeaders({{h}}, /*min_pow_checked=*/true, state)
+// (rpc/mining.cpp:1138): min_pow_checked is the CALLER's anti-DoS assertion
+// (validation.cpp:4229), and an authenticated RPC caller is not the flooding
+// peer the gate exists to stop. The code has vouched since 200b5ba; this
+// comment still described the pre-fix behavior, and that stale description is
+// what the submitblock site was mirroring.
 func (s *Server) handleSubmitHeader(params json.RawMessage) (result interface{}, rpcErr *RPCError) {
 	// Recover from any panic during header decode/processing so a malformed
 	// submitheader cannot crash the node (DoS vector), mirroring the

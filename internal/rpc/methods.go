@@ -2359,11 +2359,52 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	}
 
 	// Add header to index.
-	// minPowChecked=false: submitblock arrives from an external caller (RPC
-	// client / miner) that has NOT passed through the PRESYNC pipeline.
-	// AddHeader will enforce the MinimumChainWork gate itself.
+	//
+	// minPowChecked=TRUE. Core's min_pow_checked is a CALLER-SUPPLIED
+	// anti-DoS assertion, not a property of the header: AcceptBlockHeader
+	// refuses to create a NEW index entry when the caller did not vouch —
+	//
+	//	if (!min_pow_checked) {
+	//	    LogDebug(BCLog::VALIDATION, "%s: not adding new block header %s,
+	//	            missing anti-dos proof-of-work validation\n", ...);
+	//	    return state.Invalid(BlockValidationResult::BLOCK_HEADER_LOW_WORK,
+	//	                         "too-little-chainwork");
+	//	}
+	//	                              (bitcoin-core validation.cpp:4229-4233)
+	//
+	// — and every RPC entry point in Core hard-codes the vouch, because an
+	// authenticated RPC caller is not the flooding peer the gate exists to
+	// stop: submitblock passes /*min_pow_checked=*/true (rpc/mining.cpp:1095),
+	// as do generateblock (:157) and submitheader (:1138). The gate's real
+	// caller is net_processing, which only vouches after the headers-presync
+	// anti-DoS check has run.
+	//
+	// This site passed FALSE, so blockbrew's analogue — "reject unless the
+	// new tip's cumulative work already meets MinimumChainWork"
+	// (headerindex.go:474-479) — ran on the RPC path. On a normally-synced
+	// mainnet node the tip's work is astronomically past the threshold and
+	// nothing was ever observed. At an assumeUTXO snapshot base it is fatal
+	// and PERMANENT: the base is a real early-chain block (6299, cumulative
+	// work 0x189c189c189c) many orders of magnitude below mainnet's
+	// nMinimumChainWork, so EVERY child of the base was refused before it
+	// could be indexed, and submitblock answered a bare "rejected" for a
+	// block Core accepts. That is the divergence the 2026-09-05 boundary
+	// campaign caught at block 6300 (run 20260905T174115Z). The same hole
+	// exists on any node that is legitimately below the threshold — a
+	// genesis-IBD mainnet node fed by submitblock — the snapshot base just
+	// makes it inescapable, since nothing can ever raise the work.
+	//
+	// handleSubmitHeader has vouched since 200b5ba (2026-06-24), when the
+	// submitheader review caught exactly this divergence on the method it was
+	// reviewing; the pre-existing submitblock site was out of that scope and
+	// was left behind. The two RPCs now agree with each other and with Core.
+	//
+	// This grants an RPC caller no capability it did not already have:
+	// submitheader admits the identical header today. The P2P arm
+	// (p2p/sync.go:2686, an unrequested block message) still passes false,
+	// which is where Core's anti-DoS assertion actually belongs.
 	hash := block.Header.BlockHash()
-	hdrNode, err := s.headerIndex.AddHeader(block.Header, false)
+	hdrNode, err := s.headerIndex.AddHeader(block.Header, true)
 	if err != nil {
 		if errors.Is(err, consensus.ErrDuplicateHeader) {
 			// A known HEADER is not a duplicate BLOCK.
@@ -2518,9 +2559,12 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	}
 
 	// Add header to index before connecting (ignore duplicate — headers may
-	// already be present from P2P header sync).
+	// already be present from P2P header sync). minPowChecked=true for the
+	// same reason as the first AddHeader above (Core rpc/mining.cpp:1095):
+	// leaving it false here would re-reject the header this handler just
+	// admitted whenever the two indexes are distinct objects.
 	if s.chainMgr != nil {
-		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header, false); err != nil && !errors.Is(err, consensus.ErrDuplicateHeader) {
+		if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header, true); err != nil && !errors.Is(err, consensus.ErrDuplicateHeader) {
 			return bip22ResultStringForBlock(block, err), nil
 		}
 
@@ -2630,8 +2674,11 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interfac
 		}
 
 		hash := block.Header.BlockHash()
-		// minPowChecked=false: same as submitblock — external caller, no PRESYNC.
-		if _, err := s.headerIndex.AddHeader(block.Header, false); err != nil && err != consensus.ErrDuplicateHeader {
+		// minPowChecked=true: same as submitblock — Core hard-codes the vouch
+		// at every RPC block-submission entry point (rpc/mining.cpp:1095); the
+		// anti-DoS assertion is net_processing's to make, not an authenticated
+		// caller's. See the long note in handleSubmitBlock.
+		if _, err := s.headerIndex.AddHeader(block.Header, true); err != nil && err != consensus.ErrDuplicateHeader {
 			results[i] = fmt.Sprintf("header validation failed: %v", err)
 			continue
 		}
@@ -2657,7 +2704,7 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interfac
 		}
 
 		if s.chainMgr != nil {
-			if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header, false); err != nil && err != consensus.ErrDuplicateHeader {
+			if _, err := s.chainMgr.GetHeaderIndex().AddHeader(block.Header, true); err != nil && err != consensus.ErrDuplicateHeader {
 				results[i] = fmt.Sprintf("failed to add header: %v", err)
 				continue
 			}
