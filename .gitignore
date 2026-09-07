@@ -40,3 +40,10 @@ blockbrew.w13b
 blockbrew.pre-w13
 blockbrew.pre-w13-recovery
 blockbrew.462c233-deployed
+
+# Build artifacts — verify-fix.sh builds these on demand
+# (`go build -o cmd/verifyscript_shim/verifyscript_shim ./cmd/verifyscript_shim`).
+# Tracking them made every `go build` dirty the tree, which blocked
+# promote_mainnet.sh's DIRTY-TREE gate and stalled the v1.0.1 redeploy.
+verifyscript_shim
+cmd/verifyscript_shim/verifyscript_shim
