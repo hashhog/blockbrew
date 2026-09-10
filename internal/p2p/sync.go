@@ -164,7 +164,10 @@ type blockRequest struct {
 	NextRetryAt time.Time
 	// StallResets counts stall-handler resets for this entry (backoff
 	// exponent). Deliberately separate from RetryCount, which drives
-	// peer rotation and is zeroed by design on a pending-reset.
+	// peer rotation. RetryCount is NOT zeroed on a pending-reset:
+	// stallRecoveryPlan uses it (with RequestAt) as the tried-and-failed
+	// bit, and wiping it made every post-reset pass look never-issued
+	// (13 min at 966196 on 2026-09-09).
 	StallResets int
 
 	// FastPathFailed latches when fastPathDispatch's disk read failed for
@@ -196,25 +199,54 @@ func stallBackoff(resets int) time.Duration {
 // wait counts as an escalation.
 //
 // #75: a request that was NEVER ISSUED — no assigned peer, no retries, nothing
-// in flight — has no failed attempt to penalise.  Charging it the escalating
-// stallBackoff(StallResets) makes the node serve out a growing penalty for work
-// it never attempted; observed on mainnet 2026-08-28 as ~5m43s per block at the
-// tip, cleared only when a peer sent the block unsolicited.  Such a request gets
-// the BASE backoff and does not escalate, so it is retried promptly on a fresh
-// peer.
+// in flight, never dispatched — has no failed attempt to penalise. Charging it
+// the escalating stallBackoff(StallResets) makes the node serve out a growing
+// penalty for work it never attempted; observed on mainnet 2026-08-28 as
+// ~5m43s per block at the tip, cleared only when a peer sent the block
+// unsolicited. Such a request gets the BASE backoff and does not escalate, so
+// it is retried promptly on a fresh peer.
 //
 // A request that WAS dispatched and failed keeps the escalating penalty — that
 // is what stops a hot re-request loop against a peer that cannot serve us.
+// Dispatch is stamped on RequestAt and is not cleared by stall/eviction
+// resets; RetryCount and Peer are additional signals when they have not yet
+// been reset. Without RequestAt, both reset sites (StartBlockDownload peer
+// eviction and the pending-stall arm) nilled Peer and zeroed RetryCount, so
+// every subsequent pass looked never-issued and StallResets froze — 13 min
+// at height 966196 on 2026-09-09.
 //
 // This does not weaken #73: the caller only reaches this decision when no
 // backoff is currently ticking (see stallShouldRearm), so the perpetual-re-arm
 // starvation that wedged 964241 for 12+ minutes remains impossible.
 func stallRecoveryPlan(req *blockRequest, inFlight bool) (time.Duration, bool) {
-	neverIssued := req.RetryCount == 0 && req.Peer == nil && !inFlight
+	neverIssued := req.RetryCount == 0 && req.Peer == nil && !inFlight && req.RequestAt.IsZero()
 	if neverIssued {
 		return stallBackoff(0), false
 	}
 	return stallBackoff(req.StallResets), true
+}
+
+// releasePeerSlot returns a queue entry to Pending after its owning peer is
+// gone (W13 eviction). Peer is cleared so requestBlocks can assign a live
+// one. RetryCount is kept: zeroing it made stallRecoveryPlan treat a tried
+// request as never-issued.
+func releasePeerSlot(req *blockRequest) {
+	req.State = BlockDownloadPending
+	req.Peer = nil
+}
+
+// applyPendingStallRecovery re-arms a Pending request the stall detector
+// has decided is not downloading. Peer is cleared so any live peer may
+// take the slot; RetryCount is not. Tests drive this helper to reach the
+// same escalation branch the production stall handler uses.
+func applyPendingStallRecovery(req *blockRequest, now time.Time, inFlight bool) (time.Duration, bool) {
+	backoff, escalate := stallRecoveryPlan(req, inFlight)
+	req.Peer = nil
+	req.NextRetryAt = now.Add(backoff)
+	if escalate {
+		req.StallResets++
+	}
+	return backoff, escalate
 }
 
 func stallShouldRearm(req *blockRequest, now time.Time) bool {
@@ -1841,9 +1873,7 @@ func (sm *SyncManager) StartBlockDownload() {
 				if req.State == BlockDownloadInFlight {
 					delete(sm.inflight, req.Hash)
 				}
-				req.State = BlockDownloadPending
-				req.Peer = nil
-				req.RetryCount = 0
+				releasePeerSlot(req)
 				evicted++
 			}
 		}
@@ -2205,15 +2235,9 @@ func (sm *SyncManager) blockDownloadLoop() {
 							// Force a re-request by logging and letting requestBlocks
 							// pick it up on next tick. Also reset peer to allow any peer.
 							_, inFlight := sm.inflight[req.Hash]
-							backoff, escalate := stallRecoveryPlan(req, inFlight)
+							backoff, escalate := applyPendingStallRecovery(req, time.Now(), inFlight)
 							log.Printf("sync: block %d is pending but not downloading, clearing peer restriction (backoff %s, escalate=%v)",
 								nh, backoff, escalate)
-							req.Peer = nil
-							req.RetryCount = 0
-							req.NextRetryAt = time.Now().Add(backoff)
-							if escalate {
-								req.StallResets++
-							}
 							// W48: state invariant says Pending blocks must not be in
 							// sm.inflight; otherwise requestBlocks skips them and the
 							// stall never clears. Sibling branches (line ~1014, ~1034)
@@ -2572,9 +2596,7 @@ func (sm *SyncManager) checkStaleRequests() {
 		// timeout (up to 120 s × 16 slots per dead peer = the W8/W12 wedge).
 		if req.Peer == nil || !req.Peer.IsConnected() || req.Peer.ShouldBan() {
 			delete(sm.inflight, hash)
-			req.State = BlockDownloadPending
-			req.Peer = nil
-			req.RetryCount = 0
+			releasePeerSlot(req)
 			evictedDead++
 			continue
 		}

@@ -3,6 +3,9 @@ package p2p
 import (
 	"testing"
 	"time"
+
+	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 // TestStallShouldRearm pins #73 layer C — the stall handler starving its own
@@ -133,5 +136,196 @@ func TestStallRecoveryPlan_TriedAndFailedStillEscalates(t *testing.T) {
 	inflight := &blockRequest{State: BlockDownloadPending, StallResets: 1}
 	if _, escalate := stallRecoveryPlan(inflight, true); !escalate {
 		t.Error("a request still in flight counts as attempted")
+	}
+}
+
+// TestStallRecoveryPlan_DispatchedThenResetStillEscalates is the 09-09
+// control. Live log at height 966196: state=Pending, inflight=0, peer=false,
+// retries=0 — the same shape as #75's never-issued case — except getdata HAD
+// been sent (RequestAt is stamped on dispatch and is not cleared). Both reset
+// sites used to nil Peer and zero RetryCount, so stallRecoveryPlan took the
+// never-issued branch on every subsequent pass and StallResets froze for
+// 13 minutes. A dispatched-then-reset request must escalate.
+//
+// Revert control: restore
+//
+//	neverIssued := req.RetryCount == 0 && req.Peer == nil && !inFlight
+//
+// in stallRecoveryPlan (drop the RequestAt conjunct) and this test fails.
+func TestStallRecoveryPlan_DispatchedThenResetStillEscalates(t *testing.T) {
+	req := &blockRequest{
+		State:       BlockDownloadPending,
+		Peer:        nil,
+		RetryCount:  0, // live logs: retries=0 the whole stall
+		StallResets: 1,
+		RequestAt:   time.Now().Add(-time.Minute),
+	}
+	backoff, escalate := stallRecoveryPlan(req, false)
+	if !escalate {
+		t.Fatal("a request that was dispatched (RequestAt set) is not never-issued " +
+			"after the stall reset; must take the escalation branch")
+	}
+	if backoff != stallBackoff(1) {
+		t.Errorf("backoff=%v, want stallBackoff(StallResets)=%v", backoff, stallBackoff(1))
+	}
+}
+
+// TestApplyPendingStallRecovery_EscalatesAcrossResets drives the production
+// stall-handler helper over repeated passes — the path that was unreachable
+// when the helper zeroed RetryCount. StallResets must grow on every pass of
+// a previously dispatched request; RetryCount must survive.
+func TestApplyPendingStallRecovery_EscalatesAcrossResets(t *testing.T) {
+	now := time.Now()
+	req := &blockRequest{
+		State:      BlockDownloadPending,
+		Peer:       &Peer{},
+		RetryCount: 2,
+		RequestAt:  now.Add(-time.Minute),
+	}
+
+	for i := 0; i < 6; i++ {
+		_, escalate := applyPendingStallRecovery(req, now, false)
+		if !escalate {
+			t.Fatalf("pass %d: dispatched request must escalate; stallRecoveryPlan "+
+				"took the never-issued branch (RetryCount=%d peer=%v RequestAt zero=%v)",
+				i, req.RetryCount, req.Peer != nil, req.RequestAt.IsZero())
+		}
+		if req.RetryCount != 2 {
+			t.Fatalf("pass %d: RetryCount=%d, want 2 — zeroing it is why the "+
+				"escalation branch was unreachable", i, req.RetryCount)
+		}
+		if req.Peer != nil {
+			t.Fatalf("pass %d: peer restriction must be cleared", i)
+		}
+		now = now.Add(10 * time.Second)
+	}
+	if req.StallResets != 6 {
+		t.Fatalf("StallResets=%d, want 6 — the escalation branch did not run on every pass",
+			req.StallResets)
+	}
+}
+
+// TestApplyPendingStallRecovery_NeverIssuedDoesNotEscalate keeps the #75
+// pin on the production helper, not just stallRecoveryPlan: a request that
+// was never dispatched must not accrue StallResets.
+func TestApplyPendingStallRecovery_NeverIssuedDoesNotEscalate(t *testing.T) {
+	req := &blockRequest{State: BlockDownloadPending, StallResets: 4}
+	_, escalate := applyPendingStallRecovery(req, time.Now(), false)
+	if escalate {
+		t.Fatal("#75: a never-issued request must not escalate")
+	}
+	if req.StallResets != 4 {
+		t.Fatalf("StallResets=%d, want 4 (must not increment on never-issued)", req.StallResets)
+	}
+}
+
+func TestReleasePeerSlot_PreservesRetryCount(t *testing.T) {
+	req := &blockRequest{
+		State:      BlockDownloadInFlight,
+		Peer:       &Peer{},
+		RetryCount: 3,
+		RequestAt:  time.Now(),
+	}
+	releasePeerSlot(req)
+	if req.State != BlockDownloadPending {
+		t.Fatalf("state=%d, want Pending", req.State)
+	}
+	if req.Peer != nil {
+		t.Fatal("peer must be cleared so a live peer can be assigned")
+	}
+	if req.RetryCount != 3 {
+		t.Fatalf("RetryCount=%d, want 3: zeroing it is why stallRecoveryPlan never escalated (09-09 966196)",
+			req.RetryCount)
+	}
+	if _, escalate := stallRecoveryPlan(req, false); !escalate {
+		t.Fatal("after releasePeerSlot, a previously issued request must still escalate")
+	}
+}
+
+// TestStartBlockDownload_EvictionPreservesRetryCountAndEscalates reaches
+// the production eviction site (sync.go StartBlockDownload) that used to
+// assign RetryCount=0. Re-adding that assignment fails this test.
+func TestStartBlockDownload_EvictionPreservesRetryCountAndEscalates(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+	dead := createMockPeer("dead:8333", 0)
+	dead.state = PeerStateDisconnected
+	req := &blockRequest{
+		Height:      966196,
+		State:       BlockDownloadInFlight,
+		Peer:        dead,
+		RetryCount:  2,
+		StallResets: 3,
+		RequestAt:   time.Now().Add(-time.Minute),
+	}
+	sm.blockQueue = []*blockRequest{req}
+	sm.inflight[req.Hash] = req
+
+	sm.StartBlockDownload()
+
+	if req.RetryCount != 2 {
+		t.Fatalf("RetryCount=%d, want 2: StartBlockDownload eviction zeroed it, so stallRecoveryPlan never escalates",
+			req.RetryCount)
+	}
+	if req.Peer != nil {
+		t.Fatal("dead peer must be cleared")
+	}
+	if req.State != BlockDownloadPending {
+		t.Fatalf("state=%d, want Pending", req.State)
+	}
+	if _, ok := sm.inflight[req.Hash]; ok {
+		t.Fatal("in-flight slot must be released")
+	}
+	if _, escalate := stallRecoveryPlan(req, false); !escalate {
+		t.Fatal("after StartBlockDownload eviction, a tried request must still escalate")
+	}
+}
+
+// TestCheckStaleRequests_DeadPeerPreservesRetryCountAndEscalates reaches
+// the other production reset that used to assign RetryCount=0 (the W13
+// inflight sweep). Same control as the StartBlockDownload pin.
+func TestCheckStaleRequests_DeadPeerPreservesRetryCountAndEscalates(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+	dead := createMockPeer("dead:8333", 0)
+	dead.state = PeerStateDisconnected
+	var hash wire.Hash256
+	hash[0] = 1
+	req := &blockRequest{
+		Hash:        hash,
+		Height:      966196,
+		State:       BlockDownloadInFlight,
+		Peer:        dead,
+		RetryCount:  2,
+		StallResets: 1,
+		RequestAt:   time.Now().Add(-time.Minute),
+	}
+	sm.inflight[hash] = req
+
+	sm.checkStaleRequests()
+
+	if req.RetryCount != 2 {
+		t.Fatalf("RetryCount=%d, want 2 (zeroing it is the 09-09 unreachable-escalation bug)",
+			req.RetryCount)
+	}
+	if req.State != BlockDownloadPending {
+		t.Fatalf("state=%d, want Pending", req.State)
+	}
+	if req.Peer != nil {
+		t.Fatal("dead peer must be cleared")
+	}
+	if _, ok := sm.inflight[hash]; ok {
+		t.Fatal("in-flight slot must be released")
+	}
+	if _, escalate := stallRecoveryPlan(req, false); !escalate {
+		t.Fatal("after dead-peer eviction, a previously issued request must still escalate")
 	}
 }
