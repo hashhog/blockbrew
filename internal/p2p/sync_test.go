@@ -164,6 +164,52 @@ func TestSyncManagerHandleHeaders(t *testing.T) {
 	}
 }
 
+// TestHandleHeadersAdvancesSyncedHeaders is the sync-side control for
+// QUEUES.md blockbrew item 3. Core UpdateBlockAvailability sets
+// pindexBestKnownBlock from headers this peer announced that we also have;
+// getpeerinfo.synced_headers is that height — not VERSION startHeight, and
+// not the -1 stub. A re-delivered (already-known) batch still updates.
+func TestHandleHeadersAdvancesSyncedHeaders(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	peer := createMockPeer("1.2.3.4:8333", 100)
+	if got := peer.SyncedHeaders(); got != -1 {
+		t.Fatalf("SyncedHeaders before headers = %d, want -1", got)
+	}
+
+	headers := make([]wire.BlockHeader, 3)
+	prevHash := params.GenesisHash
+	prevTimestamp := params.GenesisBlock.Header.Timestamp
+	for i := 0; i < 3; i++ {
+		headers[i] = createTestBlockHeader(prevHash, prevTimestamp+600, uint32(i+1))
+		prevHash = headers[i].BlockHash()
+		prevTimestamp = headers[i].Timestamp
+	}
+
+	sm.HandleHeaders(peer, &MsgHeaders{Headers: headers})
+	if idx.BestHeight() != 3 {
+		t.Fatalf("best height = %d, want 3", idx.BestHeight())
+	}
+	if got := peer.SyncedHeaders(); got != 3 {
+		t.Errorf("SyncedHeaders after first batch = %d, want 3", got)
+	}
+
+	// Duplicate (already-known) announcement still counts: Core
+	// UpdateBlockAvailability looks the hash up in the index.
+	sm.HandleHeaders(peer, &MsgHeaders{Headers: headers})
+	if got := peer.SyncedHeaders(); got != 3 {
+		t.Errorf("SyncedHeaders after duplicate batch = %d, want 3", got)
+	}
+	if got := peer.SyncedBlocks(); got != -1 {
+		t.Errorf("SyncedBlocks after headers-only = %d, want -1", got)
+	}
+}
+
 // drainGetHeaders non-blockingly collects all MsgGetHeaders queued on a mock
 // peer's sendQueue. Used by the periodic-discovery regression tests.
 func drainGetHeaders(peer *Peer) []*MsgGetHeaders {
@@ -917,6 +963,68 @@ func TestSyncManagerHandleBlock(t *testing.T) {
 	}
 }
 
+// TestHandleBlockAdvancesSyncedBlocks is the block-side control for
+// QUEUES.md blockbrew item 3. Receiving a requested body from this peer
+// advances pindexLastCommonBlock (getpeerinfo.synced_blocks) and implies
+// the header is also in common.
+func TestHandleBlockAdvancesSyncedBlocks(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+
+	peer := createMockPeer("1.2.3.4:8333", 100)
+	if got := peer.SyncedBlocks(); got != -1 {
+		t.Fatalf("SyncedBlocks before body = %d, want -1", got)
+	}
+
+	genesis := idx.Genesis()
+	header := createTestBlockHeader(genesis.Hash, genesis.Header.Timestamp+600, 1)
+	blockHash := header.BlockHash()
+	if _, err := idx.AddHeader(header, true); err != nil {
+		t.Fatalf("failed to add header: %v", err)
+	}
+
+	sm.mu.Lock()
+	sm.inflight[blockHash] = &blockRequest{
+		Hash:      blockHash,
+		Height:    1,
+		Peer:      peer,
+		State:     BlockDownloadInFlight,
+		RequestAt: time.Now(),
+	}
+	sm.mu.Unlock()
+
+	block := &wire.MsgBlock{
+		Header: header,
+		Transactions: []*wire.MsgTx{
+			{
+				Version: 1,
+				TxIn: []*wire.TxIn{
+					{
+						PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+						SignatureScript:  []byte{0x01, 0x01},
+						Sequence:         0xFFFFFFFF,
+					},
+				},
+				TxOut: []*wire.TxOut{
+					{Value: 5000000000, PkScript: []byte{0x51}},
+				},
+			},
+		},
+	}
+	sm.HandleBlock(peer, &MsgBlock{Block: block})
+
+	if got := peer.SyncedBlocks(); got != 1 {
+		t.Errorf("SyncedBlocks after body = %d, want 1", got)
+	}
+	if got := peer.SyncedHeaders(); got != 1 {
+		t.Errorf("SyncedHeaders after body = %d, want 1 (body implies header)", got)
+	}
+}
+
 func TestSyncManagerIgnoresUnsolicitedBlock(t *testing.T) {
 	params := consensus.RegtestParams()
 	idx := consensus.NewHeaderIndex(params)
@@ -1163,8 +1271,8 @@ func (m *mockChainConnector) AdoptIfAlreadyFlushed(b *wire.MsgBlock) (bool, erro
 	}
 	return false, nil
 }
-func (m *mockChainConnector) IsIBD() bool              { return !m.postIBD }
-func (m *mockChainConnector) IsPruning() bool          { return m.pruning }
+func (m *mockChainConnector) IsIBD() bool     { return !m.postIBD }
+func (m *mockChainConnector) IsPruning() bool { return m.pruning }
 
 // TestIsIBDActive_TrueAtStartup verifies that a freshly created SyncManager
 // reports IsIBDActive()=true before any blocks have connected.
@@ -1324,10 +1432,10 @@ func (s *stallingChainConnector) ConnectBlock(_ *wire.MsgBlock) error {
 // nextHeight) the validation worker parked forever, which backed up
 // validationChan and caused the peer readHandler to drop incoming blocks.
 // The new implementation must:
-//   1. Spawn N parallel validation workers (so one slow ConnectBlock
-//      can't stop validation globally).
-//   2. Fall back to requeueForRedownload() when connectionChan is full,
-//      instead of parking the goroutine.
+//  1. Spawn N parallel validation workers (so one slow ConnectBlock
+//     can't stop validation globally).
+//  2. Fall back to requeueForRedownload() when connectionChan is full,
+//     instead of parking the goroutine.
 //
 // This test stuffs both channels past capacity with a wedged connection
 // worker, then asserts the validation workers drained validationChan
@@ -1606,8 +1714,8 @@ func TestEvictDistantPendingNoop(t *testing.T) {
 // Used to verify the halt-on-validation-failure branch.
 type failingChainConnector struct {
 	mockChainConnector
-	err     error
-	calls   atomic.Int32
+	err   error
+	calls atomic.Int32
 }
 
 func (f *failingChainConnector) ConnectBlock(_ *wire.MsgBlock) error {

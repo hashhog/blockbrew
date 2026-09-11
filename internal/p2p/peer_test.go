@@ -748,15 +748,15 @@ func TestShouldRelayTx(t *testing.T) {
 		vsize      int64 // tx vsize in vbytes
 		wantRelay  bool
 	}{
-		{"no filter", 0, 1000, 100, true},          // Any tx passes with no filter
-		{"no filter zero fee", 0, 0, 100, true},    // Even zero fee passes with no filter
-		{"exact threshold", 1000, 100, 100, true},  // 100 sat / 100 vB = 1 sat/vB = 1000 sat/kvB
-		{"above threshold", 1000, 200, 100, true},  // 200 sat / 100 vB = 2 sat/vB
-		{"below threshold", 1000, 50, 100, false},  // 50 sat / 100 vB = 0.5 sat/vB < 1 sat/vB
-		{"high filter", 10000, 500, 100, false},    // 500 sat / 100 vB = 5 sat/vB < 10 sat/vB
+		{"no filter", 0, 1000, 100, true},            // Any tx passes with no filter
+		{"no filter zero fee", 0, 0, 100, true},      // Even zero fee passes with no filter
+		{"exact threshold", 1000, 100, 100, true},    // 100 sat / 100 vB = 1 sat/vB = 1000 sat/kvB
+		{"above threshold", 1000, 200, 100, true},    // 200 sat / 100 vB = 2 sat/vB
+		{"below threshold", 1000, 50, 100, false},    // 50 sat / 100 vB = 0.5 sat/vB < 1 sat/vB
+		{"high filter", 10000, 500, 100, false},      // 500 sat / 100 vB = 5 sat/vB < 10 sat/vB
 		{"high filter pass", 10000, 1000, 100, true}, // 1000 sat / 100 vB = 10 sat/vB
-		{"large tx below", 1000, 100, 200, false},  // 100 sat / 200 vB = 0.5 sat/vB < 1 sat/vB
-		{"large tx above", 1000, 250, 200, true},   // 250 sat / 200 vB = 1.25 sat/vB > 1 sat/vB
+		{"large tx below", 1000, 100, 200, false},    // 100 sat / 200 vB = 0.5 sat/vB < 1 sat/vB
+		{"large tx above", 1000, 250, 200, true},     // 250 sat / 200 vB = 1.25 sat/vB > 1 sat/vB
 	}
 
 	for _, tt := range tests {
@@ -785,5 +785,67 @@ func TestFeeFilterConstants(t *testing.T) {
 
 	if FeeFilterMaxChangeDelay != 5*time.Minute {
 		t.Errorf("FeeFilterMaxChangeDelay = %v, want 5m", FeeFilterMaxChangeDelay)
+	}
+}
+
+// TestPeerSyncedHeightsDefaultUnset pins Core's nSyncHeight / nCommonHeight
+// sentinel: a peer that has not announced a header we have, and has not
+// delivered a block body, reports -1 — including a zero-value Peer, and
+// including after VERSION (startHeight is not pindexBestKnownBlock).
+func TestPeerSyncedHeightsDefaultUnset(t *testing.T) {
+	p := NewTestPeer("1.2.3.4:8333", 800000)
+	if got := p.SyncedHeaders(); got != -1 {
+		t.Errorf("SyncedHeaders() = %d, want -1 before any announcement", got)
+	}
+	if got := p.SyncedBlocks(); got != -1 {
+		t.Errorf("SyncedBlocks() = %d, want -1 before any block body", got)
+	}
+	if p.StartHeight() != 800000 {
+		t.Errorf("StartHeight() = %d, want 800000 (VERSION is independent of synced_*)", p.StartHeight())
+	}
+
+	var zero Peer
+	if got := zero.SyncedHeaders(); got != -1 {
+		t.Errorf("zero Peer SyncedHeaders() = %d, want -1", got)
+	}
+	if got := zero.SyncedBlocks(); got != -1 {
+		t.Errorf("zero Peer SyncedBlocks() = %d, want -1", got)
+	}
+}
+
+// TestPeerSyncedHeightsMonotonicAndGenesisZero: height 0 is a valid
+// measurement (genesis) and must not collapse to the unset sentinel; a
+// lower later announcement must not rewind the best-known height.
+func TestPeerSyncedHeightsMonotonicAndGenesisZero(t *testing.T) {
+	p := NewTestPeer("1.2.3.4:8333", 0)
+
+	p.UpdateSyncedHeaders(0)
+	if got := p.SyncedHeaders(); got != 0 {
+		t.Errorf("SyncedHeaders after genesis announce = %d, want 0", got)
+	}
+	if got := p.SyncedBlocks(); got != -1 {
+		t.Errorf("SyncedBlocks after header-only = %d, want -1", got)
+	}
+
+	p.UpdateSyncedHeaders(50)
+	p.UpdateSyncedHeaders(20) // must not rewind
+	if got := p.SyncedHeaders(); got != 50 {
+		t.Errorf("SyncedHeaders after rewind attempt = %d, want 50", got)
+	}
+
+	p.UpdateSyncedBlocks(40)
+	if got := p.SyncedBlocks(); got != 40 {
+		t.Errorf("SyncedBlocks = %d, want 40", got)
+	}
+	if got := p.SyncedHeaders(); got != 50 {
+		t.Errorf("SyncedHeaders after lower block body = %d, want 50 (headers stay ahead)", got)
+	}
+
+	p.UpdateSyncedBlocks(60)
+	if got := p.SyncedBlocks(); got != 60 {
+		t.Errorf("SyncedBlocks = %d, want 60", got)
+	}
+	if got := p.SyncedHeaders(); got != 60 {
+		t.Errorf("SyncedHeaders after higher block body = %d, want 60 (body implies header)", got)
 	}
 }

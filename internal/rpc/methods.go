@@ -1538,6 +1538,12 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 			connType = "inbound"
 		}
 		mappedAS := s.peerMgr.GetMappedASForAddr(p.Address())
+		presyncedHeaders := int32(-1)
+		inflight := []int{}
+		if s.syncMgr != nil {
+			presyncedHeaders = s.syncMgr.PresyncHeightForPeer(p.Address())
+			inflight = s.syncMgr.InflightHeightsForPeer(p)
+		}
 		result = append(result, PeerInfo{
 			ID:                    i,
 			Addr:                  p.Address(),
@@ -1562,10 +1568,10 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 			Inbound:               p.Inbound(),
 			BIP152HBTo:            false,
 			BIP152HBFrom:          false,
-			PreSyncedHeaders:      -1,
-			SyncedHeaders:         -1,
-			SyncedBlocks:          -1,
-			Inflight:              []int{},
+			PreSyncedHeaders:      presyncedHeaders,
+			SyncedHeaders:         p.SyncedHeaders(),
+			SyncedBlocks:          p.SyncedBlocks(),
+			Inflight:              inflight,
 			AddrRelayEnabled:      true,
 			AddrProcessed:         0,
 			AddrRateLimited:       0,

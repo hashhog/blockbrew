@@ -244,6 +244,16 @@ type Peer struct {
 	// addrTokenInit guards lazy one-time initialisation of the bucket to 1.0
 	// for peers constructed before this field existed.
 	addrTokenInit bool
+
+	// Per-peer header/block sync heights surfaced by getpeerinfo.
+	// Core: CNodeState.pindexBestKnownBlock / pindexLastCommonBlock
+	// (net_processing.cpp GetNodeStateStats → nSyncHeight / nCommonHeight).
+	// A zero-value Peer reports -1 until the first update; height 0 (genesis)
+	// is a valid measurement and must not collapse to the unset sentinel.
+	syncedHeaders    int32
+	hasSyncedHeaders bool
+	syncedBlocks     int32
+	hasSyncedBlocks  bool
 }
 
 // markGetAddrRecvd records that we have answered a getaddr from this peer and
@@ -1411,6 +1421,75 @@ func (p *Peer) StartHeight() int32 {
 		return 0
 	}
 	return p.peerVersion.StartHeight
+}
+
+// SyncedHeaders is getpeerinfo.synced_headers: the last header we have in
+// common with this peer (Core nSyncHeight). -1 until this peer announces a
+// header we also have. Not the VERSION startHeight stub.
+func (p *Peer) SyncedHeaders() int32 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.hasSyncedHeaders {
+		return -1
+	}
+	return p.syncedHeaders
+}
+
+// SyncedBlocks is getpeerinfo.synced_blocks: the last full block we have in
+// common with this peer (Core nCommonHeight). -1 until we receive a block
+// body from this peer.
+func (p *Peer) SyncedBlocks() int32 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if !p.hasSyncedBlocks {
+		return -1
+	}
+	return p.syncedBlocks
+}
+
+// UpdateSyncedHeaders records a header this peer announced that we also
+// have (Core UpdateBlockAvailability → pindexBestKnownBlock). Height is
+// monotonic: a lower announcement does not rewind the best-known tip.
+func (p *Peer) UpdateSyncedHeaders(height int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.hasSyncedHeaders || height > p.syncedHeaders {
+		p.syncedHeaders = height
+		p.hasSyncedHeaders = true
+	}
+}
+
+// UpdateSyncedBlocks records a block body received from this peer (Core
+// pindexLastCommonBlock). A received body implies the header is also in
+// common, so synced_headers is advanced too.
+func (p *Peer) UpdateSyncedBlocks(height int32) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.hasSyncedBlocks || height > p.syncedBlocks {
+		p.syncedBlocks = height
+		p.hasSyncedBlocks = true
+	}
+	if !p.hasSyncedHeaders || height > p.syncedHeaders {
+		p.syncedHeaders = height
+		p.hasSyncedHeaders = true
+	}
+}
+
+// NewTestPeer returns a connected peer with no socket. Tests use this to
+// drive ConnectedPeers / getpeerinfo / sync handlers without I/O.
+func NewTestPeer(addr string, startHeight int32) *Peer {
+	return &Peer{
+		config: PeerConfig{
+			Network:         MainnetMagic,
+			ProtocolVersion: ProtocolVersion,
+		},
+		addr:          addr,
+		state:         PeerStateConnected,
+		peerVersion:   &MsgVersion{StartHeight: startHeight},
+		sendQueue:     make(chan Message, SendQueueSize),
+		quit:          make(chan struct{}),
+		handshakeDone: make(chan struct{}),
+	}
 }
 
 // IsConnected returns true if the handshake is complete and the peer is live.

@@ -554,6 +554,24 @@ func (pm *PeerManager) ConnectedPeers() []*Peer {
 	return peers
 }
 
+// InsertConnectedPeer registers an already-connected peer without dialing.
+// Tests use this to drive ConnectedPeers / getpeerinfo without a live socket.
+func (pm *PeerManager) InsertConnectedPeer(p *Peer) {
+	if pm == nil || p == nil {
+		return
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if pm.peers == nil {
+		pm.peers = make(map[string]*PeerInfo)
+	}
+	pm.peers[p.Address()] = &PeerInfo{
+		peer:        p,
+		connType:    ConnFullRelay,
+		connectedAt: time.Now(),
+	}
+}
+
 // GetTotalBytes returns the cumulative bytes received and sent across the
 // node's P2P connections, for the `getnettotals` RPC.
 //

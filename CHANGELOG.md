@@ -4,6 +4,7 @@
 
 Changes since `v1.0.0`:
 
+- feat: getpeerinfo reports per-peer synced_headers/synced_blocks instead of -1 stubs
 - fix(p2p): stall resets keep RetryCount so stallRecoveryPlan can escalate
 - bf18c02 docs: say the cited paths are private before the claims that rest on them
 - d1c4d39 fix: RPC block submission must vouch min-pow-checked, as Core does

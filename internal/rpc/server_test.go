@@ -12,6 +12,7 @@ import (
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
+	"github.com/hashhog/blockbrew/internal/p2p"
 	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -763,6 +764,96 @@ func TestGetPeerInfoWireShape(t *testing.T) {
 	}
 	if hbFrom >= preSynced {
 		t.Errorf("getpeerinfo: bip152_hb_from must precede presynced_headers, got %d >= %d\n%s", hbFrom, preSynced, js)
+	}
+}
+
+// TestGetPeerInfoPerPeerSyncFields is the control for QUEUES.md blockbrew
+// item 3. Core rpc/net.cpp:271-272 emits nSyncHeight / nCommonHeight from
+// CNodeState (pindexBestKnownBlock / pindexLastCommonBlock), not the -1
+// placeholders. A peer that has announced a header we have and delivered a
+// block body must surface those heights; a peer that has done neither stays
+// at -1 (the Core unset sentinel — not VERSION startHeight).
+func TestGetPeerInfoPerPeerSyncFields(t *testing.T) {
+	params := consensus.RegtestParams()
+	pm := p2p.NewPeerManager(p2p.PeerManagerConfig{ChainParams: params})
+
+	live := p2p.NewTestPeer("192.168.1.3:8333", 800000)
+	live.UpdateSyncedHeaders(850010)
+	live.UpdateSyncedBlocks(849900)
+	pm.InsertConnectedPeer(live)
+
+	unset := p2p.NewTestPeer("192.168.1.4:8333", 800000)
+	pm.InsertConnectedPeer(unset)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithPeerManager(pm),
+	)
+
+	resp := testRPCRequest(t, server.handleRPC, "getpeerinfo", []interface{}{}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	arr, ok := resp.Result.([]interface{})
+	if !ok {
+		t.Fatalf("result type %T, want []interface{}", resp.Result)
+	}
+	if len(arr) != 2 {
+		t.Fatalf("getpeerinfo returned %d peers, want 2", len(arr))
+	}
+
+	byAddr := make(map[string]map[string]interface{}, len(arr))
+	for _, raw := range arr {
+		m, ok := raw.(map[string]interface{})
+		if !ok {
+			t.Fatalf("peer entry type %T, want object", raw)
+		}
+		addr, _ := m["addr"].(string)
+		byAddr[addr] = m
+	}
+
+	gotLive, ok := byAddr["192.168.1.3:8333"]
+	if !ok {
+		t.Fatalf("missing live peer in getpeerinfo: %v", byAddr)
+	}
+	if got := jsonNumber(t, gotLive, "synced_headers"); got != 850010 {
+		t.Errorf("live synced_headers = %v, want 850010 (not the -1 stub)", got)
+	}
+	if got := jsonNumber(t, gotLive, "synced_blocks"); got != 849900 {
+		t.Errorf("live synced_blocks = %v, want 849900 (not the -1 stub)", got)
+	}
+
+	gotUnset, ok := byAddr["192.168.1.4:8333"]
+	if !ok {
+		t.Fatalf("missing unset peer in getpeerinfo: %v", byAddr)
+	}
+	if got := jsonNumber(t, gotUnset, "synced_headers"); got != -1 {
+		t.Errorf("unset synced_headers = %v, want -1", got)
+	}
+	if got := jsonNumber(t, gotUnset, "synced_blocks"); got != -1 {
+		t.Errorf("unset synced_blocks = %v, want -1", got)
+	}
+}
+
+func jsonNumber(t *testing.T, m map[string]interface{}, key string) int64 {
+	t.Helper()
+	v, ok := m[key]
+	if !ok {
+		t.Fatalf("missing field %q in %v", key, m)
+	}
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil {
+			t.Fatalf("%s: %v", key, err)
+		}
+		return i
+	default:
+		t.Fatalf("field %q has type %T, want number", key, v)
+		return 0
 	}
 }
 

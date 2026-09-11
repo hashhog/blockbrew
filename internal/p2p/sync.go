@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"math/rand/v2"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -868,7 +869,7 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 			// → ErrOrphanHeader → a spurious tip-rooted re-sync that wedged the IBD
 			// at h102000. See _ibd-from-genesis-campaign finding #1.
 			if len(result.POWValidatedHeaders) > 0 {
-				sm.addPipelineHeaders(result.POWValidatedHeaders)
+				sm.addPipelineHeaders(peer, result.POWValidatedHeaders)
 			}
 			return
 		}
@@ -893,14 +894,16 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 // addPipelineHeaders adds PRESYNC/REDOWNLOAD-promoted headers to the header
 // index ONLY. Unlike addValidatedHeaders it performs NO out-of-band side effects:
 // no orphan getheaders re-request, no full-batch getheaders, no block-download
-// kickoff, no headersSynced flip, no chain-recovery hook. The HeadersSyncState is
+// kickoff, no headersSynced flip, no chain-recovery hook. Per-peer
+// synced_headers is updated (Core UpdateBlockAvailability) because that is
+// CNodeState, not a sync-completion side effect. The HeadersSyncState is
 // still active and owns the next request via NextLocator (Core gates the
 // "fetch more" getheaders on !have_headers_sync, net_processing.cpp:3104). The
 // redownload set is pre-validated and strictly in order, so an AddHeader error
 // here is unexpected — log and stop, but DO NOT send a getheaders (that ad-hoc
 // re-request, rooted at a stale tip, is exactly the collision class that wedged
 // the genesis IBD). Caller must hold sm.mu.
-func (sm *SyncManager) addPipelineHeaders(headers []wire.BlockHeader) {
+func (sm *SyncManager) addPipelineHeaders(peer *Peer, headers []wire.BlockHeader) {
 	startHeight := sm.headerIndex.BestHeight()
 	added := 0
 	var pending []storage.HeaderBatchEntry
@@ -911,6 +914,7 @@ func (sm *SyncManager) addPipelineHeaders(headers []wire.BlockHeader) {
 		node, err := sm.headerIndex.AddHeader(headers[i], true)
 		if err != nil {
 			if err == consensus.ErrDuplicateHeader {
+				sm.notePeerAnnouncedHash(peer, headers[i].BlockHash())
 				continue
 			}
 			// Pre-validated, in-order redownload headers should always connect;
@@ -926,6 +930,9 @@ func (sm *SyncManager) addPipelineHeaders(headers []wire.BlockHeader) {
 				sm.headerIndex.BestHeight()+1, err)
 			break
 		}
+		if peer != nil {
+			peer.UpdateSyncedHeaders(node.Height)
+		}
 		added++
 		if sm.chainDB != nil {
 			pending = append(pending, storage.HeaderBatchEntry{Hash: node.Hash, Header: &headers[i]})
@@ -938,6 +945,17 @@ func (sm *SyncManager) addPipelineHeaders(headers []wire.BlockHeader) {
 	}
 	if added > 0 {
 		log.Printf("sync: added %d headers (%d -> %d)", added, startHeight, sm.headerIndex.BestHeight())
+	}
+}
+
+// notePeerAnnouncedHash records that this peer announced a header we already
+// have (Core UpdateBlockAvailability → pindexBestKnownBlock / nSyncHeight).
+func (sm *SyncManager) notePeerAnnouncedHash(peer *Peer, hash wire.Hash256) {
+	if sm.headerIndex == nil || peer == nil {
+		return
+	}
+	if node := sm.headerIndex.GetNode(hash); node != nil {
+		peer.UpdateSyncedHeaders(node.Height)
 	}
 }
 
@@ -974,7 +992,9 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 		node, err := sm.headerIndex.AddHeader(hdr, true)
 		if err != nil {
 			if err == consensus.ErrDuplicateHeader {
-				// Skip duplicates silently
+				// Already-known header this peer announced: Core
+				// UpdateBlockAvailability still sets pindexBestKnownBlock.
+				sm.notePeerAnnouncedHash(peer, hdr.BlockHash())
 				continue
 			}
 
@@ -1077,6 +1097,7 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 		}
 
 		headersAdded++
+		peer.UpdateSyncedHeaders(node.Height)
 
 		// Buffer the header for the batched DB write below.
 		if sm.chainDB != nil {
@@ -1334,6 +1355,7 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 			if sm.headerIndex != nil {
 				tipHeight := sm.headerIndex.BestHeight()
 				if node := sm.headerIndex.GetNode(blockHash); node != nil {
+					p.UpdateSyncedHeaders(node.Height)
 					depth := tipHeight - node.Height
 					if depth > MaxCmpctBlockDepth {
 						log.Printf("[compact] cmpctblock from %s is %d deep (limit %d), requesting full block (hash=%s)",
@@ -1397,6 +1419,7 @@ func (sm *SyncManager) HandleInv(peer *Peer, msg *MsgInv) {
 		switch baseType {
 		case InvTypeBlock:
 			hasBlock = true
+			sm.notePeerAnnouncedHash(peer, inv.Hash)
 		case InvTypeTx, InvTypeWtx:
 			// Collect tx announcements to (maybe) request. Actual REQUEST
 			// decision (IBD gate, block-relay-only, membership, dedup) is
@@ -2710,6 +2733,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 					log.Printf("sync: added header for unsolicited block (height %d)", node.Height)
 					nh = node.Height
 					resolvedHeight = true
+					peer.UpdateSyncedHeaders(node.Height)
 				} else if err == consensus.ErrDuplicateHeader {
 					// Header already in the index — look up its canonical height.
 					// Without this we would slot the block at pending[sm.nextHeight]
@@ -2719,6 +2743,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 					if existing := sm.headerIndex.GetNode(hash); existing != nil {
 						nh = existing.Height
 						resolvedHeight = true
+						peer.UpdateSyncedHeaders(existing.Height)
 					}
 				} else if err != nil {
 					log.Printf("sync: failed to add header for unsolicited block: %v — dropping", err)
@@ -2770,6 +2795,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 			// Mirrors haskoin f768a01 which removed the active-tip
 			// putBlock from submitBlock once connectBlockAt's WriteBatch
 			// folded in the body store.
+			peer.UpdateSyncedBlocks(nh)
 			select {
 			case sm.validationChan <- &blockWithRequest{
 				block: msg.Block,
@@ -2799,6 +2825,8 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 		sm.decreaseStallTimeout(peer)
 		sm.mu.Unlock()
 	}
+
+	peer.UpdateSyncedBlocks(req.Height)
 
 	// Store block to database. Use StoreBlockAt so the flat-file
 	// BlockFileInfo metadata records the chain height for this block.
@@ -3780,6 +3808,40 @@ func (sm *SyncManager) BlocksInFlight() int {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
 	return len(sm.inflight)
+}
+
+// InflightHeightsForPeer returns the heights currently in flight from this
+// peer (getpeerinfo.inflight). Core GetNodeStateStats walks
+// CNodeState.vBlocksInFlight. Always a non-nil slice so JSON emits [].
+func (sm *SyncManager) InflightHeightsForPeer(peer *Peer) []int {
+	heights := make([]int, 0)
+	if sm == nil || peer == nil {
+		return heights
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	for _, req := range sm.inflight {
+		if req != nil && req.Peer == peer {
+			heights = append(heights, int(req.Height))
+		}
+	}
+	sort.Ints(heights)
+	return heights
+}
+
+// PresyncHeightForPeer is getpeerinfo.presynced_headers: the PRESYNC
+// height for this peer, or -1 if no low-work headerssync is in progress.
+// Core: HeadersSyncState::GetPresyncHeight (rpc/net.cpp:1836).
+func (sm *SyncManager) PresyncHeightForPeer(addr string) int32 {
+	if sm == nil {
+		return -1
+	}
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+	if hss, ok := sm.peerHeadersSync[addr]; ok && hss != nil {
+		return hss.PresyncHeight()
+	}
+	return -1
 }
 
 // BlockQueueLength returns the number of blocks waiting to be downloaded.
