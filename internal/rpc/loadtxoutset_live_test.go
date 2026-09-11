@@ -321,3 +321,146 @@ func TestLoadTxOutSetLive_Reject(t *testing.T) {
 		t.Fatalf("bg must have connected every block genesis->base (height %d) before the mismatch, got %d", baseHeight, got)
 	}
 }
+
+// newHeadersOnlyLoadRig builds a chain whose headers and bodies are in the
+// index/store but whose chain manager is still at genesis. That is Core's
+// loadtxoutset starting point (headers synced, snapshot not yet activated)
+// and the discriminator for "success without activation": without persisting
+// the snapshot into the live chainstate, getblockcount stays 0 and a restart
+// has nothing to recover (no height index, no chainstate pointer).
+func newHeadersOnlyLoadRig(t *testing.T, nBlocks int) *dumpTxOutSetTestRig {
+	t.Helper()
+
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	db := storage.NewChainDB(storage.NewMemDB())
+	utxo := consensus.NewUTXOSet(db)
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: idx,
+		ChainDB:     db,
+		UTXOSet:     utxo,
+	})
+
+	tips := make([]*consensus.BlockNode, 0, nBlocks)
+	prev := idx.Genesis()
+	for i := 0; i < nBlocks; i++ {
+		blk := buildRegtestBlock(t, params, prev)
+		node, err := idx.AddHeader(blk.Header, true)
+		if err != nil {
+			t.Fatalf("AddHeader at height %d: %v", prev.Height+1, err)
+		}
+		if err := db.StoreBlock(blk.Header.BlockHash(), blk); err != nil {
+			t.Fatalf("StoreBlock at height %d: %v", prev.Height+1, err)
+		}
+		tips = append(tips, node)
+		prev = node
+	}
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithChainManager(cm),
+		WithHeaderIndex(idx),
+		WithChainDB(db),
+	)
+	return &dumpTxOutSetTestRig{
+		params: params,
+		idx:    idx,
+		db:     db,
+		utxo:   utxo,
+		cm:     cm,
+		server: server,
+		tips:   tips,
+	}
+}
+
+func buildSnapshotCoinsFromIndex(t *testing.T, rig *dumpTxOutSetTestRig, baseHeight int32) *consensus.UTXOSet {
+	t.Helper()
+	coins := consensus.NewUTXOSet(storage.NewChainDB(storage.NewMemDB()))
+	for h := int32(1); h <= baseHeight; h++ {
+		node := rig.idx.GetHeaderByHeight(h)
+		if node == nil {
+			t.Fatalf("no header at height %d", h)
+		}
+		block, err := rig.db.GetBlock(node.Hash)
+		if err != nil {
+			t.Fatalf("GetBlock(%s) at height %d: %v", node.Hash.String(), h, err)
+		}
+		if _, err := coins.ConnectBlockUTXOs(block, h); err != nil {
+			t.Fatalf("ConnectBlockUTXOs(height=%d): %v", h, err)
+		}
+	}
+	return coins
+}
+
+func restartChainFromDB(t *testing.T, params *consensus.ChainParams, db *storage.ChainDB) (hash wire.Hash256, height int32) {
+	t.Helper()
+	cs, err := db.GetChainState()
+	if err != nil {
+		t.Fatalf("GetChainState after loadtxoutset: %v", err)
+	}
+	newIdx := consensus.NewHeaderIndex(params)
+	if cs.BestHeight > 0 {
+		loaded, herr := newIdx.HydrateFromDB(db, cs.BestHash, cs.BestHeight)
+		if herr != nil {
+			t.Fatalf("HydrateFromDB: %v", herr)
+		}
+		if loaded == 0 {
+			t.Fatal("HydrateFromDB loaded 0 headers — snapshot activation did not persist the header band")
+		}
+	}
+	newCM := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params:      params,
+		HeaderIndex: newIdx,
+		ChainDB:     db,
+		UTXOSet:     consensus.NewUTXOSet(db),
+	})
+	if _, err := newCM.RecoverFromPersistedBlocks(); err != nil {
+		t.Fatalf("RecoverFromPersistedBlocks: %v", err)
+	}
+	return newCM.BestBlock()
+}
+
+// TestLoadTxOutSet_RestartPersistsActivatedTip is the in-repo control for
+// boot-smoke `restart FAIL 298`: loadtxoutset must move the live tip to the
+// snapshot base AND leave a chainstate a restart can rehydrate, without
+// relying on body-feed ConnectBlock durability.
+func TestLoadTxOutSet_RestartPersistsActivatedTip(t *testing.T) {
+	consensus.ClearRegtestAssumeUTXO()
+	t.Cleanup(consensus.ClearRegtestAssumeUTXO)
+
+	const nBlocks = 4
+	rig := newHeadersOnlyLoadRig(t, nBlocks)
+	if _, h := rig.cm.BestBlock(); h != 0 {
+		t.Fatalf("precondition: headers-only rig must start at genesis, got height %d", h)
+	}
+	baseNode := rig.tips[nBlocks-1]
+	baseHash := baseNode.Hash
+	baseHeight := baseNode.Height
+
+	coins := buildSnapshotCoinsFromIndex(t, rig, baseHeight)
+	snapPath, commitment := writeLiveSnapshot(t, t.TempDir(), coins, baseHash, rig.params.NetworkMagic)
+	consensus.RegisterRegtestAssumeUTXO(consensus.AssumeUTXOData{
+		Height:         baseHeight,
+		HashSerialized: commitment,
+		ChainTxCount:   uint64(nBlocks + 1),
+		BlockHash:      baseHash,
+	})
+
+	if _, rpcErr := liveLoadTxOutSet(t, rig.server, snapPath); rpcErr != nil {
+		t.Fatalf("loadtxoutset returned error: %+v", rpcErr)
+	}
+
+	gotHash, gotHeight := rig.cm.BestBlock()
+	if gotHeight != baseHeight || gotHash != baseHash {
+		t.Fatalf("after loadtxoutset: tip %s@%d, want snapshot base %s@%d",
+			gotHash.String(), gotHeight, baseHash.String(), baseHeight)
+	}
+
+	restartHash, restartHeight := restartChainFromDB(t, rig.params, rig.db)
+	if restartHeight != baseHeight || restartHash != baseHash {
+		t.Fatalf("after restart: tip %s@%d, want snapshot base %s@%d (activation was not durable)",
+			restartHash.String(), restartHeight, baseHash.String(), baseHeight)
+	}
+}

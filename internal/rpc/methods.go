@@ -3763,6 +3763,20 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 			meta.BlockHash.String(), finishErr)
 	}
 
+	// Persist the activated snapshot into the LIVE chainstate so a restart
+	// keeps the loaded tip. The coins above live in a throwaway MemDB used
+	// for the load-time hash gate and the background re-derivation; without
+	// this step getblockcount is 299 only while the process is up (body-feed
+	// ConnectBlock is in-memory during IBD) and a clean restart recovers
+	// getblockcount=298 — boot-smoke `restart FAIL 298`. Core writes the
+	// snapshot chainstate to disk and WriteSnapshotBaseBlockhash
+	// (validation.cpp:5709-5714, node/utxo_snapshot.cpp) before returning
+	// from ActivateSnapshot.
+	if err := s.persistActivatedSnapshot(meta, expected, loaded); err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf(
+			"Unable to persist activated snapshot: %v", err)}
+	}
+
 	// Record the activation on the server so getchainstates can read
 	// validated / snapshot_blockhash from the snapshot chainstate.
 	s.snapshotMu.Lock()
@@ -3772,6 +3786,91 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 
 	loadStats, _ := s.computeLoadResult(meta, expected.Height)
 	return loadStats, nil
+}
+
+// persistActivatedSnapshot writes the authenticated snapshot into the live
+// chain database so a restart presents the same tip. Three things have to
+// land together, all with a Sync batch (IBD ConnectBlock uses NoSync, and
+// the SIGTERM shutdown path can return before the atomic chainstate flush):
+//
+//  1. Coins + coins marker at the snapshot base. During IBD the live UTXO
+//     cache holds every connect since the last 2000-block flush; a restart
+//     without this flush has nothing to replay past the last durable body.
+//  2. Every header from height 1 through the base. submitheader is
+//     in-memory only, so HydrateFromDB otherwise loads 0 headers and
+//     RecoverFromPersistedBlocks can only rebuild from bodies that survived.
+//  3. Chainstate pointer (BestHash/BestHeight) at the snapshot base, so
+//     loadChainState adopts it once the headers are in the index.
+//
+// When the live chain is still at genesis (headers fed, bodies not
+// connected), the snapshot coins are copied from `loaded` into the live
+// UTXO set and the chain manager adopts the base as its tip — Core's
+// m_chain.SetTip(*snapshot_start_block).
+func (s *Server) persistActivatedSnapshot(meta *consensus.SnapshotMetadata, expected *consensus.AssumeUTXOData, loaded *consensus.UTXOSet) error {
+	if s.chainDB == nil {
+		return nil
+	}
+	baseHash := meta.BlockHash
+	baseHeight := expected.Height
+
+	var tipH int32
+	if s.chainMgr != nil {
+		_, tipH = s.chainMgr.BestBlock()
+	}
+
+	if s.chainMgr != nil {
+		if live, ok := s.chainMgr.UTXOSet().(*consensus.UTXOSet); ok && live != nil {
+			if tipH < baseHeight && loaded != nil {
+				if _, err := loaded.ScanUTXOs(func(op wire.OutPoint, e *consensus.UTXOEntry) bool {
+					live.AddUTXO(op, e)
+					return true
+				}); err != nil {
+					return fmt.Errorf("copy snapshot coins into live chainstate: %w", err)
+				}
+			}
+			live.SetAppliedTip(baseHash, baseHeight)
+			if err := live.Flush(); err != nil {
+				return fmt.Errorf("flush snapshot coins: %w", err)
+			}
+		}
+	}
+
+	batch := s.chainDB.NewBatch()
+	if s.headerIndex != nil {
+		if baseNode := s.headerIndex.GetNode(baseHash); baseNode != nil {
+			for h := int32(1); h <= baseHeight; h++ {
+				n := baseNode.GetAncestor(h)
+				if n == nil {
+					continue
+				}
+				var buf bytes.Buffer
+				hdr := n.Header
+				if err := hdr.Serialize(&buf); err != nil {
+					return fmt.Errorf("serialize snapshot header %d: %w", h, err)
+				}
+				val := make([]byte, buf.Len())
+				copy(val, buf.Bytes())
+				batch.Put(storage.MakeBlockHeaderKey(n.Hash), val)
+				s.chainDB.SetBlockHeightBatch(batch, h, n.Hash)
+			}
+		}
+	}
+	s.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+		BestHash:   baseHash,
+		BestHeight: baseHeight,
+	})
+	if err := batch.Write(); err != nil {
+		return fmt.Errorf("persist snapshot chain view: %w", err)
+	}
+
+	if s.chainMgr != nil && tipH < baseHeight {
+		if err := s.chainMgr.AdoptSnapshotTip(baseHash, baseHeight); err != nil {
+			return err
+		}
+	}
+	log.Printf("[snapshot] persisted activation at %s@%d (headers+coins+chainstate durable)",
+		baseHash.String(), baseHeight)
+	return nil
 }
 
 // computeLoadResult builds the LoadTxOutSetResult for a completed load.

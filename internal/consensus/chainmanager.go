@@ -493,6 +493,38 @@ func (cm *ChainManager) ReloadChainState() {
 		state.BestHash.String(), state.BestHeight, headerHeight)
 }
 
+// AdoptSnapshotTip makes an assumeUTXO snapshot base the active chain view
+// without connecting the intervening blocks. The base header must already be
+// in the header index — the same precondition Core's ActivateSnapshot
+// enforces (validation.cpp:5611-5616) before `m_chain.SetTip(*snapshot_start_block)`
+// (validation.cpp:5917). The coins the snapshot describes must already be in
+// the UTXO set (and, for a restart to keep them, durable on disk).
+func (cm *ChainManager) AdoptSnapshotTip(hash wire.Hash256, height int32) error {
+	if cm.headerIndex == nil {
+		return fmt.Errorf("adopt snapshot tip: no header index")
+	}
+	node := cm.headerIndex.GetNode(hash)
+	if node == nil {
+		return fmt.Errorf("adopt snapshot tip: base %s not in header index", hash.String())
+	}
+	if node.Height != height {
+		return fmt.Errorf("adopt snapshot tip: header index has %s at height %d, want %d",
+			hash.String(), node.Height, height)
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	cm.tipNode = node
+	cm.tipHeight = height
+	cm.updateTipCache(node.Hash, height)
+	cm.setAppliedTip(hash, height)
+	cm.isIBD = false
+	cm.pendingRecovery.Store(false)
+	log.Printf("chainmgr: adopted assumeUTXO snapshot tip %s at height %d",
+		hash.String()[:16], height)
+	return nil
+}
+
 // getBlockProofEquivalentTime computes the number of seconds of chain activity
 // represented by the work difference between bestHeader and pindex.
 //
