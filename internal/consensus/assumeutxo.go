@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -574,6 +575,95 @@ type SnapshotLoadStats struct {
 	CoinsLoaded uint64
 	BlockHash   wire.Hash256
 	Height      int32
+}
+
+// SnapshotFileHash is HASH_SERIALIZED (Core hash_serialized_3) computed by
+// streaming a v2 dumptxoutset file through WriteTxOutSer. The UTXO set is
+// never materialised — 166M coins must not become a Go map. This is the
+// capture path for C(958794) on a tree that no longer has the genesis
+// datadir: the dump is Core's coins at the pin, the hasher is blockbrew's.
+type SnapshotFileHash struct {
+	Hash      wire.Hash256
+	Coins     uint64
+	BlockHash wire.Hash256
+}
+
+// HashSnapshotFile opens path and returns HashSnapshotReader over it.
+func HashSnapshotFile(path string) (SnapshotFileHash, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return SnapshotFileHash{}, err
+	}
+	defer f.Close()
+	return HashSnapshotReader(bufio.NewReaderSize(f, 1<<20))
+}
+
+// HashSnapshotReader streams a Core-format snapshot from r and returns
+// SHA256d over TxOutSer of every coin, in file order (txid asc, vout asc —
+// the same order ComputeHashSerialized's pebble cursor yields).
+func HashSnapshotReader(r io.Reader) (SnapshotFileHash, error) {
+	sr, err := NewSnapshotReader(r)
+	if err != nil {
+		return SnapshotFileHash{}, err
+	}
+	h := sha256.New()
+	in := sr.r
+	coinsLeft := sr.metadata.CoinsCount
+	var coins uint64
+	for coinsLeft > 0 {
+		var txid wire.Hash256
+		if err := txid.Deserialize(in); err != nil {
+			return SnapshotFileHash{}, fmt.Errorf("read txid at coin %d: %w", coins, err)
+		}
+		count, err := wire.ReadCompactSize(in)
+		if err != nil {
+			return SnapshotFileHash{}, fmt.Errorf("read coin count at coin %d: %w", coins, err)
+		}
+		if count > coinsLeft {
+			return SnapshotFileHash{}, fmt.Errorf("coin count %d exceeds remaining %d", count, coinsLeft)
+		}
+		for i := uint64(0); i < count; i++ {
+			vout, err := wire.ReadCompactSize(in)
+			if err != nil {
+				return SnapshotFileHash{}, fmt.Errorf("read vout at coin %d: %w", coins, err)
+			}
+			if vout >= uint64(math.MaxUint32) {
+				return SnapshotFileHash{}, fmt.Errorf("%w: index %d at coin %d", ErrCoinOutpointIndexMax, vout, coins)
+			}
+			entry, err := readCoin(in)
+			if err != nil {
+				return SnapshotFileHash{}, fmt.Errorf("read coin %d: %w", coins, err)
+			}
+			op := wire.OutPoint{Hash: txid, Index: uint32(vout)}
+			if err := WriteTxOutSer(h, op, entry); err != nil {
+				return SnapshotFileHash{}, err
+			}
+			coinsLeft--
+			coins++
+			if coins%10_000_000 == 0 {
+				log.Printf("[snapshot-hash] hashed %d coins (%.2f%%)",
+					coins, float64(coins)*100/float64(sr.metadata.CoinsCount))
+			}
+		}
+	}
+	var probe [1]byte
+	switch n, err := in.Read(probe[:]); {
+	case n == 0 && err != nil:
+		// EOF — snapshot ends cleanly.
+	case n > 0:
+		return SnapshotFileHash{}, fmt.Errorf("%w after %d coins", ErrSnapshotTrailingBytes, coins)
+	case err == nil:
+		return SnapshotFileHash{}, fmt.Errorf("%w after %d coins (zero-byte read without EOF)", ErrSnapshotTrailingBytes, coins)
+	}
+	first := h.Sum(nil)
+	second := sha256.Sum256(first)
+	var out wire.Hash256
+	copy(out[:], second[:])
+	return SnapshotFileHash{
+		Hash:      out,
+		Coins:     coins,
+		BlockHash: sr.metadata.BlockHash,
+	}, nil
 }
 
 // ComputeUTXOHash computes the Bitcoin Core HASH_SERIALIZED commitment over the

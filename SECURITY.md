@@ -9,6 +9,9 @@ cross-validate each other and Bitcoin Core.
 > the tag (`v0.1.0-rc1`) is cut once it reproduces the **C(958794)** UTXO commitment
 > byte-for-byte (see `../receipts/NODE4-BLOCKBREW-T2-CAPTURE-RUNBOOK.md`). Evidence
 > specifics recorded 2026-08-15 at tag time (T2 capture verified 2026-08-14).
+> The 08-15 +1-coin miss is crash-recovery, not a hasher disagreement; a third
+> capture on this tree (2026-09-12) stream-hashes Core's `utxo-958794.dat` and
+> matches C(958794) (`TestHashSnapshotFile_C958794`).
 
 ## Project maturity — read this first
 

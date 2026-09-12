@@ -10,12 +10,10 @@ A Bitcoin full node written from scratch in Go. Part of the Hashhog project.
 > what that does and does not leave verifiable is further down this section.
 
 **Label: "Validated — DISPUTED"** (`receipts/RELEASE-v1.0-SCORECARD.md`,
-§The table). blockbrew is the one node in the fleet whose Validated label is
-contradicted by a second committed artifact, and the suffix is part of the label
-so a skim cannot miss it — the detail is two paragraphs down, and the governing
-document says the pair "must not be counted either way until adjudicated". If the
-later capture is authoritative, blockbrew is not Validated and the fleet count is
-4/10, not 5/10.
+§The table). Two 2026-08 captures disagreed about C(958794); that pair is
+**adjudicated** (see below). The suffix stays because the matching 08-14
+lineage belongs to a retired binary and a deleted datadir — this tree has
+not re-run genesis→958794. The hasher on this tree does reproduce the pin.
 
 The undisputed half of the label — "reproduced Core's UTXO set from genesis with
 all scripts verified" — means one specific thing: blockbrew connected every mainnet block from block 0
@@ -29,9 +27,19 @@ project certifies that reproduction and nothing else
 (`receipts/beta1-tag-drafts-2026-08-20.md:23-27`). Neither label certifies wallet
 or fund-custody readiness — see `SECURITY.md`.
 
-**But two committed artifacts disagree about whether blockbrew has actually done
-that, and nothing in the repository resolves them** — the release scorecard
-reports both rather than picking one:
+**The 08-14 / 08-15 pair is adjudicated.** The 08-15 miss is not a
+counter-measurement of the hasher: crash recovery re-applied three
+coinbase-only blocks, and 958187's coinbase had already been spent, so the
+set grew by exactly one coin (`24ec9202…7a5a`, 166,180,926). That defect is
+pinned by `TestRecoveryDoesNotResurrectSpentCoinbase`. A third capture on
+this tree (2026-09-12) stream-hashes Core's `utxo-958794.dat` through
+blockbrew's `WriteTxOutSer` and matches C(958794) —
+`29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0` over
+166,180,925 coins, base
+`000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e`.
+Control: `go test ./internal/consensus/ -count=1 -timeout 45m -run TestHashSnapshotFile_C958794`.
+This is a hasher capture (the ladder covers the validator); it is not a
+new from-genesis lineage for HEAD.
 
 - `receipts/TRUST-ANCHOR.md:143` records a MATCH — 2026-08-14T18:20:25Z, height
   958794, `hash_serialized_3`
@@ -40,7 +48,8 @@ reports both rather than picking one:
 - `receipts/T2-capture-blockbrew-20260815T125623Z.md`, dated one day later, says
   "blockbrew does NOT reproduce C(958794). Do NOT tag." with
   `24ec9202799b6eafbee0a931fb6f4ac543c0e520652cbae594cec6c3168e7a5a` and
-  166,180,926 coins — one coin more than the anchor.
+  166,180,926 coins — one coin more than the anchor. Adjudicated as
+  crash-recovery mutation, not a hasher miss.
 
 The committed genesis → 250000 replay ledger
 (`CORE-PARITY-AUDIT/replay-ledgers/blockbrew-av0-danger-ledger.txt`) is the
