@@ -1,6 +1,16 @@
 # Changelog
 
-## v1.0.1 (unreleased)
+## v1.0.2 — 2026-09-13
+
+- bee96ce test: stop prune_one_MiB hanging the cmd/blockbrew package
+- 7387f31 test: third C(958794) capture via streaming snapshot hasher
+- 007eb9c feat: getpeerinfo reports per-peer synced_headers/synced_blocks
+- d76963e fix: persist loadtxoutset so a restart keeps the snapshot tip
+- c1de01e fix(p2p): stall resets must not wipe RetryCount so stallRecoveryPlan can escalate
+- fd19099 build: stop tracking the two verifyscript_shim binaries
+
+
+## v1.0.2 — 2026-09-13
 
 Changes since `v1.0.0`:
 
