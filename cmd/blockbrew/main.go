@@ -588,7 +588,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
 	flag.BoolVar(&cfg.EnablePackageRelay, "packagerelay", false, "Enable BIP-331 package relay (sendpackages). Default OFF — Bitcoin Core v31.99 has no package-relay wire protocol. Pass `-packagerelay=true` to opt in. Also settable via BLOCKBREW_PACKAGE_RELAY=1.")
 	flag.BoolVar(&cfg.PeerBloomFilters, "peerbloomfilters", false, "Advertise NODE_BLOOM (BIP-111) and honor BIP-35 \"mempool\" requests. Default OFF, matching Bitcoin Core's DEFAULT_PEERBLOOMFILTERS=false. Pass `-peerbloomfilters=true` to opt in.")
-	flag.Int64Var(&cfg.Prune, "prune", 0, "Auto-prune target in MiB for the blk*.dat directory. 0 = archive (no pruning, default). Must be >= 550 if non-zero (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES). Headers, UTXO set, and the last 288 blocks are never pruned.")
+	flag.Int64Var(&cfg.Prune, "prune", 0, "Auto-prune target in MiB for the blk*.dat directory. 0 = archive (no pruning, default). 1 = manual pruning via pruneblockchain RPC. >= 550 = automatic (Bitcoin Core MIN_DISK_SPACE_FOR_BLOCK_FILES). Values 2..549 are rejected. Headers, UTXO set, and the last 288 blocks are never pruned.")
 	// Operational-parity flags. Mirror Bitcoin Core init.cpp argspec.
 	flag.BoolVar(&cfg.Daemon, "daemon", false, "Run in the background as a daemon (default: false). When true, blockbrew double-forks and detaches before init.")
 	flag.StringVar(&cfg.PidFile, "pid", "", "Write the daemon pid to <file> (default: <datadir>/blockbrew.pid).")
@@ -2968,7 +2968,8 @@ func printHelp() {
 	fmt.Println("                  Pass -bip324v2=false to opt out. Also via env:")
 	fmt.Println("                  BLOCKBREW_BIP324_V2=0 (off) or =1 (on; default)")
 	fmt.Println("  --prune=N       Auto-prune target in MiB (default: 0 = archive)")
-	fmt.Println("                  N must be 0 or >= 550 (Bitcoin Core MIN_DISK_SPACE)")
+	fmt.Println("                  0 = archive; 1 = manual (pruneblockchain RPC);")
+	fmt.Println("                  >= 550 = automatic (Bitcoin Core MIN_DISK_SPACE)")
 	fmt.Println("                  Headers, UTXO set, and last 288 blocks never pruned")
 	fmt.Println()
 	fmt.Println("Operational flags (Bitcoin Core compat):")

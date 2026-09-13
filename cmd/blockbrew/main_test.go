@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/p2p"
 	"github.com/hashhog/blockbrew/internal/storage"
@@ -184,11 +186,11 @@ func TestNetworkDataDirSuffix(t *testing.T) {
 func TestConfigValidation(t *testing.T) {
 	// Test that config values are sensible
 	cfg := Config{
-		MaxOutbound:  8,
-		MaxInbound:   117,
-		MaxMempool:   300,
-		MinRelayFee:  0.00001,
-		WalletFile:   "wallet.dat",
+		MaxOutbound: 8,
+		MaxInbound:  117,
+		MaxMempool:  300,
+		MinRelayFee: 0.00001,
+		WalletFile:  "wallet.dat",
 	}
 
 	// MaxOutbound should be positive
@@ -343,11 +345,15 @@ func TestPruneFloorConstant(t *testing.T) {
 }
 
 // TestParsePruneFlagAcceptsValid spot-checks that valid -prune values
-// (0 and any value >= 550) are accepted by the in-process binary. We
-// cannot directly call parseFlags() — it uses flag.Parse() with global
-// state and os.Exit on failure — so we shell out to the test binary in
-// a subprocess and check that it accepts the flag without immediately
-// exiting.
+// (0, 1 = Core manual mode, and any value >= 550) are accepted, and that
+// 2..549 and negatives are rejected. We cannot directly call parseFlags()
+// — it uses flag.Parse() with global state and os.Exit on failure — so we
+// shell out to a built binary and check the exit.
+//
+// Every spawn is bounded: context.WithTimeout + CommandContext + t.Cleanup
+// kill. A previous version of the prune=1 case omitted --version and
+// expected a reject, so CombinedOutput blocked on a live mainnet node
+// until Go's 10-minute package timeout (v1.0.2 unit-tests gate FAIL).
 //
 // Skipped under -short to keep `go test ./...` fast.
 func TestParsePruneFlagAcceptsValid(t *testing.T) {
@@ -358,9 +364,10 @@ func TestParsePruneFlagAcceptsValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build test binary: %v", err)
 	}
-	defer os.Remove(binary)
 
-	// Pass --version so the binary exits cleanly after flag parse.
+	// Pass --version so accepted flags exit after parse. Isolate every
+	// case under -datadir=TempDir so a forgotten --version cannot start
+	// against ~/.blockbrew (the hang did that on 2026-09-13).
 	tests := []struct {
 		name    string
 		args    []string
@@ -370,13 +377,18 @@ func TestParsePruneFlagAcceptsValid(t *testing.T) {
 		{"prune at floor", []string{"-prune=550", "--version"}, false},
 		{"prune above floor", []string{"-prune=2048", "--version"}, false},
 		{"prune below floor", []string{"-prune=100"}, true},
-		{"prune one MiB", []string{"-prune=1"}, true},
+		// -prune=1 is Bitcoin Core manual mode (init.cpp:524), not a 1 MiB
+		// target. parseFlags accepts it and run() starts the node.
+		{"prune one MiB", []string{"-prune=1", "--version"}, false},
 		{"prune negative", []string{"-prune=-5"}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := exec.Command(binary, tt.args...)
-			out, err := cmd.CombinedOutput()
+			args := append([]string{
+				"-datadir=" + t.TempDir(),
+				"-network=regtest",
+			}, tt.args...)
+			out, err := runTestBinary(t, 15*time.Second, binary, args...)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected non-zero exit, got success: %s", out)
@@ -407,9 +419,8 @@ func TestReindexRefusesToStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build test binary: %v", err)
 	}
-	defer os.Remove(binary)
-	cmd := exec.Command(binary, "-reindex", "-datadir=/tmp/blockbrew-reindex-test")
-	out, err := cmd.CombinedOutput()
+	out, err := runTestBinary(t, 15*time.Second, binary,
+		"-reindex", "-datadir="+t.TempDir(), "-network=regtest")
 	if err == nil {
 		t.Fatalf("expected non-zero exit for -reindex, got success: %s", out)
 	}
@@ -460,8 +471,28 @@ func TestStdFlagSetterRoundtrip(t *testing.T) {
 	}
 }
 
+// runTestBinary starts binary with args, bounded by timeout. The child is
+// killed on timeout and again in t.Cleanup so a spawn can never hang the
+// package the way CombinedOutput did for -prune=1.
+func runTestBinary(t *testing.T, timeout time.Duration, binary string, args ...string) ([]byte, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	t.Cleanup(cancel)
+	cmd := exec.CommandContext(ctx, binary, args...)
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("subprocess timed out after %s (args=%q): %v\n%s", timeout, args, err, out)
+	}
+	return out, err
+}
+
 // buildTestBinary compiles the blockbrew binary into a tempfile and
-// returns the path. Callers must os.Remove(path) when done.
+// returns the path. The TempDir is cleaned up with the test.
 func buildTestBinary(t *testing.T) (string, error) {
 	t.Helper()
 	tmp := t.TempDir()
