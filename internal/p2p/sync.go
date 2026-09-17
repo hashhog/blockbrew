@@ -175,6 +175,12 @@ type blockRequest struct {
 	// this request despite HasBlock=true; requestBlocks then stops
 	// diverting it from the network (#73 layer D).
 	FastPathFailed bool
+
+	// pipelineBlock is the body last seen for this request at Received or
+	// Validated. The stall detector re-injects it into the local pipeline
+	// instead of discarding already-validated work back to the download
+	// queue (mainnet 2026-09-17: state=3 reset to pending, 1 blk / 3–8 min).
+	pipelineBlock *wire.MsgBlock
 }
 
 // stallBackoff returns the re-request delay after the nth stall reset:
@@ -255,6 +261,104 @@ func stallShouldRearm(req *blockRequest, now time.Time) bool {
 		return true
 	}
 	return req.NextRetryAt.IsZero() || !now.Before(req.NextRetryAt)
+}
+
+// applyStallRecovery is the stall detector's per-request action at nextHeight.
+// Must be called with sm.mu held. Non-blocking channel sends only.
+//
+// Pending: re-arm (or leave an existing backoff to expire).
+// InFlight: stuck DOWNLOAD — reset to Pending so a live peer can retry.
+// Received/Validated: already downloaded. Core connects a block that passed
+// validation on the same path that accepted it (ActivateBestChain); it does
+// not re-queue that block for getdata. Resetting these states was the
+// 2026-09-17 mainnet crawl: each HOL reached Validated, the stall detector
+// threw it back to Pending (and the next 16 pipeline entries with it), and
+// catch-up crawled at ~1 block per 3–8 min.
+func (sm *SyncManager) applyStallRecovery(req *blockRequest, now time.Time) {
+	if req == nil {
+		return
+	}
+	_, inFlight := sm.inflight[req.Hash]
+	if req.State == BlockDownloadPending && !stallShouldRearm(req, now) {
+		log.Printf("sync: block %d stalled, backoff already armed (%s left) — waiting it out",
+			req.Height, req.NextRetryAt.Sub(now).Round(time.Second))
+		return
+	}
+	if req.State == BlockDownloadPending {
+		backoff, escalate := applyPendingStallRecovery(req, now, inFlight)
+		log.Printf("sync: block %d is pending but not downloading, clearing peer restriction (backoff %s, escalate=%v)",
+			req.Height, backoff, escalate)
+		delete(sm.inflight, req.Hash)
+		return
+	}
+	if req.State == BlockDownloadReceived || req.State == BlockDownloadValidated {
+		// Already in the local pipeline. Re-inject the body so a lost
+		// wakeup (Validated but not in connectionWorker's pending map)
+		// recovers without a getdata round-trip. Never assign Pending:
+		// that was the 2026-09-17 crawl (state=3 → pending → 60s backoff).
+		sm.nudgeStalledPipeline(req)
+		return
+	}
+	if req.State == BlockDownloadConnected {
+		return
+	}
+	// InFlight (and any unknown non-terminal state): genuine download stall.
+	log.Printf("sync: block %d stuck in state %d, resetting to pending (backoff %s)",
+		req.Height, req.State, stallBackoff(req.StallResets))
+	req.State = BlockDownloadPending
+	req.Peer = nil
+	req.NextRetryAt = now.Add(stallBackoff(req.StallResets))
+	req.StallResets++
+	delete(sm.inflight, req.Hash)
+}
+
+// nudgeStalledPipeline re-injects a Received/Validated request into the
+// local pipeline. Non-blocking: if the destination channel is full the
+// body stays on req.pipelineBlock for the next stall pass.
+// Must be called with sm.mu held.
+func (sm *SyncManager) nudgeStalledPipeline(req *blockRequest) {
+	if req == nil {
+		return
+	}
+	block := req.pipelineBlock
+	if block == nil {
+		log.Printf("sync: stall at height %d state=%d: no body to re-inject — leaving in place, not resetting to pending",
+			req.Height, req.State)
+		return
+	}
+	bwr := &blockWithRequest{block: block, req: req}
+	switch req.State {
+	case BlockDownloadValidated:
+		select {
+		case sm.connectionChan <- bwr:
+			log.Printf("sync: block %d is validated; nudging connect path (not re-downloading)", req.Height)
+		default:
+			log.Printf("sync: block %d is validated; connectionChan full — leaving in place (not resetting to pending)", req.Height)
+		}
+	case BlockDownloadReceived:
+		select {
+		case sm.validationChan <- bwr:
+			log.Printf("sync: block %d is received; nudging validation path (not re-downloading)", req.Height)
+		default:
+			log.Printf("sync: block %d is received; validationChan full — leaving in place (not resetting to pending)", req.Height)
+		}
+	}
+}
+
+// applyNearbyStallReset resets stuck DOWNLOAD slots in (nh, nh+16].
+// Only InFlight is eligible: Received/Validated are local-pipeline states
+// and must not be thrown back to the download queue. The old "any
+// non-Pending" window wiped the next 16 already-validated blocks on every
+// HOL stall and is why catch-up went one block at a time.
+func applyNearbyStallReset(queue []*blockRequest, nh int32, inflight map[wire.Hash256]*blockRequest) {
+	resetWindow := int32(16)
+	for _, req := range queue {
+		if req.Height > nh && req.Height <= nh+resetWindow && req.State == BlockDownloadInFlight {
+			req.State = BlockDownloadPending
+			req.Peer = nil
+			delete(inflight, req.Hash)
+		}
+	}
 }
 
 // blockWithRequest pairs a received block with its request metadata.
@@ -2240,45 +2344,7 @@ func (sm *SyncManager) blockDownloadLoop() {
 						log.Printf("sync: stall detected at height %d: state=%d, inflight=%d, peer=%v, retries=%d, stallDuration=%v",
 							nh, req.State, inflightLen, req.Peer != nil, req.RetryCount, stallDuration)
 
-						if req.State == BlockDownloadPending && !stallShouldRearm(req, time.Now()) {
-							// A retry backoff is already armed and still ticking.
-							// LEAVE IT ALONE. Re-arming NextRetryAt on every stall
-							// pass (10s ticker) pushes the deadline perpetually
-							// into the future once the backoff length exceeds the
-							// pass interval, so requestBlocks' backoff gate never
-							// opens and the block is never requested again — the
-							// permanence half of the 964241 tip wedge (#73;
-							// timeline: backoff 16s->32s->60s re-armed every
-							// 5-15s for 12+ minutes, zero requests issued).
-							log.Printf("sync: block %d stalled, backoff already armed (%s left) — waiting it out",
-								nh, time.Until(req.NextRetryAt).Round(time.Second))
-						} else if req.State == BlockDownloadPending {
-							// Block is pending but not being downloaded.
-							// This happens when all peers are busy or disconnected.
-							// Force a re-request by logging and letting requestBlocks
-							// pick it up on next tick. Also reset peer to allow any peer.
-							_, inFlight := sm.inflight[req.Hash]
-							backoff, escalate := applyPendingStallRecovery(req, time.Now(), inFlight)
-							log.Printf("sync: block %d is pending but not downloading, clearing peer restriction (backoff %s, escalate=%v)",
-								nh, backoff, escalate)
-							// W48: state invariant says Pending blocks must not be in
-							// sm.inflight; otherwise requestBlocks skips them and the
-							// stall never clears. Sibling branches (line ~1014, ~1034)
-							// already do this; match them here. Delete is a no-op if
-							// the block isn't actually in the map.
-							delete(sm.inflight, req.Hash)
-						} else if req.State != BlockDownloadPending {
-							// Block is in some intermediate state (InFlight, Received, Validated).
-							// It may be stuck in the pipeline. Reset to pending.
-							log.Printf("sync: block %d stuck in state %d, resetting to pending (backoff %s)",
-								nh, req.State, stallBackoff(req.StallResets))
-							req.State = BlockDownloadPending
-							req.Peer = nil
-							req.NextRetryAt = time.Now().Add(stallBackoff(req.StallResets))
-							req.StallResets++
-							// Also remove from inflight if it's there
-							delete(sm.inflight, req.Hash)
-						}
+						sm.applyStallRecovery(req, time.Now())
 						break
 					}
 				}
@@ -2328,18 +2394,10 @@ func (sm *SyncManager) blockDownloadLoop() {
 					}
 				}
 
-				// Also reset any blocks in non-pending states near nextHeight
-				// to ensure the pipeline can flow
-				resetWindow := int32(16)
-				for _, req := range sm.blockQueue {
-					if req.Height > nh && req.Height <= nh+resetWindow {
-						if req.State != BlockDownloadPending && req.State != BlockDownloadConnected {
-							req.State = BlockDownloadPending
-							req.Peer = nil
-							delete(sm.inflight, req.Hash)
-						}
-					}
-				}
+				// Also reset stuck DOWNLOAD slots near nextHeight so the
+				// pipeline can flow. applyNearbyStallReset owns the policy
+				// for which states are eligible.
+				applyNearbyStallReset(sm.blockQueue, nh, sm.inflight)
 			}
 			if nh != lastNextHeight {
 				lastNextHeight = nh
@@ -2811,6 +2869,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 			log.Printf("sync: received late block height=%d (nextH=%d) from %s",
 				req.Height, nh, peer.Address())
 		}
+		req.pipelineBlock = msg.Block
 		req.State = BlockDownloadReceived
 		sm.mu.Unlock()
 	} else {
@@ -2819,6 +2878,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 				req.Height, nh, peer.Address())
 		}
 		delete(sm.inflight, hash)
+		req.pipelineBlock = msg.Block
 		req.State = BlockDownloadReceived
 
 		// Reduce stall timeout for successful peer
@@ -2967,6 +3027,7 @@ func (sm *SyncManager) validationWorker() {
 					// lets validationChan keep draining; the block is already
 					// stored to DB (handleBlock) and will be re-delivered via
 					// the stall detector's re-request path once pressure eases.
+					bwr.req.pipelineBlock = bwr.block
 					bwr.req.State = BlockDownloadValidated
 					select {
 					case sm.connectionChan <- bwr:
@@ -2978,6 +3039,7 @@ func (sm *SyncManager) validationWorker() {
 					return
 				}
 
+				bwr.req.pipelineBlock = bwr.block
 				bwr.req.State = BlockDownloadValidated
 
 				// Send to connection pipeline.
@@ -3074,6 +3136,7 @@ func (sm *SyncManager) fastPathDispatch(req *blockRequest) {
 		sm.mu.Unlock()
 		return
 	}
+	req.pipelineBlock = block
 	req.State = BlockDownloadReceived
 	sm.mu.Unlock()
 

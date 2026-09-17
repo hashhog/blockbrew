@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"sync"
 	"testing"
 	"time"
 
@@ -327,5 +328,242 @@ func TestCheckStaleRequests_DeadPeerPreservesRetryCountAndEscalates(t *testing.T
 	}
 	if _, escalate := stallRecoveryPlan(req, false); !escalate {
 		t.Fatal("after dead-peer eviction, a previously issued request must still escalate")
+	}
+}
+
+// advancingChainConnector is a mock whose ConnectBlock advances the tip so
+// connectPendingBlocks' IBD-DESYNC guard does not rewind nextHeight.
+type advancingChainConnector struct {
+	mockChainConnector
+	mu         sync.Mutex
+	connects   int
+	lastHeight int32
+}
+
+func (a *advancingChainConnector) ConnectBlock(b *wire.MsgBlock) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.connects++
+	a.tipHeight++
+	if b != nil {
+		a.tipHash = b.Header.BlockHash()
+	}
+	a.lastHeight = a.tipHeight
+	return nil
+}
+
+func (a *advancingChainConnector) BestBlock() (wire.Hash256, int32) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.tipHash, a.tipHeight
+}
+
+func (a *advancingChainConnector) connectCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.connects
+}
+
+func stallTestBlock(height int32) *wire.MsgBlock {
+	hdr := createTestBlockHeader(wire.Hash256{}, uint32(100+height), uint32(height))
+	return &wire.MsgBlock{
+		Header: hdr,
+		Transactions: []*wire.MsgTx{{
+			Version: 1,
+			TxIn: []*wire.TxIn{{
+				PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+				SignatureScript:  []byte{0x01, byte(height)},
+				Sequence:         0xFFFFFFFF,
+			}},
+			TxOut: []*wire.TxOut{{Value: 5000000000, PkScript: []byte{0x51}}},
+		}},
+	}
+}
+
+// TestApplyStallRecovery_DoesNotResetValidatedToPending is control (2) for
+// the 2026-09-17 mainnet crawl. Live log: state=3 (Validated) → "stuck in
+// state 3, resetting to pending". A Validated HOL has already been
+// downloaded AND sanity-checked; the stall detector must drive connect, not
+// throw the work away. Fails on d30f4bb: applyStallRecovery copies the
+// `else if req.State != Pending` branch that assigned Pending.
+func TestApplyStallRecovery_DoesNotResetValidatedToPending(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+	req := &blockRequest{
+		Height:     967280,
+		State:      BlockDownloadValidated,
+		RetryCount: 1,
+	}
+	sm.blockQueue = []*blockRequest{req}
+	sm.nextHeight = 967280
+
+	sm.applyStallRecovery(req, time.Now())
+
+	if req.State != BlockDownloadValidated {
+		t.Fatalf("applyStallRecovery reset Validated → state=%d (want Validated=%d); "+
+			"a downloaded+validated block must not be thrown back to the download queue",
+			req.State, BlockDownloadValidated)
+	}
+	if req.Peer != nil {
+		t.Fatal("Validated recovery must not assign a download peer")
+	}
+}
+
+func TestApplyStallRecovery_DoesNotResetReceivedToPending(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+	req := &blockRequest{Height: 967280, State: BlockDownloadReceived}
+	sm.applyStallRecovery(req, time.Now())
+	if req.State != BlockDownloadReceived {
+		t.Fatalf("applyStallRecovery reset Received → state=%d (want Received=%d)",
+			req.State, BlockDownloadReceived)
+	}
+}
+
+func TestApplyStallRecovery_StillResetsInFlight(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+	peer := createMockPeer("1.2.3.4:8333", 0)
+	req := &blockRequest{
+		Height: 967280,
+		State:  BlockDownloadInFlight,
+		Peer:   peer,
+	}
+	sm.inflight[req.Hash] = req
+	sm.applyStallRecovery(req, time.Now())
+	if req.State != BlockDownloadPending {
+		t.Fatalf("InFlight is a stuck DOWNLOAD; state=%d, want Pending", req.State)
+	}
+	if req.Peer != nil {
+		t.Fatal("InFlight reset must clear the peer so a live one can retry")
+	}
+	if _, ok := sm.inflight[req.Hash]; ok {
+		t.Fatal("InFlight reset must drop the inflight slot")
+	}
+}
+
+// TestStallRecovery_ValidatedHeadConnectsWithoutRedownload is control (1).
+// A queue whose HOL is Validated, with the body already in hand, must end
+// Connected without any re-download (no InFlight, no peer, ConnectBlock
+// called once). Lost-wakeup shape: the body is on the request, not in
+// connectionChan — the stall detector has to nudge the connect path.
+// Fails on d30f4bb: recovery assigns Pending and never injects, so the
+// connectionWorker never sees the block.
+func TestStallRecovery_ValidatedHeadConnectsWithoutRedownload(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	adv := &advancingChainConnector{mockChainConnector: mockChainConnector{tipHeight: 0, tipTimestamp: 1}}
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		ChainManager:   adv,
+		DownloadWindow: 8,
+	})
+	sm.Start()
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			sm.Stop()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("Stop did not complete within 3s")
+		}
+	}()
+
+	block := stallTestBlock(1)
+	req := &blockRequest{
+		Hash:          block.Header.BlockHash(),
+		Height:        1,
+		State:         BlockDownloadValidated,
+		pipelineBlock: block,
+	}
+	sm.mu.Lock()
+	sm.blockQueue = []*blockRequest{req}
+	sm.nextHeight = 1
+	sm.applyStallRecovery(req, time.Now())
+	stateAfterRecovery := req.State
+	sm.mu.Unlock()
+
+	if stateAfterRecovery == BlockDownloadPending || stateAfterRecovery == BlockDownloadInFlight {
+		t.Fatalf("stall recovery put Validated HOL into download state %d; "+
+			"must leave it in the local pipeline (Validated) and nudge connect",
+			stateAfterRecovery)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		sm.mu.Lock()
+		st := req.State
+		sm.mu.Unlock()
+		if st == BlockDownloadConnected {
+			if adv.connectCount() != 1 {
+				t.Fatalf("ConnectBlock called %d times, want 1 (no re-download, no double connect)",
+					adv.connectCount())
+			}
+			if req.Peer != nil {
+				t.Fatal("Connected HOL was assigned a download peer — that is a re-download")
+			}
+			return
+		}
+		if st == BlockDownloadPending || st == BlockDownloadInFlight {
+			t.Fatalf("HOL fell into download state %d while waiting to connect — re-download", st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	sm.mu.Lock()
+	st := req.State
+	sm.mu.Unlock()
+	t.Fatalf("Validated HOL did not connect: state=%d connects=%d (want Connected, 1 connect, no re-download)",
+		st, adv.connectCount())
+}
+
+// TestApplyNearbyStallReset_PreservesValidatedAndReceived: the 16-height
+// window that runs on every stall pass used to assign Pending to every
+// non-Pending/non-Connected neighbour, wiping already-validated blocks
+// ahead of the HOL. That is why catch-up went one block at a time.
+func TestApplyNearbyStallReset_PreservesValidatedAndReceived(t *testing.T) {
+	var h1, h2, h3, h4 wire.Hash256
+	h1[0], h2[0], h3[0], h4[0] = 1, 2, 3, 4
+	validated := &blockRequest{Hash: h1, Height: 967281, State: BlockDownloadValidated}
+	received := &blockRequest{Hash: h2, Height: 967282, State: BlockDownloadReceived}
+	inflight := &blockRequest{Hash: h3, Height: 967283, State: BlockDownloadInFlight, Peer: &Peer{}}
+	pending := &blockRequest{Hash: h4, Height: 967284, State: BlockDownloadPending}
+	inflightMap := map[wire.Hash256]*blockRequest{h3: inflight}
+	queue := []*blockRequest{validated, received, inflight, pending}
+
+	applyNearbyStallReset(queue, 967280, inflightMap)
+
+	if validated.State != BlockDownloadValidated {
+		t.Fatalf("window reset Validated neighbour to %d", validated.State)
+	}
+	if received.State != BlockDownloadReceived {
+		t.Fatalf("window reset Received neighbour to %d", received.State)
+	}
+	if inflight.State != BlockDownloadPending {
+		t.Fatalf("window must still release a stuck InFlight neighbour, state=%d", inflight.State)
+	}
+	if inflight.Peer != nil {
+		t.Fatal("InFlight neighbour peer must be cleared")
+	}
+	if _, ok := inflightMap[h3]; ok {
+		t.Fatal("InFlight neighbour must leave the inflight map")
+	}
+	if pending.State != BlockDownloadPending {
+		t.Fatalf("Pending neighbour mutated to %d", pending.State)
 	}
 }
