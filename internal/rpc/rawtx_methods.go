@@ -556,13 +556,6 @@ func decodeOrderedObject(raw json.RawMessage) ([]createRawOutput, *RPCError) {
 // (neither alone complete) we keep the longer (more-signatures) of the two
 // scriptSigs rather than splicing the two sig sets together; the output for
 // that input is therefore NOT guaranteed byte-identical to Core.
-//
-// DEVIATION (flagged): Core resolves every input's prevout from its own UTXO +
-// mempool CCoinsViewCache and throws RPC_VERIFY_ERROR (-25) "Input not found or
-// already spent" when a coin is missing/spent. This handler does NOT consult
-// chainstate — combine is a pure function of the provided variants here — so it
-// does NOT raise -25 for unresolvable prevouts. The -22 empty / -22
-// decode-failure / -3 non-array error paths DO match Core byte-for-byte.
 func (s *Server) handleCombineRawTransaction(params json.RawMessage) (interface{}, *RPCError) {
 	// Core: UniValue txs = request.params[0].get_array(); a non-array (or a
 	// missing param) is a JSON type error from get_array(). We accept the
@@ -684,6 +677,17 @@ func (s *Server) handleCombineRawTransaction(params json.RawMessage) (interface{
 		})
 	}
 
+	// Core (rawtransaction.cpp:625-653) loads every prevout from the
+	// chain+mempool coins view and throws RPC_VERIFY_ERROR (-25)
+	// "Input not found or already spent" when AccessCoin reports spent
+	// (missing coins are spent). The live R5 unknown-input probe is a
+	// pair of txs whose prevout is 32 0xaa bytes.
+	for _, txin := range merged.TxIn {
+		if s.lookupCombineCoin(txin.PreviousOutPoint) == nil {
+			return nil, &RPCError{Code: RPCErrVerify, Message: "Input not found or already spent"}
+		}
+	}
+
 	// Core re-encodes WITH witness (TX_WITH_WITNESS) unconditionally; the
 	// serializer only emits the marker/flag when the tx HasWitness (Core
 	// CTransaction::HasWitness). MsgTx.Serialize already drives the marker off
@@ -694,6 +698,23 @@ func (s *Server) handleCombineRawTransaction(params json.RawMessage) (interface{
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Failed to serialize combined transaction: %v", err)}
 	}
 	return hex.EncodeToString(buf.Bytes()), nil
+}
+
+// lookupCombineCoin returns the chain or mempool coin for outpoint, or nil
+// if it is missing/spent. Mirrors Core's CCoinsViewMemPool overlay used by
+// combinerawtransaction (rawtransaction.cpp:626-643).
+func (s *Server) lookupCombineCoin(outpoint wire.OutPoint) *consensus.UTXOEntry {
+	if s.chainMgr != nil {
+		if view := s.chainMgr.UTXOSet(); view != nil {
+			if e := view.GetUTXO(outpoint); e != nil {
+				return e
+			}
+		}
+	}
+	if s.mempool != nil {
+		return s.mempool.GetUTXO(outpoint)
+	}
+	return nil
 }
 
 // decodeCombineVariant decodes one hex-encoded raw tx for combinerawtransaction,
@@ -741,7 +762,7 @@ func decodeCombineVariant(hexStr string) (*wire.MsgTx, error) {
 // TestMempoolAcceptResult is the result for a single transaction.
 type TestMempoolAcceptResult struct {
 	TxID         string   `json:"txid"`
-	WTxID        string   `json:"wtxid,omitempty"`
+	WTxID        string   `json:"wtxid"`
 	Allowed      bool     `json:"allowed"`
 	VSize        int64    `json:"vsize,omitempty"`
 	Fees         *FeeInfo `json:"fees,omitempty"`
@@ -825,28 +846,23 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 
 		result := &TestMempoolAcceptResult{}
 
-		// Decode the transaction
+		// Decode the transaction. Core (rpc/mempool.cpp:332-335) throws
+		// RPC_DESERIALIZATION_ERROR (-22) for the whole call on the first
+		// DecodeHexTx failure — it does not return a per-tx reject-reason.
 		txBytes, err := hex.DecodeString(rawTxHex)
 		if err != nil {
-			result.Allowed = false
-			result.RejectReason = "invalid-hex"
-			results = append(results, result)
-			continue
+			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %s Make sure the tx has at least one input.", rawTxHex)}
 		}
 
 		tx := &wire.MsgTx{}
 		if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
-			result.Allowed = false
-			result.RejectReason = "decode-error"
-			results = append(results, result)
-			continue
+			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %s Make sure the tx has at least one input.", rawTxHex)}
 		}
 
 		txHash := tx.TxHash()
 		result.TxID = txHash.String()
-		if tx.HasWitness() {
-			result.WTxID = tx.WTxHash().String()
-		}
+		// Core always emits wtxid (mempool.cpp:359), even when wtxid == txid.
+		result.WTxID = tx.WTxHash().String()
 
 		// Check if already in mempool
 		if s.mempool.HasTransaction(txHash) {

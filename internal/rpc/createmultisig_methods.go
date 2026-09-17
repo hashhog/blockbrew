@@ -61,7 +61,7 @@ func (s *Server) handleCreateMultisig(params json.RawMessage) (interface{}, *RPC
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Number of keys %d is not in range [1..16]", nKeys)}
 	}
 	if nRequired < 1 || nRequired > nKeys {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Multisig threshold %d is not in range [1..%d]", nRequired, nKeys)}
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: fmt.Sprintf("not enough keys supplied (got %d keys, but need at least %d to redeem)", nKeys, nRequired)}
 	}
 
 	// Validate address_type.
@@ -77,17 +77,17 @@ func (s *Server) handleCreateMultisig(params json.RawMessage) (interface{}, *RPC
 	for i, pkHex := range pubkeyStrs {
 		pkBytes, err := hex.DecodeString(pkHex)
 		if err != nil {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Pubkey %d is not valid hex", i)}
+			return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: fmt.Sprintf("Invalid public key: %s", pkHex)}
 		}
 		// Must be 33 bytes (compressed) for bech32/p2sh-segwit; Core also
 		// rejects uncompressed for segwit.  For legacy we accept 33-byte
 		// compressed only (Core's createmultisig accepts only compressed).
 		if len(pkBytes) != 33 {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Pubkey %d is not compressed (must be 33 bytes)", i)}
+			return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: fmt.Sprintf("Invalid public key: %s", pkHex)}
 		}
 		// Verify the point is on the curve.
 		if _, err := crypto.PublicKeyFromBytes(pkBytes); err != nil {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Pubkey %d is not a valid secp256k1 public key", i)}
+			return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: fmt.Sprintf("Invalid public key: %s", pkHex)}
 		}
 		pubkeys[i] = pkBytes
 	}

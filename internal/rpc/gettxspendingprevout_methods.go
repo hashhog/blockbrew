@@ -121,7 +121,9 @@ func (s *Server) handleGetTxSpendingPrevout(params json.RawMessage) (interface{}
 		}
 		voutF, ok := o["vout"].(float64)
 		if !ok {
-			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, missing vout"}
+			// Core reads vout via UniValue::getInt; a missing key is a type
+			// error (-3), not RPC_INVALID_PARAMETER. R5 missing-vout probe.
+			return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type null is not of expected type number"}
 		}
 		nOutput := int(voutF)
 		if nOutput < 0 {

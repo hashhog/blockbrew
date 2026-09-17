@@ -544,9 +544,7 @@ func TestW137_BUG15_AnalyzePSBTNextRoleCoarse(t *testing.T) {
 // the wallet-side "is finalized" notion vs Core's "is_final".
 func TestW137_BUG16_AnalyzeFieldNameDivergence(t *testing.T) {
 	// IsComplete returns the wallet-side notion; the RPC layer
-	// re-exposes it as `is_finalized` per-input. Core uses `is_final`.
-	// We pin the bool semantics here; field-name divergence is at the
-	// JSON serialization boundary (rpc package).
+	// re-exposes it as `is_final` per-input (Core rpc/rawtransaction.cpp:1941).
 	prevHash, _ := wire.NewHash256FromHex("0000000000000000000000000000000000000000000000000000000000000001")
 	tx := &wire.MsgTx{
 		Version: 2,

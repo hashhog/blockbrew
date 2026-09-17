@@ -1200,7 +1200,7 @@ func (s *Server) handleSubmitPackage(params json.RawMessage) (interface{}, *RPCE
 	}
 
 	if len(rawTxs) == 0 {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Package must contain at least one transaction"}
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Package must contain at least one transaction"}
 	}
 
 	// Parse maxfeerate (optional, default 0.10 BTC/kvB)
@@ -1932,7 +1932,8 @@ func (s *Server) handleAddNode(params json.RawMessage) (interface{}, *RPCError) 
 			peer.Disconnect()
 		}
 	default:
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid command (use add, remove, or onetry)"}
+		// Core net.cpp addnode: unknown command is RPC_MISC_ERROR (-1).
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Invalid command (use add, remove, or onetry)"}
 	}
 
 	return nil, nil
@@ -1942,9 +1943,69 @@ func (s *Server) handleAddNode(params json.RawMessage) (interface{}, *RPCError) 
 // Mining RPCs
 // ============================================================================
 
+// parseGBTClientRules extracts template_request.rules from the GBT argument
+// object. Mirrors Core rpc/mining.cpp:715-760 (setClientRules). A missing
+// or null template_request yields an empty set, which the caller then
+// rejects as missing-segwit. A non-object first argument is a type error.
+func parseGBTClientRules(params json.RawMessage) (map[string]struct{}, *RPCError) {
+	rules := make(map[string]struct{})
+	var args []json.RawMessage
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		return rules, nil
+	}
+	var oparam map[string]interface{}
+	if err := json.Unmarshal(args[0], &oparam); err != nil {
+		var any interface{}
+		_ = json.Unmarshal(args[0], &any)
+		return nil, &RPCError{
+			Code:    RPCErrTypeError,
+			Message: fmt.Sprintf("JSON value of type %s is not of expected type object", jsonTypeName(any)),
+		}
+	}
+	raw, ok := oparam["rules"]
+	if !ok || raw == nil {
+		return rules, nil
+	}
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil, &RPCError{
+			Code:    RPCErrTypeError,
+			Message: fmt.Sprintf("JSON value of type %s is not of expected type array", jsonTypeName(raw)),
+		}
+	}
+	for _, v := range arr {
+		s, ok := v.(string)
+		if !ok {
+			return nil, &RPCError{
+				Code:    RPCErrTypeError,
+				Message: fmt.Sprintf("JSON value of type %s is not of expected type string", jsonTypeName(v)),
+			}
+		}
+		rules[s] = struct{}{}
+	}
+	return rules, nil
+}
+
 func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *RPCError) {
 	if s.templateGen == nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: "Mining not available"}
+	}
+
+	// Parse template_request and enforce client rules before generating.
+	// Core (rpc/mining.cpp:715-857): missing "segwit" in rules[] is
+	// RPC_INVALID_PARAMETER (-8). The live R5 missing-segwit-rule probe
+	// is params=[{}].
+	setClientRules, rpcErr := parseGBTClientRules(params)
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if s.chainParams != nil && s.chainParams.Name == "signet" {
+		if _, ok := setClientRules["signet"]; !ok {
+			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "getblocktemplate must be called with the signet rule set (call with {\"rules\": [\"segwit\", \"signet\"]})"}
+		}
+	}
+	if _, ok := setClientRules["segwit"]; !ok {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})"}
 	}
 
 	// Generate template with default config
@@ -3006,7 +3067,7 @@ func (s *Server) handleGetDescriptorInfo(params json.RawMessage) (interface{}, *
 	// Get descriptor info
 	info, err := wallet.GetDescriptorInfo(desc, net)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: err.Error()}
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: err.Error()}
 	}
 
 	return &DescriptorInfoResult{
@@ -3032,6 +3093,13 @@ func (s *Server) handleDeriveAddresses(params json.RawMessage) (interface{}, *RP
 	desc, ok := args[0].(string)
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid descriptor"}
+	}
+
+	// Core Parse(..., require_checksum=true) (output_script.cpp:315).
+	// Missing/bad checksum is RPC_INVALID_ADDRESS_OR_KEY (-5), not a
+	// silent accept. The live R5 missing-checksum probe is a bare wpkh().
+	if err := wallet.RequireDescriptorChecksum(desc); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: err.Error()}
 	}
 
 	// Parse optional range parameter
@@ -3060,21 +3128,25 @@ func (s *Server) handleDeriveAddresses(params json.RawMessage) (interface{}, *RP
 	// Parse descriptor to check if it's ranged
 	parsed, err := wallet.ParseDescriptor(desc, net)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: err.Error()}
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: err.Error()}
+	}
+
+	// Core output_script.cpp:320-326: range is forbidden on an un-ranged
+	// descriptor (-8) and required on a ranged one (-8).
+	if !parsed.IsRange() && len(args) >= 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Range should not be specified for an un-ranged descriptor"}
+	}
+	if parsed.IsRange() && len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Range must be specified for a ranged descriptor"}
 	}
 
 	// For non-ranged descriptors, derive a single address
 	if !parsed.IsRange() {
 		addresses, err := wallet.DeriveAddresses(desc, net, 0, 0)
 		if err != nil {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: err.Error()}
+			return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: err.Error()}
 		}
 		return addresses, nil
-	}
-
-	// For ranged descriptors, a range must be specified
-	if len(args) < 2 {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Range must be specified for ranged descriptor"}
 	}
 
 	addresses, err := wallet.DeriveAddresses(desc, net, start, end)

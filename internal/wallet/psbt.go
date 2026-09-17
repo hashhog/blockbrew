@@ -340,7 +340,10 @@ func DecodePSBTReader(r io.Reader) (*PSBT, error) {
 				return nil, errors.New("global unsigned tx key must have no data")
 			}
 			tx := &wire.MsgTx{}
-			if err := tx.Deserialize(bytes.NewReader(value)); err != nil {
+			// PSBT unsigned tx is serialized without witness (BIP174).
+			// Deserialize (witness-first) treats a 0-input tx's 0x00 0x01
+			// (vin-count, vout-count) as the segwit marker/flag.
+			if err := tx.DeserializeNoWitness(bytes.NewReader(value)); err != nil {
 				return nil, fmt.Errorf("failed to deserialize unsigned tx: %w", err)
 			}
 			// Verify empty scripts

@@ -295,7 +295,12 @@ type LoadOptions struct {
 // re-adds each transaction via AcceptToMemoryPool. Missing files return a nil
 // result and a nil error so callers can treat "no dump on disk" as a no-op.
 func (mp *Mempool) Load(dataDir string, opts LoadOptions) (*LoadResult, error) {
-	path := MempoolPath(dataDir)
+	return mp.LoadFile(MempoolPath(dataDir), opts)
+}
+
+// LoadFile is Load against an explicit path (importmempool RPC). Missing
+// files still return (nil, nil); the RPC layer maps that to -1.
+func (mp *Mempool) LoadFile(path string, opts LoadOptions) (*LoadResult, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {

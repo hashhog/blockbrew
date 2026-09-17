@@ -656,6 +656,10 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleDumpMempool(params)
 	case "loadmempool":
 		return s.handleLoadMempool(params)
+	case "importmempool":
+		return s.handleImportMempool(params)
+	case "pruneblockchain":
+		return s.handlePruneBlockchain(params)
 	// Prioritisation RPCs (W120 BUG-10 / FIX-72). Mirrors Core
 	// src/rpc/mining.cpp::prioritisetransaction +
 	// src/rpc/mining.cpp::getprioritisedtransactions. The mempool delta
@@ -845,6 +849,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleJoinPSBTs(params)
 	case "utxoupdatepsbt":
 		return s.handleUTXOUpdatePSBT(params)
+	case "descriptorprocesspsbt":
+		return s.handleDescriptorProcessPSBT(params)
 
 	// Control RPCs
 	case "stop":

@@ -57,6 +57,19 @@ func PrivateKeyFromBytes(b []byte) *PrivateKey {
 	return &PrivateKey{key: key}
 }
 
+// SecretBytesValid reports whether b is a 32-byte scalar in [1, N-1].
+// Matches secp256k1_ec_seckey_verify / Bitcoin Core CKey::Check (key.cpp:158).
+func SecretBytesValid(b []byte) bool {
+	if len(b) != 32 {
+		return false
+	}
+	var s secp256k1.ModNScalar
+	var arr [32]byte
+	copy(arr[:], b)
+	overflow := s.SetBytes(&arr)
+	return overflow == 0 && !s.IsZero()
+}
+
 // Serialize returns the 32-byte big-endian scalar.
 func (pk *PrivateKey) Serialize() []byte {
 	return pk.key.Serialize()

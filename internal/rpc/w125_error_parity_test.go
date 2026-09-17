@@ -690,9 +690,9 @@ func TestW125_BUG_20b_CreateMultisig_NRequiredOutOfRange(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -8.",
-			resp.Error.Code, RPCErrInvalidParams)
+	if resp.Error.Code != RPCErrInvalidParameter {
+		t.Errorf("code = %d, want %d (Core RPC_INVALID_PARAMETER)",
+			resp.Error.Code, RPCErrInvalidParameter)
 	}
 }
 
@@ -707,9 +707,9 @@ func TestW125_BUG_20c_CreateMultisig_InvalidPubkey(t *testing.T) {
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	if resp.Error.Code != RPCErrInvalidParams {
-		t.Errorf("documented divergence: code = %d, want %d (current). Core wants -5.",
-			resp.Error.Code, RPCErrInvalidParams)
+	if resp.Error.Code != RPCErrInvalidAddressOrKey {
+		t.Errorf("code = %d, want %d (Core RPC_INVALID_ADDRESS_OR_KEY)",
+			resp.Error.Code, RPCErrInvalidAddressOrKey)
 	}
 }
 

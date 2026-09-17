@@ -1,5 +1,6 @@
 // wave47b_methods.go — RPC ports from wave-47b P2:
-//   gettxoutsetinfo, getnetworkhashps, gettxoutproof, verifytxoutproof, getrpcinfo
+//
+//	gettxoutsetinfo, getnetworkhashps, gettxoutproof, verifytxoutproof, getrpcinfo
 //
 // Reference: Bitcoin Core src/rpc/blockchain.cpp + src/rpc/mining.cpp
 // Ouroboros reference: src/ouroboros/rpc.py
@@ -258,20 +259,26 @@ func (s *Server) handleGetNetworkHashPS(params json.RawMessage) (interface{}, *R
 		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
 	}
 
-	// Parse optional [nblocks, height].
+	// Parse optional [nblocks, height]. Core declares both as RPCArg::Type::NUM
+	// (rpc/mining.cpp:119-120), so a non-number is RPC_TYPE_ERROR (-3) — not a
+	// silent default. The live R5 type-error probe is params=["foo"].
 	var args []interface{}
 	_ = json.Unmarshal(params, &args)
 	nblocksI := int64(120)
 	heightI := int64(-1)
-	if len(args) >= 1 {
-		if v, ok := args[0].(float64); ok {
-			nblocksI = int64(v)
+	if len(args) >= 1 && args[0] != nil {
+		n, rpcErr := parseRPCInt32(args[0])
+		if rpcErr != nil {
+			return nil, rpcErr
 		}
+		nblocksI = int64(n)
 	}
-	if len(args) >= 2 {
-		if v, ok := args[1].(float64); ok {
-			heightI = int64(v)
+	if len(args) >= 2 && args[1] != nil {
+		n, rpcErr := parseRPCInt32(args[1])
+		if rpcErr != nil {
+			return nil, rpcErr
 		}
+		heightI = int64(n)
 	}
 
 	_, bestHeight := s.chainMgr.BestBlock()
@@ -459,7 +466,8 @@ func (s *Server) handleVerifyTxOutProof(params json.RawMessage) (interface{}, *R
 	}
 	proofBytes, err := hex.DecodeString(proofHex)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hex"}
+		// Core ParseHexV (rpc/util.cpp:130-136): non-hex is RPC_INVALID_PARAMETER (-8).
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: fmt.Sprintf("proof must be hexadecimal string (not '%s')", proofHex)}
 	}
 	if len(proofBytes) < 84 {
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Proof too short"}

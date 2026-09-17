@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/address"
+	bbcrypto "github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -17,163 +18,34 @@ import (
 // ============================================================================
 
 // handleCreatePSBT creates a PSBT from raw transaction inputs and outputs.
-// Inputs: [inputs, outputs, locktime, replaceable]
+// Core (rpc/rawtransaction.cpp:1620-1658) is ConstructTransaction (the same
+// helper createrawtransaction uses) then a blank PSBT wrap. Reuse that
+// path so object-form outputs and ParseHashV txid errors stay in lockstep.
 func (s *Server) handleCreatePSBT(params json.RawMessage) (interface{}, *RPCError) {
-	var args []interface{}
-	if err := json.Unmarshal(params, &args); err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	raw, rpcErr := s.handleCreateRawTransaction(params)
+	if rpcErr != nil {
+		return nil, rpcErr
 	}
-
-	if len(args) < 2 {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing inputs and/or outputs"}
-	}
-
-	// Parse inputs
-	inputsRaw, ok := args[0].([]interface{})
+	hexStr, ok := raw.(string)
 	if !ok {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid inputs"}
+		return nil, &RPCError{Code: RPCErrInternal, Message: "createpsbt: unexpected raw-tx type"}
 	}
-
-	// Parse outputs
-	outputsRaw, ok := args[1].([]interface{})
-	if !ok {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid outputs"}
+	txBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
 	}
-
-	// Parse optional locktime
-	lockTime := uint32(0)
-	if len(args) >= 3 {
-		if lt, ok := args[2].(float64); ok {
-			lockTime = uint32(lt)
-		}
+	tx := &wire.MsgTx{}
+	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: err.Error()}
 	}
-
-	// Parse optional replaceable flag (BIP125)
-	replaceable := false
-	if len(args) >= 4 {
-		if r, ok := args[3].(bool); ok {
-			replaceable = r
-		}
-	}
-
-	// Build the unsigned transaction
-	tx := &wire.MsgTx{
-		Version:  2,
-		LockTime: lockTime,
-	}
-
-	// Add inputs
-	for i, inp := range inputsRaw {
-		inputMap, ok := inp.(map[string]interface{})
-		if !ok {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid input %d", i)}
-		}
-
-		txidStr, ok := inputMap["txid"].(string)
-		if !ok {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Missing txid in input %d", i)}
-		}
-
-		voutFloat, ok := inputMap["vout"].(float64)
-		if !ok {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Missing vout in input %d", i)}
-		}
-
-		txid, err := wire.NewHash256FromHex(txidStr)
-		if err != nil {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid txid in input %d", i)}
-		}
-
-		// BIP-125 RBF opt-in: nSequence ≤ MAX_BIP125_RBF_SEQUENCE
-		// (0xFFFFFFFD). Previously 0xFFFFFFFE (MAX_SEQUENCE_NONFINAL,
-		// anti-fee-sniping), which does NOT signal RBF. Comment claimed
-		// "Enable RBF by default" but code was off-by-one. Fixed via
-		// FIX-61 / W118 BUG-1 ("comment-claims-correct-code-violates-spec"
-		// pattern). Reference: BIP-125; bitcoin-core/src/policy/rbf.h.
-		sequence := wallet.BIP125RBFSequence
-		if !replaceable {
-			sequence = 0xffffffff
-		}
-		if seq, ok := inputMap["sequence"].(float64); ok {
-			sequence = uint32(seq)
-		}
-
-		tx.TxIn = append(tx.TxIn, &wire.TxIn{
-			PreviousOutPoint: wire.OutPoint{
-				Hash:  txid,
-				Index: uint32(voutFloat),
-			},
-			Sequence: sequence,
-		})
-	}
-
-	// Add outputs
-	for i, out := range outputsRaw {
-		outputMap, ok := out.(map[string]interface{})
-		if !ok {
-			return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid output %d", i)}
-		}
-
-		for addrStr, amountRaw := range outputMap {
-			amountBTC, ok := amountRaw.(float64)
-			if !ok {
-				return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid amount in output %d", i)}
-			}
-
-			amountSat := int64(amountBTC * satoshiPerBitcoin)
-
-			// Check for "data" key (OP_RETURN output)
-			if addrStr == "data" {
-				dataStr, ok := amountRaw.(string)
-				if !ok {
-					return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid data output"}
-				}
-				dataBytes, err := hex.DecodeString(dataStr)
-				if err != nil {
-					return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hex in data output"}
-				}
-				// Build OP_RETURN script: OP_RETURN <push data>
-				pkScript := make([]byte, 0, 2+len(dataBytes))
-				pkScript = append(pkScript, 0x6a) // OP_RETURN
-				if len(dataBytes) < 76 {
-					pkScript = append(pkScript, byte(len(dataBytes)))
-				} else if len(dataBytes) < 256 {
-					pkScript = append(pkScript, 0x4c, byte(len(dataBytes)))
-				}
-				pkScript = append(pkScript, dataBytes...)
-				tx.TxOut = append(tx.TxOut, &wire.TxOut{
-					Value:    0,
-					PkScript: pkScript,
-				})
-				continue
-			}
-
-			// Decode address to scriptPubKey
-			// Need to import address package for this
-			pkScript, err := addressToScript(addrStr)
-			if err != nil {
-				return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Invalid address: %s", addrStr)}
-			}
-
-			tx.TxOut = append(tx.TxOut, &wire.TxOut{
-				Value:    amountSat,
-				PkScript: pkScript,
-			})
-		}
-	}
-
-	// Create PSBT
 	psbt, err := wallet.NewPSBT(tx)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to create PSBT: %v", err)}
+		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
 	}
-
-	// Encode to base64
 	encoded, err := psbt.EncodeBase64()
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to encode PSBT: %v", err)}
+		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
 	}
-
 	return encoded, nil
 }
 
@@ -219,7 +91,7 @@ func (s *Server) handleCombinePSBT(params json.RawMessage) (interface{}, *RPCErr
 	}
 
 	if len(psbtsRaw) < 1 {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "At least one PSBT required"}
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "At least one PSBT is required"}
 	}
 
 	// Decode all PSBTs
@@ -518,26 +390,9 @@ func (s *Server) handleAnalyzePSBT(params json.RawMessage) (interface{}, *RPCErr
 
 		if !isFinalized {
 			allComplete = false
-
-			// Analyze what's missing
-			missing := []string{}
-
-			if !hasUTXO {
-				missing = append(missing, "utxo")
-			}
-
-			// Check if has any partial sigs
-			if len(input.PartialSigs) == 0 && len(input.TapKeySig) == 0 {
-				missing = append(missing, "signature")
-			}
-
-			if len(missing) > 0 {
-				inputResult.Missing = &AnalyzePSBTMissing{
-					Signatures: len(input.PartialSigs) == 0,
-				}
-			}
-
-			// Determine next role
+			// Core (rpc/rawtransaction.cpp:1944-1966) only emits "missing"
+			// when it has concrete keyids / script hashes. An unsigned PSBT
+			// with no UTXO has next=updater and no "missing" object.
 			if !hasUTXO {
 				inputResult.Next = "updater"
 			} else if len(input.PartialSigs) == 0 && len(input.TapKeySig) == 0 {
@@ -595,6 +450,117 @@ func (s *Server) handleAnalyzePSBT(params json.RawMessage) (interface{}, *RPCErr
 	}
 
 	return result, nil
+}
+
+// handleDescriptorProcessPSBT implements Core's descriptorprocesspsbt
+// (rpc/rawtransaction.cpp:1990-2069). The R5 update-exact probe is an
+// unsigned PSBT whose output script matches wpkh(privkey-1); Core fills
+// PSBT_OUT_BIP32_DERIVATION (fingerprint = HASH160(pub)[:4], empty path)
+// and returns complete=false.
+func (s *Server) handleDescriptorProcessPSBT(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if len(args) < 2 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing psbt or descriptors"}
+	}
+	psbtStr, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type " + jsonTypeName(args[0]) + " is not of expected type string"}
+	}
+	descsRaw, ok := args[1].([]interface{})
+	if !ok {
+		return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type " + jsonTypeName(args[1]) + " is not of expected type array"}
+	}
+
+	psbt, err := wallet.DecodePSBTBase64(psbtStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed %s", err)}
+	}
+
+	net := s.getNetwork()
+	type descKeys struct {
+		scripts [][]byte
+		pubs    [][]byte
+	}
+	var filled []descKeys
+	for _, raw := range descsRaw {
+		descStr := ""
+		switch t := raw.(type) {
+		case string:
+			descStr = t
+		case map[string]interface{}:
+			s, ok := t["desc"].(string)
+			if !ok {
+				return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Missing descriptor"}
+			}
+			descStr = s
+		default:
+			return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid descriptor"}
+		}
+		parsed, err := wallet.ParseDescriptor(descStr, net)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: err.Error()}
+		}
+		scripts, err := parsed.Expand(0)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: err.Error()}
+		}
+		dk := descKeys{scripts: scripts}
+		for _, kp := range parsed.Keys {
+			pub, gerr := kp.GetPubKey(0)
+			if gerr != nil || pub == nil {
+				continue
+			}
+			dk.pubs = append(dk.pubs, pub.SerializeCompressed())
+		}
+		filled = append(filled, dk)
+	}
+
+	for i, txout := range psbt.UnsignedTx.TxOut {
+		for _, d := range filled {
+			match := false
+			for _, spk := range d.scripts {
+				if bytes.Equal(spk, txout.PkScript) {
+					match = true
+					break
+				}
+			}
+			if !match {
+				continue
+			}
+			if psbt.Outputs[i].BIP32Derivation == nil {
+				psbt.Outputs[i].BIP32Derivation = make(map[string]*wallet.BIP32Derivation)
+			}
+			for _, pub := range d.pubs {
+				h160 := bbcrypto.Hash160(pub)
+				var fp [4]byte
+				copy(fp[:], h160[:4])
+				psbt.Outputs[i].BIP32Derivation[string(pub)] = &wallet.BIP32Derivation{Fingerprint: fp}
+			}
+		}
+	}
+
+	encoded, err := psbt.EncodeBase64()
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
+	}
+	complete := true
+	for _, in := range psbt.Inputs {
+		if len(in.FinalScriptSig) == 0 && len(in.FinalScriptWitness) == 0 {
+			complete = false
+			break
+		}
+	}
+	if len(psbt.Inputs) == 0 {
+		complete = false
+	}
+	out := map[string]interface{}{
+		"psbt":     encoded,
+		"complete": complete,
+	}
+	return out, nil
 }
 
 // handleJoinPSBTs joins multiple PSBTs into one (combining inputs and outputs).
@@ -747,13 +713,14 @@ type AnalyzePSBTResult struct {
 	Inputs   []AnalyzePSBTInput `json:"inputs"`
 	Fee      float64            `json:"fee,omitempty"`
 	Next     string             `json:"next,omitempty"`
-	Complete bool               `json:"complete"`
+	Complete bool               `json:"-"` // Core has no top-level "complete" (rpc/rawtransaction.cpp:1969-1985)
 }
 
 // AnalyzePSBTInput is the analysis of a single PSBT input.
+// JSON names match Core rpc/rawtransaction.cpp:1940-1942 (is_final, not is_finalized).
 type AnalyzePSBTInput struct {
 	HasUTXO     bool                `json:"has_utxo"`
-	IsFinalized bool                `json:"is_finalized"`
+	IsFinalized bool                `json:"is_final"`
 	Missing     *AnalyzePSBTMissing `json:"missing,omitempty"`
 	Next        string              `json:"next,omitempty"`
 }
@@ -766,36 +733,36 @@ type AnalyzePSBTMissing struct {
 
 // DecodePSBTResult is the result of decodepsbt RPC.
 type DecodePSBTResult struct {
-	Tx       *TxResult             `json:"tx"`
+	Tx          *TxResult          `json:"tx"`
 	GlobalXPubs []DecodePSBTXPub   `json:"global_xpubs,omitempty"`
-	Unknown  map[string]string     `json:"unknown,omitempty"`
-	Inputs   []DecodePSBTInput     `json:"inputs"`
-	Outputs  []DecodePSBTOutput    `json:"outputs"`
-	Fee      float64               `json:"fee,omitempty"`
+	Unknown     map[string]string  `json:"unknown,omitempty"`
+	Inputs      []DecodePSBTInput  `json:"inputs"`
+	Outputs     []DecodePSBTOutput `json:"outputs"`
+	Fee         float64            `json:"fee,omitempty"`
 }
 
 // DecodePSBTXPub represents an extended public key in decodepsbt.
 type DecodePSBTXPub struct {
-	XPub       string `json:"xpub"`
-	MasterFP   string `json:"master_fingerprint"`
-	Path       string `json:"path"`
+	XPub     string `json:"xpub"`
+	MasterFP string `json:"master_fingerprint"`
+	Path     string `json:"path"`
 }
 
 // DecodePSBTInput represents a decoded PSBT input.
 type DecodePSBTInput struct {
-	NonWitnessUTXO    *TxResult            `json:"non_witness_utxo,omitempty"`
-	WitnessUTXO       *VoutResult          `json:"witness_utxo,omitempty"`
-	PartialSignatures map[string]string    `json:"partial_signatures,omitempty"`
-	SighashType       string               `json:"sighash,omitempty"`
-	RedeemScript      *Script              `json:"redeem_script,omitempty"`
-	WitnessScript     *Script              `json:"witness_script,omitempty"`
-	BIP32Derivation   []DecodePSBTBIP32    `json:"bip32_derivs,omitempty"`
-	FinalScriptSig    *Script              `json:"final_scriptSig,omitempty"`
-	FinalScriptWitness []string            `json:"final_scriptwitness,omitempty"`
-	TapKeySig         string               `json:"tap_key_sig,omitempty"`
-	TapInternalKey    string               `json:"tap_internal_key,omitempty"`
-	TapMerkleRoot     string               `json:"tap_merkle_root,omitempty"`
-	Unknown           map[string]string    `json:"unknown,omitempty"`
+	NonWitnessUTXO     *TxResult         `json:"non_witness_utxo,omitempty"`
+	WitnessUTXO        *VoutResult       `json:"witness_utxo,omitempty"`
+	PartialSignatures  map[string]string `json:"partial_signatures,omitempty"`
+	SighashType        string            `json:"sighash,omitempty"`
+	RedeemScript       *Script           `json:"redeem_script,omitempty"`
+	WitnessScript      *Script           `json:"witness_script,omitempty"`
+	BIP32Derivation    []DecodePSBTBIP32 `json:"bip32_derivs,omitempty"`
+	FinalScriptSig     *Script           `json:"final_scriptSig,omitempty"`
+	FinalScriptWitness []string          `json:"final_scriptwitness,omitempty"`
+	TapKeySig          string            `json:"tap_key_sig,omitempty"`
+	TapInternalKey     string            `json:"tap_internal_key,omitempty"`
+	TapMerkleRoot      string            `json:"tap_merkle_root,omitempty"`
+	Unknown            map[string]string `json:"unknown,omitempty"`
 }
 
 // DecodePSBTOutput represents a decoded PSBT output.
@@ -1104,7 +1071,7 @@ func buildDecodePSBTResultWithNet(psbt *wallet.PSBT, net address.Network) map[st
 					parts = append(parts, hex.EncodeToString(p))
 				}
 				musigArr = append(musigArr, map[string]any{
-					"aggregate_pubkey":   hex.EncodeToString(entry.AggregatePubkey),
+					"aggregate_pubkey":    hex.EncodeToString(entry.AggregatePubkey),
 					"participant_pubkeys": parts,
 				})
 			}

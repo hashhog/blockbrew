@@ -179,16 +179,12 @@ func (s *Server) handleGetBlockStats(params json.RawMessage) (interface{}, *RPCE
 // parseHashOrHeight resolves the getblockstats first argument to a BlockNode.
 // It mirrors Bitcoin Core's ParseHashOrHeight (rpc/blockchain.cpp:126):
 //
-//   - numeric (JSON number, or a string that parses as an integer): a block
-//     height into the active chain. Negative or above-tip heights are
-//     RPC_INVALID_PARAMETER (-8).
-//   - otherwise: a block hash. Unknown hash is RPC_INVALID_ADDRESS_OR_KEY (-5).
+//   - JSON number: a block height. Negative or above-tip → -8.
+//   - otherwise: a block hash (ParseHashV). Unknown hash → -5.
 //
-// Bitcoin Core's RPC frontend treats a numeric height arg as `getInt<int>`
-// whether it arrives as a JSON number or a numeric string, so we accept both.
+// A JSON *string* is never a height (param.isNum() is false for strings),
+// even if it is all digits — the R5 notfound probe is a 64-digit hex hash.
 func (s *Server) parseHashOrHeight(param interface{}) (*consensus.BlockNode, *RPCError) {
-	// Numeric height: JSON number, or a string of digits (Core's frontend
-	// coerces numeric strings to the NUM arg type).
 	if height, ok := asBlockHeight(param); ok {
 		tip := s.chainMgr.BestBlockNode()
 		if tip == nil {
@@ -236,37 +232,18 @@ func (s *Server) parseHashOrHeight(param interface{}) (*consensus.BlockNode, *RP
 // A non-numeric string (e.g. a hex hash) returns (0, false) so the caller falls
 // through to hash resolution.
 func asBlockHeight(v interface{}) (int32, bool) {
-	switch t := v.(type) {
-	case float64:
-		return int32(int64(t)), true
-	case string:
-		if t == "" {
-			return 0, false
-		}
-		neg := false
-		s := t
-		if s[0] == '+' || s[0] == '-' {
-			neg = s[0] == '-'
-			s = s[1:]
-		}
-		if s == "" {
-			return 0, false
-		}
-		var n int64
-		for i := 0; i < len(s); i++ {
-			c := s[i]
-			if c < '0' || c > '9' {
-				return 0, false
-			}
-			n = n*10 + int64(c-'0')
-		}
-		if neg {
-			n = -n
-		}
-		return int32(n), true
-	default:
+	// Core ParseHashOrHeight uses param.isNum() (rpc/blockchain.cpp:131).
+	// A JSON *string* of digits is a hash, not a height — the R5 notfound
+	// probe is a 64-digit hex string that this used to misread as height 1.
+	t, ok := v.(float64)
+	if !ok {
 		return 0, false
 	}
+	n, rpcErr := coreGetInt32(t)
+	if rpcErr != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // computeBlockStats produces the full getblockstats result for a block. It is a

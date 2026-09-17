@@ -87,7 +87,7 @@ func (s *Server) handleScanTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 		return s.scanTxOutSetStart(args)
 	default:
 		return nil, &RPCError{
-			Code:    RPCErrInvalidParams,
+			Code:    RPCErrInvalidParameter,
 			Message: fmt.Sprintf("Invalid action '%s'", action),
 		}
 	}

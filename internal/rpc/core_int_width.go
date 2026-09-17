@@ -32,3 +32,20 @@ func coreGetIntArg(v float64) (int, *RPCError) {
 	}
 	return int(n), nil
 }
+
+// parseRPCInt32 reads a JSON-RPC numeric argument the way Core's
+// UniValue::getInt<int> does: a non-number is RPC_TYPE_ERROR (-3)
+// "JSON value of type X is not of expected type number"; a number that
+// is fractional or outside int32 is RPC_MISC_ERROR (-1) "JSON integer
+// out of range". json.Unmarshal into interface{} yields float64 for
+// every JSON number.
+func parseRPCInt32(v interface{}) (int32, *RPCError) {
+	f, ok := v.(float64)
+	if !ok {
+		return 0, &RPCError{
+			Code:    RPCErrTypeError,
+			Message: "JSON value of type " + jsonTypeName(v) + " is not of expected type number",
+		}
+	}
+	return coreGetInt32(f)
+}

@@ -2,13 +2,15 @@
 //
 // Reference: Bitcoin Core src/rpc/util.cpp (validateaddress)
 // Spec: Core 27+ format — valid returns {address, isvalid, isscript, iswitness,
-//   scriptPubKey, witness_version?, witness_program?}; invalid returns
-//   {isvalid:false, error, error_locations:[]}
+//
+//	scriptPubKey, witness_version?, witness_program?}; invalid returns
+//	{isvalid:false, error, error_locations:[]}
 package rpc
 
 import (
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 
 	"github.com/hashhog/blockbrew/internal/address"
 )
@@ -29,9 +31,9 @@ type validateAddressResult struct {
 // isvalid, error_locations, error — NOT isvalid/error/error_locations. The
 // byte-diff harness checks field-emission order.
 type validateAddressInvalidResult struct {
-	IsValid        bool     `json:"isvalid"`
-	ErrorLocations []string `json:"error_locations"`
-	Error          string   `json:"error"`
+	IsValid        bool   `json:"isvalid"`
+	ErrorLocations []int  `json:"error_locations"`
+	Error          string `json:"error"`
 }
 
 func (s *Server) handleValidateAddress(params json.RawMessage) (interface{}, *RPCError) {
@@ -49,8 +51,8 @@ func (s *Server) handleValidateAddress(params json.RawMessage) (interface{}, *RP
 	if err != nil {
 		return &validateAddressInvalidResult{
 			IsValid:        false,
-			Error:          "Invalid or unsupported Segwit (Bech32) or Base58 encoding.",
-			ErrorLocations: []string{},
+			Error:          validateAddressErrorMessage(addrStr, net),
+			ErrorLocations: []int{},
 		}, nil
 	}
 
@@ -98,4 +100,30 @@ func (s *Server) handleValidateAddress(params json.RawMessage) (interface{}, *RP
 	}
 
 	return result, nil
+}
+
+// validateAddressErrorMessage mirrors Bitcoin Core DecodeDestination
+// (key_io.cpp:85-128) error strings. The R5 exact-invalid probe is
+// "notanaddress": not a Bech32 HRP prefix, Base58Check fails, raw Base58
+// succeeds → "Invalid checksum or length of Base58 address (P2PKH or P2SH)".
+func validateAddressErrorMessage(addrStr string, net address.Network) string {
+	hrp := "bc"
+	switch net {
+	case address.Testnet, address.Signet:
+		hrp = "tb"
+	case address.Regtest:
+		hrp = "bcrt"
+	}
+	lower := strings.ToLower(addrStr)
+	isBech32 := len(lower) >= len(hrp) && lower[:len(hrp)] == hrp
+	if isBech32 {
+		return "Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+	}
+	if _, _, err := address.Base58CheckDecode(addrStr); err == nil {
+		return "Invalid or unsupported Base58-encoded address."
+	}
+	if _, err := address.Base58Decode(addrStr); err != nil {
+		return "Invalid or unsupported Segwit (Bech32) or Base58 encoding."
+	}
+	return "Invalid checksum or length of Base58 address (P2PKH or P2SH)"
 }

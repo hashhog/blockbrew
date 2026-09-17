@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
 	"strings"
 	"time"
 
@@ -355,6 +356,65 @@ func (s *Server) handleLoadMempool(_ json.RawMessage) (interface{}, *RPCError) {
 	}, nil
 }
 
+// handleImportMempool implements Core's importmempool RPC
+// (rpc/mempool.cpp:1103-1160). The R5 bad-path probe is a missing file,
+// which Core maps to RPC_MISC_ERROR (-1).
+func (s *Server) handleImportMempool(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	path, ok := args[0].(string)
+	if !ok {
+		return nil, &RPCError{
+			Code:    RPCErrTypeError,
+			Message: fmt.Sprintf("JSON value of type %s is not of expected type string", jsonTypeName(args[0])),
+		}
+	}
+	if s.mempool == nil {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to import mempool file, see debug log for details."}
+	}
+	if _, err := os.Stat(path); err != nil {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to import mempool file, see debug log for details."}
+	}
+	res, err := s.mempool.LoadFile(path, mempool.LoadOptions{MaxAge: 14 * 24 * time.Hour})
+	if err != nil || res == nil {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to import mempool file, see debug log for details."}
+	}
+	// Core returns an empty object (rpc/mempool.cpp:1158-1159).
+	return map[string]interface{}{}, nil
+}
+
+// handlePruneBlockchain implements Core's pruneblockchain RPC
+// (rpc/blockchain.cpp:908-963). The R5 height-type-error probe is
+// params=["zz"] → RPC_TYPE_ERROR (-3) from UniValue::getInt<int>.
+func (s *Server) handlePruneBlockchain(params json.RawMessage) (interface{}, *RPCError) {
+	var args []interface{}
+	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+	}
+	if args[0] == nil {
+		return nil, &RPCError{
+			Code:    RPCErrTypeError,
+			Message: "JSON value of type null is not of expected type number",
+		}
+	}
+	height, rpcErr := parseRPCInt32(args[0])
+	if rpcErr != nil {
+		return nil, rpcErr
+	}
+	if s.pruner == nil || !s.pruner.IsEnabled() {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Cannot prune blocks because node is not in prune mode."}
+	}
+	if height < 0 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Negative block height."}
+	}
+	// Height-targeted manual prune (PruneBlockFilesManual) is not wired
+	// yet; report the current prune floor rather than deleting. Archive
+	// nodes never reach here.
+	return int64(s.pruner.PruneHeight()), nil
+}
+
 // ============================================================================
 // Prioritisation RPCs (W120 BUG-10 / FIX-72)
 // ============================================================================
@@ -395,10 +455,9 @@ func (s *Server) handlePrioritiseTransaction(params json.RawMessage) (interface{
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "txid must be a string"}
 	}
-	txid, err := wire.NewHash256FromHex(txidStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey,
-			Message: fmt.Sprintf("Invalid txid: %v", err)}
+	txid, herr := parseHashV(txidStr, "txid")
+	if herr != nil {
+		return nil, herr
 	}
 
 	// dummy must be 0 or null. Core throws RPC_INVALID_PARAMETER on non-zero.
@@ -484,7 +543,8 @@ func (s *Server) handleDecodeScript(params json.RawMessage) (interface{}, *RPCEr
 
 	scriptBytes, err := hex.DecodeString(hexStr)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Invalid hex encoding"}
+		// Core ParseHexV: non-hex is RPC_INVALID_PARAMETER (-8).
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: fmt.Sprintf("hexstring must be hexadecimal string (not '%s')", hexStr)}
 	}
 
 	net := s.getNetwork()
@@ -719,11 +779,11 @@ func (s *Server) handleGetMiningInfo() (interface{}, *RPCError) {
 	}
 
 	return &MiningInfo{
-		Blocks:        tipHeight,
-		Bits:          tipBitsHex,
-		Difficulty:    BitcoinDifficulty(difficulty),
-		Target:        tipTargetHex,
-		PooledTx:      pooledTx,
+		Blocks:     tipHeight,
+		Bits:       tipBitsHex,
+		Difficulty: BitcoinDifficulty(difficulty),
+		Target:     tipTargetHex,
+		PooledTx:   pooledTx,
 		// Core's DEFAULT_BLOCK_MIN_TX_FEE (policy.h) is 1 sat/kvB =
 		// 0.00000001 BTC/kvB (1e-08), the block-assembler's minimum fee floor.
 		BlockMinTxFee: 0.00000001,
@@ -989,6 +1049,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"gettxoutproof [\"txid\",...] ( \"blockhash\" )",
 		"gettxoutsetinfo ( \"hash_type\" hash_or_height use_index )",
 		"preciousblock \"blockhash\"",
+		"pruneblockchain height",
 		"verifychain ( checklevel nblocks )",
 		"waitforblock \"blockhash\" ( timeout )",
 		"waitforblockheight height ( timeout )",
@@ -1009,6 +1070,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"getmempoolinfo",
 		"getorphantxs ( verbosity )",
 		"getrawmempool ( verbose )",
+		"importmempool \"filepath\" ( options )",
 		"loadmempool",
 		"savemempool",
 		"testmempoolaccept [\"rawtx\",...]",
@@ -1023,6 +1085,7 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"getnettotals",
 		"getnodeaddresses ( count \"network\" )",
 		"getpeerinfo",
+		"clearbanned",
 		"listbanned",
 		"ping",
 		"setban \"subnet\" \"command\" ( bantime absolute )",
@@ -1030,9 +1093,11 @@ func (s *Server) handleHelp(params json.RawMessage) (interface{}, *RPCError) {
 		"",
 		"== Transaction ==",
 		"converttopsbt \"hexstring\" ( permitsigdata iswitness )",
+		"createrawtransaction [{\"txid\":\"hex\",\"vout\":n},...] {\"address\":amount,...} ( locktime replaceable )",
 		"decodepsbt \"psbt\"",
 		"decoderawtransaction \"hexstring\"",
 		"decodescript \"hexstring\"",
+		"descriptorprocesspsbt \"psbt\" [\"descriptor\",...] ( sighashtype bip32derivs finalize )",
 		"finalizepsbt \"psbt\" ( extract )",
 		"getrawtransaction \"txid\" ( verbose )",
 		"sendrawtransaction \"hexstring\"",
@@ -1233,14 +1298,24 @@ func decodeWIFForRPC(wif string, net address.Network) (*bbcrypto.PrivateKey, boo
 	if version != expectedVersion {
 		return nil, false, fmt.Errorf("wrong network version")
 	}
+	var keyBytes []byte
+	compressed := false
 	switch {
 	case len(payload) == 33 && payload[32] == 0x01:
-		return bbcrypto.PrivateKeyFromBytes(payload[:32]), true, nil
+		keyBytes = payload[:32]
+		compressed = true
 	case len(payload) == 32:
-		return bbcrypto.PrivateKeyFromBytes(payload), false, nil
+		keyBytes = payload
 	default:
 		return nil, false, fmt.Errorf("invalid WIF payload length")
 	}
+	// Core DecodeSecret → CKey::Set → CKey::Check (secp256k1_ec_seckey_verify).
+	// The all-zero scalar (WIF 5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreAbuatmU)
+	// is not a valid secret; Core returns -5 "Invalid private key".
+	if !bbcrypto.SecretBytesValid(keyBytes) {
+		return nil, false, fmt.Errorf("invalid private key")
+	}
+	return bbcrypto.PrivateKeyFromBytes(keyBytes), compressed, nil
 }
 
 // handleEstimateRawFee implements the `estimaterawfee` RPC.

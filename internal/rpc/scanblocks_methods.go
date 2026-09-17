@@ -74,7 +74,7 @@ func (s *Server) handleScanBlocks(params json.RawMessage) (interface{}, *RPCErro
 		return s.scanBlocksStart(args)
 	default:
 		return nil, &RPCError{
-			Code:    RPCErrInvalidParams,
+			Code:    RPCErrInvalidParameter,
 			Message: fmt.Sprintf("Invalid action '%s'", action),
 		}
 	}
