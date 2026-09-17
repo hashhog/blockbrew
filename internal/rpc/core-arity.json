@@ -9,6 +9,11 @@
   "required": 1,
   "sig": "analyzepsbt \"psbt\""
  },
+ "backupwallet": {
+  "declared": 1,
+  "required": 1,
+  "sig": "backupwallet \"destination\""
+ },
  "clearbanned": {
   "declared": 0,
   "required": 0,
@@ -43,6 +48,11 @@
   "declared": 5,
   "required": 2,
   "sig": "createrawtransaction [{\"txid\":\"hex\",\"vout\":n,\"sequence\":n},...] [{\"address\":amount,...},{\"data\":\"hex\"},...] ( locktime replaceable version )"
+ },
+ "createwallet": {
+  "declared": 10,
+  "required": 1,
+  "sig": "createwallet \"wallet_name\" ( disable_private_keys blank \"passphrase\" avoid_reuse descriptors load_on_startup external_signer )"
  },
  "decodepsbt": {
   "declared": 1,
@@ -93,6 +103,16 @@
   "declared": 0,
   "required": 0,
   "sig": "getaddrmaninfo"
+ },
+ "getaddressinfo": {
+  "declared": 1,
+  "required": 1,
+  "sig": "getaddressinfo \"address\""
+ },
+ "getbalances": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getbalances"
  },
  "getbestblockhash": {
   "declared": 0,
@@ -224,6 +244,11 @@
   "required": 0,
   "sig": "getnetworkhashps ( nblocks height )"
  },
+ "getnewaddress": {
+  "declared": 2,
+  "required": 0,
+  "sig": "getnewaddress ( \"label\" \"address_type\" )"
+ },
  "getnetworkinfo": {
   "declared": 0,
   "required": 0,
@@ -274,6 +299,11 @@
   "required": 0,
   "sig": "gettxoutsetinfo ( \"hash_type\" hash_or_height use_index )"
  },
+ "getwalletinfo": {
+  "declared": 0,
+  "required": 0,
+  "sig": "getwalletinfo"
+ },
  "gettxspendingprevout": {
   "declared": 2,
   "required": 1,
@@ -298,6 +328,26 @@
   "declared": 0,
   "required": 0,
   "sig": "listbanned"
+ },
+ "listtransactions": {
+  "declared": 4,
+  "required": 0,
+  "sig": "listtransactions ( dummy count skip include_watchonly )"
+ },
+ "listunspent": {
+  "declared": 5,
+  "required": 0,
+  "sig": "listunspent ( minconf maxconf addresses include_unsafe query_options )"
+ },
+ "listwallets": {
+  "declared": 0,
+  "required": 0,
+  "sig": "listwallets"
+ },
+ "loadwallet": {
+  "declared": 2,
+  "required": 1,
+  "sig": "loadwallet \"filename\" ( load_on_startup )"
  },
  "logging": {
   "declared": 2,
@@ -324,6 +374,11 @@
   "required": 1,
   "sig": "pruneblockchain height"
  },
+ "restorewallet": {
+  "declared": 3,
+  "required": 2,
+  "sig": "restorewallet \"wallet_name\" \"backup_file\" ( load_on_startup )"
+ },
  "savemempool": {
   "declared": 0,
   "required": 0,
@@ -339,10 +394,20 @@
   "required": 1,
   "sig": "scantxoutset \"action\" ( [scanobjects,...] )"
  },
+ "send": {
+  "declared": 6,
+  "required": 1,
+  "sig": "send outputs ( conf_target \"estimate_mode\" fee_rate options version )"
+ },
  "sendrawtransaction": {
   "declared": 3,
   "required": 1,
   "sig": "sendrawtransaction \"hexstring\" ( maxfeerate maxburnamount )"
+ },
+ "sendtoaddress": {
+  "declared": 11,
+  "required": 2,
+  "sig": "sendtoaddress \"address\" amount ( \"comment\" \"comment_to\" subtractfeefromamount replaceable conf_target \"estimate_mode\" avoid_reuse fee_rate verbose )"
  },
  "setban": {
   "declared": 4,
@@ -365,9 +430,9 @@
   "sig": "signrawtransactionwithkey \"hexstring\" [\"privatekey\",...] ( [{\"txid\":\"hex\",\"vout\":n,\"scriptPubKey\":\"hex\",\"redeemScript\":\"hex\",\"witnessScript\":\"hex\",\"amount\":amount},...] \"sighashtype\" )"
  },
  "stop": {
-  "declared": 0,
+  "declared": 1,
   "required": 0,
-  "sig": "stop"
+  "sig": "stop ( wait )"
  },
  "submitblock": {
   "declared": 2,
@@ -388,6 +453,11 @@
   "declared": 2,
   "required": 1,
   "sig": "testmempoolaccept [\"rawtx\",...] ( maxfeerate )"
+ },
+ "unloadwallet": {
+  "declared": 2,
+  "required": 0,
+  "sig": "unloadwallet ( \"wallet_name\" load_on_startup )"
  },
  "uptime": {
   "declared": 0,
@@ -433,5 +503,15 @@
   "declared": 2,
   "required": 0,
   "sig": "waitfornewblock ( timeout \"current_tip\" )"
+ },
+ "walletcreatefundedpsbt": {
+  "declared": 6,
+  "required": 2,
+  "sig": "walletcreatefundedpsbt ( inputs ) outputs ( locktime options bip32derivs version )"
+ },
+ "walletprocesspsbt": {
+  "declared": 5,
+  "required": 1,
+  "sig": "walletprocesspsbt \"psbt\" ( sign \"sighashtype\" bip32derivs finalize )"
  }
 }

@@ -69,7 +69,18 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 			opts.AvoidReuse = val
 		}
 	}
-	// args[5] is descriptors (ignored, always true in blockbrew)
+	// args[5] is descriptors. Core refuses false: wallet.cpp:403-404
+	// "descriptors argument must be set to \"true\"; it is no longer
+	// possible to create a legacy wallet." T3 is descriptor-only.
+	if len(args) >= 6 && args[5] != nil {
+		val, ok := args[5].(bool)
+		if !ok {
+			return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type " + jsonTypeName(args[5]) + " is not of expected type bool"}
+		}
+		if !val {
+			return nil, &RPCError{Code: RPCErrWalletError, Message: "descriptors argument must be set to \"true\"; it is no longer possible to create a legacy wallet."}
+		}
+	}
 	if len(args) >= 7 {
 		if val, ok := args[6].(bool); ok {
 			opts.LoadOnStartup = &val
@@ -99,11 +110,11 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 
 	w, err := s.walletMgr.CreateWallet(name, opts)
 	if err != nil {
-		if err == wallet.ErrWalletAlreadyLoaded {
-			return nil, &RPCError{Code: RPCErrWalletAlreadyLoaded, Message: fmt.Sprintf("Wallet \"%s\" is already loaded", name)}
-		}
-		if err == wallet.ErrWalletAlreadyExists {
-			return nil, &RPCError{Code: RPCErrWalletError, Message: fmt.Sprintf("Wallet \"%s\" already exists", name)}
+		// Core CreateWallet maps FAILED_ALREADY_EXISTS through FAILED_VERIFY
+		// onto RPC_WALLET_ERROR (-4), not RPC_WALLET_ALREADY_LOADED (-35).
+		// wallet.cpp CreateWallet + HandleWalletError default arm.
+		if err == wallet.ErrWalletAlreadyLoaded || err == wallet.ErrWalletAlreadyExists {
+			return nil, &RPCError{Code: RPCErrWalletError, Message: "Wallet file verification failed."}
 		}
 		return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
 	}
@@ -415,10 +426,57 @@ func (s *Server) handleGetBalanceWithWallet(walletName string) (interface{}, *RP
 	return float64(spendable) / satoshiPerBitcoin, nil
 }
 
-func (s *Server) handleListUnspentWithWallet(walletName string) (interface{}, *RPCError) {
+func (s *Server) handleListUnspentWithWallet(params json.RawMessage, walletName string) (interface{}, *RPCError) {
 	w, rpcErr := s.getWalletForRPC(walletName)
 	if rpcErr != nil {
 		return nil, rpcErr
+	}
+
+	// Core coins.cpp listunspent: minconf default 1, maxconf 9999999,
+	// addresses unique and valid.
+	minConf := int32(1)
+	maxConf := int32(9999999)
+	var filterAddrs map[string]struct{}
+	if len(params) > 0 && string(params) != "null" {
+		var args []interface{}
+		if err := json.Unmarshal(params, &args); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+		}
+		if len(args) >= 1 && args[0] != nil {
+			n, err := parseRPCInt32(args[0])
+			if err != nil {
+				return nil, err
+			}
+			minConf = n
+		}
+		if len(args) >= 2 && args[1] != nil {
+			n, err := parseRPCInt32(args[1])
+			if err != nil {
+				return nil, err
+			}
+			maxConf = n
+		}
+		if len(args) >= 3 && args[2] != nil {
+			raw, ok := args[2].([]interface{})
+			if !ok {
+				return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type " + jsonTypeName(args[2]) + " is not of expected type array"}
+			}
+			filterAddrs = make(map[string]struct{}, len(raw))
+			net := w.Network()
+			for _, item := range raw {
+				addr, ok := item.(string)
+				if !ok {
+					return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type " + jsonTypeName(item) + " is not of expected type string"}
+				}
+				if _, err := address.DecodeAddress(addr, net); err != nil {
+					return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid Bitcoin address: " + addr}
+				}
+				if _, dup := filterAddrs[addr]; dup {
+					return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Invalid parameter, duplicated address: " + addr}
+				}
+				filterAddrs[addr] = struct{}{}
+			}
+		}
 	}
 
 	utxos := w.ListUnspent()
@@ -427,11 +485,20 @@ func (s *Server) handleListUnspentWithWallet(walletName string) (interface{}, *R
 		_, tipHeight = s.chainMgr.BestBlock()
 	}
 
+	net := s.addressNetwork()
 	result := make([]ListUnspentResult, 0, len(utxos))
 	for _, u := range utxos {
 		confs := int32(0)
 		if u.Confirmed && u.Height > 0 {
 			confs = tipHeight - u.Height + 1
+		}
+		if confs < minConf || confs > maxConf {
+			continue
+		}
+		if filterAddrs != nil {
+			if _, ok := filterAddrs[u.Address]; !ok {
+				continue
+			}
 		}
 
 		spendable := !w.IsLocked() && w.IsUTXOSpendable(u, tipHeight)
@@ -441,15 +508,33 @@ func (s *Server) handleListUnspentWithWallet(walletName string) (interface{}, *R
 		// DescriptorImpl::IsSolvable — the wallet can't construct a witness).
 		det := w.AddressDetail(u.Address)
 
+		spk := u.PkScript
+		if len(spk) == 0 && u.Address != "" {
+			if decoded, err := address.DecodeAddress(u.Address, net); err == nil {
+				spk = decoded.ScriptPubKey()
+			}
+		}
+		desc := ""
+		if len(spk) > 0 {
+			desc = inferDescriptor(spk, net)
+		}
+		parentDescs := []string{}
+		if desc != "" {
+			parentDescs = []string{desc}
+		}
+
 		result = append(result, ListUnspentResult{
 			TxID:          u.OutPoint.Hash.String(),
 			Vout:          u.OutPoint.Index,
 			Address:       u.Address,
 			Label:         w.GetLabel(u.Address),
+			ScriptPubKey:  hex.EncodeToString(spk),
 			Amount:        float64(u.Amount) / satoshiPerBitcoin,
 			Confirmations: confs,
 			Spendable:     spendable,
 			Solvable:      det.Solvable,
+			Desc:          desc,
+			ParentDescs:   parentDescs,
 			Safe:          u.Confirmed,
 		})
 	}
@@ -482,13 +567,14 @@ func (s *Server) handleSendToAddressWithWallet(params json.RawMessage, walletNam
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
 	}
-
-	amountBTC, ok := args[1].(float64)
-	if !ok {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid amount"}
+	if _, err := address.DecodeAddress(addr, w.Network()); err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid Bitcoin address"}
 	}
 
-	amountSat := int64(amountBTC * satoshiPerBitcoin)
+	amountSat, rpcAmtErr := amountFromValue(args[1])
+	if rpcAmtErr != nil {
+		return nil, rpcAmtErr
+	}
 
 	feeRate := 10.0
 	if s.mempool != nil {
@@ -505,8 +591,9 @@ func (s *Server) handleSendToAddressWithWallet(params json.RawMessage, walletNam
 
 	tx, err := w.CreateTransactionWithTip(addr, amountSat, feeRate, tipHeight)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrWalletError, Message: err.Error()}
+		return nil, mapSpendError(err)
 	}
+	commitWalletSend(w, tx)
 
 	if s.mempool != nil {
 		if err := s.mempool.AcceptToMemoryPool(tx); err != nil {
@@ -642,32 +729,37 @@ func (s *Server) handleListTransactionsWithWallet(params json.RawMessage, wallet
 	}
 
 	count := 10
-	if params != nil {
+	skip := 0
+	if params != nil && len(params) > 0 && string(params) != "null" {
 		var args []interface{}
-		if err := json.Unmarshal(params, &args); err == nil {
-			if len(args) >= 2 {
-				if c, ok := args[1].(float64); ok {
-					count = int(c)
-				}
+		if err := json.Unmarshal(params, &args); err != nil {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
+		}
+		if len(args) >= 2 && args[1] != nil {
+			n, err := parseRPCInt32(args[1])
+			if err != nil {
+				return nil, err
 			}
+			if n < 0 {
+				return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Negative count"}
+			}
+			count = int(n)
+		}
+		if len(args) >= 3 && args[2] != nil {
+			n, err := parseRPCInt32(args[2])
+			if err != nil {
+				return nil, err
+			}
+			if n < 0 {
+				return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Negative from"}
+			}
+			skip = int(n)
 		}
 	}
 
 	_, tipHeight := int32(0), int32(0)
 	if s.chainMgr != nil {
 		_, tipHeight = s.chainMgr.BestBlock()
-	}
-
-	skip := 0
-	if params != nil {
-		var args []interface{}
-		if err := json.Unmarshal(params, &args); err == nil {
-			if len(args) >= 3 {
-				if sk, ok := args[2].(float64); ok && sk > 0 {
-					skip = int(sk)
-				}
-			}
-		}
 	}
 
 	history := w.GetHistory()
@@ -725,6 +817,8 @@ func (s *Server) walletTxToListEntries(tx *wallet.WalletTx, tipHeight int32) []L
 			Confirmations:     confs,
 			TxID:              txid,
 			Time:              tx.Timestamp,
+			TimeReceived:      tx.Timestamp,
+			Abandoned:         false,
 			BlockHeight:       tx.Height,
 			BlockHash:         blockHash,
 			BlockTime:         tx.Timestamp,
@@ -858,6 +952,12 @@ func (s *Server) handleGetWalletInfoWithWallet(walletName string) (interface{}, 
 	confirmed, unconfirmed := w.GetBalance()
 	history := w.GetHistory()
 
+	tipHeight := int32(0)
+	tipHash := wire.Hash256{}
+	if s.chainMgr != nil {
+		tipHash, tipHeight = s.chainMgr.BestBlock()
+	}
+
 	return &WalletInfo{
 		WalletName:         w.Name(),
 		WalletVersion:      169900, // Latest legacy wallet version for compatibility
@@ -874,8 +974,13 @@ func (s *Server) handleGetWalletInfoWithWallet(walletName string) (interface{}, 
 		Scanning:           false,
 		Descriptors:        true,
 		ExternalSigner:     false,
-		Blank:              confirmed == 0 && unconfirmed == 0 && len(history) == 0,
-		Locked:             w.IsLocked(),
+		Blank:              false,
+		Flags:              []string{"descriptor_wallet"},
+		LastProcessedBlock: LastProcessedBlock{
+			Hash:   tipHash.String(),
+			Height: tipHeight,
+		},
+		Locked: w.IsLocked(),
 	}, nil
 }
 
@@ -1007,6 +1112,12 @@ func (s *Server) buildAddressInfo(w *wallet.Wallet, addr string) (*AddressInfoRe
 	// descriptor IS the wallet descriptor it came from.
 	if det.ParentDesc != "" {
 		result.Desc = det.ParentDesc
+	}
+	if result.Desc == "" {
+		result.Desc = inferDescriptor(spk, s.addressNetwork())
+	}
+	if result.ParentDesc == "" {
+		result.ParentDesc = result.Desc
 	}
 
 	// Script classification from the scriptPubKey template.

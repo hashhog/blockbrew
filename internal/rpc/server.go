@@ -747,6 +747,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleListWalletDir()
 	case "backupwallet":
 		return s.handleBackupWallet(params, walletName)
+	case "restorewallet":
+		return s.handleRestoreWallet(params)
 
 	// Wallet RPCs (require wallet context)
 	case "getnewaddress":
@@ -754,9 +756,11 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 	case "getbalance":
 		return s.handleGetBalanceWithWallet(walletName)
 	case "listunspent":
-		return s.handleListUnspentWithWallet(walletName)
+		return s.handleListUnspentWithWallet(params, walletName)
 	case "sendtoaddress":
 		return s.handleSendToAddressWithWallet(params, walletName)
+	case "send":
+		return s.handleSend(params, walletName)
 	case "encryptwallet":
 		return s.handleEncryptWalletWithWallet(params, walletName)
 	case "walletpassphrase":
@@ -854,6 +858,9 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 
 	// Control RPCs
 	case "stop":
+		if rpcErr := checkStopWaitArg(params); rpcErr != nil {
+			return nil, rpcErr
+		}
 		return s.handleStop()
 	case "uptime":
 		return s.handleUptime()

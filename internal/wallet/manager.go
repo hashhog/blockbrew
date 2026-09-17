@@ -19,6 +19,7 @@ var (
 	ErrWalletAlreadyLoaded  = errors.New("wallet already loaded")
 	ErrWalletNotFound       = errors.New("wallet not found")
 	ErrWalletAlreadyExists  = errors.New("wallet already exists")
+	ErrInvalidBackupFile    = errors.New("backup file does not exist")
 	ErrNoWalletSpecified    = errors.New("wallet file not specified")
 	ErrMultipleWalletsNamed = errors.New("multiple wallets loaded, specify wallet name")
 	ErrInvalidWalletName    = errors.New("invalid wallet name")
@@ -440,6 +441,42 @@ func (m *Manager) BackupWallet(name, destination string) error {
 	}
 
 	return os.WriteFile(destination, srcData, 0600)
+}
+
+// RestoreWallet copies a backup file into a new wallet directory and loads it.
+// Core: src/wallet/wallet.cpp RestoreWallet. Missing backup is
+// FAILED_INVALID_BACKUP_FILE; an existing wallet.dat is FAILED_ALREADY_EXISTS.
+func (m *Manager) RestoreWallet(name, backupFile string, loadOnStartup *bool) (*Wallet, error) {
+	if _, err := os.Stat(backupFile); err != nil {
+		if os.IsNotExist(err) {
+			return nil, ErrInvalidBackupFile
+		}
+		return nil, err
+	}
+
+	walletPath := m.walletDir(name)
+	if _, err := os.Stat(filepath.Join(walletPath, "wallet.dat")); err == nil {
+		return nil, ErrWalletAlreadyExists
+	}
+
+	m.mu.RLock()
+	_, loaded := m.wallets[name]
+	m.mu.RUnlock()
+	if loaded {
+		return nil, ErrWalletAlreadyExists
+	}
+
+	if err := os.MkdirAll(walletPath, 0700); err != nil {
+		return nil, err
+	}
+	srcData, err := os.ReadFile(backupFile)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.WriteFile(filepath.Join(walletPath, "wallet.dat"), srcData, 0600); err != nil {
+		return nil, err
+	}
+	return m.LoadWallet(name, loadOnStartup)
 }
 
 // AutoLoadWallets returns the list of wallet names configured to auto-load.

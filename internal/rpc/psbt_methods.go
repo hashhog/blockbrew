@@ -300,7 +300,25 @@ func (s *Server) handleWalletProcessPSBT(params json.RawMessage) (interface{}, *
 	// Decode PSBT
 	psbt, err := wallet.DecodePSBTBase64(psbtStr)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Failed to decode PSBT: %v", err)}
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed %s", err)}
+	}
+
+	// Core FillPSBT (spend.cpp): copy witness_utxo from the wallet when
+	// the PSBT creator did not attach UTXO data. createpsbt is a pure
+	// constructor and leaves inputs empty; without this fill, SignPSBT
+	// returns "PSBT input missing UTXO information".
+	if s.wallet != nil && psbt.UnsignedTx != nil {
+		for i, in := range psbt.UnsignedTx.TxIn {
+			if i >= len(psbt.Inputs) {
+				break
+			}
+			if psbt.Inputs[i].WitnessUTXO != nil || psbt.Inputs[i].NonWitnessUTXO != nil {
+				continue
+			}
+			if u := s.wallet.GetUTXO(in.PreviousOutPoint); u != nil {
+				psbt.Inputs[i].WitnessUTXO = &wire.TxOut{Value: u.Amount, PkScript: u.PkScript}
+			}
+		}
 	}
 
 	// Sign if requested
@@ -344,10 +362,19 @@ func (s *Server) handleWalletProcessPSBT(params json.RawMessage) (interface{}, *
 		return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to encode PSBT"}
 	}
 
-	return &ProcessPSBTResult{
+	result := &ProcessPSBTResult{
 		PSBT:     encoded,
 		Complete: complete,
-	}, nil
+	}
+	if complete {
+		if tx, xerr := wallet.ExtractTransaction(psbt); xerr == nil {
+			var buf bytes.Buffer
+			if err := tx.Serialize(&buf); err == nil {
+				result.Hex = hex.EncodeToString(buf.Bytes())
+			}
+		}
+	}
+	return result, nil
 }
 
 // handleAnalyzePSBT analyzes a PSBT.
@@ -706,6 +733,7 @@ type FinalizePSBTResult struct {
 type ProcessPSBTResult struct {
 	PSBT     string `json:"psbt"`
 	Complete bool   `json:"complete"`
+	Hex      string `json:"hex,omitempty"`
 }
 
 // AnalyzePSBTResult is the result of analyzepsbt RPC.

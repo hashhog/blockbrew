@@ -317,10 +317,15 @@ func (s *Server) handleListTransactions(params json.RawMessage) (interface{}, *R
 		var args []interface{}
 		if err := json.Unmarshal(params, &args); err == nil {
 			// args[0] is label (ignored), args[1] is count
-			if len(args) >= 2 {
-				if c, ok := args[1].(float64); ok {
-					count = int(c)
+			if len(args) >= 2 && args[1] != nil {
+				n, err := parseRPCInt32(args[1])
+				if err != nil {
+					return nil, err
 				}
+				if n < 0 {
+					return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Negative count"}
+				}
+				count = int(n)
 			}
 		}
 	}

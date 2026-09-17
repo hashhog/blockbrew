@@ -289,6 +289,16 @@ func TestR5_HelpListsClearbannedAndCreaterawtransaction(t *testing.T) {
 		"submitpackage",
 		"validateaddress",
 		"verifytxoutproof",
+		"getblockfilter",
+		"backupwallet",
+		"loadwallet",
+		"unloadwallet",
+		"createwallet",
+		"restorewallet",
+		"send",
+		"listwallets",
+		"walletprocesspsbt",
+		"walletcreatefundedpsbt",
 	}
 	for _, m := range want {
 		found := false

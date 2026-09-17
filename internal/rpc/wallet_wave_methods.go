@@ -293,7 +293,7 @@ func (s *Server) handleWalletCreateFundedPSBT(params json.RawMessage, walletName
 		outputs = []map[string]interface{}{single}
 	}
 	if len(outputs) == 0 {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "At least one output required"}
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "At least one output required"}
 	}
 
 	// 3. Optional locktime (third arg).

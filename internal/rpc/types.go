@@ -7,26 +7,28 @@ import (
 
 // JSON-RPC error codes (from Bitcoin Core).
 const (
-	RPCErrParseError             = -32700 // Invalid JSON was received
-	RPCErrInvalidRequest         = -32600 // The JSON sent is not a valid Request object
-	RPCErrMethodNotFound         = -32601 // The method does not exist
-	RPCErrInvalidParams          = -32602 // Invalid method parameter(s)
-	RPCErrInternal               = -32603 // Internal JSON-RPC error
-	RPCErrMiscError              = -1     // Generic application error (Core protocol.h RPC_MISC_ERROR)
-	RPCErrTypeError              = -3     // Unexpected type was passed as parameter
-	RPCErrInvalidAddressOrKey    = -5     // Invalid address or key
-	RPCErrInvalidParameter       = -8     // Invalid, missing or duplicate parameter
-	RPCErrBlockNotFound          = -5     // Block not found
-	RPCErrTxNotFound             = -5     // Transaction not found
-	RPCErrWalletError            = -4     // Unspecified wallet error
-	RPCErrWalletNotFound         = -18    // Wallet not loaded
-	RPCErrWalletNotSpecified     = -19    // Multiple wallets loaded, must specify which
-	RPCErrWalletAlreadyLoaded    = -35    // Wallet is already loaded
-	RPCErrDeserialization        = -22    // Error parsing or validating structure in raw format
-	RPCErrVerify                 = -25    // Error during verification
-	RPCErrInWarmup               = -28    // Client still warming up
-	RPCErrClientNodeNotConnected = -29    // Node to disconnect not found in connected nodes
-	RPCErrClientP2PDisabled      = -31    // No valid connection manager instance found (Core protocol.h:64)
+	RPCErrParseError              = -32700 // Invalid JSON was received
+	RPCErrInvalidRequest          = -32600 // The JSON sent is not a valid Request object
+	RPCErrMethodNotFound          = -32601 // The method does not exist
+	RPCErrInvalidParams           = -32602 // Invalid method parameter(s)
+	RPCErrInternal                = -32603 // Internal JSON-RPC error
+	RPCErrMiscError               = -1     // Generic application error (Core protocol.h RPC_MISC_ERROR)
+	RPCErrTypeError               = -3     // Unexpected type was passed as parameter
+	RPCErrInvalidAddressOrKey     = -5     // Invalid address or key
+	RPCErrInvalidParameter        = -8     // Invalid, missing or duplicate parameter
+	RPCErrBlockNotFound           = -5     // Block not found
+	RPCErrTxNotFound              = -5     // Transaction not found
+	RPCErrWalletError             = -4     // Unspecified wallet error
+	RPCErrWalletInsufficientFunds = -6     // Wallet insufficient funds (Core protocol.h RPC_WALLET_INSUFFICIENT_FUNDS)
+	RPCErrWalletNotFound          = -18    // Wallet not loaded
+	RPCErrWalletNotSpecified      = -19    // Multiple wallets loaded, must specify which
+	RPCErrWalletAlreadyLoaded     = -35    // Wallet is already loaded
+	RPCErrWalletAlreadyExists     = -36    // Wallet already exists (Core protocol.h RPC_WALLET_ALREADY_EXISTS)
+	RPCErrDeserialization         = -22    // Error parsing or validating structure in raw format
+	RPCErrVerify                  = -25    // Error during verification
+	RPCErrInWarmup                = -28    // Client still warming up
+	RPCErrClientNodeNotConnected  = -29    // Node to disconnect not found in connected nodes
+	RPCErrClientP2PDisabled       = -31    // No valid connection manager instance found (Core protocol.h:64)
 
 	// P2P peer/ban-management error codes (Bitcoin Core protocol.h:60-63).
 	// These map operator addnode/setban bad-input cases to the exact Core
@@ -284,62 +286,62 @@ type MempoolEntryFees struct {
 // getmempoolentry). Field order matches Bitcoin Core's MempoolEntryToJSON
 // pushKV order (src/rpc/mempool.cpp:515-568).
 type MempoolEntry struct {
-	VSize           int64            `json:"vsize"`
-	Weight          int64            `json:"weight"`
-	Time            int64            `json:"time"`
-	Height          int32            `json:"height"`
-	DescendantCount int              `json:"descendantcount"`
-	DescendantSize  int64            `json:"descendantsize"`
-	AncestorCount   int              `json:"ancestorcount"`
-	AncestorSize    int64            `json:"ancestorsize"`
-	WTxID           string           `json:"wtxid"`
+	VSize           int64  `json:"vsize"`
+	Weight          int64  `json:"weight"`
+	Time            int64  `json:"time"`
+	Height          int32  `json:"height"`
+	DescendantCount int    `json:"descendantcount"`
+	DescendantSize  int64  `json:"descendantsize"`
+	AncestorCount   int    `json:"ancestorcount"`
+	AncestorSize    int64  `json:"ancestorsize"`
+	WTxID           string `json:"wtxid"`
 	// Fees is the nested fee sub-object matching Core's fees{base, modified,
 	// ancestor, descendant} shape. Replaces the old flat fee/modifiedfee/
 	// ancestorfees/descendantfees top-level fields which Core removed.
 	// W120 BUG-1 / FIX-68. Reference:
 	// `bitcoin-core/src/rpc/mempool.cpp::MempoolEntryToJSON`.
-	Fees            MempoolEntryFees `json:"fees"`
-	Depends         []string         `json:"depends"`
-	SpentBy         []string         `json:"spentby"`
+	Fees    MempoolEntryFees `json:"fees"`
+	Depends []string         `json:"depends"`
+	SpentBy []string         `json:"spentby"`
 	// BIP125Replaceable mirrors Core's `bip125-replaceable` field. Boolean
 	// (not the {"yes","no","unknown"} string used in wallet RPCs because the
 	// entry is by construction known-in-mempool). Computed by walking the tx
 	// + unconfirmed mempool ancestors per BIP-125 §"Signaling implementation"
 	// and short-circuiting to true when `-mempoolfullrbf=1` is in force.
 	BIP125Replaceable bool `json:"bip125-replaceable"`
-	Unbroadcast     bool `json:"unbroadcast"`
+	Unbroadcast       bool `json:"unbroadcast"`
 }
 
 // PeerInfo represents peer information in RPC responses.
 type PeerInfo struct {
-	ID                    int              `json:"id"`
-	Addr                  string           `json:"addr"`
-	Network               string           `json:"network"`
-	Services              string           `json:"services"`
-	ServicesNames         []string         `json:"servicesnames"`
-	RelayTxes             bool             `json:"relaytxes"`
+	ID            int      `json:"id"`
+	Addr          string   `json:"addr"`
+	Network       string   `json:"network"`
+	Services      string   `json:"services"`
+	ServicesNames []string `json:"servicesnames"`
+	RelayTxes     bool     `json:"relaytxes"`
 	// LastInvSequence (Core m_last_inv_seq) and InvToSend (Core m_inv_to_send)
 	// are emitted immediately after relaytxes and before lastsend, matching
 	// Core v31.99 getpeerinfo wire order (rpc/net.cpp:243-244). blockbrew does
 	// not track either value at the manager layer, so both are emitted as 0 —
 	// the same convention as addr_processed/addr_rate_limited.
-	LastInvSequence       int64            `json:"last_inv_sequence"`
-	InvToSend             int64            `json:"inv_to_send"`
-	LastSend              int64            `json:"lastsend"`
-	LastRecv              int64            `json:"lastrecv"`
-	LastTransaction       int64            `json:"last_transaction"`
-	LastBlock             int64            `json:"last_block"`
-	BytesSent             uint64           `json:"bytessent"`
-	BytesRecv             uint64           `json:"bytesrecv"`
-	ConnTime              int64            `json:"conntime"`
-	TimeOffset            int64            `json:"timeoffset"`
-	PingTime              float64          `json:"pingtime"`
-	MinPing               float64          `json:"minping"`
-	Version               int32            `json:"version"`
-	SubVer                string           `json:"subver"`
-	Inbound               bool             `json:"inbound"`
-	BIP152HBTo            bool             `json:"bip152_hb_to"`
-	BIP152HBFrom          bool             `json:"bip152_hb_from"`
+	LastInvSequence int64   `json:"last_inv_sequence"`
+	InvToSend       int64   `json:"inv_to_send"`
+	LastSend        int64   `json:"lastsend"`
+	LastRecv        int64   `json:"lastrecv"`
+	LastTransaction int64   `json:"last_transaction"`
+	LastBlock       int64   `json:"last_block"`
+	BytesSent       uint64  `json:"bytessent"`
+	BytesRecv       uint64  `json:"bytesrecv"`
+	ConnTime        int64   `json:"conntime"`
+	TimeOffset      int64   `json:"timeoffset"`
+	PingTime        float64 `json:"pingtime"`
+	MinPing         float64 `json:"minping"`
+	Version         int32   `json:"version"`
+	SubVer          string  `json:"subver"`
+	Inbound         bool    `json:"inbound"`
+	BIP152HBTo      bool    `json:"bip152_hb_to"`
+	BIP152HBFrom    bool    `json:"bip152_hb_from"`
 	// Core v31.99 getpeerinfo no longer emits `startingheight` — rpc/net.cpp
 	// pushes presynced_headers directly after bip152_hb_from. The legacy
 	// m_starting_height was dropped from RPC output, so the field is omitted
@@ -412,36 +414,41 @@ type ChainTip struct {
 
 // WalletInfo represents the result of getwalletinfo.
 type WalletInfo struct {
-	WalletName            string  `json:"walletname"`
-	WalletVersion         int     `json:"walletversion"`
-	Format                string  `json:"format,omitempty"`
-	Balance               float64 `json:"balance"`
-	UnconfirmedBalance    float64 `json:"unconfirmed_balance"`
-	TxCount               int     `json:"txcount"`
-	KeypoolSize           int     `json:"keypoolsize"`
-	KeypoolSizeHDInternal int     `json:"keypoolsize_hd_internal,omitempty"`
-	UnlockedUntil         *int64  `json:"unlocked_until,omitempty"`
-	PayTxFee              float64 `json:"paytxfee"`
-	PrivateKeysEnabled    bool    `json:"private_keys_enabled"`
-	AvoidReuse            bool    `json:"avoid_reuse"`
-	Scanning              bool    `json:"scanning"`
-	Descriptors           bool    `json:"descriptors"`
-	ExternalSigner        bool    `json:"external_signer"`
-	Blank                 bool    `json:"blank"`
-	Locked                bool    `json:"-"` // Internal use, not serialized
+	WalletName            string             `json:"walletname"`
+	WalletVersion         int                `json:"walletversion"`
+	Format                string             `json:"format,omitempty"`
+	Balance               float64            `json:"balance"`
+	UnconfirmedBalance    float64            `json:"unconfirmed_balance"`
+	TxCount               int                `json:"txcount"`
+	KeypoolSize           int                `json:"keypoolsize"`
+	KeypoolSizeHDInternal int                `json:"keypoolsize_hd_internal,omitempty"`
+	UnlockedUntil         *int64             `json:"unlocked_until,omitempty"`
+	PayTxFee              float64            `json:"paytxfee"`
+	PrivateKeysEnabled    bool               `json:"private_keys_enabled"`
+	AvoidReuse            bool               `json:"avoid_reuse"`
+	Scanning              bool               `json:"scanning"`
+	Descriptors           bool               `json:"descriptors"`
+	ExternalSigner        bool               `json:"external_signer"`
+	Blank                 bool               `json:"blank"`
+	Flags                 []string           `json:"flags"`
+	LastProcessedBlock    LastProcessedBlock `json:"lastprocessedblock"`
+	Locked                bool               `json:"-"` // Internal use, not serialized
 }
 
 // ListUnspentResult represents an unspent output for listunspent.
 type ListUnspentResult struct {
-	TxID          string  `json:"txid"`
-	Vout          uint32  `json:"vout"`
-	Address       string  `json:"address"`
-	Label         string  `json:"label,omitempty"`
-	Amount        float64 `json:"amount"`
-	Confirmations int32   `json:"confirmations"`
-	Spendable     bool    `json:"spendable"`
-	Solvable      bool    `json:"solvable"`
-	Safe          bool    `json:"safe"`
+	TxID          string   `json:"txid"`
+	Vout          uint32   `json:"vout"`
+	Address       string   `json:"address"`
+	Label         string   `json:"label"`
+	ScriptPubKey  string   `json:"scriptPubKey"`
+	Amount        float64  `json:"amount"`
+	Confirmations int32    `json:"confirmations"`
+	Spendable     bool     `json:"spendable"`
+	Solvable      bool     `json:"solvable"`
+	Desc          string   `json:"desc,omitempty"`
+	ParentDescs   []string `json:"parent_descs"`
+	Safe          bool     `json:"safe"`
 }
 
 // ListTransactionsResult represents a wallet transaction for listtransactions.
@@ -467,6 +474,8 @@ type ListTransactionsResult struct {
 	BlockTime     int64  `json:"blocktime,omitempty"`
 	TxID          string `json:"txid"`
 	Time          int64  `json:"time"`
+	TimeReceived  int64  `json:"timereceived"`
+	Abandoned     bool   `json:"abandoned"`
 	BlockHeight   int32  `json:"blockheight,omitempty"`
 	// BIP125Replaceable mirrors Core's `bip125-replaceable` field on
 	// `listtransactions` / `gettransaction` / `listsinceblock`. String,

@@ -766,12 +766,14 @@ func TestW125_BUG_21_WalletPassphrase_MissingArg(t *testing.T) {
 
 func TestW125_BUG_22_SendToAddress_NoWallet(t *testing.T) {
 	server := w125TestServer(t)
+	// Two args so the dispatcher arity check (required=2) does not fire
+	// first; Core then returns RPC_WALLET_NOT_FOUND (-18) when no wallet
+	// is loaded (GetWalletForJSONRPCRequest).
 	resp := testRPCRequest(t, server.handleRPC,
-		"sendtoaddress", []interface{}{}, "", "")
+		"sendtoaddress", []interface{}{"bcrt1qw508d6qejxtdg4y5r3zarvary0c5xw7kygt080", 0.001}, "", "")
 	if resp.Error == nil {
 		t.Fatal("expected error, got nil")
 	}
-	// No wallet wired → -18 RPCErrWalletNotFound — Core-correct shape.
 	if resp.Error.Code != RPCErrWalletNotFound {
 		t.Errorf("PRESENT regressed: code = %d, want %d (-18 RPCErrWalletNotFound)",
 			resp.Error.Code, RPCErrWalletNotFound)
