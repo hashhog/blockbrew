@@ -267,9 +267,33 @@ func TestR5_HelpListsClearbannedAndCreaterawtransaction(t *testing.T) {
 		t.Fatalf("help errored: %+v", resp.Error)
 	}
 	text, _ := resp.Result.(string)
-	for _, m := range []string{"clearbanned", "createrawtransaction"} {
+	// Live probe 20260917T070153Z on 13ea105: these 16 answer Core-correctly
+	// but fail help-parity. clearbanned/createrawtransaction were the previous
+	// two; keep them so a regression in either class is visible.
+	want := []string{
+		"clearbanned",
+		"createrawtransaction",
+		"analyzepsbt",
+		"combinepsbt",
+		"combinerawtransaction",
+		"createmultisig",
+		"createpsbt",
+		"deriveaddresses",
+		"getdescriptorinfo",
+		"getnetworkhashps",
+		"gettxspendingprevout",
+		"joinpsbts",
+		"prioritisetransaction",
+		"scanblocks",
+		"scantxoutset",
+		"submitpackage",
+		"validateaddress",
+		"verifytxoutproof",
+	}
+	for _, m := range want {
 		found := false
 		for _, line := range splitHelpLines(text) {
+			line = trimHelpLine(line)
 			if line == m || (len(line) > len(m) && line[:len(m)] == m && (line[len(m)] == ' ' || line[len(m)] == '(')) {
 				found = true
 				break
@@ -279,6 +303,13 @@ func TestR5_HelpListsClearbannedAndCreaterawtransaction(t *testing.T) {
 			t.Errorf("help does not list %s", m)
 		}
 	}
+}
+
+func trimHelpLine(s string) string {
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\t') {
+		s = s[1:]
+	}
+	return s
 }
 
 func splitHelpLines(s string) []string {
