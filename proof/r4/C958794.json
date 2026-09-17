@@ -1,0 +1,27 @@
+{
+  "commitment": "C(958794)",
+  "height": 958794,
+  "bestblockhash": "000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e",
+  "hash_serialized_3": "29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0",
+  "coins": 166180925,
+  "status": "DISPUTED",
+  "head_reproduction": false,
+  "snapshot_booted": false,
+  "match": false,
+  "capture_0814": {
+    "utc": "2026-08-14T18:20:25Z",
+    "hash_serialized_3": "29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0",
+    "coins": 166180925,
+    "match": true,
+    "binary_and_datadir": "GONE",
+    "note": "Genuine 256-bit match on a retired genesis-rig binary. Does not count for HEAD."
+  },
+  "capture_0815": {
+    "utc": "2026-08-15T12:56:23Z",
+    "hash_serialized_3": "24ec9202799b6eafbee0a931fb6f4ac543c0e520652cbae594cec6c3168e7a5a",
+    "coins": 166180926,
+    "match": false,
+    "adjudication": "crash-recovery re-applied spent coinbase 958187; +1 coin. Not a hasher miss."
+  },
+  "trust_anchor_rule": "Snapshot-booted lineages do NOT count. Re-hashing a Core dumptxoutset file does NOT count. A MATCH whose binary and datadir are gone does not count for HEAD."
+}

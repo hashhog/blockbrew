@@ -1,0 +1,26 @@
+{
+  "live": {
+    "artifact": "r5/live-20260917T091843Z.json",
+    "command": "python3 tools/r5_probe.py --impl blockbrew -v",
+    "T1": {"pass": 45, "total": 46},
+    "T2": {"pass": 40, "total": 41},
+    "T3": {"pass": 0, "total": 16, "note": "SKIP-REGTEST on the live lane"},
+    "fails": [],
+    "skips_live_lane": ["stop", "getblockfilter"],
+    "note": "Operator live control 2026-09-17T09:18Z on the deployed pin 5ccdd59. FAIL count is 0. The two unscored live-lane methods are stop (T1) and getblockfilter (T2), which are regtest-lane specs and PASS there."
+  },
+  "regtest": {
+    "artifact": "r5/regtest-20260917T083336Z.json",
+    "command": "bash tools/regtest-harness.sh --r5-lane=blockbrew",
+    "T1": {"pass": 1, "total": 1},
+    "T2": {"pass": 1, "total": 1},
+    "T3": {"pass": 16, "total": 16},
+    "methods_scored": 18,
+    "fails": []
+  },
+  "in_repo": {
+    "command": "go test ./internal/rpc/ -count=1 -timeout 120s -run TestR5_",
+    "after": "r5/t1-after.txt",
+    "after_summary": "44 tests, 0 failures"
+  }
+}

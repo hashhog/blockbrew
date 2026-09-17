@@ -1,0 +1,97 @@
+{
+  "r4": {
+    "files": [
+      "r4/status.json",
+      "r4/C958794.json",
+      "r4/capture-0814.md",
+      "r4/capture-0815.md",
+      "r4/capture-watch-excerpt.txt",
+      "r4/hasher-not-lineage.txt",
+      "r4/genesis-unit.service",
+      "r4/lineage.log.gz",
+      "r4/lineage.log.sha256",
+      "r4/lineage.log.gz.sha256",
+      "r4/lineage-excerpt.txt",
+      "r4/av0-250000-ledger.txt",
+      "r4/av0-250000-ledger.jsonl",
+      "r4/command.txt"
+    ],
+    "status": "DISPUTED",
+    "head_reproduction": false,
+    "snapshot_booted": false,
+    "snapshot_booted_does_not_count": true,
+    "hasher_file_match_counts_as_r4": false,
+    "height": 958794,
+    "bestblockhash": "000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e",
+    "hash_serialized_3": "29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0",
+    "coins": 166180925,
+    "capture_0814_utc": "2026-08-14T18:20:25Z",
+    "capture_0815_hash": "24ec9202799b6eafbee0a931fb6f4ac543c0e520652cbae594cec6c3168e7a5a",
+    "capture_0815_coins": 166180926,
+    "lineage_log_sha256": "92156aad1b0b8794b95692ed572e296966dd6991bee997d790933cf87b061a25",
+    "genesis_block_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    "assumevalid": "0",
+    "lineage_binary_and_datadir": "GONE",
+    "ledger_250000_overall": "FAIL@250000",
+    "ledger_250000_wedge_height": 231020,
+    "blocker": "Matching 08-14 capture binary and datadir are gone. No from-genesis reproduction of C(958794) exists for HEAD. Hasher-of-a-Core-dump and snapshot-booted ranges do not count."
+  },
+  "r1": {
+    "files": [
+      "r1/results.json",
+      "r1/script.txt",
+      "r1/script-inrepo.txt",
+      "r1/tx.txt",
+      "r1/sighash.txt",
+      "r1/command.txt"
+    ],
+    "script_pass": 1217,
+    "script_fail": 0,
+    "script_assemble_errors_pre_run": 5,
+    "script_in_repo_pass": 1222,
+    "tx_valid_pass": 121,
+    "tx_invalid_pass": 93,
+    "sighash_pass": 500,
+    "divergences": 0,
+    "decided": 1931,
+    "charter_vector_count": 1936
+  },
+  "r2": {
+    "files": [
+      "r2/results.json",
+      "r2/nightly-report-excerpt.txt",
+      "r2/cve-2010-fail.txt",
+      "r2/command.txt"
+    ],
+    "pass": 369,
+    "fail": 1,
+    "err": 0,
+    "consensus_splits_accept_vs_reject": 0
+  },
+  "r5": {
+    "files": [
+      "r5/scorecard.json",
+      "r5/live-20260917T091843Z.json",
+      "r5/regtest-20260917T083336Z.json",
+      "r5/t1-after.txt",
+      "r5/command.txt"
+    ],
+    "live_t1_pass": 45,
+    "live_t1_total": 46,
+    "live_t2_pass": 40,
+    "live_t2_total": 41,
+    "live_fail_count": 0,
+    "regtest_t3_pass": 16,
+    "regtest_t3_total": 16,
+    "in_repo_r5_pass": 44,
+    "in_repo_r5_fail": 0
+  },
+  "provenance": {
+    "files": ["provenance.txt"],
+    "binary_sha256": "4ba0d7c4dbb7c4a902cafd8380782dee495024e52e9270315bb869262ac7ede1",
+    "binary_path": "blockbrew",
+    "deploy_pin": "5ccdd59596ec35882e51a5f777dea29fe415f587",
+    "toolchain": "go1.24.1 linux/amd64",
+    "parent_commit": "5ccdd59596ec35882e51a5f777dea29fe415f587"
+  }
+}

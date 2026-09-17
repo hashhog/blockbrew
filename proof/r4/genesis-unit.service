@@ -1,0 +1,34 @@
+[Unit]
+Description=HashHog genesis IBD — blockbrew (mainnet, from-genesis, AV=0, pruned) — T2 3rd lineage
+Documentation=https://github.com/hashhog receipts/TRUST-ANCHOR.md (C(944183) 3rd lineage)
+After=network-online.target
+
+[Service]
+Type=simple
+# From-genesis full-validation IBD (-assumevalid=0 => every script verified from block 0).
+# -connect pins to local Core as block source (implies -dnsseed=0 + no auto-outbound).
+# -prune=10000 MiB (~10 GiB; headers+UTXO+last 288 never pruned -> gettxoutsetinfo capture ok).
+# Nice=15: this is the 3rd C(944183) T2 lineage, secondary to the 4 primary genesis IBDs.
+Nice=15
+# Fable Tier-0 ops-ask 2026-07-14: GOGC=200 (2x Go heap growth between GC) + dbcache=8192
+# (~6.4G UTXO + ~1.6G Pebble). W76 telemetry at 491k: utxo_avg 602ms >> script 148ms => cache-bound.
+Environment=GOGC=200
+ExecStart=/home/work/hashhog/blockbrew/blockbrew \
+  -network=mainnet \
+  -datadir=/home/work/genesis-ibd/blockbrew \
+  -assumevalid=0 \
+  -connect=127.0.0.1:28620 \
+  -rpcbind=127.0.0.1:8366 \
+  -listen=0.0.0.0:8466 \
+  -prune=10000 \
+  -dbcache=8192
+WorkingDirectory=/home/work/hashhog/blockbrew
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=300
+LimitNOFILE=524288
+StandardOutput=append:/home/work/genesis-ibd/logs/blockbrew.log
+StandardError=append:/home/work/genesis-ibd/logs/blockbrew.log
+
+[Install]
+WantedBy=default.target

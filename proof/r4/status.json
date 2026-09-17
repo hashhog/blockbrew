@@ -1,0 +1,19 @@
+{
+  "status": "DISPUTED",
+  "commitment": "C(958794)",
+  "head_reproduction": false,
+  "snapshot_booted": false,
+  "snapshot_booted_does_not_count": true,
+  "hasher_file_match_counts_as_r4": false,
+  "range_counts_as_r4": false,
+  "hash_serialized_3": "29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0",
+  "coins": 166180925,
+  "height": 958794,
+  "bestblockhash": "000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e",
+  "genesis_block_hash": "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+  "assumevalid_required_for_r4": "0",
+  "lineage_binary_and_datadir": "GONE",
+  "ledger_250000_overall": "FAIL@250000",
+  "ledger_250000_wedge_height": 231020,
+  "blocker": "Matching 08-14 capture binary and datadir are gone. No from-genesis reproduction of C(958794) exists for HEAD. Re-hashing Core's dumptxoutset is file-integrity, not a lineage. Snapshot-booted range-runner CLOSED rows do not count."
+}

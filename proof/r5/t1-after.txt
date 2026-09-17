@@ -1,0 +1,95 @@
+# AFTER: in-repo R5 control on 5ccdd59 (the deployed pin)
+# go test ./internal/rpc/ -count=1 -timeout 120s -v -run TestR5_
+
+=== RUN   TestR5_GetNetworkHashPS_TypeError
+--- PASS: TestR5_GetNetworkHashPS_TypeError (0.00s)
+=== RUN   TestR5_GetBlockTemplate_MissingSegwitRule
+--- PASS: TestR5_GetBlockTemplate_MissingSegwitRule (0.00s)
+=== RUN   TestR5_CombineRawTransaction_UnknownInput
+--- PASS: TestR5_CombineRawTransaction_UnknownInput (0.00s)
+=== RUN   TestR5_DeriveAddresses_MissingChecksum
+--- PASS: TestR5_DeriveAddresses_MissingChecksum (0.00s)
+=== RUN   TestR5_DeriveAddresses_RangeOnUnranged
+--- PASS: TestR5_DeriveAddresses_RangeOnUnranged (0.00s)
+=== RUN   TestR5_ImportMempool_BadPath
+--- PASS: TestR5_ImportMempool_BadPath (0.00s)
+=== RUN   TestR5_PruneBlockchain_HeightTypeError
+--- PASS: TestR5_PruneBlockchain_HeightTypeError (0.00s)
+=== RUN   TestR5_SignMessageWithPrivKey_ZeroPrivkey
+--- PASS: TestR5_SignMessageWithPrivKey_ZeroPrivkey (0.00s)
+=== RUN   TestR5_GetBlockStats_NotFound
+--- PASS: TestR5_GetBlockStats_NotFound (0.00s)
+=== RUN   TestR5_AddNode_InvalidCommand
+--- PASS: TestR5_AddNode_InvalidCommand (0.00s)
+=== RUN   TestR5_DecodeScript_NonHex
+--- PASS: TestR5_DecodeScript_NonHex (0.00s)
+=== RUN   TestR5_VerifyTxOutProof_NonHex
+--- PASS: TestR5_VerifyTxOutProof_NonHex (0.00s)
+=== RUN   TestR5_GetTxSpendingPrevout_MissingVout
+--- PASS: TestR5_GetTxSpendingPrevout_MissingVout (0.00s)
+=== RUN   TestR5_PrioritiseTransaction_BadTxid
+--- PASS: TestR5_PrioritiseTransaction_BadTxid (0.00s)
+=== RUN   TestR5_ScanBlocks_BadAction
+--- PASS: TestR5_ScanBlocks_BadAction (0.00s)
+=== RUN   TestR5_ScanTxOutSet_BadAction
+--- PASS: TestR5_ScanTxOutSet_BadAction (0.00s)
+=== RUN   TestR5_CombinePSBT_EmptyArray
+--- PASS: TestR5_CombinePSBT_EmptyArray (0.00s)
+=== RUN   TestR5_SubmitPackage_EmptyArray
+--- PASS: TestR5_SubmitPackage_EmptyArray (0.00s)
+=== RUN   TestR5_CreateMultisig_InvalidPubkey
+--- PASS: TestR5_CreateMultisig_InvalidPubkey (0.00s)
+=== RUN   TestR5_CreateMultisig_NotEnoughKeys
+--- PASS: TestR5_CreateMultisig_NotEnoughKeys (0.00s)
+=== RUN   TestR5_GetDescriptorInfo_Invalid
+--- PASS: TestR5_GetDescriptorInfo_Invalid (0.00s)
+=== RUN   TestR5_GetDescriptorInfo_BadChecksum
+--- PASS: TestR5_GetDescriptorInfo_BadChecksum (0.00s)
+=== RUN   TestR5_CreatePSBT_CanonicalExact
+--- PASS: TestR5_CreatePSBT_CanonicalExact (0.00s)
+=== RUN   TestR5_CreatePSBT_BadTxid
+--- PASS: TestR5_CreatePSBT_BadTxid (0.00s)
+=== RUN   TestR5_JoinPSBTs_Exact
+--- PASS: TestR5_JoinPSBTs_Exact (0.00s)
+=== RUN   TestR5_DescriptorProcessPSBT_BadDescriptor
+--- PASS: TestR5_DescriptorProcessPSBT_BadDescriptor (0.00s)
+=== RUN   TestR5_DescriptorProcessPSBT_UpdateExact
+--- PASS: TestR5_DescriptorProcessPSBT_UpdateExact (0.01s)
+=== RUN   TestR5_HelpListsClearbannedAndCreaterawtransaction
+--- PASS: TestR5_HelpListsClearbannedAndCreaterawtransaction (0.00s)
+=== RUN   TestR5_ValidateAddress_ExactInvalid
+--- PASS: TestR5_ValidateAddress_ExactInvalid (0.00s)
+=== RUN   TestR5_AnalyzePSBT_Exact
+--- PASS: TestR5_AnalyzePSBT_Exact (0.00s)
+=== RUN   TestR5_TestMempoolAccept_MissingInputsExact
+--- PASS: TestR5_TestMempoolAccept_MissingInputsExact (0.00s)
+=== RUN   TestR5_TestMempoolAccept_DecodeError
+--- PASS: TestR5_TestMempoolAccept_DecodeError (0.00s)
+=== RUN   TestR5_CreateWallet_LegacyRefused
+--- PASS: TestR5_CreateWallet_LegacyRefused (0.00s)
+=== RUN   TestR5_CreateWallet_AlreadyExistsAndNoName
+--- PASS: TestR5_CreateWallet_AlreadyExistsAndNoName (0.10s)
+=== RUN   TestR5_ListTransactions_NegativeCountSkip
+--- PASS: TestR5_ListTransactions_NegativeCountSkip (0.11s)
+=== RUN   TestR5_ListUnspent_FilterRejects
+--- PASS: TestR5_ListUnspent_FilterRejects (0.08s)
+=== RUN   TestR5_WrongArity_WalletZeroArg
+--- PASS: TestR5_WrongArity_WalletZeroArg (0.06s)
+=== RUN   TestR5_GetWalletInfo_HasFlags
+--- PASS: TestR5_GetWalletInfo_HasFlags (0.06s)
+=== RUN   TestR5_Send_Rejects
+--- PASS: TestR5_Send_Rejects (0.06s)
+=== RUN   TestR5_SendToAddress_ErrorCodes
+--- PASS: TestR5_SendToAddress_ErrorCodes (0.08s)
+=== RUN   TestR5_RestoreWallet_BackupMissingAndAlreadyExists
+--- PASS: TestR5_RestoreWallet_BackupMissingAndAlreadyExists (0.26s)
+=== RUN   TestR5_Stop_WrongType
+--- PASS: TestR5_Stop_WrongType (0.00s)
+=== RUN   TestR5_WalletCreateFundedPSBT_NoOutputs
+--- PASS: TestR5_WalletCreateFundedPSBT_NoOutputs (0.11s)
+=== RUN   TestR5_WalletProcessPSBT_DecodeError
+--- PASS: TestR5_WalletProcessPSBT_DecodeError (0.08s)
+PASS
+ok  	github.com/hashhog/blockbrew/internal/rpc	1.020s
+
+44 tests, 0 failures

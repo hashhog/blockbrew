@@ -1,0 +1,21 @@
+# Re-run R4 (from-genesis UTXO-hash identity with Core). Days, not minutes.
+# Snapshot-booted range-runner CLOSED rows do NOT count (TRUST-ANCHOR).
+# Hashing Core's dumptxoutset does NOT count (file-integrity, not a lineage).
+#
+# What a HEAD reproduction would take, on this host:
+#
+#   1. Fresh datadir. Launch with the unit in r4/genesis-unit.service:
+#        -assumevalid=0 -connect=127.0.0.1:28620 -prune=10000 -dbcache=8192
+#      Feed is a blk-replay-server capped at --max-serve-height 958794.
+#   2. Wait until tip == 958794. Freeze there (cap, not rollback).
+#   3. gettxoutsetinfo (or dumptxoutset + compute-snapshot-hash.py).
+#   4. Require:
+#        height        == 958794
+#        bestblockhash == 000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e
+#        coins         == 166180925
+#        hash_serialized_3 == 29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0
+#      and a lineage log that starts at height=0 on Bitcoin's genesis hash
+#      with assumevalid DISABLED and no loadtxoutset/assumeutxo lines.
+#
+# The 08-14 MATCH did this on a binary and datadir that are GONE.
+# Until it is done again on HEAD, R4 stays DISPUTED.

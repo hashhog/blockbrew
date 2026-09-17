@@ -1,0 +1,83 @@
+## start of lineage log (first 40 lines)
+[blockbrew] 2026/07/28 14:43:59.546116 blockbrew v0.1.0 starting...
+[blockbrew] 2026/07/28 14:43:59.546156 Network: mainnet
+[blockbrew] 2026/07/28 14:43:59.546158 Data directory: /home/work/genesis-ibd/blockbrew
+[blockbrew] 2026/07/28 14:43:59.546159 BIP-324 v2 transport: ENABLED (outbound + inbound; v1 fall-through)
+[blockbrew] 2026/07/28 14:43:59.546197 PID file: /home/work/genesis-ibd/blockbrew/blockbrew.pid (pid=1877097)
+[blockbrew] 2026/07/28 14:43:59.546216 assumevalid DISABLED (-assumevalid=0): full script verification of all history
+[blockbrew] 2026/07/28 14:43:59.546218 WARNING: RPC password is empty, consider setting --rpcpassword for security
+[blockbrew] 2026/07/28 14:43:59.599486 Database opened at /home/work/genesis-ibd/blockbrew/chaindata (-dbcache=8192 MiB → utxo_cache=6553 MiB, pebble_block_cache=1638 MiB)
+[blockbrew] 2026/07/28 14:43:59.599556 Flat-file block store opened at /home/work/genesis-ibd/blockbrew/blocks (current file=blk00000.dat)
+[blockbrew] 2026/07/28 14:43:59.599560 Pruning enabled: target=10000 MiB (~9.8 GiB); MIN_BLOCKS_TO_KEEP=288
+[blockbrew] 2026/07/28 14:43:59.599577 Header index initialized with genesis: 000000000019d668
+[blockbrew] 2026/07/28 14:43:59.599580 No existing chain state found, starting fresh
+[blockbrew] 2026/07/28 14:43:59.646487 UTXO set initialized (cache_max=6553 MiB)
+[blockbrew] 2026/07/28 14:43:59.646547 chainmgr: loaded chain state from DB: height=0 hash=000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+[blockbrew] 2026/07/28 14:43:59.646552 Chain manager initialized (parallel scripts: true, pruning: true)
+[blockbrew] 2026/07/28 14:43:59.646579 Mempool initialized (max 300 MB, fullrbf=true)
+[blockbrew] 2026/07/28 14:43:59.646796 No wallet file found, starting with empty wallet
+[blockbrew] 2026/07/28 14:43:59.646814 wallet auto-flush started (interval 5s)
+[blockbrew] 2026/07/28 14:43:59.646877 RPC cookie written to /home/work/genesis-ibd/blockbrew/.cookie
+[blockbrew] 2026/07/28 14:43:59.646881 Starting services...
+[blockbrew] 2026/07/28 14:43:59.647108 P2P network listening on 0.0.0.0:8466
+[blockbrew] 2026/07/28 14:43:59.647136 Sync manager started
+[blockbrew] 2026/07/28 14:43:59.647125 P2P: -connect set (1 peer(s)) — DNS seeds and auto-outbound dialing disabled; pinning to 127.0.0.1:28620
+[blockbrew] 2026/07/28 14:43:59.647171 RPC server listening on 127.0.0.1:8366
+[blockbrew] 2026/07/28 14:43:59.647173 RPC server listening on 127.0.0.1:8366
+[blockbrew] 2026/07/28 14:43:59.647189 blockbrew v0.1.0 started successfully
+[blockbrew] 2026/07/28 14:43:59.647215 Prometheus metrics server listening on 0.0.0.0:9332
+[blockbrew] 2026/07/28 14:43:59.647319 Metrics server error: listen tcp 0.0.0.0:9332: bind: address already in use
+[blockbrew] 2026/07/28 14:43:59.647932 v2 transport negotiation failed for 127.0.0.1:28620, redialing fresh socket for v1: v2 handshake failed: read garbage: read tcp 127.0.0.1:46992->127.0.0.1:28620: read: connection reset by peer
+[blockbrew] 2026/07/28 14:43:59.648314 sync: starting header sync with 127.0.0.1:28620 (height 958794)
+[blockbrew] 2026/07/28 14:43:59.648337 headerssync: started with peer=127.0.0.1:28620 height=0 max_commitments=5542649 min_work=1128750f82f4c366153a3a030
+[blockbrew] 2026/07/28 14:43:59.648340 sync: starting PRESYNC pipeline with 127.0.0.1:28620 (tip_work < min_work)
+[blockbrew] 2026/07/28 14:44:00.798693 headerssync: transition with peer=127.0.0.1:28620: sufficient work at height=940000, redownloading from height=0
+[blockbrew] 2026/07/28 14:44:00.836673 sync: added 1696 headers (0 -> 1696)
+[blockbrew] 2026/07/28 14:44:00.855172 sync: added 2000 headers (1696 -> 3696)
+[blockbrew] 2026/07/28 14:44:00.861252 sync: added 2000 headers (3696 -> 5696)
+[blockbrew] 2026/07/28 14:44:00.877001 sync: added 2000 headers (5696 -> 7696)
+[blockbrew] 2026/07/28 14:44:00.883357 sync: added 2000 headers (7696 -> 9696)
+[blockbrew] 2026/07/28 14:44:00.889946 sync: added 2000 headers (9696 -> 11696)
+[blockbrew] 2026/07/28 14:44:00.896588 sync: added 2000 headers (11696 -> 13696)
+
+## first chainstate at genesis (height=0, Bitcoin genesis hash)
+14:[blockbrew] 2026/07/28 14:43:59.646547 chainmgr: loaded chain state from DB: height=0 hash=000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f
+
+## assumevalid DISABLED banner (first occurrence)
+6:[blockbrew] 2026/07/28 14:43:59.546216 assumevalid DISABLED (-assumevalid=0): full script verification of all history
+
+## first block-download from height 1 (startHeight=0)
+501:[blockbrew] 2026/07/28 14:44:07.126195 sync: starting block download from height 1 to 940000 (288 blocks, startHeight=0)
+
+## first flush at height=958794
+325788:[blockbrew] 2026/08/14 11:35:30.968548 flushing chainstate atomically at height 958794
+
+## IBD progress at the 958794 freeze (first occurrence)
+169096:[blockbrew] 2026/08/08 11:20:44.398830 sync: IBD progress 958794/960004 (99.9%) [queue=64, inflight=16, validCh=0/1024, connCh=0/1024, nextH=958795]
+
+## end of lineage log (last 16 lines)
+[blockbrew] 2026/08/15 10:36:19.900008 stopping P2P
+[blockbrew] 2026/08/15 10:36:19.900029 Sync manager stopped
+[blockbrew] 2026/08/15 10:36:19.900224 saved 0 block-relay-only anchor(s) to /home/work/genesis-ibd/blockbrew/anchors.json
+[blockbrew] 2026/08/15 10:36:19.900367 saved 0 peer address(es) to /home/work/genesis-ibd/blockbrew/peers.json
+[blockbrew] 2026/08/15 10:36:19.900419 Peer manager stopped
+[blockbrew] 2026/08/15 10:36:19.903718 Fee estimates saved
+[blockbrew] 2026/08/15 10:36:19.919932 mempool.dat saved (0 txs)
+[blockbrew] 2026/08/15 10:36:20.084277 Wallet saved
+[blockbrew] 2026/08/15 10:36:20.084312 flushing chainstate atomically at height 958794
+[blockbrew] 2026/08/15 10:36:20.126567 Chainstate flushed atomically (UTXO + tip) at height 958794
+[blockbrew] 2026/08/15 10:36:20.515180 Block store flushed
+[blockbrew] 2026/08/15 10:36:20.515195 closing DB
+[blockbrew] 2026/08/15 10:36:21.331019 Database closed
+[blockbrew] 2026/08/15 10:36:21.331044 ZMQ publisher stopped
+[blockbrew] 2026/08/15 10:36:21.331112 blockbrew shutdown complete
+[blockbrew] 2026/08/15 10:36:21.331115 exit
+
+## snapshot-boot negative control: loadtxoutset/assumeutxo/snapshot lines
+matches=0 (must be 0 for a from-genesis lineage)
+
+## honest limit
+This log belongs to the 2026-07-28 genesis-rig binary, not HEAD.
+The datadir /home/work/genesis-ibd/blockbrew is GONE. The MATCH
+capture of 2026-08-14 cannot be re-run from this tree. R4 for HEAD
+is DISPUTED / UNPROVEN until a new from-genesis reproduction exists.

@@ -1,0 +1,15 @@
+  jobs recorded: 440   corpora x impls
+  IMPL           PASS   FAIL   ERR   AGREEMENT
+  ----------------------------------------------
+  blockbrew       369      1     0       99.7%
+
+  DIVERGENCES (blockbrew rows only):
+    blockbrew    _cve-histbug-2026-07-07/cve-2010-value-overflow 1 failed
+                 (sum-over-maxmoney: both REJECT, reason differs —
+                  Core reject:bad-txns-txouttotal-toolarge,
+                  blockbrew reject:rejected)
+
+  CONSENSUS SPLITS (accept vs reject -- chain-split risk): 0
+  (The nightly classifier's split count has an accounting gap on the full
+   10-impl report; the one blockbrew FAIL log was read directly and is
+   reject-vs-reject. See r2/results.json and r2/cve-2010-fail.txt.)

@@ -1,0 +1,25 @@
+# Hasher-of-a-Core-dump is NOT an R4 lineage
+counts_as_r4=false
+
+Commit 7387f315 (2026-09-12) stream-hashes Core's dumptxoutset
+`/data/nvme1/hashhog-mainnet/snapshots/utxo-958794.dat` through
+blockbrew's WriteTxOutSer / SHA256d:
+
+  TestHashSnapshotFile_C958794 PASS 181.62s
+  MATCH coins=166180925
+  hash_serialized_3=29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0
+  base=000000000000000000015eaadd989e4f09ff75b643a128dc7bdf6070431d7d0e
+
+TRUST-ANCHOR, applied without weakening:
+
+  What does NOT count: re-hashing a loaded snapshot file (that is
+  file-integrity, already done 10/10 at load); a TRUSTED snapshot-booted
+  node's state at H (circular).
+
+This test proves blockbrew's hasher agrees with Core's pin on Core's own
+dump. It does not prove this tree built that set from genesis with
+assumevalid=0. The 08-15 +1 was crash-recovery, not the hasher — and that
+adjudication still leaves HEAD without a from-genesis capture.
+
+Control (needs the 9.4G dump on this host):
+  go test ./internal/consensus/ -count=1 -timeout 45m -run TestHashSnapshotFile_C958794

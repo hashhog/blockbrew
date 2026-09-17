@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- docs: CHARTER proof bundle (`proof/`; `bash proof/verify.sh`)
+
 ## v1.0.2 — 2026-09-13
 
 - bee96ce test: stop prune_one_MiB hanging the cmd/blockbrew package

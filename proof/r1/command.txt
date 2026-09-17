@@ -1,0 +1,19 @@
+# Re-run R1 (interpreter) for blockbrew.
+#
+# Phase B (CHARTER instrument; needs the hashhog meta-repo sibling
+# bitcoin-core/src/test/data and tools/phaseb-vectors):
+#
+#   export PATH="/usr/local/go/bin:$PATH"
+#   (cd blockbrew && go build -o cmd/verifyscript_shim/verifyscript_shim ./cmd/verifyscript_shim)
+#   cd tools/phaseb-vectors
+#   python3 phaseb_vectors.py --driver=../../blockbrew/cmd/verifyscript_shim/verifyscript_shim
+#   python3 phaseb_vectors.py --driver=../../blockbrew/cmd/verifyscript_shim/verifyscript_shim --txvectors
+#   python3 phaseb_vectors.py --driver=../../blockbrew/cmd/verifyscript_shim/verifyscript_shim --sighash
+#
+# In-repo harnesses (need Core's JSON next to this clone):
+#
+#   go run ./cmd/script_test /path/to/script_tests.json
+#   go run ./cmd/sighash_test /path/to/sighash.json
+#
+# The live re-run inside `bash proof/verify.sh` is the in-repo R5 suite
+# (no Core JSON required). Re-running the heavy R1 arms is this file.

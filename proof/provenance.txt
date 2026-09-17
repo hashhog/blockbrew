@@ -1,0 +1,26 @@
+# Provenance — blockbrew proof bundle
+assembled_utc: 2026-09-17T19:25:45Z
+repo: https://github.com/hashhog/blockbrew
+branch: master
+commit: 5ccdd59596ec35882e51a5f777dea29fe415f587
+commit_short: 5ccdd59596ec
+subject: fix: T3 wallet RPC matches Core on the R5 regtest lane
+tree_clean: NO
+binary: blockbrew
+binary_sha256: 4ba0d7c4dbb7c4a902cafd8380782dee495024e52e9270315bb869262ac7ede1
+toolchain: go version go1.24.1 linux/amd64
+target: Linux amd64
+build: go build -o blockbrew ./cmd/blockbrew
+deploy_pin: 5ccdd59596ec35882e51a5f777dea29fe415f587
+deploy_sha256: 4ba0d7c4dbb7c4a902cafd8380782dee495024e52e9270315bb869262ac7ede1
+
+# Honest caveats
+The attested binary is the promoted pin (deploy/blockbrew/MANIFEST
+sha256=4ba0d7c4…, commit 5ccdd59), which is byte-identical to the live
+mainnet unit's /proc/<pid>/exe at assembly. Go embeds build metadata;
+a different Go, libc, or build path is expected to produce different
+bytes. Behavioural re-runs (R1 shim, in-repo R5 tests) are the stronger
+check. See REPRODUCIBLE-BUILD.md.
+This script refreshes provenance + MANIFEST only. Frozen evidence in
+r1/ r2/ r4/ r5/ is not regenerated from outside this repository.
+R4 for HEAD is DISPUTED — do not rewrite provenance to claim Validated.
