@@ -1527,3 +1527,152 @@ func TestMuteNoFirstByteRotatesBeforeBaseStallTimeout(t *testing.T) {
 			gotGood, node.Hash)
 	}
 }
+
+// pipelineOnePeerNearMax is the live 9ccaa90 startup shape: one connected
+// peer, N near-max bodies queued, all getdata issued on that single
+// connection (MaxBlocksPerPeer=16).
+func pipelineOnePeerNearMax(t *testing.T, n int) (*SyncManager, *Peer, []*blockRequest) {
+	t.Helper()
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	genesis := idx.Genesis()
+	nodes := make([]*consensus.BlockNode, n)
+	prev := genesis.Hash
+	ts := genesis.Header.Timestamp
+	for i := 0; i < n; i++ {
+		ts += 600
+		block := nearMaxWeightBlock(t, prev, ts)
+		node, err := idx.AddHeader(block.Header, true)
+		if err != nil {
+			t.Fatalf("AddHeader %d: %v", i+1, err)
+		}
+		nodes[i] = node
+		prev = node.Hash
+	}
+
+	pm := &PeerManager{}
+	peer := createMockPeer("busy.example:8333", nodes[n-1].Height)
+	pm.InsertConnectedPeer(peer)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		PeerManager:    pm,
+		DownloadWindow: 16,
+	})
+
+	sm.mu.Lock()
+	for _, node := range nodes {
+		sm.blockQueue = append(sm.blockQueue, &blockRequest{
+			Hash:   node.Hash,
+			Height: node.Height,
+			State:  BlockDownloadPending,
+		})
+	}
+	sm.nextHeight = nodes[0].Height
+	sm.mu.Unlock()
+
+	sm.requestBlocks()
+	got := drainGetData(peer)
+	if len(got) != n {
+		t.Fatalf("getdata count=%d, want %d pipelined on the one peer", len(got), n)
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.inflight) != n {
+		t.Fatalf("inflight=%d, want %d", len(sm.inflight), n)
+	}
+	reqs := append([]*blockRequest(nil), sm.blockQueue...)
+	return sm, peer, reqs
+}
+
+func pipelineHead(reqs []*blockRequest) *blockRequest {
+	head := reqs[0]
+	for _, req := range reqs[1:] {
+		if req.Height < head.Height {
+			head = req
+		}
+	}
+	return head
+}
+
+// TestPipelinedBodiesOnOnePeerDoNotFirstByteTimeoutWhileHeadIsLive is the
+// 9ccaa90 live residual. Deployed 2026-09-18T20:32Z, the node queued 12
+// near-max bodies and put inflight=10 on 5.61.52.150. That peer started a
+// body (first-byte ttfb=81ms). 16s later the other inflight requests on
+// the SAME peer logged "fetch no-first-byte … ttfb-timeout=16s — rotating"
+// and were re-issued, often back to the same address. The peer was not
+// mute — it was busy sending the pipelined head. FirstByteTimeout detects
+// a mute *peer*, not a connection that is still transferring an earlier
+// getdata.
+//
+// Live series: 967590–967610 are all ~3.99M weight. Catch-up of 12 blocks
+// still took 4.5 min because the pipeline kept cancelling itself.
+func TestPipelinedBodiesOnOnePeerDoNotFirstByteTimeoutWhileHeadIsLive(t *testing.T) {
+	const n = 4
+	sm, peer, reqs := pipelineOnePeerNearMax(t, n)
+	head := pipelineHead(reqs)
+
+	sm.mu.Lock()
+	aged := time.Now().Add(-FirstByteTimeout - time.Second)
+	for _, req := range reqs {
+		req.RequestAt = aged
+		req.FirstByteAt = time.Time{}
+	}
+	// Head is live: first-byte arrived in 80ms, matching the production line.
+	head.FirstByteAt = aged.Add(80 * time.Millisecond)
+	head.PayloadSize = 1_600_000
+	sm.mu.Unlock()
+
+	sm.checkStaleRequests()
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.inflight) != n {
+		t.Fatalf("after %s with head streaming: inflight=%d queued=%d, want %d still on the busy peer "+
+			"(live 9ccaa90: first-byte on 5.61.52.150 then 9× 'no-first-byte — rotating' on that same peer)",
+			FirstByteTimeout, len(sm.inflight), len(sm.blockQueue), n)
+	}
+	for _, req := range reqs {
+		if req.State != BlockDownloadInFlight {
+			t.Fatalf("height %d state=%d, want InFlight; sibling was first-byte-timed-out while the peer was sending the head",
+				req.Height, req.State)
+		}
+		if req.Peer != peer {
+			t.Fatalf("height %d rotated off the streaming peer", req.Height)
+		}
+	}
+}
+
+// TestMutePipelineHeadRotatesWholePeerPipeline is the other half: a peer
+// that has sent zero bytes on the pipeline head is actually mute, so every
+// inflight body on that connection must rotate — not sit behind a 24h
+// "not the head" clock.
+func TestMutePipelineHeadRotatesWholePeerPipeline(t *testing.T) {
+	const n = 4
+	sm, peer, reqs := pipelineOnePeerNearMax(t, n)
+
+	sm.mu.Lock()
+	aged := time.Now().Add(-FirstByteTimeout - time.Second)
+	for _, req := range reqs {
+		req.RequestAt = aged
+		req.FirstByteAt = time.Time{}
+	}
+	sm.mu.Unlock()
+
+	sm.checkStaleRequests()
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if len(sm.inflight) != 0 {
+		t.Fatalf("mute peer still has inflight=%d, want 0 (whole pipeline must rotate)", len(sm.inflight))
+	}
+	for _, req := range reqs {
+		if req.State != BlockDownloadPending {
+			t.Fatalf("height %d state=%d, want Pending after mute-head rotation", req.Height, req.State)
+		}
+		if _, failed := req.FailedPeers[peer.Address()]; !failed {
+			t.Fatalf("height %d missing FailedPeers[%s] after mute pipeline rotate", req.Height, peer.Address())
+		}
+	}
+}

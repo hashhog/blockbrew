@@ -72,6 +72,13 @@ const (
 	// Using BaseStallTimeout (sized for a 4 MiB *complete* transfer) as
 	// the mute detector is why 967594 sat through three rotations for 13
 	// minutes while six other impls on the same box stayed at tip.
+	//
+	// Applies only to the pipeline HEAD on a peer (lowest-height inflight
+	// body). Siblings queued behind an in-progress transfer are waiting
+	// on the same connection, not mute. Live 9ccaa90 (2026-09-18T20:33Z):
+	// inflight=10 on 5.61.52.150, first-byte at 81ms, then the other 9
+	// logged "no-first-byte — rotating" at 16s while that body was still
+	// arriving, which cancelled the pipeline the previous commit added.
 	FirstByteTimeout = 16 * time.Second
 
 	// MaxStallTimeout caps adaptive per-peer backoff (double on stall).
@@ -382,6 +389,10 @@ func (sm *SyncManager) applyStallRecovery(req *blockRequest, now time.Time) {
 	}
 	log.Printf("sync: block %d in-flight timed out after %s, rotating peer (retries %d→%d)",
 		req.Height, now.Sub(req.RequestAt).Round(time.Second), req.RetryCount, req.RetryCount+1)
+	if req.FirstByteAt.IsZero() && sm.isPeerPipelineHeadLocked(req) {
+		sm.rotateMutePeerPipelineLocked(req)
+		return
+	}
 	sm.rotateTimedOutRequest(req)
 }
 
@@ -403,12 +414,103 @@ func (sm *SyncManager) rotateTimedOutRequest(req *blockRequest) {
 			sm.increaseStallTimeout(req.Peer)
 		}
 	}
+	peer := req.Peer
 	req.State = BlockDownloadPending
 	req.RetryCount++
 	req.NextRetryAt = time.Time{}
 	req.FirstByteAt = time.Time{}
 	req.PayloadSize = 0
 	delete(sm.inflight, req.Hash)
+	sm.armPeerPipelineHeadLocked(peer)
+}
+
+// isPeerPipelineHeadLocked reports whether req is the lowest-height
+// inflight body on its peer. Bitcoin P2P is one-message-at-a-time per
+// connection: later getdata wait behind the head, they are not mute.
+// Caller MUST hold sm.mu.
+func (sm *SyncManager) isPeerPipelineHeadLocked(req *blockRequest) bool {
+	if req == nil || req.Peer == nil {
+		return true
+	}
+	for _, other := range sm.inflight {
+		if other == nil || other == req || other.Peer != req.Peer {
+			continue
+		}
+		if other.Height < req.Height {
+			return false
+		}
+	}
+	return true
+}
+
+// armPeerPipelineHeadLocked restarts the mute-clock on the new pipeline
+// head after an inflight body on this peer leaves (completed or rotated).
+// Without this, a sibling whose getdata was sent 50s ago becomes head
+// and immediately trips FirstByteTimeout. Caller MUST hold sm.mu.
+func (sm *SyncManager) armPeerPipelineHeadLocked(peer *Peer) {
+	if peer == nil {
+		return
+	}
+	var head *blockRequest
+	for _, req := range sm.inflight {
+		if req == nil || req.Peer != peer {
+			continue
+		}
+		if head == nil || req.Height < head.Height {
+			head = req
+		}
+	}
+	if head == nil || !head.FirstByteAt.IsZero() {
+		return
+	}
+	head.RequestAt = time.Now()
+}
+
+// rotateMutePeerPipelineLocked rotates every inflight body on a peer
+// whose pipeline head sent no first byte. Siblings will never see bytes
+// from a mute connection either; leaving them inflight with the non-head
+// 24h clock would pin them for a day. Caller MUST hold sm.mu.
+func (sm *SyncManager) rotateMutePeerPipelineLocked(head *blockRequest) int {
+	if head == nil {
+		return 0
+	}
+	peer := head.Peer
+	type sib struct {
+		req  *blockRequest
+		wait time.Duration
+	}
+	var siblings []sib
+	if peer != nil {
+		for _, req := range sm.inflight {
+			if req == nil || req == head || req.Peer != peer {
+				continue
+			}
+			wait := time.Duration(0)
+			if !req.RequestAt.IsZero() {
+				wait = time.Since(req.RequestAt)
+			}
+			siblings = append(siblings, sib{req: req, wait: wait})
+		}
+	}
+	n := 0
+	sm.rotateTimedOutRequest(head)
+	n++
+	for _, s := range siblings {
+		if _, still := sm.inflight[s.req.Hash]; !still {
+			continue
+		}
+		if s.req.FirstByteAt.IsZero() {
+			addr := ""
+			if peer != nil {
+				addr = peer.Address()
+			}
+			log.Printf("sync: fetch no-first-byte height=%d peer=%s wait=%s ttfb-timeout=%s — rotating",
+				s.req.Height, addr, s.wait.Round(time.Millisecond), FirstByteTimeout)
+		}
+		sm.rotateTimedOutRequest(s.req)
+		n++
+	}
+	return n
 }
 
 // nudgeStalledPipeline re-injects a Received/Validated request into the
@@ -2893,34 +2995,53 @@ func (sm *SyncManager) checkStaleRequests() {
 	now := time.Now()
 	timedOut := 0
 	evictedDead := 0
+	var dead []wire.Hash256
+	var stale []*blockRequest
 	for hash, req := range sm.inflight {
 		// W13 fix: if the owning peer is gone (disconnected or flagged for
 		// ban), free the slot immediately — don't wait for the adaptive
 		// timeout (up to 120 s × 16 slots per dead peer = the W8/W12 wedge).
 		if req.Peer == nil || !req.Peer.IsConnected() || req.Peer.ShouldBan() {
-			delete(sm.inflight, hash)
-			releasePeerSlot(req)
-			evictedDead++
+			dead = append(dead, hash)
 			continue
 		}
-
-		timeout := sm.requestTimeout(req)
-		if now.Sub(req.RequestAt) > timeout {
-			timedOut++
-			// W35: do NOT score misbehavior for block-download timeouts.
-			// Mute (no first byte) uses FirstByteTimeout and does not
-			// double the complete-transfer window — that doubling is
-			// why 967594's third rotation waited ~6 min.
-			if req.FirstByteAt.IsZero() {
-				addr := ""
-				if req.Peer != nil {
-					addr = req.Peer.Address()
-				}
-				log.Printf("sync: fetch no-first-byte height=%d peer=%s wait=%s ttfb-timeout=%s — rotating",
-					req.Height, addr, now.Sub(req.RequestAt).Round(time.Millisecond), FirstByteTimeout)
-			}
-			sm.rotateTimedOutRequest(req)
+		if now.Sub(req.RequestAt) > sm.requestTimeout(req) {
+			stale = append(stale, req)
 		}
+	}
+	for _, hash := range dead {
+		req := sm.inflight[hash]
+		delete(sm.inflight, hash)
+		if req != nil {
+			releasePeerSlot(req)
+		}
+		evictedDead++
+	}
+	for _, req := range stale {
+		if _, still := sm.inflight[req.Hash]; !still {
+			continue
+		}
+		timedOut++
+		// W35: do NOT score misbehavior for block-download timeouts.
+		// Mute (no first byte) uses FirstByteTimeout and does not
+		// double the complete-transfer window — that doubling is
+		// why 967594's third rotation waited ~6 min.
+		if req.FirstByteAt.IsZero() {
+			addr := ""
+			if req.Peer != nil {
+				addr = req.Peer.Address()
+			}
+			log.Printf("sync: fetch no-first-byte height=%d peer=%s wait=%s ttfb-timeout=%s — rotating",
+				req.Height, addr, now.Sub(req.RequestAt).Round(time.Millisecond), FirstByteTimeout)
+			if sm.isPeerPipelineHeadLocked(req) {
+				extra := sm.rotateMutePeerPipelineLocked(req)
+				if extra > 1 {
+					timedOut += extra - 1
+				}
+				continue
+			}
+		}
+		sm.rotateTimedOutRequest(req)
 	}
 	if evictedDead > 0 {
 		log.Printf("sync: evicted %d in-flight blocks from disconnected/banned peers", evictedDead)
@@ -2946,11 +3067,19 @@ func (sm *SyncManager) getStallTimeout(peer *Peer) time.Duration {
 // byte of the body) uses FirstByteTimeout so we rotate in seconds, not
 // the 128s complete-transfer window. Once bytes are flowing, the
 // complete-transfer timeout (BaseStallTimeout, possibly adapted) applies.
+//
+// Non-head inflight bodies on the same peer are waiting on the
+// connection, not on a mute peer — live 9ccaa90 cancelled 9 of 10
+// inflight at 16s while the head was still arriving. They get a long
+// timeout until they become the head (armPeerPipelineHeadLocked).
 func (sm *SyncManager) requestTimeout(req *blockRequest) time.Duration {
 	if req == nil {
 		return BaseStallTimeout
 	}
 	timeout := sm.getStallTimeout(req.Peer)
+	if req.Peer != nil && !sm.isPeerPipelineHeadLocked(req) {
+		return 24 * time.Hour
+	}
 	if req.FirstByteAt.IsZero() && FirstByteTimeout < timeout {
 		return FirstByteTimeout
 	}
@@ -2972,7 +3101,11 @@ func (sm *SyncManager) noteBlockFirstByte(peer *Peer, payloadLen uint32) {
 		if req.Peer != peer || !req.FirstByteAt.IsZero() {
 			continue
 		}
-		if oldest == nil || req.RequestAt.Before(oldest.RequestAt) {
+		// Lowest height, not earliest RequestAt: we issue getdata in
+		// height order and the peer sends one body at a time. RequestAt
+		// jitter plus map iteration made live 9ccaa90 stamp height
+		// 967608 while the payload size matched 967597.
+		if oldest == nil || req.Height < oldest.Height {
 			oldest = req
 		}
 	}
@@ -3188,6 +3321,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 
 		// Reduce stall timeout for successful peer
 		sm.decreaseStallTimeout(peer)
+		sm.armPeerPipelineHeadLocked(peer)
 		sm.mu.Unlock()
 	}
 
