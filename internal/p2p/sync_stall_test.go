@@ -1032,3 +1032,251 @@ func (l *lockedLogWriter) Write(p []byte) (int, error) {
 	defer l.mu.Unlock()
 	return l.w.Write(p)
 }
+
+// liveLargeSerializedBytes is block 967558's size. 09695ad sized
+// BaseStallTimeout against 1.54 MB (967495); this residual is a larger
+// body whose mute-timeout path left inflight=0 for minutes.
+const liveLargeSerializedBytes = 1_691_146
+
+// largeSerializedNearMaxBlock is a CheckBlockSanity-valid regtest block
+// whose witness-inclusive serialized size is ≥1.6 MB and whose weight is
+// in [3.9M, MaxBlockWeight] — the 967558 shape (1,691,146 B / 3,993,097 WU).
+// nearMaxWeightBlock pads with OP_RETURN so it serializes to ~981 KiB; a
+// bytes/sec test on that fixture cannot see this residual.
+func largeSerializedNearMaxBlock(t *testing.T, prev wire.Hash256, timestamp uint32) *wire.MsgBlock {
+	t.Helper()
+	coinbase := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x01, 0x01},
+			Sequence:         0xFFFFFFFF,
+		}},
+		TxOut: []*wire.TxOut{{Value: 50e8, PkScript: []byte{0x51}}},
+	}
+	pad := bytes.Repeat([]byte{0x6a}, 10000)
+	padding := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: coinbase.TxHash(), Index: 0},
+			SignatureScript:  []byte{0x51},
+			Sequence:         0xFFFFFFFF,
+		}},
+	}
+	// ~50 × 10 KiB OP_RETURN ≈ 500 KiB non-witness; witness fills serialized
+	// size to ≥1.6 MB while weight stays under the cap.
+	for i := 0; i < 50; i++ {
+		padding.TxOut = append(padding.TxOut, &wire.TxOut{Value: 0, PkScript: pad})
+	}
+	witChunk := bytes.Repeat([]byte{0x00}, 20000)
+	block := &wire.MsgBlock{Transactions: []*wire.MsgTx{coinbase, padding}}
+	for i := 0; i < 200; i++ {
+		var ser bytes.Buffer
+		if err := block.Serialize(&ser); err != nil {
+			t.Fatalf("Serialize: %v", err)
+		}
+		w := consensus.CalcBlockWeight(block)
+		size := ser.Len()
+		if size >= 1_600_000 && w >= 3_900_000 && w <= consensus.MaxBlockWeight {
+			break
+		}
+		if w > consensus.MaxBlockWeight {
+			if len(padding.TxOut) > 1 {
+				padding.TxOut = padding.TxOut[:len(padding.TxOut)-1]
+				continue
+			}
+			if n := len(padding.TxIn[0].Witness); n > 0 {
+				padding.TxIn[0].Witness = padding.TxIn[0].Witness[:n-1]
+				continue
+			}
+			t.Fatalf("cannot fit ≥1.6MB serialized near-max-weight block (size=%d weight=%d)", size, w)
+		}
+		if size < 1_600_000 {
+			padding.TxIn[0].Witness = append(padding.TxIn[0].Witness, witChunk)
+			continue
+		}
+		padding.TxOut = append(padding.TxOut, &wire.TxOut{Value: 0, PkScript: pad})
+	}
+	hashes := []wire.Hash256{coinbase.TxHash(), padding.TxHash()}
+	block.Header = wire.BlockHeader{
+		Version:    1,
+		PrevBlock:  prev,
+		MerkleRoot: consensus.CalcMerkleRoot(hashes),
+		Timestamp:  timestamp,
+		Bits:       0x207fffff,
+	}
+	mineRegtestHeader(&block.Header)
+	var ser bytes.Buffer
+	if err := block.Serialize(&ser); err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	w := consensus.CalcBlockWeight(block)
+	if ser.Len() < 1_600_000 {
+		t.Fatalf("large-serialized fixture is %d bytes, want ≥1600000 (967558 was %d)", ser.Len(), liveLargeSerializedBytes)
+	}
+	if w < 3_900_000 || w > consensus.MaxBlockWeight {
+		t.Fatalf("large-serialized fixture weight %d not in [3900000, %d]", w, consensus.MaxBlockWeight)
+	}
+	if err := consensus.CheckBlockSanity(block, consensus.RegtestParams().PowLimit); err != nil {
+		t.Fatalf("large-serialized fixture failed CheckBlockSanity: %v", err)
+	}
+	return block
+}
+
+// TestMuteMidBodyLargeSerializedBlockRotatesBeforeNextInflight is the
+// 2026-09-18 residual control after 09695ad. Live on 967558 (1,691,146 B /
+// weight 3,993,097): mute mid-body, then
+//
+//	stall detected … inflight=0, peer=true, retries=3  (10m14s)
+//	block 967558 is pending but not downloading, clearing peer restriction
+//
+// A peer is connected and rotation has been entered, but nothing is
+// outstanding. inflight=0 is the observable — a bytes/sec test on a 1.54 MB
+// body passes on this path. After the mute timeout, the stall pass must not
+// arm a backoff or clear the mute-peer skip, so the next requestBlocks
+// produces a new inflight on a different peer (time-to-next-inflight) and
+// that body connects.
+func TestMuteMidBodyLargeSerializedBlockRotatesBeforeNextInflight(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	genesis := idx.Genesis()
+	block := largeSerializedNearMaxBlock(t, genesis.Hash, genesis.Header.Timestamp+600)
+	node, err := idx.AddHeader(block.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+
+	adv := &advancingChainConnector{mockChainConnector: mockChainConnector{tipHeight: 0, tipTimestamp: 1}}
+	pm := &PeerManager{}
+	mute := createMockPeer("mute.example:8333", node.Height)
+	good := createMockPeer("good.example:8333", node.Height)
+	pm.InsertConnectedPeer(mute)
+	pm.InsertConnectedPeer(good)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		PeerManager:    pm,
+		ChainManager:   adv,
+		DownloadWindow: 8,
+	})
+	sm.Start()
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			sm.Stop()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Stop did not complete within 5s")
+		}
+	}()
+
+	req := &blockRequest{
+		Hash:   node.Hash,
+		Height: node.Height,
+		State:  BlockDownloadPending,
+	}
+	sm.mu.Lock()
+	sm.blockQueue = []*blockRequest{req}
+	sm.nextHeight = node.Height
+	sm.mu.Unlock()
+
+	sm.requestBlocks()
+	gotMute := drainGetData(mute)
+	if len(gotMute) != 1 || gotMute[0] != node.Hash {
+		t.Fatalf("mute peer getdata = %v, want [%s]", gotMute, node.Hash)
+	}
+	if extra := drainGetData(good); len(extra) != 0 {
+		t.Fatalf("good peer got getdata before mute timeout: %v", extra)
+	}
+	sm.mu.Lock()
+	if req.State != BlockDownloadInFlight || req.Peer != mute {
+		sm.mu.Unlock()
+		t.Fatalf("after requestBlocks: state=%d peer=%v, want InFlight on mute", req.State, req.Peer != nil)
+	}
+	// Mute goes quiet mid-body. Production: checkStaleRequests (1s) times
+	// the request out, then checkForStall (10s) sees Pending + inflight=0
+	// because nextHeight has already been stuck > BaseStallTimeout.
+	req.RequestAt = time.Now().Add(-BaseStallTimeout - time.Second)
+	sm.mu.Unlock()
+
+	sm.checkStaleRequests()
+
+	sm.mu.Lock()
+	if req.State != BlockDownloadPending {
+		st := req.State
+		sm.mu.Unlock()
+		t.Fatalf("after mute timeout: state=%d, want Pending", st)
+	}
+	if _, ok := sm.inflight[req.Hash]; ok {
+		sm.mu.Unlock()
+		t.Fatal("after mute timeout inflight must be empty so the residual is observable")
+	}
+	if req.RetryCount < 1 || req.Peer != mute {
+		retries, peerSet := req.RetryCount, req.Peer != nil
+		sm.mu.Unlock()
+		t.Fatalf("after mute timeout: retries=%d peer=%v, want ≥1 and mute skip-hint kept", retries, peerSet)
+	}
+	now := time.Now()
+	sm.checkForStall(now, node.Height, now.Add(-BaseStallTimeout-time.Second))
+	gated := !req.NextRetryAt.IsZero() && now.Before(req.NextRetryAt)
+	skipCleared := req.Peer != mute
+	inflightAfterStall := len(sm.inflight)
+	sm.mu.Unlock()
+
+	if gated || skipCleared {
+		t.Fatalf("time-to-next-inflight blocked after mute timeout: backoff=%v skipCleared=%v inflight=%d (live 967558: inflight=0, peer=true, then 'clearing peer restriction')",
+			time.Until(req.NextRetryAt).Round(time.Millisecond), skipCleared, inflightAfterStall)
+	}
+
+	sm.requestBlocks()
+
+	if extra := drainGetData(mute); len(extra) != 0 {
+		t.Fatalf("mute peer was asked again after timeout (%v) — must rotate away", extra)
+	}
+	gotGood := drainGetData(good)
+	if len(gotGood) != 1 || gotGood[0] != node.Hash {
+		t.Fatalf("good peer getdata = %v, want [%s] (time-to-next-inflight did not rotate)", gotGood, node.Hash)
+	}
+	sm.mu.Lock()
+	_, inFlight := sm.inflight[req.Hash]
+	rotatedPeer := req.Peer
+	sm.mu.Unlock()
+	if !inFlight || rotatedPeer != good {
+		t.Fatalf("after rotation: inflight=%v peer=%v, want inflight on good (inflight=0 is the residual)",
+			inFlight, rotatedPeer != nil)
+	}
+
+	sm.HandleBlock(good, &MsgBlock{Block: block})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		sm.mu.Lock()
+		st := req.State
+		nh := sm.nextHeight
+		sm.mu.Unlock()
+		if st == BlockDownloadConnected {
+			if adv.connectCount() != 1 {
+				t.Fatalf("ConnectBlock called %d times, want 1", adv.connectCount())
+			}
+			_, tip := adv.BestBlock()
+			if tip != node.Height {
+				t.Fatalf("tip height %d, want %d (connect cursor did not advance)", tip, node.Height)
+			}
+			if nh != node.Height+1 {
+				t.Fatalf("nextHeight=%d, want %d (connect cursor)", nh, node.Height+1)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	sm.mu.Lock()
+	st := req.State
+	nh := sm.nextHeight
+	sm.mu.Unlock()
+	t.Fatalf("rotated ≥1.6MB body did not connect: state=%d nextHeight=%d connects=%d",
+		st, nh, adv.connectCount())
+}

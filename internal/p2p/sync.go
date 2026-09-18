@@ -310,6 +310,18 @@ func (sm *SyncManager) applyStallRecovery(req *blockRequest, now time.Time) {
 		return
 	}
 	if req.State == BlockDownloadPending {
+		// Mute-timeout rotation is in progress: Peer is the skip hint
+		// requestBlocks uses once RetryCount >= MaxRetriesBeforeRotate, and
+		// NextRetryAt is zero so the 100ms request tick may fire.
+		// applyPendingStallRecovery would nil Peer ("clearing peer
+		// restriction") and arm stallBackoff — live 967558 sat
+		// inflight=0, peer=true, retries=3 for 10+ minutes on a 1.69 MB
+		// body, then re-selected the mute peer. Leave the skip hint.
+		if req.Peer != nil && req.RetryCount >= MaxRetriesBeforeRotate {
+			log.Printf("sync: block %d pending rotation off %s (retries=%d) — leaving skip hint, not arming backoff",
+				req.Height, req.Peer.Address(), req.RetryCount)
+			return
+		}
 		backoff, escalate := applyPendingStallRecovery(req, now, inFlight)
 		log.Printf("sync: block %d is pending but not downloading, clearing peer restriction (backoff %s, escalate=%v)",
 			req.Height, backoff, escalate)
@@ -2664,10 +2676,14 @@ func (sm *SyncManager) requestBlocks() {
 			break
 		}
 
-		// Mark request as in-flight
+		// Mark request as in-flight. Consume any leftover stall/notfound
+		// backoff so a later mute timeout is not still gated by it
+		// (checkStaleRequests used to leave NextRetryAt set, so the
+		// 100ms request tick skipped the rotate).
 		req.Peer = selectedPeer
 		req.State = BlockDownloadInFlight
 		req.RequestAt = time.Now().Add(requestJitter())
+		req.NextRetryAt = time.Time{}
 		sm.inflight[req.Hash] = req
 		peerInflight[selectedPeer.Address()]++
 
@@ -2759,11 +2775,13 @@ func (sm *SyncManager) checkStaleRequests() {
 			// Increase timeout for this peer (adaptive backoff)
 			sm.increaseStallTimeout(req.Peer)
 
-			// Reset request for retry — keep Peer reference so requestBlocks
-			// can rotate to a different peer on the next attempt.
+			// Reset request for retry — keep Peer so requestBlocks skips it,
+			// and clear NextRetryAt so the next 100ms tick rotates immediately
+			// (same contract as applyStallRecovery's InFlight timeout).
 			delete(sm.inflight, hash)
 			req.State = BlockDownloadPending
 			req.RetryCount++
+			req.NextRetryAt = time.Time{}
 			// Don't nil out req.Peer — requestBlocks uses it to avoid the same peer
 		}
 	}
