@@ -302,9 +302,11 @@ func (c *ChainDB) GetBlockHashByHeight(height int32) (wire.Hash256, error) {
 	return hash, nil
 }
 
-// HistoryFloor returns the lowest height in 1..tip whose block BODY is
-// stored, if height 1 has no body. ok=false means no prefix hole (tip==0
-// or height 1 has a body).
+// HistoryFloor is FirstBody: the lowest height in 1..tip whose block
+// BODY is stored, if height 1 has no body. ok=false means no prefix hole
+// (tip==0 or height 1 has a body). Does not notice interior holes —
+// that is BodyFloor. Used as the default audit floor so a hole above
+// the first body is visible.
 //
 // Bitcoin Core's block index is dense from genesis even on a pruned node
 // — getblockhash(1) always resolves, and pruned/pruneheight describe
@@ -318,11 +320,20 @@ func (c *ChainDB) GetBlockHashByHeight(height int32) (wire.Hash256, error) {
 // with missing bodies is still detected. This is an honest-limitation
 // detector only — it does not backfill genesis→floor.
 func (c *ChainDB) HistoryFloor(tip int32, hashAt func(int32) (wire.Hash256, bool)) (int32, bool) {
+	return c.FirstBody(tip, hashAt)
+}
+
+// FirstBody is the lowest height > 0 whose body is stored, if height 1
+// is missing. 0,false means no prefix gap. Binary search, O(log tip).
+func (c *ChainDB) FirstBody(tip int32, hashAt func(int32) (wire.Hash256, bool)) (int32, bool) {
 	if c == nil || tip <= 0 {
 		return 0, false
 	}
 	if c.hasBodyAt(1, hashAt) {
 		return 0, false
+	}
+	if !c.hasBodyAt(tip, hashAt) {
+		return tip, true
 	}
 	lo, hi := int32(1), tip
 	for lo < hi {
@@ -336,19 +347,111 @@ func (c *ChainDB) HistoryFloor(tip int32, hashAt func(int32) (wire.Hash256, bool
 	return lo, true
 }
 
-func (c *ChainDB) hasBodyAt(height int32, hashAt func(int32) (wire.Hash256, bool)) bool {
-	var hash wire.Hash256
-	var found bool
-	if hashAt != nil {
-		hash, found = hashAt(height)
-	} else {
-		h, err := c.GetBlockHashByHeight(height)
-		hash, found = h, err == nil
+// BodyFloor is the first height of the contiguous body run ending at
+// tip. Core BlockManager::GetFirstBlock / getblockchaininfo.pruneheight:
+// "the first block unpruned, all previous blocks were pruned". Walk
+// tip→genesis until the parent is missing. 0,false means height 1..tip
+// are all present. Otherwise H such that H..tip all have bodies and H-1
+// does not (or tip if even the tip is missing).
+//
+// An interior hole raises this above FirstBody. Live nimrod 2026-09-18:
+// first body 952185, hole 966302..967347, suffix 967348 — pruneheight
+// must be 967348, not 952185. Does not backfill. O(contiguous suffix).
+func (c *ChainDB) BodyFloor(tip int32, hashAt func(int32) (wire.Hash256, bool)) (int32, bool) {
+	if c == nil || tip <= 0 {
+		return 0, false
 	}
+	if !c.hasBodyAt(tip, hashAt) {
+		return tip, true
+	}
+	h := tip
+	for h > 0 {
+		if !c.hasBodyAt(h-1, hashAt) {
+			if h == 1 {
+				return 0, false
+			}
+			return h, true
+		}
+		h--
+	}
+	return 0, false
+}
+
+// RetainedBodyAudit is the result of walking [floor, tip] and asking
+// whether each connected active-chain body is actually readable.
+type RetainedBodyAudit struct {
+	Floor     int32   // lowest height treated as retained (inclusive)
+	Tip       int32   // scan upper bound
+	Checked   int     // heights inspected in [floor, tip]
+	HoleCount int     // connected heights whose body is missing
+	Holes     []int32 // sample of hole heights, ascending, capped at maxHoles
+	Truncated bool    // true if HoleCount > len(Holes)
+}
+
+// AuditRetainedBodies walks every height between the retained floor and
+// tip and records connected blocks whose body is unreadable.
+//
+// Floor is pruneHeight when that is >= 0. Otherwise it is FirstBody —
+// the lowest height getblockchaininfo might have claimed — so a hole
+// above that floor is reported. Inferring the floor from the contiguous
+// suffix made the audit structurally unable to fail: the hole decided
+// where it started looking (nimrod 87ac1d8: floor 967348, checked=145,
+// hole 966302..967347 never visited).
+//
+// A height with no index row is not "connected" — that is a snapshot
+// hole, not a retained-range body hole. Does not abort the node.
+func (c *ChainDB) AuditRetainedBodies(tip, pruneHeight int32, maxHoles int, hashAt func(int32) (wire.Hash256, bool)) RetainedBodyAudit {
+	var result RetainedBodyAudit
+	result.Tip = tip
+	if c == nil || tip < 0 {
+		return result
+	}
+	floor := pruneHeight
+	if pruneHeight < 0 {
+		first, hole := c.FirstBody(tip, hashAt)
+		if hole {
+			floor = first
+		} else {
+			floor = 0
+		}
+	}
+	if floor > tip {
+		result.Floor = floor
+		return result
+	}
+	result.Floor = floor
+	result.Checked = int(tip - floor + 1)
+	if maxHoles <= 0 {
+		maxHoles = 64
+	}
+	for h := floor; h <= tip; h++ {
+		hash, indexed := c.hashAtHeight(h, hashAt)
+		have := indexed && c.HasBlockBody(hash)
+		if indexed && !have {
+			result.HoleCount++
+			if len(result.Holes) < maxHoles {
+				result.Holes = append(result.Holes, h)
+			}
+		}
+	}
+	result.Truncated = result.HoleCount > len(result.Holes)
+	return result
+}
+
+func (c *ChainDB) hasBodyAt(height int32, hashAt func(int32) (wire.Hash256, bool)) bool {
+	hash, found := c.hashAtHeight(height, hashAt)
 	if !found {
 		return false
 	}
 	return c.HasBlockBody(hash)
+}
+
+func (c *ChainDB) hashAtHeight(height int32, hashAt func(int32) (wire.Hash256, bool)) (wire.Hash256, bool) {
+	if hashAt != nil {
+		return hashAt(height)
+	}
+	h, err := c.GetBlockHashByHeight(height)
+	return h, err == nil
 }
 
 // GetChainState retrieves the current chain state.

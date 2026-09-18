@@ -136,3 +136,81 @@ func TestHistoryFloor_HashAtCallbackBeatsMissingIndex(t *testing.T) {
 		t.Fatalf("callback-driven floor = %d, %v; want 10, true", floor, ok)
 	}
 }
+
+func TestHistoryFloor_InteriorHoleStillReportsFirstBody(t *testing.T) {
+	// HistoryFloor is first-body (audit floor). pruneheight is BodyFloor
+	// (contiguous suffix). This fixture is the live 87ac1d8 shape:
+	// prefix miss 1..5, island 6..10, hole 11..13, suffix 14..20.
+	c := NewChainDB(NewMemDB())
+	seedHeight(t, c, 0, true)
+	for n := int32(1); n <= 20; n++ {
+		withBody := (n >= 6 && n <= 10) || n >= 14
+		seedHeight(t, c, n, withBody)
+	}
+	floor, ok := c.HistoryFloor(20, nil)
+	if !ok || floor != 6 {
+		t.Fatalf("HistoryFloor (first body) = %d, %v; want 6, true", floor, ok)
+	}
+}
+
+func TestBodyFloor_CompleteChainIsZero(t *testing.T) {
+	c := NewChainDB(NewMemDB())
+	for n := int32(0); n <= 8; n++ {
+		seedHeight(t, c, n, true)
+	}
+	if floor, ok := c.BodyFloor(8, nil); ok {
+		t.Fatalf("complete chain BodyFloor = %d, %v; want 0, false", floor, ok)
+	}
+}
+
+func TestBodyFloor_PrefixGapMatchesFirstBody(t *testing.T) {
+	c := NewChainDB(NewMemDB())
+	seedHeight(t, c, 0, true)
+	for n := int32(1); n <= 20; n++ {
+		seedHeight(t, c, n, n >= 10)
+	}
+	floor, ok := c.BodyFloor(20, nil)
+	if !ok || floor != 10 {
+		t.Fatalf("prefix-only BodyFloor = %d, %v; want 10, true", floor, ok)
+	}
+	first, fok := c.FirstBody(20, nil)
+	if !fok || first != 10 {
+		t.Fatalf("FirstBody = %d, %v; want 10, true", first, fok)
+	}
+}
+
+func TestBodyFloor_InteriorHoleRaisesToContiguousSuffix(t *testing.T) {
+	c := NewChainDB(NewMemDB())
+	seedHeight(t, c, 0, true)
+	for n := int32(1); n <= 20; n++ {
+		withBody := (n >= 6 && n <= 10) || n >= 14
+		seedHeight(t, c, n, withBody)
+	}
+	first, ok := c.FirstBody(20, nil)
+	if !ok || first != 6 {
+		t.Fatalf("FirstBody = %d, %v; want 6, true", first, ok)
+	}
+	floor, ok := c.BodyFloor(20, nil)
+	if !ok || floor != 14 {
+		t.Fatalf("BodyFloor = %d, %v; want 14, true (contiguous suffix)", floor, ok)
+	}
+}
+
+func TestBodyFloor_TipMissingReportsTip(t *testing.T) {
+	c := NewChainDB(NewMemDB())
+	seedHeight(t, c, 0, true)
+	floor, ok := c.BodyFloor(50, nil)
+	if !ok || floor != 50 {
+		t.Fatalf("no bodies at all: BodyFloor = %d, %v; want 50, true", floor, ok)
+	}
+}
+
+func TestFirstBody_NoneWhenHeightOneHasBody(t *testing.T) {
+	c := NewChainDB(NewMemDB())
+	for n := int32(0); n <= 10; n++ {
+		seedHeight(t, c, n, true)
+	}
+	if floor, ok := c.FirstBody(10, nil); ok {
+		t.Fatalf("dense bodies FirstBody = %d, %v; want 0, false", floor, ok)
+	}
+}

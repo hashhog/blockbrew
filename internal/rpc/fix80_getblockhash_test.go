@@ -45,6 +45,14 @@ func TestFIX80_GetBlockHash_ChainDBFallback(t *testing.T) {
 		if err := cdb.SetBlockHeight(m.height, m.hash); err != nil {
 			t.Fatalf("SetBlockHeight(%d): %v", m.height, err)
 		}
+		// getblockhash consults the body store for height > 0. An index
+		// row without a body is pruned data, not a successful lookup.
+		blk := &wire.MsgBlock{
+			Header: wire.BlockHeader{Nonce: uint32(m.height)},
+		}
+		if err := cdb.StoreBlock(m.hash, blk); err != nil {
+			t.Fatalf("StoreBlock(%d): %v", m.height, err)
+		}
 	}
 
 	// Verify chainDB roundtrip for each mapping.  Note that, since

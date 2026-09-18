@@ -989,6 +989,43 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	})
 	log.Printf("Chain manager initialized (parallel scripts: %v, pruning: %v)", cfg.ParallelScripts, pruner.IsEnabled())
 
+	// Self-check: every height between the first stored body and the tip
+	// must have a readable body. A connected block whose body is missing
+	// fails wallet rescan and peer getdata at exactly that height.
+	// Scan from the first stored body (what getblockchaininfo used to
+	// advertise), not from the contiguous suffix. pruneheight itself is
+	// the contiguous floor — they disagree exactly when there is a hole
+	// the operator needs to hear about. Log; do not refuse to boot.
+	{
+		_, tipHeight := chainMgr.BestBlock()
+		hashAt := func(h int32) (wire.Hash256, bool) {
+			if tip := chainMgr.BestBlockNode(); tip != nil {
+				if anc := tip.GetAncestor(h); anc != nil {
+					return anc.Hash, true
+				}
+			}
+			hash, err := chainDB.GetBlockHashByHeight(h)
+			return hash, err == nil
+		}
+		advertised, _ := chainDB.BodyFloor(tipHeight, hashAt)
+		audit := chainDB.AuditRetainedBodies(tipHeight, -1, 64, hashAt)
+		if advertised != audit.Floor {
+			log.Printf("pruneheight is the contiguous suffix; first body is lower pruneheight=%d firstBody=%d tip=%d",
+				advertised, audit.Floor, audit.Tip)
+		}
+		if audit.HoleCount > 0 {
+			firstHole := int32(-1)
+			if len(audit.Holes) > 0 {
+				firstHole = audit.Holes[0]
+			}
+			log.Printf("retained-range body hole floor=%d tip=%d checked=%d holes=%d firstHole=%d truncated=%v pruneheight=%d",
+				audit.Floor, audit.Tip, audit.Checked, audit.HoleCount, firstHole, audit.Truncated, advertised)
+		} else {
+			log.Printf("retained-range bodies contiguous floor=%d tip=%d checked=%d pruneheight=%d",
+				audit.Floor, audit.Tip, audit.Checked, advertised)
+		}
+	}
+
 	// Wire the wait-family-RPC tip-change notifier (Core KernelNotifications
 	// blockTip / WaitTipChanged). Pulsed by chainMgr.updateTipCache on every
 	// tip advance (ConnectBlock IBD + post-IBD, submitblock/generate, and both

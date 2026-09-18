@@ -25,9 +25,18 @@ import (
 // the node simply does not retain is -1 "Block not available (pruned data)"
 // (same string Core's getblock uses for pruned bodies).
 //
+// pruneheight is the first height of the contiguous run to the tip
+// (Core GetFirstBlock), NOT the first stored body. An interior hole
+// raises that floor; advertising the first body over-claims complete
+// data (nimrod 87ac1d8: pruneheight=952185 while 966302..967347 were
+// unreadable). The retained-range audit scans from the first body so
+// a hole above that floor is visible. getblockhash consults the body
+// store, not a floor cutoff — an island below pruneheight still
+// returns its hash, an interior hole returns -1.
+//
 // This commit reports the truth. It does not backfill genesis→floor.
 //
-// CONTROL: go test ./internal/storage/ ./internal/rpc/ -count=1 -timeout 120s -run 'TestHistoryFloor_|TestPrunedHistory_'
+// CONTROL: go test ./internal/storage/ ./internal/rpc/ -count=1 -timeout 120s -run 'TestHistoryFloor_|TestBodyFloor_|TestFirstBody_|TestRetainedBody_|TestPrunedHistory_'
 
 const (
 	prunedHistoryFloor = int32(10)
@@ -116,9 +125,9 @@ func indexHoleServer(t *testing.T, floor, tip int32) *Server {
 }
 
 // connectedBodyHoleRig mines a dense header+body chain 1..tip, then deletes
-// bodies below floor. Headers stay in memory (getblockhash of an in-range
-// height still answers, matching live blockbrew) while getblock of those
-// hashes cannot serve a body. -prune is off.
+// bodies below floor. Headers stay in memory (getblock-by-hash of a known
+// header still reaches the body-missing path) while getblockhash of those
+// heights consults the body store and returns -1. -prune is off.
 type connectedBodyHoleRig struct {
 	server *Server
 	db     *storage.ChainDB
@@ -196,6 +205,57 @@ func newCompleteChainRig(t *testing.T, tip int32) *connectedBodyHoleRig {
 	return newConnectedBodyHoleRig(t, 1, tip)
 }
 
+// newGappedRetentionRig is the live 87ac1d8 shape, scaled: unretained
+// prefix, an island of bodies, a hole, then a contiguous suffix to the
+// tip. 2026-09-18 mainnet: first body 952185, hole 966302..967347,
+// suffix 967348..tip.
+func newGappedRetentionRig(t *testing.T, firstBody, holeLo, holeHi, tip int32) *connectedBodyHoleRig {
+	t.Helper()
+	rig := newConnectedBodyHoleRig(t, firstBody, tip)
+	rig.punchBodies(t, holeLo, holeHi)
+	return rig
+}
+
+func (r *connectedBodyHoleRig) punchBodies(t *testing.T, lo, hi int32) {
+	t.Helper()
+	tipNode := r.cm.BestBlockNode()
+	if tipNode == nil {
+		t.Fatal("no tip")
+	}
+	for h := lo; h <= hi; h++ {
+		anc := tipNode.GetAncestor(h)
+		if anc == nil {
+			t.Fatalf("no ancestor at height %d", h)
+		}
+		if err := r.db.DB().Delete(storage.MakeBlockDataKey(anc.Hash)); err != nil {
+			t.Fatalf("delete body at %d: %v", h, err)
+		}
+		if r.db.HasBlockBody(anc.Hash) {
+			t.Fatalf("body still present at height %d after delete", h)
+		}
+	}
+}
+
+func (r *connectedBodyHoleRig) hashAt(t *testing.T, height int32) string {
+	t.Helper()
+	tipNode := r.cm.BestBlockNode()
+	if tipNode == nil {
+		t.Fatal("no tip")
+	}
+	anc := tipNode.GetAncestor(height)
+	if anc == nil {
+		t.Fatalf("no ancestor at height %d", height)
+	}
+	return anc.Hash.String()
+}
+
+func (r *connectedBodyHoleRig) bodyViaGetblock(t *testing.T, height int32) bool {
+	t.Helper()
+	hexHash := r.hashAt(t, height)
+	resp := testRPCRequest(t, r.server.handleRPC, "getblock", []interface{}{hexHash, float64(0)}, "", "")
+	return resp.Error == nil
+}
+
 func rpcJSONMap(t *testing.T, server *Server, method string, params []interface{}) map[string]interface{} {
 	t.Helper()
 	resp := testRPCRequest(t, server.handleRPC, method, params, "", "")
@@ -255,14 +315,14 @@ func TestPrunedHistory_DenseIndexMissingBodiesReportsPrunedTrue(t *testing.T) {
 	if int32(got) != prunedHistoryFloor {
 		t.Fatalf("pruneheight = %v, want %d", m["pruneheight"], prunedHistoryFloor)
 	}
-	// Index/headers are dense: getblockhash of an in-range retained-header
-	// height still returns the hash (Core getblockhash is index-only).
+	// Headers are dense but the body is gone: getblockhash consults the
+	// body store, not a floor cutoff, and must not hand out the index hash.
 	resp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(5)}, "", "")
-	if resp.Error != nil {
-		t.Fatalf("getblockhash(5) on dense headers must still return the hash, got %v", resp.Error)
+	if resp.Error == nil {
+		t.Fatal("getblockhash(5) must not return a hash for a body we do not hold")
 	}
-	if _, ok := resp.Result.(string); !ok {
-		t.Fatalf("getblockhash(5) result type %T, want string", resp.Result)
+	if resp.Error.Code != RPCErrMisc || resp.Error.Message != prunedDataMsg {
+		t.Fatalf("got %v, want -1 %q", resp.Error, prunedDataMsg)
 	}
 }
 
@@ -337,14 +397,9 @@ func TestPrunedHistory_GetBlockHashNegativeIsStillMinus8(t *testing.T) {
 
 func TestPrunedHistory_GetBlockMissingBodyWithIndexIsPrunedData(t *testing.T) {
 	rig := newConnectedBodyHoleRig(t, prunedHistoryFloor, prunedHistoryTip)
-	hashResp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(5)}, "", "")
-	if hashResp.Error != nil {
-		t.Fatalf("getblockhash(5): %v", hashResp.Error)
-	}
-	hashHex, ok := hashResp.Result.(string)
-	if !ok {
-		t.Fatalf("getblockhash(5) type %T", hashResp.Result)
-	}
+	// Probe getblock-by-hash independently of getblockhash: the height
+	// index still resolves, the body store does not.
+	hashHex := rig.hashAt(t, 5)
 	resp := testRPCRequest(t, rig.server.handleRPC, "getblock", []interface{}{hashHex}, "", "")
 	if resp.Error == nil {
 		t.Fatal("getblock of a known-but-unretained body must error")
@@ -369,4 +424,126 @@ func TestPrunedHistory_GetBlockAtFloorHasBody(t *testing.T) {
 	if !ok || hexStr == "" {
 		t.Fatalf("getblock at floor result = %v (%T), want hex", resp.Result, resp.Result)
 	}
+}
+
+func TestPrunedHistory_InteriorHoleRaisesPruneheightToContiguousSuffix(t *testing.T) {
+	// Binary-search first-body is 6; the contiguous run to the tip
+	// starts at 14. pruneheight is the latter (Core GetFirstBlock).
+	// 385e480 advertised the first stored body and over-claimed.
+	rig := newGappedRetentionRig(t, 6, 11, 13, 20)
+	m := rpcJSONMap(t, rig.server, "getblockchaininfo", []interface{}{})
+	if pruned, _ := m["pruned"].(bool); !pruned {
+		t.Fatalf("gapped retention must report pruned=true, got %v", m["pruned"])
+	}
+	got, _ := m["pruneheight"].(float64)
+	if int32(got) != 14 {
+		t.Fatalf("pruneheight = %v, want 14 (contiguous suffix, not first body 6)", m["pruneheight"])
+	}
+	if _, present := m["prune_target_size"]; present {
+		t.Fatalf("do not invent prune_target_size when -prune is off: %v", m["prune_target_size"])
+	}
+}
+
+func TestPrunedHistory_TwoSidedProbeAtPruneheight(t *testing.T) {
+	rig := newGappedRetentionRig(t, 6, 11, 13, 20)
+	m := rpcJSONMap(t, rig.server, "getblockchaininfo", []interface{}{})
+	got, _ := m["pruneheight"].(float64)
+	floor := int32(got)
+	if floor != 14 {
+		t.Fatalf("pruneheight = %v, want 14", m["pruneheight"])
+	}
+	if !rig.db.HasBlockBody(mustAncestorHash(t, rig, 10)) {
+		t.Fatal("island body at 10 must still be on disk")
+	}
+	if rig.db.HasBlockBody(mustAncestorHash(t, rig, 11)) {
+		t.Fatal("hole at 11 must have no body")
+	}
+	if rig.db.HasBlockBody(mustAncestorHash(t, rig, 13)) {
+		t.Fatal("hole at 13 must have no body")
+	}
+	if !rig.db.HasBlockBody(mustAncestorHash(t, rig, 14)) {
+		t.Fatal("suffix start 14 must have a body")
+	}
+	if !rig.bodyViaGetblock(t, floor) {
+		t.Fatalf("getblock at pruneheight=%d must succeed", floor)
+	}
+	if !rig.bodyViaGetblock(t, floor+1) {
+		t.Fatalf("getblock at pruneheight+1=%d must succeed", floor+1)
+	}
+	if !rig.bodyViaGetblock(t, 20) {
+		t.Fatal("getblock at tip must succeed")
+	}
+	if rig.bodyViaGetblock(t, 11) {
+		t.Fatal("getblock at hole 11 must be refused")
+	}
+	if rig.bodyViaGetblock(t, 13) {
+		t.Fatal("getblock at hole 13 must be refused")
+	}
+	if rig.bodyViaGetblock(t, 5) {
+		t.Fatal("getblock below first body must be refused")
+	}
+	// Island below pruneheight is still servable by hash — we hold the body.
+	if !rig.bodyViaGetblock(t, 10) {
+		t.Fatal("getblock of island 10 must succeed (body present, below pruneheight)")
+	}
+}
+
+func TestPrunedHistory_GetBlockHashAtInteriorHoleIsMinus1NotIndexHash(t *testing.T) {
+	rig := newGappedRetentionRig(t, 6, 11, 13, 20)
+	// Height index / header walk still resolves 11.
+	if _, ok := rig.server.hashAtHeight(11); !ok {
+		t.Fatal("height 11 must still be in the index")
+	}
+	resp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(11)}, "", "")
+	if resp.Error == nil {
+		t.Fatalf("getblockhash(11) must not hand out a hash for a body we do not hold, got %v", resp.Result)
+	}
+	if resp.Error.Code != RPCErrMisc || resp.Error.Message != prunedDataMsg {
+		t.Fatalf("got %v, want -1 %q", resp.Error, prunedDataMsg)
+	}
+	atFloor := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(14)}, "", "")
+	if atFloor.Error != nil {
+		t.Fatalf("getblockhash(14) at contiguous floor: %v", atFloor.Error)
+	}
+	if _, ok := atFloor.Result.(string); !ok {
+		t.Fatalf("getblockhash(14) type %T", atFloor.Result)
+	}
+}
+
+func TestPrunedHistory_GetBlockHashOnIslandBelowHoleReturnsHash(t *testing.T) {
+	rig := newGappedRetentionRig(t, 6, 11, 13, 20)
+	// Floor cutoff over-claims: height 10 has a body, so a pruneheight
+	// cutoff of 14 would refuse a hash we can actually serve.
+	resp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(10)}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("getblockhash(10) island below pruneheight must return the hash, got %v", resp.Error)
+	}
+	got, ok := resp.Result.(string)
+	if !ok || len(got) != 64 {
+		t.Fatalf("getblockhash(10) = %v (%T), want 64-char hex", resp.Result, resp.Result)
+	}
+}
+
+func TestPrunedHistory_GetBlockHashBelowFirstBodyOnDenseHeadersIsMinus1(t *testing.T) {
+	rig := newConnectedBodyHoleRig(t, prunedHistoryFloor, prunedHistoryTip)
+	resp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(5)}, "", "")
+	if resp.Error == nil {
+		t.Fatal("getblockhash(5) must not return a hash for a body we do not hold")
+	}
+	if resp.Error.Code != RPCErrMisc || resp.Error.Message != prunedDataMsg {
+		t.Fatalf("got %v, want -1 %q", resp.Error, prunedDataMsg)
+	}
+}
+
+func mustAncestorHash(t *testing.T, rig *connectedBodyHoleRig, height int32) wire.Hash256 {
+	t.Helper()
+	tipNode := rig.cm.BestBlockNode()
+	if tipNode == nil {
+		t.Fatal("no tip")
+	}
+	anc := tipNode.GetAncestor(height)
+	if anc == nil {
+		t.Fatalf("no ancestor at height %d", height)
+	}
+	return anc.Hash
 }
