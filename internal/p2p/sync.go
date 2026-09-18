@@ -3438,7 +3438,9 @@ func (sm *SyncManager) validationWorker() {
 						// Mark as invalid in header index
 						node := sm.headerIndex.GetNode(bwr.req.Hash)
 						if node != nil {
+							sm.mu.Lock()
 							node.Status |= consensus.StatusInvalid
+							sm.mu.Unlock()
 						}
 					}
 					// Penalize the peer that sent the invalid block (the peer
@@ -3466,8 +3468,10 @@ func (sm *SyncManager) validationWorker() {
 					// lets validationChan keep draining; the block is already
 					// stored to DB (handleBlock) and will be re-delivered via
 					// the stall detector's re-request path once pressure eases.
+					sm.mu.Lock()
 					bwr.req.pipelineBlock = bwr.block
 					bwr.req.State = BlockDownloadValidated
+					sm.mu.Unlock()
 					select {
 					case sm.connectionChan <- bwr:
 					case <-sm.quit:
@@ -3478,8 +3482,10 @@ func (sm *SyncManager) validationWorker() {
 					return
 				}
 
+				sm.mu.Lock()
 				bwr.req.pipelineBlock = bwr.block
 				bwr.req.State = BlockDownloadValidated
+				sm.mu.Unlock()
 
 				// Send to connection pipeline.
 				//

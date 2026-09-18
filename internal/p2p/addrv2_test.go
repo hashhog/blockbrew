@@ -627,41 +627,9 @@ func TestADDRv2Negotiation(t *testing.T) {
 	serverWg.Add(1)
 	go func() {
 		defer serverWg.Done()
-		// Read version from client
-		msg, err := ReadMessage(serverConn, config.Network)
-		if err != nil {
-			return
-		}
-		if _, ok := msg.(*MsgVersion); !ok {
-			return
-		}
-
-		// Send our version
-		version := &MsgVersion{
-			ProtocolVersion: ProtocolVersion,
-			Services:        ServiceNodeNetwork | ServiceNodeWitness,
-			Timestamp:       time.Now().Unix(),
-			Nonce:           87654321,
-			UserAgent:       "/mocknode:0.1.0/",
-			StartHeight:     800001,
-			Relay:           true,
-		}
-		WriteMessage(serverConn, config.Network, version)
-
-		// Send sendaddrv2 (indicating server supports ADDRv2)
-		WriteMessage(serverConn, config.Network, &MsgSendAddrv2{})
-
-		// Send verack
-		WriteMessage(serverConn, config.Network, &MsgVerAck{})
-
-		// Read remaining messages until connection closes
-		for {
-			serverConn.SetReadDeadline(time.Now().Add(time.Second))
-			_, err := ReadMessage(serverConn, config.Network)
-			if err != nil {
-				return
-			}
-		}
+		_ = mockServerHandshakeOpts(serverConn, config.Network, mockHandshakeOpts{
+			extraBeforeVerack: []Message{&MsgSendAddrv2{}},
+		})
 	}()
 
 	// Start peer handshake
@@ -676,7 +644,7 @@ func TestADDRv2Negotiation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("peer.Start() failed: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(pipeHandshakeBudget):
 		t.Fatal("handshake timed out")
 	}
 
@@ -726,33 +694,9 @@ func TestADDRv2NegotiationOldPeer(t *testing.T) {
 	serverWg.Add(1)
 	go func() {
 		defer serverWg.Done()
-		// Read version
-		msg, _ := ReadMessage(serverConn, config.Network)
-		if _, ok := msg.(*MsgVersion); !ok {
-			return
-		}
-
-		// Send version (no sendaddrv2)
-		version := &MsgVersion{
-			ProtocolVersion: 70015, // Older version
-			Services:        ServiceNodeNetwork,
-			Timestamp:       time.Now().Unix(),
-			Nonce:           87654321,
-			UserAgent:       "/oldnode:0.1.0/",
-			StartHeight:     800001,
-			Relay:           true,
-		}
-		WriteMessage(serverConn, config.Network, version)
-		WriteMessage(serverConn, config.Network, &MsgVerAck{})
-
-		// Read until closed
-		for {
-			serverConn.SetReadDeadline(time.Now().Add(time.Second))
-			_, err := ReadMessage(serverConn, config.Network)
-			if err != nil {
-				return
-			}
-		}
+		_ = mockServerHandshakeOpts(serverConn, config.Network, mockHandshakeOpts{
+			protocolVersion: 70015,
+		})
 	}()
 
 	// Start handshake
@@ -766,7 +710,7 @@ func TestADDRv2NegotiationOldPeer(t *testing.T) {
 		if err != nil {
 			t.Fatalf("peer.Start() failed: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(pipeHandshakeBudget):
 		t.Fatal("handshake timed out")
 	}
 
@@ -818,25 +762,18 @@ func TestSendAddrv2AfterVerackMisbehavior(t *testing.T) {
 	go peer.writeHandler()
 
 	// Send sendaddrv2 after handshake complete - this should trigger misbehavior
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
-		WriteMessage(serverConn, config.Network, &MsgSendAddrv2{})
-		// Keep reading to allow peer to process
-		for {
-			serverConn.SetReadDeadline(time.Now().Add(time.Second))
-			_, err := ReadMessage(serverConn, config.Network)
-			if err != nil {
-				return
-			}
-		}
+		defer wg.Done()
+		sess := servePipe(serverConn, config.Network)
+		_ = writePipeMessage(serverConn, config.Network, &MsgSendAddrv2{})
+		_ = sess.waitClose(pipeHandshakeBudget)
 	}()
 
-	// Wait for message to be processed
-	time.Sleep(100 * time.Millisecond)
-
-	// Peer should have misbehavior score
-	if peer.MisbehaviorScore() == 0 {
-		t.Error("peer should have misbehavior score for sendaddrv2 after verack")
-	}
+	waitUntil(t, pipeHandshakeBudget, func() bool {
+		return peer.MisbehaviorScore() > 0
+	})
 
 	// wantsAddrv2 should still be false
 	if peer.WantsAddrv2() {
@@ -844,4 +781,5 @@ func TestSendAddrv2AfterVerackMisbehavior(t *testing.T) {
 	}
 
 	peer.Disconnect()
+	wg.Wait()
 }

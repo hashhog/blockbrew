@@ -6,6 +6,7 @@
 package p2p
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -21,13 +22,13 @@ import (
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW99_G1_MisbehavingSingleEventModel(t *testing.T) {
 	// A low-score event (score=20) must immediately discourage the peer.
-	banCalled := false
+	var banCalled atomic.Bool
 	p := &Peer{
 		addr:      "1.2.3.4:8333",
 		sendQueue: make(chan Message, SendQueueSize),
 		quit:      make(chan struct{}),
 	}
-	p.banCallback = func(_ *Peer) { banCalled = true }
+	p.banCallback = func(_ *Peer) { banCalled.Store(true) }
 
 	result := p.Misbehaving(20, "minor infraction")
 
@@ -38,11 +39,7 @@ func TestW99_G1_MisbehavingSingleEventModel(t *testing.T) {
 		t.Error("G1: shouldBan must be set immediately on first Misbehaving() call")
 	}
 
-	// Give the async goroutine a moment to execute the callback.
-	time.Sleep(10 * time.Millisecond)
-	if !banCalled {
-		t.Error("G1: ban callback must fire on first Misbehaving() call (score=20)")
-	}
+	waitUntil(t, pipeHandshakeBudget, func() bool { return banCalled.Load() })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -752,34 +749,34 @@ func TestW99_MisbehaviorScoreAccumulation(t *testing.T) {
 // TestW99_MisbehaviorThresholdReached verifies ban fires on the first call (W99 G1 fix).
 // Under the single-event model there is no threshold — the first event discourages.
 func TestW99_MisbehaviorThresholdReached(t *testing.T) {
-	banFired := false
+	var banFired atomic.Bool
 	p := &Peer{
 		addr:      "1.2.3.4:8333",
 		sendQueue: make(chan Message, SendQueueSize),
 		quit:      make(chan struct{}),
 		banCallback: func(_ *Peer) {
-			banFired = true
+			banFired.Store(true)
 		},
 	}
 
 	// Under single-event model: ANY Misbehaving() call fires the ban immediately.
 	p.Misbehaving(1, "single event")
-	if !p.shouldBan {
+	if !p.ShouldBan() {
 		t.Error("shouldBan must be true after first Misbehaving() call (single-event model)")
 	}
 
-	// Give the goroutine a moment to execute the callback.
-	time.Sleep(10 * time.Millisecond)
-	if !banFired {
-		t.Error("ban callback must fire on first Misbehaving() call")
-	}
+	waitUntil(t, pipeHandshakeBudget, func() bool { return banFired.Load() })
 
 	// Second call must be a no-op (already banned — callback must not re-fire).
-	banFired = false
+	banFired.Store(false)
 	p.Misbehaving(99, "second event — must be no-op")
-	time.Sleep(10 * time.Millisecond)
-	if banFired {
-		t.Error("ban callback must NOT re-fire when peer is already banned")
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if banFired.Load() {
+			t.Error("ban callback must NOT re-fire when peer is already banned")
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
@@ -851,9 +848,9 @@ func TestW99_VersionMessageAllowedOnlyOnce(t *testing.T) {
 // TestW99_PingTimeoutNotEnforced documents G29 bug.
 func TestW99_PingTimeoutNotEnforced(t *testing.T) {
 	p := &Peer{
-		addr:         "1.2.3.4:8333",
-		sendQueue:    make(chan Message, SendQueueSize),
-		quit:         make(chan struct{}),
+		addr:          "1.2.3.4:8333",
+		sendQueue:     make(chan Message, SendQueueSize),
+		quit:          make(chan struct{}),
 		lastPingNonce: 12345,
 		lastPingTime:  time.Now().Add(-2 * PingTimeout), // Ping sent 2× timeout ago
 	}

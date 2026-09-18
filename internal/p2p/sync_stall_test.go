@@ -14,6 +14,11 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
+// syncStallJoinBudget is the explicit wait for SyncManager.Stop and for a
+// ≥1.6 MB body to connect. Implicit 3–5s waits were a coin flip while the
+// box was loaded; the waiter still returns as soon as the condition holds.
+const syncStallJoinBudget = 30 * time.Second
+
 // TestStallShouldRearm pins #73 layer C — the stall handler starving its own
 // retry. Live timeline (mainnet 964241, 2026-08-27): once the stall backoff
 // reached 16s+ while stall passes arrived every 5-15s, EVERY pass re-armed
@@ -493,8 +498,8 @@ func TestStallRecovery_ValidatedHeadConnectsWithoutRedownload(t *testing.T) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(3 * time.Second):
-			t.Fatal("Stop did not complete within 3s")
+		case <-time.After(syncStallJoinBudget):
+			t.Fatal("Stop did not complete within 30s")
 		}
 	}()
 
@@ -518,7 +523,7 @@ func TestStallRecovery_ValidatedHeadConnectsWithoutRedownload(t *testing.T) {
 			stateAfterRecovery)
 	}
 
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(syncStallJoinBudget)
 	for time.Now().Before(deadline) {
 		sm.mu.Lock()
 		st := req.State
@@ -752,8 +757,8 @@ func TestMuteMidBodyNearMaxBlockRotatesAndConnects(t *testing.T) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Stop did not complete within 5s")
+		case <-time.After(syncStallJoinBudget):
+			t.Fatal("Stop did not complete within 30s")
 		}
 	}()
 
@@ -833,7 +838,7 @@ func TestMuteMidBodyNearMaxBlockRotatesAndConnects(t *testing.T) {
 
 	sm.HandleBlock(good, &MsgBlock{Block: block})
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(syncStallJoinBudget)
 	for time.Now().Before(deadline) {
 		sm.mu.Lock()
 		st := req.State
@@ -922,8 +927,8 @@ func TestNearMaxBodyAtRealisticRateCompletesWithoutStall(t *testing.T) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Stop did not complete within 5s")
+		case <-time.After(syncStallJoinBudget):
+			t.Fatal("Stop did not complete within 30s")
 		}
 	}()
 
@@ -1007,7 +1012,7 @@ func TestNearMaxBodyAtRealisticRateCompletesWithoutStall(t *testing.T) {
 
 	sm.HandleBlock(peer, &MsgBlock{Block: block})
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(syncStallJoinBudget)
 	for time.Now().Before(deadline) {
 		sm.mu.Lock()
 		st := req.State
@@ -1154,8 +1159,10 @@ func TestMuteMidBodyLargeSerializedBlockRotatesBeforeNextInflight(t *testing.T) 
 	pm := &PeerManager{}
 	mute := createMockPeer("mute.example:8333", node.Height)
 	good := createMockPeer("good.example:8333", node.Height)
+	// Insert mute alone for the first getdata. ConnectedPeers iterates a
+	// map, so inserting both here made which peer received the request a
+	// coin flip (the 2026-09-18 load-flake).
 	pm.InsertConnectedPeer(mute)
-	pm.InsertConnectedPeer(good)
 
 	sm := NewSyncManager(SyncManagerConfig{
 		ChainParams:    params,
@@ -1173,8 +1180,8 @@ func TestMuteMidBodyLargeSerializedBlockRotatesBeforeNextInflight(t *testing.T) 
 		}()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Stop did not complete within 5s")
+		case <-time.After(syncStallJoinBudget):
+			t.Fatal("Stop did not complete within 30s")
 		}
 	}()
 
@@ -1192,9 +1199,6 @@ func TestMuteMidBodyLargeSerializedBlockRotatesBeforeNextInflight(t *testing.T) 
 	gotMute := drainGetData(mute)
 	if len(gotMute) != 1 || gotMute[0] != node.Hash {
 		t.Fatalf("mute peer getdata = %v, want [%s]", gotMute, node.Hash)
-	}
-	if extra := drainGetData(good); len(extra) != 0 {
-		t.Fatalf("good peer got getdata before mute timeout: %v", extra)
 	}
 	sm.mu.Lock()
 	if req.State != BlockDownloadInFlight || req.Peer != mute {
@@ -1236,6 +1240,7 @@ func TestMuteMidBodyLargeSerializedBlockRotatesBeforeNextInflight(t *testing.T) 
 			time.Until(req.NextRetryAt).Round(time.Millisecond), skipCleared, inflightAfterStall)
 	}
 
+	pm.InsertConnectedPeer(good)
 	sm.requestBlocks()
 
 	if extra := drainGetData(mute); len(extra) != 0 {
@@ -1256,7 +1261,7 @@ func TestMuteMidBodyLargeSerializedBlockRotatesBeforeNextInflight(t *testing.T) 
 
 	sm.HandleBlock(good, &MsgBlock{Block: block})
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(syncStallJoinBudget)
 	for time.Now().Before(deadline) {
 		sm.mu.Lock()
 		st := req.State
@@ -1352,8 +1357,8 @@ func TestNearMaxStretchKeepsTipWithinTwoOfHeaderTip(t *testing.T) {
 		}()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
-			t.Fatal("Stop did not complete within 5s")
+		case <-time.After(syncStallJoinBudget):
+			t.Fatal("Stop did not complete within 30s")
 		}
 	}()
 
@@ -1428,7 +1433,7 @@ func TestNearMaxStretchKeepsTipWithinTwoOfHeaderTip(t *testing.T) {
 		sm.HandleBlock(peers[0], &MsgBlock{Block: blk})
 	}
 
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(syncStallJoinBudget)
 	for time.Now().Before(deadline) {
 		_, tip := adv.BestBlock()
 		if headerTip-tip <= 2 {

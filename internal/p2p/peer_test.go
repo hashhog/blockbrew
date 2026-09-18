@@ -61,7 +61,7 @@ func TestPeerHandshakeOutbound(t *testing.T) {
 		if err != nil {
 			t.Fatalf("peer.Start() failed: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(pipeHandshakeBudget):
 		t.Fatal("handshake timed out")
 	}
 
@@ -74,7 +74,9 @@ func TestPeerHandshakeOutbound(t *testing.T) {
 		t.Errorf("state = %v, want %v", peer.State(), PeerStateConnected)
 	}
 
-	// Clean up
+	// Close ordering: handshakeDone is the signal; then hang up. The
+	// mock treats the resulting closed-pipe as success, not a fixture
+	// failure.
 	peer.Disconnect()
 	wg.Wait()
 
@@ -121,7 +123,7 @@ func TestPeerHandshakeInbound(t *testing.T) {
 		if err != nil {
 			t.Fatalf("peer.Start() failed: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(pipeHandshakeBudget):
 		t.Fatal("handshake timed out")
 	}
 
@@ -138,53 +140,64 @@ func TestPeerHandshakeInbound(t *testing.T) {
 	}
 }
 
-// mockServerHandshake simulates a Bitcoin node responding to our handshake.
+type mockHandshakeOpts struct {
+	protocolVersion   int32
+	nonce             uint64
+	extraBeforeVerack []Message
+}
+
+// mockServerHandshake simulates a Bitcoin node responding to an outbound
+// handshake. The pipe reader runs concurrently with our writes so net.Pipe
+// cannot deadlock when the peer also writes (wtxidrelay/sendaddrv2/verack).
 func mockServerHandshake(conn net.Conn, magic uint32) error {
-	// 1. Wait for version from client
-	msg, err := ReadMessage(conn, magic)
-	if err != nil {
+	return mockServerHandshakeOpts(conn, magic, mockHandshakeOpts{})
+}
+
+func mockServerHandshakeOpts(conn net.Conn, magic uint32, opts mockHandshakeOpts) error {
+	sess := servePipe(conn, magic)
+	if _, err := sess.waitMessage(pipeHandshakeBudget, func(m Message) bool {
+		_, ok := m.(*MsgVersion)
+		return ok
+	}); err != nil {
 		return err
 	}
-	if _, ok := msg.(*MsgVersion); !ok {
-		return ErrHandshakeFailed
-	}
 
-	// 2. Send our version
+	pv := opts.protocolVersion
+	if pv == 0 {
+		pv = ProtocolVersion
+	}
+	nonce := opts.nonce
+	if nonce == 0 {
+		nonce = 87654321
+	}
 	version := &MsgVersion{
-		ProtocolVersion: ProtocolVersion,
+		ProtocolVersion: pv,
 		Services:        ServiceNodeNetwork | ServiceNodeWitness,
 		Timestamp:       time.Now().Unix(),
 		AddrRecv:        NetAddress{},
 		AddrFrom:        NetAddress{},
-		Nonce:           87654321, // Different nonce
+		Nonce:           nonce,
 		UserAgent:       "/mocknode:0.1.0/",
 		StartHeight:     800001,
 		Relay:           true,
 	}
-	if err := WriteMessage(conn, magic, version); err != nil {
+	if err := writePipeMessage(conn, magic, version); err != nil {
 		return err
 	}
-
-	// 3. Send verack
-	if err := WriteMessage(conn, magic, &MsgVerAck{}); err != nil {
-		return err
-	}
-
-	// 4. Read remaining messages (verack, sendheaders, etc.) until connection closes
-	// The peer may close the connection at any time after handshake
-	for {
-		conn.SetReadDeadline(time.Now().Add(time.Second))
-		_, err := ReadMessage(conn, magic)
-		if err != nil {
-			// Expected EOF when peer disconnects
-			return nil
+	for _, extra := range opts.extraBeforeVerack {
+		if err := writePipeMessage(conn, magic, extra); err != nil {
+			return err
 		}
 	}
+	if err := writePipeMessage(conn, magic, &MsgVerAck{}); err != nil {
+		return err
+	}
+	return sess.waitClose(pipeHandshakeBudget)
 }
 
 // mockClientHandshake simulates an outbound client initiating handshake with us.
 func mockClientHandshake(conn net.Conn, magic uint32) error {
-	// 1. Send version (client initiates)
+	sess := servePipe(conn, magic)
 	version := &MsgVersion{
 		ProtocolVersion: ProtocolVersion,
 		Services:        ServiceNodeNetwork,
@@ -196,16 +209,23 @@ func mockClientHandshake(conn net.Conn, magic uint32) error {
 		StartHeight:     799999,
 		Relay:           true,
 	}
-	if err := WriteMessage(conn, magic, version); err != nil {
+	if err := writePipeMessage(conn, magic, version); err != nil {
 		return err
 	}
 
-	// 2. Read messages until we get both version and verack (order may vary)
 	gotVersion := false
 	gotVerack := false
 	for !gotVersion || !gotVerack {
-		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-		msg, err := ReadMessage(conn, magic)
+		msg, err := sess.waitMessage(pipeHandshakeBudget, func(m Message) bool {
+			switch m.(type) {
+			case *MsgVersion:
+				return !gotVersion
+			case *MsgVerAck:
+				return !gotVerack
+			default:
+				return false
+			}
+		})
 		if err != nil {
 			return err
 		}
@@ -217,19 +237,10 @@ func mockClientHandshake(conn net.Conn, magic uint32) error {
 		}
 	}
 
-	// 3. Send verack
-	if err := WriteMessage(conn, magic, &MsgVerAck{}); err != nil {
+	if err := writePipeMessage(conn, magic, &MsgVerAck{}); err != nil {
 		return err
 	}
-
-	// 4. Read any additional messages until connection closes
-	for {
-		conn.SetReadDeadline(time.Now().Add(time.Second))
-		_, err := ReadMessage(conn, magic)
-		if err != nil {
-			return nil
-		}
-	}
+	return sess.waitClose(pipeHandshakeBudget)
 }
 
 // TestPeerPingPong tests ping/pong nonce matching and latency measurement.
@@ -274,17 +285,17 @@ func TestPeerPingPong(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		sess := servePipe(serverConn, config.Network)
 		for {
-			serverConn.SetReadDeadline(time.Now().Add(2 * time.Second))
-			msg, err := ReadMessage(serverConn, config.Network)
+			msg, err := sess.waitMessage(pipeHandshakeBudget, func(m Message) bool {
+				_, ok := m.(*MsgPing)
+				return ok
+			})
 			if err != nil {
 				return
 			}
-			if ping, ok := msg.(*MsgPing); ok {
-				// Respond with pong (same nonce)
-				pong := &MsgPong{Nonce: ping.Nonce}
-				WriteMessage(serverConn, config.Network, pong)
-			}
+			ping := msg.(*MsgPing)
+			_ = writePipeMessage(serverConn, config.Network, &MsgPong{Nonce: ping.Nonce})
 		}
 	}()
 
@@ -297,14 +308,8 @@ func TestPeerPingPong(t *testing.T) {
 
 	peer.SendMessage(&MsgPing{Nonce: testNonce})
 
-	// Wait for pong to be processed
-	time.Sleep(100 * time.Millisecond)
-
-	// Check that latency was measured
+	waitUntil(t, pipeHandshakeBudget, func() bool { return peer.PingLatency() > 0 })
 	latency := peer.PingLatency()
-	if latency == 0 {
-		t.Error("ping latency should be measured after pong received")
-	}
 	if latency > time.Second {
 		t.Errorf("ping latency = %v, seems too high", latency)
 	}
@@ -360,7 +365,7 @@ func TestPeerDisconnectCleanup(t *testing.T) {
 	select {
 	case <-done:
 		// Success - all goroutines cleaned up
-	case <-time.After(2 * time.Second):
+	case <-time.After(pipeHandshakeBudget):
 		t.Fatal("Disconnect did not return in time - goroutines may be stuck")
 	}
 
@@ -407,7 +412,11 @@ func TestPeerSelfConnectionDetection(t *testing.T) {
 	go peer.writeHandler()
 
 	// Server sends a version with our own nonce (self-connection)
+	var wg sync.WaitGroup
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
+		sess := servePipe(serverConn, config.Network)
 		version := &MsgVersion{
 			ProtocolVersion: ProtocolVersion,
 			Services:        ServiceNodeNetwork,
@@ -417,18 +426,16 @@ func TestPeerSelfConnectionDetection(t *testing.T) {
 			StartHeight:     800000,
 			Relay:           true,
 		}
-		WriteMessage(serverConn, config.Network, version)
+		_ = writePipeMessage(serverConn, config.Network, version)
+		_ = sess.waitClose(pipeHandshakeBudget)
 	}()
 
-	// Wait a bit for the peer to detect and disconnect
-	time.Sleep(200 * time.Millisecond)
-
-	// Peer should have disconnected
-	if peer.State() != PeerStateDisconnected {
-		t.Errorf("peer should disconnect on self-connection, state = %v", peer.State())
-	}
+	waitUntil(t, pipeHandshakeBudget, func() bool {
+		return peer.State() == PeerStateDisconnected
+	})
 
 	peer.Disconnect() // Ensure cleanup
+	wg.Wait()
 }
 
 // TestPeerProtocolVersionNegotiation tests version negotiation.
@@ -467,30 +474,9 @@ func TestPeerProtocolVersionNegotiation(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// Read our version
-		ReadMessage(serverConn, config.Network)
-
-		// Send version with older protocol
-		version := &MsgVersion{
-			ProtocolVersion: 70015, // Older version
-			Services:        ServiceNodeNetwork,
-			Timestamp:       time.Now().Unix(),
-			Nonce:           87654321,
-			UserAgent:       "/oldnode:0.1.0/",
-			StartHeight:     800000,
-			Relay:           true,
-		}
-		WriteMessage(serverConn, config.Network, version)
-		WriteMessage(serverConn, config.Network, &MsgVerAck{})
-
-		// Read verack and any other messages
-		for {
-			serverConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			_, err := ReadMessage(serverConn, config.Network)
-			if err != nil {
-				return
-			}
-		}
+		_ = mockServerHandshakeOpts(serverConn, config.Network, mockHandshakeOpts{
+			protocolVersion: 70015,
+		})
 	}()
 
 	// Start handshake
@@ -504,7 +490,7 @@ func TestPeerProtocolVersionNegotiation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("handshake failed: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(pipeHandshakeBudget):
 		t.Fatal("handshake timed out")
 	}
 
@@ -569,32 +555,19 @@ func TestPeerListeners(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// Send ping
-		WriteMessage(serverConn, config.Network, &MsgPing{Nonce: 123})
-		// Read the pong response
-		serverConn.SetReadDeadline(time.Now().Add(time.Second))
-		ReadMessage(serverConn, config.Network)
-		// Send pong
-		WriteMessage(serverConn, config.Network, &MsgPong{Nonce: 456})
-		// Keep reading until closed
-		for {
-			serverConn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
-			_, err := ReadMessage(serverConn, config.Network)
-			if err != nil {
-				return
-			}
-		}
+		sess := servePipe(serverConn, config.Network)
+		_ = writePipeMessage(serverConn, config.Network, &MsgPing{Nonce: 123})
+		_, _ = sess.waitMessage(pipeHandshakeBudget, func(m Message) bool {
+			_, ok := m.(*MsgPong)
+			return ok
+		})
+		_ = writePipeMessage(serverConn, config.Network, &MsgPong{Nonce: 456})
+		_ = sess.waitClose(pipeHandshakeBudget)
 	}()
 
-	// Wait for messages to be processed
-	time.Sleep(200 * time.Millisecond)
-
-	if !pingReceived.Load() {
-		t.Error("OnPing listener was not called")
-	}
-	if !pongReceived.Load() {
-		t.Error("OnPong listener was not called")
-	}
+	waitUntil(t, pipeHandshakeBudget, func() bool {
+		return pingReceived.Load() && pongReceived.Load()
+	})
 
 	peer.Disconnect()
 	wg.Wait()

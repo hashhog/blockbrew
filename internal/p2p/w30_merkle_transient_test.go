@@ -22,7 +22,7 @@ func makeW30Coinbase(tag byte) *wire.MsgTx {
 		}},
 		TxOut: []*wire.TxOut{{
 			Value:    5_000_000_000, // 50 BTC
-			PkScript: []byte{0x51}, // OP_1
+			PkScript: []byte{0x51},  // OP_1
 		}},
 	}
 }
@@ -163,7 +163,10 @@ func TestW30MerkleTransientClassification(t *testing.T) {
 			t.Fatal("validationWorker did not process block within timeout")
 		}
 
-		if node.Status&consensus.StatusInvalid != 0 {
+		sm.mu.Lock()
+		invalid := node.Status&consensus.StatusInvalid != 0
+		sm.mu.Unlock()
+		if invalid {
 			t.Errorf("ErrBlockMutated: StatusInvalid set — should be TRANSIENT (no permanent ban)")
 		}
 		// Transient path resets State to BlockDownloadPending (requeueForRedownload).
@@ -201,7 +204,7 @@ func TestW30MerkleTransientClassification(t *testing.T) {
 		// cb2 is a different coinbase — its TxHash ≠ merkleRoot → ErrBadMerkleRoot.
 		cb2 := makeW30Coinbase(0x21)
 		block := &wire.MsgBlock{
-			Header:       hdr,            // MerkleRoot = cb1.TxHash()
+			Header:       hdr,                // MerkleRoot = cb1.TxHash()
 			Transactions: []*wire.MsgTx{cb2}, // delivered tx has different TxHash
 		}
 
@@ -215,9 +218,12 @@ func TestW30MerkleTransientClassification(t *testing.T) {
 
 		// POST-FIX: StatusInvalid must NOT be set (transient, requeued).
 		// PRE-FIX: StatusInvalid WOULD be set here.
-		if node.Status&consensus.StatusInvalid != 0 {
-			t.Errorf("ErrBadMerkleRoot: StatusInvalid set — should be TRANSIENT per Core "+
-				"BLOCK_MUTATED (validation.cpp:3843-3848 \"bad-txnmrklroot\"); "+
+		sm.mu.Lock()
+		invalid := node.Status&consensus.StatusInvalid != 0
+		sm.mu.Unlock()
+		if invalid {
+			t.Errorf("ErrBadMerkleRoot: StatusInvalid set — should be TRANSIENT per Core " +
+				"BLOCK_MUTATED (validation.cpp:3843-3848 \"bad-txnmrklroot\"); " +
 				"pre-fix this test would fail here, proving the fix is EFFECTIVE")
 		}
 		sm.mu.Lock()
@@ -259,8 +265,11 @@ func TestW30MerkleTransientClassification(t *testing.T) {
 		}
 
 		// StatusInvalid MUST be set: ErrFirstTxNotCoinbase is PERMANENT.
-		if node.Status&consensus.StatusInvalid == 0 {
-			t.Errorf("ErrFirstTxNotCoinbase: StatusInvalid not set — should remain PERMANENT "+
+		sm.mu.Lock()
+		invalid := node.Status&consensus.StatusInvalid == 0
+		sm.mu.Unlock()
+		if invalid {
+			t.Errorf("ErrFirstTxNotCoinbase: StatusInvalid not set — should remain PERMANENT " +
 				"(Core BLOCK_CONSENSUS, validation.cpp:3950-3952 \"bad-cb-missing\")")
 		}
 	})
