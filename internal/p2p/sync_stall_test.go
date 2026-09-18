@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"bytes"
 	"sync"
 	"testing"
 	"time"
@@ -437,17 +438,25 @@ func TestApplyStallRecovery_StillResetsInFlight(t *testing.T) {
 	})
 	peer := createMockPeer("1.2.3.4:8333", 0)
 	req := &blockRequest{
-		Height: 967280,
-		State:  BlockDownloadInFlight,
-		Peer:   peer,
+		Height:     967280,
+		State:      BlockDownloadInFlight,
+		Peer:       peer,
+		RequestAt:  time.Now().Add(-BaseStallTimeout - time.Second),
+		RetryCount: 0,
 	}
 	sm.inflight[req.Hash] = req
 	sm.applyStallRecovery(req, time.Now())
 	if req.State != BlockDownloadPending {
 		t.Fatalf("InFlight is a stuck DOWNLOAD; state=%d, want Pending", req.State)
 	}
-	if req.Peer != nil {
-		t.Fatal("InFlight reset must clear the peer so a live one can retry")
+	if req.Peer != peer {
+		t.Fatal("timed-out InFlight must keep Peer so requestBlocks skips the mute peer")
+	}
+	if req.RetryCount != 1 {
+		t.Fatalf("RetryCount=%d, want 1: mute timeout must count as a failed attempt", req.RetryCount)
+	}
+	if !req.NextRetryAt.IsZero() {
+		t.Fatal("timed-out InFlight must retry immediately, not arm a stall backoff")
 	}
 	if _, ok := sm.inflight[req.Hash]; ok {
 		t.Fatal("InFlight reset must drop the inflight slot")
@@ -566,4 +575,280 @@ func TestApplyNearbyStallReset_PreservesValidatedAndReceived(t *testing.T) {
 	if pending.State != BlockDownloadPending {
 		t.Fatalf("Pending neighbour mutated to %d", pending.State)
 	}
+}
+
+// drainGetData pulls queued getdata hashes off a mock peer without blocking.
+func drainGetData(p *Peer) []wire.Hash256 {
+	var out []wire.Hash256
+	for {
+		select {
+		case msg := <-p.sendQueue:
+			if gd, ok := msg.(*MsgGetData); ok {
+				for _, inv := range gd.InvList {
+					out = append(out, inv.Hash)
+				}
+			}
+		default:
+			return out
+		}
+	}
+}
+
+func mineRegtestHeader(h *wire.BlockHeader) {
+	target := consensus.CompactToBig(h.Bits)
+	for i := uint32(0); i < 1_000_000; i++ {
+		h.Nonce = i
+		if consensus.HashToBig(h.BlockHash()).Cmp(target) <= 0 {
+			return
+		}
+	}
+	panic("regtest header did not meet target")
+}
+
+// nearMaxWeightBlock builds a CheckBlockSanity-valid regtest block whose
+// weight is ≥ 3.9M WU (the live 967495 block was 3,993,841). Padding is
+// OP_RETURN-filler outputs so sigops stay well under the block cap.
+func nearMaxWeightBlock(t *testing.T, prev wire.Hash256, timestamp uint32) *wire.MsgBlock {
+	t.Helper()
+	coinbase := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{}, Index: 0xFFFFFFFF},
+			SignatureScript:  []byte{0x01, 0x01},
+			Sequence:         0xFFFFFFFF,
+		}},
+		TxOut: []*wire.TxOut{{Value: 50e8, PkScript: []byte{0x51}}},
+	}
+	pad := bytes.Repeat([]byte{0x6a}, 10000)
+	padding := &wire.MsgTx{
+		Version: 1,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: wire.OutPoint{Hash: coinbase.TxHash(), Index: 0},
+			SignatureScript:  []byte{0x51},
+			Sequence:         0xFFFFFFFF,
+		}},
+	}
+	// 97 × 10 KiB scripts ≈ 3.88M WU plus header/coinbase; add until we
+	// clear 3.9M without crossing MaxBlockWeight.
+	for i := 0; i < 97; i++ {
+		padding.TxOut = append(padding.TxOut, &wire.TxOut{Value: 0, PkScript: pad})
+	}
+	block := &wire.MsgBlock{Transactions: []*wire.MsgTx{coinbase, padding}}
+	for {
+		w := consensus.CalcBlockWeight(block)
+		if w >= 3_900_000 && w <= consensus.MaxBlockWeight {
+			break
+		}
+		if w > consensus.MaxBlockWeight {
+			if len(padding.TxOut) == 0 {
+				t.Fatalf("cannot fit near-max weight block (weight=%d)", w)
+			}
+			padding.TxOut = padding.TxOut[:len(padding.TxOut)-1]
+			continue
+		}
+		padding.TxOut = append(padding.TxOut, &wire.TxOut{Value: 0, PkScript: pad})
+	}
+	hashes := []wire.Hash256{coinbase.TxHash(), padding.TxHash()}
+	block.Header = wire.BlockHeader{
+		Version:    1,
+		PrevBlock:  prev,
+		MerkleRoot: consensus.CalcMerkleRoot(hashes),
+		Timestamp:  timestamp,
+		Bits:       0x207fffff,
+	}
+	mineRegtestHeader(&block.Header)
+	w := consensus.CalcBlockWeight(block)
+	if w < 3_900_000 || w > consensus.MaxBlockWeight {
+		t.Fatalf("near-max block weight %d not in [3900000, %d]", w, consensus.MaxBlockWeight)
+	}
+	return block
+}
+
+// TestApplyStallRecovery_DoesNotAbortYoungInFlight is the unit pin for the
+// 967495 abort: once nextHeight has been stuck >30s, every stall tick reset
+// InFlight → Pending (backoff 2s…60s) even when getdata had just gone out.
+// A near-max block cannot finish in that 10s window. A request still inside
+// getStallTimeout must be left to complete.
+func TestApplyStallRecovery_DoesNotAbortYoungInFlight(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams: params,
+		HeaderIndex: idx,
+	})
+	peer := createMockPeer("mute.example:8333", 1)
+	var hash wire.Hash256
+	hash[0] = 0x49
+	req := &blockRequest{
+		Hash:      hash,
+		Height:    967495,
+		State:     BlockDownloadInFlight,
+		Peer:      peer,
+		RequestAt: time.Now(),
+	}
+	sm.inflight[hash] = req
+	sm.blockQueue = []*blockRequest{req}
+
+	sm.applyStallRecovery(req, time.Now())
+
+	if req.State != BlockDownloadInFlight {
+		t.Fatalf("young InFlight was reset to state=%d (want InFlight=%d); "+
+			"aborting a download that just started is the 967495 stall "+
+			"(state=1 → pending + backoff, retries=0, never rotated)",
+			req.State, BlockDownloadInFlight)
+	}
+	if req.Peer != peer {
+		t.Fatal("young InFlight must keep its download peer")
+	}
+	if _, ok := sm.inflight[hash]; !ok {
+		t.Fatal("young InFlight must stay in the inflight map")
+	}
+	if req.RetryCount != 0 {
+		t.Fatalf("RetryCount=%d, want 0: a live download is not a failed attempt", req.RetryCount)
+	}
+}
+
+// TestMuteMidBodyNearMaxBlockRotatesAndConnects is the 2026-09-18 control.
+// Live at height 967495 (weight 3,993,841, 99.8% of max): header accepted,
+// then `stall detected … state=0, inflight=0, peer=false, retries=0` for
+// minutes, briefly `state=1, inflight=1, peer=true` immediately followed by
+// `stuck in state 1, resetting to pending (backoff 1m0s)`. A peer that goes
+// mute mid-body must be timed out, the request must rotate to another
+// connected peer, and that peer's body must connect. A test that serves a
+// small block promptly cannot reproduce the abort-during-download.
+func TestMuteMidBodyNearMaxBlockRotatesAndConnects(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	genesis := idx.Genesis()
+	block := nearMaxWeightBlock(t, genesis.Hash, genesis.Header.Timestamp+600)
+	node, err := idx.AddHeader(block.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+
+	adv := &advancingChainConnector{mockChainConnector: mockChainConnector{tipHeight: 0, tipTimestamp: 1}}
+	pm := &PeerManager{}
+	mute := createMockPeer("mute.example:8333", node.Height)
+	good := createMockPeer("good.example:8333", node.Height)
+	pm.InsertConnectedPeer(mute)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		PeerManager:    pm,
+		ChainManager:   adv,
+		DownloadWindow: 8,
+	})
+	sm.Start()
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			sm.Stop()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Stop did not complete within 5s")
+		}
+	}()
+
+	req := &blockRequest{
+		Hash:   node.Hash,
+		Height: node.Height,
+		State:  BlockDownloadPending,
+	}
+	sm.mu.Lock()
+	sm.blockQueue = []*blockRequest{req}
+	sm.nextHeight = node.Height
+	sm.mu.Unlock()
+
+	sm.requestBlocks()
+
+	gotMute := drainGetData(mute)
+	if len(gotMute) != 1 || gotMute[0] != node.Hash {
+		t.Fatalf("mute peer getdata = %v, want [%s]", gotMute, node.Hash)
+	}
+	sm.mu.Lock()
+	if req.State != BlockDownloadInFlight || req.Peer != mute {
+		sm.mu.Unlock()
+		t.Fatalf("after requestBlocks: state=%d peer=%v, want InFlight on mute", req.State, req.Peer != nil)
+	}
+	sm.mu.Unlock()
+
+	// Stall detector fires because nextHeight has not advanced (the live
+	// stallDuration was already minutes). The download itself is young —
+	// mute has gone quiet mid-body, but the per-request window has not
+	// expired. Aborting here is the bug.
+	sm.mu.Lock()
+	sm.applyStallRecovery(req, time.Now())
+	youngState, youngPeer := req.State, req.Peer
+	sm.mu.Unlock()
+	if youngState != BlockDownloadInFlight {
+		t.Fatalf("young near-max InFlight reset to state=%d; stall detector must not abort a download still inside getStallTimeout",
+			youngState)
+	}
+	if youngPeer != mute {
+		t.Fatal("young InFlight peer was cleared — that is an abort")
+	}
+
+	// Mute never delivers. The per-request window expires.
+	sm.mu.Lock()
+	req.RequestAt = time.Now().Add(-BaseStallTimeout - time.Second)
+	sm.applyStallRecovery(req, time.Now())
+	staleState := req.State
+	staleRetries := req.RetryCount
+	stalePeer := req.Peer
+	staleRetryAt := req.NextRetryAt
+	sm.mu.Unlock()
+	if staleState != BlockDownloadPending {
+		t.Fatalf("timed-out InFlight state=%d, want Pending so another peer can be asked", staleState)
+	}
+	if staleRetries < 1 {
+		t.Fatalf("RetryCount=%d after mute timeout, want ≥1 so requestBlocks rotates (live log: retries=0 the whole stall)",
+			staleRetries)
+	}
+	if stalePeer != mute {
+		t.Fatal("timed-out InFlight must keep Peer so requestBlocks skips the mute peer")
+	}
+	if !staleRetryAt.IsZero() && time.Until(staleRetryAt) > time.Second {
+		t.Fatalf("NextRetryAt is %s in the future — a mute timeout must rotate immediately, not serve a 60s self-penalty",
+			time.Until(staleRetryAt).Round(time.Millisecond))
+	}
+
+	pm.InsertConnectedPeer(good)
+	sm.requestBlocks()
+
+	if extra := drainGetData(mute); len(extra) != 0 {
+		t.Fatalf("mute peer was asked again after timeout (%v) — must rotate away", extra)
+	}
+	gotGood := drainGetData(good)
+	if len(gotGood) != 1 || gotGood[0] != node.Hash {
+		t.Fatalf("good peer getdata = %v, want [%s] (did not rotate)", gotGood, node.Hash)
+	}
+
+	sm.HandleBlock(good, &MsgBlock{Block: block})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		sm.mu.Lock()
+		st := req.State
+		sm.mu.Unlock()
+		if st == BlockDownloadConnected {
+			if adv.connectCount() != 1 {
+				t.Fatalf("ConnectBlock called %d times, want 1", adv.connectCount())
+			}
+			_, tip := adv.BestBlock()
+			if tip != node.Height {
+				t.Fatalf("tip height %d, want %d", tip, node.Height)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	sm.mu.Lock()
+	st := req.State
+	sm.mu.Unlock()
+	t.Fatalf("rotated near-max block did not connect: state=%d connects=%d (want Connected, tip=%d)",
+		st, adv.connectCount(), node.Height)
 }

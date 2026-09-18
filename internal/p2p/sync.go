@@ -56,7 +56,10 @@ const (
 	MaxStallTimeout = 120 * time.Second
 
 	// MaxRetriesBeforeRotate is how many timeouts before we avoid a peer.
-	MaxRetriesBeforeRotate = 3
+	// 1 = skip the mute peer on the very next getdata (the 967495 stall
+	// sat retries=0 for minutes because InFlight resets never incremented
+	// RetryCount, so this gate never opened).
+	MaxRetriesBeforeRotate = 1
 
 	// ProgressLogInterval is how often to log IBD progress.
 	ProgressLogInterval = 10 * time.Second
@@ -267,7 +270,15 @@ func stallShouldRearm(req *blockRequest, now time.Time) bool {
 // Must be called with sm.mu held. Non-blocking channel sends only.
 //
 // Pending: re-arm (or leave an existing backoff to expire).
-// InFlight: stuck DOWNLOAD — reset to Pending so a live peer can retry.
+// InFlight: a download in progress. Do NOT abort it just because nextHeight
+// has not advanced — that was the 967495 stall: a near-max block's getdata
+// was cancelled every 10s (`stuck in state 1, resetting to pending`),
+// RetryCount never incremented (retries=0), and a 60s backoff left
+// peer=false, inflight=0 while 8 peers were connected. Leave requests
+// still inside getStallTimeout; once the request itself is stale,
+// increment RetryCount, keep Peer so requestBlocks skips it, and retry
+// immediately (no self-penalty). checkStaleRequests does the same on its
+// 1s ticker; whichever fires first wins and the other is a no-op.
 // Received/Validated: already downloaded. Core connects a block that passed
 // validation on the same path that accepted it (ActivateBestChain); it does
 // not re-queue that block for getdata. Resetting these states was the
@@ -302,13 +313,24 @@ func (sm *SyncManager) applyStallRecovery(req *blockRequest, now time.Time) {
 	if req.State == BlockDownloadConnected {
 		return
 	}
-	// InFlight (and any unknown non-terminal state): genuine download stall.
-	log.Printf("sync: block %d stuck in state %d, resetting to pending (backoff %s)",
-		req.Height, req.State, stallBackoff(req.StallResets))
+	// InFlight (and any unknown non-terminal download state).
+	timeout := sm.getStallTimeout(req.Peer)
+	if now.Sub(req.RequestAt) <= timeout {
+		peerAddr := ""
+		if req.Peer != nil {
+			peerAddr = req.Peer.Address()
+		}
+		log.Printf("sync: block %d in flight from %s for %s (timeout %s) — leaving it to finish",
+			req.Height, peerAddr, now.Sub(req.RequestAt).Round(time.Second), timeout)
+		return
+	}
+	log.Printf("sync: block %d in-flight timed out after %s, rotating peer (retries %d→%d)",
+		req.Height, now.Sub(req.RequestAt).Round(time.Second), req.RetryCount, req.RetryCount+1)
 	req.State = BlockDownloadPending
-	req.Peer = nil
-	req.NextRetryAt = now.Add(stallBackoff(req.StallResets))
-	req.StallResets++
+	req.RetryCount++
+	// Keep Peer so requestBlocks skips it (same contract as checkStaleRequests).
+	req.NextRetryAt = time.Time{}
+	sm.increaseStallTimeout(req.Peer)
 	delete(sm.inflight, req.Hash)
 }
 
@@ -352,8 +374,14 @@ func (sm *SyncManager) nudgeStalledPipeline(req *blockRequest) {
 // HOL stall and is why catch-up went one block at a time.
 func applyNearbyStallReset(queue []*blockRequest, nh int32, inflight map[wire.Hash256]*blockRequest) {
 	resetWindow := int32(16)
+	now := time.Now()
 	for _, req := range queue {
 		if req.Height > nh && req.Height <= nh+resetWindow && req.State == BlockDownloadInFlight {
+			// Same young-download protection as applyStallRecovery: a
+			// pipelined body still inside BaseStallTimeout is not stuck.
+			if now.Sub(req.RequestAt) <= BaseStallTimeout {
+				continue
+			}
 			req.State = BlockDownloadPending
 			req.Peer = nil
 			delete(inflight, req.Hash)
@@ -2645,7 +2673,9 @@ func (sm *SyncManager) requestBlocks() {
 				// 964255: peers "never delivered" blocks they were never
 				// asked for). Short retry backoff; requestBlocks' round-
 				// robin picks a different peer next tick.
-				sm.mu.Lock()
+				// Already holding sm.mu (this function's outer lock);
+				// re-Lock here deadlocked the download loop on a full
+				// send queue.
 				for _, inv := range batch {
 					if req, ok := sm.inflight[inv.Hash]; ok && req.Peer == peer {
 						req.State = BlockDownloadPending
@@ -2654,7 +2684,6 @@ func (sm *SyncManager) requestBlocks() {
 						delete(sm.inflight, inv.Hash)
 					}
 				}
-				sm.mu.Unlock()
 				log.Printf("sync: getdata batch of %d DROPPED for %s — requests reverted to pending",
 					len(batch), peer.Address())
 			}
