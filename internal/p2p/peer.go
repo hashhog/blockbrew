@@ -67,21 +67,26 @@ type PeerConfig struct {
 
 // PeerListeners contains callbacks invoked when messages are received.
 type PeerListeners struct {
-	OnVersion     func(p *Peer, msg *MsgVersion)
-	OnVerAck      func(p *Peer, msg *MsgVerAck)
-	OnInv         func(p *Peer, msg *MsgInv)
-	OnHeaders     func(p *Peer, msg *MsgHeaders)
-	OnBlock       func(p *Peer, msg *MsgBlock)
-	OnTx          func(p *Peer, msg *MsgTx)
-	OnPing        func(p *Peer, msg *MsgPing)
-	OnPong        func(p *Peer, msg *MsgPong)
-	OnAddr        func(p *Peer, msg *MsgAddr)
-	OnGetAddr     func(p *Peer, msg *MsgGetAddr)
-	OnGetData     func(p *Peer, msg *MsgGetData)
-	OnGetHeaders  func(p *Peer, msg *MsgGetHeaders)
-	OnNotFound    func(p *Peer, msg *MsgNotFound)
-	OnFeeFilter   func(p *Peer, msg *MsgFeeFilter)
-	OnSendHeaders func(p *Peer, msg *MsgSendHeaders)
+	OnVersion func(p *Peer, msg *MsgVersion)
+	OnVerAck  func(p *Peer, msg *MsgVerAck)
+	OnInv     func(p *Peer, msg *MsgInv)
+	OnHeaders func(p *Peer, msg *MsgHeaders)
+	OnBlock   func(p *Peer, msg *MsgBlock)
+	// OnMessageHeader is invoked after a valid message header is read and
+	// before the payload. cmd is the command string (empty on BIP324 v2
+	// until the payload is decrypted — then length is still the advertised
+	// payload size). Used to stamp first-byte of an in-flight block body.
+	OnMessageHeader func(p *Peer, cmd string, length uint32)
+	OnTx            func(p *Peer, msg *MsgTx)
+	OnPing          func(p *Peer, msg *MsgPing)
+	OnPong          func(p *Peer, msg *MsgPong)
+	OnAddr          func(p *Peer, msg *MsgAddr)
+	OnGetAddr       func(p *Peer, msg *MsgGetAddr)
+	OnGetData       func(p *Peer, msg *MsgGetData)
+	OnGetHeaders    func(p *Peer, msg *MsgGetHeaders)
+	OnNotFound      func(p *Peer, msg *MsgNotFound)
+	OnFeeFilter     func(p *Peer, msg *MsgFeeFilter)
+	OnSendHeaders   func(p *Peer, msg *MsgSendHeaders)
 	// BIP35 "Tx relay + mempool" callback — peer requests our mempool contents.
 	OnMempool func(p *Peer, msg *MsgMempool)
 	// BIP152 compact block callbacks
@@ -626,6 +631,19 @@ func (p *Peer) remoteNetAddress() NetAddress {
 	return *NewNetAddress(addr, 0)
 }
 
+func (p *Peer) installHeaderHook() {
+	if p.transport == nil {
+		return
+	}
+	if ht, ok := p.transport.(headerHookTransport); ok {
+		ht.SetHeaderHook(func(cmd string, length uint32) {
+			if p.config.Listeners != nil && p.config.Listeners.OnMessageHeader != nil {
+				p.config.Listeners.OnMessageHeader(p, cmd, length)
+			}
+		})
+	}
+}
+
 // localNetAddress returns our local NetAddress (placeholder since we don't know our external IP).
 func (p *Peer) localNetAddress() NetAddress {
 	return NetAddress{
@@ -639,6 +657,7 @@ func (p *Peer) localNetAddress() NetAddress {
 func (p *Peer) readHandler() {
 	defer p.wg.Done()
 	defer p.signalDisconnect()
+	p.installHeaderHook()
 	for {
 		// Check if we should stop
 		select {

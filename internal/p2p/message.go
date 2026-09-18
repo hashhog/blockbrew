@@ -70,9 +70,9 @@ func IsNonFatalMessageError(err error) bool {
 
 // Maximum counts for various message fields.
 const (
-	MaxInvVects     = 50000
-	MaxHeaders      = 2000
-	MaxAddresses    = 1000
+	MaxInvVects      = 50000
+	MaxHeaders       = 2000
+	MaxAddresses     = 1000
 	MaxBlockLocators = 101
 
 	// MaxGetDataSize is the maximum number of inventory vectors in a single
@@ -238,6 +238,10 @@ func WriteMessage(w io.Writer, magic uint32, msg Message) error {
 // the message is skipped rather than killing the connection, since the payload
 // was fully consumed and the stream remains valid.
 func ReadMessage(r io.Reader, magic uint32) (Message, error) {
+	return readMessage(r, magic, nil)
+}
+
+func readMessage(r io.Reader, magic uint32, afterHeader MessageHeaderHook) (Message, error) {
 	// Read header
 	h, err := ReadMessageHeader(r)
 	if err != nil {
@@ -252,6 +256,10 @@ func ReadMessage(r io.Reader, magic uint32) (Message, error) {
 	// Enforce max payload size
 	if h.Length > MaxPayloadSize {
 		return nil, ErrPayloadTooLarge
+	}
+
+	if afterHeader != nil {
+		afterHeader(h.CommandString(), h.Length)
 	}
 
 	// Read payload

@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"strings"
@@ -956,6 +957,9 @@ func TestNearMaxBodyAtRealisticRateCompletesWithoutStall(t *testing.T) {
 	now := time.Now()
 	sm.mu.Lock()
 	req.RequestAt = now.Add(-fetch)
+	// Bytes are flowing: first-byte stamped so the mute (16s) timeout
+	// does not abort a realistic-rate complete transfer (47s at 32 KiB/s).
+	req.FirstByteAt = req.RequestAt
 	if req.State != BlockDownloadInFlight {
 		sm.mu.Unlock()
 		t.Fatalf("after requestBlocks: state=%d, want InFlight", req.State)
@@ -1279,4 +1283,247 @@ func TestMuteMidBodyLargeSerializedBlockRotatesBeforeNextInflight(t *testing.T) 
 	sm.mu.Unlock()
 	t.Fatalf("rotated ≥1.6MB body did not connect: state=%d nextHeight=%d connects=%d",
 		st, nh, adv.connectCount())
+}
+
+// TestNearMaxStretchKeepsTipWithinTwoOfHeaderTip is the 2026-09-18 967594
+// RATE control. Live (receipts/blockbrew-nearmax-stall-series-967594-2026-09-18T1958Z.txt):
+//
+//	15:36:45  starting block download … 967594 to 967594 (1 blocks)
+//	15:40:56  StartBlockDownload called but block queue already populated (floor=967594)
+//	          (repeated as headers 967595–967601 arrived)
+//	15:47:54  stall detected … inflight=0  — 7daf81b's "leaving skip hint" fired
+//	15:49:52  967594 finally arrives (13 min for 1.58 MB)
+//	15:50:00  queue rebuilt for 967595–967599; those time out the same way
+//
+// 7daf81b is reached and the body eventually arrives. The defect is that the
+// at-tip snapshot pins one body while headers keep landing, so inflight drops
+// to 0 and the pipeline is empty. The control is a RATE, not "the block
+// eventually arrived": over a stretch of ≥5 near-max blocks, more than one
+// body must be requested in parallel after the extra headers, and the
+// connected tip must sit within 2 of the header tip once those bodies are
+// delivered.
+func TestNearMaxStretchKeepsTipWithinTwoOfHeaderTip(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	genesis := idx.Genesis()
+
+	const nBlocks = 5
+	blocks := make([]*wire.MsgBlock, nBlocks)
+	nodes := make([]*consensus.BlockNode, nBlocks)
+	prev := genesis.Hash
+	ts := genesis.Header.Timestamp
+	for i := 0; i < nBlocks; i++ {
+		ts += 600
+		blocks[i] = nearMaxWeightBlock(t, prev, ts)
+		node, err := idx.AddHeader(blocks[i].Header, true)
+		if err != nil {
+			t.Fatalf("AddHeader %d: %v", i+1, err)
+		}
+		nodes[i] = node
+		prev = node.Hash
+		w := consensus.CalcBlockWeight(blocks[i])
+		if w < 3_900_000 {
+			t.Fatalf("block %d weight %d, want ≥3.9M (near-max stretch)", i+1, w)
+		}
+	}
+	headerTip := nodes[nBlocks-1].Height
+
+	adv := &advancingChainConnector{mockChainConnector: mockChainConnector{tipHeight: 0, tipTimestamp: 1}}
+	pm := &PeerManager{}
+	peers := make([]*Peer, nBlocks)
+	for i := 0; i < nBlocks; i++ {
+		peers[i] = createMockPeer(fmt.Sprintf("p%d.example:8333", i), headerTip)
+		pm.InsertConnectedPeer(peers[i])
+	}
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		PeerManager:    pm,
+		ChainManager:   adv,
+		DownloadWindow: 16,
+	})
+	sm.Start()
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			sm.Stop()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Stop did not complete within 5s")
+		}
+	}()
+
+	// Live at-tip snapshot: only the first new header is queued.
+	req0 := &blockRequest{
+		Hash:   nodes[0].Hash,
+		Height: nodes[0].Height,
+		State:  BlockDownloadPending,
+	}
+	sm.mu.Lock()
+	sm.blockQueue = []*blockRequest{req0}
+	sm.nextHeight = nodes[0].Height
+	sm.headersSynced = true
+	sm.mu.Unlock()
+
+	sm.requestBlocks()
+	firstAsked := 0
+	for _, p := range peers {
+		firstAsked += len(drainGetData(p))
+	}
+	if firstAsked != 1 {
+		t.Fatalf("initial at-tip getdata count=%d, want 1", firstAsked)
+	}
+
+	// Remaining headers are already in the index (they arrived while the
+	// first body was in flight). Production then calls StartBlockDownload
+	// via onSyncComplete and, before this fix, logged "already populated"
+	// and returned — leaving the queue at 1.
+	sm.StartBlockDownload()
+	sm.requestBlocks()
+
+	asked := make(map[wire.Hash256]struct{})
+	for _, p := range peers {
+		for _, h := range drainGetData(p) {
+			asked[h] = struct{}{}
+		}
+	}
+	sm.mu.Lock()
+	qlen := len(sm.blockQueue)
+	inflight := len(sm.inflight)
+	sm.mu.Unlock()
+
+	if qlen < nBlocks {
+		t.Fatalf("queue length=%d inflight=%d extra-getdata=%d after headers extended to %d: "+
+			"StartBlockDownload pinned the at-tip snapshot (live 967594: "+
+			"'already populated (floor=967594)' while headers 967595-967601 arrived; "+
+			"inflight=0, only one body requested)",
+			qlen, inflight, len(asked), headerTip)
+	}
+	// ASK 3: more than one body in parallel during a near-max stretch.
+	// The first getdata is already drained; extra-getdata plus the still-
+	// inflight first body must be ≥2.
+	parallel := inflight
+	if parallel < 2 {
+		t.Fatalf("parallel bodies: inflight=%d unique extra getdata=%d, want inflight≥2 "+
+			"(live stall line had inflight=0 while headers kept arriving)",
+			inflight, len(asked))
+	}
+
+	byHash := make(map[wire.Hash256]*wire.MsgBlock, nBlocks)
+	for i, n := range nodes {
+		byHash[n.Hash] = blocks[i]
+	}
+	sm.mu.Lock()
+	queued := append([]*blockRequest(nil), sm.blockQueue...)
+	sm.mu.Unlock()
+	for _, req := range queued {
+		blk := byHash[req.Hash]
+		if blk == nil {
+			t.Fatalf("queued hash %s has no fixture body", req.Hash)
+		}
+		sm.HandleBlock(peers[0], &MsgBlock{Block: blk})
+	}
+
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		_, tip := adv.BestBlock()
+		if headerTip-tip <= 2 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, tip := adv.BestBlock()
+	t.Fatalf("RATE: tip %d is %d behind header tip %d (want ≤2); live 967594 sat 7 behind 967601 with 7daf81b firing",
+		tip, headerTip-tip, headerTip)
+}
+
+// TestMuteNoFirstByteRotatesBeforeBaseStallTimeout is ASK (1) of the
+// 967594 residual: a peer that sends zero body bytes after getdata must
+// rotate on FirstByteTimeout (16s), not wait BaseStallTimeout (128s).
+// Distinguishes "the peer is mute" from "the peer is slow but streaming".
+func TestMuteNoFirstByteRotatesBeforeBaseStallTimeout(t *testing.T) {
+	if FirstByteTimeout >= BaseStallTimeout {
+		t.Fatalf("FirstByteTimeout %s must be < BaseStallTimeout %s", FirstByteTimeout, BaseStallTimeout)
+	}
+
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	genesis := idx.Genesis()
+	block := nearMaxWeightBlock(t, genesis.Hash, genesis.Header.Timestamp+600)
+	node, err := idx.AddHeader(block.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+
+	pm := &PeerManager{}
+	mute := createMockPeer("mute.example:8333", node.Height)
+	good := createMockPeer("good.example:8333", node.Height)
+	pm.InsertConnectedPeer(mute)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		PeerManager:    pm,
+		DownloadWindow: 8,
+	})
+
+	req := &blockRequest{
+		Hash:   node.Hash,
+		Height: node.Height,
+		State:  BlockDownloadPending,
+	}
+	sm.mu.Lock()
+	sm.blockQueue = []*blockRequest{req}
+	sm.nextHeight = node.Height
+	sm.mu.Unlock()
+
+	sm.requestBlocks()
+	gotMute := drainGetData(mute)
+	if len(gotMute) != 1 || gotMute[0] != node.Hash {
+		t.Fatalf("mute peer getdata = %v, want [%s]", gotMute, node.Hash)
+	}
+
+	sm.mu.Lock()
+	if req.State != BlockDownloadInFlight || !req.FirstByteAt.IsZero() {
+		st, fb := req.State, req.FirstByteAt
+		sm.mu.Unlock()
+		t.Fatalf("after getdata: state=%d firstByte=%v, want InFlight with zero FirstByteAt", st, fb)
+	}
+	// 16s of silence, well inside the 128s complete-transfer window.
+	req.RequestAt = time.Now().Add(-FirstByteTimeout - time.Second)
+	sm.mu.Unlock()
+
+	sm.checkStaleRequests()
+
+	sm.mu.Lock()
+	st := req.State
+	retries := req.RetryCount
+	peerHint := req.Peer
+	_, stillIn := sm.inflight[req.Hash]
+	sm.mu.Unlock()
+	if st != BlockDownloadPending {
+		t.Fatalf("after %s mute: state=%d, want Pending (rotated on first-byte, not waiting %s)",
+			FirstByteTimeout, st, BaseStallTimeout)
+	}
+	if stillIn {
+		t.Fatal("mute no-first-byte must leave inflight")
+	}
+	if retries < 1 || peerHint != mute {
+		t.Fatalf("retries=%d peer=%v, want ≥1 and mute skip-hint", retries, peerHint != nil)
+	}
+
+	pm.InsertConnectedPeer(good)
+	sm.requestBlocks()
+	if extra := drainGetData(mute); len(extra) != 0 {
+		t.Fatalf("mute peer was asked again after first-byte timeout: %v", extra)
+	}
+	gotGood := drainGetData(good)
+	if len(gotGood) != 1 || gotGood[0] != node.Hash {
+		t.Fatalf("good peer getdata = %v, want [%s] (first-byte mute must rotate before BaseStallTimeout)",
+			gotGood, node.Hash)
+	}
 }

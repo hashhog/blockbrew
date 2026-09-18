@@ -37,11 +37,22 @@ type Transport interface {
 	SetWriteDeadline(t time.Time) error
 }
 
+// MessageHeaderHook is called after a valid message header is read and
+// before the payload is consumed. cmd is the command string; length is
+// the advertised payload size. On BIP324 v2 the command is unknown until
+// decrypt completes, so cmd may be empty while length is still set.
+type MessageHeaderHook func(cmd string, length uint32)
+
+type headerHookTransport interface {
+	SetHeaderHook(MessageHeaderHook)
+}
+
 // V1Transport implements the v1 (plaintext) P2P transport.
 type V1Transport struct {
-	conn   net.Conn
-	magic  uint32
-	mu     sync.Mutex
+	conn       net.Conn
+	magic      uint32
+	mu         sync.Mutex
+	headerHook MessageHeaderHook
 }
 
 // NewV1Transport creates a new v1 transport.
@@ -52,9 +63,14 @@ func NewV1Transport(conn net.Conn, magic uint32) *V1Transport {
 	}
 }
 
+// SetHeaderHook installs a callback fired after the 24-byte header.
+func (t *V1Transport) SetHeaderHook(h MessageHeaderHook) {
+	t.headerHook = h
+}
+
 // ReadMessage reads a v1 message from the connection.
 func (t *V1Transport) ReadMessage() (Message, error) {
-	return ReadMessage(t.conn, t.magic)
+	return readMessage(t.conn, t.magic, t.headerHook)
 }
 
 // WriteMessage writes a v1 message to the connection.
@@ -114,13 +130,14 @@ const (
 // threaded by construction (only one goroutine calls Handshake), so it
 // just takes both locks.
 type V2Transport struct {
-	conn      net.Conn
-	magic     uint32
-	cipher    *BIP324Cipher
-	initiator bool
-	state     V2TransportState
-	sendMu    sync.Mutex
-	recvMu    sync.Mutex
+	conn       net.Conn
+	magic      uint32
+	cipher     *BIP324Cipher
+	initiator  bool
+	state      V2TransportState
+	sendMu     sync.Mutex
+	recvMu     sync.Mutex
+	headerHook MessageHeaderHook
 
 	// Handshake data
 	ourGarbage   []byte
@@ -138,11 +155,11 @@ func NewV2Transport(conn net.Conn, magic uint32, initiator bool) (*V2Transport, 
 	}
 
 	return &V2Transport{
-		conn:      conn,
-		magic:     magic,
-		cipher:    cipher,
-		initiator: initiator,
-		state:     V2StateKeyExchange,
+		conn:       conn,
+		magic:      magic,
+		cipher:     cipher,
+		initiator:  initiator,
+		state:      V2StateKeyExchange,
 		ourGarbage: GenerateGarbage(),
 	}, nil
 }
@@ -155,11 +172,11 @@ func NewV2TransportWithKey(conn net.Conn, magic uint32, initiator bool, privKey,
 	}
 
 	return &V2Transport{
-		conn:      conn,
-		magic:     magic,
-		cipher:    cipher,
-		initiator: initiator,
-		state:     V2StateKeyExchange,
+		conn:       conn,
+		magic:      magic,
+		cipher:     cipher,
+		initiator:  initiator,
+		state:      V2StateKeyExchange,
 		ourGarbage: GenerateGarbage(),
 	}, nil
 }
@@ -399,6 +416,10 @@ func (t *V2Transport) readVersionPacket() error {
 	return nil
 }
 
+func (t *V2Transport) SetHeaderHook(h MessageHeaderHook) {
+	t.headerHook = h
+}
+
 // ReadMessage reads an encrypted message from the v2 transport.
 //
 // Locks recvMu only; writes can proceed concurrently because the BIP-324
@@ -426,6 +447,13 @@ func (t *V2Transport) ReadMessage() (Message, error) {
 		// Validate length
 		if length > MaxPayloadSize {
 			return nil, ErrPayloadTooLarge
+		}
+
+		// Command is still encrypted. A payload ≥80 bytes can be a block
+		// (header size); fire the hook so a mute getdata is not held for
+		// the full 128s complete-transfer window while this body streams.
+		if t.headerHook != nil && length >= 80 {
+			t.headerHook("", length)
 		}
 
 		// Read encrypted payload

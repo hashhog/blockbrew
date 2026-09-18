@@ -66,6 +66,14 @@ const (
 	// Core's BLOCK_DOWNLOAD_TIMEOUT_BASE is one block interval (600s).
 	BaseStallTimeout = 128 * time.Second
 
+	// FirstByteTimeout is how long we wait after getdata for the *start*
+	// of a block payload. A mute peer sends nothing; a slow-but-live peer
+	// starts the message header almost immediately and then streams.
+	// Using BaseStallTimeout (sized for a 4 MiB *complete* transfer) as
+	// the mute detector is why 967594 sat through three rotations for 13
+	// minutes while six other impls on the same box stayed at tip.
+	FirstByteTimeout = 16 * time.Second
+
 	// MaxStallTimeout caps adaptive per-peer backoff (double on stall).
 	MaxStallTimeout = 512 * time.Second
 
@@ -198,6 +206,16 @@ type blockRequest struct {
 	// instead of discarding already-validated work back to the download
 	// queue (mainnet 2026-09-17: state=3 reset to pending, 1 blk / 3–8 min).
 	pipelineBlock *wire.MsgBlock
+
+	// FirstByteAt is when the peer started sending this body (v1: the
+	// 24-byte "block" header; v2: a payload long enough to be a block).
+	// Zero means we have seen no bytes of the body since getdata — the
+	// mute-peer observable. Distinguished from a slow-but-live transfer
+	// which stamps this and then takes BaseStallTimeout to finish.
+	FirstByteAt time.Time
+	// PayloadSize is the advertised block payload length from the message
+	// header (0 until first byte). Used for the fetch-rate log line.
+	PayloadSize uint32
 }
 
 // stallBackoff returns the re-request delay after the nth stall reset:
@@ -257,6 +275,18 @@ func stallRecoveryPlan(req *blockRequest, inFlight bool) (time.Duration, bool) {
 func releasePeerSlot(req *blockRequest) {
 	req.State = BlockDownloadPending
 	req.Peer = nil
+	req.FirstByteAt = time.Time{}
+	req.PayloadSize = 0
+}
+
+func (req *blockRequest) noteFailedPeer(addr string) {
+	if req == nil || addr == "" {
+		return
+	}
+	if req.FailedPeers == nil {
+		req.FailedPeers = make(map[string]struct{})
+	}
+	req.FailedPeers[addr] = struct{}{}
 }
 
 // applyPendingStallRecovery re-arms a Pending request the stall detector
@@ -340,7 +370,7 @@ func (sm *SyncManager) applyStallRecovery(req *blockRequest, now time.Time) {
 		return
 	}
 	// InFlight (and any unknown non-terminal download state).
-	timeout := sm.getStallTimeout(req.Peer)
+	timeout := sm.requestTimeout(req)
 	if now.Sub(req.RequestAt) <= timeout {
 		peerAddr := ""
 		if req.Peer != nil {
@@ -352,11 +382,32 @@ func (sm *SyncManager) applyStallRecovery(req *blockRequest, now time.Time) {
 	}
 	log.Printf("sync: block %d in-flight timed out after %s, rotating peer (retries %d→%d)",
 		req.Height, now.Sub(req.RequestAt).Round(time.Second), req.RetryCount, req.RetryCount+1)
+	sm.rotateTimedOutRequest(req)
+}
+
+// rotateTimedOutRequest returns an InFlight request to Pending so
+// requestBlocks can pick another peer. The mute skip-hint (Peer) is kept.
+// A peer that sent no first byte is recorded in FailedPeers so we do not
+// cycle back to it after the next peer also times out (live 967594: three
+// rotations, the third waited ~6 min because increaseStallTimeout had
+// doubled the mute peer's window). Mid-body slowness still backs off.
+// Caller MUST hold sm.mu.
+func (sm *SyncManager) rotateTimedOutRequest(req *blockRequest) {
+	if req == nil {
+		return
+	}
+	mute := req.FirstByteAt.IsZero()
+	if req.Peer != nil {
+		req.noteFailedPeer(req.Peer.Address())
+		if !mute {
+			sm.increaseStallTimeout(req.Peer)
+		}
+	}
 	req.State = BlockDownloadPending
 	req.RetryCount++
-	// Keep Peer so requestBlocks skips it (same contract as checkStaleRequests).
 	req.NextRetryAt = time.Time{}
-	sm.increaseStallTimeout(req.Peer)
+	req.FirstByteAt = time.Time{}
+	req.PayloadSize = 0
 	delete(sm.inflight, req.Hash)
 }
 
@@ -410,6 +461,8 @@ func applyNearbyStallReset(queue []*blockRequest, nh int32, inflight map[wire.Ha
 			}
 			req.State = BlockDownloadPending
 			req.Peer = nil
+			req.FirstByteAt = time.Time{}
+			req.PayloadSize = 0
 			delete(inflight, req.Hash)
 		}
 	}
@@ -1487,6 +1540,11 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 		OnBlock: func(p *Peer, msg *MsgBlock) {
 			sm.HandleBlock(p, msg)
 		},
+		OnMessageHeader: func(p *Peer, cmd string, length uint32) {
+			if cmd == "block" || (cmd == "" && length >= 80) {
+				sm.noteBlockFirstByte(p, length)
+			}
+		},
 		OnGetData: func(p *Peer, msg *MsgGetData) {
 			sm.HandleGetData(p, msg)
 		},
@@ -2110,6 +2168,19 @@ func (sm *SyncManager) StartBlockDownload() {
 			sm.blockQueue = nil
 			// fall through to the build path
 		} else {
+			extended := sm.extendBlockQueueLocked()
+			if extended > 0 {
+				headerH := int32(0)
+				if sm.headerIndex != nil {
+					headerH = sm.headerIndex.BestHeight()
+				}
+				log.Printf("sync: extended block queue by %d (now %d, header tip %d, floor=%d) — late headers while a body was in flight",
+					extended, len(sm.blockQueue), headerH, floorH)
+				if sm.blockDownloadLoopRunning.CompareAndSwap(false, true) {
+					go sm.blockDownloadLoop()
+				}
+				return
+			}
 			log.Printf("sync: StartBlockDownload called but block queue already populated (floor=%d)", floorH)
 			return
 		}
@@ -2301,6 +2372,85 @@ func (sm *SyncManager) StartBlockDownload() {
 	} else {
 		log.Printf("sync: block-download loop already running — rebuilt queue handed to it (no second loop)")
 	}
+}
+
+// extendBlockQueueLocked appends newly-arrived header-tip blocks onto an
+// already-populated download queue without touching in-flight state.
+//
+// StartBlockDownload builds a SNAPSHOT of the header tip. At the live tip
+// that snapshot is often one block; later headers then hit the "already
+// populated" short-circuit and are not requested until the HOL body
+// connects and the queue drains. Live 967594 (2026-09-18): 13 min for one
+// 1.58 MB body while headers 967595–967601 arrived, stall line inflight=0,
+// then a 5-block rebuild that timed out the same way. Core's
+// FindNextBlocksToDownload recomputes the window every pass.
+//
+// Only a FORWARD extension of the queued chain is appended — the
+// contiguous suffix after the current max queued height. Walking from the
+// header tip would enqueue the TOP window and leave a gap after maxQ
+// (GEN-BREW-665671). A below-tip heavier fork keeps its existing
+// fork-aware queue (GAP2).
+// Caller MUST hold sm.mu. Returns the number of requests appended.
+func (sm *SyncManager) extendBlockQueueLocked() int {
+	if sm.headerIndex == nil || len(sm.blockQueue) == 0 {
+		return 0
+	}
+	bestTip := sm.headerIndex.BestTip()
+	if bestTip == nil {
+		return 0
+	}
+
+	maxQ := sm.blockQueue[0]
+	queued := make(map[wire.Hash256]struct{}, len(sm.blockQueue))
+	for _, req := range sm.blockQueue {
+		queued[req.Hash] = struct{}{}
+		if req.Height > maxQ.Height {
+			maxQ = req
+		}
+	}
+	if bestTip.Height <= maxQ.Height {
+		return 0
+	}
+	maxNode := sm.headerIndex.GetNode(maxQ.Hash)
+	if maxNode == nil {
+		return 0
+	}
+	if anc := bestTip.GetAncestor(maxQ.Height); anc != maxNode {
+		return 0
+	}
+
+	room := sm.downloadWindow - len(sm.blockQueue)
+	if room <= 0 {
+		return 0
+	}
+	if room > consensus.MaxReorgDepth {
+		room = consensus.MaxReorgDepth
+	}
+	endHeight := bestTip.Height
+	if maxQ.Height+int32(room) < endHeight {
+		endHeight = maxQ.Height + int32(room)
+	}
+
+	added := 0
+	for h := maxQ.Height + 1; h <= endHeight; h++ {
+		n := bestTip.GetAncestor(h)
+		if n == nil {
+			break
+		}
+		if _, ok := queued[n.Hash]; ok {
+			continue
+		}
+		if n.Status&consensus.StatusDataStored != 0 {
+			continue
+		}
+		sm.blockQueue = append(sm.blockQueue, &blockRequest{
+			Hash:   n.Hash,
+			Height: n.Height,
+			State:  BlockDownloadPending,
+		})
+		added++
+	}
+	return added
 }
 
 // healGappedBlockQueue breaks the GEN-BREW-665671 block-download livelock: a
@@ -2754,35 +2904,22 @@ func (sm *SyncManager) checkStaleRequests() {
 			continue
 		}
 
-		// Get the adaptive timeout for this peer
-		timeout := sm.getStallTimeout(req.Peer)
-
+		timeout := sm.requestTimeout(req)
 		if now.Sub(req.RequestAt) > timeout {
 			timedOut++
-
 			// W35: do NOT score misbehavior for block-download timeouts.
-			// Bitcoin Core's policy: BLOCK_DOWNLOAD_STALLING isn't banned;
-			// only INVALID_BLOCK etc. score heavily. During IBD, peers
-			// legitimately time out under load (16 parallel reqs/peer,
-			// slow links, pruned nodes). +50 per timeout × threshold 100
-			// caused cascade bans — observed W35 at height 194,098 where
-			// 15+ peers got banned in ~5 minutes, wedging progress. Rely
-			// on per-peer adaptive timeout backoff + peer rotation to
-			// deprioritise slow peers without permanent bans.
-			// (ScoreBlockDownloadStall/Misbehaving still used for actual
-			// protocol violations elsewhere.)
-
-			// Increase timeout for this peer (adaptive backoff)
-			sm.increaseStallTimeout(req.Peer)
-
-			// Reset request for retry — keep Peer so requestBlocks skips it,
-			// and clear NextRetryAt so the next 100ms tick rotates immediately
-			// (same contract as applyStallRecovery's InFlight timeout).
-			delete(sm.inflight, hash)
-			req.State = BlockDownloadPending
-			req.RetryCount++
-			req.NextRetryAt = time.Time{}
-			// Don't nil out req.Peer — requestBlocks uses it to avoid the same peer
+			// Mute (no first byte) uses FirstByteTimeout and does not
+			// double the complete-transfer window — that doubling is
+			// why 967594's third rotation waited ~6 min.
+			if req.FirstByteAt.IsZero() {
+				addr := ""
+				if req.Peer != nil {
+					addr = req.Peer.Address()
+				}
+				log.Printf("sync: fetch no-first-byte height=%d peer=%s wait=%s ttfb-timeout=%s — rotating",
+					req.Height, addr, now.Sub(req.RequestAt).Round(time.Millisecond), FirstByteTimeout)
+			}
+			sm.rotateTimedOutRequest(req)
 		}
 	}
 	if evictedDead > 0 {
@@ -2803,6 +2940,92 @@ func (sm *SyncManager) getStallTimeout(peer *Peer) time.Duration {
 		return BaseStallTimeout
 	}
 	return timeout
+}
+
+// requestTimeout is the per-request download deadline. Mute (no first
+// byte of the body) uses FirstByteTimeout so we rotate in seconds, not
+// the 128s complete-transfer window. Once bytes are flowing, the
+// complete-transfer timeout (BaseStallTimeout, possibly adapted) applies.
+func (sm *SyncManager) requestTimeout(req *blockRequest) time.Duration {
+	if req == nil {
+		return BaseStallTimeout
+	}
+	timeout := sm.getStallTimeout(req.Peer)
+	if req.FirstByteAt.IsZero() && FirstByteTimeout < timeout {
+		return FirstByteTimeout
+	}
+	return timeout
+}
+
+// noteBlockFirstByte stamps FirstByteAt on the oldest inflight request
+// from peer that has not yet seen a body byte. v1 calls this when the
+// 24-byte "block" header arrives; v2 when a payload long enough to be a
+// block starts. Caller must NOT hold sm.mu.
+func (sm *SyncManager) noteBlockFirstByte(peer *Peer, payloadLen uint32) {
+	if peer == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	var oldest *blockRequest
+	for _, req := range sm.inflight {
+		if req.Peer != peer || !req.FirstByteAt.IsZero() {
+			continue
+		}
+		if oldest == nil || req.RequestAt.Before(oldest.RequestAt) {
+			oldest = req
+		}
+	}
+	if oldest == nil {
+		return
+	}
+	now := time.Now()
+	oldest.FirstByteAt = now
+	if payloadLen > 0 {
+		oldest.PayloadSize = payloadLen
+	}
+	ttfb := time.Duration(0)
+	if !oldest.RequestAt.IsZero() {
+		ttfb = now.Sub(oldest.RequestAt)
+	}
+	log.Printf("sync: fetch first-byte height=%d peer=%s ttfb=%s size=%d inflight=%d",
+		oldest.Height, peer.Address(), ttfb.Round(time.Millisecond), payloadLen, len(sm.inflight))
+}
+
+// logFetchLocked emits the complete-fetch rate line. Caller holds sm.mu.
+func (sm *SyncManager) logFetchLocked(req *blockRequest, peer *Peer) {
+	if req == nil {
+		return
+	}
+	wait := time.Duration(0)
+	ttfb := time.Duration(0)
+	now := time.Now()
+	if !req.RequestAt.IsZero() {
+		wait = now.Sub(req.RequestAt)
+		if wait < 0 {
+			wait = 0
+		}
+	}
+	if !req.FirstByteAt.IsZero() && !req.RequestAt.IsZero() {
+		ttfb = req.FirstByteAt.Sub(req.RequestAt)
+		if ttfb < 0 {
+			ttfb = 0
+		}
+	} else {
+		ttfb = wait
+	}
+	size := int(req.PayloadSize)
+	rate := 0
+	if wait > 0 && size > 0 {
+		rate = int(float64(size) / wait.Seconds())
+	}
+	addr := ""
+	if peer != nil {
+		addr = peer.Address()
+	}
+	log.Printf("sync: fetch height=%d peer=%s ttfb=%s wait=%s size=%d rate=%d B/s inflight=%d queued=%d",
+		req.Height, addr, ttfb.Round(time.Millisecond), wait.Round(time.Millisecond),
+		size, rate, len(sm.inflight), len(sm.blockQueue))
 }
 
 // increaseStallTimeout doubles the timeout for a peer (adaptive backoff).
@@ -2945,6 +3168,10 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 		}
 		req.pipelineBlock = msg.Block
 		req.State = BlockDownloadReceived
+		if req.FirstByteAt.IsZero() {
+			req.FirstByteAt = time.Now()
+		}
+		sm.logFetchLocked(req, peer)
 		sm.mu.Unlock()
 	} else {
 		if req.Height == nh || req.Height == nh+1 {
@@ -2954,6 +3181,10 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 		delete(sm.inflight, hash)
 		req.pipelineBlock = msg.Block
 		req.State = BlockDownloadReceived
+		if req.FirstByteAt.IsZero() {
+			req.FirstByteAt = time.Now()
+		}
+		sm.logFetchLocked(req, peer)
 
 		// Reduce stall timeout for successful peer
 		sm.decreaseStallTimeout(peer)
