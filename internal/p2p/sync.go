@@ -49,11 +49,25 @@ const (
 	// BlockRequestTimeout is the timeout for a single block request.
 	BlockRequestTimeout = 2 * time.Minute
 
-	// BaseStallTimeout is the initial stall detection timeout.
-	BaseStallTimeout = 30 * time.Second
+	// minLiveBlockThroughput is the slowest peer we still treat as live
+	// (bytes/s). A mute peer sends nothing; 32 KiB/s still finishes a
+	// max-serialized block. Live soak 2026-09-18 on 967513-967519
+	// (≈1.54 MB, weight ≥3.99M): p90 stallDuration 38.1s / worst 56.0s
+	// ⇒ ~27–40 KiB/s.
+	minLiveBlockThroughput = 32 * 1024
 
-	// MaxStallTimeout is the maximum stall timeout after adaptive backoff.
-	MaxStallTimeout = 120 * time.Second
+	// BaseStallTimeout is the initial per-request timeout and the stall
+	// detector's "nextHeight has not moved" threshold.
+	//
+	// 30s aborted live 4 M-weight bodies: the same soak rotated retries
+	// 1..7 (peer=true) and sat at a 2-block lag while six other impls on
+	// the same box stayed at tip. Sized for MaxBlockSerializedSize (4 MiB)
+	// at minLiveBlockThroughput: 4_000_000 / 32768 ≈ 122s, rounded to 128s.
+	// Core's BLOCK_DOWNLOAD_TIMEOUT_BASE is one block interval (600s).
+	BaseStallTimeout = 128 * time.Second
+
+	// MaxStallTimeout caps adaptive per-peer backoff (double on stall).
+	MaxStallTimeout = 512 * time.Second
 
 	// MaxRetriesBeforeRotate is how many timeouts before we avoid a peer.
 	// 1 = skip the mute peer on the very next getdata (the 967495 stall
@@ -2328,6 +2342,90 @@ func (sm *SyncManager) healGappedBlockQueue(nextHeight int32, inflightLen int) b
 	return true
 }
 
+// checkForStall is one stall-detector pass. Must be called with sm.mu held.
+// lastNextHeight/lastAdvanceTime are the loop cursor; the return values replace them.
+func (sm *SyncManager) checkForStall(now time.Time, lastNextHeight int32, lastAdvanceTime time.Time) (int32, time.Time) {
+	nh := sm.nextHeight
+	inflightLen := len(sm.inflight)
+	stallDuration := now.Sub(lastAdvanceTime)
+
+	if nh == lastNextHeight && stallDuration > BaseStallTimeout {
+		// nextHeight hasn't advanced for BaseStallTimeout. Diagnose the stall.
+		found := false
+		for _, req := range sm.blockQueue {
+			if req.Height == nh {
+				found = true
+				// A getdata still inside getStallTimeout is a live download,
+				// not a stall. Logging it as "stall detected" was the soak
+				// residual: 48 lines in 39 min of seven near-max blocks, all
+				// peer=true, while the body was still arriving.
+				if req.State == BlockDownloadInFlight && now.Sub(req.RequestAt) <= sm.getStallTimeout(req.Peer) {
+					break
+				}
+				log.Printf("sync: stall detected at height %d: state=%d, inflight=%d, peer=%v, retries=%d, stallDuration=%v",
+					nh, req.State, inflightLen, req.Peer != nil, req.RetryCount, stallDuration)
+
+				sm.applyStallRecovery(req, now)
+				break
+			}
+		}
+		if !found {
+			// Block not in queue at all - it was removed (connected or skipped).
+			// This shouldn't happen if nextH points to it. Log for debugging.
+			log.Printf("sync: stall at height %d but block NOT IN QUEUE, inflight=%d queue=%d",
+				nh, inflightLen, len(sm.blockQueue))
+
+			// ESCALATION (GEN-BREW-665671): this branch is an invariant
+			// violation — nextHeight points at a block the queue does
+			// not contain — and it does NOT self-heal: requestBlocks
+			// has nothing to request, so the same line repeats forever
+			// while the node looks "busy". On genesis-blockbrew it ran
+			// 3.5 days (underlying cause: unreadable blocks behind a
+			// corrupt pebble sstable). Mirror the [CHAINSTATE-CORRUPTION]
+			// idiom: after a minute of the SAME height, say so once,
+			// loudly, with the operator action — then rate-limit.
+			// Silence-by-repetition is what hid the real failure.
+			if nh == sm.lastWedgeHeight {
+				sm.wedgeStallCount++
+			} else {
+				sm.lastWedgeHeight = nh
+				sm.wedgeStallCount = 1
+			}
+			if sm.wedgeStallCount == 6 { // 6 x 10s ticker = ~1 min
+				log.Printf("[SYNC-WEDGE] block download is STUCK at height %d: the block is absent "+
+					"from the queue and cannot be re-requested, so this will not recover on its own "+
+					"(%v with no tip advance). Common cause: block data is unreadable on disk (check "+
+					"the log for 'pebble' / checksum errors above). Operator action: restart the node "+
+					"— the startup consistency probe will roll back to the last known-good tip and "+
+					"report if chaindata/ must be removed for a full re-sync.",
+					nh, stallDuration.Round(time.Second))
+			}
+
+			// GEN-BREW-665671 self-heal: if the "NOT IN QUEUE" is because
+			// the queue floor sits ABOVE nextHeight (an unfillable gap
+			// below the queue, nothing in flight), drop the gapped queue
+			// so the drain check below rebuilds from the validated tip.
+			// This turns the forever-spin into a self-recovery; the
+			// [SYNC-WEDGE] escalation above stays as a fallback for the
+			// distinct on-disk-corruption cause (floor == nextHeight but
+			// the block itself is unreadable), which a rebuild can't fix.
+			if sm.healGappedBlockQueue(nh, inflightLen) {
+				sm.wedgeStallCount = 0
+				sm.lastWedgeHeight = 0
+			}
+		}
+
+		// Also reset stuck DOWNLOAD slots near nextHeight so the
+		// pipeline can flow. applyNearbyStallReset owns the policy
+		// for which states are eligible.
+		applyNearbyStallReset(sm.blockQueue, nh, sm.inflight)
+	}
+	if nh != lastNextHeight {
+		return nh, now
+	}
+	return lastNextHeight, lastAdvanceTime
+}
+
 // blockDownloadLoop is the main loop for requesting blocks during IBD.
 func (sm *SyncManager) blockDownloadLoop() {
 	// Release the single-loop guard on EVERY exit path (quit, drained queue,
@@ -2359,78 +2457,7 @@ func (sm *SyncManager) blockDownloadLoop() {
 
 		case <-stallCheckTicker.C:
 			sm.mu.Lock()
-			nh := sm.nextHeight
-			inflightLen := len(sm.inflight)
-			stallDuration := time.Since(lastAdvanceTime)
-
-			if nh == lastNextHeight && stallDuration > 30*time.Second {
-				// nextHeight hasn't advanced for 30s. Diagnose the stall.
-				found := false
-				for _, req := range sm.blockQueue {
-					if req.Height == nh {
-						found = true
-						log.Printf("sync: stall detected at height %d: state=%d, inflight=%d, peer=%v, retries=%d, stallDuration=%v",
-							nh, req.State, inflightLen, req.Peer != nil, req.RetryCount, stallDuration)
-
-						sm.applyStallRecovery(req, time.Now())
-						break
-					}
-				}
-				if !found {
-					// Block not in queue at all - it was removed (connected or skipped).
-					// This shouldn't happen if nextH points to it. Log for debugging.
-					log.Printf("sync: stall at height %d but block NOT IN QUEUE, inflight=%d queue=%d",
-						nh, inflightLen, len(sm.blockQueue))
-
-					// ESCALATION (GEN-BREW-665671): this branch is an invariant
-					// violation — nextHeight points at a block the queue does
-					// not contain — and it does NOT self-heal: requestBlocks
-					// has nothing to request, so the same line repeats forever
-					// while the node looks "busy". On genesis-blockbrew it ran
-					// 3.5 days (underlying cause: unreadable blocks behind a
-					// corrupt pebble sstable). Mirror the [CHAINSTATE-CORRUPTION]
-					// idiom: after a minute of the SAME height, say so once,
-					// loudly, with the operator action — then rate-limit.
-					// Silence-by-repetition is what hid the real failure.
-					if nh == sm.lastWedgeHeight {
-						sm.wedgeStallCount++
-					} else {
-						sm.lastWedgeHeight = nh
-						sm.wedgeStallCount = 1
-					}
-					if sm.wedgeStallCount == 6 { // 6 x 10s ticker = ~1 min
-						log.Printf("[SYNC-WEDGE] block download is STUCK at height %d: the block is absent "+
-							"from the queue and cannot be re-requested, so this will not recover on its own "+
-							"(%v with no tip advance). Common cause: block data is unreadable on disk (check "+
-							"the log for 'pebble' / checksum errors above). Operator action: restart the node "+
-							"— the startup consistency probe will roll back to the last known-good tip and "+
-							"report if chaindata/ must be removed for a full re-sync.",
-							nh, stallDuration.Round(time.Second))
-					}
-
-					// GEN-BREW-665671 self-heal: if the "NOT IN QUEUE" is because
-					// the queue floor sits ABOVE nextHeight (an unfillable gap
-					// below the queue, nothing in flight), drop the gapped queue
-					// so the drain check below rebuilds from the validated tip.
-					// This turns the forever-spin into a self-recovery; the
-					// [SYNC-WEDGE] escalation above stays as a fallback for the
-					// distinct on-disk-corruption cause (floor == nextHeight but
-					// the block itself is unreadable), which a rebuild can't fix.
-					if sm.healGappedBlockQueue(nh, inflightLen) {
-						sm.wedgeStallCount = 0
-						sm.lastWedgeHeight = 0
-					}
-				}
-
-				// Also reset stuck DOWNLOAD slots near nextHeight so the
-				// pipeline can flow. applyNearbyStallReset owns the policy
-				// for which states are eligible.
-				applyNearbyStallReset(sm.blockQueue, nh, sm.inflight)
-			}
-			if nh != lastNextHeight {
-				lastNextHeight = nh
-				lastAdvanceTime = time.Now()
-			}
+			lastNextHeight, lastAdvanceTime = sm.checkForStall(time.Now(), lastNextHeight, lastAdvanceTime)
 			sm.mu.Unlock()
 
 		case <-sm.quit:

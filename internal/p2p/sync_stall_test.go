@@ -2,6 +2,9 @@ package p2p
 
 import (
 	"bytes"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -851,4 +854,181 @@ func TestMuteMidBodyNearMaxBlockRotatesAndConnects(t *testing.T) {
 	sm.mu.Unlock()
 	t.Fatalf("rotated near-max block did not connect: state=%d connects=%d (want Connected, tip=%d)",
 		st, adv.connectCount(), node.Height)
+}
+
+// liveNearMaxSerializedBytes is block 967495's size (the first near-max stall).
+// nearMaxWeightBlock pads with OP_RETURN so it is denser than a 7k-tx mainnet
+// body; the timeout must cover the real wire size, not just the test fixture.
+const liveNearMaxSerializedBytes = 1_539_532
+
+// TestNearMaxBodyAtRealisticRateCompletesWithoutStall is the 2026-09-18 soak
+// control. Seven consecutive ≥3.9 M-weight blocks arrived; rotation worked
+// (retries 1..7, peer=true) but each body took long enough to hit
+// getStallTimeout, so the node sat at a 2-block lag while six other impls
+// on the same box stayed at tip. If the fetch time of a ≥3.9 M-weight body
+// at a realistic rate is anywhere near getStallTimeout, the timeout is the
+// bug. The body must connect without a "stall detected" line.
+func TestNearMaxBodyAtRealisticRateCompletesWithoutStall(t *testing.T) {
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	genesis := idx.Genesis()
+	block := nearMaxWeightBlock(t, genesis.Hash, genesis.Header.Timestamp+600)
+	node, err := idx.AddHeader(block.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+
+	var ser bytes.Buffer
+	if err := block.Serialize(&ser); err != nil {
+		t.Fatalf("Serialize: %v", err)
+	}
+	size := ser.Len()
+	if size < 900_000 {
+		t.Fatalf("near-max body serialized to %d bytes; want ≥900KiB", size)
+	}
+	wireBytes := size
+	if wireBytes < liveNearMaxSerializedBytes {
+		wireBytes = liveNearMaxSerializedBytes
+	}
+	fetch := time.Duration(wireBytes) * time.Second / minLiveBlockThroughput
+	if fetch < 35*time.Second {
+		t.Fatalf("fixture fetch %s is too short to exercise the soak (live p90 38.1s)", fetch)
+	}
+
+	var logBuf bytes.Buffer
+	var logMu sync.Mutex
+	log.SetOutput(&lockedLogWriter{mu: &logMu, w: &logBuf})
+	defer log.SetOutput(os.Stderr)
+
+	adv := &advancingChainConnector{mockChainConnector: mockChainConnector{tipHeight: 0, tipTimestamp: 1}}
+	pm := &PeerManager{}
+	peer := createMockPeer("slow.example:8333", node.Height)
+	pm.InsertConnectedPeer(peer)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		PeerManager:    pm,
+		ChainManager:   adv,
+		DownloadWindow: 8,
+	})
+	sm.Start()
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			sm.Stop()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Stop did not complete within 5s")
+		}
+	}()
+
+	timeout := sm.getStallTimeout(peer)
+	t.Logf("near-max body serialized=%d wireBytes=%d rate=%d B/s fetch=%s getStallTimeout=%s BaseStallTimeout=%s",
+		size, wireBytes, minLiveBlockThroughput, fetch, timeout, BaseStallTimeout)
+	if fetch >= timeout {
+		t.Fatalf("time-to-complete %s for a %d-byte ≥3.9M-weight body at %d B/s is not inside getStallTimeout %s — the timeout is the bug, not the peer (live p90 38.1s / worst 56.0s vs old 30s)",
+			fetch, wireBytes, minLiveBlockThroughput, timeout)
+	}
+
+	req := &blockRequest{
+		Hash:   node.Hash,
+		Height: node.Height,
+		State:  BlockDownloadPending,
+	}
+	sm.mu.Lock()
+	sm.blockQueue = []*blockRequest{req}
+	sm.nextHeight = node.Height
+	sm.mu.Unlock()
+
+	sm.requestBlocks()
+	got := drainGetData(peer)
+	if len(got) != 1 || got[0] != node.Hash {
+		t.Fatalf("getdata = %v, want [%s]", got, node.Hash)
+	}
+
+	// Body is still arriving: RequestAt is `fetch` ago, matching a 1.54 MB
+	// transfer at 32 KiB/s. checkStaleRequests and the stall ticker both
+	// fire in that window on mainnet (1s and 10s ticks).
+	now := time.Now()
+	sm.mu.Lock()
+	req.RequestAt = now.Add(-fetch)
+	if req.State != BlockDownloadInFlight {
+		sm.mu.Unlock()
+		t.Fatalf("after requestBlocks: state=%d, want InFlight", req.State)
+	}
+	sm.mu.Unlock()
+
+	sm.checkStaleRequests()
+
+	sm.mu.Lock()
+	if req.State != BlockDownloadInFlight {
+		st, retries := req.State, req.RetryCount
+		sm.mu.Unlock()
+		t.Fatalf("checkStaleRequests aborted a realistic-rate near-max fetch: state=%d retries=%d after %s (timeout %s)",
+			st, retries, fetch, timeout)
+	}
+	lastH, _ := sm.checkForStall(now, node.Height, now.Add(-fetch))
+	stateAfterStall := req.State
+	sm.mu.Unlock()
+	if stateAfterStall != BlockDownloadInFlight {
+		t.Fatalf("stall detector aborted a live near-max download: state=%d after fetch %s", stateAfterStall, fetch)
+	}
+	if lastH != node.Height {
+		t.Fatalf("stall cursor height %d, want %d", lastH, node.Height)
+	}
+
+	// After a prior timeout, stallDuration is already > BaseStallTimeout
+	// while the replacement getdata is still young. That produced the soak
+	// residual: 48 "stall detected" lines in 39 min, all peer=true.
+	sm.mu.Lock()
+	req.RequestAt = now
+	sm.checkForStall(now, node.Height, now.Add(-BaseStallTimeout-time.Second))
+	if req.State != BlockDownloadInFlight {
+		st := req.State
+		sm.mu.Unlock()
+		t.Fatalf("young InFlight during a long nextHeight stall was reset to state=%d", st)
+	}
+	sm.mu.Unlock()
+
+	logMu.Lock()
+	logs := logBuf.String()
+	logMu.Unlock()
+	if strings.Contains(logs, "stall detected") {
+		t.Fatalf("stall line during a realistic-rate near-max fetch (timeout %s, fetch %s):\n%s", timeout, fetch, logs)
+	}
+
+	sm.HandleBlock(peer, &MsgBlock{Block: block})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		sm.mu.Lock()
+		st := req.State
+		sm.mu.Unlock()
+		if st == BlockDownloadConnected {
+			if adv.connectCount() != 1 {
+				t.Fatalf("ConnectBlock called %d times, want 1", adv.connectCount())
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	sm.mu.Lock()
+	st := req.State
+	sm.mu.Unlock()
+	t.Fatalf("near-max body did not connect: state=%d connects=%d", st, adv.connectCount())
+}
+
+type lockedLogWriter struct {
+	mu *sync.Mutex
+	w  *bytes.Buffer
+}
+
+func (l *lockedLogWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
