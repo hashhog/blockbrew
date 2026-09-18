@@ -302,6 +302,55 @@ func (c *ChainDB) GetBlockHashByHeight(height int32) (wire.Hash256, error) {
 	return hash, nil
 }
 
+// HistoryFloor returns the lowest height in 1..tip whose block BODY is
+// stored, if height 1 has no body. ok=false means no prefix hole (tip==0
+// or height 1 has a body).
+//
+// Bitcoin Core's block index is dense from genesis even on a pruned node
+// — getblockhash(1) always resolves, and pruned/pruneheight describe
+// missing *bodies*. blockbrew snapshot-boot / assume-valid datadirs keep
+// genesis plus a suffix of bodies and nothing in 1..floor-1. Live mainnet
+// (2026-09-17): getblock misses at 1 / 500000 / 900000 / 940000 and HAVEs
+// from 960000, while getblockchaininfo claimed pruned:false.
+//
+// hashAt resolves height→hash. nil means GetBlockHashByHeight (the on-disk
+// index). RPC passes an in-memory ancestor walk so a dense header chain
+// with missing bodies is still detected. This is an honest-limitation
+// detector only — it does not backfill genesis→floor.
+func (c *ChainDB) HistoryFloor(tip int32, hashAt func(int32) (wire.Hash256, bool)) (int32, bool) {
+	if c == nil || tip <= 0 {
+		return 0, false
+	}
+	if c.hasBodyAt(1, hashAt) {
+		return 0, false
+	}
+	lo, hi := int32(1), tip
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if c.hasBodyAt(mid, hashAt) {
+			hi = mid
+		} else {
+			lo = mid + 1
+		}
+	}
+	return lo, true
+}
+
+func (c *ChainDB) hasBodyAt(height int32, hashAt func(int32) (wire.Hash256, bool)) bool {
+	var hash wire.Hash256
+	var found bool
+	if hashAt != nil {
+		hash, found = hashAt(height)
+	} else {
+		h, err := c.GetBlockHashByHeight(height)
+		hash, found = h, err == nil
+	}
+	if !found {
+		return false
+	}
+	return c.HasBlockBody(hash)
+}
+
 // GetChainState retrieves the current chain state.
 func (c *ChainDB) GetChainState() (*ChainState, error) {
 	data, err := c.db.Get(ChainStateKey)

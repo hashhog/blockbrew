@@ -132,6 +132,12 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 	// the same shape (omitempty in BlockchainInfo). When the operator
 	// passed `-prune=N` but no pass has yet freed any files,
 	// pruneheight is still reported as 0 — Core does the same.
+	//
+	// SNAPSHOT-BOOT HOLE: `-prune` off is not the same as "holds the full
+	// chain". A datadir that does not retain bodies from height 1 must
+	// still report pruned=true and pruneheight=first complete body
+	// (rpc/blockchain.cpp). Do not invent prune_target_size /
+	// automatic_pruning when `-prune` is off.
 	pruned := s.pruner.IsEnabled()
 	pruneHeight := int32(0)
 	pruneTarget := uint64(0)
@@ -142,6 +148,14 @@ func (s *Server) handleGetBlockchainInfo() (interface{}, *RPCError) {
 		// Core parity (rpc/blockchain.cpp:1452): automatic_pruning is
 		// false when -prune=1 (manual mode); true otherwise.
 		automaticPruning = pruneTarget > 0
+	}
+	if s.chainDB != nil {
+		if floor, hole := s.chainDB.HistoryFloor(tipHeight, s.hashAtHeight); hole {
+			pruned = true
+			if floor > pruneHeight {
+				pruneHeight = floor
+			}
+		}
 	}
 
 	return &BlockchainInfo{
@@ -286,19 +300,16 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 	// "had it, pruned now" so callers see Core's pruned-data error
 	// (RPC_MISC_ERROR / "Block not available (pruned data)") instead of
 	// a generic -5 not-found that operators can't tell from a typo'd hash.
-	// We report pruned only when the operator actually enabled pruning
-	// AND the header is known on the active chain — the same conditions
-	// Core checks (rpc/blockchain.cpp:677).
+	// Core GetBlockChecked (rpc/blockchain.cpp) throws that string when
+	// the index knows the header and the body is gone. A snapshot-boot
+	// hole is the same operator-visible state even when `-prune` is off.
 	block, err := s.chainDB.GetBlock(hash)
 	if err != nil {
-		// Header in index + on main chain + prune enabled implies pruned.
-		if s.pruner.IsEnabled() && s.headerIndex != nil {
+		if s.headerIndex != nil {
 			if hdrNode := s.headerIndex.GetNode(hash); hdrNode != nil {
-				if s.chainMgr != nil && s.chainMgr.IsInMainChain(hash) {
-					return nil, &RPCError{
-						Code:    RPCErrMisc,
-						Message: "Block not available (pruned data)",
-					}
+				return nil, &RPCError{
+					Code:    RPCErrMisc,
+					Message: "Block not available (pruned data)",
 				}
 			}
 		}
@@ -477,9 +488,10 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 // We therefore prefer the in-memory active chain (Core's behaviour),
 // falling back to chainDB only when the chain manager has not yet been
 // initialised (early startup, or unit tests that wire chainDB without
-// a chain manager).  Out-of-range heights now return Core's
-// "Block height out of range" with RPC_INVALID_PARAMETER (-8), matching
-// rpc/blockchain.cpp:589-591.
+// a chain manager).  Out-of-range heights (height < 0 or height > tip)
+// return Core's "Block height out of range" with RPC_INVALID_PARAMETER
+// (-8). An in-range height with no retained index row returns -1
+// "Block not available (pruned data)" — not a bad-parameter error.
 func (s *Server) handleGetBlockHash(params json.RawMessage) (interface{}, *RPCError) {
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
@@ -502,36 +514,88 @@ func (s *Server) handleGetBlockHash(params json.RawMessage) (interface{}, *RPCEr
 		return nil, rpcErr
 	}
 
+	// Core: `nHeight < 0 || nHeight > active_chain.Height()` → -8
+	// "Block height out of range" (rpc/blockchain.cpp::getblockhash).
+	// A height inside 0..=tip that we simply do not retain is NOT a
+	// bad parameter — Core would still return the hash because its
+	// index is dense. blockbrew's assumeutxo / assume-valid hole
+	// (missing height-index row) is the latter; -8 there reads as
+	// "the caller asked for a height that cannot exist". Use Core's
+	// pruned-data wording instead.
+	tip, haveTip := s.tipHeightForHash()
+	if height < 0 || (haveTip && height > tip) {
+		return nil, &RPCError{
+			Code:    RPCErrInvalidParameter,
+			Message: "Block height out of range",
+		}
+	}
+
 	// Primary path: walk the in-memory active chain from tip to ancestor
 	// at `height`.  Matches Core's `active_chain[nHeight]` semantics.
 	if s.chainMgr != nil {
-		tipNode := s.chainMgr.BestBlockNode()
-		if tipNode != nil {
-			if height < 0 || height > tipNode.Height {
-				return nil, &RPCError{
-					Code:    RPCErrInvalidParameter,
-					Message: "Block height out of range",
-				}
-			}
+		if tipNode := s.chainMgr.BestBlockNode(); tipNode != nil {
 			if anc := tipNode.GetAncestor(height); anc != nil {
 				return anc.Hash.String(), nil
 			}
 		}
 	}
 
-	// Fallback: chainDB lookup.  This is reached only when no chain
-	// manager is wired (early startup before NewChainManager, or unit
-	// tests that exercise the storage path directly).
-	if s.chainDB == nil {
-		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Block height out of range"}
+	// Fallback: chainDB lookup.  This is reached when no chain manager
+	// is wired (early startup, or unit tests that exercise the storage
+	// path directly), or when the in-memory walk has a hole.
+	if s.chainDB != nil {
+		hash, err := s.chainDB.GetBlockHashByHeight(height)
+		if err == nil {
+			return hash.String(), nil
+		}
 	}
 
-	hash, err := s.chainDB.GetBlockHashByHeight(height)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Block height out of range"}
+	if haveTip && height <= tip {
+		return nil, &RPCError{
+			Code:    RPCErrMisc,
+			Message: "Block not available (pruned data)",
+		}
 	}
+	return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Block height out of range"}
+}
 
-	return hash.String(), nil
+// tipHeightForHash is the best-effort tip used to split getblockhash
+// in-range-but-unretained (-1) from genuinely out-of-range (-8).
+func (s *Server) tipHeightForHash() (int32, bool) {
+	if s.chainMgr != nil {
+		if tipNode := s.chainMgr.BestBlockNode(); tipNode != nil {
+			return tipNode.Height, true
+		}
+		_, h := s.chainMgr.BestBlock()
+		return h, true
+	}
+	if s.chainDB != nil {
+		cs, err := s.chainDB.GetChainState()
+		if err == nil && cs != nil {
+			return cs.BestHeight, true
+		}
+	}
+	return 0, false
+}
+
+// hashAtHeight resolves a main-chain height to its hash for HistoryFloor.
+// Prefers the in-memory ancestor walk (dense headers, sparse bodies — the
+// live mainnet shape) and falls back to the on-disk height index.
+func (s *Server) hashAtHeight(height int32) (wire.Hash256, bool) {
+	if s.chainMgr != nil {
+		if tip := s.chainMgr.BestBlockNode(); tip != nil {
+			if anc := tip.GetAncestor(height); anc != nil {
+				return anc.Hash, true
+			}
+		}
+	}
+	if s.chainDB != nil {
+		h, err := s.chainDB.GetBlockHashByHeight(height)
+		if err == nil {
+			return h, true
+		}
+	}
+	return wire.Hash256{}, false
 }
 
 func (s *Server) handleGetBlockCount() (interface{}, *RPCError) {

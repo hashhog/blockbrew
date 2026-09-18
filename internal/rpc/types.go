@@ -108,10 +108,12 @@ type BlockchainInfo struct {
 	ChainWork            string            `json:"chainwork"`
 	SizeOnDisk           int64             `json:"size_on_disk"`
 	Pruned               bool              `json:"pruned"`
-	// PruneHeight is the lowest-height block whose body is still on disk.
-	// Only emitted when pruned=true; matches Bitcoin Core's
-	// rpc/blockchain.cpp getblockchaininfo behavior. omitempty so archive
-	// nodes don't include the key, also matching Core.
+	// PruneHeight is the lowest-height block whose body is still on disk
+	// (Core: "the first block unpruned"). Set both when `-prune` is on
+	// and when a snapshot-boot / assume-valid datadir has a prefix hole
+	// in retained bodies — pruned=false would claim the node holds the
+	// full chain. Only emitted when pruned=true; omitempty so a true
+	// archive node does not include the key, matching Core.
 	PruneHeight int32 `json:"pruneheight,omitempty"`
 	// AutomaticPruning is true when the node will automatically delete
 	// old block files to stay under -prune target. Always true when

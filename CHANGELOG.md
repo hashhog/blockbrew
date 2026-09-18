@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- fix: report pruned:true + pruneheight when historical block bodies are missing
 - docs: CHARTER proof bundle (`proof/`; `bash proof/verify.sh`)
 
 ## v1.0.2 — 2026-09-13
