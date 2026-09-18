@@ -77,16 +77,21 @@ type PeerListeners struct {
 	// until the payload is decrypted — then length is still the advertised
 	// payload size). Used to stamp first-byte of an in-flight block body.
 	OnMessageHeader func(p *Peer, cmd string, length uint32)
-	OnTx            func(p *Peer, msg *MsgTx)
-	OnPing          func(p *Peer, msg *MsgPing)
-	OnPong          func(p *Peer, msg *MsgPong)
-	OnAddr          func(p *Peer, msg *MsgAddr)
-	OnGetAddr       func(p *Peer, msg *MsgGetAddr)
-	OnGetData       func(p *Peer, msg *MsgGetData)
-	OnGetHeaders    func(p *Peer, msg *MsgGetHeaders)
-	OnNotFound      func(p *Peer, msg *MsgNotFound)
-	OnFeeFilter     func(p *Peer, msg *MsgFeeFilter)
-	OnSendHeaders   func(p *Peer, msg *MsgSendHeaders)
+	// OnNonBlockPayload is invoked after a fully-decoded message whose
+	// command is not "block". Retracts a v2 length-only first-byte stamp
+	// (command unknown until decrypt) so a compact block does not arm the
+	// 128s complete-transfer window.
+	OnNonBlockPayload func(p *Peer)
+	OnTx              func(p *Peer, msg *MsgTx)
+	OnPing            func(p *Peer, msg *MsgPing)
+	OnPong            func(p *Peer, msg *MsgPong)
+	OnAddr            func(p *Peer, msg *MsgAddr)
+	OnGetAddr         func(p *Peer, msg *MsgGetAddr)
+	OnGetData         func(p *Peer, msg *MsgGetData)
+	OnGetHeaders      func(p *Peer, msg *MsgGetHeaders)
+	OnNotFound        func(p *Peer, msg *MsgNotFound)
+	OnFeeFilter       func(p *Peer, msg *MsgFeeFilter)
+	OnSendHeaders     func(p *Peer, msg *MsgSendHeaders)
 	// BIP35 "Tx relay + mempool" callback — peer requests our mempool contents.
 	OnMempool func(p *Peer, msg *MsgMempool)
 	// BIP152 compact block callbacks
@@ -703,6 +708,10 @@ func (p *Peer) readHandler() {
 
 		// Track bytes received (approximate)
 		atomic.AddUint64(&p.bytesRecvd, uint64(len(msg.Command())+24)) // header + command overhead
+
+		if msg.Command() != "block" && p.config.Listeners != nil && p.config.Listeners.OnNonBlockPayload != nil {
+			p.config.Listeners.OnNonBlockPayload(p)
+		}
 
 		p.handleMessage(msg)
 	}

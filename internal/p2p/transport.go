@@ -452,6 +452,8 @@ func (t *V2Transport) ReadMessage() (Message, error) {
 		// Command is still encrypted. A payload ≥80 bytes can be a block
 		// (header size); fire the hook so a mute getdata is not held for
 		// the full 128s complete-transfer window while this body streams.
+		// Compact blocks and other ≥80-byte v2 messages also match — the
+		// sync manager retracts the stamp once decrypt shows a non-block.
 		if t.headerHook != nil && length >= 80 {
 			t.headerHook("", length)
 		}

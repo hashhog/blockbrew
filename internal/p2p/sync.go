@@ -1647,6 +1647,9 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 				sm.noteBlockFirstByte(p, length)
 			}
 		},
+		OnNonBlockPayload: func(p *Peer) {
+			sm.retractNonBlockFirstByte(p)
+		},
 		OnGetData: func(p *Peer, msg *MsgGetData) {
 			sm.HandleGetData(p, msg)
 		},
@@ -3084,6 +3087,32 @@ func (sm *SyncManager) requestTimeout(req *blockRequest) time.Duration {
 		return FirstByteTimeout
 	}
 	return timeout
+}
+
+// retractNonBlockFirstByte clears a first-byte stamp that the v2
+// length-only header hook applied to a message that was not a `block`.
+// BIP324 encrypts the command inside the payload, so the hook fires with
+// cmd=="" for every payload ≥80 bytes. A compact block (~162 KiB on live
+// 967624 and 967626) is not the getdata body: leaving FirstByteAt set
+// switches requestTimeout from FirstByteTimeout (16s) to BaseStallTimeout
+// (128s) and rotateTimedOutRequest then doubles it. Live 416cbeb 23:13Z:
+// 967626 first-byte size=162004 ttfb=-130ms from 71.183.49.199, then
+// 4m22s of silence (256s doubled window) while Core sat on that tip.
+func (sm *SyncManager) retractNonBlockFirstByte(peer *Peer) {
+	if peer == nil {
+		return
+	}
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for _, req := range sm.inflight {
+		if req == nil || req.Peer != peer || req.FirstByteAt.IsZero() {
+			continue
+		}
+		log.Printf("sync: fetch first-byte retracted height=%d peer=%s size=%d — not a block body",
+			req.Height, peer.Address(), req.PayloadSize)
+		req.FirstByteAt = time.Time{}
+		req.PayloadSize = 0
+	}
 }
 
 // noteBlockFirstByte stamps FirstByteAt on the oldest inflight request

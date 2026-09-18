@@ -1681,3 +1681,148 @@ func TestMutePipelineHeadRotatesWholePeerPipeline(t *testing.T) {
 		}
 	}
 }
+
+// oneInflightNearMax is the live 416cbeb at-tip shape: one connected peer,
+// one near-max body already getdata'd.
+func oneInflightNearMax(t *testing.T, addr string) (*SyncManager, *Peer, *blockRequest) {
+	t.Helper()
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	genesis := idx.Genesis()
+	block := nearMaxWeightBlock(t, genesis.Hash, genesis.Header.Timestamp+600)
+	node, err := idx.AddHeader(block.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader: %v", err)
+	}
+
+	pm := &PeerManager{}
+	peer := createMockPeer(addr, node.Height)
+	pm.InsertConnectedPeer(peer)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    idx,
+		PeerManager:    pm,
+		DownloadWindow: 8,
+	})
+	req := &blockRequest{
+		Hash:   node.Hash,
+		Height: node.Height,
+		State:  BlockDownloadPending,
+	}
+	sm.mu.Lock()
+	sm.blockQueue = []*blockRequest{req}
+	sm.nextHeight = node.Height
+	sm.mu.Unlock()
+
+	sm.requestBlocks()
+	if got := drainGetData(peer); len(got) != 1 || got[0] != node.Hash {
+		t.Fatalf("getdata = %v, want [%s]", got, node.Hash)
+	}
+	return sm, peer, req
+}
+
+// TestV2NonBlockPayloadDoesNotArmCompleteTransferTimeout is the live
+// 416cbeb residual after the pipeline-head first-byte fix. BIP324 v2
+// encrypts the command, so OnMessageHeader fires with cmd=="" for every
+// payload ≥80 bytes. A compact block is ~162 KiB; stamping that as the
+// block body switches requestTimeout from FirstByteTimeout (16s) to
+// BaseStallTimeout (128s), then increaseStallTimeout doubles it.
+//
+// Live 2026-09-18T23:13Z on the hash-verified 416cbeb pin: height 967626
+// first-byte size=162004 ttfb=-130ms from 71.183.49.199 (v2, compact
+// announce=false), then 4m22s of silence until the next peer's first-byte
+// (size=95) — 256s doubled window — while Core and 8/9 fleet nodes sat on
+// that tip. 967624 on the same peer was the previous doubling: first-byte
+// size=162004 at 18:49:44, rotate at 18:51:53 (129s).
+func TestV2NonBlockPayloadDoesNotArmCompleteTransferTimeout(t *testing.T) {
+	if FirstByteTimeout >= BaseStallTimeout {
+		t.Fatalf("FirstByteTimeout %s must be < BaseStallTimeout %s", FirstByteTimeout, BaseStallTimeout)
+	}
+
+	const compactSize uint32 = 162004 // live 967624 and 967626 from 71.183.49.199
+	sm, peer, req := oneInflightNearMax(t, "71.183.49.199:8333")
+
+	sm.noteBlockFirstByte(peer, compactSize)
+
+	sm.mu.Lock()
+	if req.FirstByteAt.IsZero() || req.PayloadSize != compactSize {
+		fb, sz := req.FirstByteAt, req.PayloadSize
+		sm.mu.Unlock()
+		t.Fatalf("after v2 length hook: firstByte=%v size=%d, want stamped %d", fb, sz, compactSize)
+	}
+	sm.mu.Unlock()
+
+	// Decrypt finished: command is cmpctblock, not block.
+	sm.retractNonBlockFirstByte(peer)
+
+	sm.mu.Lock()
+	if !req.FirstByteAt.IsZero() || req.PayloadSize != 0 {
+		fb, sz := req.FirstByteAt, req.PayloadSize
+		sm.mu.Unlock()
+		t.Fatalf("after non-block retract: firstByte=%v size=%d, want cleared", fb, sz)
+	}
+	req.RequestAt = time.Now().Add(-FirstByteTimeout - time.Second)
+	sm.mu.Unlock()
+
+	sm.checkStaleRequests()
+
+	sm.mu.Lock()
+	st := req.State
+	_, stillIn := sm.inflight[req.Hash]
+	stall := sm.getStallTimeout(peer)
+	sm.mu.Unlock()
+	if st != BlockDownloadPending || stillIn {
+		t.Fatalf("after %s with v2 non-block size=%d: state=%d inflight=%v, want Pending "+
+			"(live 416cbeb 967626: first-byte size=162004 then 4m22s on the 256s doubled window)",
+			FirstByteTimeout, compactSize, st, stillIn)
+	}
+	if stall != BaseStallTimeout {
+		t.Fatalf("stall timeout=%s, want %s (false first-byte must not double the complete-transfer window)",
+			stall, BaseStallTimeout)
+	}
+}
+
+// TestV2BlockPayloadKeepsFirstByteInsideCompleteTransferWindow is the
+// other half: a real v2 block's length prefix (cmd unknown, size = full
+// body) MUST keep FirstByteAt so a 1.5 MB ReadFull is not rotated at 16s.
+func TestV2BlockPayloadKeepsFirstByteInsideCompleteTransferWindow(t *testing.T) {
+	const blockSize uint32 = 1570511 // Core size of 967626
+	sm, peer, req := oneInflightNearMax(t, "v2-block.example:8333")
+
+	sm.noteBlockFirstByte(peer, blockSize)
+
+	sm.mu.Lock()
+	req.RequestAt = time.Now().Add(-FirstByteTimeout - time.Second)
+	sm.mu.Unlock()
+
+	sm.checkStaleRequests()
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if req.State != BlockDownloadInFlight {
+		t.Fatalf("real v2 block size=%d after %s: state=%d, want InFlight (body still streaming)",
+			blockSize, FirstByteTimeout, req.State)
+	}
+	if _, ok := sm.inflight[req.Hash]; !ok {
+		t.Fatal("real v2 block left inflight; 16s mute timeout fired during the body")
+	}
+}
+
+func TestCreatePeerListenersRetractsV2NonBlockFirstByte(t *testing.T) {
+	const compactSize uint32 = 162004
+	sm, peer, req := oneInflightNearMax(t, "71.183.49.199:8333")
+	listeners := sm.CreatePeerListeners()
+	if listeners.OnNonBlockPayload == nil {
+		t.Fatal("OnNonBlockPayload not wired; v2 cmpctblock would keep the 128s window")
+	}
+
+	sm.noteBlockFirstByte(peer, compactSize)
+	listeners.OnNonBlockPayload(peer)
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if !req.FirstByteAt.IsZero() || req.PayloadSize != 0 {
+		t.Fatalf("after OnNonBlockPayload: firstByte=%v size=%d, want retracted", req.FirstByteAt, req.PayloadSize)
+	}
+}
