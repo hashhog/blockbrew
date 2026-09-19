@@ -82,10 +82,11 @@ type ChainManager struct {
 	flushInterval    int
 
 	// IBD optimizations
-	assumeValidHash   wire.Hash256 // Skip script validation below this hash
-	assumeValidHeight int32        // Height of assume-valid block
-	isIBD             bool         // Initial Block Download mode
-	parallelScripts   bool         // Use parallel script validation
+	assumeValidHash   wire.Hash256      // Skip script validation below this hash
+	assumeValidHeight int32             // Height of assume-valid block
+	isIBD             bool              // Initial Block Download mode
+	parallelScripts   bool              // Use parallel script validation
+	scriptCheckQueue  *ScriptCheckQueue // persistent CCheckQueue; nil when serial
 
 	// pruningEnabled gates the MaxReorgDepth reorg cap. false (archive, the
 	// default) = no cap: follow the most-work valid chain to any depth like
@@ -236,6 +237,10 @@ type ChainManagerConfig struct {
 	// IBD optimizations
 	AssumeValidHash wire.Hash256 // Hash of assume-valid block (skip scripts below this)
 	ParallelScripts bool         // Use parallel script validation (default: true)
+	// Par is Bitcoin Core's -par (init.cpp:513). 0 = auto (every core),
+	// 1 = serial, n>1 = n threads including the master, n<0 = leave |n|
+	// cores free. Ignored when ParallelScripts is false.
+	Par int
 
 	// SigCacheSize is the maximum number of entries in the signature cache.
 	// Default: 50,000 entries. Set to 0 to disable caching.
@@ -304,6 +309,10 @@ func NewChainManager(config ChainManagerConfig) *ChainManager {
 
 	// parallelScripts is already set from config.ParallelScripts in the struct
 	// literal above. No override needed.
+	if cm.parallelScripts {
+		extra := ResolveScriptCheckWorkers(config.Par)
+		cm.scriptCheckQueue = NewScriptCheckQueue(extra)
+	}
 
 	// Initialize tip from genesis if no UTXO set provided
 	if cm.utxoSet == nil {
@@ -1800,7 +1809,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			cache:    scriptView,
 			fallback: cm.utxoSet,
 		}
-		if cm.parallelScripts {
+		if cm.scriptCheckQueue != nil {
+			jobs, err := CollectScriptChecks(block, scriptUTXOView, flags, cm.sigCache)
+			if err != nil {
+				rollbackUTXOs()
+				return fmt.Errorf("script validation failed: %w", err)
+			}
+			if res := cm.scriptCheckQueue.Run(jobs); !res.OK {
+				rollbackUTXOs()
+				return fmt.Errorf("script validation failed: %w", res.FirstFailErr)
+			}
+		} else if cm.parallelScripts {
 			if err := ParallelScriptValidationCached(block, scriptUTXOView, flags, cm.sigCache); err != nil {
 				rollbackUTXOs()
 				return fmt.Errorf("script validation failed: %w", err)
@@ -2276,6 +2295,20 @@ func (cm *ChainManager) SetParallelScripts(parallel bool) {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.parallelScripts = parallel
+}
+
+// ScriptCheckQueue returns the persistent script-check pool, or nil when
+// this manager is serial (ParallelScripts=false).
+func (cm *ChainManager) ScriptCheckQueue() *ScriptCheckQueue {
+	return cm.scriptCheckQueue
+}
+
+// StopScriptCheckQueue joins extra script-check workers. Safe to call on a
+// serial manager. Idempotent.
+func (cm *ChainManager) StopScriptCheckQueue() {
+	if cm.scriptCheckQueue != nil {
+		cm.scriptCheckQueue.Stop()
+	}
 }
 
 // IsTooFarAhead reports whether blockHeight is too far ahead of activeHeight

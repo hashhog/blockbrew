@@ -795,6 +795,7 @@ func TestW105_G28_Par1SerialPath_ConfigInverted(t *testing.T) {
 		HeaderIndex:     idx,
 		ParallelScripts: false, // user wants serial
 	})
+	defer cmSerial.StopScriptCheckQueue()
 	if cmSerial.parallelScripts {
 		t.Error("W105-B11 regression: ParallelScripts=false must not be inverted to true by NewChainManager")
 	}
@@ -805,6 +806,7 @@ func TestW105_G28_Par1SerialPath_ConfigInverted(t *testing.T) {
 		HeaderIndex:     idx,
 		ParallelScripts: true,
 	})
+	defer cmParallel.StopScriptCheckQueue()
 	if !cmParallel.parallelScripts {
 		t.Error("W105-B11: ParallelScripts=true was not propagated into ChainManager")
 	}

@@ -5,9 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"runtime"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/script"
@@ -39,11 +36,11 @@ var (
 	// ContextualCheckBlock after the witness commitment is verified. Bitcoin
 	// Core reports this as "bad-blk-weight" (validation.cpp:4179-4180 —
 	// "weight limit failed").
-	ErrBlockWeightTooHigh       = errors.New("block weight exceeds maximum")
-	ErrTimestampTooFar          = errors.New("block timestamp too far in the future")
-	ErrBlockVersionTooLow       = errors.New("block version too low for height")
-	ErrTimestampBeforeMTP       = errors.New("block timestamp before median time past")
-	ErrBadBIP34Height           = errors.New("coinbase does not contain valid block height")
+	ErrBlockWeightTooHigh   = errors.New("block weight exceeds maximum")
+	ErrTimestampTooFar      = errors.New("block timestamp too far in the future")
+	ErrBlockVersionTooLow   = errors.New("block version too low for height")
+	ErrTimestampBeforeMTP   = errors.New("block timestamp before median time past")
+	ErrBadBIP34Height       = errors.New("coinbase does not contain valid block height")
 	ErrBadWitnessCommitment = errors.New("witness commitment mismatch")
 	// ErrBadWitnessNonceSize signals that the coinbase scriptWitness does not
 	// contain exactly one 32-byte element. Bitcoin Core: "bad-witness-nonce-size"
@@ -692,286 +689,30 @@ func (v *InMemoryUTXOView) AddTxOutputsAtHeight(tx *wire.MsgTx, height int32) {
 	v.AddTxOutputs(tx, height)
 }
 
-// scriptJob represents a single script validation job.
-type scriptJob struct {
-	tx       *wire.MsgTx
-	txIdx    int
-	inputIdx int
-	prevOut  *UTXOEntry
-	prevOuts []*wire.TxOut
-}
-
-// ParallelScriptValidation validates all transaction scripts in a block using parallel workers.
-// Script validation is CPU-intensive and embarrassingly parallel since each input is independent.
-// This function provides significant speedup on multi-core systems (roughly 6-7x on 8 cores).
+// ParallelScriptValidation validates all transaction scripts in a block.
+// One-shot callers (tests, verifychain) get a temporary ScriptCheckQueue
+// sized from -par=0 (auto). ConnectBlock uses the process-lifetime pool
+// on ChainManager instead, so it does not respawn workers per block.
 func ParallelScriptValidation(block *wire.MsgBlock, utxoView UTXOView, flags script.ScriptFlags) error {
-	numWorkers := runtime.GOMAXPROCS(0)
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
-
-	// Collect all script validation jobs
-	var jobs []scriptJob
-
-	for txIdx, tx := range block.Transactions {
-		// Skip coinbase (first transaction has no real inputs)
-		if txIdx == 0 {
-			continue
-		}
-
-		// Build prevOuts slice for this transaction (needed for sighash)
-		prevOuts := make([]*wire.TxOut, len(tx.TxIn))
-		for i, in := range tx.TxIn {
-			utxo := utxoView.GetUTXO(in.PreviousOutPoint)
-			if utxo == nil {
-				return fmt.Errorf("missing UTXO for tx %d input %d: %s:%d",
-					txIdx, i, in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
-			}
-			prevOuts[i] = &wire.TxOut{
-				Value:    utxo.Amount,
-				PkScript: utxo.PkScript,
-			}
-		}
-
-		// Create a job for each input
-		for inputIdx, in := range tx.TxIn {
-			utxo := utxoView.GetUTXO(in.PreviousOutPoint)
-			if utxo == nil {
-				return fmt.Errorf("missing UTXO for tx %d input %d", txIdx, inputIdx)
-			}
-			jobs = append(jobs, scriptJob{
-				tx:       tx,
-				txIdx:    txIdx,
-				inputIdx: inputIdx,
-				prevOut:  utxo,
-				prevOuts: prevOuts,
-			})
-		}
-	}
-
-	// If no jobs, validation passes
-	if len(jobs) == 0 {
-		return nil
-	}
-
-	// For small job counts, validate sequentially to avoid goroutine overhead
-	if len(jobs) <= 4 {
-		for _, job := range jobs {
-			err := script.VerifyScript(
-				job.tx.TxIn[job.inputIdx].SignatureScript,
-				job.prevOut.PkScript,
-				job.tx,
-				job.inputIdx,
-				flags,
-				job.prevOut.Amount,
-				job.prevOuts,
-			)
-			if err != nil {
-				return fmt.Errorf("tx %d input %d: script failed: %w", job.txIdx, job.inputIdx, err)
-			}
-		}
-		return nil
-	}
-
-	// Use atomic.Pointer to store the first error without race conditions.
-	// Workers check this to exit early once any script fails.
-	var firstErr atomic.Pointer[error]
-
-	// WaitGroup to track completion
-	var wg sync.WaitGroup
-
-	// Semaphore to limit concurrent workers
-	sem := make(chan struct{}, numWorkers)
-
-	for _, job := range jobs {
-		wg.Add(1)
-		go func(j scriptJob) {
-			defer wg.Done()
-
-			// Acquire semaphore slot
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			// Check if we already have an error (early exit)
-			if firstErr.Load() != nil {
-				return
-			}
-
-			// Validate the script
-			err := script.VerifyScript(
-				j.tx.TxIn[j.inputIdx].SignatureScript,
-				j.prevOut.PkScript,
-				j.tx,
-				j.inputIdx,
-				flags,
-				j.prevOut.Amount,
-				j.prevOuts,
-			)
-			if err != nil {
-				// Store the first error atomically (only first wins)
-				wrapped := fmt.Errorf("tx %d input %d: script failed: %w", j.txIdx, j.inputIdx, err)
-				firstErr.CompareAndSwap(nil, &wrapped)
-			}
-		}(job)
-	}
-
-	// Wait for all workers to finish
-	wg.Wait()
-
-	// Check if there was an error
-	if errPtr := firstErr.Load(); errPtr != nil {
-		return *errPtr
-	}
-	return nil
+	return ParallelScriptValidationCached(block, utxoView, flags, nil)
 }
 
 // ParallelScriptValidationCached validates scripts with signature cache support.
 // Cached entries are looked up before expensive script verification, and successful
 // verifications are added to the cache for future reuse.
 func ParallelScriptValidationCached(block *wire.MsgBlock, utxoView UTXOView, flags script.ScriptFlags, cache *SigCache) error {
-	numWorkers := runtime.GOMAXPROCS(0)
-	if numWorkers < 1 {
-		numWorkers = 1
+	jobs, err := CollectScriptChecks(block, utxoView, flags, cache)
+	if err != nil {
+		return err
 	}
-
-	// Collect all script validation jobs
-	var jobs []scriptJob
-
-	for txIdx, tx := range block.Transactions {
-		// Skip coinbase (first transaction has no real inputs)
-		if txIdx == 0 {
-			continue
-		}
-
-		// Build prevOuts slice for this transaction (needed for sighash)
-		prevOuts := make([]*wire.TxOut, len(tx.TxIn))
-		for i, in := range tx.TxIn {
-			utxo := utxoView.GetUTXO(in.PreviousOutPoint)
-			if utxo == nil {
-				return fmt.Errorf("missing UTXO for tx %d input %d: %s:%d",
-					txIdx, i, in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
-			}
-			prevOuts[i] = &wire.TxOut{
-				Value:    utxo.Amount,
-				PkScript: utxo.PkScript,
-			}
-		}
-
-		// Create a job for each input
-		for inputIdx, in := range tx.TxIn {
-			utxo := utxoView.GetUTXO(in.PreviousOutPoint)
-			if utxo == nil {
-				return fmt.Errorf("missing UTXO for tx %d input %d", txIdx, inputIdx)
-			}
-			jobs = append(jobs, scriptJob{
-				tx:       tx,
-				txIdx:    txIdx,
-				inputIdx: inputIdx,
-				prevOut:  utxo,
-				prevOuts: prevOuts,
-			})
-		}
-	}
-
-	// If no jobs, validation passes
 	if len(jobs) == 0 {
 		return nil
 	}
-
-	// For small job counts, validate sequentially to avoid goroutine overhead
-	if len(jobs) <= 4 {
-		for _, job := range jobs {
-			// Use WTxHash (witness txid) so that segwit transactions with the
-			// same txid but different witnesses map to distinct cache entries
-			// (fix for W105-B8B).
-			wtxhash := job.tx.WTxHash()
-			// Also commit to prevOut amount + pkScript so the cache key
-			// uniquely identifies every input to script evaluation, including
-			// the sighash material that comes from the UTXO rather than the
-			// spending tx (W160 BUG-11 "sigcache-omits-sighash").
-			if cache != nil && cache.Lookup(wtxhash, uint32(job.inputIdx), flags, job.prevOut.Amount, job.prevOut.PkScript) {
-				continue
-			}
-
-			err := script.VerifyScript(
-				job.tx.TxIn[job.inputIdx].SignatureScript,
-				job.prevOut.PkScript,
-				job.tx,
-				job.inputIdx,
-				flags,
-				job.prevOut.Amount,
-				job.prevOuts,
-			)
-			if err != nil {
-				return fmt.Errorf("tx %d input %d: script failed: %w", job.txIdx, job.inputIdx, err)
-			}
-
-			// Cache successful verification
-			if cache != nil {
-				cache.Insert(wtxhash, uint32(job.inputIdx), flags, job.prevOut.Amount, job.prevOut.PkScript)
-			}
-		}
-		return nil
-	}
-
-	// Use atomic.Pointer to store the first error without race conditions.
-	var firstErr atomic.Pointer[error]
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, numWorkers)
-
-	for _, job := range jobs {
-		wg.Add(1)
-		go func(j scriptJob) {
-			defer wg.Done()
-
-			// Acquire semaphore slot
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			// Check if we already have an error (early exit)
-			if firstErr.Load() != nil {
-				return
-			}
-
-			// Use WTxHash (witness txid) so that segwit transactions with the
-			// same txid but different witnesses map to distinct cache entries
-			// (fix for W105-B8B).
-			wtxhash := j.tx.WTxHash()
-			// Also commit to prevOut amount + pkScript so the cache key
-			// uniquely identifies every input to script evaluation, including
-			// the sighash material that comes from the UTXO rather than the
-			// spending tx (W160 BUG-11 "sigcache-omits-sighash").
-			if cache != nil && cache.Lookup(wtxhash, uint32(j.inputIdx), flags, j.prevOut.Amount, j.prevOut.PkScript) {
-				return
-			}
-
-			// Validate the script
-			err := script.VerifyScript(
-				j.tx.TxIn[j.inputIdx].SignatureScript,
-				j.prevOut.PkScript,
-				j.tx,
-				j.inputIdx,
-				flags,
-				j.prevOut.Amount,
-				j.prevOuts,
-			)
-			if err != nil {
-				wrapped := fmt.Errorf("tx %d input %d: script failed: %w", j.txIdx, j.inputIdx, err)
-				firstErr.CompareAndSwap(nil, &wrapped)
-				return
-			}
-
-			// Cache successful verification
-			if cache != nil {
-				cache.Insert(wtxhash, uint32(j.inputIdx), flags, j.prevOut.Amount, j.prevOut.PkScript)
-			}
-		}(job)
-	}
-
-	wg.Wait()
-
-	if errPtr := firstErr.Load(); errPtr != nil {
-		return *errPtr
+	q := NewScriptCheckQueue(ResolveScriptCheckWorkers(0))
+	defer q.Stop()
+	res := q.Run(jobs)
+	if !res.OK {
+		return res.FirstFailErr
 	}
 	return nil
 }

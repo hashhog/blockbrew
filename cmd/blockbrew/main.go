@@ -96,6 +96,10 @@ type Config struct {
 	// Performance profiling
 	PprofAddr       string
 	ParallelScripts bool
+	// Par is Bitcoin Core's -par (init.cpp:513). 0 = auto (every core),
+	// 1 = serial, n>1 = n script threads including the connecting thread,
+	// n<0 = leave |n| cores free. Only used when ParallelScripts is true.
+	Par int
 
 	// AssumeValid mirrors Bitcoin Core's `-assumevalid` argument. Empty
 	// (default) uses the network's built-in assume-valid block, below which
@@ -582,6 +586,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.PrintVersion, "version", false, "Print version and exit")
 	flag.StringVar(&cfg.PprofAddr, "pprof", "", "pprof HTTP server address (e.g., localhost:6060)")
 	flag.BoolVar(&cfg.ParallelScripts, "parallelscripts", true, "Enable parallel script validation")
+	flag.IntVar(&cfg.Par, "par", 0, "Script verification threads (0 = auto = every core, 1 = serial, n = n threads including master, n<0 = leave |n| cores free). Bitcoin Core -par (init.cpp:513).")
 	flag.StringVar(&cfg.AssumeValid, "assumevalid", "", "Assume-valid block hash (display hex). Below this block, script verification is skipped during IBD. Empty (default) uses the network's built-in value. `-assumevalid=0` DISABLES the skip so ALL history is fully script-verified (used by the mainnet-replay harness). Mirrors Bitcoin Core's -assumevalid.")
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
@@ -982,12 +987,20 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		UTXOSet:         utxoSet,
 		AssumeValidHash: chainParams.AssumeValidHash,
 		ParallelScripts: cfg.ParallelScripts,
+		Par:             cfg.Par,
 		// Archive (default) drops the MaxReorgDepth cap so deep reorgs follow
 		// the most-work chain like Core; pruned keeps the cap as protection
 		// against reorging past the retained undo window.
 		PruningEnabled: pruner.IsEnabled(),
 	})
-	log.Printf("Chain manager initialized (parallel scripts: %v, pruning: %v)", cfg.ParallelScripts, pruner.IsEnabled())
+	extraWorkers := 0
+	if q := chainMgr.ScriptCheckQueue(); q != nil {
+		extraWorkers = q.ExtraWorkers()
+	}
+	log.Printf("Chain manager initialized (parallel scripts: %v, par=%d extra-workers=%d, pruning: %v)", cfg.ParallelScripts, cfg.Par, extraWorkers, pruner.IsEnabled())
+	if extraWorkers > 0 {
+		log.Printf("Script verification uses %d additional threads", extraWorkers)
+	}
 
 	// Self-check: every height between the first stored body and the tip
 	// must have a readable body. A connected block whose body is missing
@@ -2266,6 +2279,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// last atomic flush on restart, so the cost is replay time, never
 		// correctness.
 		chainAtRest := chainMgr.QuiesceForShutdown(chainQuiesceTimeout)
+		chainMgr.StopScriptCheckQueue()
 		if !chainAtRest {
 			log.Printf("WARNING: chain did not quiesce within %s — a chain-mutating "+
 				"operation is STILL IN FLIGHT. SKIPPING the chainstate flush: "+
@@ -2427,6 +2441,7 @@ func handleImportBlocks(args []string) {
 	dataDir := fs.String("datadir", defaultDataDir, "Data directory")
 	network := fs.String("network", "mainnet", "Network (mainnet, testnet, regtest, signet, testnet4)")
 	parallelScripts := fs.Bool("parallelscripts", true, "Enable parallel script validation")
+	par := fs.Int("par", 0, "Script verification threads (0 = auto = every core, 1 = serial). Bitcoin Core -par.")
 	assumeValid := fs.String("assumevalid", "", "Assume-valid block hash (display hex). `-assumevalid=0` disables the skip so ALL history is fully script-verified. Mirrors Bitcoin Core's -assumevalid.")
 	fs.Parse(args)
 
@@ -2514,7 +2529,12 @@ func handleImportBlocks(args []string) {
 		UTXOSet:         utxoSet,
 		AssumeValidHash: chainParams.AssumeValidHash,
 		ParallelScripts: *parallelScripts,
+		Par:             *par,
 	})
+	defer chainMgr.StopScriptCheckQueue()
+	if q := chainMgr.ScriptCheckQueue(); q != nil && q.ExtraWorkers() > 0 {
+		log.Printf("Script verification uses %d additional threads", q.ExtraWorkers())
+	}
 
 	tipHeight, err := prepareImportChain(chainMgr)
 	if err != nil {
@@ -3001,6 +3021,9 @@ func printHelp() {
 	fmt.Println("  --version       Print version and exit")
 	fmt.Println("  --pprof         pprof HTTP server address (e.g., localhost:6060)")
 	fmt.Println("  --parallelscripts  Enable parallel script validation (default: true)")
+	fmt.Println("  --par=N          Script verification threads (default: 0 = auto = every core).")
+	fmt.Println("                    1 = serial; n>1 = n threads including master; n<0 = leave |n| cores free.")
+	fmt.Println("                    Bitcoin Core -par (init.cpp:513).")
 	fmt.Println("  --bip324v2      Enable BIP-324 v2 encrypted transport (default: true)")
 	fmt.Println("                  Pass -bip324v2=false to opt out. Also via env:")
 	fmt.Println("                  BLOCKBREW_BIP324_V2=0 (off) or =1 (on; default)")
