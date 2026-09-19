@@ -713,6 +713,15 @@ type SyncManager struct {
 	// dropped/never-served tx does not pin the slot forever (Core's
 	// TxRequestTracker expiry).  Protected by mu.
 	txInflight map[wire.Hash256]time.Time
+
+	// ttfbSamples are first-byte observations used to tell "this peer
+	// is slow" from "we asked while another body was still on the
+	// wire". Pipeline-head samples are peer latency; non-head samples
+	// include our own pipeline delay. Compact-block false stamps are
+	// dropped by retractNonBlockFirstByte. Guarded by sm.mu.
+	ttfbSamples   []ttfbSample
+	ttfbRetracted int
+	lastTtfbDist  time.Time
 }
 
 // MempoolTxSource is the minimal mempool interface the sync manager needs to
@@ -3110,6 +3119,7 @@ func (sm *SyncManager) retractNonBlockFirstByte(peer *Peer) {
 		}
 		log.Printf("sync: fetch first-byte retracted height=%d peer=%s size=%d — not a block body",
 			req.Height, peer.Address(), req.PayloadSize)
+		sm.dropTtfbLocked(peer.Address(), req.Height)
 		req.FirstByteAt = time.Time{}
 		req.PayloadSize = 0
 	}
@@ -3150,8 +3160,11 @@ func (sm *SyncManager) noteBlockFirstByte(peer *Peer, payloadLen uint32) {
 	if !oldest.RequestAt.IsZero() {
 		ttfb = now.Sub(oldest.RequestAt)
 	}
-	log.Printf("sync: fetch first-byte height=%d peer=%s ttfb=%s size=%d inflight=%d",
-		oldest.Height, peer.Address(), ttfb.Round(time.Millisecond), payloadLen, len(sm.inflight))
+	head := sm.isPeerPipelineHeadLocked(oldest)
+	log.Printf("sync: fetch first-byte height=%d peer=%s ttfb=%s size=%d inflight=%d head=%v",
+		oldest.Height, peer.Address(), ttfb.Round(time.Millisecond), payloadLen, len(sm.inflight), head)
+	sm.recordTtfbLocked(peer.Address(), ttfb, payloadLen, oldest.Height, head)
+	sm.maybeLogTtfbDistLocked()
 }
 
 // logFetchLocked emits the complete-fetch rate line. Caller holds sm.mu.
