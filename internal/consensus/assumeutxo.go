@@ -531,6 +531,10 @@ func LoadSnapshotCoinsWithCache(sr *SnapshotReader, db *storage.ChainDB, baseHei
 					return nil, nil, fmt.Errorf("snapshot batch flush at coin %d: %w", coinsLoaded, ferr)
 				}
 				if flushed && cb > 32<<20 {
+					// Return the discarded batch so peak RSS is per-cycle,
+					// not cumulative. GOGC=400 would otherwise keep the
+					// previous maps until 5x live; this is why the 3x bound
+					// sawtooths (6.5G -> 1.5G) instead of climbing.
 					runtime.GC()
 				}
 			}

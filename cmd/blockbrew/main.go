@@ -363,6 +363,17 @@ func parseBIP324V2Env(v string, defaultOn bool) bool {
 	return defaultOn
 }
 
+// dbcacheFlagHelp is the -h / -help text for -dbcache. Peak RSS during
+// -load-snapshot is a bound, not a budget: the 815000 rung on f131703
+// honoured a 2.01 GB UTXO-cache share and peaked at 6.57 GB RSS (~3x).
+// Cause: CacheBytes undercounts cache+dirty+fresh (~2x heap), and Pebble
+// write buffers overlap the still-resident coins until the batch flush
+// discards the maps (~1x more). RSS falls after each flush (not a leak).
+const dbcacheFlagHelp = "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD). Peak RSS during -load-snapshot is ~3x the UTXO share (coins maps + overlapping Pebble flush buffers); a bound, not a budget — size RAM from the peak, not this number."
+
+// loadSnapshotFlagHelp is the -h text for -load-snapshot. Same 3x bound.
+const loadSnapshotFlagHelp = "Load a Bitcoin Core-format UTXO snapshot (utxo\\xff magic) from <path> before starting the node. Only acted on when the chainstate is fresh (height==0); otherwise an error is logged and the snapshot is skipped. Mirrors Bitcoin Core's `-loadsnapshot=<path>`. Peak RSS is ~3x the -dbcache UTXO share per batch (not a leak: RSS falls after each flush)."
+
 // computeCacheSplit returns (utxoCacheBytes, pebbleBlockCacheBytes) for a
 // given -dbcache value in MiB. Clamped to [4, 65536] MiB.
 func computeCacheSplit(dbcacheMiB int) (utxoCacheBytes int64, pebbleBlockCacheBytes int64) {
@@ -589,7 +600,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.Par, "par", 0, "Script verification threads (0 = auto = every core, 1 = serial, n = n threads including master, n<0 = leave |n| cores free). Bitcoin Core -par (init.cpp:513).")
 	flag.StringVar(&cfg.AssumeValid, "assumevalid", "", "Assume-valid block hash (display hex). Below this block, script verification is skipped during IBD. Empty (default) uses the network's built-in value. `-assumevalid=0` DISABLES the skip so ALL history is fully script-verified (used by the mainnet-replay harness). Mirrors Bitcoin Core's -assumevalid.")
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
-	flag.IntVar(&cfg.DBCache, "dbcache", 2560, "Database cache size in MiB (split: 80% UTXO cache + 20% Pebble block cache; recommend 4096+ for active IBD)")
+	flag.IntVar(&cfg.DBCache, "dbcache", 2560, dbcacheFlagHelp)
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
 	flag.BoolVar(&cfg.EnablePackageRelay, "packagerelay", false, "Enable BIP-331 package relay (sendpackages). Default OFF — Bitcoin Core v31.99 has no package-relay wire protocol. Pass `-packagerelay=true` to opt in. Also settable via BLOCKBREW_PACKAGE_RELAY=1.")
 	flag.BoolVar(&cfg.PeerBloomFilters, "peerbloomfilters", false, "Advertise NODE_BLOOM (BIP-111) and honor BIP-35 \"mempool\" requests. Default OFF, matching Bitcoin Core's DEFAULT_PEERBLOOMFILTERS=false. Pass `-peerbloomfilters=true` to opt in.")
@@ -609,7 +620,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.ZMQPubSequence, "zmqpubsequence", "", "ZMQ endpoint for sequence notifications (block connect/disconnect, tx accept/remove).")
 	flag.BoolVar(&cfg.RPCReadyNotify, "rpcready-notify", true, "On systemd hosts, send READY=1 to NOTIFY_SOCKET once RPC is bound. No-op when NOTIFY_SOCKET is unset.")
 	flag.IntVar(&cfg.HealthPort, "healthport", 0, "If non-zero, bind a /healthz HTTP endpoint on 127.0.0.1:<port> for liveness/readiness probes. 0 disables.")
-	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", "Load a Bitcoin Core-format UTXO snapshot (utxo\\xff magic) from <path> before starting the node. Only acted on when the chainstate is fresh (height==0); otherwise an error is logged and the snapshot is skipped. Mirrors Bitcoin Core's `-loadsnapshot=<path>`.")
+	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", loadSnapshotFlagHelp)
 	flag.BoolVar(&cfg.BlockFilterIndex, "blockfilterindex", false, "Maintain the BIP-157/158 basic compact-block-filter index. Default OFF (matches Bitcoin Core's `-blockfilterindex=0`). When ON, blockbrew populates the index on every connected block, rewinds it on disconnect (Phase 2 reorg-aware), and exposes the resulting filters via /rest/blockfilter, /rest/blockfilterheaders, and the getblockfilter RPC.")
 	flag.BoolVar(&cfg.CoinStatsIndex, "coinstatsindex", false, "Maintain the coinstatsindex (per-height UTXO-set MuHash + counts: txouts, bogosize, total_amount). Default OFF (matches Bitcoin Core's `-coinstatsindex=0`). When ON, gettxoutsetinfo can be queried for a specific block height/hash with hash_type muhash|none, served from the index; getindexinfo reports it.")
 	flag.BoolVar(&cfg.TxoSpenderIndex, "txospenderindex", false, "Maintain a transaction output spender index (spent outpoint -> spending txid), used by the gettxspendingprevout RPC call. Default OFF (matches Bitcoin Core's `-txospenderindex=0`). When ON, gettxspendingprevout can resolve confirmed spends (mempool_only=false); getindexinfo reports it. The RPC's mempool form works regardless of this flag.")
@@ -3022,6 +3033,10 @@ func printHelp() {
 	fmt.Println("  --wallet        Wallet file name (default: wallet.dat)")
 	fmt.Println("  --loglevel      Log level: debug, info, warn, error (default: info)")
 	fmt.Println("  --txindex       Enable transaction index")
+	fmt.Println("  --dbcache=N     Database cache in MiB (default: 2560; 80% UTXO / 20% Pebble).")
+	fmt.Println("                  Peak RSS during -load-snapshot is ~3x the UTXO share")
+	fmt.Println("                  (coins maps + overlapping Pebble flush buffers); a bound,")
+	fmt.Println("                  not a budget — size RAM from the peak, not from -dbcache.")
 	fmt.Println("  --maxmempool    Maximum mempool size in MB (default: 300)")
 	fmt.Println("  --minrelayfee   Minimum relay fee in BTC/kvB (default: 0.00001)")
 	fmt.Println("  --version       Print version and exit")
@@ -3060,6 +3075,8 @@ func printHelp() {
 	fmt.Println("  --load-snapshot=<path>  Bitcoin Core-format UTXO snapshot to load at boot")
 	fmt.Println("                          (utxo\\xff magic). Mirrors Core's -loadsnapshot.")
 	fmt.Println("                          Only acted on when chainstate is fresh (height==0).")
+	fmt.Println("                          Peak RSS is ~3x the -dbcache UTXO share per batch;")
+	fmt.Println("                          RSS falls after each flush (not a leak).")
 	fmt.Println()
 	fmt.Println("Examples:")
 	fmt.Println("  blockbrew                                           Start node on mainnet")

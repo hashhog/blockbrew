@@ -206,7 +206,15 @@ func (u *UTXOSet) GetUTXO(outpoint wire.OutPoint) *UTXOEntry {
 }
 
 // estimateEntrySize estimates the memory usage of a UTXO entry in bytes.
-// Includes: OutPoint (36 bytes), Amount (8), PkScript (len + header), Height (4), IsCoinbase (1), map overhead (~100)
+// Includes: OutPoint (36 bytes), Amount (8), PkScript (len + header), Height (4),
+// IsCoinbase (1), map overhead (~100 for the coins cache map).
+//
+// The +100 is one map. AddUTXO also inserts dirty and fresh, so live Go heap
+// with all three populated is ~2x this figure (measured 375 B/coin heap vs
+// 174 B estimated for P2PKH-25). Snapshot load then overlaps a Pebble write
+// of the same batch, which is the rest of the ~3x peak-RSS / cacheBytes bound
+// on -load-snapshot. Do not "correct" this estimate downward for IBD: a
+// lower figure would keep more coins resident, not fewer.
 func estimateEntrySize(entry *UTXOEntry) int64 {
 	return int64(36 + 8 + len(entry.PkScript) + 4 + 1 + 100)
 }

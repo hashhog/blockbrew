@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- docs: -dbcache / -load-snapshot help: peak RSS is ~3x the UTXO share (bound, not budget)
 - fix: --load-snapshot flushes in -dbcache-sized batches instead of pinning 5x the file in RAM
 - fix: report pruned:true + pruneheight when historical block bodies are missing
 - docs: CHARTER proof bundle (`proof/`; `bash proof/verify.sh`)
