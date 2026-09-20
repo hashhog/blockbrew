@@ -556,16 +556,63 @@ func (u *UTXOSet) Flush() error {
 	return u.flushLocked()
 }
 
-// flushLocked performs flush while holding the lock.
+// snapshotFlushCheckCoins is Core's PopulateAndValidateSnapshot check
+// interval (validation.cpp:5840): every 120,000 coins, flush if CRITICAL.
+const snapshotFlushCheckCoins = uint64(120_000)
+
+// snapshotFlushInterval returns how often LoadSnapshotCoins should inspect
+// the cache. Core's 120k stride is ~5 MiB of slack at 41 B/coin; a tiny
+// test budget would never fire at that stride, so shrink it so slack stays
+// under roughly 1/8 of the budget.
+func snapshotFlushInterval(maxCacheBytes int64) uint64 {
+	if maxCacheBytes <= 0 {
+		return snapshotFlushCheckCoins
+	}
+	budgetInterval := uint64(maxCacheBytes / (150 * 8))
+	if budgetInterval < 1 {
+		budgetInterval = 1
+	}
+	if budgetInterval > snapshotFlushCheckCoins {
+		return snapshotFlushCheckCoins
+	}
+	return budgetInterval
+}
+
+// flushSnapshotIfOverBudget is the snapshot-load analogue of Core's
+// GetCoinsCacheSizeState() >= CRITICAL flush (validation.cpp:5846-5856).
+// It reports the cache size BEFORE any flush so callers can track peak
+// residency, writes dirty coins, and discards the cache (Core Flush, not
+// IBD Sync). Callers MUST NOT hold u.mu.
+func (u *UTXOSet) flushSnapshotIfOverBudget(maxCacheBytes int64) (cacheBytes int64, flushed bool, err error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	cacheBytes = u.cacheBytes
+	if cacheBytes <= maxCacheBytes {
+		return cacheBytes, false, nil
+	}
+	if err := u.flushLockedDiscard(true); err != nil {
+		return cacheBytes, false, err
+	}
+	return cacheBytes, true, nil
+}
+
+// flushLocked performs flush while holding the lock, keeping a warm cache
+// up to -dbcache (IBD / ConnectBlock).
 //
 // Pebble enforces a hard 4 GiB cap on a single batch (open.go:47,
 // batch.go:1413, ErrBatchTooLarge). A normal block-connect produces dozens
 // of dirty entries — well under the cap — but a -load-snapshot import
-// hands flushLocked all 165M coins in one shot, easily 8+ GiB serialized,
-// which used to panic mid-import. We now split the writes into chunks
-// well below the cap so loadSnapshotFromFile can durably commit a Core-
-// format UTXO snapshot in one go without a Pebble panic.
+// used to hand flushLocked all 165M coins in one shot. LoadSnapshotCoins
+// now flushes per -dbcache batch, so this split is a safety net rather
+// than the only bound.
 func (u *UTXOSet) flushLocked() error {
+	return u.flushLockedDiscard(false)
+}
+
+// flushLockedDiscard writes dirty/deleted coins. discardCache drops the
+// in-memory map afterwards (snapshot import); otherwise eviction keeps
+// the working set up to maxCacheBytes (IBD). Callers MUST hold u.mu.
+func (u *UTXOSet) flushLockedDiscard(discardCache bool) error {
 	if u.db == nil {
 		return nil
 	}
@@ -711,6 +758,23 @@ func (u *UTXOSet) flushLocked() error {
 	u.fresh = make(map[wire.OutPoint]bool, 100_000)
 	u.flushes++
 	u.blocksSinceFlush = 0
+
+	return u.finishFlushLocked(discardCache)
+}
+
+// finishFlushLocked applies the post-write cache policy. Callers MUST hold u.mu
+// and MUST have already cleared dirty/deleted/fresh. discardCache is the
+// snapshot-import path: Core CCoinsViewCache::Flush clears cacheCoins after
+// BatchWrite (coins.cpp). IBD keeps a warm working set up to -dbcache.
+func (u *UTXOSet) finishFlushLocked(discardCache bool) error {
+	if discardCache {
+		// Snapshot coins are not a useful working set until ConnectBlock;
+		// drop the map so RSS tracks the current batch, not the whole set.
+		// Go maps never shrink on delete, so replace rather than clear.
+		u.cache = make(map[wire.OutPoint]*UTXOEntry, 100_000)
+		u.cacheBytes = 0
+		return nil
+	}
 
 	// Post-flush the entire cache is clean (persisted to disk), so it is SAFE
 	// to keep serving every entry from memory until we actually exceed the

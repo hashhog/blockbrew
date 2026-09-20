@@ -12,6 +12,7 @@ import (
 	"math"
 	"math/big"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -442,17 +443,30 @@ func (sr *SnapshotReader) Metadata() *SnapshotMetadata {
 //   - BUG-W102-03: outpoint.n == UINT32_MAX → ErrCoinOutpointIndexMax
 //   - BUG-W102-04: trailing bytes after coins_left==0 → ErrSnapshotTrailingBytes
 //
-// Returns the populated UTXOSet and load statistics.  Does NOT flush the set
-// (see the deferred-flush note on LoadSnapshot).
+// Returns the populated UTXOSet and load statistics.  Mid-load flushes are
+// bounded by maxCacheBytes (DefaultCacheMaxBytes here); the caller's final
+// Flush still stamps the applied-through marker after hash authentication.
 func LoadSnapshotCoins(sr *SnapshotReader, db *storage.ChainDB, baseHeight int32) (*UTXOSet, *SnapshotLoadStats, error) {
+	return LoadSnapshotCoinsWithCache(sr, db, baseHeight, DefaultCacheMaxBytes)
+}
+
+// LoadSnapshotCoinsWithCache is LoadSnapshotCoins with an explicit coins-cache
+// budget, the analogue of Core's m_coinstip_cache_size_bytes during
+// PopulateAndValidateSnapshot (validation.cpp:5846-5856). -load-snapshot
+// passes the node's -dbcache UTXO share so a 6 GB snapshot cannot pin 33 GB.
+func LoadSnapshotCoinsWithCache(sr *SnapshotReader, db *storage.ChainDB, baseHeight int32, maxCacheBytes int64) (*UTXOSet, *SnapshotLoadStats, error) {
+	if maxCacheBytes <= 0 {
+		maxCacheBytes = DefaultCacheMaxBytes
+	}
 	r := sr.r
-	utxoSet := NewUTXOSet(db)
+	utxoSet := NewUTXOSetWithMaxCache(db, maxCacheBytes)
 	stats := &SnapshotLoadStats{
 		BlockHash: sr.metadata.BlockHash,
 	}
 
 	coinsLeft := sr.metadata.CoinsCount
 	coinsLoaded := uint64(0)
+	flushEvery := snapshotFlushInterval(maxCacheBytes)
 
 	for coinsLeft > 0 {
 		// Read txid
@@ -508,10 +522,24 @@ func LoadSnapshotCoins(sr *SnapshotReader, db *storage.ChainDB, baseHeight int32
 			coinsLeft--
 			coinsLoaded++
 
+			if coinsLoaded%flushEvery == 0 {
+				cb, flushed, ferr := utxoSet.flushSnapshotIfOverBudget(maxCacheBytes)
+				if cb > stats.PeakCacheBytes {
+					stats.PeakCacheBytes = cb
+				}
+				if ferr != nil {
+					return nil, nil, fmt.Errorf("snapshot batch flush at coin %d: %w", coinsLoaded, ferr)
+				}
+				if flushed && cb > 32<<20 {
+					runtime.GC()
+				}
+			}
+
 			// Log progress periodically
 			if coinsLoaded%1000000 == 0 {
-				log.Printf("[snapshot] loaded %d coins (%.2f%%)",
-					coinsLoaded, float64(coinsLoaded)*100/float64(sr.metadata.CoinsCount))
+				log.Printf("[snapshot] loaded %d coins (%.2f%%, cache %d MiB)",
+					coinsLoaded, float64(coinsLoaded)*100/float64(sr.metadata.CoinsCount),
+					utxoSet.CacheBytes()>>20)
 			}
 		}
 	}
@@ -531,7 +559,16 @@ func LoadSnapshotCoins(sr *SnapshotReader, db *storage.ChainDB, baseHeight int32
 	}
 
 	stats.CoinsLoaded = coinsLoaded
-	log.Printf("[snapshot] loaded %d coins from snapshot (deferred flush)", coinsLoaded)
+	cb, _, ferr := utxoSet.flushSnapshotIfOverBudget(maxCacheBytes)
+	if cb > stats.PeakCacheBytes {
+		stats.PeakCacheBytes = cb
+	}
+	if ferr != nil {
+		return nil, nil, fmt.Errorf("snapshot final batch flush: %w", ferr)
+	}
+	stats.Flushes = utxoSet.Stats().Flushes
+	log.Printf("[snapshot] loaded %d coins from snapshot (%d batch flushes, peak cache %d bytes)",
+		coinsLoaded, stats.Flushes, stats.PeakCacheBytes)
 	return utxoSet, stats, nil
 }
 
@@ -572,9 +609,11 @@ func readCoin(r io.Reader) (*UTXOEntry, error) {
 
 // SnapshotLoadStats contains statistics about a snapshot load operation.
 type SnapshotLoadStats struct {
-	CoinsLoaded uint64
-	BlockHash   wire.Hash256
-	Height      int32
+	CoinsLoaded    uint64
+	BlockHash      wire.Hash256
+	Height         int32
+	PeakCacheBytes int64  // max UTXOSet.CacheBytes observed during load
+	Flushes        uint64 // mid-load batch flushes (Core CRITICAL path)
 }
 
 // SnapshotFileHash is HASH_SERIALIZED (Core hash_serialized_3) computed by

@@ -3852,7 +3852,13 @@ func (s *Server) handleLoadTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 	// genuinely separate object from the background validator's store (the
 	// aliasing guard in ActivateSnapshotWithBackground requires this).
 	snapDB := storage.NewChainDB(storage.NewMemDB())
-	loaded, _, err := consensus.LoadSnapshotCoins(sr, snapDB, expected.Height)
+	maxCache := int64(consensus.DefaultCacheMaxBytes)
+	if s.chainMgr != nil {
+		if live, ok := s.chainMgr.UTXOSet().(*consensus.UTXOSet); ok && live != nil {
+			maxCache = live.MaxCacheBytes()
+		}
+	}
+	loaded, _, err := consensus.LoadSnapshotCoinsWithCache(sr, snapDB, expected.Height, maxCache)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Unable to load snapshot coins: %v", err)}
 	}

@@ -402,7 +402,9 @@ func TestW138_G21_NoInterruptCheckInsideCoinLoop(t *testing.T) {
 // accumulates everything in cache then defers flush; peak RAM for a 160M
 // coin snapshot is unbounded.
 func TestW138_G22_NoBatchFlushOnCriticalCache(t *testing.T) {
-	t.Skip("W138 audit: BUG-15 / G21 — no batched flush during coin loop; peak RAM = full coin set, unlike Core's bounded flush-on-CRITICAL pattern")
+	// BUG-15 closed: LoadSnapshotCoins flushes when the cache exceeds
+	// maxCacheBytes (Core PopulateAndValidateSnapshot CRITICAL flush).
+	TestLoadSnapshotCoinsRespectsCacheBudget(t)
 }
 
 // TestW138_G22_NoSetBestBlockAtPopulationEnd (BUG-3).

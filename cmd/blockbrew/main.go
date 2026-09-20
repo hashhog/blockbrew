@@ -2829,7 +2829,14 @@ func loadSnapshotFromFile(
 
 	// --- Step 8: deserialise coins with per-coin guards + EOF check.
 	// BUG-W102-01..04 are enforced inside LoadSnapshotCoins.
-	loaded, stats, err := consensus.LoadSnapshotCoins(sr, chainDB, expected.Height)
+	// Bound the in-memory coins cache to the node's -dbcache UTXO share
+	// (Core PopulateAndValidateSnapshot CRITICAL flush). Without this a
+	// 6.23 GB snapshot pinned 33 GB RSS (receipt 2026-09-20).
+	maxCache := int64(consensus.DefaultCacheMaxBytes)
+	if utxoSet != nil {
+		maxCache = utxoSet.MaxCacheBytes()
+	}
+	loaded, stats, err := consensus.LoadSnapshotCoinsWithCache(sr, chainDB, expected.Height, maxCache)
 	if err != nil {
 		return fmt.Errorf("LoadSnapshotCoins: %w", err)
 	}
@@ -2857,13 +2864,12 @@ func loadSnapshotFromFile(
 
 	// --- Step 10: flush and promote chainstate.
 	//
-	// LoadSnapshotCoins deliberately defers the flush so that the
-	// post-flush cache eviction (utxoset.go:299) doesn't run before
-	// ComputeHashSerialized has had a chance to walk the in-memory
-	// cache.  Calling Flush here accepts the eviction that follows;
-	// we no longer need the cache populated since the coins are now
-	// durable in chainDB and the active utxoSet (which shares the
-	// same chainDB) will read them on demand.
+	// LoadSnapshotCoins already flushed dirty coins in -dbcache-sized
+	// batches (and discarded the cache after each, matching Core
+	// CCoinsViewCache::Flush). ComputeHashSerialized walks the DB via
+	// ScanUTXOs, so it does not need the whole set resident. This final
+	// Flush commits any remainder and stamps the applied-through marker
+	// in the same write as those last coins.
 	//
 	// Stamp the coins marker BEFORE the flush so it rides the same write as
 	// the coins it describes: after this flush the persisted set reflects
