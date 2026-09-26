@@ -1630,9 +1630,21 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// each downloaded block, so that hook covers the P2P path too — leaving
 	// this callback empty avoids double-firing (e.g. a double mp.chainHeight++
 	// or double-credited wallet txHistory).
+	//
+	// The one thing this callback DOES do is relay: it fires only for blocks
+	// the SyncManager downloaded and connected from P2P, which is exactly the
+	// set the mining RPCs (which call AnnounceBlock themselves) do not cover.
+	// Without it blockbrew connected P2P blocks but never announced them, so
+	// two Core peers that could only reach each other through blockbrew never
+	// converged (regtest relay test, 2026-09-26). Core parity:
+	// PeerManagerImpl::UpdatedBlockTip -> SendMessages (headers to sendheaders
+	// peers, inv otherwise), skipped during IBD.
 	onBlockConnected := func(block *wire.MsgBlock, height int32) {
-		_ = block
 		_ = height
+		if peerMgr == nil || !p2p.ShouldAnnounceTip(block.Header.Timestamp, time.Now()) {
+			return
+		}
+		peerMgr.AnnounceBlock(block.Header, block.Header.BlockHash())
 	}
 	syncMgr = p2p.NewSyncManager(p2p.SyncManagerConfig{
 		ChainParams:  chainParams,

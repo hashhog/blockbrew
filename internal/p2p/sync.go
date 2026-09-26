@@ -1614,9 +1614,16 @@ func (sm *SyncManager) HandleGetHeaders(peer *Peer, msg *MsgGetHeaders) {
 		startNode = sm.headerIndex.Genesis()
 	}
 
-	// Collect headers starting after startNode
+	// Collect headers starting after startNode, from the ACTIVE (connected)
+	// chain only. Core answers getheaders from ActiveChain()
+	// (FindForkInGlobalIndex + ActiveChain().Next, net_processing.cpp
+	// GETHEADERS handler). Serving the best-HEADER chain instead handed peers
+	// headers whose bodies we had not downloaded yet; their getdata then went
+	// unanswered and they stalled on the gap until their block-download
+	// timeout (regtest relay test 2026-09-26: Core B stuck at height 1).
 	headers := make([]wire.BlockHeader, 0, MaxHeadersPerRequest)
-	bestTip := sm.headerIndex.BestTip()
+	bestTip := sm.activeTipNode()
+	startNode = activeChainFork(startNode, bestTip)
 
 	for height := startNode.Height + 1; height <= bestTip.Height && len(headers) < MaxHeadersPerRequest; height++ {
 		node := bestTip.GetAncestor(height)
@@ -1636,6 +1643,39 @@ func (sm *SyncManager) HandleGetHeaders(peer *Peer, msg *MsgGetHeaders) {
 		Headers: headers,
 	}
 	peer.SendMessage(response)
+}
+
+// activeTipNode returns the header-index node of the connected chain tip,
+// falling back to the best header only when no chain manager is wired (tests).
+func (sm *SyncManager) activeTipNode() *consensus.BlockNode {
+	if sm.chainMgr != nil {
+		hash, _ := sm.chainMgr.BestBlock()
+		if node := sm.headerIndex.GetNode(hash); node != nil {
+			return node
+		}
+	}
+	return sm.headerIndex.BestTip()
+}
+
+// activeChainFork returns the last ancestor of start (inclusive) that is on
+// the chain ending at tip — Core's FindForkInGlobalIndex for one locator hit.
+// A locator entry on a side branch or ahead of our connected tip maps to the
+// fork point, so we never serve headers past the connected tip.
+func activeChainFork(start, tip *consensus.BlockNode) *consensus.BlockNode {
+	if start == nil || tip == nil {
+		return start
+	}
+	n := start
+	if n.Height > tip.Height {
+		n = n.GetAncestor(tip.Height)
+	}
+	for n != nil && tip.GetAncestor(n.Height) != n {
+		n = n.Parent
+	}
+	if n == nil {
+		return start
+	}
+	return n
 }
 
 // CreatePeerListeners returns PeerListeners configured for sync.
@@ -2150,7 +2190,13 @@ func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
 		// Strip witness flag to get base type
 		baseType := inv.Type &^ InvWitnessFlag
 		switch baseType {
-		case InvTypeBlock:
+		// InvTypeCmpctBlock (MSG_CMPCT_BLOCK, 4): how a Core peer fetches a
+		// single directly-announced tip from a peer that sent sendcmpct
+		// (HeadersDirectFetchBlocks). It used to hit no case at all -- no
+		// block, no notfound -- so the peer waited out its download timeout.
+		// Serve the full witness block, which is Core's own reply outside
+		// MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData, IsMsgCmpctBlk arm).
+		case InvTypeBlock, InvTypeCmpctBlock:
 			// Prune-mode gate: if we're a NODE_NETWORK_LIMITED node and the
 			// requested block is below tip-288, decline with notfound.
 			if pruneHorizon >= 0 && sm.headerIndex != nil {

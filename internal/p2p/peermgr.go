@@ -874,6 +874,19 @@ func (pm *PeerManager) BroadcastMessage(msg Message) {
 	}
 }
 
+// AnnounceMaxTipAge mirrors Core's DEFAULT_MAX_TIP_AGE
+// (kernel/chainstatemanager_opts.h:24): a tip older than this means the node
+// is still in initial block download.
+const AnnounceMaxTipAge = 24 * time.Hour
+
+// ShouldAnnounceTip reports whether a newly connected tip with header time
+// ts should be relayed to peers. Core's PeerManagerImpl::UpdatedBlockTip
+// (net_processing.cpp:2162) returns early while fInitialDownload; on a synced
+// node the deciding IBD clause is the tip age.
+func ShouldAnnounceTip(ts uint32, now time.Time) bool {
+	return now.Sub(time.Unix(int64(ts), 0)) <= AnnounceMaxTipAge
+}
+
 // AnnounceBlock announces a newly accepted block to all connected peers,
 // honoring BIP-130 (sendheaders).  Peers that previously sent us a
 // `sendheaders` message receive a `headers` message containing the block
