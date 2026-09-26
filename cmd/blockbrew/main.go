@@ -10,10 +10,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -282,6 +284,16 @@ type Config struct {
 	// of hanging with zero peers. Pass -fixedseeds=0 to disable. Suppressed
 	// unconditionally under -connect.
 	FixedSeeds bool
+
+	// ExternalIP lists our own public address(es) to advertise to peers
+	// (Core -externalip=<ip>[:port]; repeatable / comma-separated). A bare IP
+	// uses the P2P listen port.
+	ExternalIP connectFlag
+
+	// Discover learns our public address from what outbound peers report in
+	// VERSION addr_recv (Core -discover; default on, off when -externalip is
+	// given unless -discover is passed explicitly).
+	Discover bool
 }
 
 // connectFlag implements flag.Value so `-connect=<ip:port>` may be repeated
@@ -304,6 +316,28 @@ func (c *connectFlag) Set(v string) error {
 		}
 	}
 	return nil
+}
+
+// parseExternalIP parses an -externalip value: "<ip>", "<ip>:<port>" or
+// "[<ipv6>]:<port>". Port 0 means "use the listen port".
+func parseExternalIP(v string) (net.IP, uint16, error) {
+	v = strings.TrimSpace(v)
+	if ip := net.ParseIP(strings.Trim(v, "[]")); ip != nil {
+		return ip, 0, nil
+	}
+	host, portStr, err := net.SplitHostPort(v)
+	if err != nil {
+		return nil, 0, fmt.Errorf("invalid address %q", v)
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return nil, 0, fmt.Errorf("invalid IP %q", host)
+	}
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil || port == 0 {
+		return nil, 0, fmt.Errorf("invalid port %q", portStr)
+	}
+	return ip, uint16(port), nil
 }
 
 // debugFlag implements flag.Value so `-debug=` may be repeated and/or
@@ -628,6 +662,8 @@ func parseFlags() *Config {
 	flag.Var(&cfg.Connect, "connect", "Connect ONLY to the specified <ip:port> peer(s) and disable both DNS-seed resolution and addrman/auto-outbound dialing. Repeatable / comma-separated. Mirrors Bitcoin Core's `-connect=<ip:port>` (implies -dnsseed=0 and turns off automatic outbound connections). The pinned peers are dialed as manual connections and re-dialed if they drop. Empty (default) = normal peer discovery.")
 	flag.BoolVar(&cfg.NoDNSSeed, "nodnsseed", false, "Disable DNS-seed resolution without otherwise changing peer discovery (addrman/auto-outbound dialing still runs). Mirrors Bitcoin Core's `-dnsseed=0` / `-nodnsseed`. Implied automatically when -connect is set.")
 	flag.BoolVar(&cfg.FixedSeeds, "fixedseeds", true, "Enable the last-resort fixed-seed fallback (default ON, mirrors Bitcoin Core's `-fixedseeds=1`). When DNS seeding returns empty or fails AND the address book is empty, blockbrew injects the curated bootstrap IPs so the node can still find peers instead of hanging with zero outbound connections. Pass -fixedseeds=0 to disable. Suppressed under -connect.")
+	flag.Var(&cfg.ExternalIP, "externalip", "Specify your own public address <ip>[:port] to advertise to peers (repeatable / comma-separated). A bare IP uses the P2P listen port. Implies -discover=0 unless -discover is given. Mirrors Bitcoin Core's `-externalip`.")
+	flag.BoolVar(&cfg.Discover, "discover", true, "Discover own public address from what outbound peers report (default: 1 unless -externalip is set). Mirrors Bitcoin Core's `-discover`.")
 	flag.Parse()
 
 	// Apply config file (CLI > config > default). Build the set of flags
@@ -708,6 +744,19 @@ func parseFlags() *Config {
 	})
 	if !cliPackageRelaySet {
 		cfg.EnablePackageRelay = parseBIP324V2Env(os.Getenv("BLOCKBREW_PACKAGE_RELAY"), false)
+	}
+
+	// Core init.cpp:815: -externalip set -> soft-set -discover=0.
+	if len(cfg.ExternalIP) > 0 {
+		discoverSet := false
+		flag.Visit(func(f *flag.Flag) {
+			if f.Name == "discover" {
+				discoverSet = true
+			}
+		})
+		if !discoverSet {
+			cfg.Discover = false
+		}
 	}
 
 	if cfg.ListenP2P == "" {
@@ -1856,7 +1905,21 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// flips NoFixedSeeds. The fallback fires only when DNS is empty/disabled
 		// and the address book is empty, and is suppressed under -connect.
 		NoFixedSeeds: !cfg.FixedSeeds,
+		// Self-address advertisement (Core -discover / MaybeSendAddr IBD gate).
+		Discover:  cfg.Discover,
+		IsIBDFunc: syncMgr.IsIBDActive,
 	})
+	for _, s := range cfg.ExternalIP {
+		ip, port, err := parseExternalIP(s)
+		if err != nil {
+			return fmt.Errorf("-externalip: %w", err)
+		}
+		if peerMgr.AddExternalIP(ip, port) {
+			log.Printf("externalip: advertising %s", s)
+		} else {
+			log.Printf("WARNING: -externalip=%s is not publicly routable or we are not listening; ignored", s)
+		}
+	}
 
 	// Wire the peer manager back into the sync manager (breaks circular dependency)
 	syncMgr.SetPeerManager(peerMgr)

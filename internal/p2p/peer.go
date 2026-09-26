@@ -63,6 +63,9 @@ type PeerConfig struct {
 	// only our SEND of sendpackages is gated. Opt in via -packagerelay /
 	// BLOCKBREW_PACKAGE_RELAY=1.
 	EnablePackageRelay bool
+	// LocalAddrFunc, when set, supplies our own address for the VERSION
+	// addr_from field (ok=false keeps the 0.0.0.0:0 placeholder).
+	LocalAddrFunc func() (ip net.IP, port uint16, ok bool)
 }
 
 // PeerListeners contains callbacks invoked when messages are received.
@@ -254,6 +257,9 @@ type Peer struct {
 	// addrTokenInit guards lazy one-time initialisation of the bucket to 1.0
 	// for peers constructed before this field existed.
 	addrTokenInit bool
+	// nextLocalAddrSend is when our own address is next announced to this
+	// peer (Core Peer::m_next_local_addr_send); zero = never sent yet.
+	nextLocalAddrSend time.Time
 
 	// Per-peer header/block sync heights surfaced by getpeerinfo.
 	// Core: CNodeState.pindexBestKnownBlock / pindexLastCommonBlock
@@ -649,13 +655,30 @@ func (p *Peer) installHeaderHook() {
 	}
 }
 
-// localNetAddress returns our local NetAddress (placeholder since we don't know our external IP).
+// localNetAddress returns our own NetAddress for VERSION addr_from: the best
+// known local address when there is one, else the 0.0.0.0:0 placeholder.
 func (p *Peer) localNetAddress() NetAddress {
+	if p.config.LocalAddrFunc != nil {
+		if ip, port, ok := p.config.LocalAddrFunc(); ok {
+			return NetAddress{Services: p.config.Services, IP: ip.To16(), Port: port}
+		}
+	}
 	return NetAddress{
 		Services: p.config.Services,
 		IP:       net.IPv4zero.To16(),
 		Port:     0,
 	}
+}
+
+// AddrLocal returns the address the peer told us it sees us at (VERSION
+// addr_recv; Core CNode::GetAddrLocal). Zero value before VERSION.
+func (p *Peer) AddrLocal() NetAddress {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if p.peerVersion == nil {
+		return NetAddress{}
+	}
+	return p.peerVersion.AddrRecv
 }
 
 // readHandler reads messages from the TCP connection in a loop.

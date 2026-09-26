@@ -203,6 +203,14 @@ type PeerManagerConfig struct {
 	// solely on -addnode / gossip / inbound). Suppressed unconditionally under
 	// -connect, exactly like DNS seeding.
 	NoFixedSeeds bool
+
+	// Discover enables learning our public address from what outbound peers
+	// report in VERSION addr_recv (Core -discover; default on, off when
+	// -externalip is given). ExternalIPs are added via AddExternalIP.
+	Discover bool
+	// IsIBDFunc reports initial block download; our address is not
+	// advertised during IBD (Core MaybeSendAddr). nil = never in IBD.
+	IsIBDFunc func() bool
 }
 
 // BanInfo contains information about a banned peer.
@@ -271,6 +279,9 @@ type PeerManager struct {
 	// An atomic so the connect-loop / accept-loop hot paths read it without
 	// the peer-map lock. Not persisted; resets to enabled on restart.
 	networkActive atomic.Bool
+
+	// localAddrs is our own address table (Core mapLocalHost); see localaddr.go.
+	localAddrs *localAddrTable
 }
 
 // UsingASMap returns true when an asmap was loaded at startup. Mirrors
@@ -443,6 +454,7 @@ func NewPeerManager(config PeerManagerConfig) *PeerManager {
 		subnetCounts: make(map[string]int),
 		quit:         make(chan struct{}),
 		rng:          rand.New(rand.NewSource(time.Now().UnixNano())),
+		localAddrs:   newLocalAddrTable(),
 	}
 
 	// P2P networking is active by default (Core CConnman.fNetworkActive
@@ -501,6 +513,10 @@ func (pm *PeerManager) Start() error {
 	// Start the connection manager
 	pm.wg.Add(1)
 	go pm.connectionHandler()
+
+	// Periodic self-address re-announcement (Core MaybeSendAddr timer).
+	pm.wg.Add(1)
+	go pm.localAddrHandler()
 
 	return nil
 }
@@ -1842,6 +1858,9 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 		pm.config.OnPeerConnected(peer)
 	}
 
+	// Initial self-announcement (Core MaybeSendAddr, first SendMessages).
+	pm.maybeSendLocalAddr(peer, time.Now())
+
 	// Request addresses from full-relay peers only (not block-relay-only)
 	if connType == ConnFullRelay {
 		peer.SendMessage(&MsgGetAddr{})
@@ -1934,6 +1953,9 @@ func (pm *PeerManager) listenHandler() {
 			if pm.config.OnPeerConnected != nil {
 				pm.config.OnPeerConnected(p)
 			}
+
+			// Initial self-announcement (Core MaybeSendAddr).
+			pm.maybeSendLocalAddr(p, time.Now())
 
 			// Wait for disconnect
 			pm.waitForPeerDisconnect(p)
@@ -2169,6 +2191,10 @@ func (pm *PeerManager) makePeerConfig() PeerConfig {
 		Listeners:          listeners,
 		PreferV2:           pm.config.PreferV2,
 		EnablePackageRelay: pm.config.EnablePackageRelay,
+		LocalAddrFunc: func() (net.IP, uint16, bool) {
+			la, ok := pm.bestLocalAddress()
+			return la.IP, la.Port, ok
+		},
 	}
 }
 
@@ -2268,6 +2294,18 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 	// Copy existing listeners if provided
 	if pm.config.Listeners != nil {
 		*listeners = *pm.config.Listeners
+	}
+
+	// Wrap OnVersion to learn our own address from addr_recv (Core
+	// ProcessMessage VERSION: SeenLocal / SetAddrLocal).
+	originalOnVersion := listeners.OnVersion
+	listeners.OnVersion = func(p *Peer, msg *MsgVersion) {
+		if p != nil && msg != nil {
+			pm.noteVersionAddrRecv(p, msg.AddrRecv, time.Now())
+		}
+		if originalOnVersion != nil {
+			originalOnVersion(p, msg)
+		}
 	}
 
 	// Wrap OnGetAddr to answer a getaddr with the addr anti-DoS guards

@@ -371,24 +371,32 @@ type PeerInfo struct {
 
 // NetworkInfo represents the result of getnetworkinfo.
 type NetworkInfo struct {
-	Version            int32          `json:"version"`
-	SubVersion         string         `json:"subversion"`
-	ProtocolVersion    int32          `json:"protocolversion"`
-	LocalServices      string         `json:"localservices"`
-	LocalServicesNames []string       `json:"localservicesnames"`
-	LocalRelay         bool           `json:"localrelay"`
-	TimeOffset         int64          `json:"timeoffset"`
-	NetworkActive      bool           `json:"networkactive"`
-	Connections        int            `json:"connections"`
-	ConnectionsIn      int            `json:"connections_in"`
-	ConnectionsOut     int            `json:"connections_out"`
-	Networks           []NetworkEntry `json:"networks"`
-	RelayFee           float64        `json:"relayfee"`
-	IncrementalFee     float64        `json:"incrementalfee"`
-	LocalAddresses     []interface{}  `json:"localaddresses"`
+	Version            int32               `json:"version"`
+	SubVersion         string              `json:"subversion"`
+	ProtocolVersion    int32               `json:"protocolversion"`
+	LocalServices      string              `json:"localservices"`
+	LocalServicesNames []string            `json:"localservicesnames"`
+	LocalRelay         bool                `json:"localrelay"`
+	TimeOffset         int64               `json:"timeoffset"`
+	NetworkActive      bool                `json:"networkactive"`
+	Connections        int                 `json:"connections"`
+	ConnectionsIn      int                 `json:"connections_in"`
+	ConnectionsOut     int                 `json:"connections_out"`
+	Networks           []NetworkEntry      `json:"networks"`
+	RelayFee           float64             `json:"relayfee"`
+	IncrementalFee     float64             `json:"incrementalfee"`
+	LocalAddresses     []LocalAddressEntry `json:"localaddresses"`
 	// Warnings is an ARRAY of strings in Core v31.99 (node::GetWarningsForRpc;
 	// rpc/net.cpp). blockbrew previously emitted a bare string.
 	Warnings []string `json:"warnings"`
+}
+
+// LocalAddressEntry is one getnetworkinfo.localaddresses row (Core
+// rpc/net.cpp: {address, port, score} from mapLocalHost).
+type LocalAddressEntry struct {
+	Address string `json:"address"`
+	Port    int    `json:"port"`
+	Score   int    `json:"score"`
 }
 
 // NetworkEntry represents a network in getnetworkinfo.

@@ -1698,6 +1698,17 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 		localServices = s.peerMgr.LocalServices()
 	}
 
+	// localaddresses: our own advertised addresses (-externalip + discovered),
+	// Core rpc/net.cpp. Always an array, never null.
+	localAddrs := []LocalAddressEntry{}
+	if s.peerMgr != nil {
+		for _, la := range s.peerMgr.LocalAddresses() {
+			localAddrs = append(localAddrs, LocalAddressEntry{
+				Address: la.IP.String(), Port: int(la.Port), Score: la.Score,
+			})
+		}
+	}
+
 	return &NetworkInfo{
 		Version:            250000,
 		SubVersion:         "/blockbrew:0.1.0/",
@@ -1726,7 +1737,7 @@ func (s *Server) handleGetNetworkInfo() (interface{}, *RPCError) {
 		// Core default 100 sat/kvB floor these render 0.00000100.
 		RelayFee:       float64(relayFeeKvB) / satoshiPerBitcoin,
 		IncrementalFee: float64(incrementalFeeKvB) / satoshiPerBitcoin,
-		LocalAddresses: []interface{}{},
+		LocalAddresses: localAddrs,
 		Warnings:       []string{},
 	}, nil
 }
