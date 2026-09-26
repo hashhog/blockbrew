@@ -256,6 +256,8 @@ func TestW136_G7_SendHeadersEmittedOnHandshake(t *testing.T) {
 		quit:              make(chan struct{}),
 		handshakeDone:     make(chan struct{}),
 		compactBlockState: NewCompactBlockState(),
+		config:            PeerConfig{ProtocolVersion: ProtocolVersion},
+		peerVersion:       &MsgVersion{ProtocolVersion: ProtocolVersion},
 	}
 	p.versionSent = true
 	p.versionRecvd = true
@@ -300,6 +302,8 @@ func TestW136_G8_SendHeadersNoChainWorkGate(t *testing.T) {
 		quit:              make(chan struct{}),
 		handshakeDone:     make(chan struct{}),
 		compactBlockState: NewCompactBlockState(),
+		config:            PeerConfig{ProtocolVersion: ProtocolVersion},
+		peerVersion:       &MsgVersion{ProtocolVersion: ProtocolVersion},
 	}
 	p.versionSent = true
 	p.versionRecvd = true

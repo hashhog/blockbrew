@@ -439,11 +439,12 @@ func TestW99_G19_SecondVersionMessageNotDisconnected(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G20 — `verack` required before non-handshake msgs — PARTIAL
+// G20 — non-handshake msgs before verack are IGNORED, not punished
 //
-// peer.go handleMessage: non-handshake messages when state==PeerStateHandshaking
-// call Misbehaving(10). PASS for the check, but score is 10, requiring 10
-// violations before ban. Core immediately disconnects (via single-event discourage).
+// Core net_processing.cpp: "Unsupported message prior to verack" is logged and
+// the message dropped — no disconnect, no Misbehaving. (The original W99 note
+// claimed Core disconnects; it does not.) Before VERSION the same holds
+// ("non-version message before version handshake").
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW99_G20_VerackRequiredBeforeNonHandshake(t *testing.T) {
 	p := &Peer{
@@ -452,12 +453,18 @@ func TestW99_G20_VerackRequiredBeforeNonHandshake(t *testing.T) {
 		sendQueue: make(chan Message, SendQueueSize),
 		quit:      make(chan struct{}),
 	}
+	p.versionRecvd = true
 
-	// Sending a non-handshake message during handshake should trigger Misbehaving
 	p.handleMessage(&MsgInv{})
+	p.handleMessage(&MsgPing{Nonce: 1})
 
-	if p.misbehaviorScore != 10 {
-		t.Errorf("G20: misbehaviorScore = %d after pre-verack message, want 10", p.misbehaviorScore)
+	if p.misbehaviorScore != 0 || p.shouldBan {
+		t.Errorf("G20: pre-verack inv/ping scored %d (ban=%v), want ignored", p.misbehaviorScore, p.shouldBan)
+	}
+	select {
+	case m := <-p.sendQueue:
+		t.Errorf("G20: pre-verack ping must not be answered, got %s", m.Command())
+	default:
 	}
 }
 

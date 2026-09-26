@@ -20,7 +20,7 @@ func createMockPeer(addr string, startHeight int32) *Peer {
 		},
 		addr:          addr,
 		state:         PeerStateConnected,
-		peerVersion:   &MsgVersion{StartHeight: startHeight},
+		peerVersion:   &MsgVersion{StartHeight: startHeight, Services: ServiceNodeNetwork | ServiceNodeWitness},
 		sendQueue:     make(chan Message, SendQueueSize),
 		quit:          make(chan struct{}),
 		handshakeDone: make(chan struct{}),

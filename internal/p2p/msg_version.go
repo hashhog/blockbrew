@@ -20,6 +20,17 @@ const (
 // Protocol version constants.
 const (
 	ProtocolVersion = 70016 // Current protocol version
+
+	// MinPeerProtoVersion is the lowest peer version we keep. Bitcoin Core
+	// node/protocol_version.h MIN_PEER_PROTO_VERSION, enforced for EVERY
+	// peer (inbound and outbound) in net_processing.cpp VERSION handling.
+	MinPeerProtoVersion = 31800
+
+	// Feature-message version gates (Core node/protocol_version.h). A
+	// feature message is only sent when the common version reaches its gate.
+	SendHeadersVersion    = 70012 // BIP130 sendheaders
+	ShortIDsBlocksVersion = 70014 // BIP152 sendcmpct / cmpctblock
+	WTxidRelayVersion     = 70016 // BIP339 wtxidrelay (+ sendaddrv2 courtesy gate)
 )
 
 // MaxUserAgentLen is the maximum allowed user agent string length.

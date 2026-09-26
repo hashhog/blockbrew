@@ -1694,6 +1694,11 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 				}
 			}
 
+			// Only NODE_WITNESS peers are asked for blocks (Core
+			// CanServeWitnesses); the queue will fetch it from one.
+			if !p.CanServeWitnesses() {
+				return
+			}
 			log.Printf("[compact] Received cmpctblock from %s, falling back to full block request (hash=%s)",
 				p.Address(), blockHash)
 			inv := &MsgGetData{
@@ -2168,7 +2173,9 @@ func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
 				continue
 			}
 			log.Printf("sync: serving block at %x to peer %s", inv.Hash[:4], peer.Address())
-			peer.SendMessage(&MsgBlock{Block: block})
+			// MSG_BLOCK (no witness flag) is answered without witness data,
+			// as Core does; only MSG_WITNESS_BLOCK gets the witness form.
+			peer.SendMessage(&MsgBlock{Block: block, NoWitness: inv.Type == InvTypeBlock})
 		case InvTypeTx, InvTypeWtx:
 			// Serve a transaction from the mempool. Mirrors Bitcoin Core's
 			// net_processing.cpp ProcessGetData -> FindTxForGetData: look the
@@ -2193,7 +2200,9 @@ func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
 				notFound = append(notFound, inv)
 				continue
 			}
-			peer.SendMessage(&MsgTx{Tx: tx})
+			// MSG_TX (no witness flag) is answered without witness data
+			// (Core: inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS).
+			peer.SendMessage(&MsgTx{Tx: tx, NoWitness: inv.Type == InvTypeTx})
 		}
 	}
 	if len(notFound) > 0 {
@@ -2849,8 +2858,17 @@ func (sm *SyncManager) requestBlocks() {
 		}
 	}
 
-	// Get connected peers
-	peers := sm.peerMgr.ConnectedPeers()
+	// Get connected peers that can serve witness blocks. Every peer that
+	// passes the version floor is kept connected, but — like Core's
+	// FindNextBlocksToDownload / CanServeWitnesses — we only ask NODE_WITNESS
+	// peers for blocks (we request MSG_WITNESS_BLOCK; a non-witness peer
+	// cannot serve it). This filter also bounds the fallback loop below.
+	var peers []*Peer
+	for _, peer := range sm.peerMgr.ConnectedPeers() {
+		if peer.CanServeWitnesses() {
+			peers = append(peers, peer)
+		}
+	}
 	if len(peers) == 0 {
 		return
 	}

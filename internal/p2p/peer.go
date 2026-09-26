@@ -794,17 +794,33 @@ func (p *Peer) pingHandler() {
 
 // handleMessage dispatches received messages to the appropriate handler.
 func (p *Peer) handleMessage(msg Message) {
-	// Check for messages sent before handshake (except version/verack/wtxidrelay/sendcmpct/sendaddrv2/sendtxrcncl/sendpackages)
-	switch msg.(type) {
-	case *MsgVersion, *MsgVerAck, *MsgWTxidRelay, *MsgSendCmpct, *MsgSendAddrv2, *MsgSendTxRcncl,
-		*MsgSendPackages:
-		// These are allowed before handshake
-	default:
-		p.mu.RLock()
-		handshaking := p.state == PeerStateHandshaking
-		p.mu.RUnlock()
-		if handshaking {
-			p.Misbehaving(10, "message before handshake complete")
+	// Messages before the handshake completes (Bitcoin Core
+	// net_processing.cpp ProcessMessage):
+	//   - before VERSION, every other message is logged and ignored
+	//     ("non-version message before version handshake");
+	//   - between VERSION and VERACK, Core PROCESSES verack, wtxidrelay,
+	//     sendaddrv2, sendtxrcncl, sendheaders and sendcmpct (sendpackages is
+	//     blockbrew's BIP-331 extension, handled the same way), and logs and
+	//     ignores everything else ("Unsupported message prior to verack").
+	// Neither case disconnects or scores the peer: a pre-verack ping, inv or
+	// feefilter is not misbehaviour.
+	p.mu.RLock()
+	handshaking := p.state == PeerStateHandshaking
+	versionRecvd := p.versionRecvd
+	p.mu.RUnlock()
+	if handshaking {
+		if _, isVersion := msg.(*MsgVersion); !isVersion && !versionRecvd {
+			log.Printf("peer %s: non-version message %q before version handshake, ignoring",
+				p.addr, msg.Command())
+			return
+		}
+		switch msg.(type) {
+		case *MsgVersion, *MsgVerAck, *MsgWTxidRelay, *MsgSendCmpct, *MsgSendAddrv2, *MsgSendTxRcncl,
+			*MsgSendPackages, *MsgSendHeaders:
+			// Processed before verack.
+		default:
+			log.Printf("peer %s: unsupported message %q prior to verack, ignoring",
+				p.addr, msg.Command())
 			return
 		}
 	}
@@ -984,8 +1000,28 @@ func (p *Peer) handleMessage(msg Message) {
 
 // handleVersion processes a received version message.
 func (p *Peer) handleVersion(msg *MsgVersion) {
-	// Check for self-connection
 	p.mu.Lock()
+	// Core: a second VERSION is logged and ignored ("redundant version
+	// message") — it must not overwrite the negotiated state or re-send verack.
+	if p.versionRecvd {
+		p.mu.Unlock()
+		log.Printf("peer %s: redundant version message, ignoring", p.addr)
+		return
+	}
+
+	// Core MIN_PEER_PROTO_VERSION: disconnect peers older than 31800, inbound
+	// and outbound alike ("peer using obsolete version"). This is a plain
+	// disconnect, not misbehaviour. Anything at or above the floor is kept,
+	// whatever its services: the NODE_WITNESS requirement only governs which
+	// peers we download blocks from (Peer.CanServeWitnesses).
+	if msg.ProtocolVersion < MinPeerProtoVersion {
+		p.mu.Unlock()
+		log.Printf("peer %s using obsolete version %d, disconnecting", p.addr, msg.ProtocolVersion)
+		p.signalDisconnect()
+		return
+	}
+
+	// Check for self-connection
 	if msg.Nonce == p.localNonce {
 		p.mu.Unlock()
 		p.signalDisconnect()
@@ -1011,8 +1047,10 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 		p.sendVersionMessage()
 	}
 
-	// Send feature negotiation messages before verack if peer supports protocol >= 70016
-	if msg.ProtocolVersion >= 70016 {
+	// Send feature negotiation messages before verack only when the common
+	// version supports them (Core: greatest_common_version >= WTXID_RELAY_VERSION
+	// for wtxidrelay; >= 70016 courtesy gate for sendaddrv2).
+	if p.ProtocolVersion() >= WTxidRelayVersion {
 		p.SendMessage(&MsgWTxidRelay{})
 		// BIP155: Signal ADDRv2 support
 		p.SendMessage(&MsgSendAddrv2{})
@@ -1149,16 +1187,27 @@ func (p *Peer) checkHandshakeComplete() {
 	p.wg.Add(1)
 	go p.pingHandler()
 
+	// Feature messages are gated on the common version so an old peer
+	// (anything from MinPeerProtoVersion up) is never sent a message it
+	// cannot parse. Core: sendheaders needs SENDHEADERS_VERSION (70012,
+	// MaybeSendSendHeaders), sendcmpct needs SHORT_IDS_BLOCKS_VERSION
+	// (70014, VERACK handler).
+	commonVersion := p.ProtocolVersion()
+
 	// Send sendheaders (BIP130) to request header announcements
-	p.SendMessage(&MsgSendHeaders{})
+	if commonVersion >= SendHeadersVersion {
+		p.SendMessage(&MsgSendHeaders{})
+	}
 
 	// Send sendcmpct (BIP152) to indicate we support compact blocks
 	// Version 2 indicates segwit support (wtxid-based short IDs)
 	// announce=false means low-bandwidth mode (we'll receive inv/headers first)
-	p.SendMessage(&MsgSendCmpct{
-		AnnounceUsingCmpctBlock: false,
-		CmpctBlockVersion:       CmpctBlockVersion,
-	})
+	if commonVersion >= ShortIDsBlocksVersion {
+		p.SendMessage(&MsgSendCmpct{
+			AnnounceUsingCmpctBlock: false,
+			CmpctBlockVersion:       CmpctBlockVersion,
+		})
+	}
 }
 
 // handlePong processes a received pong message.
@@ -1461,6 +1510,14 @@ func (p *Peer) Services() uint64 {
 		return 0
 	}
 	return p.peerVersion.Services
+}
+
+// CanServeWitnesses reports whether the peer advertised NODE_WITNESS. We only
+// download blocks from such peers (Core CanServeWitnesses, used by
+// FindNextBlocksToDownload / compact-block fetch): a non-witness peer is a
+// valid connection but cannot serve the witness data we validate.
+func (p *Peer) CanServeWitnesses() bool {
+	return p.Services()&ServiceNodeWitness != 0
 }
 
 // StartHeight returns the peer's advertised best height.
