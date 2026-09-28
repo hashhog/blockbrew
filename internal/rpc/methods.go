@@ -11,7 +11,6 @@ import (
 	"math"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -697,19 +696,17 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 		}
 	}
 
-	// nTx: number of transactions in the block.
-	// Try local block store first; fall back to a Bitcoin Core RPC lookup
-	// when the local flatfile index entry is absent (can happen if the
-	// Pebble WAL was flushed between WriteBlock and IndexBlock during a
-	// prior IBD run).
+	// nTx: number of transactions in the block, from the node's OWN block
+	// store. Core's blockheaderToJSON reports blockindex->nTx, which is 0 for
+	// a header whose block data has never been received (rpc/blockchain.cpp;
+	// chain.h "nTx ... 0 if the block data is not available"). An answer is
+	// never borrowed from another node: getblockheader used to ask the live
+	// Bitcoin Core (its RPC port + cookie) for nTx when the body was missing (R3).
 	nTx := 0
 	if s.chainDB != nil {
 		if block, err := s.chainDB.GetBlock(hash); err == nil {
 			nTx = len(block.Transactions)
 		}
-	}
-	if nTx == 0 {
-		nTx = s.nTxFromFallback(hashStr)
 	}
 
 	return &BlockHeaderResult{
@@ -749,80 +746,6 @@ func blockDifficulty(bits uint32) float64 {
 		nShift--
 	}
 	return dDiff
-}
-
-// nTxFromFallback queries a locally-running Bitcoin Core node for the
-// transaction count of a block whose body is absent from blockbrew's own
-// flat-file store.  This situation arises when the Pebble WAL was not
-// flushed between WriteBlock and IndexBlock during a prior IBD run,
-// leaving the flat-file position index ("P" key) absent for some blocks.
-//
-// The function tries well-known cookie paths for mainnet and testnet4
-// Bitcoin Core installs on the hashhog fleet.  It is a best-effort
-// read-only RPC call; on any error it returns 0 silently so that
-// getblockheader still returns a valid (if incomplete) response.
-func (s *Server) nTxFromFallback(blockHashHex string) int {
-	// Known cookie locations for bitcoin-core on the hashhog fleet.
-	type endpoint struct {
-		url        string
-		cookiePath string
-	}
-	endpoints := []endpoint{
-		{"http://127.0.0.1:8332", "/data/nvme1/hashhog-mainnet/bitcoin-core/.cookie"},
-		{"http://127.0.0.1:48343", "/home/work/hashhog/testnet4-data/bitcoin-core/.cookie"},
-	}
-
-	for _, ep := range endpoints {
-		cookieBytes, err := os.ReadFile(ep.cookiePath)
-		if err != nil {
-			continue
-		}
-		cookie := strings.TrimSpace(string(cookieBytes))
-
-		nTx, err := queryBitcoinCoreNTx(ep.url, cookie, blockHashHex)
-		if err == nil && nTx > 0 {
-			return nTx
-		}
-	}
-	return 0
-}
-
-// queryBitcoinCoreNTx makes a JSON-RPC getblockheader call to the given
-// Bitcoin Core-compatible endpoint and extracts the nTx field.
-func queryBitcoinCoreNTx(rpcURL, cookieAuth, blockHashHex string) (int, error) {
-	reqBody := fmt.Sprintf(`{"jsonrpc":"1.0","method":"getblockheader","params":[%q,true],"id":1}`,
-		blockHashHex)
-	req, err := http.NewRequest("POST", rpcURL, strings.NewReader(reqBody))
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	// cookieAuth is "__cookie__:<secret>" — use as raw Basic auth user:pass
-	parts := strings.SplitN(cookieAuth, ":", 2)
-	if len(parts) == 2 {
-		req.SetBasicAuth(parts[0], parts[1])
-	}
-
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	defer resp.Body.Close()
-
-	var rpcResp struct {
-		Result struct {
-			NTx int `json:"nTx"`
-		} `json:"result"`
-		Error interface{} `json:"error"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&rpcResp); err != nil {
-		return 0, err
-	}
-	if rpcResp.Error != nil {
-		return 0, fmt.Errorf("rpc error: %v", rpcResp.Error)
-	}
-	return rpcResp.Result.NTx, nil
 }
 
 func (s *Server) handleGetDifficulty() (interface{}, *RPCError) {
