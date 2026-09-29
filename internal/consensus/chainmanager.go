@@ -759,7 +759,10 @@ func (cm *ChainManager) AdoptAppliedBlock(block *wire.MsgBlock) error {
 		}
 		txid := tx.TxHash()
 		for vout, out := range tx.TxOut {
-			cm.utxoSet.AddUTXO(wire.OutPoint{Hash: txid, Index: uint32(vout)}, &UTXOEntry{
+			// Overwrite semantics (Core RollforwardBlock -> AddCoins with
+			// check_for_overwrite): the output may already be durable, so it
+			// must not be FRESH or a later spend would skip the disk delete.
+			addUTXOPossibleOverwrite(cm.utxoSet, wire.OutPoint{Hash: txid, Index: uint32(vout)}, &UTXOEntry{
 				Amount:     out.Value,
 				PkScript:   bytes.Clone(out.PkScript),
 				Height:     node.Height,

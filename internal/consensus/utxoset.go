@@ -219,12 +219,59 @@ func estimateEntrySize(entry *UTXOEntry) int64 {
 	return int64(36 + 8 + len(entry.PkScript) + 4 + 1 + 100)
 }
 
-// AddUTXO adds a new UTXO to the set.
+// AddUTXO adds a new UTXO to the set. The caller asserts the outpoint is not
+// an unspent coin in the durable set (Core AddCoin with possible_overwrite =
+// false). Use AddUTXOOverwrite when the coin may already be on disk.
 func (u *UTXOSet) AddUTXO(outpoint wire.OutPoint, entry *UTXOEntry) {
+	u.addUTXO(outpoint, entry, false)
+}
+
+// AddUTXOOverwrite adds a UTXO that may already exist, unspent, in the durable
+// set (Core AddCoin with possible_overwrite = true): the entry is never marked
+// FRESH, so a later spend before the next flush still deletes it from disk.
+// Used for coinbase outputs (Core AddCoins: overwrite = fCoinbase), unclean
+// undo restores, and the boot roll-forward that re-applies a block whose
+// outputs may already be durable.
+func (u *UTXOSet) AddUTXOOverwrite(outpoint wire.OutPoint, entry *UTXOEntry) {
+	u.addUTXO(outpoint, entry, true)
+}
+
+// addUTXOPossibleOverwrite adds with possible-overwrite semantics when the
+// view is a flushing cache (UTXOSet); a view with no durable layer has no
+// FRESH optimisation to get wrong, so plain AddUTXO is equivalent there.
+func addUTXOPossibleOverwrite(v UpdatableUTXOView, op wire.OutPoint, entry *UTXOEntry) {
+	if ow, ok := v.(interface {
+		AddUTXOOverwrite(wire.OutPoint, *UTXOEntry)
+	}); ok {
+		ow.AddUTXOOverwrite(op, entry)
+		return
+	}
+	v.AddUTXO(op, entry)
+}
+
+func (u *UTXOSet) addUTXO(outpoint wire.OutPoint, entry *UTXOEntry, possibleOverwrite bool) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
 	u.journalPre(outpoint)
+
+	// FRESH decision — Core coins.cpp CCoinsViewCache::AddCoin. FRESH means
+	// "the durable set does not hold this coin", which licenses a later spend
+	// to drop the entry without writing a delete. It may be set only when
+	// nothing in the cache says the coin could be on disk:
+	//
+	//   - an existing FRESH entry stays FRESH (Core never clears FRESH here);
+	//   - a DIRTY spent entry (u.deleted) is a delete not yet flushed, so the
+	//     coin IS on disk. Core: "If the coin exists in this cache as a spent
+	//     coin and is DIRTY ... we can't mark it as FRESH." Doing so let an
+	//     undo/rollback re-add followed by a second spend drop the pending
+	//     delete, leaving a spent coin in the durable UTXO set;
+	//   - a DIRTY unspent non-FRESH entry, or a CLEAN cached entry (read
+	//     through or retained after a flush), is also on disk;
+	//   - possibleOverwrite: the caller cannot rule out a durable copy.
+	_, cached := u.cache[outpoint]
+	fresh := u.fresh[outpoint] ||
+		(!possibleOverwrite && !cached && !u.dirty[outpoint] && !u.deleted[outpoint])
 
 	// Track size change
 	if existing, ok := u.cache[outpoint]; ok {
@@ -234,10 +281,12 @@ func (u *UTXOSet) AddUTXO(outpoint wire.OutPoint, entry *UTXOEntry) {
 
 	u.cache[outpoint] = entry
 	u.dirty[outpoint] = true
-	// Mark as FRESH: this entry has never been written to disk.
-	// If it's spent before the next flush, we skip the write entirely.
-	u.fresh[outpoint] = true
-	delete(u.deleted, outpoint) // Clear any pending deletion
+	if fresh {
+		// Never written to disk: if spent before the next flush, skip the
+		// write and the delete entirely.
+		u.fresh[outpoint] = true
+	}
+	delete(u.deleted, outpoint) // superseded by the dirty add (a Put)
 }
 
 // SpendUTXO marks a UTXO as spent (removes it from the set).
@@ -1141,12 +1190,20 @@ func (u *UTXOSet) AddTxOutputs(tx *wire.MsgTx, height int32) {
 			Hash:  txHash,
 			Index: uint32(i),
 		}
-		u.AddUTXO(outpoint, &UTXOEntry{
+		coin := &UTXOEntry{
 			Amount:     out.Value,
 			PkScript:   bytes.Clone(out.PkScript),
 			Height:     height,
 			IsCoinbase: isCoinbase,
-		})
+		}
+		// Core AddCoins (coins.cpp): overwrite = fCoinbase. Pre-BIP34
+		// duplicate coinbases can overwrite a durable coin, so a coinbase
+		// output is never FRESH.
+		if isCoinbase {
+			u.AddUTXOOverwrite(outpoint, coin)
+		} else {
+			u.AddUTXO(outpoint, coin)
+		}
 	}
 }
 
@@ -1803,7 +1860,12 @@ func (u *UTXOSet) ApplyTxInUndo(undo *UTXOEntry, outpoint wire.OutPoint) (clean 
 		Height:     undo.Height,
 		IsCoinbase: undo.IsCoinbase,
 	}
-	u.AddUTXO(outpoint, entry)
+	// Core validation.cpp ApplyTxInUndo: AddCoin(out, undo, !fClean).
+	if clean {
+		u.AddUTXO(outpoint, entry)
+	} else {
+		u.AddUTXOOverwrite(outpoint, entry)
+	}
 
 	return clean, true
 }
