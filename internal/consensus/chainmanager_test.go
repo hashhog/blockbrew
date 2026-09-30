@@ -3,6 +3,7 @@ package consensus
 import (
 	"bytes"
 	"errors"
+	"math/big"
 	"sync"
 	"testing"
 
@@ -1449,6 +1450,68 @@ func TestVerifyChainstateConsistencyGenesisOnly(t *testing.T) {
 	}
 	if res.BlocksProbed != 0 {
 		t.Errorf("BlocksProbed should be 0 on a genesis-only chain, got %d", res.BlocksProbed)
+	}
+}
+
+// TestVerifyChainstateConsistencyStopsAtSnapshotBase: on an assumeUTXO
+// datadir the snapshot base and the band below it have no bodies by design.
+// The probe must stop at the recorded base instead of reading the band as
+// corruption and peeling the validated chain above it (2026-09-30: a restart
+// of a 969183-based rebuild rolled tip 969312 back toward the base). The
+// "no record" arm is the control: the identical datadir WITHOUT the
+// snapshot-base record must still be reported as corrupt, proving the test
+// reaches the probe's missing-body branch.
+func TestVerifyChainstateConsistencyStopsAtSnapshotBase(t *testing.T) {
+	for _, withRecord := range []bool{true, false} {
+		params := RegtestParams()
+		idx := NewHeaderIndex(params)
+		memDB := storage.NewMemDB()
+		db := storage.NewChainDB(memDB)
+		cm := NewChainManager(ChainManagerConfig{Params: params, HeaderIndex: idx, ChainDB: db})
+
+		prev := idx.Genesis()
+		hashes := make([]wire.Hash256, 0, 6)
+		for i := 0; i < 6; i++ {
+			blk := createTestBlock(t, params, prev, nil)
+			hash := blk.Header.BlockHash()
+			node, err := idx.AddHeader(blk.Header, true)
+			if err != nil {
+				t.Fatalf("AddHeader %d: %v", i, err)
+			}
+			if err := db.StoreBlock(hash, blk); err != nil {
+				t.Fatalf("StoreBlock %d: %v", i, err)
+			}
+			if err := cm.ConnectBlock(blk); err != nil {
+				t.Fatalf("ConnectBlock %d: %v", i, err)
+			}
+			prev = node
+			hashes = append(hashes, hash)
+		}
+		// Snapshot base at height 3: heights 1..3 are the detached band
+		// (no bodies), 4..6 were connected above the base.
+		for h := 1; h <= 3; h++ {
+			if err := memDB.Delete(storage.MakeBlockDataKey(hashes[h-1])); err != nil {
+				t.Fatalf("Delete body %d: %v", h, err)
+			}
+		}
+		if withRecord {
+			if err := db.SetSnapshotBase(&storage.SnapshotBase{Hash: hashes[2], Height: 3, Chainwork: big.NewInt(1)}); err != nil {
+				t.Fatalf("SetSnapshotBase: %v", err)
+			}
+		}
+
+		res := cm.VerifyChainstateConsistency(10)
+		_, tip := cm.BestBlock()
+		if withRecord {
+			if res.CorruptionAtHeight != 0 || res.RolledBackBlocks != 0 || res.RollbackFailed || tip != 6 {
+				t.Errorf("with snapshot base: want clean probe at tip 6, got %+v tip=%d", res, tip)
+			}
+			if res.BlocksProbed != 3 {
+				t.Errorf("with snapshot base: want exactly the 3 blocks above the base probed, got %d", res.BlocksProbed)
+			}
+		} else if res.CorruptionAtHeight == 0 {
+			t.Errorf("control (no snapshot record): missing band bodies must still read as corruption, got %+v", res)
+		}
 	}
 }
 

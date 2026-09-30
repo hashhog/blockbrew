@@ -3680,9 +3680,25 @@ func (cm *ChainManager) VerifyChainstateConsistency(maxDepth int) ChainstateCons
 	// Walk back from tip up to maxDepth blocks. We stop early at the
 	// first detected corruption — DisconnectBlock will peel the tip back
 	// to that height (inclusive) and the next IBD pass re-applies it.
+	// Snapshot floor: on an assumeUTXO-bootstrapped datadir the snapshot
+	// base and the header band below it are detached BY DESIGN — they carry
+	// no block bodies and no undo data (a -load-snapshot boot never
+	// materialises genesis..base). Walking into that band reported every
+	// band header as "block body missing", then peeled the ENTIRE validated
+	// chain above the base via DisconnectBlock before failing at the base
+	// with a false [CHAINSTATE-CORRUPTION] "remove chaindata/" instruction
+	// (observed 2026-09-30 on a 969183-based rebuild: tip 969312 rolled back
+	// toward 969183 on an ordinary restart). Core's equivalent (CVerifyDB)
+	// stops at the first block without data. The base itself is the
+	// validated floor, so the walk covers heights strictly above it.
+	floor := int32(0)
+	if sb, err := cm.chainDB.GetSnapshotBase(); err == nil && sb != nil {
+		floor = sb.Height
+	}
+
 	node := cm.tipNode
 	deepestBad := int32(-1)
-	for i := 0; i < maxDepth && node != nil && node.Height > 0; i++ {
+	for i := 0; i < maxDepth && node != nil && node.Height > floor; i++ {
 		res.BlocksProbed++
 
 		// Fetch the block body. If it is missing, the on-disk state has
