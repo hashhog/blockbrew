@@ -2278,13 +2278,32 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// process past the 30s hard exit — if the chain has not quiesced by then
 	// we skip the flush entirely rather than persist a torn chainstate.
 	const chainQuiesceTimeout = 20 * time.Second
-	watchdog := time.AfterFunc(shutdownDeadline, func() {
-		log.Printf("shutdown deadline (%s) exceeded, forcing exit", shutdownDeadline)
-		// Best-effort DB close so we don't leave the LSM in a corrupt state.
-		// We ignore errors — we're about to die anyway.
-		_ = db.Close()
+	// dbFinalMu is taken by the shutdown sequence when it starts its final
+	// chainstate flush and is never released: from that point the DB belongs
+	// to that sequence until it has closed it. The forced-exit paths (the
+	// deadline watchdog, a second signal) close the DB only if they can take
+	// it. Before this, a watchdog firing while shutdown was still writing
+	// closed Pebble underneath the chainstate batch ("panic: pebble: closed"
+	// in pebbleBatch.Write, observed 2026-10-02 when a wallet save under load
+	// pushed shutdown past 30 s) or closed it a second time right after the
+	// sequence had (pebble db.go:1573). Exiting without Close mid-flush is
+	// safe: every chainstate batch is synced to the WAL, which is the same
+	// guarantee a SIGKILL relies on.
+	var dbFinalMu sync.Mutex
+	forceExit := func() {
+		if dbFinalMu.TryLock() {
+			// Best-effort DB close so we don't leave the LSM in a corrupt
+			// state. We ignore errors — we're about to die anyway.
+			_ = db.Close()
+		} else {
+			log.Printf("final chainstate flush/close in progress; exiting without closing the DB again")
+		}
 		log.Printf("exit (forced)")
 		os.Exit(1)
+	}
+	watchdog := time.AfterFunc(shutdownDeadline, func() {
+		log.Printf("shutdown deadline (%s) exceeded, forcing exit", shutdownDeadline)
+		forceExit()
 	})
 
 	// Second signal escalates immediately. After an RPC `stop` the FIRST
@@ -2305,8 +2324,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			return
 		}
 		log.Printf("received second signal %s, forcing exit", s)
-		_ = db.Close()
-		os.Exit(1)
+		forceExit()
 	}()
 
 	// Cancel contexts and stop long-running goroutines in reverse startup
@@ -2372,6 +2390,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// h=938360 wedge (and lunarblock's Apr 28 h=938344 wedge).  After
 		// this fix there is no on-disk state where UTXOs reflect height
 		// N+M but chain_tip still says height N.
+		// From here to db.Close() the DB belongs to this sequence; the
+		// forced-exit paths must not close it underneath (see dbFinalMu).
+		dbFinalMu.Lock()
+
 		// Before touching the chainstate, prove the chain is AT REST.
 		//
 		// rpcServer.Stop() above does not wait for in-flight handlers — it

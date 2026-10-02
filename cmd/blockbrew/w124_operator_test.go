@@ -612,3 +612,40 @@ func TestW124_G_NoVerifyChainRPC_BUG17(t *testing.T) {
 		"no -checkblocks (Core default 6) / -checklevel (Core default 3) operator " +
 		"dials. Fix: add the two flags and run the verifychain engine at startup.")
 }
+
+// TestForcedExitNeverClosesDBUnderShutdownFlush pins the shutdown/watchdog
+// hand-off in main (not reachable from a unit test). The final chainstate
+// flush and DB close own the DB (dbFinalMu taken before the flush, never
+// released); the forced-exit path closes the DB only via TryLock. Before,
+// the 30 s watchdog called db.Close() unconditionally: when a slow wallet
+// save pushed shutdown past the deadline, the chainstate batch then hit a
+// closed Pebble ("panic: pebble: closed", pebbleBatch.Write, 2026-10-02
+// regtest RPC stop under load ~68).
+func TestForcedExitNeverClosesDBUnderShutdownFlush(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(w124RepoRoot(t), "cmd/blockbrew/main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(body)
+	wd := strings.Index(src, "watchdog := time.AfterFunc(shutdownDeadline")
+	fe := strings.Index(src, "forceExit := func() {")
+	if wd < 0 || fe < 0 || fe > wd {
+		t.Fatalf("forceExit helper missing or not defined before the watchdog (forceExit=%d watchdog=%d)", fe, wd)
+	}
+	feBody := src[fe : fe+strings.Index(src[fe:], "\n\t}\n")]
+	if !strings.Contains(feBody, "dbFinalMu.TryLock()") {
+		t.Fatalf("forceExit closes the DB without checking the shutdown owns it:\n%s", feBody)
+	}
+	wdBody := src[wd : wd+strings.Index(src[wd:], "\n\t})\n")]
+	if strings.Contains(wdBody, "db.Close()") {
+		t.Fatalf("watchdog closes the DB directly:\n%s", wdBody)
+	}
+	lock := strings.Index(src, "dbFinalMu.Lock()")
+	flush := strings.Index(src, "utxoSet.FlushBatch(shutBatch)")
+	if lock < 0 || flush < 0 || lock > flush {
+		t.Fatalf("shutdown must take dbFinalMu before its chainstate flush (lock=%d flush=%d)", lock, flush)
+	}
+	if strings.Count(src, "dbFinalMu.Unlock()") != 0 {
+		t.Fatal("dbFinalMu must never be released once the final flush owns the DB")
+	}
+}
