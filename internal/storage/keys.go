@@ -38,6 +38,17 @@ var (
 	// not part of the consensus block-connect path.
 	ChainTxCountPrefix = []byte("Q")
 
+	// BlockFailedPrefix persists the operator-set failure flags of the block
+	// index (invalidateblock / reconsiderblock). Key: "V" + block_hash,
+	// value: one byte of consensus.BlockStatus failure bits (StatusInvalid
+	// 0x08 = Core's BLOCK_FAILED_VALID on the explicitly invalidated block,
+	// StatusInvalidChild 0x10 = its descendants). Core keeps these in the
+	// on-disk block index (CDiskBlockIndex nStatus, written by
+	// BlockManager::WriteBatchSync for every dirty index entry), so an
+	// invalidation survives a restart until reconsiderblock clears it.
+	// Absent = no failure flag.
+	BlockFailedPrefix = []byte("V")
+
 	// ChainStateKey stores the current chain tip hash and height.
 	ChainStateKey = []byte("chainstate")
 
@@ -118,6 +129,14 @@ func MakeBlockHeaderKey(hash wire.Hash256) []byte {
 func MakeBlockDataKey(hash wire.Hash256) []byte {
 	key := make([]byte, 1+32)
 	key[0] = BlockDataPrefix[0]
+	copy(key[1:], hash[:])
+	return key
+}
+
+// MakeBlockFailedKey creates a key for a persisted block-failure flag.
+func MakeBlockFailedKey(hash wire.Hash256) []byte {
+	key := make([]byte, 1+32)
+	key[0] = BlockFailedPrefix[0]
 	copy(key[1:], hash[:])
 	return key
 }

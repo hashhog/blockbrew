@@ -2468,6 +2468,10 @@ func (cm *ChainManager) RecoverFromPersistedBlocks() (int, error) {
 	//
 	// Datadirs written before the marker existed report it absent, and fall back
 	// to exactly the previous behaviour.
+	// Phase 2b — re-apply persisted invalidateblock flags BEFORE replaying, so
+	// the replay below can never reconnect a block the operator invalidated.
+	cm.restoreBlockFailures()
+
 	replayed := 0
 	coinsHash, coinsHeight, haveCoinsMarker := cm.durableCoinsTip()
 	if haveCoinsMarker {
@@ -2495,6 +2499,13 @@ func (cm *ChainManager) RecoverFromPersistedBlocks() (int, error) {
 				log.Printf("chainmgr: recovery: AddHeader (replay) at height %d failed (%v); stopping", next, err)
 				break
 			}
+		}
+		if n := cm.headerIndex.GetNode(hash); n != nil && n.Status.IsInvalid() {
+			// A height-index entry for a block marked invalid (e.g. left by a
+			// pre-fix disconnect). Never replay it.
+			log.Printf("chainmgr: recovery: block %s at height %d is marked invalid; stopping replay",
+				hash.String()[:16], next)
+			break
 		}
 		// Already reflected in the persisted set: advance the tip over it and
 		// touch nothing else. `hash` came from the same height->hash map that
@@ -2835,13 +2846,25 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	// peels and finally by the new-tip ConnectBlock writes within the same
 	// batch. Pebble's batch dedups in-key Puts, so only the final value lands
 	// on disk. Outside ReorgTo we issue a direct Put as before.
+	//
+	// The disconnected height also leaves the active-chain height index ("N").
+	// A stale N:<h> above the tip is read by RecoverFromPersistedBlocks as an
+	// unflushed block ahead of the tip and RECONNECTED on the next boot —
+	// observed: invalidateblock(A2), invalidateblock(A1), clean restart, node
+	// back at A2. Under ReorgTo the delete rides the shared batch, and the
+	// new branch's ConnectBlock re-puts the same key later in that batch, so
+	// the last write wins.
 	if cm.chainDB != nil {
 		if cm.reorgBatch != nil {
+			cm.chainDB.DeleteBlockHeightBatch(cm.reorgBatch, prevHeight)
 			cm.chainDB.SetChainStateBatch(cm.reorgBatch, &storage.ChainState{
 				BestHash:   parent.Hash,
 				BestHeight: parent.Height,
 			})
 		} else {
+			if err := cm.chainDB.DeleteBlockHeight(prevHeight); err != nil {
+				log.Printf("chainmgr: warning: failed to drop height index %d on disconnect: %v", prevHeight, err)
+			}
 			cm.chainDB.SetChainState(&storage.ChainState{
 				BestHash:   parent.Hash,
 				BestHeight: parent.Height,
@@ -3478,6 +3501,14 @@ func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
 		}
 	}
 
+	// Persist the failure flags (Core: BLOCK_FAILED_VALID on the block,
+	// m_dirty_blockindex -> WriteBatchSync). In-memory-only flags were the
+	// bug: a restart forgot the invalidation and reconnected the branch.
+	// Written after the disconnect, as Core marks each block as it leaves
+	// the chain; a crash before this line loses only the flag, never
+	// leaves a flagged block as the persisted tip.
+	cm.persistFailureFlagsLocked(failureSubtree(node))
+
 	// Update header index to recalculate best tip excluding invalid blocks
 	cm.headerIndex.RecalculateBestTip()
 
@@ -3554,15 +3585,24 @@ func (cm *ChainManager) ReconsiderBlock(hash wire.Hash256) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 
-	// Clear invalid flags from this block and all ancestors up to genesis
+	// Core ResetBlockFailureFlags (validation.cpp): clear the failure flag
+	// from this block, every ANCESTOR and every DESCENDANT — including a
+	// descendant that was itself explicitly invalidated (BLOCK_FAILED_VALID
+	// is cleared there too, not just the child flag). Then persist the
+	// cleared entries so the reconsideration survives a restart.
+	var cleared []*BlockNode
 	current := node
 	for current != nil {
+		if current.Status.IsInvalid() {
+			cleared = append(cleared, current)
+		}
 		current.Status &^= (StatusInvalid | StatusInvalidChild)
 		current = current.Parent
 	}
 
 	// Clear invalid flags from all descendants
-	cm.clearDescendantInvalidFlags(node)
+	cleared = append(cleared, cm.clearDescendantInvalidFlags(node)...)
+	cm.persistFailureFlagsLocked(cleared)
 
 	// Recalculate best tip
 	cm.headerIndex.RecalculateBestTip()
@@ -3585,8 +3625,12 @@ func (cm *ChainManager) ReconsiderBlock(hash wire.Hash256) error {
 	return nil
 }
 
-// clearDescendantInvalidFlags clears invalid flags from all descendants of a block.
-func (cm *ChainManager) clearDescendantInvalidFlags(node *BlockNode) {
+// clearDescendantInvalidFlags clears both failure flags from all descendants
+// of a block (Core ResetBlockFailureFlags clears BLOCK_FAILED_VALID on every
+// descendant, so reconsiderblock(A1) after invalidateblock(A2) +
+// invalidateblock(A1) returns to A2). Returns the nodes whose flags changed.
+func (cm *ChainManager) clearDescendantInvalidFlags(node *BlockNode) []*BlockNode {
+	var cleared []*BlockNode
 	// Use BFS to clear flags from all descendants
 	queue := make([]*BlockNode, 0)
 	for _, child := range node.Children {
@@ -3597,12 +3641,129 @@ func (cm *ChainManager) clearDescendantInvalidFlags(node *BlockNode) {
 		current := queue[0]
 		queue = queue[1:]
 
-		// Clear invalid child flag (keep explicit invalid if set)
-		current.Status &^= StatusInvalidChild
+		if current.Status.IsInvalid() {
+			cleared = append(cleared, current)
+		}
+		current.Status &^= (StatusInvalid | StatusInvalidChild)
 
 		// Add children to queue
 		queue = append(queue, current.Children...)
 	}
+	return cleared
+}
+
+// failureSubtree returns node and every descendant (the set whose failure
+// flags InvalidateBlock just set).
+func failureSubtree(node *BlockNode) []*BlockNode {
+	out := []*BlockNode{node}
+	for i := 0; i < len(out); i++ {
+		out = append(out, out[i].Children...)
+	}
+	return out
+}
+
+// failureFlagMask is the part of BlockStatus that is persisted per block.
+const failureFlagMask = StatusInvalid | StatusInvalidChild
+
+// persistFailureFlagsLocked writes the CURRENT failure flags of nodes to the
+// chain DB (absent flags delete the entry). Core's equivalent is the dirty
+// block-index flush (BlockManager::WriteBatchSync); blockbrew kept these
+// flags in memory only, so invalidateblock was forgotten on restart.
+func (cm *ChainManager) persistFailureFlagsLocked(nodes []*BlockNode) {
+	if cm.chainDB == nil || len(nodes) == 0 {
+		return
+	}
+	entries := make([]storage.BlockFailure, 0, len(nodes))
+	for _, n := range nodes {
+		entries = append(entries, storage.BlockFailure{Hash: n.Hash, Flags: byte(n.Status & failureFlagMask)})
+	}
+	if err := cm.chainDB.WriteBlockFailures(entries); err != nil {
+		log.Printf("chainmgr: WARNING: failed to persist block failure flags for %d block(s): %v", len(entries), err)
+	}
+}
+
+// restoreBlockFailures re-applies the persisted invalidateblock flags at boot
+// (Core: LoadBlockIndexGuts reads nStatus incl. BLOCK_FAILED_* from disk, and
+// the failed blocks stay in the index so reconsiderblock can find them).
+//
+// Headers of invalidated blocks are usually NOT reachable by the boot
+// hydration (it walks back from the active tip, and submitblock'd blocks have
+// no header-store entry), so they are re-added here from the header store or
+// the stored body, parents first. Returns how many flags were applied.
+func (cm *ChainManager) restoreBlockFailures() int {
+	if cm.chainDB == nil {
+		return 0
+	}
+	fails, err := cm.chainDB.ReadBlockFailures()
+	if err != nil {
+		log.Printf("chainmgr: WARNING: reading persisted block failure flags: %v", err)
+	}
+	if len(fails) == 0 {
+		return 0
+	}
+
+	// Re-add missing headers, parents before children (repeat while progress).
+	pending := make([]storage.BlockFailure, 0, len(fails))
+	for _, f := range fails {
+		if cm.headerIndex.GetNode(f.Hash) == nil {
+			pending = append(pending, f)
+		}
+	}
+	for progress := true; progress && len(pending) > 0; {
+		progress = false
+		rest := pending[:0]
+		for _, f := range pending {
+			var hdr *wire.BlockHeader
+			if h, err := cm.chainDB.GetBlockHeader(f.Hash); err == nil && h != nil {
+				hdr = h
+			} else if b, err := cm.chainDB.GetBlock(f.Hash); err == nil && b != nil {
+				hdr = &b.Header
+			}
+			if hdr == nil {
+				continue // nothing on disk to rebuild it from; drop it
+			}
+			if _, err := cm.headerIndex.AddHeader(*hdr, true); err != nil && !errors.Is(err, ErrDuplicateHeader) {
+				rest = append(rest, f)
+				continue
+			}
+			progress = true
+		}
+		pending = rest
+	}
+
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	// Connected blocks had their bodies; mark the active chain as having
+	// data (as it was before the restart) so best-chain selection after a
+	// later reconsiderblock can reach a branch that forks off it.
+	for n := cm.tipNode; n != nil; n = n.Parent {
+		n.Status |= StatusDataStored
+	}
+
+	applied := 0
+	var roots []*BlockNode
+	for _, f := range fails {
+		n := cm.headerIndex.GetNode(f.Hash)
+		if n == nil {
+			continue
+		}
+		n.Status |= BlockStatus(f.Flags) & failureFlagMask
+		if cm.chainDB.HasBlock(n.Hash) {
+			n.Status |= StatusDataStored
+		}
+		if n.Status&StatusInvalid != 0 {
+			roots = append(roots, n)
+		}
+		applied++
+	}
+	for _, r := range roots {
+		cm.markDescendantsInvalid(r)
+	}
+	cm.headerIndex.RecalculateBestTip()
+	log.Printf("chainmgr: restored %d persisted block failure flag(s) (%d invalidated root(s), %d without a header on disk)",
+		applied, len(roots), len(fails)-applied)
+	return applied
 }
 
 // PreciousBlock gives a block temporary priority in chain selection.

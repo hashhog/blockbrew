@@ -589,6 +589,62 @@ func (c *ChainDB) SetBlockHeightBatch(batch Batch, height int32, hash wire.Hash2
 	batch.Put(key, hash[:])
 }
 
+// DeleteBlockHeightBatch removes the height->hash entry for a height that is
+// no longer on the active chain (DisconnectBlock). The "N" map is the ACTIVE
+// chain index (Core's m_chain); leaving a disconnected block in it lets the
+// boot-time replay (RecoverFromPersistedBlocks) read it as an unflushed block
+// "ahead of the tip" and reconnect it — which is how an invalidateblock'd
+// branch came back after a restart.
+func (c *ChainDB) DeleteBlockHeightBatch(batch Batch, height int32) {
+	batch.Delete(MakeBlockHeightKey(height))
+}
+
+// DeleteBlockHeight is the unbatched form of DeleteBlockHeightBatch.
+func (c *ChainDB) DeleteBlockHeight(height int32) error {
+	return c.db.Delete(MakeBlockHeightKey(height))
+}
+
+// BlockFailure is one persisted block-index failure flag.
+type BlockFailure struct {
+	Hash  wire.Hash256
+	Flags byte
+}
+
+// WriteBlockFailures persists failure flags (flags != 0 -> put, flags == 0 ->
+// delete) in one synced batch. Mirrors Core's WriteBatchSync of the dirty
+// block index after invalidateblock / reconsiderblock.
+func (c *ChainDB) WriteBlockFailures(entries []BlockFailure) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	batch := c.db.NewBatch()
+	for _, e := range entries {
+		if e.Flags == 0 {
+			batch.Delete(MakeBlockFailedKey(e.Hash))
+		} else {
+			batch.Put(MakeBlockFailedKey(e.Hash), []byte{e.Flags})
+		}
+	}
+	return batch.Write()
+}
+
+// ReadBlockFailures returns every persisted block-index failure flag.
+func (c *ChainDB) ReadBlockFailures() ([]BlockFailure, error) {
+	it := c.db.NewIterator(BlockFailedPrefix)
+	defer it.Release()
+	var out []BlockFailure
+	for it.Next() {
+		k, v := it.Key(), it.Value()
+		if len(k) != 1+32 || len(v) != 1 || v[0] == 0 {
+			continue
+		}
+		var h wire.Hash256
+		copy(h[:], k[1:])
+		out = append(out, BlockFailure{Hash: h, Flags: v[0]})
+	}
+	return out, it.Error()
+}
+
 // WriteBlockUndoBatch adds undo data to an existing batch (for atomic writes).
 func (c *ChainDB) WriteBlockUndoBatch(batch Batch, hash wire.Hash256, undo *BlockUndo) {
 	key := MakeUndoBlockKey(hash)
