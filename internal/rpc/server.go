@@ -451,6 +451,17 @@ func (s *Server) Stop() error {
 		defer cancel()
 		if s.httpServer != nil {
 			s.stopErr = s.httpServer.Shutdown(ctx)
+			if s.stopErr != nil {
+				// Shutdown gave up on a request still in flight (a client
+				// that never finishes sending, a handler that ignores the
+				// shutdown). Shutdown leaves those connections open; Close
+				// tears them down so no client socket outlives Stop and a
+				// stuck request cannot be the reason the daemon is still
+				// alive. Its handler's writes now fail fast.
+				if cerr := s.httpServer.Close(); cerr != nil {
+					log.Printf("RPC: force-closing remaining connections: %v", cerr)
+				}
+			}
 		}
 
 		// Shutdown returns once handlers finish or ctx expires; it does not

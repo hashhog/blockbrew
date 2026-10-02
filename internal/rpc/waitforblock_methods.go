@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -129,16 +130,29 @@ func (s *Server) waitForTip(predicate func(hash wire.Hash256, height int32) bool
 		return waitResult{Hash: hash.String(), Height: height}, nil
 	}
 
-	// Absolute deadline for the bounded case. Core uses a steady-clock deadline
-	// and re-derives the remaining slice after each wake; a single time.Timer
-	// firing into a channel is the Go analogue. nil timer/channel = unbounded.
-	var timer *time.Timer
-	var deadlineCh <-chan struct{}
+	// Wake channel: closed when the caller's deadline elapses OR the RPC
+	// server begins shutting down. Core's wait loops run `while (... &&
+	// IsRPCRunning())` and return the current block once RPC stops; an
+	// unbounded waitfornewblock that ignored shutdown kept the HTTP server's
+	// Shutdown waiting until its context expired ("RPC server stop error:
+	// context deadline exceeded", mainnet 2026-10-02) and leaked the handler.
+	wake := make(chan struct{})
+	var wakeOnce sync.Once
+	fire := func() { wakeOnce.Do(func() { close(wake) }) }
 	if timeoutMs > 0 {
-		done := make(chan struct{})
-		timer = time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, func() { close(done) })
-		deadlineCh = done
+		timer := time.AfterFunc(time.Duration(timeoutMs)*time.Millisecond, fire)
 		defer timer.Stop()
+	}
+	if s.shutdown != nil {
+		left := make(chan struct{})
+		defer close(left)
+		go func() {
+			select {
+			case <-s.shutdown:
+				fire()
+			case <-left:
+			}
+		}()
 	}
 
 	for {
@@ -151,16 +165,12 @@ func (s *Server) waitForTip(predicate func(hash wire.Hash256, height int32) bool
 		if predicate(hash, height) {
 			return waitResult{Hash: hash.String(), Height: height}, nil
 		}
-		if timeoutMs > 0 {
-			// Re-read the tip one last time on the timeout path so the returned
-			// block reflects the latest known tip (Core returns the current
-			// block on timeout).
-			if !notifier.Wait(gen, deadlineCh) {
-				hash, height = s.chainMgr.BestBlock()
-				return waitResult{Hash: hash.String(), Height: height}, nil
-			}
-		} else {
-			notifier.Wait(gen, nil)
+		// Deadline or shutdown: re-read the tip one last time so the returned
+		// block reflects the latest known tip (Core returns the current block
+		// on timeout and when RPC stops).
+		if !notifier.Wait(gen, wake) {
+			hash, height = s.chainMgr.BestBlock()
+			return waitResult{Hash: hash.String(), Height: height}, nil
 		}
 	}
 }
