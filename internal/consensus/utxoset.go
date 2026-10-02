@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -1179,6 +1180,12 @@ type UTXOSnapshot struct {
 	// written before the marker existed) the label is whatever the caller
 	// filled in while still holding the locks that froze the set.
 	HasMarker bool
+
+	// FlushedEntries / FlushDuration describe the flush that preceded the
+	// snapshot (dirty + deleted entries written), for operator logging: it
+	// is the only part of a walk that excludes block connection.
+	FlushedEntries int
+	FlushDuration  time.Duration
 }
 
 // OpenSnapshot flushes the cache and opens a storage snapshot of the coin
@@ -1197,17 +1204,20 @@ func (u *UTXOSet) OpenSnapshot() (*UTXOSnapshot, error) {
 		return nil, errors.New("utxo set has no database")
 	}
 	u.mu.Lock()
+	flushed := len(u.dirty) + len(u.deleted)
+	flushStart := time.Now()
 	if err := u.flushLocked(); err != nil {
 		u.mu.Unlock()
 		return nil, err
 	}
+	flushDur := time.Since(flushStart)
 	snap, err := u.db.NewSnapshot()
 	u.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}
 
-	s := &UTXOSnapshot{snap: snap}
+	s := &UTXOSnapshot{snap: snap, FlushedEntries: flushed, FlushDuration: flushDur}
 	// An interrupted multi-batch flush means the persisted set and its
 	// marker disagree; there is no honest label for it (fail closed, as boot
 	// does).

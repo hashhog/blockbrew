@@ -3353,10 +3353,12 @@ func (cm *ChainManager) OpenUTXOSnapshot() (*UTXOSnapshot, error) {
 		return nil, errors.New("UTXO set does not support snapshots")
 	}
 
+	waitStart := time.Now()
 	cm.reorgMu.Lock()
 	defer cm.reorgMu.Unlock()
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
+	lockWait := time.Since(waitStart)
 
 	tip := cm.tipNode
 	snap, err := us.OpenSnapshot()
@@ -3377,6 +3379,8 @@ func (cm *ChainManager) OpenUTXOSnapshot() (*UTXOSnapshot, error) {
 		log.Printf("chainmgr: UTXO snapshot marker %s (height %d) differs from the chain tip %s (height %d)",
 			snap.BestHash.String(), snap.BestHeight, tip.Hash.String(), tip.Height)
 	}
+	log.Printf("chainmgr: UTXO snapshot opened at height %d (lock wait %s; flushed %d coin entries in %s under the chain lock)",
+		snap.BestHeight, lockWait.Round(time.Millisecond), snap.FlushedEntries, snap.FlushDuration.Round(time.Millisecond))
 	return snap, nil
 }
 
