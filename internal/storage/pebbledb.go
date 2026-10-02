@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"github.com/cockroachdb/pebble"
@@ -82,6 +83,14 @@ func removeStalePebbleLock(path string) error {
 type PebbleDB struct {
 	db    *pebble.DB
 	cache *pebble.Cache
+
+	// closeOnce makes Close idempotent. The daemon's shutdown sequence and
+	// its 30 s deadline watchdog both close the DB; when shutdown overran the
+	// deadline under load, the second pebble.DB.Close panicked
+	// "pebble: closed" (observed 2026-10-01 on an RPC stop). A concurrent
+	// second caller waits for the first and gets its result.
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // PebbleDBConfig contains Pebble database configuration options.
@@ -331,11 +340,13 @@ func (p *PebbleDB) Flush() error {
 }
 
 func (p *PebbleDB) Close() error {
-	err := p.db.Close()
-	if p.cache != nil {
-		p.cache.Unref()
-	}
-	return err
+	p.closeOnce.Do(func() {
+		p.closeErr = p.db.Close()
+		if p.cache != nil {
+			p.cache.Unref()
+		}
+	})
+	return p.closeErr
 }
 
 // prefixUpperBound computes the upper bound for prefix iteration.

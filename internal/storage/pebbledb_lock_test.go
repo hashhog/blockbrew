@@ -3,6 +3,7 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -103,4 +104,44 @@ func TestNewPebbleDB_RecoversFromStaleLock(t *testing.T) {
 	if err := db2.Close(); err != nil {
 		t.Fatalf("Close after recovery: %v", err)
 	}
+}
+
+// TestPebbleDBCloseIsIdempotent: shutdown and the shutdown-deadline watchdog
+// may both close the DB, possibly at the same time. Neither may panic.
+//
+// NEGATIVE CONTROL: without closeOnce the second Close panics
+// "pebble: closed" (pebble db.go:1573) — the panic seen on a regtest RPC stop
+// that overran the 30 s deadline on 2026-10-01.
+func TestPebbleDBCloseIsIdempotent(t *testing.T) {
+	db, err := NewPebbleDB(t.TempDir())
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("concurrent Close panicked: %v", r)
+				}
+			}()
+			if err := db.Close(); err != nil {
+				t.Errorf("Close: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("Close after Close panicked: %v", r)
+			}
+		}()
+		_ = db.Close()
+	}()
 }
