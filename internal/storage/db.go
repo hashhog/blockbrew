@@ -72,3 +72,31 @@ type Iterator interface {
 	// Error returns any accumulated error.
 	Error() error
 }
+
+// Snapshot is a point-in-time, read-only view of a DB. Every read through it
+// (Get and every iterator it opens) observes exactly the committed state at
+// the moment the snapshot was taken, no matter what is written afterwards.
+//
+// This is what lets a long whole-set walk (gettxoutsetinfo) run WITHOUT any
+// chain lock and still describe one coherent state: the coin rows and the
+// coins best-block marker (CoinsTipKey) are written in the same batch, so a
+// snapshot that contains one contains the other. Core gets the same property
+// from the LevelDB snapshot behind CCoinsViewDB::Cursor() — the stats are
+// labelled with pcursor->GetBestBlock(), read from that same snapshot
+// (kernel/coinstats.cpp ComputeUTXOStats).
+//
+// Close MUST be called; an open snapshot pins old versions of every key it
+// covers, and Pebble refuses a clean Close while one is outstanding.
+type Snapshot interface {
+	// Get reads a key as of the snapshot. Returns nil, nil if absent.
+	Get(key []byte) ([]byte, error)
+	// NewIterator iterates keys with the given prefix as of the snapshot.
+	NewIterator(prefix []byte) Iterator
+	// Close releases the snapshot.
+	Close() error
+}
+
+// Snapshotter is implemented by DB backends that can take a Snapshot.
+type Snapshotter interface {
+	NewSnapshot() Snapshot
+}

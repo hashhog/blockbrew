@@ -141,63 +141,49 @@ func TestW124_G9_NoInterruptInChainManager_BUG2(t *testing.T) {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// G10 — BUG-3: `stop` RPC does NOT stop the daemon.
+// G10 — BUG-3 (FIXED): `stop` RPC runs the daemon's SIGTERM shutdown path.
 // ────────────────────────────────────────────────────────────────────────
 
-func TestW124_G10_StopRPCDoesNotStopDaemon_BUG3(t *testing.T) {
-	// Structural evidence: handleStop calls s.Stop() which only closes
-	// the RPC HTTP server. There is no syscall.SIGTERM, no signal to the
-	// process group, no close on a main-level shutdown channel.
+// TestW124_G10_StopRPCRunsSignalShutdownPath pins the wiring that cannot be
+// exercised from a unit test (main's signal wait): handleStop only REQUESTS
+// shutdown (it must not stop the RPC server itself — that was the no-op stop,
+// and the later SIGTERM then double-closed the shutdown channel and
+// panicked), and main waits on that request next to SIGINT/SIGTERM before
+// running the one shutdown sequence. The behaviour is proven end-to-end on
+// regtest by tools/crash-restart-harness.py (final clean stop = "rpc-stop").
+func TestW124_G10_StopRPCRunsSignalShutdownPath(t *testing.T) {
 	methodsBody, err := os.ReadFile(filepath.Join(w124RepoRoot(t), "internal/rpc/methods.go"))
 	if err != nil {
 		t.Fatalf("read methods.go: %v", err)
 	}
 	mSrc := string(methodsBody)
-	handleStopIdx := strings.Index(mSrc, "func (s *Server) handleStop()")
-	if handleStopIdx < 0 {
+	i := strings.Index(mSrc, "func (s *Server) handleStop()")
+	if i < 0 {
 		t.Fatalf("handleStop gone? audit stale")
 	}
-	// Function body sits in the ~250 chars after the declaration.
-	endIdx := handleStopIdx + 500
-	if endIdx > len(mSrc) {
-		endIdx = len(mSrc)
+	j := strings.Index(mSrc[i:], "\n}\n")
+	body := mSrc[i : i+j]
+	if !strings.Contains(body, "s.RequestStop()") {
+		t.Fatalf("handleStop does not request daemon shutdown:\n%s", body)
 	}
-	handleStopBody := mSrc[handleStopIdx:endIdx]
-	if !strings.Contains(handleStopBody, "s.Stop()") {
-		t.Fatalf("handleStop no longer calls s.Stop(); body:\n%s", handleStopBody)
-	}
-	// Fail if the body now signals the process — bug may be fixed.
-	if strings.Contains(handleStopBody, "syscall.SIGTERM") ||
-		strings.Contains(handleStopBody, "os.Process") ||
-		strings.Contains(handleStopBody, "syscall.Kill") {
-		t.Fatalf("BUG-3 may be fixed: handleStop now signals the process:\n%s", handleStopBody)
+	if strings.Contains(body, "s.Stop()") {
+		t.Fatalf("handleStop stops the RPC server itself (the no-op stop + double-close panic):\n%s", body)
 	}
 
-	serverBody, err := os.ReadFile(filepath.Join(w124RepoRoot(t), "internal/rpc/server.go"))
+	mainBody, err := os.ReadFile(filepath.Join(w124RepoRoot(t), "cmd/blockbrew/main.go"))
 	if err != nil {
-		t.Fatalf("read server.go: %v", err)
+		t.Fatalf("read main.go: %v", err)
 	}
-	sSrc := string(serverBody)
-	serverStopIdx := strings.Index(sSrc, "func (s *Server) Stop() error")
-	if serverStopIdx < 0 {
-		t.Fatalf("Server.Stop gone? audit stale")
+	src := string(mainBody)
+	sel := strings.Index(src, "case <-rpcServer.StopRequested():")
+	notify := strings.Index(src, "signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)")
+	shut := strings.Index(src, "rpcServer.Stop()")
+	if sel < 0 || notify < 0 || shut < 0 {
+		t.Fatalf("main.go does not wait on rpcServer.StopRequested() beside the signals (sel=%d notify=%d stop=%d)", sel, notify, shut)
 	}
-	serverStopEnd := serverStopIdx + 500
-	if serverStopEnd > len(sSrc) {
-		serverStopEnd = len(sSrc)
+	if !(notify < sel && sel < shut) {
+		t.Fatalf("main.go: the RPC stop wait must sit with the signal wait, before the shutdown sequence (notify=%d sel=%d stop=%d)", notify, sel, shut)
 	}
-	stopBody := sSrc[serverStopIdx:serverStopEnd]
-	if strings.Contains(stopBody, "syscall.SIGTERM") || strings.Contains(stopBody, "syscall.Kill") {
-		t.Fatalf("Server.Stop now signals the process — bug may be fixed:\n%s", stopBody)
-	}
-	t.Skip("BUG-3 (P0 MISSING): internal/rpc/methods.go:2159 handleStop() calls " +
-		"s.Stop() which only stops the RPC HTTP listener (server.go:343 close(s.shutdown) " +
-		"+ httpServer.Shutdown). The main goroutine sits at main.go:1526 blocked on " +
-		"sigChan; no signal is delivered. After `bitcoin-cli stop` returns success the " +
-		"RPC listener is gone but P2P + sync + mempool + wallet + ZMQ + chain manager " +
-		"all keep running. This breaks every Core-playbook restart script. " +
-		"Fix: handleStop must syscall.Kill(os.Getpid(), syscall.SIGTERM) so the main " +
-		"signal handler runs the full shutdown sequence.")
 }
 
 // ────────────────────────────────────────────────────────────────────────

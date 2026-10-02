@@ -3325,6 +3325,61 @@ func (cm *ChainManager) UTXOSet() UpdatableUTXOView {
 	return cm.utxoSet
 }
 
+// OpenUTXOSnapshot flushes the coin cache and opens ONE storage snapshot of
+// the coin database, labelled with the block that snapshot describes, for a
+// lock-free whole-set walk (gettxoutsetinfo).
+//
+// Only the flush and the snapshot open happen under the chain locks; the
+// caller walks the returned snapshot with no lock held, so block connection
+// and every other RPC keep running for the minutes-to-hours a mainnet walk
+// takes. Core: ComputeUTXOStats runs over a cursor snapshot, labelled with
+// pcursor->GetBestBlock() from that snapshot, with cs_main held only for the
+// flush (rpc/blockchain.cpp gettxoutsetinfo, kernel/coinstats.cpp).
+//
+// Locks, and why both:
+//   - cm.mu (read): ConnectBlock/DisconnectBlock hold it for the whole block,
+//     and mutate the cache and advance the applied-through marker as separate
+//     steps. Flushing in between would persist half a block, or a block's
+//     coins under the previous block's marker.
+//   - cm.reorgMu: ReorgTo and InvalidateBlock release cm.mu between their
+//     per-block steps while the in-memory set is mid-switch and its writes
+//     are meant to land in ONE batch at the end. A flush in that window
+//     would persist half a reorg.
+//
+// The caller MUST Close the snapshot.
+func (cm *ChainManager) OpenUTXOSnapshot() (*UTXOSnapshot, error) {
+	us, ok := cm.utxoSet.(*UTXOSet)
+	if !ok || us == nil {
+		return nil, errors.New("UTXO set does not support snapshots")
+	}
+
+	cm.reorgMu.Lock()
+	defer cm.reorgMu.Unlock()
+	cm.mu.RLock()
+	defer cm.mu.RUnlock()
+
+	tip := cm.tipNode
+	snap, err := us.OpenSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	if !snap.HasMarker {
+		// Datadir predating the coins marker: the chain tip, read under the
+		// same locks that froze the set, is the only honest label.
+		if tip == nil {
+			snap.Close()
+			return nil, errors.New("UTXO snapshot has no best-block marker and the chain has no tip")
+		}
+		snap.BestHash, snap.BestHeight = tip.Hash, tip.Height
+	} else if tip != nil && snap.BestHash != tip.Hash {
+		// The snapshot label is still the right one to report — it names the
+		// block whose coins were flushed — but at rest these should agree.
+		log.Printf("chainmgr: UTXO snapshot marker %s (height %d) differs from the chain tip %s (height %d)",
+			snap.BestHash.String(), snap.BestHeight, tip.Hash.String(), tip.Height)
+	}
+	return snap, nil
+}
+
 // InvalidateBlock marks a block as invalid and triggers a reorg if needed.
 // This implements the invalidateblock RPC behavior.
 // If the block is in the active chain, it will be disconnected along with all

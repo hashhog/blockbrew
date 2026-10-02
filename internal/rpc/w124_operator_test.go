@@ -14,12 +14,14 @@
 package rpc
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -40,63 +42,100 @@ func w124ReadServerGo(t *testing.T) string {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// G10 — BUG-3: `stop` RPC does not signal the daemon process.
+// G10 — BUG-3 (FIXED): `stop` requests daemon shutdown; Stop is idempotent.
 // ────────────────────────────────────────────────────────────────────────
-//
-// Live test (RPC-side flavour): build a Server with a no-op httpServer,
-// call handleStop, and confirm:
-//
-//   - the call returns success (matches Core wire contract);
-//   - s.shutdown is closed (RPC HTTP server gets the message);
-//   - NO process-level signal was raised — there is no main-level hook
-//     to fire from inside the RPC package, so the daemon stays up.
-//
-// The "stays up" half is implicit (we can't easily check process state
-// from a unit test), so the audit relies on the structural pin in
-// cmd/blockbrew/w124_operator_test.go::TestW124_G10_StopRPCDoesNotStopDaemon_BUG3.
-// Here we record the RPC side: handleStop's effect ends at s.Stop().
 
-func TestW124_G10RPC_HandleStopOnlyClosesShutdownChan_BUG3(t *testing.T) {
-	s := NewServer(RPCConfig{
-		ListenAddr: "127.0.0.1:0",
-		Username:   "u",
-		Password:   "p",
-	})
-	// Sanity: pre-call, shutdown chan is open.
+// TestW124_G10RPC_HandleStopRequestsDaemonShutdown: `stop` must signal the
+// daemon (StopRequested) and must NOT tear down the RPC server itself — the
+// daemon's shutdown sequence does that, once. The old handleStop called
+// s.Stop() from a goroutine: the node kept running without RPC, and the
+// SIGTERM that followed called Stop again and panicked ("close of closed
+// channel", server.go:388, 3 of 4 stops in the 2026-10-01 harness run).
+func TestW124_G10RPC_HandleStopRequestsDaemonShutdown(t *testing.T) {
+	s := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0", Username: "u", Password: "p"})
+
+	res, rpcErr := s.handleStop()
+	if rpcErr != nil {
+		t.Fatalf("handleStop returned RPCError: %v", rpcErr)
+	}
+	if res != "blockbrew server stopping" {
+		t.Errorf("handleStop reply %v", res)
+	}
+	select {
+	case <-s.StopRequested():
+	case <-time.After(2 * time.Second):
+		t.Fatal("handleStop did not request daemon shutdown")
+	}
+	// The RPC server itself is left for the daemon's shutdown to stop.
+	time.Sleep(200 * time.Millisecond)
 	select {
 	case <-s.shutdown:
-		t.Fatal("shutdown chan already closed before handleStop")
+		t.Fatal("handleStop closed the RPC shutdown channel itself")
 	default:
 	}
-
-	// Call handleStop and verify the dispatched goroutine eventually closes
-	// the shutdown channel without doing anything else daemon-level.
-	// handleStop sleeps 100ms then calls s.Stop(); we wait up to 1s.
-	if _, err := s.handleStop(); err != nil {
-		t.Fatalf("handleStop returned RPCError: %v", err)
+	// A second `stop` is harmless.
+	if _, rpcErr := s.handleStop(); rpcErr != nil {
+		t.Fatalf("second handleStop: %v", rpcErr)
 	}
+}
 
-	// We don't have a public httpServer here; Stop() bails on nil httpServer
-	// (server.go:349 nil-guard). It does close(s.shutdown) unconditionally.
-	// Wait for that close.
-	timer := time.NewTimer(2 * time.Second)
-	defer timer.Stop()
+// TestServerStopIsIdempotent: the daemon may call Stop after a `stop` RPC, on
+// SIGTERM, or both, from several goroutines. None of that may panic, and
+// every call returns.
+//
+// NEGATIVE CONTROL: against 75aa909's Stop (close(s.shutdown) with no once
+// guard) the second call panics "close of closed channel".
+func TestServerStopIsIdempotent(t *testing.T) {
+	addr := fmt.Sprintf("127.0.0.1:%d", freePort(t))
+	s := NewServer(RPCConfig{ListenAddr: addr})
+	if err := s.Start(); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	waitReachable(t, addr)
+
+	// `stop` RPC, then the daemon's own Stop, then a SIGTERM-driven Stop.
+	if _, rpcErr := s.handleStop(); rpcErr != nil {
+		t.Fatalf("handleStop: %v", rpcErr)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					errs <- fmt.Errorf("Stop panicked: %v", r)
+				}
+			}()
+			_ = s.Stop()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Errorf("Stop after Stop panicked: %v", r)
+			}
+		}()
+		if err := s.Stop(); err != nil {
+			t.Errorf("repeat Stop: %v", err)
+		}
+	}()
 	select {
 	case <-s.shutdown:
-		// expected
-	case <-timer.C:
-		t.Fatal("s.shutdown was not closed within 2s of handleStop")
+	default:
+		t.Error("Stop did not close the shutdown channel")
 	}
-
-	// The structural pin lives in cmd/blockbrew; here we just record that
-	// the RPC-side effect is bounded.
-	t.Skip("BUG-3 (P0): handleStop closes s.shutdown and stops the HTTP server. " +
-		"It does NOT signal the daemon process — main.go:1526 sigChan is " +
-		"untouched. After this call returns 'stopping' to the client, the " +
-		"daemon stays up indefinitely. Fix: handleStop must syscall.Kill " +
-		"(os.Getpid(), syscall.SIGTERM) so main's signal handler runs the " +
-		"full shutdown sequence. See cmd/blockbrew/w124_operator_test.go::" +
-		"TestW124_G10_StopRPCDoesNotStopDaemon_BUG3 for the cmd-side pin.")
+	if !s.beginLongOp() {
+		return
+	}
+	s.endLongOp()
+	t.Error("a long-running RPC could still start after Stop")
 }
 
 // ────────────────────────────────────────────────────────────────────────

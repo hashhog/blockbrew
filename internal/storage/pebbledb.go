@@ -276,6 +276,51 @@ func (p *PebbleDB) NewIterator(prefix []byte) Iterator {
 	}
 }
 
+// NewSnapshot returns a point-in-time view of the committed DB state (pebble
+// DB.NewSnapshot). Reads through it are unaffected by later batches.
+func (p *PebbleDB) NewSnapshot() Snapshot {
+	return &pebbleSnapshot{snap: p.db.NewSnapshot()}
+}
+
+// pebbleSnapshot wraps a *pebble.Snapshot as a storage.Snapshot.
+type pebbleSnapshot struct {
+	snap *pebble.Snapshot
+}
+
+// Get reads a key as of the snapshot. Returns nil, nil if absent.
+func (s *pebbleSnapshot) Get(key []byte) ([]byte, error) {
+	val, closer, err := s.snap.Get(key)
+	if err == pebble.ErrNotFound {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, len(val))
+	copy(out, val)
+	closer.Close()
+	return out, nil
+}
+
+// NewIterator iterates keys with the given prefix as of the snapshot.
+func (s *pebbleSnapshot) NewIterator(prefix []byte) Iterator {
+	opts := &pebble.IterOptions{}
+	if prefix != nil {
+		opts.LowerBound = prefix
+		opts.UpperBound = prefixUpperBound(prefix)
+	}
+	iter, err := s.snap.NewIter(opts)
+	if err != nil {
+		return &pebbleIterator{err: err}
+	}
+	return &pebbleIterator{iter: iter, prefix: prefix, first: true}
+}
+
+// Close releases the snapshot.
+func (s *pebbleSnapshot) Close() error {
+	return s.snap.Close()
+}
+
 // Close closes the database and releases resources.
 // Flush synchronously flushes the memtable to a durable L0 sstable (pebble
 // DB.Flush fsyncs before returning). Used by the flushchainstate RPC so a

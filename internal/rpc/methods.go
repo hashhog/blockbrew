@@ -2875,13 +2875,17 @@ func (s *Server) handleEstimateSmartFee(params json.RawMessage) (interface{}, *R
 // Control RPCs
 // ============================================================================
 
+// handleStop asks the daemon to shut down and returns at once. Core: `stop`
+// calls StartShutdown() (rpc/server.cpp) — the same path SIGTERM takes — and
+// the reply goes out before the HTTP server stops.
+//
+// It used to call s.Stop() itself: that closed only the RPC HTTP server and
+// left the node running with no RPC (a no-op stop), and a SIGTERM afterwards
+// then ran Stop a second time and panicked on the already-closed channel. Now
+// it only signals; the daemon's main loop runs the full shutdown, which stops
+// this server exactly once.
 func (s *Server) handleStop() (interface{}, *RPCError) {
-	// Signal shutdown in background to allow response to be sent
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		s.Stop()
-	}()
-
+	s.RequestStop()
 	return "blockbrew server stopping", nil
 }
 

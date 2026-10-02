@@ -32,6 +32,7 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"hash"
 	"io"
 	"sort"
 
@@ -198,46 +199,67 @@ type UTXOSetInfo struct {
 // walk) so the RPC dispatch arm can pick the one the caller requested without
 // re-walking the set.
 func ComputeUTXOSetInfo(utxoSet *UTXOSet) (UTXOSetInfo, error) {
-	var info UTXOSetInfo
-
-	h := sha256.New()
-	mh := crypto.NewMuHash3072()
-
-	// transactions = number of distinct txids; the cursor groups coins by
-	// txid, so a count of txid transitions (plus one for the first) is exact.
-	var haveTx bool
-	var prevTxid wire.Hash256
-
-	_, err := utxoSet.ScanUTXOs(func(op wire.OutPoint, entry *UTXOEntry) bool {
-		// Per-coin accounting (ApplyStats).
-		info.TxOuts++
-		info.TotalAmount += entry.Amount
-		info.BogoSize += GetBogoSize(entry.PkScript)
-		if !haveTx || op.Hash != prevTxid {
-			info.Transactions++
-			prevTxid = op.Hash
-			haveTx = true
-		}
-
-		// hash_serialized_3: stream the per-coin record (cursor order).
-		_ = WriteTxOutSer(h, op, entry)
-		// muhash: insert the same per-coin record (order-independent).
-		mh.Insert(txOutSerBytes(op, entry))
-		return true
-	})
-	if err != nil {
+	acc := newUTXOStatsAccumulator()
+	if _, err := utxoSet.ScanUTXOs(acc.add); err != nil {
 		return UTXOSetInfo{}, err
 	}
+	return acc.finish(), nil
+}
 
+// ComputeUTXOSetInfoFromSnapshot computes the same statistics as
+// ComputeUTXOSetInfo over ONE storage snapshot, without holding any lock for
+// the walk. The block the numbers describe is snap.BestHash/BestHeight — the
+// label read from the same snapshot — never a tip read at some other moment.
+// A closed stop channel aborts the walk with ErrScanAborted.
+func ComputeUTXOSetInfoFromSnapshot(snap *UTXOSnapshot, stop <-chan struct{}) (UTXOSetInfo, error) {
+	acc := newUTXOStatsAccumulator()
+	if _, err := snap.Scan(stop, acc.add); err != nil {
+		return UTXOSetInfo{}, err
+	}
+	return acc.finish(), nil
+}
+
+// utxoStatsAccumulator folds coins, in cursor order, into a UTXOSetInfo.
+type utxoStatsAccumulator struct {
+	info     UTXOSetInfo
+	h        hash.Hash
+	mh       *crypto.MuHash3072
+	haveTx   bool
+	prevTxid wire.Hash256
+}
+
+func newUTXOStatsAccumulator() *utxoStatsAccumulator {
+	return &utxoStatsAccumulator{h: sha256.New(), mh: crypto.NewMuHash3072()}
+}
+
+func (a *utxoStatsAccumulator) add(op wire.OutPoint, entry *UTXOEntry) bool {
+	// Per-coin accounting (ApplyStats).
+	a.info.TxOuts++
+	a.info.TotalAmount += entry.Amount
+	a.info.BogoSize += GetBogoSize(entry.PkScript)
+	// transactions = number of distinct txids; the cursor groups coins by
+	// txid, so a count of txid transitions (plus one for the first) is exact.
+	if !a.haveTx || op.Hash != a.prevTxid {
+		a.info.Transactions++
+		a.prevTxid = op.Hash
+		a.haveTx = true
+	}
+	// hash_serialized_3: stream the per-coin record (cursor order).
+	_ = WriteTxOutSer(a.h, op, entry)
+	// muhash: insert the same per-coin record (order-independent).
+	a.mh.Insert(txOutSerBytes(op, entry))
+	return true
+}
+
+func (a *utxoStatsAccumulator) finish() UTXOSetInfo {
+	info := a.info
 	// HashWriter::GetHash() == SHA256d.
-	first := h.Sum(nil)
+	first := a.h.Sum(nil)
 	second := sha256.Sum256(first)
 	copy(info.HashSerialized3[:], second[:])
-
-	digest := mh.Finalize()
+	digest := a.mh.Finalize()
 	copy(info.MuHash[:], digest[:])
-
-	return info, nil
+	return info
 }
 
 // ComputeMuHashUTXO computes Core's MUHASH3072 over the given UTXOSet's cache.

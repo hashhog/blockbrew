@@ -606,6 +606,19 @@ func (c *ChainDB) DeleteBlockUndoBatch(batch Batch, hash wire.Hash256) {
 	batch.Delete(key)
 }
 
+// ErrSnapshotUnsupported is returned by NewSnapshot when the backing DB
+// cannot take a point-in-time snapshot.
+var ErrSnapshotUnsupported = errors.New("storage: backend does not support snapshots")
+
+// NewSnapshot takes a point-in-time read view of the underlying database (see
+// Snapshot). The caller MUST Close it.
+func (c *ChainDB) NewSnapshot() (Snapshot, error) {
+	if sn, ok := c.db.(Snapshotter); ok {
+		return sn.NewSnapshot(), nil
+	}
+	return nil, ErrSnapshotUnsupported
+}
+
 // NewBatch creates a new write batch from the underlying database.
 func (c *ChainDB) NewBatch() Batch {
 	return c.db.NewBatch()

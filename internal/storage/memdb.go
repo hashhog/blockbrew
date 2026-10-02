@@ -267,3 +267,17 @@ func (it *memIterator) Release() {
 func (it *memIterator) Error() error {
 	return it.err
 }
+
+// NewSnapshot returns a point-in-time copy of the database. The copy is a
+// MemDB of its own, so later writes to m are invisible through it.
+func (m *MemDB) NewSnapshot() Snapshot {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	cp := make(map[string][]byte, len(m.data))
+	for k, v := range m.data {
+		val := make([]byte, len(v))
+		copy(val, v)
+		cp[k] = val
+	}
+	return &MemDB{data: cp}
+}

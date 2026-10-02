@@ -1156,6 +1156,141 @@ func (u *UTXOSet) ScanUTXOs(visit func(outpoint wire.OutPoint, entry *UTXOEntry)
 	return count, nil
 }
 
+// ErrScanAborted is returned by UTXOSnapshot.Scan when its stop channel
+// closes before the walk finishes (node shutdown).
+var ErrScanAborted = errors.New("utxo set scan aborted")
+
+// UTXOSnapshot is ONE point-in-time view of the flushed coin database, plus
+// the block that view describes. Everything a whole-set statistic needs —
+// every coin and the label — comes from the same storage snapshot, so a
+// block connected while the walk runs can neither leak into the totals nor
+// relabel them. This is Core's ComputeUTXOStats shape: stats over a
+// CCoinsViewDB cursor, labelled with pcursor->GetBestBlock() from that same
+// cursor's snapshot (kernel/coinstats.cpp), with cs_main held only to flush
+// and open the cursor, not for the walk.
+type UTXOSnapshot struct {
+	snap storage.Snapshot
+
+	// BestHash/BestHeight name the block whose coin set this snapshot holds.
+	BestHash   wire.Hash256
+	BestHeight int32
+	// HasMarker reports that the label was read from the snapshot's own
+	// coins best-block marker (storage.CoinsTipKey). When false (a datadir
+	// written before the marker existed) the label is whatever the caller
+	// filled in while still holding the locks that froze the set.
+	HasMarker bool
+}
+
+// OpenSnapshot flushes the cache and opens a storage snapshot of the coin
+// database, both under u.mu, so the snapshot holds exactly the set as of this
+// call, with the coins best-block marker that flush wrote beside it.
+//
+// The caller MUST Close the snapshot. The flush and the snapshot are cheap;
+// the expensive walk (Scan) holds no lock at all.
+//
+// u.mu alone does NOT make the label correct: ChainManager mutates the cache
+// and advances the applied-through marker in separate calls, so callers that
+// need a label (gettxoutsetinfo) must go through ChainManager.OpenUTXOSnapshot,
+// which also excludes block connection and reorgs for the flush.
+func (u *UTXOSet) OpenSnapshot() (*UTXOSnapshot, error) {
+	if u.db == nil {
+		return nil, errors.New("utxo set has no database")
+	}
+	u.mu.Lock()
+	if err := u.flushLocked(); err != nil {
+		u.mu.Unlock()
+		return nil, err
+	}
+	snap, err := u.db.NewSnapshot()
+	u.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	s := &UTXOSnapshot{snap: snap}
+	// An interrupted multi-batch flush means the persisted set and its
+	// marker disagree; there is no honest label for it (fail closed, as boot
+	// does).
+	if raw, err := snap.Get(storage.CoinsFlushKey); err != nil || raw != nil {
+		snap.Close()
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("coin database records an interrupted flush; refusing to label it")
+	}
+	raw, err := snap.Get(storage.CoinsTipKey)
+	if err != nil {
+		snap.Close()
+		return nil, err
+	}
+	if raw != nil {
+		cs, err := storage.DeserializeChainState(raw)
+		if err != nil {
+			snap.Close()
+			return nil, fmt.Errorf("coins best-block marker: %w", err)
+		}
+		s.BestHash = cs.BestHash
+		s.BestHeight = cs.BestHeight
+		s.HasMarker = true
+	}
+	return s, nil
+}
+
+// Close releases the storage snapshot. Safe to call more than once.
+func (s *UTXOSnapshot) Close() error {
+	if s == nil || s.snap == nil {
+		return nil
+	}
+	err := s.snap.Close()
+	s.snap = nil
+	return err
+}
+
+// scanStopCheckEvery is how many coins Scan visits between checks of its
+// stop channel.
+const scanStopCheckEvery = 4096
+
+// Scan walks every coin in the snapshot in key order (txid, then vout
+// ascending — Core's cursor order). It takes no lock: concurrent block
+// connection, flushes and RPCs proceed while it runs. If stop closes, the
+// walk ends with ErrScanAborted (a nil stop never aborts).
+func (s *UTXOSnapshot) Scan(stop <-chan struct{}, visit func(outpoint wire.OutPoint, entry *UTXOEntry) bool) (uint64, error) {
+	it := s.snap.NewIterator(storage.UTXOPrefix)
+	defer it.Release()
+
+	var count uint64
+	for it.Next() {
+		if stop != nil && count%scanStopCheckEvery == 0 {
+			select {
+			case <-stop:
+				return count, ErrScanAborted
+			default:
+			}
+		}
+		key := it.Key()
+		// Key layout: "U" + 32-byte txid + 4-byte big-endian vout index.
+		if len(key) != 1+32+4 {
+			continue
+		}
+		var outpoint wire.OutPoint
+		copy(outpoint.Hash[:], key[1:33])
+		outpoint.Index = binary.BigEndian.Uint32(key[33:37])
+
+		entry, err := DeserializeUTXOEntry(it.Value())
+		if err != nil {
+			return count, err
+		}
+		count++
+		if !visit(outpoint, entry) {
+			break
+		}
+	}
+	if err := it.Error(); err != nil {
+		return count, err
+	}
+	return count, nil
+}
+
 // maybeFlush flushes if cache exceeds the maximum size.
 func (u *UTXOSet) maybeFlush() error {
 	u.mu.RLock()

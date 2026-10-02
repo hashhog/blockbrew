@@ -43,6 +43,33 @@ type RPCConfig struct {
 	// outside of .onion). Reference: bitcoin-core/src/httpserver.cpp.
 	TLSCertFile string
 	TLSKeyFile  string
+
+	// WriteTimeout bounds how long the server may spend on a request before
+	// its connection's write deadline expires (http.Server.WriteTimeout).
+	// Zero means DefaultRPCWriteTimeout. Methods in longRunningRPCs clear the
+	// deadline for their own request (see handleRPC), so this bound protects
+	// against stuck clients without truncating a legitimate whole-set walk.
+	WriteTimeout time.Duration
+}
+
+// DefaultRPCWriteTimeout is the connection write deadline for ordinary RPCs.
+const DefaultRPCWriteTimeout = 3600 * time.Second
+
+// longRunningRPCs are the methods whose work scales with the whole UTXO set
+// or the whole chain. Their requests run with NO write deadline: on mainnet
+// under load a gettxoutsetinfo walk took 4,901 s, the 3,600 s server-wide
+// WriteTimeout closed the connection first and the client got an empty
+// reply (curl rc=52) after all the work was done. Core has no write deadline
+// on RPC at all; the HTTP server's -rpcservertimeout only bounds an IDLE
+// connection (httpserver.cpp evhttp_set_timeout), never a running handler.
+var longRunningRPCs = map[string]bool{
+	"gettxoutsetinfo":  true,
+	"dumptxoutset":     true,
+	"loadtxoutset":     true,
+	"scantxoutset":     true,
+	"scanblocks":       true,
+	"verifychain":      true,
+	"rescanblockchain": true,
 }
 
 // Server is the JSON-RPC server.
@@ -81,7 +108,27 @@ type Server struct {
 
 	mu        sync.RWMutex
 	startTime time.Time
-	shutdown  chan struct{}
+	// shutdown is closed exactly once, by Stop. Long-running handlers watch it
+	// so they abort promptly instead of holding a DB snapshot open while the
+	// node closes its database.
+	shutdown chan struct{}
+	stopOnce sync.Once
+	stopErr  error
+
+	// stopRequested is closed (once) by the `stop` RPC. The daemon's main
+	// loop selects on it next to SIGINT/SIGTERM, so `stop` runs exactly the
+	// same shutdown sequence a SIGTERM does — Core's `stop` calls
+	// StartShutdown (rpc/server.cpp), the same path as the signal handler.
+	stopRequested     chan struct{}
+	stopRequestedOnce sync.Once
+
+	// longOps counts in-flight long-running handlers (whole-set walks). Stop
+	// waits for them, after closing shutdown, so none is still reading the
+	// database when the daemon closes it. longOpsClosed refuses new ones
+	// once Stop has begun waiting (WaitGroup.Add must not race Wait).
+	longOpsMu     sync.Mutex
+	longOps       sync.WaitGroup
+	longOpsClosed bool
 
 	// snapshotActivation records the live AssumeUTXO snapshot activation (Core
 	// ChainstateManager's second chainstate). nil while no snapshot is loaded;
@@ -249,9 +296,10 @@ func WithDebugLogController(c DebugLogController) ServerOption {
 // NewServer creates a new RPC server with the given configuration.
 func NewServer(config RPCConfig, opts ...ServerOption) *Server {
 	s := &Server{
-		config:    config,
-		startTime: time.Now(),
-		shutdown:  make(chan struct{}),
+		config:        config,
+		startTime:     time.Now(),
+		shutdown:      make(chan struct{}),
+		stopRequested: make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -332,17 +380,20 @@ func (s *Server) Start() error {
 	// override their explicit paths).
 	mux.HandleFunc("/", s.handleRPC)
 
+	writeTimeout := s.config.WriteTimeout
+	if writeTimeout <= 0 {
+		writeTimeout = DefaultRPCWriteTimeout
+	}
 	s.httpServer = &http.Server{
 		Addr:        s.config.ListenAddr,
 		Handler:     mux,
 		ReadTimeout: 30 * time.Second,
-		// WriteTimeout must accommodate legitimately long RPCs: a full
-		// gettxoutsetinfo / dumptxoutset scan over ~166M coins runs for
-		// many minutes, and a 30s deadline silently killed the connection
-		// mid-compute (empty reply, work wasted) — the w140 test note
-		// called this out. 1h matches the slowest observed full-set scan
-		// with generous margin; Core has no write deadline at all.
-		WriteTimeout: 3600 * time.Second,
+		// WriteTimeout bounds ordinary requests. Whole-set methods
+		// (longRunningRPCs) clear the deadline for their own request in
+		// handleRPC: a fixed bound is always too short for some machine —
+		// 1h was, at 4,901 s on mainnet under load (empty reply, rc=52) —
+		// and Core has no write deadline on a running RPC at all.
+		WriteTimeout: writeTimeout,
 	}
 
 	tlsEnabled := certSet && keySet
@@ -383,17 +434,70 @@ func (s *Server) Start() error {
 	return nil
 }
 
-// Stop gracefully shuts down the RPC server.
+// longOpWaitTimeout bounds how long Stop waits for in-flight whole-set walks
+// to notice the shutdown and release their database snapshot. They check
+// every few thousand coins, so this is normally milliseconds.
+const longOpWaitTimeout = 10 * time.Second
+
+// Stop gracefully shuts down the RPC server. It is idempotent: the first call
+// does the work and every later call returns the first call's result. (It
+// used to close s.shutdown unconditionally, so the `stop` RPC followed by a
+// SIGTERM — or any second caller — panicked with "close of closed channel".)
 func (s *Server) Stop() error {
-	close(s.shutdown)
+	s.stopOnce.Do(func() {
+		close(s.shutdown)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if s.httpServer != nil {
+			s.stopErr = s.httpServer.Shutdown(ctx)
+		}
 
-	if s.httpServer != nil {
-		return s.httpServer.Shutdown(ctx)
+		// Shutdown returns once handlers finish or ctx expires; it does not
+		// wait past that. Wait for the whole-set walks explicitly (they
+		// abort on s.shutdown) so none still reads the database after Stop
+		// returns and the daemon closes it.
+		s.longOpsMu.Lock()
+		s.longOpsClosed = true
+		s.longOpsMu.Unlock()
+		done := make(chan struct{})
+		go func() {
+			s.longOps.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(longOpWaitTimeout):
+			log.Printf("RPC: a long-running RPC did not stop within %s", longOpWaitTimeout)
+		}
+	})
+	return s.stopErr
+}
+
+// beginLongOp registers an in-flight long-running handler. It returns false
+// once Stop has begun, in which case the caller must not start the work.
+func (s *Server) beginLongOp() bool {
+	s.longOpsMu.Lock()
+	defer s.longOpsMu.Unlock()
+	if s.longOpsClosed {
+		return false
 	}
-	return nil
+	s.longOps.Add(1)
+	return true
+}
+
+func (s *Server) endLongOp() { s.longOps.Done() }
+
+// RequestStop asks the daemon to shut down, as the `stop` RPC does. Safe to
+// call any number of times.
+func (s *Server) RequestStop() {
+	s.stopRequestedOnce.Do(func() { close(s.stopRequested) })
+}
+
+// StopRequested is closed when the `stop` RPC has been called. The daemon's
+// main loop treats it exactly like SIGTERM.
+func (s *Server) StopRequested() <-chan struct{} {
+	return s.stopRequested
 }
 
 // handleRPC processes incoming JSON-RPC requests.
@@ -432,6 +536,13 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 	if ctx.Err() != nil {
 		s.sendError(w, req.ID, RPCErrMisc, "Request timeout")
 		return
+	}
+
+	// Whole-set methods run with no write deadline (see longRunningRPCs).
+	if longRunningRPCs[req.Method] {
+		if err := http.NewResponseController(w).SetWriteDeadline(time.Time{}); err != nil {
+			log.Printf("RPC: could not clear the write deadline for %s: %v", req.Method, err)
+		}
 	}
 
 	// Dispatch to the appropriate handler with wallet context

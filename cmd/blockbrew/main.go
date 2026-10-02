@@ -2242,13 +2242,23 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// deadline, so any blocked goroutine (P2P listener accept loop, DB
 	// compaction, UTXO flush) would hang indefinitely and force an external
 	// SIGKILL to escalate.
+	//
+	// The `stop` RPC lands here too, on exactly the same path (Core: `stop`
+	// calls StartShutdown, as the signal handler does). It used to stop only
+	// the RPC HTTP server and leave the node running.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigChan
-	if sig == syscall.SIGTERM {
-		log.Printf("received SIGTERM, beginning graceful shutdown")
-	} else {
-		log.Printf("received SIGINT, beginning graceful shutdown")
+	stopViaRPC := false
+	select {
+	case sig := <-sigChan:
+		if sig == syscall.SIGTERM {
+			log.Printf("received SIGTERM, beginning graceful shutdown")
+		} else {
+			log.Printf("received SIGINT, beginning graceful shutdown")
+		}
+	case <-rpcServer.StopRequested():
+		stopViaRPC = true
+		log.Printf("received RPC stop, beginning graceful shutdown")
 	}
 
 	// systemd: report STOPPING=1 so TimeoutStopSec doesn't tick down
@@ -2277,8 +2287,19 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		os.Exit(1)
 	})
 
-	// Second signal escalates immediately.
+	// Second signal escalates immediately. After an RPC `stop` the FIRST
+	// signal is the supervisor's ordinary SIGTERM (stop_mainnet.sh, systemd,
+	// the crash harness all send one if the process is still up), so it is
+	// logged and the graceful shutdown already running is left to finish;
+	// only a signal after that forces the exit.
 	go func() {
+		if stopViaRPC {
+			s, ok := <-sigChan
+			if !ok {
+				return
+			}
+			log.Printf("received %s while an RPC stop is already in progress; continuing graceful shutdown (send again to force)", s)
+		}
 		s, ok := <-sigChan
 		if !ok {
 			return

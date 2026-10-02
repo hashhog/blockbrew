@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -141,18 +142,39 @@ func (s *Server) handleGetTxOutSetInfo(params json.RawMessage) (interface{}, *RP
 		return ret, nil
 	}
 
-	tipHash, tipHeight := s.chainMgr.BestBlock()
-
-	utxoSet := s.chainMgr.UTXOSet()
-	us, ok := utxoSet.(*consensus.UTXOSet)
-	if !ok || us == nil {
-		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to read UTXO set"}
+	// Register as a long-running op so Stop waits for this walk to release
+	// its snapshot before the daemon closes the database.
+	if !s.beginLongOp() {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Shutting down"}
 	}
+	defer s.endLongOp()
 
-	info, err := consensus.ComputeUTXOSetInfo(us)
+	// ONE snapshot: flush + open under the chain locks (milliseconds), then
+	// walk it with no lock held. The height/bestblock come from the SAME
+	// snapshot as the coins — Core labels the stats with
+	// pcursor->GetBestBlock() from the cursor it walks (kernel/coinstats.cpp).
+	// The tip used to be read via BestBlock() BEFORE the flush and the
+	// iterator, so a block connected in between was counted in the set but
+	// not in the label (and a flush could even land mid-ConnectBlock).
+	snap, err := s.chainMgr.OpenUTXOSnapshot()
 	if err != nil {
+		log.Printf("gettxoutsetinfo: cannot open a UTXO snapshot: %v", err)
 		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to read UTXO set"}
 	}
+	defer snap.Close()
+	if txoutsetWalkHook != nil {
+		txoutsetWalkHook()
+	}
+
+	info, err := consensus.ComputeUTXOSetInfoFromSnapshot(snap, s.shutdown)
+	if errors.Is(err, consensus.ErrScanAborted) {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Shutting down"}
+	}
+	if err != nil {
+		log.Printf("gettxoutsetinfo: UTXO walk failed: %v", err)
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to read UTXO set"}
+	}
+	tipHash, tipHeight := snap.BestHash, snap.BestHeight
 
 	// disk_size: Core fills this from CCoinsViewDB::EstimateSize(), the LevelDB
 	// estimated on-disk byte count of the coins database. That value is storage-
@@ -186,6 +208,11 @@ func (s *Server) handleGetTxOutSetInfo(params json.RawMessage) (interface{}, *RP
 		Set("disk_size", diskSize)
 	return ret, nil
 }
+
+// txoutsetWalkHook, when non-nil, runs after gettxoutsetinfo has fixed the set
+// it will report and before the walk starts. Test seam only: tests connect a
+// block here to prove the block cannot leak into, or relabel, the result.
+var txoutsetWalkHook func()
 
 // resolveHashOrHeight maps the gettxoutsetinfo hash_or_height argument to a
 // main-chain block height. The argument is either:
