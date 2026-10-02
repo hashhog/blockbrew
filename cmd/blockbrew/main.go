@@ -2265,13 +2265,20 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// against a node mid-flush.
 	notifyStopping()
 
-	// 14. Hard 30-second deadline watchdog. If graceful shutdown has not
-	// completed by then we best-effort close the DB and os.Exit(1). This
-	// guarantees the process never hangs longer than 30s after a signal,
-	// matching Bitcoin Core's init.cpp shutdown semantics (StartShutdown +
-	// bounded thread join).
+	// 14. Hard deadline watchdog. If graceful shutdown has not completed by
+	// then we make a BOUNDED best-effort DB close and os.Exit(1), so the
+	// process never outlives shutdownDeadline+forcedCloseBudget after a
+	// signal (Core: StartShutdown + bounded thread join).
+	//
+	// 80 s, not 30: on mainnet under load (2026-10-02) the honest work —
+	// RPC drain, P2P stop + peers.json, mempool.dat (11.6k txs), the
+	// scrypt-enveloped wallet, the chainstate batch, Pebble close — did not
+	// fit in 30 s, so EVERY stop took the forced path and skipped the final
+	// flush. 80 s + forcedCloseBudget (10 s) = 90 s stays inside
+	// stop_mainnet.sh's 120 s blockbrew grace, and 80 s is inside systemd's
+	// default 90 s TimeoutStopSec.
 	shutdownDone := make(chan struct{})
-	const shutdownDeadline = 30 * time.Second
+	const shutdownDeadline = 80 * time.Second
 
 	// Budget for proving the chain is at rest before the chainstate flush.
 	// Deliberately inside shutdownDeadline so a stuck mutation cannot push the
@@ -2292,9 +2299,12 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	var dbFinalMu sync.Mutex
 	forceExit := func() {
 		if dbFinalMu.TryLock() {
-			// Best-effort DB close so we don't leave the LSM in a corrupt
-			// state. We ignore errors — we're about to die anyway.
-			_ = db.Close()
+			// Best-effort DB close, BOUNDED: an unbounded Close here (it
+			// waits for running compactions) kept the forced exit alive
+			// past the 120 s grace on mainnet 2026-10-02 -> SIGKILL.
+			if _, finished := closeWithin(db.Close, forcedCloseBudget); !finished {
+				log.Printf("DB close still running after %s; exiting without it (chainstate batches are WAL-synced)", forcedCloseBudget)
+			}
 		} else {
 			log.Printf("final chainstate flush/close in progress; exiting without closing the DB again")
 		}
@@ -2355,31 +2365,49 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		peerMgr.Stop()
 		log.Printf("Peer manager stopped")
 
-		// Save auxiliary state.
-		if err := feeEstimator.Save(cfg.DataDir); err != nil {
-			log.Printf("Warning: fee estimates save failed: %v", err)
-		} else {
-			log.Printf("Fee estimates saved")
-		}
-		if err := mp.Dump(cfg.DataDir); err != nil {
-			log.Printf("Warning: mempool.dat dump failed: %v", err)
-		} else {
-			log.Printf("mempool.dat saved (%d txs)", mp.Count())
-		}
-		if w != nil {
-			// Stop the auto-flusher (does a final synchronous flush of any
-			// pending mutations) then force one more durable save so the clean
-			// shutdown is guaranteed persisted even if nothing was dirty.
-			w.StopAutoFlush()
-			// Save under the wallet's CURRENT envelope password (a literal ""
-			// here would strip the passphrase protection of an encrypted
-			// wallet on every clean shutdown).
-			if err := w.Save(); err != nil {
-				log.Printf("Warning: wallet save failed: %v", err)
-			} else {
-				log.Printf("Wallet saved")
-			}
-		}
+		// Save auxiliary state — concurrently with each other AND with the
+		// chainstate flush below. None of them touches Pebble (each writes
+		// its own file), and serially they were the bulk of the shutdown
+		// time (mainnet 2026-10-02: fee 2 s, mempool.dat 16 s, wallet 20 s).
+		// The chainstate flush, the one write that matters for correctness,
+		// no longer queues behind them.
+		auxDone := make(chan struct{})
+		go func() {
+			defer close(auxDone)
+			runConcurrently(
+				func() {
+					if err := feeEstimator.Save(cfg.DataDir); err != nil {
+						log.Printf("Warning: fee estimates save failed: %v", err)
+					} else {
+						log.Printf("Fee estimates saved")
+					}
+				},
+				func() {
+					if err := mp.Dump(cfg.DataDir); err != nil {
+						log.Printf("Warning: mempool.dat dump failed: %v", err)
+					} else {
+						log.Printf("mempool.dat saved (%d txs)", mp.Count())
+					}
+				},
+				func() {
+					if w == nil {
+						return
+					}
+					// Stop the auto-flusher (does a final synchronous flush of any
+					// pending mutations) then force one more durable save so the clean
+					// shutdown is guaranteed persisted even if nothing was dirty.
+					w.StopAutoFlush()
+					// Save under the wallet's CURRENT envelope password (a literal ""
+					// here would strip the passphrase protection of an encrypted
+					// wallet on every clean shutdown).
+					if err := w.Save(); err != nil {
+						log.Printf("Warning: wallet save failed: %v", err)
+					} else {
+						log.Printf("Wallet saved")
+					}
+				},
+			)
+		}()
 
 		// Flush chainstate atomically: UTXO set + chain-tip pointer in a
 		// single Pebble batch with Sync. Pre-2026-05-02 these were two
@@ -2438,6 +2466,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 				log.Printf("Chainstate flushed atomically (UTXO + tip) at height %d", bestHeight)
 			}
 		}
+
+		// The auxiliary files must be complete before the process exits.
+		<-auxDone
 
 		// Flush + close the flat-file block store BEFORE the Pebble DB.
 		// BlockStore.Close persists its state (current file num/pos and
