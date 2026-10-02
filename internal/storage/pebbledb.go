@@ -91,6 +91,30 @@ type PebbleDB struct {
 	// second caller waits for the first and gets its result.
 	closeOnce sync.Once
 	closeErr  error
+
+	// liveMu/closed make use-after-Close an error instead of a process
+	// crash. pebble panics ("pebble: closed") on any Get/Set/Commit after
+	// Close; on SIGTERM a peer goroutine still unwinding stored a block after
+	// the deadline watchdog closed the DB and took the process down with
+	// exit 2 (testnet4 gate-5 repro 2026-10-02, 3 of 5 baseline stops).
+	// Point reads/writes and batch commits hold liveMu for reading; Close
+	// takes it for writing, so it also waits for the ones in flight.
+	liveMu sync.RWMutex
+	closed bool
+}
+
+// ErrDBClosed is returned by operations that reach the DB after Close.
+var ErrDBClosed = errors.New("storage: database closed")
+
+// enter admits one operation, or reports that the DB is closed. The caller
+// must call p.liveMu.RUnlock() when enter returns nil.
+func (p *PebbleDB) enter() error {
+	p.liveMu.RLock()
+	if p.closed {
+		p.liveMu.RUnlock()
+		return ErrDBClosed
+	}
+	return nil
 }
 
 // PebbleDBConfig contains Pebble database configuration options.
@@ -188,6 +212,10 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 
 // Get retrieves a value by key. Returns nil, nil if key does not exist.
 func (p *PebbleDB) Get(key []byte) ([]byte, error) {
+	if err := p.enter(); err != nil {
+		return nil, err
+	}
+	defer p.liveMu.RUnlock()
 	val, closer, err := p.db.Get(key)
 	if err == pebble.ErrNotFound {
 		return nil, nil
@@ -208,16 +236,28 @@ func (p *PebbleDB) Get(key []byte) ([]byte, error) {
 // During IBD, crash recovery replays from the last flushed chain-state
 // checkpoint, so per-key durability is unnecessary.
 func (p *PebbleDB) Put(key, value []byte) error {
+	if err := p.enter(); err != nil {
+		return err
+	}
+	defer p.liveMu.RUnlock()
 	return p.db.Set(key, value, pebble.NoSync)
 }
 
 // Delete removes a key.
 func (p *PebbleDB) Delete(key []byte) error {
+	if err := p.enter(); err != nil {
+		return err
+	}
+	defer p.liveMu.RUnlock()
 	return p.db.Delete(key, pebble.NoSync)
 }
 
 // Has returns true if the key exists.
 func (p *PebbleDB) Has(key []byte) (bool, error) {
+	if err := p.enter(); err != nil {
+		return false, err
+	}
+	defer p.liveMu.RUnlock()
 	_, closer, err := p.db.Get(key)
 	if err == pebble.ErrNotFound {
 		return false, nil
@@ -232,6 +272,7 @@ func (p *PebbleDB) Has(key []byte) (bool, error) {
 // NewBatch creates a new write batch for atomic operations.
 func (p *PebbleDB) NewBatch() Batch {
 	return &pebbleBatch{
+		owner: p,
 		db:    p.db,
 		batch: p.db.NewBatch(),
 	}
@@ -242,6 +283,7 @@ func (p *PebbleDB) NewBatch() Batch {
 // persisted chain-state checkpoint.
 func (p *PebbleDB) NewBatchNoSync() Batch {
 	return &pebbleBatch{
+		owner:  p,
 		db:     p.db,
 		batch:  p.db.NewBatch(),
 		noSync: true,
@@ -256,6 +298,7 @@ func (p *PebbleDB) NewBatchNoSync() Batch {
 // staged but have not yet committed.
 func (p *PebbleDB) NewIndexedBatch() Batch {
 	return &pebbleBatch{
+		owner:   p,
 		db:      p.db,
 		batch:   p.db.NewIndexedBatch(),
 		indexed: true,
@@ -341,6 +384,9 @@ func (p *PebbleDB) Flush() error {
 
 func (p *PebbleDB) Close() error {
 	p.closeOnce.Do(func() {
+		p.liveMu.Lock()
+		p.closed = true
+		p.liveMu.Unlock()
 		p.closeErr = p.db.Close()
 		if p.cache != nil {
 			p.cache.Unref()
@@ -371,6 +417,7 @@ func prefixUpperBound(prefix []byte) []byte {
 
 // pebbleBatch wraps a Pebble batch.
 type pebbleBatch struct {
+	owner   *PebbleDB // nil only in tests that build a batch by hand
 	db      *pebble.DB
 	batch   *pebble.Batch
 	noSync  bool // Skip fsync on commit (for IBD performance)
@@ -397,6 +444,12 @@ func (b *pebbleBatch) Get(key []byte) ([]byte, error) {
 		closer io.Closer
 		err    error
 	)
+	if b.owner != nil {
+		if err := b.owner.enter(); err != nil {
+			return nil, err
+		}
+		defer b.owner.liveMu.RUnlock()
+	}
 	if b.indexed {
 		val, closer, err = b.batch.Get(key)
 	} else {
@@ -416,6 +469,12 @@ func (b *pebbleBatch) Get(key []byte) ([]byte, error) {
 
 // Write atomically applies all operations in the batch.
 func (b *pebbleBatch) Write() error {
+	if b.owner != nil {
+		if err := b.owner.enter(); err != nil {
+			return err
+		}
+		defer b.owner.liveMu.RUnlock()
+	}
 	if b.noSync {
 		return b.batch.Commit(pebble.NoSync)
 	}

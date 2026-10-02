@@ -2362,6 +2362,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		log.Printf("stopping P2P")
 		syncMgr.Stop()
 		log.Printf("Sync manager stopped")
+		// No block is stored from here on: peer goroutines still unwinding
+		// must not queue synced block-store writes ahead of the final close.
+		blockStore.BeginClose()
 		peerMgr.Stop()
 		log.Printf("Peer manager stopped")
 

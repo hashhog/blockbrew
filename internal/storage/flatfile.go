@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -174,6 +175,9 @@ func DeserializeBlockFileInfo(r io.Reader) (*BlockFileInfo, error) {
 var (
 	ErrBadMagic       = errors.New("flatfile: bad network magic")
 	ErrBlockTooLarge  = errors.New("flatfile: block too large")
+	// ErrBlockStoreClosed is returned by writes that reach the store after
+	// Close has begun.
+	ErrBlockStoreClosed = errors.New("flatfile: block store closed")
 	ErrCorruptedData  = errors.New("flatfile: corrupted data")
 	ErrDiskFull       = errors.New("flatfile: disk full")
 	ErrInvalidPos     = errors.New("flatfile: invalid position")
@@ -182,6 +186,12 @@ var (
 // BlockStore manages flat file block storage with blk*.dat and rev*.dat files.
 type BlockStore struct {
 	mu             sync.RWMutex
+	// closing is set by Close before it takes mu. Writers that were queued on
+	// mu behind it give up instead of each performing their own synced state
+	// commit: a SIGTERM during IBD on a busy disk left 9 peer goroutines
+	// queued in WriteBlock, and Close waited for every one of them (46 s,
+	// testnet4 gate-5 run 2026-10-02 — the shutdown deadline fired first).
+	closing        atomic.Bool
 	dataDir        string
 	magic          uint32
 	maxFileSize    uint32
@@ -235,6 +245,9 @@ func (bs *BlockStore) undoFilename(fileNum int32) string {
 func (bs *BlockStore) WriteBlock(blockData []byte, height uint32, blockTime uint64) (FlatFilePos, error) {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
+	if bs.closing.Load() {
+		return FlatFilePos{FileNum: -1}, ErrBlockStoreClosed
+	}
 
 	blockSize := uint32(len(blockData))
 	totalSize := StorageHeaderSize + blockSize
@@ -372,6 +385,9 @@ func (bs *BlockStore) ReadBlock(pos FlatFilePos) ([]byte, error) {
 func (bs *BlockStore) WriteUndo(fileNum int32, undoData []byte) (FlatFilePos, error) {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
+	if bs.closing.Load() {
+		return FlatFilePos{FileNum: -1}, ErrBlockStoreClosed
+	}
 
 	if fileNum < 0 || int32(len(bs.fileInfo)) <= fileNum {
 		return FlatFilePos{FileNum: -1}, ErrInvalidPos
@@ -669,7 +685,17 @@ func (bs *BlockStore) Flush() error {
 
 // Close flushes and closes the block store.
 func (bs *BlockStore) Close() error {
+	bs.closing.Store(true)
 	return bs.Flush()
+}
+
+// BeginClose makes every later WriteBlock/WriteUndo fail with
+// ErrBlockStoreClosed without flushing anything. The daemon calls it as soon
+// as block download and connection have stopped, so peer goroutines still
+// unwinding stop queueing block writes (each a synced state commit) that the
+// final Close would otherwise have to wait out.
+func (bs *BlockStore) BeginClose() {
+	bs.closing.Store(true)
 }
 
 // BlockIndex key prefixes for storing block positions.
