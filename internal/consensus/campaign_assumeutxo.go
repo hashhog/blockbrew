@@ -103,42 +103,147 @@ func LoadCampaignAssumeUTXO(params *ChainParams) (int, error) {
 	// Refuse on collision with a built-in (non-campaign) entry: campaign data
 	// may never override a production hash. Checked against the EFFECTIVE
 	// table (Core-parity regtest entries included), not just the raw
-	// params.AssumeUTXO field.
+	// params.AssumeUTXO field — by height AND by blockhash (a fixture that
+	// puts a built-in blockhash at a different height is stale or wrong).
+	//
+	// The ONE non-refusal: an entry whose whole commitment — height,
+	// blockhash, hash_serialized AND m_chain_tx_count — is IDENTICAL to the
+	// existing row is not an override but a second source agreeing with the
+	// first (Core keys an m_assumeutxo_data row by height+blockhash and checks
+	// the snapshot against its hash_serialized; a byte-identical row adds no
+	// new trust). R4's rung at 910,000 was minted by dumping a Core clone
+	// there and came out equal to Core's own hardcoded anchor; refusing it
+	// BLOCKED the slice with the best provenance of any rung. Such an entry
+	// CONFIRMS the row: the commitment is kept, and only the supplemental
+	// ancestry the row lacks (BaseTailHeaders, Chainwork — which the
+	// -load-snapshot boot needs in activateSnapshotChainView and the built-in
+	// rows never carry) is filled in. A contradiction of anything the row
+	// already pins is still refused. Hashes are compared as parsed 32-byte
+	// values, so hex case cannot matter.
 	existing := AssumeUTXOParamsForNetwork(params)
-	if existing != nil {
-		for _, e := range entries {
-			if d := existing.ForHeight(e.Height); d != nil {
-				return 0, fmt.Errorf("%s=%q: height %d collides with an existing assumeutxo entry",
-					CampaignAssumeUTXOEnvVar, path, e.Height)
-			}
-			if d := existing.ForBlockHash(e.BlockHash); d != nil {
-				return 0, fmt.Errorf("%s=%q: blockhash %s collides with an existing assumeutxo entry",
-					CampaignAssumeUTXOEnvVar, path, e.BlockHash.String())
-			}
+	var fresh []AssumeUTXOData
+	confirmed := make(map[int32]AssumeUTXOData) // height -> merged row
+	var confirmedHeights []int32
+	for _, e := range entries {
+		var byHeight, byHash *AssumeUTXOData
+		if existing != nil {
+			byHeight = existing.ForHeight(e.Height)
+			byHash = existing.ForBlockHash(e.BlockHash)
 		}
+		if byHeight == nil && byHash == nil {
+			fresh = append(fresh, e)
+			continue
+		}
+		if byHeight == nil {
+			return 0, fmt.Errorf("%s=%q: blockhash %s collides with an existing assumeutxo entry at height %d",
+				CampaignAssumeUTXOEnvVar, path, e.BlockHash.String(), byHash.Height)
+		}
+		if byHash != nil && byHash != byHeight {
+			return 0, fmt.Errorf("%s=%q: blockhash %s collides with an existing assumeutxo entry at height %d",
+				CampaignAssumeUTXOEnvVar, path, e.BlockHash.String(), byHash.Height)
+		}
+		if diff := commitmentDiff(byHeight, &e); diff != "" {
+			return 0, fmt.Errorf("%s=%q: height %d collides with an existing assumeutxo entry (%s differ from the existing entry)",
+				CampaignAssumeUTXOEnvVar, path, e.Height, diff)
+		}
+		merged, err := mergeCampaignConfirmation(*byHeight, e)
+		if err != nil {
+			return 0, fmt.Errorf("%s=%q: entry at height %d matches the existing commitment but %w",
+				CampaignAssumeUTXOEnvVar, path, e.Height, err)
+		}
+		confirmed[e.Height] = merged
+		confirmedHeights = append(confirmedHeights, e.Height)
 	}
 
 	if params.Name == "regtest" {
+		// A confirmed row is registered too: RegtestAssumeUTXOParams lets a
+		// registered row with an IDENTICAL commitment stand in for the
+		// Core-parity row, so the filled ancestry is what consumers see.
 		for _, e := range entries {
-			RegisterRegtestAssumeUTXO(e)
+			if m, ok := confirmed[e.Height]; ok {
+				RegisterRegtestAssumeUTXO(m)
+			} else {
+				RegisterRegtestAssumeUTXO(e)
+			}
 		}
 	} else {
 		var builtin []AssumeUTXOData
 		if existing != nil {
 			builtin = existing.Data
 		}
-		merged := make([]AssumeUTXOData, 0, len(builtin)+len(entries))
-		merged = append(merged, builtin...)
-		merged = append(merged, entries...)
+		merged := make([]AssumeUTXOData, 0, len(builtin)+len(fresh))
+		for _, b := range builtin {
+			if m, ok := confirmed[b.Height]; ok {
+				b = m // replace in place in the COPY; the built-in table is never mutated
+			}
+			merged = append(merged, b)
+		}
+		merged = append(merged, fresh...)
 		params.AssumeUTXO = &AssumeUTXOParams{Data: merged}
+	}
+	for _, h := range confirmedHeights {
+		m := confirmed[h]
+		log.Printf("[CAMPAIGN-ASSUMEUTXO] entry height %d is IDENTICAL to the existing assumeutxo commitment "+
+			"(blockhash, hash_serialized, m_chain_tx_count) -- accepted as a confirmation; commitment kept, "+
+			"base_tail_headers=%d chainwork_set=%v", h, len(m.BaseTailHeaders), m.Chainwork != nil)
 	}
 
 	heights := make([]int32, len(entries))
 	for i, e := range entries {
 		heights[i] = e.Height
 	}
-	log.Printf("[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=%v", len(entries), path, heights)
+	log.Printf("[CAMPAIGN-ASSUMEUTXO] loaded %d entries from %s heights=%v (confirming existing: %v)",
+		len(entries), path, heights, confirmedHeights)
 	return len(entries), nil
+}
+
+// commitmentDiff names the commitment fields (blockhash, hash_serialized,
+// m_chain_tx_count) on which a campaign entry differs from the existing row at
+// its height, or "" when the commitment is identical.
+func commitmentDiff(row, e *AssumeUTXOData) string {
+	var d []string
+	if row.BlockHash != e.BlockHash {
+		d = append(d, "blockhash")
+	}
+	if row.HashSerialized != e.HashSerialized {
+		d = append(d, "hash_serialized")
+	}
+	if row.ChainTxCount != e.ChainTxCount {
+		d = append(d, "m_chain_tx_count")
+	}
+	return strings.Join(d, "/")
+}
+
+// mergeCampaignConfirmation returns a COPY of row (whose commitment the caller
+// has already proven identical to e's) with e's supplemental ancestry filling
+// only the gaps: BaseTailHeaders and Chainwork. A value e supplies that
+// differs from one the row already pins is a contradiction and refuses. The
+// band itself was structurally verified by parseCampaignBaseTail (80-byte,
+// linked, last header hashes to the blockhash); its proof-of-work is checked
+// at graft time like any campaign band.
+func mergeCampaignConfirmation(row, e AssumeUTXOData) (AssumeUTXOData, error) {
+	if len(e.BaseTailHeaders) > 0 && len(row.BaseTailHeaders) > 0 {
+		if len(e.BaseTailHeaders) != len(row.BaseTailHeaders) {
+			return row, fmt.Errorf("its base_tail_headers contradict the existing row's band (length %d vs %d)",
+				len(e.BaseTailHeaders), len(row.BaseTailHeaders))
+		}
+		for i := range e.BaseTailHeaders {
+			if e.BaseTailHeaders[i] != row.BaseTailHeaders[i] {
+				return row, fmt.Errorf("its base_tail_headers contradict the existing row's band (element %d)", i)
+			}
+		}
+	}
+	if e.Chainwork != nil && row.Chainwork != nil && e.Chainwork.Cmp(row.Chainwork) != 0 {
+		return row, fmt.Errorf("its chainwork %s contradicts the existing row's chainwork %s",
+			e.Chainwork.Text(16), row.Chainwork.Text(16))
+	}
+	if len(row.BaseTailHeaders) == 0 && len(e.BaseTailHeaders) > 0 {
+		row.BaseTailHeaders = append([]wire.BlockHeader(nil), e.BaseTailHeaders...)
+	}
+	if row.Chainwork == nil && e.Chainwork != nil {
+		row.Chainwork = new(big.Int).Set(e.Chainwork)
+	}
+	return row, nil
 }
 
 // parseCampaignAssumeUTXOEntries validates and converts the raw JSON entries

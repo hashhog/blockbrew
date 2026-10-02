@@ -1042,8 +1042,33 @@ func RegtestAssumeUTXOParams() *AssumeUTXOParams {
 	regtestAssumeUTXOMu.Lock()
 	defer regtestAssumeUTXOMu.Unlock()
 	cp := make([]AssumeUTXOData, 0, len(RegtestCoreParityAssumeUTXOData)+len(regtestAssumeUTXOData))
-	cp = append(cp, RegtestCoreParityAssumeUTXOData...)
-	cp = append(cp, regtestAssumeUTXOData...)
+	// A registered row whose COMMITMENT (height, blockhash, hash_serialized,
+	// chain tx count) is identical to a Core-parity row stands in for it — a
+	// campaign confirmation that filled in base ancestry (see
+	// LoadCampaignAssumeUTXO). The commitment is the same either way, so this
+	// can never change which snapshot is accepted; any other registered row
+	// is simply appended, as before.
+	superseded := make(map[int]bool)
+	for _, core := range RegtestCoreParityAssumeUTXOData {
+		replaced := false
+		for j, r := range regtestAssumeUTXOData {
+			if r.Height == core.Height && r.BlockHash == core.BlockHash &&
+				r.HashSerialized == core.HashSerialized && r.ChainTxCount == core.ChainTxCount {
+				cp = append(cp, r)
+				superseded[j] = true
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			cp = append(cp, core)
+		}
+	}
+	for j, r := range regtestAssumeUTXOData {
+		if !superseded[j] {
+			cp = append(cp, r)
+		}
+	}
 	return &AssumeUTXOParams{Data: cp}
 }
 
