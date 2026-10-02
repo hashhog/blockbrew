@@ -44,7 +44,8 @@ type WalletConfig struct {
 // Wallet manages keys, addresses, and balances.
 type Wallet struct {
 	mu        sync.RWMutex
-	name      string // wallet name (empty for default wallet)
+	saveMu    sync.Mutex // orders whole SaveToFile calls; never held with mu across I/O
+	name      string     // wallet name (empty for default wallet)
 	config    WalletConfig
 	masterKey *HDKey
 	// mnemonic is the BIP-39 recovery phrase the master key was derived from.

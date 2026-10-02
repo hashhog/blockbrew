@@ -127,6 +127,29 @@ type txData struct {
 // committed) OR the new one — never a half-written file — and wallet.dat.bak
 // is a recoverable fallback if the active file is ever found corrupt.
 func (w *Wallet) SaveToFile(password string) error {
+	// saveMu orders whole saves (snapshot -> encrypt -> write) so a save that
+	// snapshotted older state can never land after a newer one, and two
+	// saves never share the staging file.
+	w.saveMu.Lock()
+	defer w.saveMu.Unlock()
+
+	// Hold the wallet lock ONLY while snapshotting the state. The scrypt
+	// envelope and the temp-write/fsync/rename/dir-fsync below used to run
+	// under it too, and every connected block's ScanBlock needs the write
+	// lock: on a slow disk the 5 s auto-flush kept the block-connect worker
+	// parked on the wallet lock, and SyncManager.Stop waits for that worker
+	// (testnet4 gate-5 repro 2026-10-02, goroutine dump: ScanBlock
+	// RWMutex.Lock vs atomicWriteWallet fsyncDir/Rename; shutdown overran
+	// its 30 s deadline).
+	plaintext, err := w.snapshotForSave()
+	if err != nil {
+		return err
+	}
+	return w.writeSnapshot(plaintext, password)
+}
+
+// snapshotForSave serialises the wallet state under the read lock.
+func (w *Wallet) snapshotForSave() ([]byte, error) {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
@@ -179,7 +202,7 @@ func (w *Wallet) SaveToFile(password string) error {
 			// Refuse to write a file that would silently drop the master key
 			// (the pre-fix locked-flush funds-loss path). Analog of Core
 			// refusing key writes while locked (scriptpubkeyman.cpp:1114-1117).
-			return errors.New("wallet save: encrypted wallet has no master-key ciphertext; refusing to write a wallet file that would drop key material")
+			return nil, errors.New("wallet save: encrypted wallet has no master-key ciphertext; refusing to write a wallet file that would drop key material")
 		}
 		data.Encrypted = true
 		data.EncryptedMaster = w.encryptedMaster
@@ -218,12 +241,13 @@ func (w *Wallet) SaveToFile(password string) error {
 	// dropped from disk by a flush that happens to run while locked.
 	data.Mnemonic = w.mnemonic
 
-	// Encode to JSON
-	plaintext, err := json.Marshal(data)
-	if err != nil {
-		return err
-	}
+	// Encode to JSON (still under the read lock: data aliases wallet maps).
+	return json.Marshal(data)
+}
 
+// writeSnapshot encrypts and durably writes a serialised snapshot. Runs
+// without the wallet lock.
+func (w *Wallet) writeSnapshot(plaintext []byte, password string) error {
 	// Encrypt
 	ciphertext, err := encrypt(plaintext, password)
 	if err != nil {
@@ -238,8 +262,12 @@ func (w *Wallet) SaveToFile(password string) error {
 		return err
 	}
 
-	return atomicWriteWallet(w.config.DataDir, ciphertext)
+	return writeWalletFile(w.config.DataDir, ciphertext)
 }
+
+// writeWalletFile is the durable write SaveToFile performs. A variable only so
+// tests can stand in a write that blocks the way an fsync on a busy disk does.
+var writeWalletFile = atomicWriteWallet
 
 // atomicWriteWallet performs the temp → fsync → rotate-bak → rename → dir-fsync
 // dance for the wallet file. Split out so it can be unit-tested independently of
