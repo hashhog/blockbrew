@@ -1430,6 +1430,13 @@ func (p *Peer) DisconnectAsync() {
 	p.signalDisconnect()
 }
 
+// waitStopped waits up to d for the peer's goroutines to exit and reports
+// whether they did. Used by PeerManager.Stop to join every peer together
+// after signalling them all; never call it from a peer's own goroutine.
+func (p *Peer) waitStopped(d time.Duration) bool {
+	return waitGroupWithin(&p.wg, d)
+}
+
 // SendMessage queues a message for sending.
 // SendMessage queues msg for delivery. Returns true if the message was
 // queued, false if it was DROPPED (send queue full, or peer quitting).

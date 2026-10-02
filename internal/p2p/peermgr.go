@@ -547,13 +547,64 @@ func (pm *PeerManager) Stop() {
 		}
 		pm.mu.RUnlock()
 
+		// Signal EVERY peer first, then join them together under one
+		// deadline. Disconnect() joins one peer at a time with a 5 s
+		// backstop each, so N peers whose read goroutine was still inside a
+		// slow handler (a block-store write queued behind an fsync) cost up
+		// to N x 5 s — the bulk of a 30 s shutdown budget on its own
+		// (testnet4 gate-5 repro 2026-10-02: "Disconnect() timed out after
+		// 5s" repeated, P2P stop 7-20 s).
 		for _, p := range peers {
-			p.Disconnect()
+			p.DisconnectAsync()
+		}
+		deadline := time.Now().Add(peerStopJoinTimeout)
+		var joins sync.WaitGroup
+		var stragglers int32
+		for _, p := range peers {
+			joins.Add(1)
+			go func(p *Peer) {
+				defer joins.Done()
+				if !p.waitStopped(time.Until(deadline)) {
+					atomic.AddInt32(&stragglers, 1)
+				}
+			}(p)
+		}
+		joins.Wait()
+		if n := atomic.LoadInt32(&stragglers); n > 0 {
+			log.Printf("P2P stop: %d peer(s) still unwinding after %s; continuing shutdown", n, peerStopJoinTimeout)
 		}
 
-		// Wait for all goroutines
-		pm.wg.Wait()
+		// Wait for the manager's own goroutines (accept loop, dialers,
+		// per-connection supervisors), bounded by the same deadline: an
+		// outbound dial or handshake in flight must not hold shutdown.
+		if !waitGroupWithin(&pm.wg, time.Until(deadline)) {
+			log.Printf("P2P stop: connection goroutines still running after %s; continuing shutdown", peerStopJoinTimeout)
+		}
 	})
+}
+
+// peerStopJoinTimeout bounds PeerManager.Stop's wait for all peer and
+// connection goroutines together.
+var peerStopJoinTimeout = 10 * time.Second
+
+// waitGroupWithin waits for wg up to d and reports whether it finished.
+func waitGroupWithin(wg *sync.WaitGroup, d time.Duration) bool {
+	if d <= 0 {
+		d = time.Millisecond
+	}
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
 }
 
 // ConnectedPeers returns a snapshot of all connected peers.

@@ -3301,6 +3301,17 @@ func (sm *SyncManager) decreaseStallTimeout(peer *Peer) {
 
 // HandleBlock processes a received block message.
 func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
+	// After Stop no block is stored: a peer goroutine that is still
+	// unwinding must not start a block-store write that shutdown would then
+	// have to wait for, or that would land after the DB is closed
+	// ("panic: pebble: closed" in StoreBlockAt, testnet4 gate-5 repro
+	// 2026-10-02).
+	select {
+	case <-sm.quit:
+		return
+	default:
+	}
+
 	hash := msg.Block.Header.BlockHash()
 
 	sm.mu.Lock()
@@ -3852,6 +3863,17 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 	sm.mu.Unlock()
 
 	for {
+		// Shutdown has begun: stop between blocks. Stop() waits for this
+		// worker, and during IBD the pending map can hold hundreds of blocks;
+		// draining them all is exactly what a SIGTERM must not wait for.
+		// Leaving them unconnected is the same state as not having received
+		// them yet — they are re-downloaded on the next start.
+		select {
+		case <-sm.quit:
+			return
+		default:
+		}
+
 		bwr, ok := pending[nextHeight]
 		if !ok {
 			break
