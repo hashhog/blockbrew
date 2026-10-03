@@ -7,13 +7,14 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
-	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
+	"github.com/cockroachdb/pebble/vfs"
 )
 
 // pebbleLockFilename is the name pebble uses for its directory lockfile.
@@ -104,20 +105,22 @@ type PebbleDB struct {
 	liveMu sync.RWMutex
 	closed bool
 
-	// closeFinished is true when pebble's Close returned. CloseForShutdown
-	// leaves it false when it abandons a Close that is still waiting on a
-	// compaction. Only touched inside closeOnce.
-	closeFinished bool
+	// fs is the filesystem Pebble runs on. Close flips it into abandon mode
+	// so in-flight compactions and flushes stop at their next sstable write
+	// instead of running to completion (see Close).
+	fs *closeAbandonFS
 
-	// compactSlots is the value MaxConcurrentCompactions reports. CloseForShutdown
-	// stores 0 so a close does not schedule another compaction while it syncs.
+	// compactSlots is what MaxConcurrentCompactions reports. Close stores 0
+	// when it abandons background work, so a compaction that fails on the
+	// abandoned filesystem is not replaced by a new one in the window before
+	// pebble's own Close marks the DB closed (pebble stops scheduling then).
 	compactSlots *atomic.Int32
 
-	// testClose, when set, replaces pebble.DB.Close inside CloseForShutdown.
-	// Tests block it the way pebble blocks while a compaction is in flight
-	// (pebble db.go waits on compact.cond until compactingCount and flushing
-	// are zero). Production leaves it nil.
-	testClose func() error
+	// closing is closed when Close begins.
+	closing chan struct{}
+
+	// closeStage, when set (tests only), is called as Close passes each step.
+	closeStage func(stage string)
 }
 
 // ErrDBClosed is returned by operations that reach the DB after Close.
@@ -151,6 +154,14 @@ type PebbleDBConfig struct {
 	// Sync controls whether writes are synchronous.
 	// Default is true for durability.
 	Sync bool
+
+	// fs, when set, is the filesystem underneath the close-abandon layer.
+	// Tests use it to make sstable I/O slow; nil means the OS filesystem.
+	fs vfs.FS
+
+	// l0CompactionThreshold overrides the production value when non-zero
+	// (tests only).
+	l0CompactionThreshold int
 }
 
 // DefaultPebbleDBConfig returns the default configuration optimized for Bitcoin workloads.
@@ -185,6 +196,16 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 	// Create block cache (shared across all SSTs)
 	cache := pebble.NewCache(cfg.BlockCacheSize)
 
+	inner := cfg.fs
+	if inner == nil {
+		inner = vfs.Default
+	}
+	afs := &closeAbandonFS{FS: inner}
+	l0Compaction := 4
+	if cfg.l0CompactionThreshold > 0 {
+		l0Compaction = cfg.l0CompactionThreshold
+	}
+
 	// Configure level options with compression and bloom filters
 	levelOpts := make([]pebble.LevelOptions, 7)
 	for i := range levelOpts {
@@ -198,6 +219,7 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 	slots := new(atomic.Int32)
 	slots.Store(4)
 	opts := &pebble.Options{
+		FS:                          afs,
 		Cache:                       cache,
 		MemTableSize:                uint64(cfg.MemTableSize),
 		MemTableStopWritesThreshold: 4, // Allow 4 memtables before stalling
@@ -207,8 +229,8 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 
 		// L0 compaction settings — relaxed for IBD write throughput.
 		// Default of 2 triggers compaction too eagerly during bulk writes.
-		L0CompactionThreshold: 4,  // Start compaction when L0 has 4 files
-		L0StopWritesThreshold: 12, // Stop writes when L0 has 12 files
+		L0CompactionThreshold: l0Compaction, // Start compaction when L0 has 4 files
+		L0StopWritesThreshold: 12,           // Stop writes when L0 has 12 files
 
 		// W84: parallel background compactions. Pebble's default is 1, which
 		// serializes all compaction work. With UTXO batches flushing every
@@ -217,9 +239,20 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		// saturation. Allowing 4 concurrent compactions lets L0→L1, L1→L2,
 		// etc. proceed in parallel — bounded so we don't starve the
 		// validator on a 16-core box.
-		// The closure reads slots so shutdown can drop the limit to 0 and
-		// stop new compactions without touching pebble's cloned Options.
+		// The closure reads slots so Close can drop the limit to 0 without
+		// touching pebble's cloned Options.
 		MaxConcurrentCompactions: func() int { return int(slots.Load()) },
+
+		EventListener: &pebble.EventListener{
+			// A compaction or flush that Close abandoned reports
+			// errCloseAbandoned; that is the intended outcome, not a fault.
+			BackgroundError: func(err error) {
+				if errors.Is(err, errCloseAbandoned) {
+					return
+				}
+				log.Printf("pebble: background error: %v", err)
+			},
+		},
 	}
 
 	db, err := pebble.Open(path, opts)
@@ -228,7 +261,7 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		return nil, fmt.Errorf("pebble open failed: %w", err)
 	}
 
-	return &PebbleDB{db: db, cache: cache, compactSlots: slots}, nil
+	return &PebbleDB{db: db, cache: cache, fs: afs, compactSlots: slots, closing: make(chan struct{})}, nil
 }
 
 // Get retrieves a value by key. Returns nil, nil if key does not exist.
@@ -399,117 +432,173 @@ func (s *pebbleSnapshot) Close() error {
 // DB.Flush fsyncs before returning). Used by the flushchainstate RPC so a
 // pre-stop flush shrinks what Close() must write, narrowing the window in which
 // a SIGKILL fallback could land mid-write (see GEN-BREW-pebble-corruption).
+//
+// It returns ErrDBClosed instead of waiting when Close begins meanwhile: Close
+// abandons a running flush (its memtable stays in the synced WAL), so the
+// flush's completion signal would never come.
 func (p *PebbleDB) Flush() error {
-	return p.db.Flush()
+	if err := p.enter(); err != nil {
+		return err
+	}
+	done, err := p.db.AsyncFlush()
+	p.liveMu.RUnlock()
+	if err != nil {
+		return err
+	}
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-p.closing:
+		return ErrDBClosed
+	}
 }
 
+// Close makes every write durable, abandons background compactions and
+// flushes, and closes the database.
+//
+// pebble.DB.Close waits for every running compaction and flush to finish, and
+// pebble v1.1 has no API to cancel one. On mainnet under I/O saturation that
+// wait was 30 s and then more than 51 s (2026-10-02), past the daemon's 80 s
+// shutdown deadline, so the stop ended in "exit (forced)" although everything
+// that mattered was already on disk.
+//
+// Abandoning that work is safe because none of it is needed for durability:
+//
+//  1. The WAL is fsynced first (a Sync LogData record). Every write the node
+//     ever acknowledged, NoSync ones included, is then in the synced WAL, and
+//     pebble replays the WAL on open.
+//  2. A compaction or flush only changes the database when its version edit
+//     is written to the MANIFEST, and that happens only after every output
+//     sstable has been completely written and synced. Abandon mode fails
+//     sstable writes (never WAL, MANIFEST or OPTIONS writes), so an abandoned
+//     job fails before its edit: pebble deletes its partial outputs and the
+//     MANIFEST still names the old inputs, which are untouched. A flush that
+//     fails leaves its memtable to be rebuilt from the WAL on the next open.
+//  3. If the process dies anywhere in here (SIGKILL), the on-disk state is one
+//     a crash could already produce: pebble's crash recovery handles it, and
+//     orphaned partial sstables are deleted on open.
 func (p *PebbleDB) Close() error {
 	p.closeOnce.Do(func() {
+		if p.closing != nil {
+			close(p.closing)
+		}
 		p.liveMu.Lock()
 		p.closed = true
 		p.liveMu.Unlock()
+		if p.closeStage != nil {
+			p.closeStage("begin")
+		}
+		walErr := p.db.LogData(nil, pebble.Sync)
+		if walErr != nil {
+			// The WAL could not be synced; let Close finish whatever the
+			// background jobs are doing rather than add a second failure.
+			log.Printf("storage: WAL sync before close failed: %v", walErr)
+		} else if p.fs != nil {
+			if p.compactSlots != nil {
+				p.compactSlots.Store(0)
+			}
+			p.fs.abandon.Store(true)
+		}
+		if p.closeStage != nil {
+			p.closeStage("abandoned")
+		}
 		p.closeErr = p.db.Close()
+		if p.closeErr == nil {
+			p.closeErr = walErr
+		}
 		if p.cache != nil {
 			p.cache.Unref()
-			p.cache = nil
 		}
-		p.closeFinished = true
 	})
 	return p.closeErr
 }
 
-// CloseForShutdown syncs the WAL and closes the DB, but it will not wait
-// longer than budget.
-//
-// pebble.DB.Close waits on compact.cond until every in-flight compaction and
-// flush has finished. On a saturated disk that wait was 30s (2026-10-02
-// 20:08Z) and still running at 51s (23:31Z), so the 80s shutdown deadline
-// fired and the process took "exit (forced)" even though the chainstate
-// batch, mempool, wallet and block store were already durable and the
-// restart replayed a handful of WAL keys. After the WAL sync a close that
-// does not finish is abandoned: the caller is about to exit, and exiting on
-// a synced WAL is the recovery a crash already uses. New compactions are
-// disarmed first so the wait cannot grow by one more job.
-//
-// The bool is false when the close was abandoned. err is the close or sync
-// error when the close finished; it is nil when the close was abandoned
-// before it returned.
-func (p *PebbleDB) CloseForShutdown(budget time.Duration) (error, bool) {
-	p.closeOnce.Do(func() { p.finishClose(budget) })
-	return p.closeErr, p.closeFinished
+// errCloseAbandoned is the write error abandon mode gives a background
+// compaction or flush.
+var errCloseAbandoned = errors.New("storage: background compaction abandoned at close")
+
+// closeAbandonFS passes everything through to the wrapped FS until abandon is
+// set. From then on, writes and syncs to sstables (and the creation of new
+// ones) fail with errCloseAbandoned, so a running compaction or flush errors
+// out at its next block instead of running to the end. WAL, MANIFEST, OPTIONS
+// and marker files are never affected.
+type closeAbandonFS struct {
+	vfs.FS
+	abandon atomic.Bool
+	// refused counts sstable operations refused in abandon mode (tests read
+	// it to prove a background job was actually cut short).
+	refused atomic.Int64
 }
 
-func (p *PebbleDB) finishClose(budget time.Duration) {
-	if p.compactSlots != nil {
-		p.compactSlots.Store(0)
-	}
-	p.liveMu.Lock()
-	p.closed = true
-	p.liveMu.Unlock()
+func isSSTable(name string) bool { return strings.HasSuffix(name, ".sst") }
 
-	// Do not start Close while a WAL sync is still in Apply: Close takes the
-	// commit-pipeline lock the sync holds, and would wait out the rest of
-	// the budget on that instead of on the compaction.
-	deadline := time.Now().Add(budget)
-	if !p.syncWAL(deadline) {
-		p.closeFinished = false
-		return
+func (fs *closeAbandonFS) Create(name string) (vfs.File, error) {
+	if !isSSTable(name) {
+		return fs.FS.Create(name)
 	}
-	fn := p.db.Close
-	if p.testClose != nil {
-		fn = p.testClose
+	if fs.abandon.Load() {
+		fs.refused.Add(1)
+		return nil, errCloseAbandoned
 	}
-	if !p.closeDB(deadline, fn) {
-		p.closeFinished = false
-		return
+	f, err := fs.FS.Create(name)
+	if err != nil {
+		return nil, err
 	}
-	p.closeFinished = true
+	return &abandonableFile{File: f, fs: fs}, nil
 }
 
-func (p *PebbleDB) syncWAL(deadline time.Time) bool {
-	remain := time.Until(deadline)
-	if remain <= 0 {
-		return false
-	}
-	done := make(chan error, 1)
-	go func() {
-		done <- p.db.LogData([]byte("blockbrew-shutdown"), pebble.Sync)
-	}()
-	timer := time.NewTimer(remain)
-	defer timer.Stop()
-	select {
-	case err := <-done:
-		if err != nil {
-			p.closeErr = err
-		}
-		return true
-	case <-timer.C:
-		return false
-	}
+// abandonableFile is an sstable being written.
+type abandonableFile struct {
+	vfs.File
+	fs *closeAbandonFS
 }
 
-func (p *PebbleDB) closeDB(deadline time.Time, closeFn func() error) bool {
-	remain := time.Until(deadline)
-	if remain <= 0 {
-		return false
+func (f *abandonableFile) check() error {
+	if f.fs.abandon.Load() {
+		f.fs.refused.Add(1)
+		return errCloseAbandoned
 	}
-	done := make(chan error, 1)
-	go func() { done <- closeFn() }()
-	timer := time.NewTimer(remain)
-	defer timer.Stop()
-	select {
-	case err := <-done:
-		if p.closeErr == nil {
-			p.closeErr = err
-		}
-		if p.cache != nil {
-			p.cache.Unref()
-			p.cache = nil
-		}
-		return true
-	case <-timer.C:
-		return false
+	return nil
+}
+
+func (f *abandonableFile) Write(b []byte) (int, error) {
+	if err := f.check(); err != nil {
+		return 0, err
 	}
+	return f.File.Write(b)
+}
+
+func (f *abandonableFile) WriteAt(b []byte, off int64) (int, error) {
+	if err := f.check(); err != nil {
+		return 0, err
+	}
+	return f.File.WriteAt(b, off)
+}
+
+func (f *abandonableFile) Sync() error {
+	if err := f.check(); err != nil {
+		return err
+	}
+	return f.File.Sync()
+}
+
+func (f *abandonableFile) SyncData() error {
+	if err := f.check(); err != nil {
+		return err
+	}
+	return f.File.SyncData()
+}
+
+func (f *abandonableFile) SyncTo(length int64) (bool, error) {
+	if err := f.check(); err != nil {
+		return false, err
+	}
+	return f.File.SyncTo(length)
 }
 
 // prefixUpperBound computes the upper bound for prefix iteration.

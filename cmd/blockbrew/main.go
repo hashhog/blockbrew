@@ -2484,15 +2484,18 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("Block store flushed")
 		}
 
-		// pebble.Close waits out in-flight compactions. That wait was 30s
-		// (2026-10-02 20:08Z; the whole stop finished at 76s of this 80s
-		// deadline) and still running at 51s (23:31Z), so the deadline
-		// fired and the process logged "exit (forced)" with the chainstate
-		// already flushed. Bound the wait by the time still left, and cap
-		// it, so a compaction cannot be what trips the watchdog. A close
-		// that does not finish is abandoned; the WAL sync inside
-		// CloseForShutdown plus the synced chainstate batch is the
-		// durability a crash restart already uses.
+		// db.Close syncs the WAL and then abandons running compactions and
+		// flushes instead of waiting for them (storage.PebbleDB.Close): the
+		// unbounded wait was 30 s (2026-10-02 20:08Z) and >51 s (23:31Z), the
+		// second tripping this 80 s deadline -> "exit (forced)".
+		//
+		// Second line of defence: the close still runs under the time left
+		// before shutdownDeadline (minus a margin, capped), so if something
+		// other than a compaction holds it (a writer parked in a Pebble write
+		// stall holds the commit pipeline that the WAL sync and Close both
+		// need) the sequence exits on the synced chainstate batches instead
+		// of tripping the watchdog. Exiting with the close unfinished is the
+		// state a crash leaves; Pebble's recovery replays the WAL.
 		log.Printf("closing DB")
 		const maxDBCloseWait = 20 * time.Second
 		const closeMargin = 5 * time.Second
@@ -2503,12 +2506,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		if budget < 0 {
 			budget = 0
 		}
-		if err, finished := db.CloseForShutdown(budget); !finished {
-			log.Printf("DB close did not finish within %s; exiting without it (WAL synced, chainstate batches are durable)", budget)
+		closeStart := time.Now()
+		if err, finished := closeWithin(db.Close, budget); !finished {
+			log.Printf("DB close did not finish within %s; exiting without it (chainstate batches are WAL-synced)", budget)
 		} else if err != nil {
 			log.Printf("Warning: database close failed: %v", err)
 		} else {
-			log.Printf("Database closed")
+			log.Printf("Database closed in %s", time.Since(closeStart).Round(time.Millisecond))
 		}
 
 		// Stop ZMQ publisher (drains pending sends, closes sockets).
