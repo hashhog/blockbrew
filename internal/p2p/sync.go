@@ -678,6 +678,11 @@ type SyncManager struct {
 	chainstateCorrupted   atomic.Bool
 	lastCorruptionWarning atomic.Int64 // unix nanos
 
+	// Snapshot pre-base header backfill (see consensus.HeaderIndex.
+	// AddBackfillHeaders). backfillReqAt is when the last backfill getheaders
+	// was sent; guarded by mu.
+	backfillReqAt time.Time
+
 	// pruner, when non-nil and configured with a target, is used by
 	// HandleGetData to reject pre-prune-horizon block requests with a
 	// `notfound` reply (BIP-159 peer-served-blocks gate).
@@ -948,10 +953,11 @@ func (sm *SyncManager) syncHandler() {
 	for {
 		select {
 		case <-ticker.C:
-			sm.mu.RLock()
+			sm.mu.Lock()
 			synced := sm.headersSynced
 			syncPeer := sm.syncPeer
-			sm.mu.RUnlock()
+			sm.maybeRequestBackfillLocked(nil, false)
+			sm.mu.Unlock()
 
 			if !synced && syncPeer == nil {
 				// Not yet synced — try to start header sync
@@ -1027,6 +1033,9 @@ func (sm *SyncManager) startHeaderSync() {
 
 	// Send getheaders request
 	sm.sendGetHeaders(syncPeer, locator)
+
+	// Snapshot boot: fetch the pre-base header chain alongside.
+	sm.maybeRequestBackfillLocked(syncPeer, false)
 }
 
 // needsHeadersSync returns true if our current chain tip has less work than
@@ -1123,6 +1132,14 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 		return
 	}
 
+	// Snapshot pre-base backfill reply: hash-linked to the genesis-rooted
+	// backfill cursor, so it cannot be confused with the forward sync (which
+	// is rooted at the grafted base) or a tip announcement.
+	if len(msg.Headers) > 0 && sm.headerIndex.BackfillExpects(msg.Headers[0]) {
+		sm.handleBackfillHeadersLocked(peer, msg.Headers)
+		return
+	}
+
 	// Ignore headers from non-sync peers during INITIAL sync only.  The
 	// comment always said "during initial sync" but the code applied the
 	// gate unconditionally, so at tip a new block announced by any peer
@@ -1211,6 +1228,85 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	// Normal path (chain already above nMinimumChainWork)
 	// -----------------------------------------------------------------------
 	sm.addValidatedHeaders(peer, msg.Headers)
+}
+
+// backfillRetryInterval bounds how long an unanswered backfill getheaders is
+// waited on before it is re-sent.
+const backfillRetryInterval = 30 * time.Second
+
+// maybeRequestBackfill sends the next pre-base header request when a grafted
+// snapshot band is still detached from genesis. Block connection is held
+// (ConnectBlock returns ErrSnapshotHeadersIncomplete) until the backfill
+// splices the band, which is how Core's "base must be in the headers chain"
+// precondition is met after the fact. force skips the retry timer (used right
+// after a batch was accepted). Caller must hold sm.mu.
+func (sm *SyncManager) maybeRequestBackfillLocked(peer *Peer, force bool) {
+	if sm.headerIndex == nil {
+		return
+	}
+	locator, stop, ok := sm.headerIndex.BackfillRequest()
+	if !ok {
+		return
+	}
+	if !force && !sm.backfillReqAt.IsZero() && time.Since(sm.backfillReqAt) < backfillRetryInterval {
+		return
+	}
+	if peer == nil {
+		peer = sm.syncPeer
+	}
+	if peer == nil && sm.peerMgr != nil {
+		if peers := sm.peerMgr.ConnectedPeers(); len(peers) > 0 {
+			peer = peers[0]
+		}
+	}
+	if peer == nil {
+		return
+	}
+	if sm.backfillReqAt.IsZero() {
+		log.Printf("sync: snapshot pre-base header backfill started with %s (block connection held until the band links to genesis)",
+			peer.Address())
+	}
+	sm.backfillReqAt = time.Now()
+	peer.SendMessage(&MsgGetHeaders{
+		ProtocolVersion: uint32(peer.ProtocolVersion()),
+		BlockLocators:   locator,
+		HashStop:        stop,
+	})
+}
+
+// handleBackfillHeadersLocked feeds a backfill reply to the header index,
+// persists what it accepted, and asks for the next batch. A batch that fails
+// the full header checks costs the peer the same score as any invalid header.
+// Caller must hold sm.mu.
+func (sm *SyncManager) handleBackfillHeadersLocked(peer *Peer, headers []wire.BlockHeader) {
+	added, done, err := sm.headerIndex.AddBackfillHeaders(headers)
+	if sm.chainDB != nil && len(added) > 0 {
+		entries := make([]storage.HeaderBatchEntry, 0, len(added))
+		for _, n := range added {
+			entries = append(entries, storage.HeaderBatchEntry{Hash: n.Hash, Header: &n.Header})
+		}
+		if ferr := sm.chainDB.StoreBlockHeadersBatch(entries); ferr != nil {
+			log.Printf("sync: failed to persist %d backfilled headers: %v", len(entries), ferr)
+		}
+	}
+	if err != nil {
+		log.Printf("sync: snapshot pre-base backfill batch from %s rejected: %v", peer.Address(), err)
+		peer.Misbehaving(ScoreHeadersDontConnect, fmt.Sprintf("bad pre-base backfill headers: %v", err))
+		sm.backfillReqAt = time.Time{}
+		return
+	}
+	if done {
+		log.Printf("sync: snapshot pre-base header backfill COMPLETE: band spliced onto genesis; block connection released")
+		sm.backfillReqAt = time.Time{}
+		return
+	}
+	if len(added) > 0 {
+		last := added[len(added)-1]
+		if last.Height%50000 < int32(len(added)) {
+			log.Printf("sync: snapshot pre-base header backfill at height %d", last.Height)
+		}
+	}
+	sm.maybeRequestBackfillLocked(peer, true)
 }
 
 // addPipelineHeaders adds PRESYNC/REDOWNLOAD-promoted headers to the header
@@ -3858,6 +3954,13 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 		return
 	}
 
+	// Snapshot boot with the pre-base header chain not yet backfilled: hold
+	// every pending block (ConnectBlock would refuse with
+	// ErrSnapshotHeadersIncomplete anyway). The retry ticker re-enters here.
+	if sm.headerIndex != nil && sm.headerIndex.SnapshotHeadersPending() {
+		return
+	}
+
 	sm.mu.Lock()
 	nextHeight := sm.nextHeight
 	sm.mu.Unlock()
@@ -3964,6 +4067,15 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 			}()
 			_connDurNs := time.Since(_connStart).Nanoseconds()
 
+			if connectErr != nil && consensus.IsMissingAncestorErr(connectErr) {
+				// Not a verdict on the block: an ancestor header it needs is
+				// not indexed yet. Keep it pending (no invalid mark, no
+				// corruption latch, no peer penalty) and retry on the next
+				// tick — fail closed, the way Core simply cannot reach this.
+				log.Printf("sync: block %d (%s) deferred: %v",
+					nextHeight, bwr.req.Hash.String()[:16], connectErr)
+				break
+			}
 			if connectErr != nil {
 				log.Printf("sync: failed to connect block %d (%s): %v",
 					nextHeight, bwr.req.Hash.String()[:16], connectErr)

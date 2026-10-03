@@ -2035,13 +2035,26 @@ func (mp *Mempool) checkSequenceLocksLocked(tx *wire.MsgTx) error {
 		prevHeights[i] = utxo.Height
 	}
 
+	// MTPAtHeight answers 0 when it cannot give Core's value (ancestor or its
+	// 11-header window not indexed — a snapshot-booted node before its
+	// pre-base headers are backfilled). 0 used to flow into the lock as a coin
+	// MTP of 0, satisfying every time lock (fail-open); refuse instead.
+	mtpUnknown := false
 	getMTP := func(h int32) int64 {
 		if h < 0 {
-			return 0
+			h = 0
 		}
-		return cs.MTPAtHeight(h)
+		v := cs.MTPAtHeight(h)
+		if v <= 0 {
+			mtpUnknown = true
+		}
+		return v
 	}
 	lock := consensus.CalculateSequenceLocks(tx, prevHeights, getMTP)
+	if mtpUnknown {
+		return fmt.Errorf("%w: BIP-68 coin median-time-past unavailable (ancestor header not indexed)",
+			ErrSequenceLockNotMet)
+	}
 	if !consensus.EvaluateSequenceLocks(lock, nextHeight, cs.TipMTP()) {
 		return ErrSequenceLockNotMet
 	}

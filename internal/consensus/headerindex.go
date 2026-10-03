@@ -29,7 +29,33 @@ var (
 	//   if (!min_pow_checked)
 	//       return state.Invalid(BLOCK_HEADER_LOW_WORK, "too-little-chainwork");
 	ErrTooLittleChainwork = errors.New("too-little-chainwork")
+
+	// ErrMissingAncestorHeader is returned when a consensus value needs an
+	// ancestor header that is not in the index (a snapshot-booted node whose
+	// pre-base header chain has not been backfilled yet). It is NOT a verdict on
+	// the block or header being checked: callers must not mark anything invalid
+	// or punish a peer for it. Core never meets this state — headers-first sync
+	// holds the full header chain before any block is connected — so the only
+	// correct answer is "cannot decide yet" (fail closed), never a value
+	// computed from a partial window, a 0, or the parent's bits.
+	ErrMissingAncestorHeader = errors.New("ancestor header needed for a consensus decision is not in the header index")
+
+	// ErrSnapshotHeadersIncomplete is returned by block connection while a
+	// grafted snapshot band is still detached from genesis (pre-base headers
+	// not yet backfilled). Same non-verdict semantics as ErrMissingAncestorHeader.
+	ErrSnapshotHeadersIncomplete = errors.New("snapshot pre-base header chain not yet complete; block connection held")
+
+	// ErrBackfillHeader is returned by AddBackfillHeaders for a pre-base header
+	// batch that does not extend the backfill cursor toward the band root.
+	ErrBackfillHeader = errors.New("pre-base backfill header rejected")
 )
+
+// IsMissingAncestorErr reports whether err is a "cannot decide yet" error
+// (missing ancestor header / incomplete snapshot header chain) rather than a
+// consensus verdict.
+func IsMissingAncestorErr(err error) bool {
+	return errors.Is(err, ErrMissingAncestorHeader) || errors.Is(err, ErrSnapshotHeadersIncomplete)
+}
 
 // headerNowUnix returns the current wall-clock time in seconds since epoch.
 // It is a package variable so tests can substitute a deterministic clock when
@@ -196,6 +222,36 @@ func (n *BlockNode) GetMedianTimePast() int64 {
 	return int64(timestamps[len(timestamps)/2])
 }
 
+// GetMedianTimePastChecked is GetMedianTimePast that refuses to answer from a
+// partial window. Core's CBlockIndex::GetMedianTimePast (chain.h) walks pprev
+// up to 11 times and only stops early at genesis; an index node whose Parent
+// is nil at Height > 0 (the detached root of a grafted snapshot band) means
+// the window is missing headers, and the median of what is present is a
+// DIFFERENT number (hotbuns/camlcoin rejected valid mainnet blocks 942168 and
+// 932256 on exactly that). Returns ErrMissingAncestorHeader in that case.
+func (n *BlockNode) GetMedianTimePastChecked() (int64, error) {
+	timestamps := make([]uint32, 0, MedianTimeSpan)
+	node := n
+	for i := 0; i < MedianTimeSpan; i++ {
+		if node == nil {
+			return 0, ErrMissingAncestorHeader
+		}
+		timestamps = append(timestamps, node.Header.Timestamp)
+		if node.Parent == nil {
+			if node.Height == 0 {
+				break // genesis: a short window is Core's answer too
+			}
+			if i < MedianTimeSpan-1 {
+				return 0, fmt.Errorf("%w: median-time-past window of height %d stops at detached height %d",
+					ErrMissingAncestorHeader, n.Height, node.Height)
+			}
+		}
+		node = node.Parent
+	}
+	sort.Slice(timestamps, func(i, j int) bool { return timestamps[i] < timestamps[j] })
+	return int64(timestamps[len(timestamps)/2]), nil
+}
+
 // CalcWork calculates the proof-of-work for a block given its bits.
 // work = 2^256 / (target + 1)
 // This gives more work to blocks with lower targets (harder blocks).
@@ -264,6 +320,14 @@ type HeaderIndex struct {
 	// "every ancestor must have a body" rule in recalculateBestTipLocked has
 	// to stop there too — see the comment at its use site.
 	snapshotBase *BlockNode
+
+	// bandRoot is the lowest node of a grafted snapshot band while it is still
+	// DETACHED (Parent == nil at Height > 0); nil once the pre-base header chain
+	// has been backfilled and spliced onto genesis, or when no band is grafted.
+	// backfillTip is the genesis-rooted cursor the backfill extends toward
+	// bandRoot. See AddBackfillHeaders.
+	bandRoot    *BlockNode
+	backfillTip *BlockNode
 }
 
 // Ensure HeaderIndex implements BlockProvider
@@ -434,9 +498,13 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader, minPowChecked bool) (
 	// to the inlined checks this replaces; ContextualCheckBlockHeader is the
 	// single source of truth the header differential drives with injected
 	// MTP / current-time / expected-bits.
+	parentMTP, err := parent.GetMedianTimePastChecked()
+	if err != nil {
+		return nil, err
+	}
 	if err := idx.ContextualCheckBlockHeader(
 		header, parent, height,
-		parent.GetMedianTimePast(), headerNowUnix(), nil, false,
+		parentMTP, headerNowUnix(), nil, false,
 	); err != nil {
 		return nil, err
 	}
@@ -555,6 +623,9 @@ func (idx *HeaderIndex) ContextualCheckBlockHeader(
 	if expectedBitsOverride != nil {
 		expectedBits = *expectedBitsOverride
 	} else {
+		if err := idx.checkWorkAncestorsPresent(header, parent, height); err != nil {
+			return err
+		}
 		expectedBits = GetNextWorkRequired(idx.params, height, int64(header.Timestamp), parent, idx)
 	}
 	if header.Bits != expectedBits {
@@ -594,6 +665,43 @@ func (idx *HeaderIndex) ContextualCheckBlockHeader(
 		}
 	}
 
+	return nil
+}
+
+// checkWorkAncestorsPresent fails closed when GetNextWorkRequired would need an
+// ancestor header the index does not hold. CalculateNextWorkRequired falls back
+// to the parent's bits when the period-first ancestor is missing, and the
+// testnet min-difficulty walk-back falls back to PowLimitBits when it runs off
+// a detached root — both are values Core never computes (pow.cpp always has
+// pindexLast->GetAncestor(nHeightFirst)). Returns ErrMissingAncestorHeader
+// instead of letting either default decide a header.
+func (idx *HeaderIndex) checkWorkAncestorsPresent(header wire.BlockHeader, parent *BlockNode, height int32) error {
+	if parent == nil || idx.params.PowNoRetargeting {
+		return nil
+	}
+	interval := int32(idx.params.DifficultyAdjInterval)
+	if height%interval == 0 {
+		first := height - interval
+		if first < 0 {
+			first = 0
+		}
+		if parent.GetAncestor(first) == nil {
+			return fmt.Errorf("%w: retarget at height %d needs the header at height %d",
+				ErrMissingAncestorHeader, height, first)
+		}
+		return nil
+	}
+	if idx.params.MinDiffReductionTime &&
+		int64(header.Timestamp) <= int64(parent.Header.Timestamp)+2*idx.params.TargetSpacing {
+		n := parent
+		for n != nil && n.Height%interval != 0 && n.Header.Bits == idx.params.PowLimitBits {
+			if n.Parent == nil {
+				return fmt.Errorf("%w: min-difficulty walk-back from height %d runs off detached height %d",
+					ErrMissingAncestorHeader, height, n.Height)
+			}
+			n = n.Parent
+		}
+	}
 	return nil
 }
 
@@ -1119,6 +1227,7 @@ func (idx *HeaderIndex) GraftSnapshotBase(headers []wire.BlockHeader, baseHeight
 		if idx.snapshotBase == nil {
 			idx.snapshotBase = existing
 		}
+		idx.refreshBandRootLocked()
 		return existing, nil
 	}
 
@@ -1149,6 +1258,22 @@ func (idx *HeaderIndex) GraftSnapshotBase(headers []wire.BlockHeader, baseHeight
 
 	var parent *BlockNode
 	var base *BlockNode
+	// A band whose first header's parent is already indexed (a restart that
+	// re-grafts a band persisted all the way down to genesis after a completed
+	// backfill) is linked, not detached — but only if the heights and the
+	// cumulative work agree; a chainwork claim that disagrees with the real
+	// genesis-rooted work is a bad fixture and must not be spliced.
+	if p, ok := idx.nodes[headers[0].PrevBlock]; ok {
+		if p.Height != firstHeight-1 {
+			return nil, fmt.Errorf("graft snapshot base: band starts at height %d but its parent is indexed at height %d",
+				firstHeight, p.Height)
+		}
+		if want := new(big.Int).Add(p.TotalWork, CalcWork(headers[0].Bits)); want.Cmp(totals[0]) != 0 {
+			return nil, fmt.Errorf("graft snapshot base: supplied chain work %s disagrees with the genesis-rooted work below the band",
+				baseWork.Text(16))
+		}
+		parent = p
+	}
 	for i := range headers {
 		hash := headers[i].BlockHash()
 		height := firstHeight + int32(i)
@@ -1189,11 +1314,211 @@ func (idx *HeaderIndex) GraftSnapshotBase(headers []wire.BlockHeader, baseHeight
 	}
 
 	idx.snapshotBase = base
+	idx.refreshBandRootLocked()
 	if base.TotalWork.Cmp(idx.bestTip.TotalWork) > 0 {
 		idx.bestTip = base
 		idx.cachedBestHeight.Store(base.Height)
 	}
 	return base, nil
+}
+
+// refreshBandRootLocked recomputes bandRoot from snapshotBase: the lowest
+// ancestor, if its Parent is nil above genesis. Caller holds idx.mu.
+func (idx *HeaderIndex) refreshBandRootLocked() {
+	idx.bandRoot = nil
+	if idx.snapshotBase == nil {
+		return
+	}
+	n := idx.snapshotBase
+	for n.Parent != nil {
+		n = n.Parent
+	}
+	if n.Height > 0 {
+		idx.bandRoot = n
+		if idx.backfillTip == nil {
+			idx.backfillTip = idx.genesis
+		}
+	}
+}
+
+// SnapshotHeadersPending reports whether a grafted snapshot band is still
+// detached from genesis: its pre-base headers have not been backfilled, so
+// consensus values that read ancestors below the band (BIP-68 coin MTP, deep
+// retarget walks) cannot be computed the way Core computes them. Block
+// connection must wait while this is true.
+func (idx *HeaderIndex) SnapshotHeadersPending() bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.bandRoot != nil
+}
+
+// BackfillRequest returns the getheaders locator (built from the genesis-rooted
+// backfill cursor) and the stop hash (the detached band root) for the next
+// pre-base header request. ok is false when nothing is pending.
+func (idx *HeaderIndex) BackfillRequest() (locator []wire.Hash256, stop wire.Hash256, ok bool) {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	if idx.bandRoot == nil || idx.backfillTip == nil {
+		return nil, wire.Hash256{}, false
+	}
+	return idx.backfillTip.BuildLocator(), idx.bandRoot.Hash, true
+}
+
+// BackfillExpects reports whether a headers batch starting with first is a
+// reply to a backfill request (it extends the backfill cursor).
+func (idx *HeaderIndex) BackfillExpects(first wire.BlockHeader) bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return idx.bandRoot != nil && idx.backfillTip != nil && first.PrevBlock == idx.backfillTip.Hash
+}
+
+// AddBackfillHeaders extends the genesis-rooted backfill cursor with headers
+// from a peer, toward the detached root of a grafted snapshot band, and splices
+// the band onto genesis when the root's own header arrives.
+//
+// This is what makes a snapshot boot Core-equivalent: Core's ActivateSnapshot
+// requires the base to already sit on a full header chain (validation.cpp
+// "The base block header ... must appear in the headers chain"), so every
+// ancestor-dependent consensus value — BIP-68's GetAncestor(nCoinHeight-1)->
+// GetMedianTimePast(), the retarget period start, the time-too-old MTP — is
+// computed over real headers. Here the band is grafted first (the range
+// ladder boots without synced headers) and the chain below it is fetched
+// afterwards; block connection is held until the splice (SnapshotHeadersPending).
+//
+// Every backfilled header gets the FULL header checks AddHeader applies
+// (proof of work, difficulty transition, time-too-old against a real MTP,
+// checkpoints). The splice requires: the root's hash is the next header (so
+// the genesis-rooted chain is hash-linked to the held band), the heights
+// agree, and the genesis-rooted cumulative work equals the band's claimed
+// work at the root (which was derived from the fixture's chainwork). The band
+// headers, whose contextual checks GraftSnapshotBase had to skip, are then
+// re-checked over their now-real ancestry, and skip pointers below/through the
+// band are rebuilt. Nothing here can change bestTip: every backfilled header
+// has less work than the band.
+//
+// Returns the nodes added (for persistence), whether the splice completed,
+// and an error for a batch that does not extend the cursor or fails a check.
+// Headers already present that extend the cursor are adopted (a re-sent batch).
+func (idx *HeaderIndex) AddBackfillHeaders(headers []wire.BlockHeader) ([]*BlockNode, bool, error) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	var added []*BlockNode
+	for i := range headers {
+		if idx.bandRoot == nil {
+			return added, true, nil
+		}
+		tip := idx.backfillTip
+		hdr := headers[i]
+		if hdr.PrevBlock != tip.Hash {
+			return added, false, fmt.Errorf("%w: header %d does not extend the backfill cursor at height %d",
+				ErrBackfillHeader, i, tip.Height)
+		}
+		hash := hdr.BlockHash()
+		height := tip.Height + 1
+
+		if hash == idx.bandRoot.Hash {
+			if err := idx.spliceBandLocked(tip); err != nil {
+				return added, false, err
+			}
+			return added, true, nil
+		}
+		if height >= idx.bandRoot.Height {
+			return added, false, fmt.Errorf("%w: genesis-rooted chain reached height %d without the band root %s",
+				ErrBackfillHeader, height, idx.bandRoot.Hash.String())
+		}
+		if existing, ok := idx.nodes[hash]; ok {
+			if existing.Parent != tip {
+				return added, false, fmt.Errorf("%w: header %s already indexed on another parent",
+					ErrBackfillHeader, hash.String())
+			}
+			idx.backfillTip = existing
+			continue
+		}
+		if err := CheckProofOfWork(hash, hdr.Bits, idx.params.PowLimit); err != nil {
+			return added, false, fmt.Errorf("%w: height %d: %v", ErrBackfillHeader, height, ErrInvalidPoW)
+		}
+		if err := idx.checkLinkedHeaderLocked(hdr, tip, height); err != nil {
+			return added, false, fmt.Errorf("%w: height %d: %v", ErrBackfillHeader, height, err)
+		}
+		node := &BlockNode{
+			Hash:      hash,
+			Header:    hdr,
+			Height:    height,
+			Parent:    tip,
+			TotalWork: new(big.Int).Add(tip.TotalWork, CalcWork(hdr.Bits)),
+			Status:    StatusHeaderValid,
+		}
+		node.buildSkip()
+		tip.Children = append(tip.Children, node)
+		idx.nodes[hash] = node
+		idx.backfillTip = node
+		added = append(added, node)
+	}
+	return added, idx.bandRoot == nil, nil
+}
+
+// checkLinkedHeaderLocked runs AddHeader's contextual + checkpoint gates for a
+// header at height over a parent whose ancestry is real. Caller holds idx.mu.
+func (idx *HeaderIndex) checkLinkedHeaderLocked(hdr wire.BlockHeader, parent *BlockNode, height int32) error {
+	mtp, err := parent.GetMedianTimePastChecked()
+	if err != nil {
+		return err
+	}
+	if err := idx.ContextualCheckBlockHeader(hdr, parent, height, mtp, headerNowUnix(), nil, false); err != nil {
+		return err
+	}
+	if err := VerifyCheckpoint(idx.checkpointData, height, hdr.BlockHash()); err != nil {
+		return err
+	}
+	return CheckForkConflictsWithCheckpoint(idx.checkpointData, parent, height)
+}
+
+// spliceBandLocked links the detached band root onto parent (the backfill
+// cursor whose child the root's header names). Caller holds idx.mu.
+func (idx *HeaderIndex) spliceBandLocked(parent *BlockNode) error {
+	root := idx.bandRoot
+	if parent.Height+1 != root.Height {
+		return fmt.Errorf("%w: band root %s is at height %d but its genesis-rooted parent is at height %d",
+			ErrBackfillHeader, root.Hash.String(), root.Height, parent.Height)
+	}
+	if want := new(big.Int).Add(parent.TotalWork, CalcWork(root.Header.Bits)); want.Cmp(root.TotalWork) != 0 {
+		return fmt.Errorf("%w: band root work %s disagrees with genesis-rooted work %s (snapshot chainwork claim is wrong)",
+			ErrBackfillHeader, root.TotalWork.Text(16), want.Text(16))
+	}
+
+	root.Parent = parent
+	parent.Children = append(parent.Children, root)
+
+	// Re-check the band (and anything already built on it) over the real
+	// ancestry. Skip pointers built while the band was detached are nil
+	// wherever they would have reached below the root, so GetAncestor falls
+	// back to Parent and already sees the real chain; they are rebuilt only
+	// after every check passes, so a failed splice leaves no pointer into the
+	// genesis-rooted chain behind.
+	order := make([]*BlockNode, 0, 4096)
+	queue := []*BlockNode{root}
+	for len(queue) > 0 {
+		n := queue[0]
+		queue = queue[1:]
+		order = append(order, n)
+		queue = append(queue, n.Children...)
+	}
+	for _, n := range order {
+		if err := idx.checkLinkedHeaderLocked(n.Header, n.Parent, n.Height); err != nil {
+			// Undo the link: a band that fails its own contextual checks
+			// over the real chain is a bad fixture, and stays detached.
+			root.Parent = nil
+			parent.Children = parent.Children[:len(parent.Children)-1]
+			return fmt.Errorf("%w: band header at height %d fails its contextual checks once linked: %v",
+				ErrBackfillHeader, n.Height, err)
+		}
+	}
+	for _, n := range order { // BFS order: every parent before its children
+		n.buildSkip()
+	}
+	idx.bandRoot = nil
+	return nil
 }
 
 // HydrateSnapshotBaseFromDB re-grafts a snapshot base band that a previous run

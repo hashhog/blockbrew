@@ -1388,15 +1388,25 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		}
 	}
 
-	// Collect MTP timestamps from previous 11 blocks
-	var mtp uint32
-	prevTimestamps := cm.collectPrevTimestamps(cm.tipNode, MedianTimeSpan)
-	if len(prevTimestamps) > 0 {
-		mtp = CalcMedianTimePast(prevTimestamps)
+	// Hold connection while a grafted snapshot band is still detached from
+	// genesis: Core never connects a block before it has the full header
+	// chain, and the ancestor-dependent values below (BIP-68 coin MTP in
+	// particular, which reaches ~2,000+ blocks under a fresh snapshot base)
+	// cannot be computed until it does. Not a verdict on the block.
+	if cm.headerIndex.SnapshotHeadersPending() {
+		return fmt.Errorf("block %s at height %d: %w", hash.String()[:16], node.Height, ErrSnapshotHeadersIncomplete)
 	}
 
+	// MTP of the previous 11 blocks (BIP-113 / time-too-old). Checked: a
+	// partial window is a different number from Core's, never a substitute.
+	mtp64, err := cm.tipNode.GetMedianTimePastChecked()
+	if err != nil {
+		return fmt.Errorf("block %s at height %d: %w", hash.String()[:16], node.Height, err)
+	}
+	mtp := uint32(mtp64)
+
 	prevHeader := cm.tipNode.Header
-	err := CheckBlockContext(block, &prevHeader, node.Height, cm.params, mtp)
+	err = CheckBlockContext(block, &prevHeader, node.Height, cm.params, mtp)
 	if err != nil {
 		return fmt.Errorf("block context check failed: %w", err)
 	}
@@ -1657,14 +1667,27 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// Create MTP lookup function using header index
 			// BIP68 time-based locks need MTP at the height of the block prior to
 			// where the UTXO was confirmed
+			//
+			// Fail CLOSED when the ancestor or its 11-header window is not in
+			// the index: the old `return 0` made every time lock trivially
+			// satisfied (fail-open), and GetMedianTimePast's partial window
+			// returned a later median than Core's (fail-wrong — the
+			// hotbuns 942168 / camlcoin 932256 false rejects). Core:
+			// consensus/tx_verify.cpp CalculateSequenceLocks,
+			// block.GetAncestor(std::max(nCoinHeight - 1, 0))->GetMedianTimePast().
+			var mtpErr error
 			getMTP := func(height int32) int64 {
-				ancestor := node.GetAncestor(height)
-				if ancestor == nil {
-					return 0
+				v, err := bip68CoinMTP(node, height)
+				if err != nil && mtpErr == nil {
+					mtpErr = err
 				}
-				return ancestor.GetMedianTimePast()
+				return v
 			}
 			seqLock := CalculateSequenceLocks(tx, prevHeights, getMTP)
+			if mtpErr != nil {
+				rollbackUTXOs()
+				return fmt.Errorf("tx %d: %w", i, mtpErr)
+			}
 			if !EvaluateSequenceLocks(seqLock, node.Height, int64(mtp)) {
 				rollbackUTXOs()
 				return fmt.Errorf("tx %d: %w", i, ErrSequenceLockNotMet)
@@ -2566,6 +2589,20 @@ func (cm *ChainManager) RecoverFromPersistedBlocks() (int, error) {
 }
 
 // collectPrevTimestamps collects timestamps from the previous N blocks.
+// bip68CoinMTP is the block-connect BIP-68 coin-MTP lookup: Core's
+// block.GetAncestor(height)->GetMedianTimePast() (consensus/tx_verify.cpp
+// CalculateSequenceLocks, height = max(nCoinHeight-1, 0)), failing closed with
+// ErrMissingAncestorHeader when the ancestor or any header of its 11-header
+// window is not indexed.
+func bip68CoinMTP(node *BlockNode, height int32) (int64, error) {
+	ancestor := node.GetAncestor(height)
+	if ancestor == nil {
+		return 0, fmt.Errorf("%w: BIP-68 coin MTP needs the header at height %d",
+			ErrMissingAncestorHeader, height)
+	}
+	return ancestor.GetMedianTimePastChecked()
+}
+
 func (cm *ChainManager) collectPrevTimestamps(node *BlockNode, count int) []uint32 {
 	timestamps := make([]uint32, 0, count)
 	current := node
@@ -3160,6 +3197,12 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 			return fmt.Errorf("block %s not found for reorg: %w", node.Hash.String()[:16], err)
 		}
 		if err := cm.ConnectBlock(block); err != nil {
+			if IsMissingAncestorErr(err) {
+				// Not a verdict: the block could not be decided yet. Never
+				// mark it invalid (that would blacklist a valid chain).
+				rollbackToOriginalTip()
+				return fmt.Errorf("connect block %s deferred during reorg: %w", node.Hash.String()[:16], err)
+			}
 			// Consensus failure in the competing chain. Mark the offending
 			// block invalid (and its descendants invalid-child) so it is
 			// excluded from future best-chain selection and the doomed reorg

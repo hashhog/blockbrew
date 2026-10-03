@@ -875,7 +875,13 @@ func (a *chainStateAdapter) MTPAtHeight(height int32) int64 {
 	if anc == nil {
 		return 0
 	}
-	return anc.GetMedianTimePast()
+	// 0 = unknown (the mempool fails closed on it): a partial window on a
+	// snapshot-booted node is not Core's MTP.
+	v, err := anc.GetMedianTimePastChecked()
+	if err != nil {
+		return 0
+	}
+	return v
 }
 
 func run(cfg *Config, chainParams *consensus.ChainParams) error {
