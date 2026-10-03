@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"math/big"
@@ -478,6 +479,14 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader, minPowChecked bool) (
 	parent, exists := idx.nodes[header.PrevBlock]
 	if !exists {
 		return nil, ErrOrphanHeader
+	}
+
+	// A header building on a block already known to be invalid can never be
+	// part of a valid chain. Core: AcceptBlockHeader rejects it "bad-prevblk"
+	// (BLOCK_INVALID_PREV) and does not index it, so a peer extending an
+	// invalid block cannot make us download (or re-download) that chain.
+	if parent.Status.IsInvalid() {
+		return nil, ErrInvalidParentHeader
 	}
 
 	// Calculate new height
@@ -1125,6 +1134,53 @@ func (idx *HeaderIndex) recalculateBestTipLocked() {
 		idx.bestTip = bestCandidate
 		// Update atomic cache so RPC reads don't need to take RLock
 		idx.cachedBestHeight.Store(bestCandidate.Height)
+	}
+}
+
+// RecalculateBestHeader re-derives the best HEADER tip: the most-work header
+// that is not marked failed (StatusInvalid / StatusInvalidChild). Unlike
+// RecalculateBestTip it does NOT require block data — it answers "which chain
+// should we be downloading", and the blocks of a heavier competing chain are
+// exactly the ones we do not have yet. Called after a block is marked failed so
+// download stops chasing the invalid chain and fetches the best valid one.
+// Bitcoin Core: ChainstateManager::RecalculateBestHeader (validation.cpp),
+// called from InvalidChainFound.
+//
+// Ties keep the current best header when it is still valid (AddHeader is
+// first-seen-wins on equal work), then lower SequenceID, then lower hash —
+// deterministic regardless of map iteration order.
+func (idx *HeaderIndex) RecalculateBestHeader() {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+
+	var best *BlockNode
+	if idx.bestTip != nil && !idx.bestTip.Status.IsInvalid() {
+		best = idx.bestTip
+	}
+	for _, node := range idx.nodes {
+		if node.Status.IsInvalid() {
+			continue
+		}
+		if best == nil {
+			best = node
+			continue
+		}
+		switch node.TotalWork.Cmp(best.TotalWork) {
+		case 1:
+			best = node
+		case 0:
+			if best == idx.bestTip {
+				continue
+			}
+			if node.SequenceID < best.SequenceID ||
+				(node.SequenceID == best.SequenceID && bytes.Compare(node.Hash[:], best.Hash[:]) < 0) {
+				best = node
+			}
+		}
+	}
+	if best != nil {
+		idx.bestTip = best
+		idx.cachedBestHeight.Store(best.Height)
 	}
 }
 

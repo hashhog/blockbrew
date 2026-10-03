@@ -316,7 +316,7 @@ func CollectScriptChecks(block *wire.MsgBlock, utxoView UTXOView, flags script.S
 		for i, in := range tx.TxIn {
 			utxo := utxoView.GetUTXO(in.PreviousOutPoint)
 			if utxo == nil {
-				return nil, fmt.Errorf("missing UTXO for tx %d input %d: %s:%d",
+				return nil, fmt.Errorf("%w for tx %d input %d: %s:%d", ErrScriptPrevoutMissing,
 					txIdx, i, in.PreviousOutPoint.Hash.String(), in.PreviousOutPoint.Index)
 			}
 			prevOuts[i] = &wire.TxOut{
@@ -327,7 +327,7 @@ func CollectScriptChecks(block *wire.MsgBlock, utxoView UTXOView, flags script.S
 		for inputIdx, in := range tx.TxIn {
 			utxo := utxoView.GetUTXO(in.PreviousOutPoint)
 			if utxo == nil {
-				return nil, fmt.Errorf("missing UTXO for tx %d input %d", txIdx, inputIdx)
+				return nil, fmt.Errorf("%w for tx %d input %d", ErrScriptPrevoutMissing, txIdx, inputIdx)
 			}
 			jobs = append(jobs, ScriptCheckJob{
 				Tx:       tx,

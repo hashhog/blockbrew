@@ -574,6 +574,11 @@ func applyNearbyStallReset(queue []*blockRequest, nh int32, inflight map[wire.Ha
 type blockWithRequest struct {
 	block *wire.MsgBlock
 	req   *blockRequest
+	// from is the peer that delivered this body over the wire (nil for a body
+	// re-read from local disk). It is the peer punished if the block turns out
+	// to be consensus-invalid — Core's mapBlockSource. req.Peer is not enough:
+	// it is cleared on requeue and is never set for an unsolicited block.
+	from *Peer
 }
 
 // SyncManager coordinates header and block synchronization with peers.
@@ -3492,6 +3497,14 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 					// to reject it every retry ("prev != tip") for the lifetime
 					// of the stuck slot. See W49 cascade-loop investigation.
 					if existing := sm.headerIndex.GetNode(hash); existing != nil {
+						if existing.Status.IsInvalid() {
+							// Core BLOCK_CACHED_INVALID: a block we already
+							// judged invalid is not processed again. Not a
+							// punishment by itself (Core spares inbound peers).
+							log.Printf("sync: ignoring unsolicited block %s from %s: already known invalid",
+								hash.String()[:16], peer.Address())
+							return
+						}
 						nh = existing.Height
 						resolvedHeight = true
 						peer.UpdateSyncedHeaders(existing.Height)
@@ -3551,6 +3564,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 			case sm.validationChan <- &blockWithRequest{
 				block: msg.Block,
 				req:   &blockRequest{Hash: hash, Height: nh, State: BlockDownloadReceived},
+				from:  peer,
 			}:
 			default:
 				log.Printf("sync: validation channel full, dropping unsolicited block")
@@ -3626,7 +3640,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 	// will re-download it (from DB via fast path). This prevents unbounded
 	// goroutine/memory growth from the old goroutine-fallback approach.
 	select {
-	case sm.validationChan <- &blockWithRequest{block: msg.Block, req: req}:
+	case sm.validationChan <- &blockWithRequest{block: msg.Block, req: req, from: peer}:
 		// Sent immediately
 	default:
 		// Pipeline backed up — block is already stored to DB.
@@ -3698,19 +3712,17 @@ func (sm *SyncManager) validationWorker() {
 						errors.Is(err, consensus.ErrBadWitnessNonceSize) ||
 						errors.Is(err, consensus.ErrUnexpectedWitnessInBlock)
 					if !transientMutation {
-						// Mark as invalid in header index
-						node := sm.headerIndex.GetNode(bwr.req.Hash)
-						if node != nil {
-							sm.mu.Lock()
-							node.Status |= consensus.StatusInvalid
-							sm.mu.Unlock()
-						}
+						// Mark failed (+ descendants, persisted, best header
+						// recomputed) — the same verdict path as a ConnectBlock
+						// consensus failure. The connect loop then drops it
+						// via its known-invalid gate instead of connecting it.
+						sm.markBlockFailed(bwr.req.Hash)
 					}
 					// Penalize the peer that sent the invalid block (the peer
 					// is bad regardless: they shipped either an invalid block
 					// or a mutated one).
-					if bwr.req.Peer != nil {
-						bwr.req.Peer.Misbehaving(100, fmt.Sprintf("invalid block: %v", err))
+					if p := bwr.deliverer(); p != nil {
+						p.Misbehaving(100, fmt.Sprintf("invalid block: %v", err))
 					}
 					// On transient mutation, requeue for re-download from a
 					// different peer instead of routing to the connection
@@ -4032,6 +4044,21 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 			break
 		}
 
+		// Known-invalid gate. A block already marked failed (by the
+		// validation worker's context-free check, an earlier connect, a reorg
+		// that failed on it, or invalidateblock) is never connected: drop it
+		// and re-plan from the best valid header. Without this the IBD path,
+		// whose ConnectBlock skips the sanity checks the worker already ran,
+		// would connect a block the worker had just rejected.
+		if sm.headerIndex != nil {
+			if n := sm.headerIndex.GetNode(bwr.req.Hash); n != nil && n.Status.IsInvalid() {
+				log.Printf("sync: dropping block %d (%s): already marked invalid",
+					nextHeight, bwr.req.Hash.String()[:16])
+				nextHeight = sm.purgeInvalidAndReplan(pending)
+				continue
+			}
+		}
+
 		// Connect the block
 		if sm.chainMgr != nil {
 			// MARKER FIRST (2026-09-02). Ask the durable coins marker whether
@@ -4102,7 +4129,20 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				// ProcessSubmittedBlock dispatches parent==tip straight to
 				// ConnectBlock — so steady-state behaviour/performance is
 				// unchanged (invariant 1).
-				if sm.chainMgr.IsIBD() {
+				//
+				// Exception (2026-10-03): during IBD a body whose parent is NOT
+				// the active tip — a competing sibling/fork below or at the tip
+				// — also takes the side-branch-aware path. Raw ConnectBlock can
+				// only answer "does not connect to tip during IBD" for it, and
+				// the cascade handler then evicted and re-fetched the same body
+				// every 100 ms forever, wedging the cursor so even the valid
+				// block extending the tip never connected (instrument
+				// p2p-invalid-block-feed.py, scenario after/bip68, OBSERVED on
+				// 985c117). Core's ActivateBestChain does not distinguish IBD
+				// here. In-order IBD extensions — and a block above a gap on
+				// the tip's own chain, which the cascade handler below re-fills
+				// — keep raw ConnectBlock (invariant 1).
+				if sm.chainMgr.IsIBD() && !sm.isForkOffActiveTip(bwr.req.Hash) {
 					connectErr = sm.chainMgr.ConnectBlock(bwr.block)
 				} else {
 					connectErr = sm.chainMgr.ProcessSubmittedBlock(bwr.block)
@@ -4125,6 +4165,25 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				log.Printf("sync: block %d (%s) deferred: %v",
 					nextHeight, bwr.req.Hash.String()[:16], connectErr)
 				break
+			}
+			if bie, ok := consensus.AsBlockInvalid(connectErr); ok {
+				// A consensus VERDICT (BlockInvalidError — never a missing
+				// ancestor, a mutated body, a prevout missing from the local
+				// UTXO set, or an I/O error; see consensus.blockVerdict). Do
+				// what Core does (Chainstate::InvalidBlockFound + BlockChecked
+				// -> MaybePunishNodeForBlock): mark the failing block
+				// BLOCK_FAILED_VALID and its descendants FAILED_CHILD
+				// (persisted), punish the peer that delivered it, drop it and
+				// its descendants from the download queue, and continue on the
+				// most-work VALID header chain — fetching the competitor.
+				//
+				// This used to fall through to the [CHAINSTATE-CORRUPTION]
+				// latch below, which halted ALL block connection until a
+				// restart: one invalid block from one peer froze the node,
+				// and on restart the same peer could do it again.
+				sm.handleConsensusInvalid(bwr, bie)
+				nextHeight = sm.purgeInvalidAndReplan(pending)
+				continue
 			}
 			if connectErr != nil {
 				log.Printf("sync: failed to connect block %d (%s): %v",
@@ -4450,6 +4509,159 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 		sm.nextHeight = nextHeight
 		sm.mu.Unlock()
 	}
+}
+
+// isForkOffActiveTip reports whether hash is a block that does NOT descend
+// from the active tip (a sibling or a branch forking below it). Unknown nodes
+// report false (treated as the in-order case, the pre-existing behaviour).
+func (sm *SyncManager) isForkOffActiveTip(hash wire.Hash256) bool {
+	if sm.headerIndex == nil || sm.chainMgr == nil {
+		return false
+	}
+	node := sm.headerIndex.GetNode(hash)
+	tipHash, _ := sm.chainMgr.BestBlock()
+	tip := sm.headerIndex.GetNode(tipHash)
+	if node == nil || tip == nil {
+		return false
+	}
+	if node.Height <= tip.Height {
+		return tip.GetAncestor(node.Height) != node // a sibling/fork, not an already-connected block
+	}
+	return node.GetAncestor(tip.Height) != tip
+}
+
+// deliverer is the peer to hold responsible for this block body: the peer it
+// arrived from, else the peer it was requested from. Nil for a body re-read
+// from disk with no recorded source.
+func (bwr *blockWithRequest) deliverer() *Peer {
+	if bwr == nil {
+		return nil
+	}
+	if bwr.from != nil {
+		return bwr.from
+	}
+	if bwr.req != nil {
+		return bwr.req.Peer
+	}
+	return nil
+}
+
+// blockFailureMarker is implemented by *consensus.ChainManager. Optional on
+// ChainConnector so test doubles need not implement it.
+type blockFailureMarker interface {
+	MarkBlockFailed(hash wire.Hash256) bool
+}
+
+// markBlockFailed records a consensus verdict on hash: through the chain
+// manager when it implements blockFailureMarker (failed + descendants,
+// persisted, best header recomputed; it refuses blocks on the active chain),
+// else directly on the header index without persistence.
+func (sm *SyncManager) markBlockFailed(hash wire.Hash256) {
+	if sm.chainMgr != nil {
+		if m, ok := sm.chainMgr.(blockFailureMarker); ok {
+			m.MarkBlockFailed(hash)
+			return
+		}
+	}
+	if sm.headerIndex == nil {
+		return
+	}
+	node := sm.headerIndex.GetNode(hash)
+	if node == nil {
+		return
+	}
+	sm.mu.Lock()
+	node.Status |= consensus.StatusInvalid
+	queue := append([]*consensus.BlockNode(nil), node.Children...)
+	for len(queue) > 0 {
+		cur := queue[0]
+		queue = queue[1:]
+		if cur.Status&consensus.StatusInvalid == 0 {
+			cur.Status |= consensus.StatusInvalidChild
+		}
+		queue = append(queue, cur.Children...)
+	}
+	sm.mu.Unlock()
+	sm.headerIndex.RecalculateBestHeader()
+}
+
+// handleConsensusInvalid applies a ConnectBlock/ReorgTo consensus verdict:
+// mark the failing block (bie.Hash — for a failed reorg that is the culprit in
+// the competing branch, not necessarily the block in hand, which is then
+// already its invalid descendant) and punish the peer that delivered the block
+// in hand. Core: Chainstate::InvalidBlockFound (validation.cpp) +
+// MaybePunishNodeForBlock (net_processing.cpp; a local peer is disconnected,
+// not discouraged — PeerManager.handlePeerBan does that split).
+func (sm *SyncManager) handleConsensusInvalid(bwr *blockWithRequest, bie *consensus.BlockInvalidError) {
+	log.Printf("sync: block %d (%s) is INVALID: %v — marking %s failed (descendants invalid-child), "+
+		"continuing on the most-work valid chain",
+		bwr.req.Height, bwr.req.Hash.String()[:16], bie, bie.Hash.String()[:16])
+	sm.markBlockFailed(bie.Hash)
+	if p := bwr.deliverer(); p != nil {
+		p.Misbehaving(100, fmt.Sprintf("invalid block %s: %v", bwr.req.Hash.String()[:16], bie))
+	}
+}
+
+// purgeInvalidAndReplan removes every block now marked failed from the
+// pending-connect map, the download queue and the in-flight set, re-anchors
+// the connect cursor on the validated tip, and — if nothing is left queued —
+// rebuilds the queue from the best valid header so the competing chain is
+// fetched (Core: the failed block leaves setBlockIndexCandidates and
+// FindNextBlocksToDownload walks from the recalculated best header). Returns
+// the new connect cursor. Caller must NOT hold sm.mu.
+func (sm *SyncManager) purgeInvalidAndReplan(pending map[int32]*blockWithRequest) int32 {
+	isInvalid := func(hash wire.Hash256) bool {
+		if sm.headerIndex == nil {
+			return false
+		}
+		n := sm.headerIndex.GetNode(hash)
+		return n != nil && n.Status.IsInvalid()
+	}
+
+	for h, p := range pending {
+		if p == nil || p.req == nil || isInvalid(p.req.Hash) {
+			delete(pending, h)
+		}
+	}
+
+	var tipH int32
+	if sm.chainMgr != nil {
+		_, tipH = sm.chainMgr.BestBlock()
+	}
+
+	sm.mu.Lock()
+	kept := make([]*blockRequest, 0, len(sm.blockQueue))
+	dropped := 0
+	for _, req := range sm.blockQueue {
+		if isInvalid(req.Hash) {
+			delete(sm.inflight, req.Hash)
+			dropped++
+			continue
+		}
+		kept = append(kept, req)
+	}
+	sm.blockQueue = kept
+	for hash := range sm.inflight {
+		if isInvalid(hash) {
+			delete(sm.inflight, hash)
+		}
+	}
+	sm.nextHeight = tipH + 1
+	queueEmpty := len(sm.blockQueue) == 0
+	sm.mu.Unlock()
+
+	log.Printf("sync: dropped %d invalid block request(s); connect cursor re-anchored at height %d",
+		dropped, tipH+1)
+	if queueEmpty {
+		// Rebuild from the best VALID header (RecalculateBestHeader ran in
+		// the mark). With no valid header past the tip this is a no-op; the
+		// next valid header announcement starts the download as usual.
+		sm.StartBlockDownload()
+	}
+	sm.mu.RLock()
+	nh := sm.nextHeight
+	sm.mu.RUnlock()
+	return nh
 }
 
 // findInQueue looks up a block request in the queue by hash.

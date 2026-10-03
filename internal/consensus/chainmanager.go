@@ -1384,7 +1384,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	if !cm.isIBD {
 		err := CheckBlockSanity(block, cm.params.PowLimit)
 		if err != nil {
-			return fmt.Errorf("block sanity check failed: %w", err)
+			return blockVerdict(hash, fmt.Errorf("block sanity check failed: %w", err))
 		}
 	}
 
@@ -1408,7 +1408,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	prevHeader := cm.tipNode.Header
 	err = CheckBlockContext(block, &prevHeader, node.Height, cm.params, mtp)
 	if err != nil {
-		return fmt.Errorf("block context check failed: %w", err)
+		return blockVerdict(hash, fmt.Errorf("block context check failed: %w", err))
 	}
 
 	// Get script flags for this block (hash checked against exception map)
@@ -1492,7 +1492,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	if err := CheckBIP30(block, node.Height, hash, cm.params, cm.utxoSet,
 		func(h int32) (wire.Hash256, bool) { return node.GetAncestorHashAtHeight(h) },
 	); err != nil {
-		return err
+		return blockVerdict(hash, err)
 	}
 
 	// Cache prevouts for script validation BEFORE spending them.
@@ -1582,7 +1582,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// Check transaction sanity
 		if err := CheckTransactionSanity(tx); err != nil {
 			rollbackUTXOs()
-			return fmt.Errorf("tx %d sanity failed: %w", i, err)
+			return blockVerdict(hash, fmt.Errorf("tx %d sanity failed: %w", i, err))
 		}
 
 		txHash := tx.TxHash()
@@ -1636,12 +1636,12 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		fee, err := CheckTransactionInputs(tx, node.Height, cachedView)
 		if err != nil {
 			rollbackUTXOs()
-			return fmt.Errorf("tx %d input validation failed: %w", i, err)
+			return blockVerdict(hash, fmt.Errorf("tx %d input validation failed: %w", i, err))
 		}
 		totalFees += fee
 		if totalFees > MaxMoney {
 			rollbackUTXOs()
-			return fmt.Errorf("accumulated fee in the block out of range: %d > %d", totalFees, MaxMoney)
+			return blockVerdict(hash, fmt.Errorf("accumulated fee in the block out of range: %d > %d", totalFees, MaxMoney))
 		}
 
 		// BIP68: Enforce sequence locks after CSV activation
@@ -1690,7 +1690,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			}
 			if !EvaluateSequenceLocks(seqLock, node.Height, int64(mtp)) {
 				rollbackUTXOs()
-				return fmt.Errorf("tx %d: %w", i, ErrSequenceLockNotMet)
+				return blockVerdict(hash, fmt.Errorf("tx %d: %w", i, ErrSequenceLockNotMet))
 			}
 		}
 
@@ -1725,7 +1725,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		}
 		if nSigOpsCost > MaxBlockSigOpsCost {
 			rollbackUTXOs()
-			return fmt.Errorf("%w: %d > %d", ErrSigOpsCostTooHigh, nSigOpsCost, MaxBlockSigOpsCost)
+			return blockVerdict(hash, fmt.Errorf("%w: %d > %d", ErrSigOpsCostTooHigh, nSigOpsCost, MaxBlockSigOpsCost))
 		}
 
 		// Always record spent UTXOs for in-memory rollback. Without this,
@@ -1839,16 +1839,16 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			jobs, err := CollectScriptChecks(block, scriptUTXOView, flags, cm.sigCache)
 			if err != nil {
 				rollbackUTXOs()
-				return fmt.Errorf("script validation failed: %w", err)
+				return blockVerdict(hash, fmt.Errorf("script validation failed: %w", err))
 			}
 			if res := cm.scriptCheckQueue.Run(jobs); !res.OK {
 				rollbackUTXOs()
-				return fmt.Errorf("script validation failed: %w", res.FirstFailErr)
+				return blockVerdict(hash, fmt.Errorf("script validation failed: %w", res.FirstFailErr))
 			}
 		} else if cm.parallelScripts {
 			if err := ParallelScriptValidationCached(block, scriptUTXOView, flags, cm.sigCache); err != nil {
 				rollbackUTXOs()
-				return fmt.Errorf("script validation failed: %w", err)
+				return blockVerdict(hash, fmt.Errorf("script validation failed: %w", err))
 			}
 		} else {
 			for i, tx := range block.Transactions {
@@ -1857,7 +1857,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				}
 				if err := ValidateTransactionScripts(tx, scriptUTXOView, flags); err != nil {
 					rollbackUTXOs()
-					return fmt.Errorf("tx %d script validation failed: %w", i, err)
+					return blockVerdict(hash, fmt.Errorf("tx %d script validation failed: %w", i, err))
 				}
 			}
 		}
@@ -1871,8 +1871,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	}
 	if coinbaseValue > subsidy+totalFees {
 		rollbackUTXOs()
-		return fmt.Errorf("%w: %d > %d (subsidy %d + fees %d)",
-			ErrBadCoinbaseValue, coinbaseValue, subsidy+totalFees, subsidy, totalFees)
+		return blockVerdict(hash, fmt.Errorf("%w: %d > %d (subsidy %d + fees %d)",
+			ErrBadCoinbaseValue, coinbaseValue, subsidy+totalFees, subsidy, totalFees))
 	}
 
 	// Update chain state
@@ -3211,10 +3211,29 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 			// (validation.cpp:3040-3043, 3237-3243). B-prefix blocks that DID
 			// connect (B1, B2) stay valid, exactly as in Core. The block can
 			// be un-blacklisted later via reconsiderblock.
-			cm.mu.Lock()
-			node.Status |= StatusInvalid
-			cm.markDescendantsInvalid(node)
-			cm.mu.Unlock()
+			//
+			// Only a VERDICT marks: a typed consensus failure, or a prevout
+			// missing from the view. The latter is a verdict HERE (unlike on
+			// the active-tip connect path, see isLocalUTXOGap) because the
+			// competing branch is replayed on a view this reorg just unwound
+			// to the fork point: a prevout absent there is the branch spending
+			// a coin that does not exist on it (Core:
+			// bad-txns-inputs-missingorspent). Mutation / I/O / panic-class
+			// errors roll back WITHOUT a mark (Core never marks a block failed
+			// for a local error) and are returned unwrapped, so the caller
+			// does not punish a peer for them either.
+			if !IsBlockMutationErr(err) {
+				if _, verdict := AsBlockInvalid(err); verdict || isLocalUTXOGap(err) {
+					cm.mu.Lock()
+					cm.markBlockFailedLocked(node)
+					cm.mu.Unlock()
+					rollbackToOriginalTip()
+					return &BlockInvalidError{
+						Hash: node.Hash,
+						Err:  fmt.Errorf("connect block %s failed during reorg: %w", node.Hash.String()[:16], err),
+					}
+				}
+			}
 			rollbackToOriginalTip()
 			return fmt.Errorf("connect block %s failed during reorg: %w", node.Hash.String()[:16], err)
 		}
@@ -3571,6 +3590,43 @@ func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
 
 	log.Printf("chainmgr: invalidated block %s at height %d", hash.String()[:16], node.Height)
 	return nil
+}
+
+// MarkBlockFailed records a consensus verdict on a block that failed to
+// connect: BLOCK_FAILED_VALID on the block, BLOCK_FAILED_CHILD on every
+// descendant, both persisted (they survive a restart exactly like an
+// invalidateblock), and the best header recomputed so download/connect move
+// to the most-work chain that does not contain it. Bitcoin Core:
+// Chainstate::InvalidBlockFound -> InvalidChainFound -> SetBlockFailureFlags
+// + RecalculateBestHeader (validation.cpp).
+//
+// It refuses (returns false) for an unknown block, genesis, or a block on the
+// active chain — a connected block cannot have just failed to connect, so such
+// a call is a caller bug and marking would desynchronise the tip from its
+// flags. Idempotent: a block already marked is re-persisted, nothing more.
+func (cm *ChainManager) MarkBlockFailed(hash wire.Hash256) bool {
+	node := cm.headerIndex.GetNode(hash)
+	if node == nil || node.Height == 0 {
+		return false
+	}
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if cm.isAncestorOfTip(node) {
+		log.Printf("chainmgr: refusing to mark block %s (height %d) failed: it is on the active chain",
+			hash.String()[:16], node.Height)
+		return false
+	}
+	cm.markBlockFailedLocked(node)
+	return true
+}
+
+// markBlockFailedLocked is MarkBlockFailed's body. Caller holds cm.mu.
+// Lock order cm.mu -> headerIndex.mu, as in InvalidateBlock.
+func (cm *ChainManager) markBlockFailedLocked(node *BlockNode) {
+	node.Status |= StatusInvalid
+	cm.markDescendantsInvalid(node)
+	cm.persistFailureFlagsLocked(failureSubtree(node))
+	cm.headerIndex.RecalculateBestHeader()
 }
 
 // markDescendantsInvalid marks all descendants of a block as invalid.
