@@ -682,6 +682,7 @@ type SyncManager struct {
 	// AddBackfillHeaders). backfillReqAt is when the last backfill getheaders
 	// was sent; guarded by mu.
 	backfillReqAt time.Time
+	backfillPeer  string // address the last backfill request went to; guarded by mu
 
 	// pruner, when non-nil and configured with a target, is used by
 	// HandleGetData to reject pre-prune-horizon block requests with a
@@ -1251,21 +1252,42 @@ func (sm *SyncManager) maybeRequestBackfillLocked(peer *Peer, force bool) {
 	if !force && !sm.backfillReqAt.IsZero() && time.Since(sm.backfillReqAt) < backfillRetryInterval {
 		return
 	}
+	// Retry (timer expired, or the last batch was rejected): ROTATE to a
+	// different peer. Re-asking the one that went silent — or that fed a
+	// bad batch — can hold block connection forever (lunarblock e4b11ef
+	// needed the same rotation). A reply that arrives late from the old
+	// peer is still accepted: routing keys on the cursor, not the peer.
+	retry := !force && !sm.backfillReqAt.IsZero()
 	if peer == nil {
-		peer = sm.syncPeer
-	}
-	if peer == nil && sm.peerMgr != nil {
-		if peers := sm.peerMgr.ConnectedPeers(); len(peers) > 0 {
-			peer = peers[0]
+		var cands []*Peer
+		if sm.syncPeer != nil && sm.syncPeer.IsConnected() {
+			cands = append(cands, sm.syncPeer)
+		}
+		if sm.peerMgr != nil {
+			cands = append(cands, sm.peerMgr.ConnectedPeers()...)
+		}
+		for _, c := range cands {
+			if c == nil {
+				continue
+			}
+			if retry && c.Address() == sm.backfillPeer && len(cands) > 1 {
+				continue
+			}
+			peer = c
+			break
 		}
 	}
 	if peer == nil {
 		return
 	}
-	if sm.backfillReqAt.IsZero() {
+	if sm.backfillReqAt.IsZero() && sm.backfillPeer == "" {
 		log.Printf("sync: snapshot pre-base header backfill started with %s (block connection held until the band links to genesis)",
 			peer.Address())
+	} else if retry && peer.Address() != sm.backfillPeer {
+		log.Printf("sync: snapshot pre-base header backfill: no reply from %s in %s, rotating to %s",
+			sm.backfillPeer, backfillRetryInterval, peer.Address())
 	}
+	sm.backfillPeer = peer.Address()
 	sm.backfillReqAt = time.Now()
 	peer.SendMessage(&MsgGetHeaders{
 		ProtocolVersion: uint32(peer.ProtocolVersion()),
@@ -1292,12 +1314,18 @@ func (sm *SyncManager) handleBackfillHeadersLocked(peer *Peer, headers []wire.Bl
 	if err != nil {
 		log.Printf("sync: snapshot pre-base backfill batch from %s rejected: %v", peer.Address(), err)
 		peer.Misbehaving(ScoreHeadersDontConnect, fmt.Sprintf("bad pre-base backfill headers: %v", err))
-		sm.backfillReqAt = time.Time{}
+		// Retry from a DIFFERENT peer on the next tick (backfillPeer still
+		// names this one; an expired timestamp marks it as a retry).
+		sm.backfillReqAt = time.Now().Add(-backfillRetryInterval)
 		return
 	}
 	if done {
 		log.Printf("sync: snapshot pre-base header backfill COMPLETE: band spliced onto genesis; block connection released")
 		sm.backfillReqAt = time.Time{}
+		sm.backfillPeer = ""
+		// Forward headers deferred while the band was detached (see
+		// addValidatedHeaders) were dropped, not queued: ask again now.
+		sm.sendGetHeaders(peer, sm.headerIndex.BestTip().BuildLocator())
 		return
 	}
 	if len(added) > 0 {
@@ -1467,6 +1495,28 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 				}
 				locator := sm.headerIndex.BestTip().BuildLocator()
 				sm.sendGetHeaders(peer, locator)
+				return
+			}
+
+			// "Cannot decide yet" is NOT a bad header: an ancestor this
+			// header's contextual checks need (its parent's 11-header MTP
+			// window, a retarget period start) is below a still-detached
+			// snapshot band. The peer did nothing wrong — penalising it
+			// disconnected EVERY peer on a short-band snapshot boot (the
+			// forward headers right above the base cross the band root),
+			// so the backfill reply that would have fixed it never arrived.
+			// Keep what was accepted, drive the backfill, and re-ask for the
+			// forward headers once the band links (handleBackfillHeadersLocked).
+			if consensus.IsMissingAncestorErr(err) {
+				if sm.chainDB != nil && len(pendingHeaders) > 0 {
+					if ferr := sm.chainDB.StoreBlockHeadersBatch(pendingHeaders); ferr != nil {
+						log.Printf("sync: failed to flush %d pending headers: %v",
+							len(pendingHeaders), ferr)
+					}
+				}
+				log.Printf("sync: header from %s at height %d deferred until the snapshot pre-base backfill completes: %v",
+					addr, sm.headerIndex.BestHeight()+1, err)
+				sm.maybeRequestBackfillLocked(peer, false)
 				return
 			}
 
