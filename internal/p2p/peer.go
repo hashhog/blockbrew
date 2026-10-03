@@ -8,6 +8,7 @@ import (
 	"log"
 	"math/rand"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -186,6 +187,8 @@ type Peer struct {
 	quit              chan struct{}  // Signal to stop goroutines
 	quitOnce          sync.Once      // Ensure quit is closed only once
 	wg                sync.WaitGroup // Wait for goroutines to finish
+	ownedMu           sync.Mutex     // guards owned
+	owned             map[uint64]int // goroutine ids of this peer's own handlers
 	lastRecv          time.Time
 	lastSend          time.Time
 	lastPingNonce     uint64
@@ -685,6 +688,8 @@ func (p *Peer) AddrLocal() NetAddress {
 func (p *Peer) readHandler() {
 	defer p.wg.Done()
 	defer p.signalDisconnect()
+	p.enterPeerGoroutine()
+	defer p.leavePeerGoroutine()
 	p.installHeaderHook()
 	for {
 		// Check if we should stop
@@ -714,7 +719,9 @@ func (p *Peer) readHandler() {
 					(nfe.Command == "inv" || nfe.Command == "getdata") {
 					p.Misbehaving(100, fmt.Sprintf(
 						"oversize %s message (> MAX_INV_SZ=%d)", nfe.Command, MaxInvVects))
-					p.Disconnect()
+					// This goroutine is in p.wg. Joining Disconnect waits 5s
+					// for itself; signalling is enough.
+					p.DisconnectAsync()
 					return
 				}
 				log.Printf("peer %s: skipping bad message: %v", p.addr, err)
@@ -750,6 +757,8 @@ func (p *Peer) readHandler() {
 func (p *Peer) writeHandler() {
 	defer p.wg.Done()
 	defer p.signalDisconnect()
+	p.enterPeerGoroutine()
+	defer p.leavePeerGoroutine()
 	for {
 		select {
 		case msg := <-p.sendQueue:
@@ -778,6 +787,8 @@ func (p *Peer) writeHandler() {
 // pingHandler sends periodic pings to keep the connection alive.
 func (p *Peer) pingHandler() {
 	defer p.wg.Done()
+	p.enterPeerGoroutine()
+	defer p.leavePeerGoroutine()
 	ticker := time.NewTicker(PingInterval)
 	defer ticker.Stop()
 
@@ -1402,6 +1413,15 @@ const disconnectJoinTimeout = 5 * time.Second
 func (p *Peer) Disconnect() {
 	p.signalDisconnect()
 
+	// A message handler runs on readHandler, which is in p.wg. Waiting here
+	// cannot succeed until this call returns, so it always burns the full
+	// join timeout (5s) and holds whatever lock the handler took — the
+	// shutdown leftover where the sync path disconnects a peer from inside
+	// its own message handler. Signal only; the handler unwinds on quit.
+	if p.inPeerGoroutine() {
+		return
+	}
+
 	done := make(chan struct{})
 	go func() {
 		p.wg.Wait()
@@ -1428,6 +1448,65 @@ func (p *Peer) Disconnect() {
 // exactly what deadlocks it.
 func (p *Peer) DisconnectAsync() {
 	p.signalDisconnect()
+}
+
+// enterPeerGoroutine records that the current goroutine is one of this
+// peer's own handlers (read, write, ping — the set p.wg joins).
+func (p *Peer) enterPeerGoroutine() {
+	id := currentGoroutineID()
+	if id == 0 {
+		return
+	}
+	p.ownedMu.Lock()
+	if p.owned == nil {
+		p.owned = make(map[uint64]int)
+	}
+	p.owned[id]++
+	p.ownedMu.Unlock()
+}
+
+func (p *Peer) leavePeerGoroutine() {
+	id := currentGoroutineID()
+	if id == 0 {
+		return
+	}
+	p.ownedMu.Lock()
+	if n := p.owned[id]; n <= 1 {
+		delete(p.owned, id)
+	} else {
+		p.owned[id] = n - 1
+	}
+	p.ownedMu.Unlock()
+}
+
+// inPeerGoroutine reports whether the caller is one of this peer's handlers.
+func (p *Peer) inPeerGoroutine() bool {
+	id := currentGoroutineID()
+	if id == 0 {
+		return false
+	}
+	p.ownedMu.Lock()
+	defer p.ownedMu.Unlock()
+	return p.owned[id] > 0
+}
+
+// currentGoroutineID parses the id from runtime.Stack. Go has no public
+// goroutine id; the first line is "goroutine <id> [...]". 0 means unparsed.
+func currentGoroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	const prefix = "goroutine "
+	if n < len(prefix) {
+		return 0
+	}
+	var id uint64
+	for _, c := range buf[len(prefix):n] {
+		if c < '0' || c > '9' {
+			break
+		}
+		id = id*10 + uint64(c-'0')
+	}
+	return id
 }
 
 // waitStopped waits up to d for the peer's goroutines to exit and reports

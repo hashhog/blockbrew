@@ -91,7 +91,7 @@ func (p *mockPeer) Misbehaving(score int, reason string) bool {
 	return true
 }
 
-func (p *mockPeer) Disconnect()              { p.disconnected = true }
+func (p *mockPeer) DisconnectAsync()             { p.disconnected = true }
 func (p *mockPeer) SendMessage(msg Message) bool { p.sent = append(p.sent, msg); return true }
 
 // ----------------------------------------------------------------------------

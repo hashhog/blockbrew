@@ -53,9 +53,14 @@ type CFilterIndex interface {
 
 // PeerDisconnector is the minimal Peer surface used by the handlers to
 // punish misbehaving peers. Real *Peer implements this; tests stub it.
+//
+// DisconnectAsync, not Disconnect: these handlers run on the peer's read
+// goroutine, which p.wg is waiting for. The joining Disconnect burns
+// disconnectJoinTimeout (5s) waiting for itself (shutdown leftover
+// 2026-10-02). Signalling is enough — the read goroutine unwinds on quit.
 type PeerDisconnector interface {
 	Misbehaving(score int, reason string) bool
-	Disconnect()
+	DisconnectAsync()
 }
 
 // CFilterMessageSender is the minimal Peer surface used to push cfilter /
@@ -99,7 +104,7 @@ func PrepareBlockFilterRequest(
 	if filterType != FilterTypeBasic {
 		peer.Misbehaving(MisbehaviorScoreInvalidCFilterRequest,
 			"unsupported block filter type")
-		peer.Disconnect()
+		peer.DisconnectAsync()
 		return nil
 	}
 
@@ -107,14 +112,14 @@ func PrepareBlockFilterRequest(
 	if stopNode == nil {
 		peer.Misbehaving(MisbehaviorScoreInvalidCFilterRequest,
 			"invalid block hash in cfilter request")
-		peer.Disconnect()
+		peer.DisconnectAsync()
 		return nil
 	}
 
 	if stopNode.Height < 0 {
 		peer.Misbehaving(MisbehaviorScoreInvalidCFilterRequest,
 			"negative-height block in cfilter request")
-		peer.Disconnect()
+		peer.DisconnectAsync()
 		return nil
 	}
 
@@ -122,7 +127,7 @@ func PrepareBlockFilterRequest(
 	if startHeight > stopHeight {
 		peer.Misbehaving(MisbehaviorScoreInvalidCFilterRequest,
 			"start height > stop height in cfilter request")
-		peer.Disconnect()
+		peer.DisconnectAsync()
 		return nil
 	}
 
@@ -133,7 +138,7 @@ func PrepareBlockFilterRequest(
 	if stopHeight-startHeight >= maxHeightDiff {
 		peer.Misbehaving(MisbehaviorScoreInvalidCFilterRequest,
 			"too many cfilters/cfheaders requested")
-		peer.Disconnect()
+		peer.DisconnectAsync()
 		return nil
 	}
 
@@ -233,7 +238,7 @@ func LookupFilterHeaderByStopHashAtPrev(
 // HandleGetCFilters implements the getcfilters BIP-157 handler.
 // On success it sends one cfilter message per requested height back to
 // the peer. On peer misbehavior (unknown stop_hash, range too large,
-// etc.) it calls peer.Misbehaving + peer.Disconnect to match Core's
+// etc.) it calls peer.Misbehaving + peer.DisconnectAsync to match Core's
 // fDisconnect behavior.
 //
 // Reference: net_processing.cpp:3315 ProcessGetCFilters.
