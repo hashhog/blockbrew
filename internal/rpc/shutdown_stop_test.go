@@ -2,7 +2,9 @@ package rpc
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -156,5 +158,37 @@ func TestStopClosesConnectionOfStalledRequest(t *testing.T) {
 			t.Fatalf("connection still open %s after Stop began: Stop left the stalled request's connection open", time.Since(t0))
 		}
 		break // EOF or reset: closed
+	}
+}
+
+// Every mainnet stop on 2026-10-02 logged "RPC server stop error: context
+// deadline exceeded". Shutdown's 5s budget expired on a request still in
+// flight (flushchainstate's pebble flush outlives the SIGTERM that follows
+// it), then Stop force-closed the connection and still returned the deadline
+// as a failure. The force-close is the success path: Stop must not report it.
+func TestStopDoesNotReportDeadlineAfterForceClose(t *testing.T) {
+	s, addr := startStopTestServer(t)
+
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := io.WriteString(c, "POST / HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000\r\n\r\n{\"method\":"); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	t0 := time.Now()
+	err = s.Stop()
+	took := time.Since(t0)
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Stop returned context deadline exceeded after %s: the force-close is the success path, not a stop error", took)
+	}
+	if err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if took > 8*time.Second {
+		t.Fatalf("Stop took %s; the deadline is 5s plus the force-close", took)
 	}
 }

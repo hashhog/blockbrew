@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -460,6 +461,13 @@ func (s *Server) Stop() error {
 				// alive. Its handler's writes now fail fast.
 				if cerr := s.httpServer.Close(); cerr != nil {
 					log.Printf("RPC: force-closing remaining connections: %v", cerr)
+				}
+				// The deadline is that give-up. Force-closing handled it.
+				// Returning it made every mainnet stop log
+				// "RPC server stop error: context deadline exceeded"
+				// (2026-10-02) after a stop that had already moved on.
+				if errors.Is(s.stopErr, context.DeadlineExceeded) {
+					s.stopErr = nil
 				}
 			}
 		}

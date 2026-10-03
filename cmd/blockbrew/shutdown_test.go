@@ -103,3 +103,37 @@ func TestShutdownFitsInsideTheStopGrace(t *testing.T) {
 		t.Fatalf("shutdown waits for the aux saves before the chainstate flush (wait=%d flush=%d)", wait, flush)
 	}
 }
+
+// The graceful path's pebble Close is what blew the 80s deadline on mainnet
+// (30s at 20:08Z, still running at 51s at 23:31Z → "exit (forced)"). It must
+// be CloseForShutdown, and the budget must be the time still left before
+// shutdownDeadline so the close itself cannot trip the watchdog.
+func TestGracefulCloseCannotOutliveTheShutdownDeadline(t *testing.T) {
+	body, err := os.ReadFile(filepath.Join(w124RepoRoot(t), "cmd/blockbrew/main.go"))
+	if err != nil {
+		t.Fatalf("read main.go: %v", err)
+	}
+	src := string(body)
+	if !strings.Contains(src, "shutdownStart := time.Now()") {
+		t.Fatal("shutdown does not record when the deadline started")
+	}
+	closeLog := strings.Index(src, `log.Printf("closing DB")`)
+	if closeLog < 0 {
+		t.Fatal(`log "closing DB" not found`)
+	}
+	// The first zmqPub.Stop is the startup-failure path, above this log.
+	zmqRel := strings.Index(src[closeLog:], "zmqPub.Stop()")
+	if zmqRel < 0 {
+		t.Fatal("no zmqPub.Stop() after the DB close")
+	}
+	span := src[closeLog : closeLog+zmqRel]
+	if !strings.Contains(span, "db.CloseForShutdown(") {
+		t.Fatal("graceful shutdown does not bound the DB close; unbounded pebble Close waits for compactions")
+	}
+	if strings.Contains(span, "db.Close()") {
+		t.Fatalf("graceful path still calls unbounded db.Close():\n%s", span)
+	}
+	if !strings.Contains(span, "shutdownDeadline - time.Since(shutdownStart)") {
+		t.Fatal("close budget is not clamped to the time remaining before shutdownDeadline")
+	}
+}

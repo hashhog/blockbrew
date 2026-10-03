@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
@@ -101,6 +103,21 @@ type PebbleDB struct {
 	// takes it for writing, so it also waits for the ones in flight.
 	liveMu sync.RWMutex
 	closed bool
+
+	// closeFinished is true when pebble's Close returned. CloseForShutdown
+	// leaves it false when it abandons a Close that is still waiting on a
+	// compaction. Only touched inside closeOnce.
+	closeFinished bool
+
+	// compactSlots is the value MaxConcurrentCompactions reports. CloseForShutdown
+	// stores 0 so a close does not schedule another compaction while it syncs.
+	compactSlots *atomic.Int32
+
+	// testClose, when set, replaces pebble.DB.Close inside CloseForShutdown.
+	// Tests block it the way pebble blocks while a compaction is in flight
+	// (pebble db.go waits on compact.cond until compactingCount and flushing
+	// are zero). Production leaves it nil.
+	testClose func() error
 }
 
 // ErrDBClosed is returned by operations that reach the DB after Close.
@@ -173,11 +190,13 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 	for i := range levelOpts {
 		levelOpts[i] = pebble.LevelOptions{
 			Compression:    pebble.ZstdCompression,
-			TargetFileSize: 64 * 1024 * 1024, // 64MB target file size
+			TargetFileSize: 64 * 1024 * 1024,       // 64MB target file size
 			FilterPolicy:   bloom.FilterPolicy(10), // Bloom filter with ~1% false positive rate
 		}
 	}
 
+	slots := new(atomic.Int32)
+	slots.Store(4)
 	opts := &pebble.Options{
 		Cache:                       cache,
 		MemTableSize:                uint64(cfg.MemTableSize),
@@ -198,7 +217,9 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		// saturation. Allowing 4 concurrent compactions lets L0→L1, L1→L2,
 		// etc. proceed in parallel — bounded so we don't starve the
 		// validator on a 16-core box.
-		MaxConcurrentCompactions: func() int { return 4 },
+		// The closure reads slots so shutdown can drop the limit to 0 and
+		// stop new compactions without touching pebble's cloned Options.
+		MaxConcurrentCompactions: func() int { return int(slots.Load()) },
 	}
 
 	db, err := pebble.Open(path, opts)
@@ -207,7 +228,7 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		return nil, fmt.Errorf("pebble open failed: %w", err)
 	}
 
-	return &PebbleDB{db: db, cache: cache}, nil
+	return &PebbleDB{db: db, cache: cache, compactSlots: slots}, nil
 }
 
 // Get retrieves a value by key. Returns nil, nil if key does not exist.
@@ -390,9 +411,105 @@ func (p *PebbleDB) Close() error {
 		p.closeErr = p.db.Close()
 		if p.cache != nil {
 			p.cache.Unref()
+			p.cache = nil
 		}
+		p.closeFinished = true
 	})
 	return p.closeErr
+}
+
+// CloseForShutdown syncs the WAL and closes the DB, but it will not wait
+// longer than budget.
+//
+// pebble.DB.Close waits on compact.cond until every in-flight compaction and
+// flush has finished. On a saturated disk that wait was 30s (2026-10-02
+// 20:08Z) and still running at 51s (23:31Z), so the 80s shutdown deadline
+// fired and the process took "exit (forced)" even though the chainstate
+// batch, mempool, wallet and block store were already durable and the
+// restart replayed a handful of WAL keys. After the WAL sync a close that
+// does not finish is abandoned: the caller is about to exit, and exiting on
+// a synced WAL is the recovery a crash already uses. New compactions are
+// disarmed first so the wait cannot grow by one more job.
+//
+// The bool is false when the close was abandoned. err is the close or sync
+// error when the close finished; it is nil when the close was abandoned
+// before it returned.
+func (p *PebbleDB) CloseForShutdown(budget time.Duration) (error, bool) {
+	p.closeOnce.Do(func() { p.finishClose(budget) })
+	return p.closeErr, p.closeFinished
+}
+
+func (p *PebbleDB) finishClose(budget time.Duration) {
+	if p.compactSlots != nil {
+		p.compactSlots.Store(0)
+	}
+	p.liveMu.Lock()
+	p.closed = true
+	p.liveMu.Unlock()
+
+	// Do not start Close while a WAL sync is still in Apply: Close takes the
+	// commit-pipeline lock the sync holds, and would wait out the rest of
+	// the budget on that instead of on the compaction.
+	deadline := time.Now().Add(budget)
+	if !p.syncWAL(deadline) {
+		p.closeFinished = false
+		return
+	}
+	fn := p.db.Close
+	if p.testClose != nil {
+		fn = p.testClose
+	}
+	if !p.closeDB(deadline, fn) {
+		p.closeFinished = false
+		return
+	}
+	p.closeFinished = true
+}
+
+func (p *PebbleDB) syncWAL(deadline time.Time) bool {
+	remain := time.Until(deadline)
+	if remain <= 0 {
+		return false
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- p.db.LogData([]byte("blockbrew-shutdown"), pebble.Sync)
+	}()
+	timer := time.NewTimer(remain)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			p.closeErr = err
+		}
+		return true
+	case <-timer.C:
+		return false
+	}
+}
+
+func (p *PebbleDB) closeDB(deadline time.Time, closeFn func() error) bool {
+	remain := time.Until(deadline)
+	if remain <= 0 {
+		return false
+	}
+	done := make(chan error, 1)
+	go func() { done <- closeFn() }()
+	timer := time.NewTimer(remain)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if p.closeErr == nil {
+			p.closeErr = err
+		}
+		if p.cache != nil {
+			p.cache.Unref()
+			p.cache = nil
+		}
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // prefixUpperBound computes the upper bound for prefix iteration.

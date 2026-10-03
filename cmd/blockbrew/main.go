@@ -2278,6 +2278,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// stop_mainnet.sh's 120 s blockbrew grace, and 80 s is inside systemd's
 	// default 90 s TimeoutStopSec.
 	shutdownDone := make(chan struct{})
+	shutdownStart := time.Now()
 	const shutdownDeadline = 80 * time.Second
 
 	// Budget for proving the chain is at rest before the chainstate flush.
@@ -2421,7 +2422,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// h=938360 wedge (and lunarblock's Apr 28 h=938344 wedge).  After
 		// this fix there is no on-disk state where UTXOs reflect height
 		// N+M but chain_tip still says height N.
-		// From here to db.Close() the DB belongs to this sequence; the
+		// From here to CloseForShutdown the DB belongs to this sequence; the
 		// forced-exit paths must not close it underneath (see dbFinalMu).
 		dbFinalMu.Lock()
 
@@ -2483,11 +2484,32 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("Block store flushed")
 		}
 
+		// pebble.Close waits out in-flight compactions. That wait was 30s
+		// (2026-10-02 20:08Z; the whole stop finished at 76s of this 80s
+		// deadline) and still running at 51s (23:31Z), so the deadline
+		// fired and the process logged "exit (forced)" with the chainstate
+		// already flushed. Bound the wait by the time still left, and cap
+		// it, so a compaction cannot be what trips the watchdog. A close
+		// that does not finish is abandoned; the WAL sync inside
+		// CloseForShutdown plus the synced chainstate batch is the
+		// durability a crash restart already uses.
 		log.Printf("closing DB")
-		if err := db.Close(); err != nil {
-			log.Printf("Warning: database close failed: %v", err)
+		const maxDBCloseWait = 20 * time.Second
+		const closeMargin = 5 * time.Second
+		budget := shutdownDeadline - time.Since(shutdownStart) - closeMargin
+		if budget > maxDBCloseWait {
+			budget = maxDBCloseWait
 		}
-		log.Printf("Database closed")
+		if budget < 0 {
+			budget = 0
+		}
+		if err, finished := db.CloseForShutdown(budget); !finished {
+			log.Printf("DB close did not finish within %s; exiting without it (WAL synced, chainstate batches are durable)", budget)
+		} else if err != nil {
+			log.Printf("Warning: database close failed: %v", err)
+		} else {
+			log.Printf("Database closed")
+		}
 
 		// Stop ZMQ publisher (drains pending sends, closes sockets).
 		zmqPub.Stop()
