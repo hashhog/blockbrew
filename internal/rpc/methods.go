@@ -2903,10 +2903,24 @@ func (s *Server) handleFlushChainState() (interface{}, *RPCError) {
 	if s.chainDB == nil {
 		return nil, &RPCError{Code: RPCErrMisc, Message: "chain database unavailable"}
 	}
-	if err := s.chainDB.Flush(); err != nil {
-		return nil, &RPCError{Code: RPCErrMisc, Message: fmt.Sprintf("flushchainstate failed: %v", err)}
+	// The flush runs on its own goroutine so that a node shutting down does
+	// not wait for it: on an I/O-saturated disk a memtable flush outlasts
+	// stop_mainnet.sh's 10 s curl, the SIGTERM that follows finds this
+	// handler still running, and the RPC server's Stop then waited its full
+	// drain timeout for it at every mainnet stop ("RPC server stop error:
+	// context deadline exceeded"). Nothing is lost by not waiting: the
+	// shutdown sequence syncs the WAL and closes the database itself.
+	done := make(chan error, 1)
+	go func() { done <- s.chainDB.Flush() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrMisc, Message: fmt.Sprintf("flushchainstate failed: %v", err)}
+		}
+		return nil, nil
+	case <-s.shutdown:
+		return nil, &RPCError{Code: RPCErrMisc, Message: "flushchainstate interrupted: node is shutting down (the shutdown sequence makes the chainstate durable)"}
 	}
-	return nil, nil
 }
 
 func (s *Server) handleUptime() (interface{}, *RPCError) {

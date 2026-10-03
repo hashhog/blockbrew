@@ -6,12 +6,13 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -130,6 +131,11 @@ type Server struct {
 	longOpsMu     sync.Mutex
 	longOps       sync.WaitGroup
 	longOpsClosed bool
+
+	// inflight records every request being served, so a Stop that has to
+	// cut connections can say which requests they were.
+	inflightMu sync.Mutex
+	inflight   map[*inflightRequest]struct{}
 
 	// snapshotActivation records the live AssumeUTXO snapshot activation (Core
 	// ChainstateManager's second chainstate). nil while no snapshot is loaded;
@@ -387,7 +393,7 @@ func (s *Server) Start() error {
 	}
 	s.httpServer = &http.Server{
 		Addr:        s.config.ListenAddr,
-		Handler:     mux,
+		Handler:     s.trackInflight(mux),
 		ReadTimeout: 30 * time.Second,
 		// WriteTimeout bounds ordinary requests. Whole-set methods
 		// (longRunningRPCs) clear the deadline for their own request in
@@ -435,6 +441,73 @@ func (s *Server) Start() error {
 	return nil
 }
 
+// stopDrainTimeout bounds how long Stop lets in-flight requests finish before
+// closing their connections.
+const stopDrainTimeout = 5 * time.Second
+
+// inflightRequest is one request being served.
+type inflightRequest struct {
+	what  string // URL path, then the JSON-RPC method once decoded
+	start time.Time
+}
+
+type inflightKey struct{}
+
+// trackInflight records each request in s.inflight for its lifetime.
+func (s *Server) trackInflight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := &inflightRequest{what: r.URL.Path, start: time.Now()}
+		s.inflightMu.Lock()
+		if s.inflight == nil {
+			s.inflight = make(map[*inflightRequest]struct{})
+		}
+		s.inflight[req] = struct{}{}
+		s.inflightMu.Unlock()
+		defer func() {
+			s.inflightMu.Lock()
+			delete(s.inflight, req)
+			s.inflightMu.Unlock()
+		}()
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), inflightKey{}, req)))
+	})
+}
+
+// noteInflightMethod labels the current request with its JSON-RPC method.
+func (s *Server) noteInflightMethod(r *http.Request, method string) {
+	req, ok := r.Context().Value(inflightKey{}).(*inflightRequest)
+	if !ok {
+		return
+	}
+	s.inflightMu.Lock()
+	req.what = method
+	s.inflightMu.Unlock()
+}
+
+func (s *Server) inflightCount() int {
+	s.inflightMu.Lock()
+	defer s.inflightMu.Unlock()
+	return len(s.inflight)
+}
+
+// describeInflight lists the in-flight requests, oldest first.
+func (s *Server) describeInflight() string {
+	s.inflightMu.Lock()
+	reqs := make([]inflightRequest, 0, len(s.inflight))
+	for r := range s.inflight {
+		reqs = append(reqs, *r)
+	}
+	s.inflightMu.Unlock()
+	if len(reqs) == 0 {
+		return "(none; idle or unread connections only)"
+	}
+	sort.Slice(reqs, func(i, j int) bool { return reqs[i].start.Before(reqs[j].start) })
+	parts := make([]string, len(reqs))
+	for i, r := range reqs {
+		parts[i] = fmt.Sprintf("%s (%s)", r.what, time.Since(r.start).Round(100*time.Millisecond))
+	}
+	return strings.Join(parts, ", ")
+}
+
 // longOpWaitTimeout bounds how long Stop waits for in-flight whole-set walks
 // to notice the shutdown and release their database snapshot. They check
 // every few thousand coins, so this is normally milliseconds.
@@ -448,26 +521,26 @@ func (s *Server) Stop() error {
 	s.stopOnce.Do(func() {
 		close(s.shutdown)
 
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), stopDrainTimeout)
 		defer cancel()
 		if s.httpServer != nil {
-			s.stopErr = s.httpServer.Shutdown(ctx)
-			if s.stopErr != nil {
+			if err := s.httpServer.Shutdown(ctx); err != nil {
 				// Shutdown gave up on a request still in flight (a client
 				// that never finishes sending, a handler that ignores the
 				// shutdown). Shutdown leaves those connections open; Close
 				// tears them down so no client socket outlives Stop and a
 				// stuck request cannot be the reason the daemon is still
 				// alive. Its handler's writes now fail fast.
+				//
+				// That is the designed outcome, not a failure of Stop, so
+				// it is logged with the requests involved rather than
+				// returned. (Every mainnet stop logged a bare "RPC server
+				// stop error: context deadline exceeded", which named
+				// nothing.)
+				log.Printf("RPC: %d request(s) still running after %s, closing their connections: %s",
+					s.inflightCount(), stopDrainTimeout, s.describeInflight())
 				if cerr := s.httpServer.Close(); cerr != nil {
-					log.Printf("RPC: force-closing remaining connections: %v", cerr)
-				}
-				// The deadline is that give-up. Force-closing handled it.
-				// Returning it made every mainnet stop log
-				// "RPC server stop error: context deadline exceeded"
-				// (2026-10-02) after a stop that had already moved on.
-				if errors.Is(s.stopErr, context.DeadlineExceeded) {
-					s.stopErr = nil
+					s.stopErr = fmt.Errorf("force-closing remaining connections: %w", cerr)
 				}
 			}
 		}
@@ -550,6 +623,7 @@ func (s *Server) handleRPC(w http.ResponseWriter, r *http.Request) {
 		s.sendError(w, nil, RPCErrParseError, "Parse error")
 		return
 	}
+	s.noteInflightMethod(r, req.Method)
 
 	// Check if context already expired before dispatching
 	if ctx.Err() != nil {
