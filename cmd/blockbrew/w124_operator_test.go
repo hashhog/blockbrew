@@ -641,7 +641,7 @@ func TestForcedExitNeverClosesDBUnderShutdownFlush(t *testing.T) {
 		t.Fatalf("watchdog closes the DB directly:\n%s", wdBody)
 	}
 	lock := strings.Index(src, "dbFinalMu.Lock()")
-	flush := strings.Index(src, "utxoSet.FlushBatch(shutBatch)")
+	flush := strings.Index(src, "utxoSet.StageFlush(shutBatch)")
 	if lock < 0 || flush < 0 || lock > flush {
 		t.Fatalf("shutdown must take dbFinalMu before its chainstate flush (lock=%d flush=%d)", lock, flush)
 	}

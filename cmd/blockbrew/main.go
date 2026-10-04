@@ -2265,6 +2265,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	case <-rpcServer.StopRequested():
 		stopViaRPC = true
 		log.Printf("received RPC stop, beginning graceful shutdown")
+	case <-consensus.Aborted():
+		// Gate 6: Core's AbortNode -> StartShutdown. A system fault (failed
+		// chainstate write after a retry, coins-DB read error, panic mid-
+		// connect) latched the fatal state. Shut down WITHOUT flushing the
+		// chainstate (see below) and exit non-zero so the supervisor restarts
+		// the node on its last durable atomic batch.
+		log.Printf("[FATAL] fatal error, shutting down: %v", consensus.AbortReason())
 	}
 
 	// systemd: report STOPPING=1 so TimeoutStopSec doesn't tick down
@@ -2458,25 +2465,38 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 				"flush on restart.", chainQuiesceTimeout)
 		}
 
-		bestHash, bestHeight := chainMgr.BestBlock()
-		if chainAtRest {
-			log.Printf("flushing chainstate atomically at height %d", bestHeight)
+		// Gate 6: after AbortNode the in-memory view may be torn (a recovered
+		// panic left half a block applied; a failed write was rolled back by
+		// hand). Persisting it is how a fatal error used to become durable
+		// coin resurrection or a block adopted without scripts on the next
+		// boot. Skip the flush; the restart resumes from the last atomic batch.
+		// (StageFlush refuses after AbortNode as a second line.)
+		fatalAtFlush := consensus.IsAborted()
+		if fatalAtFlush {
+			log.Printf("[FATAL] SKIPPING the chainstate flush: the node aborted (%v); "+
+				"the restart resumes from the last durable atomic batch", consensus.AbortReason())
 		}
-		if chainAtRest {
+
+		bestHash, bestHeight := chainMgr.BestBlock()
+		if chainAtRest && !fatalAtFlush {
+			log.Printf("flushing chainstate atomically at height %d", bestHeight)
 			shutBatch := chainDB.NewBatch()
-			if err := utxoSet.FlushBatch(shutBatch); err != nil {
-				log.Printf("Warning: UTXO flush-batch failed: %v", err)
-			}
-			if bestHeight > 0 {
-				chainDB.SetChainStateBatch(shutBatch, &storage.ChainState{
-					BestHash:   bestHash,
-					BestHeight: bestHeight,
-				})
-			}
-			if err := shutBatch.Write(); err != nil {
-				log.Printf("Warning: atomic chainstate-flush batch failed: %v", err)
+			staged, serr := utxoSet.StageFlush(shutBatch)
+			if serr != nil {
+				log.Printf("Warning: UTXO flush-batch failed: %v — skipping the chainstate flush", serr)
 			} else {
-				log.Printf("Chainstate flushed atomically (UTXO + tip) at height %d", bestHeight)
+				if bestHeight > 0 {
+					chainDB.SetChainStateBatch(shutBatch, &storage.ChainState{
+						BestHash:   bestHash,
+						BestHeight: bestHeight,
+					})
+				}
+				if err := shutBatch.Write(); err != nil {
+					log.Printf("Warning: atomic chainstate-flush batch failed: %v", err)
+				} else {
+					staged.Commit()
+					log.Printf("Chainstate flushed atomically (UTXO + tip) at height %d", bestHeight)
+				}
 			}
 		}
 
@@ -2548,6 +2568,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// AfterFunc already fired concurrently; it will os.Exit(1) for us.
 		// Park the main goroutine so we don't race it.
 		select {}
+	}
+	if consensus.IsAborted() {
+		// Core: AbortNode sets a non-zero exit status (node/abort.cpp ->
+		// exit_status = EXIT_FAILURE). The supervisor must see a failure.
+		log.Printf("blockbrew shutdown complete after a fatal error: %v", consensus.AbortReason())
+		log.Printf("exit (fatal error)")
+		os.Exit(1)
 	}
 	log.Printf("blockbrew shutdown complete")
 	log.Printf("exit")

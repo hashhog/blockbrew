@@ -578,7 +578,15 @@ func CheckBIP30(block *wire.MsgBlock, height int32, blockHash wire.Hash256, para
 		txHash := tx.TxHash()
 		for i := range tx.TxOut {
 			outpoint := wire.OutPoint{Hash: txHash, Index: uint32(i)}
-			if utxoView.GetUTXO(outpoint) != nil {
+			// Gate 6 (audit F7b): a lookup that FAILS is not "no conflict".
+			// That read was fail-open — a read error let a block overwrite a
+			// live coin. A checked view reports the error (and has latched
+			// AbortNode); it is returned as a system fault, never a verdict.
+			existing, rerr := getUTXOChecked(utxoView, outpoint)
+			if rerr != nil {
+				return rerr
+			}
+			if existing != nil {
 				return fmt.Errorf("%w: output %s:%d already exists",
 					ErrDuplicateTx, txHash.String()[:16], i)
 			}

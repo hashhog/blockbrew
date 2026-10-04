@@ -35,6 +35,21 @@ type UTXOView interface {
 	GetUTXO(outpoint wire.OutPoint) *UTXOEntry
 }
 
+// checkedUTXOView is the optional typed-error read a durable view exposes
+// (UTXOSet.GetUTXOChecked): (nil, nil) = absent, error = the coins database
+// could not be read. Views with no database (in-memory, scratch) cannot fail.
+type checkedUTXOView interface {
+	GetUTXOChecked(outpoint wire.OutPoint) (*UTXOEntry, error)
+}
+
+// getUTXOChecked reads through the typed-error channel when the view has one.
+func getUTXOChecked(v UTXOView, outpoint wire.OutPoint) (*UTXOEntry, error) {
+	if c, ok := v.(checkedUTXOView); ok {
+		return c.GetUTXOChecked(outpoint)
+	}
+	return v.GetUTXO(outpoint), nil
+}
+
 // UTXOEntry represents an unspent transaction output.
 type UTXOEntry struct {
 	Amount     int64

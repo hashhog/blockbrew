@@ -755,9 +755,11 @@ func TestG28_CrashConsistency_AtomicBatch(t *testing.T) {
 
 	// Simulate atomic batch flush (as ConnectBlock does)
 	batch := chainDB.NewBatch()
-	if err := utxoSet.FlushBatch(batch); err != nil {
-		t.Fatalf("FlushBatch failed: %v", err)
+	staged, err := utxoSet.StageFlush(batch)
+	if err != nil {
+		t.Fatalf("StageFlush failed: %v", err)
 	}
+	defer staged.Commit()
 	chainDB.SetChainStateBatch(batch, &storage.ChainState{BestHash: wire.Hash256{0x01}, BestHeight: 1})
 	if err := batch.Write(); err != nil {
 		t.Fatalf("batch write failed: %v", err)

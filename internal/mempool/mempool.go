@@ -910,7 +910,20 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 // checks first (sanity, coinbase, IsStandardTx, MIN_STANDARD_TX_NONWITNESS_SIZE,
 // IsFinalTx), then sigops + chain-context (BIP-68 + CheckTxInputs), then
 // expensive script verification last.
-func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
+func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) (retErr error) {
+	// Gate 6: after AbortNode the mempool admits nothing — the chain view it
+	// validates against may be torn — and any rejection produced while the
+	// latch went up (a coins-DB read error reads as "missing inputs") is
+	// reported as the system condition it is, not as a policy/consensus
+	// reason a caller could cache or punish on.
+	if consensus.IsAborted() {
+		return consensus.ErrNodeAborted
+	}
+	defer func() {
+		if retErr != nil && consensus.IsAborted() && !errors.Is(retErr, consensus.ErrNodeAborted) {
+			retErr = fmt.Errorf("%w (suppressed: %v)", consensus.ErrNodeAborted, retErr)
+		}
+	}()
 	txHash := tx.TxHash()
 	wtxid := tx.WTxHash()
 
@@ -3780,6 +3793,10 @@ func CheckPackage(txns []*wire.MsgTx) error {
 // The package must be in child-with-unconfirmed-parents topology.
 // Returns detailed results for each transaction.
 func (mp *Mempool) AcceptPackage(txns []*wire.MsgTx) (*PackageResult, error) {
+	// Gate 6: see AddTransactionFrom.
+	if consensus.IsAborted() {
+		return nil, consensus.ErrNodeAborted
+	}
 	result := &PackageResult{
 		TxResults: make(map[wire.Hash256]*TxAcceptResult),
 	}

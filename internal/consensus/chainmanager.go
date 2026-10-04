@@ -661,9 +661,13 @@ func (cm *ChainManager) shouldSkipScripts(node *BlockNode) bool {
 // batches; the height row rewrite is idempotent).
 func (cm *ChainManager) AdoptAppliedBlock(block *wire.MsgBlock) error {
 	if !cm.beginMutation() {
-		return ErrShuttingDown
+		return mutationRefused()
 	}
 	defer cm.endMutation()
+	// Gate 6: a panic while the chain is being mutated leaves the in-memory
+	// view torn. Latch AbortNode (no further connects, no shutdown flush, exit
+	// non-zero) and re-panic; an outer recover can no longer resume on it.
+	defer latchOnPanic()
 
 	hash := block.Header.BlockHash()
 	node := cm.headerIndex.GetNode(hash)
@@ -771,37 +775,53 @@ func (cm *ChainManager) AdoptAppliedBlock(block *wire.MsgBlock) error {
 		}
 	}
 
+	// The roll-forward above applied this block's mutations, so the coins
+	// marker staged below must name this block — but ADVANCE only: the
+	// persisted set may already reflect blocks above this one (that lag is the
+	// very condition that routed us here), and lowering the marker to this
+	// height would make the next boot re-apply them.
+	prevAppliedHash, prevAppliedHeight, prevAppliedSet := cm.viewAppliedTip()
+	cm.advanceAppliedTip(hash, node.Height)
+
+	if cm.chainDB != nil {
+		// Stage the rolled-forward UTXO mutations into the SAME batch as the
+		// tip pointer. Adoption exists precisely because a previous crash left
+		// the coins and the tip out of step; committing them atomically is what
+		// stops this repair from re-creating the condition it repairs.
+		// Gate 6: write before forget, retry once, then AbortNode.
+		write := func() error {
+			batch := cm.chainDB.NewBatch()
+			staged, err := dview.StageFlush(batch)
+			if err != nil {
+				return fmt.Errorf("stage rolled-forward UTXOs: %w", err)
+			}
+			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
+			cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+				BestHash:   hash,
+				BestHeight: node.Height,
+			})
+			if err := batch.Write(); err != nil {
+				return fmt.Errorf("persist tip advance: %w", err)
+			}
+			staged.Commit()
+			return nil
+		}
+		if err := write(); err != nil {
+			log.Printf("chainmgr: adopt of %s failed to persist: %v — retrying once", hash.String()[:16], err)
+			if err2 := write(); err2 != nil {
+				fault := SystemFault("persist adopted block",
+					fmt.Errorf("%w: %v (retry: %v)", ErrChainstateWrite, err, err2))
+				AbortNode(fault)
+				cm.restoreAppliedTip(prevAppliedHash, prevAppliedHeight, prevAppliedSet)
+				return fault
+			}
+		}
+	}
+
 	cm.tipNode = node
 	cm.tipHeight = node.Height
 	cm.updateTipCache(node.Hash, node.Height)
 	node.Status |= StatusFullyValid | StatusDataStored
-	// The roll-forward above applied this block's mutations, so the coins
-	// marker staged by FlushBatch below must name this block — but ADVANCE
-	// only: the persisted set may already reflect blocks above this one (that
-	// lag is the very condition that routed us here), and lowering the marker
-	// to this height would make the next boot re-apply them.
-	cm.advanceAppliedTip(hash, node.Height)
-
-	if cm.chainDB != nil {
-		batch := cm.chainDB.NewBatch()
-		// Stage the rolled-forward UTXO mutations into the SAME batch as the
-		// tip pointer. Adoption exists precisely because a previous crash left
-		// the coins and the tip out of step; committing them atomically is what
-		// stops this repair from re-creating the condition it repairs. (The old
-		// code wrote only the tip, leaving the re-apply — when there was one —
-		// in volatile cache.)
-		if err := dview.FlushBatch(batch); err != nil {
-			return fmt.Errorf("adopt: failed to stage rolled-forward UTXOs: %w", err)
-		}
-		cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
-		cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
-			BestHash:   hash,
-			BestHeight: node.Height,
-		})
-		if err := batch.Write(); err != nil {
-			return fmt.Errorf("adopt: failed to persist tip advance: %w", err)
-		}
-	}
 
 	log.Printf("chainmgr: ADOPTED already-applied block height=%d hash=%s (marker-lag repair; block re-applied by tolerant roll-forward, committed atomically with the tip)",
 		node.Height, hash.String()[:16])
@@ -881,6 +901,34 @@ func (cm *ChainManager) setAppliedTip(hash wire.Hash256, height int32) {
 	if t, ok := cm.utxoSet.(appliedTipTracker); ok {
 		t.SetAppliedTip(hash, height)
 	}
+}
+
+// restoreAppliedTip puts the in-memory coins marker back to a value captured
+// before a connect attempt whose batch then failed to land (gate 6). An
+// authoritative restatement, like ReorgTo's rollback: the view is being rolled
+// back to exactly the state the captured marker described. No-op if no marker
+// had been set (the next flush then publishes none, as before).
+func (cm *ChainManager) restoreAppliedTip(hash wire.Hash256, height int32, wasSet bool) {
+	if wasSet {
+		cm.setAppliedTip(hash, height)
+	}
+}
+
+// batchStager is the optional capability of a UTXO view whose pending
+// mutations can be staged into a caller's batch and forgotten only after that
+// batch is written (UTXOSet.StageFlush / StagedFlush.Commit).
+type batchStager interface {
+	StageFlush(batch storage.Batch) (*StagedFlush, error)
+}
+
+// mutationRefused is the error a chain-mutating entry point returns when
+// beginMutation refuses: ErrNodeAborted once AbortNode has latched (a system
+// condition, never a verdict), ErrShuttingDown during an ordinary shutdown.
+func mutationRefused() error {
+	if IsAborted() {
+		return abortedErr()
+	}
+	return ErrShuttingDown
 }
 
 // advanceAppliedTip raises the coins marker to (hash, height) and REFUSES to
@@ -1208,9 +1256,13 @@ func (cm *ChainManager) ConnectOrAdoptBlock(block *wire.MsgBlock) error {
 // function only verifies chain shape.
 func (cm *ChainManager) AdoptFlushedBlock(block *wire.MsgBlock) error {
 	if !cm.beginMutation() {
-		return ErrShuttingDown
+		return mutationRefused()
 	}
 	defer cm.endMutation()
+	// Gate 6: a panic while the chain is being mutated leaves the in-memory
+	// view torn. Latch AbortNode (no further connects, no shutdown flush, exit
+	// non-zero) and re-panic; an outer recover can no longer resume on it.
+	defer latchOnPanic()
 
 	hash := block.Header.BlockHash()
 	node := cm.headerIndex.GetNode(hash)
@@ -1241,6 +1293,31 @@ func (cm *ChainManager) AdoptFlushedBlock(block *wire.MsgBlock) error {
 			"the header index marks it invalid", hash.String()[:16], node.Height)
 	}
 
+	if cm.chainDB != nil {
+		// Height row + tip pointer only. Deliberately NO UTXO write: there is
+		// nothing of this block's to write, and the tip-never-leads-the-coins
+		// invariant already holds because the coins marker covers this height.
+		// Gate 6: the in-memory tip moves only after the write lands; retry
+		// once, then AbortNode.
+		write := func() error {
+			batch := cm.chainDB.NewBatch()
+			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
+			cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+				BestHash:   hash,
+				BestHeight: node.Height,
+			})
+			return batch.Write()
+		}
+		if err := write(); err != nil {
+			if err2 := write(); err2 != nil {
+				fault := SystemFault("adopt-flushed: persist tip advance",
+					fmt.Errorf("%w: %v (retry: %v)", ErrChainstateWrite, err, err2))
+				AbortNode(fault)
+				return fault
+			}
+		}
+	}
+
 	cm.tipNode = node
 	cm.tipHeight = node.Height
 	cm.updateTipCache(node.Hash, node.Height)
@@ -1252,21 +1329,6 @@ func (cm *ChainManager) AdoptFlushedBlock(block *wire.MsgBlock) error {
 	// marker of 9 over a set durable through 121 and resurrect a coin on the
 	// next boot.
 	cm.advanceAppliedTip(hash, node.Height)
-
-	if cm.chainDB != nil {
-		// Height row + tip pointer only. Deliberately NO UTXO write: there is
-		// nothing of this block's to write, and the tip-never-leads-the-coins
-		// invariant already holds because the coins marker covers this height.
-		batch := cm.chainDB.NewBatch()
-		cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
-		cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
-			BestHash:   hash,
-			BestHeight: node.Height,
-		})
-		if err := batch.Write(); err != nil {
-			return fmt.Errorf("adopt-flushed: failed to persist tip advance: %w", err)
-		}
-	}
 	return nil
 }
 
@@ -1278,16 +1340,20 @@ type durableUTXOView interface {
 	// HasUTXODurable reports on-disk presence, bypassing cache and pending
 	// deletes.
 	HasUTXODurable(outpoint wire.OutPoint) bool
-	// FlushBatch stages all pending UTXO mutations into the caller's batch so
-	// they commit atomically with the tip pointer.
-	FlushBatch(batch storage.Batch) error
+	// StageFlush stages all pending UTXO mutations into the caller's batch so
+	// they commit atomically with the tip pointer; Commit after the write.
+	StageFlush(batch storage.Batch) (*StagedFlush, error)
 }
 
 func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	if !cm.beginMutation() {
-		return ErrShuttingDown
+		return mutationRefused()
 	}
 	defer cm.endMutation()
+	// Gate 6: a panic while the chain is being mutated leaves the in-memory
+	// view torn. Latch AbortNode (no further connects, no shutdown flush, exit
+	// non-zero) and re-panic; an outer recover can no longer resume on it.
+	defer latchOnPanic()
 
 	hash := block.Header.BlockHash()
 	node := cm.headerIndex.GetNode(hash)
@@ -1446,12 +1512,8 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// HeaderIndex contract that genesis is always node.Height==0 with
 	// node.Hash == params.GenesisHash.
 	if hash == cm.params.GenesisHash || node.Height == 0 {
-		// Store empty undo data and update chain state
-		cm.tipNode = node
-		cm.tipHeight = node.Height
-		cm.updateTipCache(node.Hash, node.Height)
-		node.Status |= StatusFullyValid | StatusDataStored
-		cm.advanceAppliedTip(hash, node.Height)
+		// Store empty undo data and update chain state. Gate 6: the tip moves
+		// only after the batch lands.
 		if cm.chainDB != nil {
 			batch := cm.chainDB.NewBatch()
 			// #126 (2026-05-27): fold the block body into the genesis batch
@@ -1473,12 +1535,19 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				BestHeight: node.Height,
 			})
 			if err := batch.Write(); err != nil {
-				return fmt.Errorf("failed to write genesis block batch: %w", err)
+				fault := SystemFault("write genesis block batch", fmt.Errorf("%w: %v", ErrChainstateWrite, err))
+				AbortNode(fault)
+				return fault
 			}
 			// Mirror Core blockstorage.cpp:1029 — set BLOCK_HAVE_UNDO after
 			// undo data is committed to disk.
 			cm.headerIndex.MarkUndoStored(hash)
 		}
+		cm.tipNode = node
+		cm.tipHeight = node.Height
+		cm.updateTipCache(node.Hash, node.Height)
+		node.Status |= StatusFullyValid | StatusDataStored
+		cm.advanceAppliedTip(hash, node.Height)
 		return nil
 	}
 
@@ -1620,7 +1689,16 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// separately from the rest of the first-pass work.
 		_utxoStart := time.Now()
 		for _, in := range tx.TxIn {
-			utxo := cm.utxoSet.GetUTXO(in.PreviousOutPoint)
+			// Gate 6 (audit F9): a coins-DB read error is NOT a missing coin.
+			// GetUTXOChecked retries once and latches AbortNode; the block
+			// is rolled back and the error returned as a system fault — no
+			// missing-inputs verdict, no mark, no ban (Core:
+			// CCoinsViewErrorCatcher, coins.cpp:415-427).
+			utxo, rerr := getUTXOChecked(cm.utxoSet, in.PreviousOutPoint)
+			if rerr != nil {
+				rollbackUTXOs()
+				return rerr
+			}
 			if utxo != nil {
 				cachedView.cache[in.PreviousOutPoint] = utxo
 				// Also snapshot into scriptView for the second-pass script
@@ -1875,58 +1953,55 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			ErrBadCoinbaseValue, coinbaseValue, subsidy+totalFees, subsidy, totalFees))
 	}
 
-	// Update chain state
-	cm.tipNode = node
-	cm.tipHeight = node.Height
-	cm.updateTipCache(node.Hash, node.Height)
-	// This block's UTXO mutations are now applied to the in-memory set, so
-	// the coins marker any subsequent flush stamps must name this block.
-	// Set on the success path only: every failure path above returns after
-	// rollbackUTXOs(), leaving the marker where it was.
+	// GATE 6: never commit a block the node can no longer vouch for. A coins-DB
+	// read error anywhere above (GetUTXO's legacy nil, a script-view fallback
+	// read) has already latched AbortNode at its source; whatever verdict-free
+	// path brought us here was computed on a view that may be missing coins.
+	// Core: CCoinsViewErrorCatcher aborts before ConnectBlock can return.
+	if IsAborted() {
+		rollbackUTXOs()
+		return abortedErr()
+	}
+
+	// WRITE BEFORE ADVANCE (gate 6, audit F3). The in-memory tip, the
+	// FullyValid bit and the IBD latch used to move HERE, before the batch
+	// below was written, and the batch's UTXO delta was forgotten by FlushBatch
+	// before batch.Write ran. A failed write (ENOSPC/EIO) then left the node
+	// running on a tip the disk did not have and a coin cache that had dropped
+	// the block's spends: a spent coin read back as unspent, so a later
+	// double-spend was ACCEPTED. Core moves the tip only after
+	// FlushStateToDisk succeeds and aborts the node when it does not
+	// (validation.cpp ConnectTip / FlushStateToDisk / AbortNode). So: stage,
+	// write, retry once, and only then publish; a second failure latches
+	// AbortNode and rolls the in-memory view back to the pre-block state.
 	//
+	// The applied-through coins marker is the one piece of state that must
+	// move FIRST, because StageFlush stamps it into the batch. It is restored
+	// below if the write fails.
+	prevAppliedHash, prevAppliedHeight, prevAppliedSet := cm.viewAppliedTip()
 	// ADVANCE only. A connect at or below the marker means we just re-applied
 	// a block the persisted set already reflects — a bug upstream, not here —
 	// and republishing the marker downwards would turn that into durable
 	// corruption on the next boot. Hold the marker and let the set's true
 	// high-water mark stand.
 	cm.advanceAppliedTip(hash, node.Height)
-	// G1/G3 fix (W101): set StatusFullyValid so recalculateBestTipLocked can
-	// filter invalid-marked nodes. StatusDataStored is set further down,
-	// AFTER batch.Write succeeds — see the persistence block below for why.
-	node.Status |= StatusFullyValid
-	// FIX-33 (W109 G14/G15): set StatusHaveUndo when undo data will be written
-	// to disk as part of this block connection. Mirrors Bitcoin Core's
-	// blockstorage.cpp:1029 (block.nStatus |= BLOCK_HAVE_UNDO after CBlockUndo
-	// is written to rev*.dat). When generateUndo is false (assume-valid IBD),
-	// no undo data is generated so the flag stays clear.
-	//
-	// #126: like StatusDataStored, this flag now sets on the post-batch.Write
-	// path so the in-memory headerindex never advertises HAVE_UNDO before
-	// the undo bytes are durable on disk.
-	// (Set below, gated on batch.Write success.)
 
 	// Exit IBD mode once the tip is recent — mirrors Core's
 	// IsInitialBlockDownload max-tip-age check (validation.cpp). The old
 	// condition (cm.tipHeight == cm.assumeValidHeight) was an exact equality
 	// that any height skip — notably an assumeUTXO snapshot import — jumps
 	// clean past, leaving the node stuck in IBD mode permanently. isIBD is
-	// latched: once false, nothing here sets it true again.
+	// latched: once false, nothing here sets it true again. Decided against
+	// the block being connected; applied only after it is durable.
 	const maxTipAgeSecs = 24 * 60 * 60 // Core DEFAULT_MAX_TIP_AGE
-	tipRecent := int64(cm.tipNode.Header.Timestamp) >= time.Now().Unix()-maxTipAgeSecs
+	tipRecent := int64(node.Header.Timestamp) >= time.Now().Unix()-maxTipAgeSecs
 	// G22 (W101): height-based assume-valid exit uses >= (Core semantics), not ==.
-	// An exact equality is jumped clean past by any height skip (e.g. an
-	// assumeUTXO snapshot import or a multi-block connect), leaving the node
-	// stuck in IBD permanently. Mirrors Core's IsInitialBlockDownload, which
-	// exits once the threshold is crossed (>=), never on an exact match.
-	pastAssumeValid := cm.assumeValidHeight > 0 && cm.tipHeight >= cm.assumeValidHeight
-	if cm.isIBD && (tipRecent || pastAssumeValid) {
-		cm.isIBD = false
-		log.Printf("chainmgr: exiting IBD mode at height %d (tip recent=%v, past-assume-valid=%v)", cm.tipHeight, tipRecent, pastAssumeValid)
-	}
+	pastAssumeValid := cm.assumeValidHeight > 0 && node.Height >= cm.assumeValidHeight
+	exitIBD := cm.isIBD && (tipRecent || pastAssumeValid)
+	isIBDAfter := cm.isIBD && !exitIBD
 
 	// Periodic UTXO flush during IBD
-	cm.blocksSinceFlush++
-	shouldFlush := cm.blocksSinceFlush >= cm.flushInterval
+	shouldFlush := cm.blocksSinceFlush+1 >= cm.flushInterval
 
 	_phasePersistStart = time.Now() // W76: script-validation → persistence boundary
 
@@ -1936,50 +2011,25 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// can never leave the chainstate pointing at a hash whose body the
 	// position-index lookup cannot resolve.
 	//
-	// #126 (2026-05-27): the block body (StoreBlockAtBatch) is now folded
-	// into every batch below. Pre-#126 the body was written by sync.go's
-	// HandleBlock arm at a separate non-batched callsite (StoreBlockAt),
-	// and the flat-file position-index PUT was a separate non-batched
-	// Pebble PUT (PebbleDB.Put runs with pebble.NoSync, so it was not
-	// durable until a later batch.Write triggered a Sync). A crash between
-	// those writes and ConnectBlock's chainstate batch could leave the
-	// position-index PUT un-fsynced while the chainstate advanced — the
-	// "tip advanced but chainDB.HasBlock=false" condition that #122
-	// gated against. Folding the body into this batch closes that crash
-	// window: body bytes hit blk*.dat (with fsync) immediately, and the
-	// Pebble keys that let readers find them commit together with the
-	// rest of the chainstate. StoreBlockAtBatch is idempotent (HasBlock
-	// short-circuit), so the sync.go pre-store remains a no-op cost on
-	// the hot path while still acting as side-branch staging for the
-	// out-of-order-P2P-fork case that ReorgTo's GetBlock relies on.
-	//
-	// Mirrors haskoin f768a01 which folded PrefixBlockData into
-	// connectBlockAt's WriteBatch. blockbrew's flat-file architecture
-	// means the actual block bytes go to blk*.dat (not a Pebble key),
-	// but every Pebble key that references those bytes is in this batch.
+	// #126 (2026-05-27): the block body (StoreBlockAtBatch) is folded into
+	// every batch below, so the Pebble keys that let readers find the body
+	// commit together with the rest of the chainstate. StoreBlockAtBatch is
+	// idempotent (HasBlock short-circuit). Mirrors haskoin f768a01.
 	//
 	// Pattern D (multi-block reorg atomicity, 2026-05-05): when cm.reorgBatch
 	// is set (we are inside ReorgTo), we APPEND every persistence write to
 	// that shared batch instead of opening + committing our own per-block.
-	// ReorgTo commits the union batch once, so a crash mid-reorg leaves the
-	// on-disk state at the pre-reorg tip OR the post-reorg tip — never a
-	// partial state where some blocks of the new chain are persisted but
-	// others are not.
+	// ReorgTo commits the union batch once (and applies the same
+	// write-before-forget / retry / AbortNode discipline to it).
 	if cm.chainDB != nil {
 		if cm.reorgBatch != nil {
 			// Reorg-batched path: append to the union batch ReorgTo opened.
 			// UTXO flush is done ONCE at the end of ReorgTo (not per-block)
 			// so the FRESH-bit dedup across the whole reorg span still works.
-			//
-			// #126: fold the body into the reorg union batch too. ReorgTo
-			// resolves block bodies via cm.chainDB.GetBlock before each
-			// inner ConnectBlock — those bodies are already on disk from
-			// earlier sync.go pre-stores, so StoreBlockAtBatch is a no-op
-			// here under normal operation. If a reorg replays an older
-			// branch whose body was orphaned (HasBlock = false), the body
-			// is restored as part of the union batch.
 			if err := cm.chainDB.StoreBlockAtBatch(cm.reorgBatch, hash, block, node.Height); err != nil {
-				return fmt.Errorf("failed to stage block body on reorg batch: %w", err)
+				cm.restoreAppliedTip(prevAppliedHash, prevAppliedHeight, prevAppliedSet)
+				rollbackUTXOs()
+				return SystemFault("stage block body on reorg batch", fmt.Errorf("%w: %v", ErrChainstateWrite, err))
 			}
 			if generateUndo {
 				cm.chainDB.WriteBlockUndoBatch(cm.reorgBatch, hash, blockUndo)
@@ -1992,110 +2042,101 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// #126: set HAVE_DATA + HAVE_UNDO on the in-memory headerindex.
 			// The actual on-disk commit happens later (ReorgTo's batch.Write),
 			// but the reorg-as-a-whole is atomic — if it fails, the entire
-			// in-memory chain state is rolled back via reorgInMemoryFallback
-			// semantics (per-block disconnects + connects). Setting the bits
-			// here keeps the reorg path symmetric with the regular path.
+			// in-memory chain state is rolled back. Setting the bits here
+			// keeps the reorg path symmetric with the regular path.
 			node.Status |= StatusDataStored
 			if generateUndo {
 				node.Status |= StatusHaveUndo
 			}
 		} else {
-			writeChainState := !cm.isIBD || shouldFlush
+			writeChainState := !isIBDAfter || shouldFlush
 
-			// #126: open a batch for every connect, not just when there is
-			// chainstate / undo work, so the body store can ride a batch
-			// even between IBD flush intervals. Without this, blocks
-			// reaching the "legacy non-batch" else-arm below (assume-valid
-			// IBD between flushes, generateUndo = false) would skip the
-			// atomic body-store guarantee — and a sync.go pre-store crash
-			// could leave the body in flat-file but no Pebble key
-			// referencing it until the next flush.
-			//
-			// Use NoSync for non-flush IBD batches — only the flush batch
-			// (which persists chain state) needs durability.
-			var batch storage.Batch
-			if cm.isIBD && !shouldFlush {
-				batch = cm.chainDB.NewBatchNoSync()
-			} else {
-				batch = cm.chainDB.NewBatch()
-			}
-
-			// Block body (idempotent: skipped if HasBlock(hash) already).
-			if err := cm.chainDB.StoreBlockAtBatch(batch, hash, block, node.Height); err != nil {
-				return fmt.Errorf("failed to stage block body: %w", err)
-			}
-
-			// Undo data keyed by block hash (not height, since heights can change during reorgs)
-			if generateUndo {
-				cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
-			}
-
-			// Height -> hash mapping
-			cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
-
-			// UTXO flush into the same atomic batch.
-			//
-			// DURABILITY (2026-06-06): flush the UTXO delta in the SAME synced
-			// batch whenever we advance the on-disk tip pointer
-			// (writeChainState), not only on the flushInterval (2000-block)
-			// shouldFlush cadence. At tip (isIBD=false) writeChainState is true
-			// every block, so the persisted ChainState tip used to run up to
-			// flushInterval blocks AHEAD of the persisted UTXO set; an unclean
-			// exit (OOM/SIGKILL, no final flush) then left the tip pointing past
-			// coins that only existed in the in-memory cache, and the next block
-			// failed "transaction input references missing UTXO" and wedged
-			// (the recurring [CHAINSTATE-CORRUPTION] banner — h=952343 on
-			// 2026-06-06, and 950146/950155/950304/952342 before it).
-			//
-			// writeChainState ⊇ shouldFlush (writeChainState = !isIBD ||
-			// shouldFlush) and writeChainState ⟹ a Sync batch (the NoSync arm
-			// above is gated on isIBD && !shouldFlush), so the UTXO delta always
-			// rides a durable batch together with the tip. FlushBatch is
-			// incremental (writes only the dirty set, then clears it), so at tip
-			// this costs one block's coins per ~10 min; during IBD writeChainState
-			// only fires on shouldFlush, so the 2000-block cadence is unchanged.
-			// Mirrors Bitcoin Core's invariant that CoinsTip's best-block is
-			// flushed atomically with the coins and never trails the active tip
-			// on disk (validation.cpp FlushStateToDisk).
-			if writeChainState {
-				type batchFlusher interface {
-					FlushBatch(storage.Batch) error
+			// buildAndWrite stages one complete atomic batch and writes it.
+			// It is safe to call twice: StoreBlockAtBatch is idempotent and
+			// StageFlush does not forget anything until Commit, which runs
+			// only after Write succeeded.
+			buildAndWrite := func() error {
+				// Use NoSync for non-flush IBD batches — only the flush batch
+				// (which persists chain state) needs durability.
+				var batch storage.Batch
+				if isIBDAfter && !shouldFlush {
+					batch = cm.chainDB.NewBatchNoSync()
+				} else {
+					batch = cm.chainDB.NewBatch()
 				}
-				if f, ok := cm.utxoSet.(batchFlusher); ok {
-					if err := f.FlushBatch(batch); err != nil {
-						return fmt.Errorf("failed to flush UTXOs to batch: %w", err)
+
+				// Block body (idempotent: skipped if HasBlock(hash) already).
+				if err := cm.chainDB.StoreBlockAtBatch(batch, hash, block, node.Height); err != nil {
+					return fmt.Errorf("stage block body: %w", err)
+				}
+
+				// Undo data keyed by block hash (not height, since heights can change during reorgs)
+				if generateUndo {
+					cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
+				}
+
+				// Height -> hash mapping
+				cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
+
+				// UTXO delta into the same atomic batch whenever the on-disk
+				// tip pointer advances (DURABILITY 2026-06-06: the persisted
+				// tip must never lead the persisted coins; at tip that is
+				// every block, during IBD the flushInterval cadence). Mirrors
+				// Core's invariant that CoinsTip's best-block is flushed
+				// atomically with the coins (validation.cpp FlushStateToDisk).
+				var staged *StagedFlush
+				if writeChainState {
+					if f, ok := cm.utxoSet.(batchStager); ok {
+						st, err := f.StageFlush(batch)
+						if err != nil {
+							return fmt.Errorf("stage UTXO delta: %w", err)
+						}
+						staged = st
 					}
+					// Chain state (tip hash + height) in the same atomic batch
+					cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+						BestHash:   hash,
+						BestHeight: node.Height,
+					})
 				}
+
+				if err := batch.Write(); err != nil {
+					return fmt.Errorf("write atomic block batch: %w", err)
+				}
+				// Durable: only now may the UTXO set forget the delta.
+				staged.Commit()
+				return nil
 			}
 
-			// Chain state (tip hash + height) in the same atomic batch
-			if writeChainState {
-				cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
-					BestHash:   hash,
-					BestHeight: node.Height,
-				})
-			}
-
-			if err := batch.Write(); err != nil {
-				return fmt.Errorf("failed to write atomic block batch: %w", err)
+			if err := buildAndWrite(); err != nil {
+				log.Printf("chainmgr: persisting block %d (%s) failed: %v — retrying once",
+					node.Height, hash.String()[:16], err)
+				if err2 := buildAndWrite(); err2 != nil {
+					fault := SystemFault("persist connected block",
+						fmt.Errorf("%w: block %s height %d: %v (retry: %v)",
+							ErrChainstateWrite, hash.String()[:16], node.Height, err, err2))
+					// Core FatalError -> AbortNode: no verdict, no further
+					// connects, no shutdown flush. The batch never landed
+					// (Pebble batches are atomic), so disk is at the previous
+					// block; put memory back there too.
+					AbortNode(fault)
+					cm.restoreAppliedTip(prevAppliedHash, prevAppliedHeight, prevAppliedSet)
+					rollbackUTXOs()
+					return fault
+				}
 			}
 
 			// #126: now that body + position index + undo + height + UTXO +
 			// chainstate are atomically durable, set the in-memory
-			// HAVE_DATA + HAVE_UNDO flags. Previously these were set BEFORE
-			// the batch.Write, which left a window where a write failure
-			// returned an error but the in-memory headerindex already
-			// advertised data presence. Mirrors Bitcoin Core's
-			// ReceivedBlockTransactions + blockstorage.cpp:1029 ordering:
-			// the in-memory flag transition follows the durable on-disk
-			// write.
+			// HAVE_DATA + HAVE_UNDO flags. Mirrors Bitcoin Core's
+			// ReceivedBlockTransactions + blockstorage.cpp:1029 ordering.
 			node.Status |= StatusDataStored
 			if generateUndo {
 				node.Status |= StatusHaveUndo
 			}
 
 			if shouldFlush {
-				log.Printf("chainmgr: UTXO flush at height %d (atomic)", cm.tipHeight)
+				log.Printf("chainmgr: UTXO flush at height %d (atomic)", node.Height)
 			}
 		}
 	} else {
@@ -2109,6 +2150,18 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		}
 	}
 
+	// The block is durable (or staged into the reorg union batch): publish it.
+	cm.tipNode = node
+	cm.tipHeight = node.Height
+	cm.updateTipCache(node.Hash, node.Height)
+	// G1/G3 fix (W101): set StatusFullyValid so recalculateBestTipLocked can
+	// filter invalid-marked nodes.
+	node.Status |= StatusFullyValid
+	if exitIBD {
+		cm.isIBD = false
+		log.Printf("chainmgr: exiting IBD mode at height %d (tip recent=%v, past-assume-valid=%v)", cm.tipHeight, tipRecent, pastAssumeValid)
+	}
+	cm.blocksSinceFlush++
 	if shouldFlush {
 		cm.blocksSinceFlush = 0
 	}
@@ -2680,9 +2733,13 @@ func (cm *ChainManager) CurrentReorgBatch() storage.Batch {
 // MaybeUpdateMempoolForReorg in validation.cpp.
 func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	if !cm.beginMutation() {
-		return ErrShuttingDown
+		return mutationRefused()
 	}
 	defer cm.endMutation()
+	// Gate 6: a panic while the chain is being mutated leaves the in-memory
+	// view torn. Latch AbortNode (no further connects, no shutdown flush, exit
+	// non-zero) and re-panic; an outer recover can no longer resume on it.
+	defer latchOnPanic()
 
 	// disconnectedBlock and disconnectedHeight are captured under the lock
 	// and used to fire the OnBlockDisconnected callback after the lock is
@@ -2902,10 +2959,19 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 			if err := cm.chainDB.DeleteBlockHeight(prevHeight); err != nil {
 				log.Printf("chainmgr: warning: failed to drop height index %d on disconnect: %v", prevHeight, err)
 			}
-			cm.chainDB.SetChainState(&storage.ChainState{
+			// Gate 6: this write used to be fire-and-forget. A failed tip
+			// write leaves disk at the pre-disconnect state while memory has
+			// undone the block; latch AbortNode so the torn pair can never be
+			// flushed, and the restart resumes from disk.
+			if err := cm.chainDB.SetChainState(&storage.ChainState{
 				BestHash:   parent.Hash,
 				BestHeight: parent.Height,
-			})
+			}); err != nil {
+				fault := SystemFault("persist tip after disconnect",
+					fmt.Errorf("%w: %v", ErrChainstateWrite, err))
+				AbortNode(fault)
+				return fault
+			}
 		}
 	}
 
@@ -2936,7 +3002,9 @@ var ErrShuttingDown = errors.New("chain manager is shutting down")
 // before it waits, so a mutation that slipped past the first check but landed
 // after Wait() returned would otherwise escape the barrier entirely.
 func (cm *ChainManager) beginMutation() bool {
-	if cm.quiescing.Load() {
+	// Gate 6: after AbortNode nothing may move the chain — the in-memory view
+	// may be torn and the process is on its way to a non-zero exit.
+	if cm.quiescing.Load() || IsAborted() {
 		return false
 	}
 	cm.mutationWG.Add(1)
@@ -3014,9 +3082,13 @@ var ErrReorgTooDeep = errors.New("reorg span exceeds MaxReorgDepth")
 // helpers read it under cm.mu.
 func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 	if !cm.beginMutation() {
-		return ErrShuttingDown
+		return mutationRefused()
 	}
 	defer cm.endMutation()
+	// Gate 6: a panic while the chain is being mutated leaves the in-memory
+	// view torn. Latch AbortNode (no further connects, no shutdown flush, exit
+	// non-zero) and re-panic; an outer recover can no longer resume on it.
+	defer latchOnPanic()
 
 	// Serialize against any concurrent ReorgTo. Two reorgs would otherwise
 	// share cm.reorgBatch and tangle their writes; the chainstate write at
@@ -3222,6 +3294,21 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 			// errors roll back WITHOUT a mark (Core never marks a block failed
 			// for a local error) and are returned unwrapped, so the caller
 			// does not punish a peer for them either.
+			//
+			// Gate 6 (audit F9): a coins-DB read error used to arrive here as
+			// a nil coin, i.e. as a "missing prevout", and was marked +
+			// punished. Reads now fail typed and latch AbortNode at the
+			// source, so a system fault — or ANY error once the latch is set,
+			// since the view it was computed on may be missing coins — rolls
+			// back without a mark and is returned as a non-verdict.
+			if IsSystemFault(err) || IsAborted() {
+				rollbackToOriginalTip()
+				if !IsAborted() {
+					AbortNode(err)
+				}
+				return SystemFault("reorg connect",
+					fmt.Errorf("connect block %s during reorg: %w", node.Hash.String()[:16], err))
+			}
 			if !IsBlockMutationErr(err) {
 				if _, verdict := AsBlockInvalid(err); verdict || isLocalUTXOGap(err) {
 					cm.mu.Lock()
@@ -3239,21 +3326,21 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 		}
 	}
 
-	// Drain the in-memory UTXO mutations from every Connect/Disconnect we
-	// just executed into the same batch. FlushBatch resets the dirty /
-	// deleted / fresh maps so the post-commit cache is consistent with
-	// disk. This is the moment that turns the per-block in-memory UTXO
-	// updates into durable on-disk writes — must happen before batch.Write.
-	type batchFlusher interface {
-		FlushBatch(storage.Batch) error
-	}
+	// Stage the in-memory UTXO mutations from every Connect/Disconnect we just
+	// executed into the same batch. Gate 6: staging does NOT forget them — the
+	// tracking is cleared only by Commit, after the union batch is durable.
+	// The old FlushBatch cleared dirty/deleted/fresh here, so a failed write
+	// below lost every pending mutation outside the reorg journal's reach.
 	cm.mu.Lock()
-	if f, ok := cm.utxoSet.(batchFlusher); ok {
-		if err := f.FlushBatch(batch); err != nil {
+	var staged *StagedFlush
+	if f, ok := cm.utxoSet.(batchStager); ok {
+		st, err := f.StageFlush(batch)
+		if err != nil {
 			cm.mu.Unlock()
 			rollbackToOriginalTip()
-			return fmt.Errorf("failed to flush reorg UTXO mutations to batch: %w", err)
+			return SystemFault("stage reorg UTXO delta", err)
 		}
+		staged = st
 	}
 	cm.mu.Unlock()
 
@@ -3263,14 +3350,35 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 	// After this call returns nil, on-disk state is at newTip.
 	//
 	// A Pebble batch write is all-or-nothing: on error nothing is committed,
-	// so the on-disk state is still the pre-reorg tip and we roll the
-	// in-memory state back to match (FlushBatch already reset the cache's
-	// dirty/deleted/fresh tracking, so DiscardCache here also drops the now
-	// batch-only mutations and re-reads the pre-reorg coins from disk).
+	// so the on-disk state is still the pre-reorg tip. Retry once; on a second
+	// failure roll the in-memory state back to match (the journal restores the
+	// exact pre-reorg view) and latch AbortNode — Core FatalError, never a
+	// verdict on the branch.
 	if err := batch.Write(); err != nil {
-		rollbackToOriginalTip()
-		return fmt.Errorf("failed to commit multi-block reorg batch: %w", err)
+		log.Printf("chainmgr: reorg batch write failed (%v); retrying once", err)
+		// The union batch cannot be rebuilt here (every replayed block staged
+		// into it), so the retry re-commits the same batch; a backend that
+		// refuses to re-commit a failed batch by panicking is treated as a
+		// second failure rather than a crash mid-rollback.
+		rewrite := func() (werr error) {
+			defer func() {
+				if r := recover(); r != nil {
+					werr = fmt.Errorf("batch not re-committable: %v", r)
+				}
+			}()
+			return batch.Write()
+		}
+		if err2 := rewrite(); err2 != nil {
+			fault := SystemFault("commit multi-block reorg batch",
+				fmt.Errorf("%w: %v (retry: %v)", ErrChainstateWrite, err, err2))
+			AbortNode(fault)
+			rollbackToOriginalTip()
+			return fault
+		}
 	}
+	cm.mu.Lock()
+	staged.Commit()
+	cm.mu.Unlock()
 
 	// Reorg fully applied and durable — the recorded pre-images are no longer
 	// needed; drop them.
@@ -3476,9 +3584,13 @@ func (cm *ChainManager) OpenUTXOSnapshot() (*UTXOSnapshot, error) {
 // Descendants of the invalid block are marked with StatusInvalidChild.
 func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
 	if !cm.beginMutation() {
-		return ErrShuttingDown
+		return mutationRefused()
 	}
 	defer cm.endMutation()
+	// Gate 6: a panic while the chain is being mutated leaves the in-memory
+	// view torn. Latch AbortNode (no further connects, no shutdown flush, exit
+	// non-zero) and re-panic; an outer recover can no longer resume on it.
+	defer latchOnPanic()
 
 	node := cm.headerIndex.GetNode(hash)
 	if node == nil {
@@ -3672,9 +3784,13 @@ func (cm *ChainManager) isAncestorOfTip(node *BlockNode) bool {
 // This implements the reconsiderblock RPC behavior.
 func (cm *ChainManager) ReconsiderBlock(hash wire.Hash256) error {
 	if !cm.beginMutation() {
-		return ErrShuttingDown
+		return mutationRefused()
 	}
 	defer cm.endMutation()
+	// Gate 6: a panic while the chain is being mutated leaves the in-memory
+	// view torn. Latch AbortNode (no further connects, no shutdown flush, exit
+	// non-zero) and re-panic; an outer recover can no longer resume on it.
+	defer latchOnPanic()
 
 	node := cm.headerIndex.GetNode(hash)
 	if node == nil {
@@ -3871,9 +3987,13 @@ func (cm *ChainManager) restoreBlockFailures() int {
 // Only the last PreciousBlock call matters (new calls override previous).
 func (cm *ChainManager) PreciousBlock(hash wire.Hash256) error {
 	if !cm.beginMutation() {
-		return ErrShuttingDown
+		return mutationRefused()
 	}
 	defer cm.endMutation()
+	// Gate 6: a panic while the chain is being mutated leaves the in-memory
+	// view torn. Latch AbortNode (no further connects, no shutdown flush, exit
+	// non-zero) and re-panic; an outer recover can no longer resume on it.
+	defer latchOnPanic()
 
 	node := cm.headerIndex.GetNode(hash)
 	if node == nil {

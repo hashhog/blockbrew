@@ -129,6 +129,12 @@ type UTXOSet struct {
 	// per-block on-disk flush is deferred), so a blind cache discard would
 	// lose committed state. nil on the hot path (single nil-check per mutation).
 	reorgJournal map[wire.OutPoint]utxoPreimage
+
+	// mutGen counts mutations of the tracked state (cache/dirty/deleted/fresh
+	// changes made by add/spend/undo/rollback). StagedFlush.Commit uses it to
+	// prove nothing changed between staging a batch and that batch landing.
+	// Guarded by mu.
+	mutGen uint64
 }
 
 // utxoPreimage is the snapshot of one outpoint's cache + tracking-flag state
@@ -163,47 +169,129 @@ func NewUTXOSetWithMaxCache(db *storage.ChainDB, maxCacheBytes int64) *UTXOSet {
 }
 
 // GetUTXO retrieves a UTXO by outpoint. Checks cache first, then database.
+//
+// GATE 6: a database READ ERROR is not "absent". The legacy UTXOView contract
+// has no error return, so GetUTXO still answers nil on a failed read — but only
+// after GetUTXOChecked has retried once and latched AbortNode (Core:
+// CCoinsViewErrorCatcher aborts on any coins-DB read error, coins.cpp:415-427).
+// Every caller that turns a nil into a decision must therefore either use
+// GetUTXOChecked (ConnectBlock, CheckBIP30) or check IsAborted() before acting
+// on the nil (the verdict classifier and the persistence step both do).
 func (u *UTXOSet) GetUTXO(outpoint wire.OutPoint) *UTXOEntry {
+	entry, _ := u.GetUTXOChecked(outpoint)
+	return entry
+}
+
+// GetUTXOChecked is GetUTXO with a typed system-error channel: (nil, nil) means
+// the coin is genuinely absent or spent; a non-nil error means the coins
+// database could not be read (after one retry) and the node has been aborted.
+// The error wraps ErrCoinsDBRead in a SystemFaultError — never a verdict.
+func (u *UTXOSet) GetUTXOChecked(outpoint wire.OutPoint) (*UTXOEntry, error) {
 	u.mu.RLock()
 
 	// Check if deleted
 	if u.deleted[outpoint] {
 		u.mu.RUnlock()
-		return nil
+		return nil, nil
 	}
 
 	// Check cache first
 	if entry, ok := u.cache[outpoint]; ok {
 		u.hits++
 		u.mu.RUnlock()
-		return entry
+		return entry, nil
 	}
 	u.mu.RUnlock()
 
 	// Not in cache, try database
 	if u.db == nil {
-		return nil
+		return nil, nil
 	}
 
 	key := storage.MakeUTXOKey(outpoint)
-	data, err := u.db.DB().Get(key)
-	if err != nil || data == nil {
-		return nil
+	data, err := u.readCoinKey(key)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
 	}
 
 	entry, err := DeserializeUTXOEntry(data)
 	if err != nil {
-		return nil
+		// An undecodable record is corruption of the coins DB, not a missing
+		// coin. Core: a deserialisation failure in CCoinsViewDB throws and the
+		// error catcher aborts.
+		ferr := SystemFault("decode coin", fmt.Errorf("%w: %s:%d: %v",
+			ErrCoinsDBRead, outpoint.Hash.String()[:16], outpoint.Index, err))
+		AbortNode(ferr)
+		return nil, ferr
 	}
 
-	// Cache the entry for future lookups
+	// Cache the entry for future lookups — unless a spend landed while the
+	// lock was dropped (then the coin is gone and must not be resurrected).
 	u.mu.Lock()
+	if u.deleted[outpoint] {
+		u.mu.Unlock()
+		return nil, nil
+	}
+	if cached, ok := u.cache[outpoint]; ok {
+		u.mu.Unlock()
+		return cached, nil
+	}
 	u.cache[outpoint] = entry
 	u.cacheBytes += estimateEntrySize(entry)
 	u.misses++
 	u.mu.Unlock()
 
-	return entry
+	return entry, nil
+}
+
+// readCoinKey reads one coins-DB key with Core's error discipline: a failed
+// read is retried once (a transient EINTR/EAGAIN-class hiccup must not take
+// the node down), and a second failure latches AbortNode and returns a
+// SystemFaultError. ErrDBClosed is the shutdown sequence closing Pebble under
+// a late reader: it is reported as a system fault but does not latch, because
+// the process is already on its way out and the chainstate flush that the
+// latch exists to stop has already run.
+func (u *UTXOSet) readCoinKey(key []byte) ([]byte, error) {
+	data, err := u.db.DB().Get(key)
+	if err == nil {
+		return data, nil
+	}
+	if errors.Is(err, storage.ErrDBClosed) {
+		return nil, SystemFault("read coin", fmt.Errorf("%w: %v", ErrCoinsDBRead, err))
+	}
+	log.Printf("utxoset: coins DB read failed (%v); retrying once", err)
+	data, err2 := u.db.DB().Get(key)
+	if err2 == nil {
+		return data, nil
+	}
+	ferr := SystemFault("read coin", fmt.Errorf("%w: %v (retry: %v)", ErrCoinsDBRead, err, err2))
+	if !errors.Is(err2, storage.ErrDBClosed) {
+		AbortNode(ferr)
+	}
+	return nil, ferr
+}
+
+// hasCoinKey is readCoinKey for an existence probe.
+func (u *UTXOSet) hasCoinKey(key []byte) (bool, error) {
+	ok, err := u.db.DB().Has(key)
+	if err == nil {
+		return ok, nil
+	}
+	if errors.Is(err, storage.ErrDBClosed) {
+		return false, SystemFault("probe coin", fmt.Errorf("%w: %v", ErrCoinsDBRead, err))
+	}
+	ok, err2 := u.db.DB().Has(key)
+	if err2 == nil {
+		return ok, nil
+	}
+	ferr := SystemFault("probe coin", fmt.Errorf("%w: %v (retry: %v)", ErrCoinsDBRead, err, err2))
+	if !errors.Is(err2, storage.ErrDBClosed) {
+		AbortNode(ferr)
+	}
+	return false, ferr
 }
 
 // estimateEntrySize estimates the memory usage of a UTXO entry in bytes.
@@ -353,7 +441,7 @@ func (u *UTXOSet) SpendUTXOChecked(outpoint wire.OutPoint) error {
 	// Check if in database
 	if u.db != nil {
 		key := storage.MakeUTXOKey(outpoint)
-		exists, err := u.db.DB().Has(key)
+		exists, err := u.hasCoinKey(key)
 		if err != nil {
 			return err
 		}
@@ -387,7 +475,7 @@ func (u *UTXOSet) HasUTXO(outpoint wire.OutPoint) bool {
 	}
 
 	key := storage.MakeUTXOKey(outpoint)
-	exists, err := u.db.DB().Has(key)
+	exists, err := u.hasCoinKey(key)
 	return err == nil && exists
 }
 
@@ -412,7 +500,9 @@ func (u *UTXOSet) HasUTXODurable(outpoint wire.OutPoint) bool {
 		return false
 	}
 	key := storage.MakeUTXOKey(outpoint)
-	exists, err := u.db.DB().Has(key)
+	// A read error is "no evidence" (fail-closed: adoption refuses) AND a
+	// latched AbortNode — never a guess either way.
+	exists, err := u.hasCoinKey(key)
 	return err == nil && exists
 }
 
@@ -611,7 +701,32 @@ func (u *UTXOSet) Flush() error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
-	return u.flushLocked()
+	return u.flushRetryLocked(false)
+}
+
+// flushRetryLocked is flushLockedDiscard with Core's FlushStateToDisk failure
+// discipline (gate 6): refuse outright once the node is aborted (the in-memory
+// view may be torn — a recovered panic, a failed connect — and must never reach
+// disk); on a write failure retry ONCE (flushLockedDiscard leaves every pending
+// add and delete in place on failure, and a re-run rewrites the same keys with
+// the same values), and on a second failure latch AbortNode. Callers MUST hold
+// u.mu.
+func (u *UTXOSet) flushRetryLocked(discardCache bool) error {
+	if IsAborted() {
+		return abortedErr()
+	}
+	err := u.flushLockedDiscard(discardCache)
+	if err == nil {
+		return nil
+	}
+	log.Printf("utxoset: UTXO flush failed (%v); retrying once", err)
+	if err2 := u.flushLockedDiscard(discardCache); err2 == nil {
+		return nil
+	} else {
+		ferr := SystemFault("flush UTXO set", fmt.Errorf("%w: %v (retry: %v)", ErrChainstateWrite, err, err2))
+		AbortNode(ferr)
+		return ferr
+	}
 }
 
 // snapshotFlushCheckCoins is Core's PopulateAndValidateSnapshot check
@@ -648,7 +763,7 @@ func (u *UTXOSet) flushSnapshotIfOverBudget(maxCacheBytes int64) (cacheBytes int
 	if cacheBytes <= maxCacheBytes {
 		return cacheBytes, false, nil
 	}
-	if err := u.flushLockedDiscard(true); err != nil {
+	if err := u.flushRetryLocked(true); err != nil {
 		return cacheBytes, false, err
 	}
 	return cacheBytes, true, nil
@@ -874,7 +989,7 @@ func (u *UTXOSet) MaybeFlush(forceAfterBlocks int) error {
 
 	// Flush if cache exceeds size limit or we've connected enough blocks
 	if u.cacheBytes > u.maxCacheBytes || u.blocksSinceFlush >= forceAfterBlocks {
-		return u.flushLocked()
+		return u.flushRetryLocked(false)
 	}
 	return nil
 }
@@ -950,8 +1065,37 @@ func (u *UTXOSet) MaxCacheBytes() int64 {
 	return u.maxCacheBytes
 }
 
-// FlushBatch writes all dirty entries using a provided batch (for atomic block connection).
-func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
+// StagedFlush is a UTXO delta that has been staged into a caller's batch but
+// NOT yet forgotten by the set. See StageFlush.
+type StagedFlush struct {
+	u         *UTXOSet
+	gen       uint64
+	published bool
+	done      bool
+}
+
+// StageFlush stages every pending UTXO mutation (dirty puts, deletes, and the
+// applied-through marker) into the caller's batch, for atomic commit with the
+// block body / height row / tip pointer the caller adds to the same batch.
+//
+// WRITE BEFORE FORGET (gate 6, audit F3). The previous FlushBatch cleared the
+// dirty / deleted / fresh tracking HERE — before the caller had written the
+// batch. A failed batch.Write (ENOSPC, EIO) then lost every pending delete: a
+// spent coin was read back from disk as unspent and a later double-spend was
+// ACCEPTED; every pending create was lost too, so the next honest block failed
+// missing-inputs. Core's CCoinsViewCache is cleared only after BatchWrite
+// succeeds (coins.cpp, validation.cpp FlushStateToDisk). So staging now leaves
+// the set untouched; the caller MUST call Commit() after batch.Write() returns
+// nil, and must simply drop the StagedFlush (the set is unchanged and fully
+// re-stageable) if the write fails.
+//
+// Refuses once the node is aborted: an aborted node's view may be torn (a
+// recovered panic mid-connect) and must never reach disk — this is what makes
+// the graceful-shutdown flush a no-op after AbortNode.
+func (u *UTXOSet) StageFlush(batch storage.Batch) (*StagedFlush, error) {
+	if IsAborted() {
+		return nil, abortedErr()
+	}
 	u.mu.Lock()
 	defer u.mu.Unlock()
 
@@ -975,27 +1119,57 @@ func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 	// the coins it describes (Core: txdb.cpp:158-159). ChainManager passes
 	// the same batch that carries the block body, the height row and the
 	// chain-tip pointer, so all four commit or none do. Same floor discipline
-	// as flushLocked: the marker is refused below the bound, and the bound is
-	// subsumed once one is published at or above it. The clearing is
-	// optimistic here because the caller writes the batch — exactly as the
-	// dirty/deleted maps below have always been cleared.
-	if u.stageAppliedTip(batch) {
+	// as flushLocked: the marker is refused below the bound; the bound is
+	// subsumed in Commit, once the marker is actually durable.
+	published := u.stageAppliedTip(batch)
+
+	return &StagedFlush{u: u, gen: u.mutGen, published: published}, nil
+}
+
+// Commit records that the batch carrying this staged flush was written
+// successfully: the staged mutations are durable, so the tracking maps can be
+// cleared and clean entries evicted. Call it ONLY after batch.Write() returned
+// nil. Idempotent.
+//
+// If the set was mutated between StageFlush and Commit (callers hold the chain
+// lock across both, so this is not expected), the tracking is NOT cleared —
+// those entries are simply re-written by the next flush, which is idempotent —
+// except FRESH, which is dropped wholesale: a staged-and-written entry still
+// marked FRESH would let a later spend skip its disk delete (a resurrected
+// coin), while a spurious non-FRESH only costs a redundant delete.
+func (sf *StagedFlush) Commit() {
+	if sf == nil || sf.done {
+		return
+	}
+	sf.done = true
+	u := sf.u
+	u.mu.Lock()
+	defer u.mu.Unlock()
+
+	if sf.published {
 		u.subsumeAppliedFloorLocked()
 	}
-
-	// Clear dirty, deleted, and fresh tracking (caller will write the batch)
-	u.dirty = make(map[wire.OutPoint]bool, 100_000)
-	u.deleted = make(map[wire.OutPoint]bool, 100_000)
-	u.fresh = make(map[wire.OutPoint]bool, 100_000)
 	u.flushes++
 	u.blocksSinceFlush = 0
 
+	if u.mutGen != sf.gen {
+		log.Printf("utxoset: UTXO set mutated between staging and commit of a batch flush; " +
+			"keeping dirty/deleted tracking for the next flush and clearing FRESH")
+		u.fresh = make(map[wire.OutPoint]bool, 100_000)
+		return
+	}
+
+	// Clear dirty, deleted, and fresh tracking (pre-size for next batch)
+	u.dirty = make(map[wire.OutPoint]bool, 100_000)
+	u.deleted = make(map[wire.OutPoint]bool, 100_000)
+	u.fresh = make(map[wire.OutPoint]bool, 100_000)
+
 	// Evict clean cache entries to bring memory under the limit, same as
-	// Flush(). After the caller writes the batch, all entries are persisted
-	// and can be safely re-read from disk. Keep the warm working set resident
-	// up to the configured -dbcache budget (Core CCoinsViewCache parity); only
-	// evict when strictly OVER budget and only down TO it — not to a quarter.
-	// Kept byte-for-byte in sync with flushLocked's eviction block.
+	// Flush(). All entries are now persisted and can be safely re-read from
+	// disk. Keep the warm working set resident up to the configured -dbcache
+	// budget (Core CCoinsViewCache parity); only evict when strictly OVER
+	// budget and only down TO it — not to a quarter. Kept byte-for-byte in
+	// sync with flushLocked's eviction block.
 	if u.cacheBytes > u.maxCacheBytes {
 		target := u.maxCacheBytes
 		newCache := make(map[wire.OutPoint]*UTXOEntry, len(u.cache))
@@ -1010,14 +1184,13 @@ func (u *UTXOSet) FlushBatch(batch storage.Batch) error {
 		u.cache = newCache
 		u.cacheBytes = newBytes
 	}
-
-	return nil
 }
 
 // journalPre records the pre-mutation state of op the first time it is touched
 // under an active reorg journal. Callers MUST already hold u.mu. No-op (one
 // map-nil comparison) when no journal is active — i.e. the entire hot path.
 func (u *UTXOSet) journalPre(op wire.OutPoint) {
+	u.mutGen++ // every tracked-state mutator calls journalPre first
 	if u.reorgJournal == nil {
 		return
 	}
@@ -1067,6 +1240,7 @@ func (u *UTXOSet) RollbackReorgJournal() {
 	if u.reorgJournal == nil {
 		return
 	}
+	u.mutGen++
 	setBool := func(m map[wire.OutPoint]bool, op wire.OutPoint, v bool) {
 		if v {
 			m[op] = true
@@ -2059,7 +2233,10 @@ func (u *UTXOSet) SpendUTXOWithCoin(outpoint wire.OutPoint) (*UTXOEntry, bool) {
 			return nil, false
 		}
 		key := storage.MakeUTXOKey(outpoint)
-		data, err := u.db.DB().Get(key)
+		// Gate 6: a read error is not "absent" — readCoinKey retries once
+		// and latches AbortNode, and the disconnect that called us then
+		// stops at the latch instead of acting on the miss.
+		data, err := u.readCoinKey(key)
 		if err == nil && data != nil {
 			if entry, derr := DeserializeUTXOEntry(data); derr == nil {
 				snapshot = &UTXOEntry{

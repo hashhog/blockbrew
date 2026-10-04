@@ -2347,9 +2347,24 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		if r := recover(); r != nil {
 			log.Printf("WARN: panic in handleSubmitBlock recovered: %v", r)
 			result = nil
+			if consensus.IsAborted() {
+				// The panic came from inside a chain mutation, which
+				// latched AbortNode (gate 6): a fatal error, not a
+				// malformed submission.
+				rpcErr = &RPCError{Code: RPCErrVerify, Message: consensus.ErrNodeAborted.Error()}
+				return
+			}
 			rpcErr = &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("Block processing panic: %v", r)}
 		}
 	}()
+
+	// Gate 6: after AbortNode the node accepts nothing and judges nothing.
+	// Core answers a submitblock whose processing hit a FatalError with
+	// RPC_VERIFY_ERROR (BIP22ValidationResult: state.IsError()), never a
+	// BIP-22 reject token.
+	if consensus.IsAborted() {
+		return nil, &RPCError{Code: RPCErrVerify, Message: consensus.ErrNodeAborted.Error()}
+	}
 
 	// NetworkDisable gate: refuse submissions while a `dumptxoutset
 	// rollback` dance is in progress. Mirrors Core's NetworkDisable RAII
@@ -2655,6 +2670,14 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		if err := s.chainMgr.ProcessSubmittedBlock(block); err != nil {
 			if errors.Is(err, consensus.ErrSideBranchAccepted) {
 				return "inconclusive", nil
+			}
+			// Gate 6: a system fault (failed chainstate write, coins-DB read
+			// error, AbortNode) is not a BIP-22 verdict. It used to fall
+			// through to the generic "rejected" (or, for a coins-DB read
+			// error, "bad-txns-inputs-missingorspent"). Core:
+			// BIP22ValidationResult -> state.IsError() -> RPC_VERIFY_ERROR.
+			if consensus.IsSystemFault(err) || consensus.IsAborted() {
+				return nil, &RPCError{Code: RPCErrVerify, Message: err.Error()}
 			}
 			return bip22ResultStringForBlock(block, err), nil
 		}

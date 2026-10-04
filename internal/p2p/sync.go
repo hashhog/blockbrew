@@ -3707,6 +3707,16 @@ func (sm *SyncManager) validationWorker() {
 					//   an attacker can modify witness bytes on a valid block without
 					//   changing its hash. Core ref: validation.cpp:3870-3916
 					//   (CheckWitnessMalleation, BLOCK_MUTATED).
+					// Core BLOCK_TIME_FUTURE (time-too-new): a header-receipt
+					// wall-clock gate, not a verdict on the block — never
+					// marked, never punished (net_processing.cpp
+					// MaybePunishNodeForBlock: BLOCK_TIME_FUTURE -> break).
+					// It was a persisted mark + Misbehaving(100) here. Hold it
+					// and re-request later.
+					if consensus.IsHeaderTimeFutureErr(err) {
+						sm.requeueForRedownload(bwr)
+						return
+					}
 					transientMutation := errors.Is(err, consensus.ErrBlockMutated) ||
 						errors.Is(err, consensus.ErrBadMerkleRoot) ||
 						errors.Is(err, consensus.ErrBadWitnessNonceSize) ||
@@ -3932,7 +3942,7 @@ func (sm *SyncManager) connectionWorker() {
 		// flag is latched (BUG-REPORT.md fix #4), connectPendingBlocks
 		// is a no-op until the operator restarts. Prevents the 50k/min
 		// retry storm we saw on May 1 (h=938361 wedge log).
-		if sm.chainstateCorrupted.Load() {
+		if sm.chainstateCorrupted.Load() || consensus.IsAborted() {
 			return
 		}
 
@@ -4013,6 +4023,11 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 	// the node. Without this guard the retry ticker would re-enter the
 	// connect loop every 5s and re-print the corruption banner.
 	if sm.chainstateCorrupted.Load() {
+		return
+	}
+	// Gate 6: after AbortNode no block is connected (Core: a fatal error
+	// halts). The process is shutting down with a non-zero exit.
+	if consensus.IsAborted() {
 		return
 	}
 
@@ -4111,7 +4126,14 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 			func() {
 				defer func() {
 					if r := recover(); r != nil {
-						connectErr = fmt.Errorf("PANIC in ConnectBlock: %v", r)
+						// Gate 6: a panic mid-connect leaves the chain
+						// view torn. The chain manager has already latched
+						// AbortNode (latchOnPanic) when the panic came from
+						// inside it; latch here too for a panic anywhere
+						// else on this path. Never resume, never a verdict.
+						connectErr = consensus.SystemFault("p2p connect",
+							fmt.Errorf("%w: %v", consensus.ErrPanicDuringConnect, r))
+						consensus.AbortNode(connectErr)
 					}
 				}()
 				// reorg-drop fix part 2: post-IBD, route through the
@@ -4157,6 +4179,24 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 			}()
 			_connDurNs := time.Since(_connStart).Nanoseconds()
 
+			if connectErr != nil && (consensus.IsSystemFault(connectErr) || consensus.IsAborted()) {
+				// Gate 6: a local system fault (failed chainstate write after
+				// a retry, coins-DB read error, panic) is never a verdict on
+				// the block: no mark, no punishment, no corruption banner.
+				// AbortNode is latched; the node shuts down and restarts on
+				// its last durable batch, where this block is re-validated.
+				log.Printf("[FATAL] sync: block %d (%s) not connected — system fault, not a verdict: %v",
+					nextHeight, bwr.req.Hash.String()[:16], connectErr)
+				break
+			}
+			if connectErr != nil && consensus.IsHeaderTimeFutureErr(connectErr) {
+				// Core BLOCK_TIME_FUTURE: not a verdict, no punishment — the
+				// block may simply be early (or our clock wrong). Keep it
+				// pending; the retry ticker re-tries it.
+				log.Printf("sync: block %d (%s) deferred: %v",
+					nextHeight, bwr.req.Hash.String()[:16], connectErr)
+				break
+			}
 			if connectErr != nil && consensus.IsMissingAncestorErr(connectErr) {
 				// Not a verdict on the block: an ancestor header it needs is
 				// not indexed yet. Keep it pending (no invalid mark, no
@@ -4593,6 +4633,13 @@ func (sm *SyncManager) markBlockFailed(hash wire.Hash256) {
 // MaybePunishNodeForBlock (net_processing.cpp; a local peer is disconnected,
 // not discouraged — PeerManager.handlePeerBan does that split).
 func (sm *SyncManager) handleConsensusInvalid(bwr *blockWithRequest, bie *consensus.BlockInvalidError) {
+	// Gate 6: once the node has aborted, no verdict is trusted (it may have
+	// been computed on a view missing coins): never mark, never punish.
+	if consensus.IsAborted() {
+		log.Printf("sync: suppressing verdict on block %d (%s) after AbortNode: %v",
+			bwr.req.Height, bwr.req.Hash.String()[:16], bie)
+		return
+	}
 	log.Printf("sync: block %d (%s) is INVALID: %v — marking %s failed (descendants invalid-child), "+
 		"continuing on the most-work valid chain",
 		bwr.req.Height, bwr.req.Hash.String()[:16], bie, bie.Hash.String()[:16])

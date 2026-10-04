@@ -96,7 +96,7 @@ func TestShutdownFitsInsideTheStopGrace(t *testing.T) {
 	}
 
 	lock := strings.Index(src, "dbFinalMu.Lock()")
-	flush := strings.Index(src, "utxoSet.FlushBatch(shutBatch)")
+	flush := strings.Index(src, "utxoSet.StageFlush(shutBatch)")
 	aux := strings.Index(src, "runConcurrently(")
 	dump := strings.Index(src, "mp.Dump(cfg.DataDir)")
 	wait := strings.Index(src, "<-auxDone")

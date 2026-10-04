@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -75,11 +76,39 @@ func isLocalUTXOGap(err error) bool {
 	return errors.Is(err, ErrMissingInput) || errors.Is(err, ErrScriptPrevoutMissing)
 }
 
+// IsHeaderTimeFutureErr reports whether err is the wall-clock "time-too-new"
+// gate (block timestamp more than MAX_FUTURE_BLOCK_TIME ahead of now). Core
+// returns BLOCK_TIME_FUTURE for it from ContextualCheckBlockHeader
+// (validation.cpp:4109): the header is not accepted, the block is never marked
+// failed, and MaybePunishNodeForBlock does not punish (net_processing.cpp
+// BLOCK_TIME_FUTURE -> break) — the block may simply be early, or OUR clock
+// wrong. It is a "not yet", never a verdict.
+func IsHeaderTimeFutureErr(err error) bool {
+	return errors.Is(err, ErrTimestampTooFar)
+}
+
 // blockVerdict wraps err as a BlockInvalidError for block `hash` when it is a
 // consensus verdict on that block, and returns it unchanged otherwise.
+//
+// The allow-list is the CALL SITE: blockVerdict is applied only to the output
+// of the pure consensus-rule checks in ConnectBlock (CheckBlockSanity,
+// CheckBlockContext, CheckBIP30, CheckTransactionSanity, CheckTransactionInputs,
+// BIP-68, the sigop cap, script validation, the coinbase-value check). Their
+// only non-rule failure channels are a coins-DB read error and a panic, and
+// both now latch AbortNode at the source (gate 6). So, in addition to the
+// non-verdict classes below, NOTHING is a verdict once the node is aborted —
+// the check may have run on a view missing coins — and a typed system fault is
+// never one.
 func blockVerdict(hash wire.Hash256, err error) error {
-	if err == nil || IsMissingAncestorErr(err) || IsBlockMutationErr(err) || isLocalUTXOGap(err) {
+	if err == nil || IsMissingAncestorErr(err) || IsBlockMutationErr(err) || isLocalUTXOGap(err) ||
+		IsHeaderTimeFutureErr(err) {
 		return err
+	}
+	if IsSystemFault(err) {
+		return err
+	}
+	if IsAborted() {
+		return SystemFault("validate block after AbortNode", fmt.Errorf("%w (suppressed verdict: %v)", ErrNodeAborted, err))
 	}
 	if _, already := AsBlockInvalid(err); already {
 		return err

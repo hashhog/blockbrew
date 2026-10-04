@@ -1562,9 +1562,11 @@ func TestAtomicShutdownFlushBatch(t *testing.T) {
 
 	// Build the atomic shutdown batch the same way main.go now does.
 	batch := db.NewBatch()
-	if err := utxoSet.FlushBatch(batch); err != nil {
-		t.Fatalf("FlushBatch: %v", err)
+	staged, err := utxoSet.StageFlush(batch)
+	if err != nil {
+		t.Fatalf("StageFlush: %v", err)
 	}
+	defer staged.Commit()
 	db.SetChainStateBatch(batch, &storage.ChainState{
 		BestHash:   bestHash,
 		BestHeight: bestHeight,
@@ -2908,6 +2910,11 @@ func TestReorgTo_SingleBatchProperty(t *testing.T) {
 // would lose it on restart anyway); the contract is "either pre OR post
 // state is on disk, never partial".
 func TestReorgTo_CrashPreCommitPreservesPreReorgState(t *testing.T) {
+	// The simulated commit failure now (gate 6) latches the process-wide
+	// AbortNode after its retry, exactly as a real write failure does; clear
+	// it so later tests in this binary run on a healthy node.
+	ResetAbortForTesting()
+	t.Cleanup(ResetAbortForTesting)
 	params := RegtestParams()
 	idx := NewHeaderIndex(params)
 
