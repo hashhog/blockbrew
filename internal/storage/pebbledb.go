@@ -621,7 +621,9 @@ func (p *PebbleDB) Close() error {
 		pebbleStart := time.Now()
 		tr.begin("pebble.Close")
 		p.closeErr = p.db.Close()
-		tr.end(fmt.Sprintf("err=%v", p.closeErr))
+		// The state after pebble.Close says what it did inside (fsyncs of
+		// the WAL/MANIFEST/dir, obsolete-file removes) since Close began.
+		tr.end(fmt.Sprintf("err=%v; %s", p.closeErr, p.backgroundState()))
 		if p.closeErr == nil {
 			p.closeErr = walErr
 		}
