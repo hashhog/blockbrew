@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -147,6 +150,9 @@ func TestCloseProgressNamesTheStepItIsStuckIn(t *testing.T) {
 	st := db.CloseStatus()
 	if !strings.Contains(st, `in step "write gate (wait for in-flight reads/writes)"`) {
 		t.Fatalf("CloseStatus does not name the stuck step: %q", st)
+	}
+	if runtime.GOOS == "linux" && (!strings.Contains(st, " process swap=") || !strings.Contains(st, " major faults=")) {
+		t.Fatalf("CloseStatus does not report process swap / major faults since close: %q", st)
 	}
 	if !strings.Contains(out.String(), `in step "write gate (wait for in-flight reads/writes)"`) ||
 		!strings.Contains(out.String(), "(still running)") {
@@ -317,5 +323,30 @@ func TestCloseStatusReportsAPopulatedBlockCache(t *testing.T) {
 	want := fmt.Sprintf(" block cache=%d blocks/", m.Count)
 	if !strings.Contains(st, want) {
 		t.Fatalf("CloseStatus %q does not report the cache's %d blocks", st, m.Count)
+	}
+}
+
+// procSwapAndMajflt must actually parse /proc on Linux (a silent ok=false
+// would drop the paging evidence from every close line).
+func TestProcSwapAndMajfltReadsProc(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux /proc only")
+	}
+	swap, majflt, ok := procSwapAndMajflt()
+	if !ok {
+		t.Fatal("procSwapAndMajflt: not ok on linux")
+	}
+	if swap < 0 || majflt < 0 {
+		t.Fatalf("swap=%d majflt=%d", swap, majflt)
+	}
+	// Cross-check majflt against /proc/self/stat read independently.
+	st, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := strings.Fields(string(st[strings.LastIndexByte(string(st), ')')+1:]))
+	later, err := strconv.ParseInt(f[9], 10, 64)
+	if err != nil || later < majflt {
+		t.Fatalf("majflt %d disagrees with a later /proc/self/stat field 12 %q (err %v)", majflt, f[9], err)
 	}
 }

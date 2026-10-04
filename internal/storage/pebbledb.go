@@ -565,10 +565,13 @@ func (p *PebbleDB) Close() error {
 		tr := &closeTrace{start: time.Now()}
 		p.closeTrace.Store(tr)
 		if p.fs != nil {
+			_, majflt, procOK := procSwapAndMajflt()
 			p.closeBase.Store(&closeBaseline{
 				syncs:         p.fs.ops.syncs.Load(),
 				removes:       p.fs.ops.removes.Load(),
 				tablesDeleted: p.bgWork().tablesDeleted.Load(),
+				majflt:        majflt,
+				procOK:        procOK,
 			})
 		}
 		log.Printf("storage: close: begin; %s", p.backgroundState())

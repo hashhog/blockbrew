@@ -1,9 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"fmt"
 	"log"
+	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -210,10 +213,17 @@ func (p *PebbleDB) backgroundState() string {
 		m := p.cache.Metrics()
 		s += fmt.Sprintf(" block cache=%d blocks/%d MiB", m.Count, m.Size>>20)
 	}
+	swapKB, majflt, procOK := procSwapAndMajflt()
+	if procOK {
+		s += fmt.Sprintf(" process swap=%d MiB", swapKB>>10)
+	}
 	if base := p.closeBase.Load(); base != nil {
 		s += fmt.Sprintf(" since close: fsyncs=%d removes=%d tables deleted=%d",
 			p.fs.ops.syncs.Load()-base.syncs, p.fs.ops.removes.Load()-base.removes,
 			p.bgWork().tablesDeleted.Load()-base.tablesDeleted)
+		if procOK && base.procOK {
+			s += fmt.Sprintf(" major faults=%d", majflt-base.majflt)
+		}
 	}
 	if p.fs != nil {
 		s += "; in-flight fs ops: " + p.fs.ops.inFlight(8)
@@ -224,6 +234,52 @@ func (p *PebbleDB) backgroundState() string {
 // closeBaseline holds the counters as they were when Close began.
 type closeBaseline struct {
 	syncs, removes, tablesDeleted int64
+	majflt                        int64
+	procOK                        bool
+}
+
+// procSwapAndMajflt reads this process's swapped-out memory (VmSwap) and its
+// major page-fault count from /proc/self (Linux; ok=false elsewhere).
+//
+// Why it is in the close status: pebble.Close frees every block-cache block
+// one by one. On a fresh 1.4 GiB cache that is 0.7 s; on scratch clones with
+// hours of uptime on this (swapping) box it ran 16-62 s, and live blockbrew
+// had 705 MiB swapped out after 4 h. Freeing a swapped-out block faults it
+// back in first, so a slow close with a climbing major-fault count is paging,
+// not Pebble work.
+func procSwapAndMajflt() (swapKB, majflt int64, ok bool) {
+	st, err := os.ReadFile("/proc/self/stat")
+	if err != nil {
+		return 0, 0, false
+	}
+	// Fields after the parenthesised comm; majflt is field 12 overall, the
+	// 10th after ")".
+	i := bytes.LastIndexByte(st, ')')
+	if i < 0 {
+		return 0, 0, false
+	}
+	f := strings.Fields(string(st[i+1:]))
+	if len(f) < 10 {
+		return 0, 0, false
+	}
+	majflt, err = strconv.ParseInt(f[9], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	status, err := os.ReadFile("/proc/self/status")
+	if err != nil {
+		return 0, 0, false
+	}
+	for _, line := range strings.Split(string(status), "\n") {
+		if strings.HasPrefix(line, "VmSwap:") {
+			fs := strings.Fields(line)
+			if len(fs) >= 2 {
+				swapKB, _ = strconv.ParseInt(fs[1], 10, 64)
+			}
+			return swapKB, majflt, true
+		}
+	}
+	return 0, majflt, true
 }
 
 // CloseStatus describes where a Close that has not returned is waiting. The
