@@ -2309,7 +2309,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			// Best-effort DB close, BOUNDED: an unbounded Close here (it
 			// waits for running compactions) kept the forced exit alive
 			// past the 120 s grace on mainnet 2026-10-02 -> SIGKILL.
-			if _, finished := closeWithin(db.Close, forcedCloseBudget); !finished {
+			closeStart := time.Now()
+			if _, finished := closeWithinObserved(db.Close, forcedCloseBudget, 0, func(why string) {
+				logDBCloseDiagnostics(db, why, time.Since(closeStart))
+			}); !finished {
 				log.Printf("DB close still running after %s; exiting without it (chainstate batches are WAL-synced)", forcedCloseBudget)
 			}
 		} else {
@@ -2502,11 +2505,15 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// other than a compaction holds it (a writer parked in a Pebble write
 		// stall holds the commit pipeline that the WAL sync and Close both
 		// need) the sequence exits on the synced chainstate batches instead
-		// of tripping the watchdog. Exiting with the close unfinished is the
-		// state a crash leaves; Pebble's recovery replays the WAL.
+		// of tripping the watchdog.
+		// Exiting with the close unfinished is the state a crash leaves;
+		// Pebble's recovery replays the WAL.
+		//
+		// A close still running after slowCloseDumpAfter, and one that runs
+		// out of budget, logs the step it is in and every goroutine's stack
+		// (mainnet 2026-10-04: the close overran with nothing logged).
 		log.Printf("closing DB")
 		const maxDBCloseWait = 20 * time.Second
-		const closeMargin = 5 * time.Second
 		budget := shutdownDeadline - time.Since(shutdownStart) - closeMargin
 		if budget > maxDBCloseWait {
 			budget = maxDBCloseWait
@@ -2515,7 +2522,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			budget = 0
 		}
 		closeStart := time.Now()
-		if err, finished := closeWithin(db.Close, budget); !finished {
+		if err, finished := closeWithinObserved(db.Close, budget, slowCloseDumpAfter, func(why string) {
+			logDBCloseDiagnostics(db, why, time.Since(closeStart))
+		}); !finished {
 			log.Printf("DB close did not finish within %s; exiting without it (chainstate batches are WAL-synced)", budget)
 		} else if err != nil {
 			log.Printf("Warning: database close failed: %v", err)

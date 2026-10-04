@@ -133,6 +133,12 @@ type PebbleDB struct {
 	// make nothing more durable.
 	noSyncDone   atomic.Uint64
 	syncedNoSync atomic.Uint64
+
+	// bg, closeTrace and closeBase make a slow Close observable while it is
+	// still waiting (pebbledb_closetrace.go). Observation only.
+	bg         *bgWork
+	closeTrace atomic.Pointer[closeTrace]
+	closeBase  atomic.Pointer[closeBaseline]
 }
 
 // noteNoSyncCommit records a NoSync commit that has returned.
@@ -261,6 +267,7 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		}
 	}
 
+	bg := new(bgWork)
 	slots := new(atomic.Int32)
 	slots.Store(4)
 	opts := &pebble.Options{
@@ -288,16 +295,16 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		// touching pebble's cloned Options.
 		MaxConcurrentCompactions: func() int { return int(slots.Load()) },
 
-		EventListener: &pebble.EventListener{
-			// A compaction or flush that Close abandoned reports
-			// errCloseAbandoned; that is the intended outcome, not a fault.
-			BackgroundError: func(err error) {
-				if errors.Is(err, errCloseAbandoned) {
-					return
-				}
-				log.Printf("pebble: background error: %v", err)
-			},
-		},
+		// A compaction or flush that Close abandoned reports
+		// errCloseAbandoned; that is the intended outcome, not a fault. The
+		// other callbacks only count background work for Close's progress
+		// log.
+		EventListener: bg.listener(func(err error) {
+			if errors.Is(err, errCloseAbandoned) {
+				return
+			}
+			log.Printf("pebble: background error: %v", err)
+		}),
 	}
 
 	db, err := pebble.Open(path, opts)
@@ -306,7 +313,7 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		return nil, fmt.Errorf("pebble open failed: %w", err)
 	}
 
-	return &PebbleDB{db: db, cache: cache, fs: afs, compactSlots: slots, closing: make(chan struct{})}, nil
+	return &PebbleDB{db: db, cache: cache, fs: afs, compactSlots: slots, closing: make(chan struct{}), bg: bg}, nil
 }
 
 // Get retrieves a value by key. Returns nil, nil if key does not exist.
@@ -550,9 +557,33 @@ func (p *PebbleDB) Close() error {
 		if p.closing != nil {
 			close(p.closing)
 		}
+		// Every step below is logged when it starts and when it ends, and a
+		// close that has not returned logs where it is every
+		// closeProgressInterval: on mainnet 2026-10-04 a close ran past the
+		// shutdown budget and nothing said where it waited, because the
+		// summary line below is only printed when Close returns.
+		tr := &closeTrace{start: time.Now()}
+		p.closeTrace.Store(tr)
+		if p.fs != nil {
+			p.closeBase.Store(&closeBaseline{
+				syncs:         p.fs.ops.syncs.Load(),
+				removes:       p.fs.ops.removes.Load(),
+				tablesDeleted: p.bgWork().tablesDeleted.Load(),
+			})
+		}
+		log.Printf("storage: close: begin; %s", p.backgroundState())
+		progressDone := make(chan struct{})
+		go p.reportProgress(progressDone)
+		defer func() {
+			tr.done.Store(true)
+			close(progressDone)
+		}()
+
+		tr.begin("write gate (wait for in-flight reads/writes)")
 		p.liveMu.Lock()
 		p.closed = true
 		p.liveMu.Unlock()
+		tr.end("")
 		if p.closeStage != nil {
 			p.closeStage("begin")
 		}
@@ -560,24 +591,37 @@ func (p *PebbleDB) Close() error {
 		var walErr error
 		walNote := "WAL already synced through the last acknowledged write"
 		if !p.walAlreadySynced() {
+			log.Printf("storage: close: WAL sync decision: needed (%d unsynced write(s) since the last synced batch)",
+				p.noSyncDone.Load()-p.syncedNoSync.Load())
+			tr.begin("WAL sync")
 			walErr = p.db.LogData(nil, pebble.Sync)
 			walNote = fmt.Sprintf("WAL synced in %s", time.Since(start).Round(time.Millisecond))
+			tr.end(fmt.Sprintf("err=%v", walErr))
+		} else {
+			log.Printf("storage: close: WAL sync decision: skipped (WAL already synced through the last acknowledged write)")
 		}
+		tr.begin("abandon background work")
 		if walErr != nil {
 			// The WAL could not be synced; let Close finish whatever the
 			// background jobs are doing rather than add a second failure.
 			log.Printf("storage: WAL sync before close failed: %v", walErr)
+			tr.end("NOT abandoned (WAL sync failed); background work runs to completion")
 		} else if p.fs != nil {
 			if p.compactSlots != nil {
 				p.compactSlots.Store(0)
 			}
 			p.fs.abandon.Store(true)
+			tr.end("compaction slots 0, sstable writes refused; " + p.backgroundState())
+		} else {
+			tr.end("no abandon layer")
 		}
 		if p.closeStage != nil {
 			p.closeStage("abandoned")
 		}
 		pebbleStart := time.Now()
+		tr.begin("pebble.Close")
 		p.closeErr = p.db.Close()
+		tr.end(fmt.Sprintf("err=%v", p.closeErr))
 		if p.closeErr == nil {
 			p.closeErr = walErr
 		}
@@ -588,10 +632,21 @@ func (p *PebbleDB) Close() error {
 		log.Printf("storage: close: %s; background work abandoned (%d sstable ops refused); pebble close %s",
 			walNote, refused, time.Since(pebbleStart).Round(time.Millisecond))
 		if p.cache != nil {
+			tr.begin("block cache free")
 			p.cache.Unref()
+			tr.end("")
 		}
 	})
 	return p.closeErr
+}
+
+// bgWork returns the background-work counters (an empty set for a PebbleDB
+// not built by NewPebbleDBWithConfig).
+func (p *PebbleDB) bgWork() *bgWork {
+	if p.bg == nil {
+		return &bgWork{}
+	}
+	return p.bg
 }
 
 // errCloseAbandoned is the write error abandon mode gives a background
@@ -609,29 +664,70 @@ type closeAbandonFS struct {
 	// refused counts sstable operations refused in abandon mode (tests read
 	// it to prove a background job was actually cut short).
 	refused atomic.Int64
+
+	// ops tracks fsyncs, removes, renames and sstable creation in flight, for
+	// Close's progress log. Observation only.
+	ops fsOpTracker
 }
 
 func isSSTable(name string) bool { return strings.HasSuffix(name, ".sst") }
 
 func (fs *closeAbandonFS) Create(name string) (vfs.File, error) {
 	if !isSSTable(name) {
-		return fs.FS.Create(name)
+		f, err := fs.FS.Create(name)
+		if err != nil {
+			return nil, err
+		}
+		return &trackedFile{File: f, name: name, t: &fs.ops}, nil
 	}
 	if fs.abandon.Load() {
 		fs.refused.Add(1)
 		return nil, errCloseAbandoned
 	}
+	id := fs.ops.begin("create", name)
 	f, err := fs.FS.Create(name)
+	fs.ops.end(id)
 	if err != nil {
 		return nil, err
 	}
-	return &abandonableFile{File: f, fs: fs}, nil
+	return &abandonableFile{File: f, fs: fs, name: name}, nil
+}
+
+// ReuseForWrite is how pebble recycles a WAL file; its fsyncs are tracked.
+func (fs *closeAbandonFS) ReuseForWrite(oldname, newname string) (vfs.File, error) {
+	f, err := fs.FS.ReuseForWrite(oldname, newname)
+	if err != nil {
+		return nil, err
+	}
+	return &trackedFile{File: f, name: newname, t: &fs.ops}, nil
+}
+
+// OpenDir: pebble fsyncs the data/WAL directory after creating, renaming or
+// deleting files in it; those fsyncs are tracked.
+func (fs *closeAbandonFS) OpenDir(name string) (vfs.File, error) {
+	f, err := fs.FS.OpenDir(name)
+	if err != nil {
+		return nil, err
+	}
+	return &trackedFile{File: f, name: name + "/", t: &fs.ops}, nil
+}
+
+func (fs *closeAbandonFS) Remove(name string) error {
+	defer fs.ops.end(fs.ops.begin("remove", name))
+	fs.ops.removes.Add(1)
+	return fs.FS.Remove(name)
+}
+
+func (fs *closeAbandonFS) Rename(oldname, newname string) error {
+	defer fs.ops.end(fs.ops.begin("rename", newname))
+	return fs.FS.Rename(oldname, newname)
 }
 
 // abandonableFile is an sstable being written.
 type abandonableFile struct {
 	vfs.File
-	fs *closeAbandonFS
+	fs   *closeAbandonFS
+	name string
 }
 
 func (f *abandonableFile) check() error {
@@ -660,6 +756,8 @@ func (f *abandonableFile) Sync() error {
 	if err := f.check(); err != nil {
 		return err
 	}
+	defer f.fs.ops.end(f.fs.ops.begin("fsync", f.name))
+	f.fs.ops.syncs.Add(1)
 	return f.File.Sync()
 }
 
@@ -667,6 +765,8 @@ func (f *abandonableFile) SyncData() error {
 	if err := f.check(); err != nil {
 		return err
 	}
+	defer f.fs.ops.end(f.fs.ops.begin("fdatasync", f.name))
+	f.fs.ops.syncs.Add(1)
 	return f.File.SyncData()
 }
 
@@ -674,6 +774,8 @@ func (f *abandonableFile) SyncTo(length int64) (bool, error) {
 	if err := f.check(); err != nil {
 		return false, err
 	}
+	defer f.fs.ops.end(f.fs.ops.begin("syncto", f.name))
+	f.fs.ops.syncs.Add(1)
 	return f.File.SyncTo(length)
 }
 

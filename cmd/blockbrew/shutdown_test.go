@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -69,7 +73,7 @@ func TestShutdownFitsInsideTheStopGrace(t *testing.T) {
 		t.Fatal("forceExit helper missing")
 	}
 	feBody := src[fe : fe+strings.Index(src[fe:], "\n\t}\n")]
-	if !strings.Contains(feBody, "closeWithin(db.Close, forcedCloseBudget)") {
+	if !strings.Contains(feBody, "closeWithinObserved(db.Close, forcedCloseBudget,") {
 		t.Fatalf("forced exit does not bound its DB close:\n%s", feBody)
 	}
 	if strings.Contains(feBody, "= db.Close()") {
@@ -129,13 +133,85 @@ func TestGracefulCloseCannotOutliveTheShutdownDeadline(t *testing.T) {
 		t.Fatal("no zmqPub.Stop() after the DB close")
 	}
 	span := src[closeLog : closeLog+zmqRel]
-	if !strings.Contains(span, "closeWithin(db.Close, budget)") {
-		t.Fatal("graceful shutdown does not bound the DB close")
+	if !strings.Contains(span, "closeWithinObserved(db.Close, budget, slowCloseDumpAfter,") {
+		t.Fatal("graceful shutdown does not bound (and observe) the DB close")
+	}
+	if !strings.Contains(span, "logDBCloseDiagnostics(db, why,") {
+		t.Fatal("graceful shutdown's DB close does not log where it waits")
 	}
 	if strings.Contains(span, "db.Close()") {
 		t.Fatalf("graceful path still calls unbounded db.Close():\n%s", span)
 	}
 	if !strings.Contains(span, "shutdownDeadline - time.Since(shutdownStart)") {
 		t.Fatal("close budget is not clamped to the time remaining before shutdownDeadline")
+	}
+}
+
+func TestCloseWithinObservedReportsSlowAndExpired(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	report := func(why string) { mu.Lock(); got = append(got, why); mu.Unlock() }
+	reports := func() []string { mu.Lock(); defer mu.Unlock(); return append([]string(nil), got...) }
+
+	// Fast close: no report.
+	if _, fin := closeWithinObserved(func() error { return nil }, time.Second, 200*time.Millisecond, report); !fin {
+		t.Fatal("fast close not finished")
+	}
+	if r := reports(); len(r) != 0 {
+		t.Fatalf("fast close reported %v", r)
+	}
+
+	// Slow but in budget: "slow" once, then finished.
+	_, fin := closeWithinObserved(func() error { time.Sleep(300 * time.Millisecond); return nil },
+		2*time.Second, 50*time.Millisecond, report)
+	if !fin || fmt.Sprint(reports()) != "[slow]" {
+		t.Fatalf("slow close: finished=%v reports=%v, want true [slow]", fin, reports())
+	}
+
+	// Blocked: "slow" then "expired", returns at the budget.
+	got = nil
+	release := make(chan struct{})
+	defer close(release)
+	t0 := time.Now()
+	_, fin = closeWithinObserved(func() error { <-release; return nil }, 300*time.Millisecond, 100*time.Millisecond, report)
+	if fin || fmt.Sprint(reports()) != "[slow expired]" {
+		t.Fatalf("blocked close: finished=%v reports=%v, want false [slow expired]", fin, reports())
+	}
+	if took := time.Since(t0); took > 2*time.Second {
+		t.Fatalf("waited %s on a 300ms budget", took)
+	}
+}
+
+type fakeCloseStatus struct{}
+
+func (fakeCloseStatus) CloseStatus() string { return `storage: close: in step "pebble.Close" for 21s` }
+
+//go:noinline
+func parkedInPebbleCloseForTest(release chan struct{}) { <-release }
+
+// The expiry report must contain the DB's own status AND the stack of the
+// goroutine that is actually stuck in the close.
+func TestDBCloseDiagnosticsLogStatusAndTheStuckStack(t *testing.T) {
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	release := make(chan struct{})
+	go parkedInPebbleCloseForTest(release)
+	defer close(release)
+	time.Sleep(50 * time.Millisecond)
+
+	logDBCloseDiagnostics(fakeCloseStatus{}, "expired", 21*time.Second)
+	out := buf.String()
+	for _, w := range []string{
+		`DB close expired after 21s: storage: close: in step "pebble.Close" for 21s`,
+		"DB close expired: goroutine dump",
+		".parkedInPebbleCloseForTest(",
+		"--- end of goroutine dump",
+	} {
+		if !strings.Contains(out, w) {
+			t.Fatalf("diagnostics missing %q:\n%.2000s", w, out)
+		}
 	}
 }
