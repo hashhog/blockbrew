@@ -2490,8 +2490,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			log.Printf("Block store flushed")
 		}
 
-		// db.Close syncs the WAL and then abandons running compactions and
-		// flushes instead of waiting for them (storage.PebbleDB.Close): the
+		// db.Close makes sure the WAL holds every acknowledged write (the
+		// synced batches above usually already did that, and then it skips a
+		// second WAL fsync) and abandons running compactions and flushes
+		// instead of waiting for them (storage.PebbleDB.Close): the
 		// unbounded wait was 30 s (2026-10-02 20:08Z) and >51 s (23:31Z), the
 		// second tripping this 80 s deadline -> "exit (forced)".
 		//

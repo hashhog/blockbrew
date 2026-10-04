@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/cockroachdb/pebble"
 	"github.com/cockroachdb/pebble/bloom"
@@ -121,6 +122,50 @@ type PebbleDB struct {
 
 	// closeStage, when set (tests only), is called as Close passes each step.
 	closeStage func(stage string)
+
+	// noSyncDone counts NoSync commits that have returned (Put, Delete and
+	// NoSync batches; a failed one counts too, conservatively). syncedNoSync
+	// is the largest noSyncDone value read before the start of a Sync commit
+	// that then succeeded. Every NoSync commit counted there returned before
+	// that Sync commit began, so its WAL record precedes the Sync record, and
+	// a completed Sync commit leaves every earlier WAL byte durable (see
+	// walAlreadySynced). Close uses the pair to skip a WAL sync that would
+	// make nothing more durable.
+	noSyncDone   atomic.Uint64
+	syncedNoSync atomic.Uint64
+}
+
+// noteNoSyncCommit records a NoSync commit that has returned.
+func (p *PebbleDB) noteNoSyncCommit() { p.noSyncDone.Add(1) }
+
+// noteSyncCommit records a successful Sync commit that began when
+// noSyncDone read before.
+func (p *PebbleDB) noteSyncCommit(before uint64) {
+	for {
+		cur := p.syncedNoSync.Load()
+		if before <= cur || p.syncedNoSync.CompareAndSwap(cur, before) {
+			return
+		}
+	}
+}
+
+// walAlreadySynced reports whether every write this DB acknowledged is
+// already in the durable WAL, so that a further WAL sync would add nothing.
+// Only meaningful once no write can start (Close calls it with the write gate
+// closed).
+//
+// Pebble guarantees (v1.1.5): a Sync commit returns only after the WAL file
+// holding its record is fdatasync'd up to that record (LogWriter.SyncRecord ->
+// flushLoop -> syncWithLatency, record/log_writer.go), and that sync covers
+// every record written before it in the same file. Records in an earlier WAL
+// file were synced when that file was rotated out: rotateWAL closes the old
+// writer (db.go, d.mu.log.LogWriter.Close()), and LogWriter.Close always
+// syncs (log_writer.go "Sync any flushed data to disk"). Commit order is the
+// WAL order: records are appended in commitPipeline.prepare under
+// commit.mu. So if no NoSync commit returned after the start of the last
+// successful Sync commit, nothing acknowledged is outside the synced WAL.
+func (p *PebbleDB) walAlreadySynced() bool {
+	return p.noSyncDone.Load() <= p.syncedNoSync.Load()
 }
 
 // ErrDBClosed is returned by operations that reach the DB after Close.
@@ -294,6 +339,7 @@ func (p *PebbleDB) Put(key, value []byte) error {
 		return err
 	}
 	defer p.liveMu.RUnlock()
+	defer p.noteNoSyncCommit()
 	return p.db.Set(key, value, pebble.NoSync)
 }
 
@@ -303,6 +349,7 @@ func (p *PebbleDB) Delete(key []byte) error {
 		return err
 	}
 	defer p.liveMu.RUnlock()
+	defer p.noteNoSyncCommit()
 	return p.db.Delete(key, pebble.NoSync)
 }
 
@@ -469,9 +516,13 @@ func (p *PebbleDB) Flush() error {
 //
 // Abandoning that work is safe because none of it is needed for durability:
 //
-//  1. The WAL is fsynced first (a Sync LogData record). Every write the node
-//     ever acknowledged, NoSync ones included, is then in the synced WAL, and
-//     pebble replays the WAL on open.
+//  1. Every write the node ever acknowledged, NoSync ones included, is in the
+//     synced WAL before anything is abandoned, and pebble replays the WAL on
+//     open. Usually that is already true: the shutdown sequence's last writes
+//     are Sync batches (chainstate, block-store state), and a completed Sync
+//     commit leaves every earlier WAL byte durable (walAlreadySynced). Only
+//     when a NoSync write returned after the last Sync commit does Close sync
+//     the WAL itself (a Sync LogData record).
 //  2. A compaction or flush only changes the database when its version edit
 //     is written to the MANIFEST, and that happens only after every output
 //     sstable has been completely written and synced. Abandon mode fails
@@ -482,6 +533,18 @@ func (p *PebbleDB) Flush() error {
 //  3. If the process dies anywhere in here (SIGKILL), the on-disk state is one
 //     a crash could already produce: pebble's crash recovery handles it, and
 //     orphaned partial sstables are deleted on open.
+//
+// Why skipping the redundant WAL sync matters (gate 5, 2026-10-04): on the
+// saturated disk every fsync costs seconds, and the close was a serial chain
+// of them. Goroutine dumps of a scratch mainnet-size node showed it: the
+// pre-abandon WAL sync waited 4.8-6.8 s in commitPipeline.publish while the
+// in-flight memtable flush (started by flushchainstate) used that time to
+// reach its sstable fdatasync, directory fsync and MANIFEST fsync, which
+// abandon mode cannot interrupt; pebble's Close then waited for those and
+// for its own WAL sync in LogWriter.Close (14.8 s and 16.3 s in total; the
+// live stop overran the 20 s budget). Abandoning at once instead stops the
+// flush at its next sstable write, and pebble's Close performs the one WAL
+// sync a clean close needs.
 func (p *PebbleDB) Close() error {
 	p.closeOnce.Do(func() {
 		if p.closing != nil {
@@ -493,7 +556,13 @@ func (p *PebbleDB) Close() error {
 		if p.closeStage != nil {
 			p.closeStage("begin")
 		}
-		walErr := p.db.LogData(nil, pebble.Sync)
+		start := time.Now()
+		var walErr error
+		walNote := "WAL already synced through the last acknowledged write"
+		if !p.walAlreadySynced() {
+			walErr = p.db.LogData(nil, pebble.Sync)
+			walNote = fmt.Sprintf("WAL synced in %s", time.Since(start).Round(time.Millisecond))
+		}
 		if walErr != nil {
 			// The WAL could not be synced; let Close finish whatever the
 			// background jobs are doing rather than add a second failure.
@@ -507,10 +576,17 @@ func (p *PebbleDB) Close() error {
 		if p.closeStage != nil {
 			p.closeStage("abandoned")
 		}
+		pebbleStart := time.Now()
 		p.closeErr = p.db.Close()
 		if p.closeErr == nil {
 			p.closeErr = walErr
 		}
+		var refused int64
+		if p.fs != nil {
+			refused = p.fs.refused.Load()
+		}
+		log.Printf("storage: close: %s; background work abandoned (%d sstable ops refused); pebble close %s",
+			walNote, refused, time.Since(pebbleStart).Round(time.Millisecond))
 		if p.cache != nil {
 			p.cache.Unref()
 		}
@@ -682,9 +758,26 @@ func (b *pebbleBatch) Write() error {
 		defer b.owner.liveMu.RUnlock()
 	}
 	if b.noSync {
+		if b.owner != nil {
+			defer b.owner.noteNoSyncCommit()
+		}
 		return b.batch.Commit(pebble.NoSync)
 	}
-	return b.batch.Commit(pebble.Sync)
+	if b.owner == nil {
+		return b.batch.Commit(pebble.Sync)
+	}
+	// pebble returns early from an empty batch's commit without touching
+	// the WAL (commitPipeline.Commit: "if b.Empty() { return nil }"), so
+	// only a non-empty Sync commit is evidence of a WAL sync.
+	empty := b.batch.Empty()
+	before := b.owner.noSyncDone.Load()
+	if err := b.batch.Commit(pebble.Sync); err != nil {
+		return err
+	}
+	if !empty {
+		b.owner.noteSyncCommit(before)
+	}
+	return nil
 }
 
 // Reset clears the batch for reuse.
