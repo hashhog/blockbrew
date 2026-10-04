@@ -44,8 +44,29 @@ func runConcurrently(fns ...func()) {
 }
 
 // closeMargin is what the graceful DB close leaves before shutdownDeadline for
-// the rest of the sequence (ZMQ stop, pid file).
+// the rest of the sequence (ZMQ stop, pid file) so the watchdog does not fire
+// on a sequence that is about to finish.
 const closeMargin = 5 * time.Second
+
+// dbCloseBudget is how long the graceful shutdown waits for the DB close: all
+// of the time left before deadline, minus closeMargin.
+//
+// There used to be a further 20 s cap. It was self-imposed: Core's Shutdown()
+// runs the chainstate/LevelDB close to completion with no timeout of its own
+// (the operator's bound is the supervisor's kill), and here the overall
+// shutdownDeadline already bounds a hung shutdown. Exiting before Close
+// finishes is crash-safe (every acknowledged write is in the synced WAL before
+// background work is abandoned; storage.PebbleDB.Close), but it is still a
+// crash-path exit: the LOCK file is left, the next open replays the WAL and
+// re-does abandoned work, and the close itself never reports where it waited.
+// On mainnet 2026-10-04 the cap expired with ~45 s of the deadline unused.
+func dbCloseBudget(deadline, elapsed time.Duration) time.Duration {
+	b := deadline - elapsed - closeMargin
+	if b < 0 {
+		return 0
+	}
+	return b
+}
 
 // slowCloseDumpAfter is when a DB close that is still running gets its
 // goroutine stacks written to the log once, even if it then finishes inside

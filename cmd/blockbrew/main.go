@@ -2500,12 +2500,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// unbounded wait was 30 s (2026-10-02 20:08Z) and >51 s (23:31Z), the
 		// second tripping this 80 s deadline -> "exit (forced)".
 		//
-		// Second line of defence: the close still runs under the time left
-		// before shutdownDeadline (minus a margin, capped), so if something
-		// other than a compaction holds it (a writer parked in a Pebble write
-		// stall holds the commit pipeline that the WAL sync and Close both
-		// need) the sequence exits on the synced chainstate batches instead
-		// of tripping the watchdog.
+		// Second line of defence: the close runs under ALL the time left
+		// before shutdownDeadline minus closeMargin (dbCloseBudget; the 20 s
+		// cap it used to have was self-imposed, Core runs its DB close to
+		// completion), so if something other than a compaction holds it (a
+		// writer parked in a Pebble write stall holds the commit pipeline
+		// that the WAL sync and Close both need) the sequence still exits on
+		// the synced chainstate batches instead of tripping the watchdog.
 		// Exiting with the close unfinished is the state a crash leaves;
 		// Pebble's recovery replays the WAL.
 		//
@@ -2513,14 +2514,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// out of budget, logs the step it is in and every goroutine's stack
 		// (mainnet 2026-10-04: the close overran with nothing logged).
 		log.Printf("closing DB")
-		const maxDBCloseWait = 20 * time.Second
-		budget := shutdownDeadline - time.Since(shutdownStart) - closeMargin
-		if budget > maxDBCloseWait {
-			budget = maxDBCloseWait
-		}
-		if budget < 0 {
-			budget = 0
-		}
+		budget := dbCloseBudget(shutdownDeadline, time.Since(shutdownStart))
 		closeStart := time.Now()
 		if err, finished := closeWithinObserved(db.Close, budget, slowCloseDumpAfter, func(why string) {
 			logDBCloseDiagnostics(db, why, time.Since(closeStart))

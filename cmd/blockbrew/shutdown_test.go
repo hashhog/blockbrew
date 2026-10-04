@@ -142,8 +142,32 @@ func TestGracefulCloseCannotOutliveTheShutdownDeadline(t *testing.T) {
 	if strings.Contains(span, "db.Close()") {
 		t.Fatalf("graceful path still calls unbounded db.Close():\n%s", span)
 	}
-	if !strings.Contains(span, "shutdownDeadline - time.Since(shutdownStart)") {
-		t.Fatal("close budget is not clamped to the time remaining before shutdownDeadline")
+	if !strings.Contains(span, "dbCloseBudget(shutdownDeadline, time.Since(shutdownStart))") {
+		t.Fatal("close budget is not the time remaining before shutdownDeadline")
+	}
+}
+
+// The graceful DB close gets all the time left before shutdownDeadline minus
+// closeMargin. Mainnet 2026-10-04 07:14Z: "closing DB" came 9 s after SIGTERM
+// and the close was cut off at a self-imposed 20 s cap with ~45 s of the 80 s
+// deadline unused. Core's Shutdown() runs its DB close to completion.
+func TestDBCloseBudgetIsTheRemainingDeadline(t *testing.T) {
+	const deadline = 80 * time.Second
+	for _, c := range []struct{ elapsed, want time.Duration }{
+		{9 * time.Second, 66 * time.Second}, // the live stop: was 20 s
+		{0, 75 * time.Second},
+		{60 * time.Second, 15 * time.Second},
+		{75 * time.Second, 0},
+		{90 * time.Second, 0}, // never negative
+	} {
+		if got := dbCloseBudget(deadline, c.elapsed); got != c.want {
+			t.Errorf("dbCloseBudget(80s, %s) = %s, want %s", c.elapsed, got, c.want)
+		}
+	}
+	// The graceful close plus the rest of the sequence stays inside the
+	// deadline, so the watchdog stays the backstop and never the normal path.
+	if got := dbCloseBudget(deadline, 0) + closeMargin; got > deadline {
+		t.Fatalf("close budget + margin %s exceeds the deadline %s", got, deadline)
 	}
 }
 
