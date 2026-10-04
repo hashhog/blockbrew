@@ -201,6 +201,9 @@ type BlockStore struct {
 
 	// Index maps block hash to file position (stored in LevelDB via DB interface)
 	db DB
+
+	// fileSyncs counts fsyncs flushFile performed (tests read it).
+	fileSyncs atomic.Int64
 }
 
 // NewBlockStore creates a new block store.
@@ -526,7 +529,9 @@ func (bs *BlockStore) allocateSpace(fileNum int32, addSize uint32) error {
 	return nil
 }
 
-// flushFile flushes and optionally finalizes a block file.
+// flushFile flushes and optionally finalizes a block file. Finalizing
+// truncates the pre-allocated tail to the used size BEFORE the fsync, so the
+// new size is durable too (Core: FlatFileSeq::Flush truncates, then commits).
 func (bs *BlockStore) flushFile(fileNum int32, finalize bool) error {
 	filename := bs.blockFilename(fileNum)
 
@@ -539,11 +544,6 @@ func (bs *BlockStore) flushFile(fileNum int32, finalize bool) error {
 	}
 	defer file.Close()
 
-	// Sync data
-	if err := file.Sync(); err != nil {
-		return err
-	}
-
 	// Truncate to actual used size if finalizing
 	if finalize && int32(len(bs.fileInfo)) > fileNum {
 		fi := &bs.fileInfo[fileNum]
@@ -552,7 +552,27 @@ func (bs *BlockStore) flushFile(fileNum int32, finalize bool) error {
 		}
 	}
 
-	return nil
+	// Sync data
+	bs.fileSyncs.Add(1)
+	return file.Sync()
+}
+
+// finishedFileNeedsFinalize reports whether finished block file fileNum still
+// carries a pre-allocated tail beyond its used size, i.e. its finalizing
+// truncation never became durable (a datadir written before flushFile
+// truncated ahead of its fsync, then a crash).
+func (bs *BlockStore) finishedFileNeedsFinalize(fileNum int32) (bool, error) {
+	if int32(len(bs.fileInfo)) <= fileNum {
+		return false, nil
+	}
+	st, err := os.Stat(bs.blockFilename(fileNum))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return st.Size() != int64(bs.fileInfo[fileNum].Size), nil
 }
 
 // State persistence keys
@@ -671,14 +691,35 @@ func (bs *BlockStore) CurrentFile() int32 {
 }
 
 // Flush syncs all pending data to disk.
+//
+// Every block and undo write is already durable when it returns: WriteBlock
+// and WriteUndo fsync the file after writing (and the pre-allocating
+// extension with it), and a finished file was truncated and fsynced when the
+// store rolled over to the next one. So Flush fsyncs only the current file,
+// as Core flushes only the last block file at shutdown, and finalizes a
+// finished file only when its size shows the truncation was lost. It used to
+// fsync every block file at every call. On the I/O-saturated mainnet disk
+// the live stop's block-store flush took 18 s (8 files, 2026-10-04), and on
+// a 24-file scratch datadir goroutine dumps showed it in these fsyncs for
+// 30-70 s, long enough to run the daemon past its 80 s shutdown deadline
+// before the database close began (gate 5).
 func (bs *BlockStore) Flush() error {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 
-	for i := int32(0); i <= bs.currentFileNum; i++ {
-		if err := bs.flushFile(i, i < bs.currentFileNum); err != nil {
+	for i := int32(0); i < bs.currentFileNum; i++ {
+		need, err := bs.finishedFileNeedsFinalize(i)
+		if err != nil {
 			return err
 		}
+		if need {
+			if err := bs.flushFile(i, true); err != nil {
+				return err
+			}
+		}
+	}
+	if err := bs.flushFile(bs.currentFileNum, false); err != nil {
+		return err
 	}
 	return bs.saveState()
 }
