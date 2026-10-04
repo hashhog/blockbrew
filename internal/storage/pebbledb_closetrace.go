@@ -201,6 +201,15 @@ func (p *PebbleDB) backgroundState() string {
 	}
 	s := fmt.Sprintf("flushes running=%d compactions running=%d write stall=%s sstable ops refused=%d",
 		p.bgWork().flushes.Load(), p.bgWork().compactions.Load(), stall, refused)
+	if p.cache != nil {
+		// pebble.Close evicts every cached block of every table one by one
+		// (tableCache.close -> removeDB -> Cache.EvictFile, C.free per block):
+		// on a scratch tip clone after 3 h uptime that was ~14 s of a 16.75 s
+		// close. The count drains while that runs. Cache.Metrics takes only
+		// the cache's shard locks, not DB.mu.
+		m := p.cache.Metrics()
+		s += fmt.Sprintf(" block cache=%d blocks/%d MiB", m.Count, m.Size>>20)
+	}
 	if base := p.closeBase.Load(); base != nil {
 		s += fmt.Sprintf(" since close: fsyncs=%d removes=%d tables deleted=%d",
 			p.fs.ops.syncs.Load()-base.syncs, p.fs.ops.removes.Load()-base.removes,

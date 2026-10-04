@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"path/filepath"
 	"strings"
@@ -71,6 +72,7 @@ func TestCloseLogsEveryStepStartAndEnd(t *testing.T) {
 	}
 	assertInOrder(t, out.String(),
 		"storage: close: begin; flushes running=",
+		" block cache=",
 		"storage: close: write gate (wait for in-flight reads/writes): started",
 		"storage: close: write gate (wait for in-flight reads/writes): done in",
 		"storage: close: WAL sync decision: needed (1 unsynced write(s)",
@@ -280,5 +282,40 @@ func TestCloseStatusShowsAnInFlightWALFsync(t *testing.T) {
 	}
 	if got := db.fs.ops.inFlight(8); got != "none" {
 		t.Fatalf("in-flight ops after Close: %s", got)
+	}
+}
+
+// The block-cache figure must reflect a populated cache: the close cost
+// observed on the 3 h scratch clone was pebble.Close evicting it block by
+// block, so a constant 0 here would hide exactly that.
+func TestCloseStatusReportsAPopulatedBlockCache(t *testing.T) {
+	db, err := NewPebbleDB(filepath.Join(t.TempDir(), "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	b := db.NewBatch()
+	for i := 0; i < 2000; i++ {
+		b.Put(closeTestKey(i), closeTestVal(i))
+	}
+	if err := b.Write(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.db.Flush(); err != nil { // into sstables, so reads go through the block cache
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		if _, err := db.Get(closeTestKey(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	m := db.cache.Metrics()
+	if m.Count == 0 {
+		t.Fatal("test setup: block cache still empty after reading 2000 flushed keys")
+	}
+	st := db.CloseStatus()
+	want := fmt.Sprintf(" block cache=%d blocks/", m.Count)
+	if !strings.Contains(st, want) {
+		t.Fatalf("CloseStatus %q does not report the cache's %d blocks", st, m.Count)
 	}
 }
