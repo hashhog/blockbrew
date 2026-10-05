@@ -120,17 +120,32 @@ func (s *Server) scanTxOutSetStart(args []json.RawMessage) (interface{}, *RPCErr
 		needles[hex.EncodeToString(spk)] = desc
 	}
 
-	utxoSet := s.chainMgr.UTXOSet()
-	if utxoSet == nil {
-		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set not available"}
+	// Flush + open ONE storage snapshot under the chain locks, then walk it
+	// with no lock held — Core's scantxoutset: LOCK(cs_main);
+	// ForceFlushStateToDisk(); CoinsDB().Cursor(); tip = m_chain.Tip()
+	// (rpc/blockchain.cpp). The previous UTXOSet.ScanUTXOs flushed under the
+	// UTXO-set mutex only, so the flush could land in the MIDDLE of a
+	// ConnectBlock (which drops that mutex between inputs): a partly-applied
+	// block — possibly one that then failed validation — became durable under
+	// a coins marker naming the previous block.
+	snap, err := s.chainMgr.OpenUTXOSnapshot()
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("UTXO scan failed: %v", err)}
 	}
-	us, ok := utxoSet.(*consensus.UTXOSet)
-	if !ok {
-		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set type not supported for scanning"}
-	}
+	defer snap.Close()
 
-	tipHash, tipHeight := s.chainMgr.BestBlock()
-	tipNode := s.chainMgr.BestBlockNode()
+	// Label everything with the block the snapshot holds (Core: the tip read
+	// under the same cs_main as the flush and cursor).
+	tipHash, tipHeight := snap.BestHash, snap.BestHeight
+	var tipNode *consensus.BlockNode
+	if s.headerIndex != nil {
+		tipNode = s.headerIndex.GetNode(tipHash)
+	}
+	if tipNode == nil {
+		if n := s.chainMgr.BestBlockNode(); n != nil && n.Hash == tipHash {
+			tipNode = n
+		}
+	}
 
 	// blockHashAtHeight resolves the display-hex hash of the block at `height`
 	// on the active chain. Mirrors Core's tip->GetAncestor(coin.nHeight) walk
@@ -158,7 +173,7 @@ func (s *Server) scanTxOutSetStart(args []json.RawMessage) (interface{}, *RPCErr
 	}
 	var total int64
 
-	count, err := us.ScanUTXOs(func(outpoint wire.OutPoint, entry *consensus.UTXOEntry) bool {
+	count, err := snap.Scan(s.shutdown, func(outpoint wire.OutPoint, entry *consensus.UTXOEntry) bool {
 		spkHex := hex.EncodeToString(entry.PkScript)
 		desc, matched := needles[spkHex]
 		if !matched {
