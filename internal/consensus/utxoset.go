@@ -135,6 +135,27 @@ type UTXOSet struct {
 	// prove nothing changed between staging a batch and that batch landing.
 	// Guarded by mu.
 	mutGen uint64
+
+	// readEpoch is the F0 resurrection guard (receipts/arch-f6-f7-design-
+	// 2026-10-05.md §0, invariant I5). GetUTXOChecked drops u.mu for its
+	// database read, so a reader without the chain lock (gettxout, the
+	// mempool view, other RPCs) can read coin C, then a block spends C and
+	// the flush that carries the delete commits and clears u.deleted, and
+	// only then does the reader take u.mu to install its pre-delete copy —
+	// as a CLEAN, unspent entry, which a later block then double-spends.
+	//
+	// Core never has this window: CCoinsViewCache::FetchCoin (coins.cpp:69-82)
+	// fetches from the base and inserts under cs_main, which also serialises
+	// ConnectBlock and FlushStateToDisk. blockbrew keeps the unlocked read
+	// (it is the cheap path for RPC/mempool) and makes the install
+	// conditional instead: the reader captures readEpoch together with its
+	// cache miss and installs only if the epoch is unchanged. It is bumped by
+	// every tracked mutation (journalPre: add, spend, undo), by a journal
+	// rollback, and whenever a flush lands coin writes and forgets the
+	// tombstones that recorded the spends (flushLockedDiscard, Commit). On a
+	// mismatch the reader re-runs the lookup with u.mu held across the read,
+	// where no spend or flush can interleave. Guarded by mu.
+	readEpoch uint64
 }
 
 // utxoPreimage is the snapshot of one outpoint's cache + tracking-flag state
@@ -201,6 +222,8 @@ func (u *UTXOSet) GetUTXOChecked(outpoint wire.OutPoint) (*UTXOEntry, error) {
 		u.mu.RUnlock()
 		return entry, nil
 	}
+	// F0: the epoch is captured atomically with the miss. See readEpoch.
+	epoch := u.readEpoch
 	u.mu.RUnlock()
 
 	// Not in cache, try database
@@ -208,29 +231,22 @@ func (u *UTXOSet) GetUTXOChecked(outpoint wire.OutPoint) (*UTXOEntry, error) {
 		return nil, nil
 	}
 
-	key := storage.MakeUTXOKey(outpoint)
-	data, err := u.readCoinKey(key)
-	if err != nil {
+	entry, err := u.readCoin(outpoint)
+	if err != nil || entry == nil {
+		// "Absent" is never cached (Core FetchCoin erases the empty entry).
 		return nil, err
 	}
-	if data == nil {
-		return nil, nil
-	}
 
-	entry, err := DeserializeUTXOEntry(data)
-	if err != nil {
-		// An undecodable record is corruption of the coins DB, not a missing
-		// coin. Core: a deserialisation failure in CCoinsViewDB throws and the
-		// error catcher aborts.
-		ferr := SystemFault("decode coin", fmt.Errorf("%w: %s:%d: %v",
-			ErrCoinsDBRead, outpoint.Hash.String()[:16], outpoint.Index, err))
-		AbortNode(ferr)
-		return nil, ferr
-	}
-
-	// Cache the entry for future lookups — unless a spend landed while the
-	// lock was dropped (then the coin is gone and must not be resurrected).
+	// Install only if nothing that could change C's answer happened while
+	// the lock was dropped: no add/spend/undo of any coin and no flush that
+	// landed deletes and forgot their tombstones. Otherwise the bytes in hand
+	// may describe a coin that has since been spent AND flushed — the
+	// u.deleted re-check alone cannot see that, because the flush cleared it.
 	u.mu.Lock()
+	if u.readEpoch != epoch {
+		defer u.mu.Unlock()
+		return u.getUTXOLocked(outpoint)
+	}
 	if u.deleted[outpoint] {
 		u.mu.Unlock()
 		return nil, nil
@@ -244,6 +260,52 @@ func (u *UTXOSet) GetUTXOChecked(outpoint wire.OutPoint) (*UTXOEntry, error) {
 	u.misses++
 	u.mu.Unlock()
 
+	return entry, nil
+}
+
+// getUTXOLocked is the lookup with u.mu (write) held across the database
+// read: no spend and no flush can interleave, so a coin read here is exactly
+// the coin a serial read would return and may be cached. Every writer of
+// coin keys either holds u.mu (flushLockedDiscard) or leaves u.deleted set
+// until it re-takes u.mu (StageFlush -> batch.Write -> Commit), so a delete
+// that is in flight is still answered from u.deleted. Callers MUST hold u.mu.
+func (u *UTXOSet) getUTXOLocked(outpoint wire.OutPoint) (*UTXOEntry, error) {
+	if u.deleted[outpoint] {
+		return nil, nil
+	}
+	if cached, ok := u.cache[outpoint]; ok {
+		u.hits++
+		return cached, nil
+	}
+	entry, err := u.readCoin(outpoint)
+	if err != nil || entry == nil {
+		return nil, err
+	}
+	u.cache[outpoint] = entry
+	u.cacheBytes += estimateEntrySize(entry)
+	u.misses++
+	return entry, nil
+}
+
+// readCoin reads and decodes one coin from the database (nil, nil = absent).
+func (u *UTXOSet) readCoin(outpoint wire.OutPoint) (*UTXOEntry, error) {
+	data, err := u.readCoinKey(storage.MakeUTXOKey(outpoint))
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
+	}
+	entry, err := DeserializeUTXOEntry(data)
+	if err != nil {
+		// An undecodable record is corruption of the coins DB, not a missing
+		// coin. Core: a deserialisation failure in CCoinsViewDB throws and the
+		// error catcher aborts.
+		ferr := SystemFault("decode coin", fmt.Errorf("%w: %s:%d: %v",
+			ErrCoinsDBRead, outpoint.Hash.String()[:16], outpoint.Index, err))
+		AbortNode(ferr)
+		return nil, ferr
+	}
 	return entry, nil
 }
 
@@ -925,7 +987,10 @@ func (u *UTXOSet) flushLockedDiscard(discardCache bool) error {
 		u.subsumeAppliedFloorLocked()
 	}
 
-	// Clear dirty, deleted, and fresh tracking (pre-size for next batch)
+	// Clear dirty, deleted, and fresh tracking (pre-size for next batch).
+	// Forgetting the tombstones invalidates every in-flight unlocked read
+	// (F0, see readEpoch).
+	u.readEpoch++
 	u.dirty = make(map[wire.OutPoint]bool, 100_000)
 	u.deleted = make(map[wire.OutPoint]bool, 100_000)
 	u.fresh = make(map[wire.OutPoint]bool, 100_000)
@@ -1149,6 +1214,9 @@ func (sf *StagedFlush) Commit() {
 	if sf.published {
 		u.subsumeAppliedFloorLocked()
 	}
+	// The batch landed coin writes and deletes on disk: any unlocked read
+	// that began before it may hold pre-write bytes (F0, see readEpoch).
+	u.readEpoch++
 	u.flushes++
 	u.blocksSinceFlush = 0
 
@@ -1190,7 +1258,8 @@ func (sf *StagedFlush) Commit() {
 // under an active reorg journal. Callers MUST already hold u.mu. No-op (one
 // map-nil comparison) when no journal is active — i.e. the entire hot path.
 func (u *UTXOSet) journalPre(op wire.OutPoint) {
-	u.mutGen++ // every tracked-state mutator calls journalPre first
+	u.mutGen++    // every tracked-state mutator calls journalPre first
+	u.readEpoch++ // F0: a mutation invalidates in-flight unlocked reads
 	if u.reorgJournal == nil {
 		return
 	}
@@ -1241,6 +1310,7 @@ func (u *UTXOSet) RollbackReorgJournal() {
 		return
 	}
 	u.mutGen++
+	u.readEpoch++
 	setBool := func(m map[wire.OutPoint]bool, op wire.OutPoint, v bool) {
 		if v {
 			m[op] = true
