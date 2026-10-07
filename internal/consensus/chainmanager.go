@@ -1406,6 +1406,18 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// validate/spend/add work.
 	var _firstUtxoNs int64
 
+	// A block the index marks failed (invalidateblock, an earlier verdict, or
+	// a failed ancestor) is never connected — not as an extension of the tip
+	// and not as a reorg target. Checked under cm.mu, the lock InvalidateBlock
+	// holds while it sets the flags, so a connect that was decided before the
+	// invalidation (the sync worker's known-invalid gate, a submitblock that
+	// read the tip) cannot slip the block back in after it. Core:
+	// AcceptBlockHeader BLOCK_CACHED_INVALID + FindMostWorkChain skipping
+	// BLOCK_FAILED_MASK (validation.cpp). Audit 2026-10-07 BB-3.
+	if node.Status.IsInvalid() || (node.Parent != nil && node.Parent.Status.IsInvalid()) {
+		return fmt.Errorf("%w: %s at height %d", ErrBlockMarkedInvalid, hash.String()[:16], node.Height)
+	}
+
 	// Verify this block connects to our current tip
 	if block.Header.PrevBlock != cm.tipNode.Hash {
 		// During IBD, never attempt reorgs — blocks must arrive in order.
@@ -1417,9 +1429,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		}
 		// Post-IBD: this might be a fork
 		if node.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
-			// New chain has more work - reorg
+			// New chain has more work - reorg. The decision is re-made
+			// inside reorgMu (reorgToIfMoreWork): between releasing cm.mu
+			// here and acquiring reorgMu an invalidateblock / another reorg
+			// can run, after which this target may be failed or lighter
+			// (BB-4/BB-5).
 			cm.mu.Unlock()
-			err := cm.ReorgTo(node)
+			err := cm.reorgToIfMoreWork(node)
 			cm.mu.Lock()
 			return err
 		}
@@ -2305,6 +2321,16 @@ func (cm *ChainManager) ProcessSubmittedBlock(block *wire.MsgBlock) error {
 	if newNode == nil {
 		return fmt.Errorf("block %s not found in header index", hash.String())
 	}
+	// Core AcceptBlockHeader: a block (or a child of a block) already marked
+	// failed answers BLOCK_CACHED_INVALID "duplicate-invalid" and is never
+	// activated. ConnectBlock / reorgToLocked enforce the same under the
+	// chain locks; this early answer just keeps the reason exact. BB-3.
+	cm.mu.RLock()
+	failed := newNode.Status.IsInvalid() || (newNode.Parent != nil && newNode.Parent.Status.IsInvalid())
+	cm.mu.RUnlock()
+	if failed {
+		return fmt.Errorf("%w: %s at height %d", ErrBlockMarkedInvalid, hash.String()[:16], newNode.Height)
+	}
 
 	// Snapshot current tip under read lock — both decision branches release
 	// before re-acquiring under their own locking discipline.
@@ -2334,7 +2360,7 @@ func (cm *ChainManager) ProcessSubmittedBlock(block *wire.MsgBlock) error {
 	if newNode.TotalWork.Cmp(tipWork) > 0 {
 		log.Printf("chainmgr: submitblock-triggered reorg target=%s height=%d work=%s tip_work=%s",
 			hash.String()[:16], newNode.Height, newNode.TotalWork.String(), tipWork.String())
-		return cm.ReorgTo(newNode)
+		return cm.reorgToIfMoreWork(newNode)
 	}
 
 	// Side-branch stored, no reorg.
@@ -3104,6 +3130,37 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 	return cm.reorgToLocked(newTip)
 }
 
+// reorgToIfMoreWork is ReorgTo for callers that decided to reorg because the
+// target had more work than the tip they saw (ConnectBlock's fork path,
+// ProcessSubmittedBlock). The decision is re-checked once reorgMu is held:
+// the tip may have moved (or the target been invalidated) while this caller
+// waited, and Core's ActivateBestChain re-selects under cs_main rather than
+// trusting a stale choice. A target that is no longer heavier is not an
+// error — the block stays stored as a side branch.
+func (cm *ChainManager) reorgToIfMoreWork(newTip *BlockNode) error {
+	if !cm.beginMutation() {
+		return mutationRefused()
+	}
+	defer cm.endMutation()
+	defer latchOnPanic()
+	if h := testHookBeforeReorgLock; h != nil {
+		h(newTip)
+	}
+	cm.reorgMu.Lock()
+	defer cm.reorgMu.Unlock()
+	cm.mu.RLock()
+	failed := newTip.Status.IsInvalid()
+	heavier := newTip.TotalWork.Cmp(cm.tipNode.TotalWork) > 0
+	cm.mu.RUnlock()
+	if failed {
+		return fmt.Errorf("%w: reorg target %s at height %d", ErrBlockMarkedInvalid, newTip.Hash.String()[:16], newTip.Height)
+	}
+	if !heavier {
+		return ErrSideBranchAccepted
+	}
+	return cm.reorgToLocked(newTip)
+}
+
 // testHookBeforeReorgLock, when set (tests only), runs in ReorgTo just before
 // it waits on cm.reorgMu. It is the seam that makes the BB-4 race (a sync
 // connect queued behind invalidateblock's reorgMu) deterministic.
@@ -3136,6 +3193,23 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 	for node := newTip; node != fork; node = node.Parent {
 		connectNodes = append(connectNodes, node)
 	}
+	// Never activate a branch containing a failed block. The flags are read
+	// under cm.mu (InvalidateBlock sets them under it) while this goroutine
+	// holds reorgMu, so the check cannot be overtaken by an invalidation that
+	// finished while this reorg was queued: the queued sync connect of BB-4
+	// used to wait here and then reconnect the chain invalidateblock had just
+	// disconnected, leaving the tip on invalid-flagged blocks. Refused BEFORE
+	// any disconnect, so nothing has to be rolled back. Core:
+	// FindMostWorkChain skips BLOCK_FAILED_MASK candidates (validation.cpp).
+	cm.mu.Lock()
+	for _, n := range connectNodes {
+		if n.Status.IsInvalid() {
+			cm.mu.Unlock()
+			return fmt.Errorf("%w: reorg target %s (height %d) has failed block %s at height %d on its branch",
+				ErrBlockMarkedInvalid, newTip.Hash.String()[:16], newTip.Height, n.Hash.String()[:16], n.Height)
+		}
+	}
+	cm.mu.Unlock()
 	// Reverse to connect in order (fork+1 .. newTip).
 	for i, j := 0, len(connectNodes)-1; i < j; i, j = i+1, j-1 {
 		connectNodes[i], connectNodes[j] = connectNodes[j], connectNodes[i]
@@ -3691,11 +3765,16 @@ func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
 	// leaves a flagged block as the persisted tip.
 	cm.persistFailureFlagsLocked(failureSubtree(node))
 
-	// Update header index to recalculate best tip excluding invalid blocks
+	// Update header index to recalculate best tip excluding invalid blocks:
+	// first the most-work chain we can ACTIVATE (all data present), then the
+	// best HEADER off the failed branch, so download chases the best valid
+	// header chain even where its bodies are not here yet (Core
+	// InvalidateBlock -> InvalidChainFound -> RecalculateBestHeader).
 	cm.headerIndex.RecalculateBestTip()
+	bestTip := cm.headerIndex.BestTip()
+	cm.headerIndex.RecalculateBestHeader()
 
 	// If the new best tip has more work than current tip, reorg to it
-	bestTip := cm.headerIndex.BestTip()
 	if bestTip != nil && !bestTip.Status.IsInvalid() && bestTip.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
 		// Need to activate the best valid chain.
 		// reorgToLocked, not ReorgTo: we already hold cm.reorgMu for the whole

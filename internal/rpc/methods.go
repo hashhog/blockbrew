@@ -2147,6 +2147,13 @@ func bip22ResultString(err error) string {
 		return "" // caller should return null (success)
 	}
 	switch {
+	// Core AcceptBlockHeader: BLOCK_CACHED_INVALID for a block (or a child of
+	// a block) already marked failed; BLOCK_INVALID_PREV for a header whose
+	// parent is failed (audit 2026-10-07 BB-3).
+	case errors.Is(err, consensus.ErrBlockMarkedInvalid):
+		return "duplicate-invalid"
+	case errors.Is(err, consensus.ErrInvalidParentHeader):
+		return "bad-prevblk"
 	// Proof-of-work failure (hash above target)
 	case errors.Is(err, consensus.ErrDifficultyTooLow),
 		errors.Is(err, consensus.ErrNegativeTarget),
@@ -2520,6 +2527,16 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 			existing := s.headerIndex.GetNode(hash)
 			if existing == nil {
 				return bip22ResultStringForBlock(block, err), nil
+			}
+			// Core AcceptBlockHeader: a known header whose block is marked
+			// failed (BLOCK_FAILED_MASK — invalidateblock, a verdict, or a
+			// failed ancestor) answers BLOCK_CACHED_INVALID
+			// "duplicate-invalid" and is never activated. This path used to
+			// answer "duplicate" and call ProcessSubmittedBlock, which
+			// reconnected an invalidated block and stamped it FullyValid
+			// while it was still flagged Invalid (audit 2026-10-07 BB-3).
+			if existing.Status.IsInvalid() {
+				return "duplicate-invalid", nil
 			}
 			if existing.Status&consensus.StatusDataStored != 0 {
 				// #73: a stored body is NOT proof the block was ever

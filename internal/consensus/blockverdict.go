@@ -20,6 +20,16 @@ var ErrScriptPrevoutMissing = errors.New("missing UTXO")
 // (BLOCK_INVALID_PREV), which MaybePunishNodeForBlock punishes.
 var ErrInvalidParentHeader = errors.New("bad-prevblk: header extends a block known to be invalid")
 
+// ErrBlockMarkedInvalid is returned by ConnectBlock / ReorgTo when asked to
+// connect a block the index already marks failed (StatusInvalid via
+// invalidateblock or a verdict, or StatusInvalidChild). It is NOT a new verdict
+// on the block — the mark already exists — so callers neither re-mark it nor
+// punish the peer that delivered it; they drop it and re-plan from the best
+// valid header. Bitcoin Core: AcceptBlockHeader -> BLOCK_CACHED_INVALID
+// "duplicate-invalid", and FindMostWorkChain / ActivateBestChainStep never
+// select a BLOCK_FAILED_MASK block (validation.cpp).
+var ErrBlockMarkedInvalid = errors.New("duplicate-invalid: block is marked invalid")
+
 // BlockInvalidError is a consensus VERDICT on one specific block: the block
 // itself breaks a consensus rule, so (like Core's BlockValidationResult::
 // BLOCK_CONSENSUS) it must be marked failed, never re-requested, and the peer

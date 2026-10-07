@@ -3088,6 +3088,16 @@ func (sm *SyncManager) requestBlocks() {
 		if len(sm.inflight) >= sm.downloadWindow {
 			break
 		}
+		// Never request (or fast-path dispatch) a block the index marks
+		// failed — invalidateblock, a verdict, or a failed ancestor. The
+		// queue was planned before the mark; purgeInvalidAndReplan drops the
+		// entry on the next connect pass. Core FindNextBlocksToDownload
+		// skips BLOCK_FAILED_MASK (net_processing.cpp).
+		if sm.headerIndex != nil {
+			if n := sm.headerIndex.GetNode(req.Hash); n != nil && n.Status.IsInvalid() {
+				continue
+			}
+		}
 
 		// Fast path: if the block body is already on disk (e.g. a prior
 		// requeue already persisted it, or a restart rebuilt blockQueue
@@ -4206,6 +4216,19 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 					nextHeight, bwr.req.Hash.String()[:16], connectErr)
 				break
 			}
+			if connectErr != nil && errors.Is(connectErr, consensus.ErrBlockMarkedInvalid) {
+				// The block (or an ancestor on its branch) was marked failed
+				// after the known-invalid gate above let it through — an
+				// invalidateblock that ran while this connect was queued on
+				// the chain locks (audit 2026-10-07 BB-4). Not a new verdict
+				// and not the peer's fault: drop it and re-plan from the best
+				// valid header, exactly like the gate. Never the
+				// [CHAINSTATE-CORRUPTION] halt below.
+				log.Printf("sync: dropping block %d (%s): marked invalid while queued to connect: %v",
+					nextHeight, bwr.req.Hash.String()[:16], connectErr)
+				nextHeight = sm.purgeInvalidAndReplan(pending)
+				continue
+			}
 			if bie, ok := consensus.AsBlockInvalid(connectErr); ok {
 				// A consensus VERDICT (BlockInvalidError — never a missing
 				// ancestor, a mutated body, a prevout missing from the local
@@ -4252,16 +4275,22 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 							for _, req := range sm.blockQueue {
 								if req.Height == missingHeight {
 									alreadyQueued = true
-									// Clear any invalid status so it gets re-downloaded
 									if req.State != BlockDownloadPending {
 										req.State = BlockDownloadPending
 										req.Peer = nil
 										delete(sm.inflight, req.Hash)
 									}
-									node := sm.headerIndex.GetNode(req.Hash)
-									if node != nil {
-										node.Status &^= consensus.StatusInvalid
-									}
+									// Do NOT clear a failure flag here. This
+									// used to strip StatusInvalid "so it gets
+									// re-downloaded" — a leftover from the
+									// pre-2026-05-02 skip-on-failure handler
+									// that no longer exists. Today the flag is
+									// only set by a verdict or invalidateblock,
+									// and clearing it silently undid the
+									// operator's invalidation (Core: only
+									// ReconsiderBlock resets BLOCK_FAILED_*).
+									// The known-invalid gate drops the block
+									// and re-plans instead.
 									break
 								}
 							}
@@ -4270,11 +4299,9 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 								bestTip := sm.headerIndex.BestTip()
 								if bestTip != nil {
 									ancestor := bestTip.GetAncestor(missingHeight)
-									if ancestor != nil {
+									if ancestor != nil && !ancestor.Status.IsInvalid() {
 										log.Printf("sync: gap detected — re-queuing skipped block at height %d (%s)",
 											missingHeight, ancestor.Hash.String()[:16])
-										// Clear invalid status
-										ancestor.Status &^= consensus.StatusInvalid
 										// Insert at the front of the queue
 										newReq := &blockRequest{
 											Hash:   ancestor.Hash,

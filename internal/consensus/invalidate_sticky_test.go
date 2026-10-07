@@ -120,7 +120,14 @@ func TestInvalidateStickyQueuedSyncReorg(t *testing.T) {
 		}
 		started = true
 		go func() { done <- cm.ConnectBlock(b7) }()
-		<-queued // the sync connect is now waiting on reorgMu
+		// Either the sync connect reaches ReorgTo and is about to wait on
+		// reorgMu (the BB-4 window), or it is refused outright because its
+		// branch is already flagged; both must end with the tip at 3.
+		select {
+		case <-queued:
+		case err := <-done:
+			done <- err
+		}
 	})
 
 	if err := cm.InvalidateBlock(nodes[4].Hash); err != nil {
@@ -137,5 +144,34 @@ func TestInvalidateStickyQueuedSyncReorg(t *testing.T) {
 	}
 	if serr == nil {
 		t.Errorf("queued sync ConnectBlock(7) returned nil; want a refusal")
+	}
+}
+
+// The reorg engine itself refuses a target whose branch holds a failed block,
+// before disconnecting anything (the guard a queued ReorgTo meets once
+// invalidateblock releases reorgMu, whatever path queued it).
+func TestInvalidateStickyReorgToRefusesFailedBranch(t *testing.T) {
+	cm, idx, nodes, _ := newStickyChain(t, 6)
+	params := RegtestParams()
+	b7 := createTestBlock(t, params, nodes[6], nil)
+	n7, err := idx.AddHeader(b7.Header, true)
+	if err != nil {
+		t.Fatalf("AddHeader 7: %v", err)
+	}
+	if err := cm.chainDB.StoreBlock(b7.Header.BlockHash(), b7); err != nil {
+		t.Fatalf("StoreBlock 7: %v", err)
+	}
+	if err := cm.InvalidateBlock(nodes[4].Hash); err != nil {
+		t.Fatalf("InvalidateBlock: %v", err)
+	}
+	if err := cm.ReorgTo(n7); err == nil {
+		t.Errorf("ReorgTo(7) onto the invalidated branch returned nil")
+	}
+	if got := cm.TipNode(); got != nodes[3] {
+		t.Fatalf("ReorgTo reconnected the invalidated branch: tip=%d want 3", got.Height)
+	}
+	// Best header is off the failed branch (Core RecalculateBestHeader).
+	if bt := idx.BestTip(); bt == nil || bt.Status.IsInvalid() {
+		t.Fatalf("best header still on the failed branch: %v", bt)
 	}
 }
