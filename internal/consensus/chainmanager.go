@@ -3095,11 +3095,19 @@ func (cm *ChainManager) ReorgTo(newTip *BlockNode) error {
 	// the end would race and one of the new-tip key chains would land
 	// half-committed. cm.reorgMu is separate from cm.mu so per-block
 	// helpers can take cm.mu under it without recursive-lock issues.
+	if h := testHookBeforeReorgLock; h != nil {
+		h(newTip)
+	}
 	cm.reorgMu.Lock()
 	defer cm.reorgMu.Unlock()
 
 	return cm.reorgToLocked(newTip)
 }
+
+// testHookBeforeReorgLock, when set (tests only), runs in ReorgTo just before
+// it waits on cm.reorgMu. It is the seam that makes the BB-4 race (a sync
+// connect queued behind invalidateblock's reorgMu) deterministic.
+var testHookBeforeReorgLock func(newTip *BlockNode)
 
 // reorgToLocked is ReorgTo's body. The caller MUST already hold cm.reorgMu.
 //
