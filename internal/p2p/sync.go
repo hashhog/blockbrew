@@ -759,6 +759,19 @@ const txInflightExpiry = 60 * time.Second
 
 // ChainConnector is the interface for connecting blocks to the chain.
 // This allows the sync manager to work with any chain manager implementation.
+// chainWriterGate takes the chain manager's external-writer gate for one
+// connect (consensus.ChainManager.ExternalWriter): while a dumptxoutset
+// rollback holds the chain rewound, the connect loop waits instead of
+// connecting over the rewound chainstate (Core: NetworkDisable around
+// TemporaryRollback, rpc/blockchain.cpp dumptxoutset). Connectors without a
+// gate (test mocks) get a no-op.
+func (sm *SyncManager) chainWriterGate() func() {
+	if g, ok := sm.chainMgr.(interface{ ExternalWriter() func() }); ok {
+		return g.ExternalWriter()
+	}
+	return func() {}
+}
+
 type ChainConnector interface {
 	// ConnectBlock validates and connects a block to the active chain.
 	ConnectBlock(block *wire.MsgBlock) error
@@ -4105,7 +4118,10 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 			// only blocks above it are rolled forward (validation.cpp:4773
 			// ReplayBlocks). The error-string branch below stays as the
 			// evidence-based repair for datadirs with no usable marker.
-			if adopted, adoptErr := sm.chainMgr.AdoptIfAlreadyFlushed(bwr.block); adoptErr != nil {
+			releaseGate := sm.chainWriterGate()
+			adopted, adoptErr := sm.chainMgr.AdoptIfAlreadyFlushed(bwr.block)
+			releaseGate()
+			if adoptErr != nil {
 				log.Printf("sync: marker-first adopt at height %d failed: %v (falling through to connect)",
 					nextHeight, adoptErr)
 			} else if adopted {
@@ -4174,6 +4190,11 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				// here. In-order IBD extensions — and a block above a gap on
 				// the tip's own chain, which the cascade handler below re-fills
 				// — keep raw ConnectBlock (invariant 1).
+				// Chain-writer gate: a dumptxoutset rollback holds the chain
+				// rewound; wait it out instead of connecting over the rewound
+				// chainstate (Core NetworkDisable around TemporaryRollback).
+				releaseGate := sm.chainWriterGate()
+				defer releaseGate()
 				if sm.chainMgr.IsIBD() && !sm.isForkOffActiveTip(bwr.req.Hash) {
 					connectErr = sm.chainMgr.ConnectBlock(bwr.block)
 				} else {
@@ -4421,7 +4442,10 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				// deleting a VALID 10.9-day from-genesis chainstate.
 				if bwr.block != nil &&
 					strings.Contains(connectErr.Error(), "references missing UTXO") {
-					if adoptErr := sm.chainMgr.AdoptAppliedBlock(bwr.block); adoptErr == nil {
+					releaseGate := sm.chainWriterGate()
+					adoptErr := sm.chainMgr.AdoptAppliedBlock(bwr.block)
+					releaseGate()
+					if adoptErr == nil {
 						log.Printf("sync: MARKER-LAG repaired at height %d — block already applied in a prior session; tip adopted",
 							nextHeight)
 						bwr.req.State = BlockDownloadConnected

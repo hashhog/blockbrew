@@ -293,16 +293,31 @@ func NewSnapshotWriter(w io.Writer, networkMagic [4]byte) *SnapshotWriter {
 // Callers must ensure no blocks connect between the passes (dumptxoutset
 // runs with block acceptance paused / a quiescent node).
 func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networkMagic [4]byte) (*SnapshotStats, error) {
-	stats := &SnapshotStats{}
+	stats, _, err := WriteSnapshotFromScan(w, utxoSet.ScanUTXOs, blockHash, networkMagic)
+	return stats, err
+}
 
-	// Pass 1: count coins (ScanUTXOs flushes the cache first, so the
-	// database holds the complete current set for both passes).
-	coinsCount, err := utxoSet.ScanUTXOs(func(op wire.OutPoint, entry *UTXOEntry) bool { return true })
+// UTXOScanFunc walks a coin set in key order (txid, then vout ascending).
+// UTXOSet.ScanUTXOs (flushes, then walks the live DB) and UTXOSnapshot.Scan
+// (one point-in-time storage snapshot) both satisfy it.
+type UTXOScanFunc func(visit func(outpoint wire.OutPoint, entry *UTXOEntry) bool) (uint64, error)
+
+// WriteSnapshotFromScan writes a Core-format snapshot of the set that scan
+// walks (pass 1 counts, pass 2 streams the txid-grouped records) and returns,
+// from the SAME pass 2, Core's HASH_SERIALIZED of those coins (the
+// dumptxoutset txoutset_hash). Given a UTXOSnapshot's Scan, header count,
+// body and hash all describe one storage snapshot — Core WriteUTXOSnapshot
+// over the one cursor PrepareUTXOSnapshot opened (rpc/blockchain.cpp).
+func WriteSnapshotFromScan(w io.Writer, scan UTXOScanFunc, blockHash wire.Hash256, networkMagic [4]byte) (*SnapshotStats, wire.Hash256, error) {
+	stats := &SnapshotStats{}
+	var zero wire.Hash256
+
+	// Pass 1: count coins (CoinsCount is a header field).
+	coinsCount, err := scan(func(op wire.OutPoint, entry *UTXOEntry) bool { return true })
 	if err != nil {
-		return nil, fmt.Errorf("failed to count UTXOs: %w", err)
+		return nil, zero, fmt.Errorf("failed to count UTXOs: %w", err)
 	}
 
-	// Write metadata
 	metadata := &SnapshotMetadata{
 		Magic:        SnapshotMagic,
 		Version:      SnapshotVersion,
@@ -311,7 +326,7 @@ func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networ
 		CoinsCount:   coinsCount,
 	}
 	if err := metadata.Serialize(w); err != nil {
-		return nil, fmt.Errorf("failed to write metadata: %w", err)
+		return nil, zero, fmt.Errorf("failed to write metadata: %w", err)
 	}
 
 	// Group coins by txid for compact serialization
@@ -326,21 +341,16 @@ func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networ
 		if len(txCoins) == 0 {
 			return nil
 		}
-		// Write txid
 		if err := lastTxid.Serialize(w); err != nil {
 			return err
 		}
-		// Write count of coins for this txid
 		if err := wire.WriteCompactSize(w, uint64(len(txCoins))); err != nil {
 			return err
 		}
-		// Write each coin
 		for _, tc := range txCoins {
-			// Write vout as compact size
 			if err := wire.WriteCompactSize(w, uint64(tc.vout)); err != nil {
 				return err
 			}
-			// Write coin data (height+coinbase, amount, script)
 			if err := writeCoin(w, tc.entry); err != nil {
 				return err
 			}
@@ -349,9 +359,16 @@ func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networ
 		return nil
 	}
 
-	// Pass 2: stream the grouped per-txid records straight off the cursor.
+	// Pass 2: stream the grouped per-txid records straight off the cursor,
+	// hashing every coin as it goes (Core hash_serialized_3 = SHA256d over
+	// TxOutSer in cursor order; see ComputeHashSerialized).
+	h := sha256.New()
 	var scanErr error
-	written, err := utxoSet.ScanUTXOs(func(op wire.OutPoint, entry *UTXOEntry) bool {
+	_, err = scan(func(op wire.OutPoint, entry *UTXOEntry) bool {
+		if e := WriteTxOutSer(h, op, entry); e != nil {
+			scanErr = e
+			return false
+		}
 		if op.Hash != lastTxid && len(txCoins) > 0 {
 			if e := flushTxCoins(); e != nil {
 				scanErr = e
@@ -367,27 +384,31 @@ func WriteSnapshot(w io.Writer, utxoSet *UTXOSet, blockHash wire.Hash256, networ
 		return true
 	})
 	if err != nil {
-		return nil, err
+		return nil, zero, err
 	}
 	if scanErr != nil {
-		return nil, scanErr
+		return nil, zero, scanErr
 	}
-	// Flush remaining coins
 	if err := flushTxCoins(); err != nil {
-		return nil, err
+		return nil, zero, err
 	}
 	if stats.CoinsWritten != coinsCount {
-		// The set changed between the passes (blocks connected mid-dump) —
-		// the header's CoinsCount no longer matches the body. Refuse rather
-		// than emit a snapshot that readers will mis-parse.
-		return nil, fmt.Errorf("UTXO set changed during dump: header count %d, wrote %d",
+		// The set changed between the passes (only possible on the live-DB
+		// scan, never on a storage snapshot) — the header's CoinsCount no
+		// longer matches the body. Refuse rather than emit a snapshot that
+		// readers will mis-parse.
+		return nil, zero, fmt.Errorf("UTXO set changed during dump: header count %d, wrote %d",
 			coinsCount, stats.CoinsWritten)
 	}
-	_ = written
+
+	first := h.Sum(nil)
+	second := sha256.Sum256(first)
+	var hashSer wire.Hash256
+	copy(hashSer[:], second[:])
 
 	stats.BlockHash = blockHash
 	stats.Height = -1 // Caller should set this
-	return stats, nil
+	return stats, hashSer, nil
 }
 
 // writeCoin writes a single coin in the Bitcoin Core snapshot format.

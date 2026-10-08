@@ -2556,7 +2556,7 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 					}
 				}
 				if !onActive && s.chainMgr != nil {
-					if perr := s.chainMgr.ProcessSubmittedBlock(block); perr != nil &&
+					if perr := s.chainWrite(func() error { return s.chainMgr.ProcessSubmittedBlock(block) }); perr != nil &&
 						!errors.Is(perr, consensus.ErrSideBranchAccepted) {
 						log.Printf("rpc: submitblock duplicate-activation of %s (h=%d) failed: %v",
 							hash.String()[:16], existing.Height, perr)
@@ -2684,7 +2684,7 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		// This mirrors Bitcoin Core's split between AcceptBlock (storage +
 		// header index entry) and ActivateBestChain (tip selection) in
 		// validation.cpp.
-		if err := s.chainMgr.ProcessSubmittedBlock(block); err != nil {
+		if err := s.chainWrite(func() error { return s.chainMgr.ProcessSubmittedBlock(block) }); err != nil {
 			if errors.Is(err, consensus.ErrSideBranchAccepted) {
 				return "inconclusive", nil
 			}
@@ -2819,7 +2819,7 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interfac
 			// coins marker and a submitted block may already be in the
 			// persisted UTXO set, where re-applying it re-adds coins later
 			// blocks already spent.
-			if err := s.chainMgr.ConnectOrAdoptBlock(block); err != nil {
+			if err := s.chainWrite(func() error { return s.chainMgr.ConnectOrAdoptBlock(block) }); err != nil {
 				results[i] = fmt.Sprintf("block connection failed: %v", err)
 				continue
 			}
@@ -3411,9 +3411,14 @@ func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 	if utxoSet == nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set not available"}
 	}
-	us, ok := utxoSet.(*consensus.UTXOSet)
-	if !ok {
+	if _, ok := utxoSet.(*consensus.UTXOSet); !ok {
 		return nil, &RPCError{Code: RPCErrInternal, Message: "UTXO set type not supported for snapshots"}
+	}
+
+	// Refuse an existing destination BEFORE touching the chain (Core checks
+	// the path and opens the temp file before TemporaryRollback).
+	if rerr := checkSnapshotDestination(path); rerr != nil {
+		return nil, rerr
 	}
 
 	// Pruned-mode pre-check (Core: rpc/blockchain.cpp:dumptxoutset, the
@@ -3423,74 +3428,214 @@ func (s *Server) handleDumpTxOutSet(params json.RawMessage) (interface{}, *RPCEr
 	// Every block from genesis is on disk, so any rollback target is reachable
 	// and the check is a no-op. Documented gap: revisit once `-prune` lands.
 
-	// Roll back if needed. ReorgTo(target) where target is an ancestor of the
-	// current tip just disconnects down to target (FindFork == target, no
-	// connect loop iterations).
 	rolledBack := targetNode.Hash != originalTipHash
 	if rolledBack {
-		// NetworkDisable RAII: pause inbound block acceptance for the
-		// duration of the rewind→dump→replay dance. Mirrors Core's
-		// NetworkDisable wrapper around TemporaryRollback in
-		// rpc/blockchain.cpp::dumptxoutset. The deferred restore fires
-		// on every return path (success, error) so peers can resume
-		// submitting once the original tip is back.
-		restore := s.networkDisable()
-		defer restore()
+		// TemporaryRollback + NetworkDisable (Core rpc/blockchain.cpp
+		// dumptxoutset). The pause is CHAIN-level: the P2P connect loop,
+		// submitblock, generate* and invalidate/reconsider/precious all wait
+		// on cm.ExternalWriter, so nothing can connect over the rewound
+		// chainstate (BB-2: the old flag gated only RPC submitblock; the sync
+		// loop rolled the chain forward mid-dump and the restore then dragged
+		// the tip back below it). Held from the rewind through the dump to
+		// the restore, released on every return path.
+		resume := s.chainMgr.PauseExternalWriters()
+		defer resume()
+		restoreFlag := s.networkDisable()
+		defer restoreFlag()
+
+		// Re-read the tip under the pause: an external writer may have moved
+		// it between the resolution above and the pause taking effect.
+		originalTipHash, originalTipHeight = s.chainMgr.BestBlock()
+		originalTipNode = s.chainMgr.BestBlockNode()
+		if originalTipNode == nil || originalTipNode.GetAncestor(targetNode.Height) == nil ||
+			originalTipNode.GetAncestor(targetNode.Height).Hash != targetNode.Hash {
+			return nil, &RPCError{Code: RPCErrInvalidParams,
+				Message: fmt.Sprintf("Target block %s is not on the active chain", targetNode.Hash.String())}
+		}
+
+		// Restore = reconnect upward to the best block we left, on every
+		// path out of here (Core: ~TemporaryRollback -> ReconsiderBlock ->
+		// ActivateBestChain). Nothing else can connect while paused, so the
+		// tip we left is still the best valid tip.
+		restored := false
+		restore := func() error {
+			if restored {
+				return nil
+			}
+			restored = true
+			if h, _ := s.chainMgr.BestBlock(); h == originalTipHash {
+				return nil
+			}
+			return s.chainMgr.ReorgTo(originalTipNode)
+		}
+		defer func() {
+			if err := restore(); err != nil {
+				log.Printf("rpc: dumptxoutset failed to restore tip %s (height %d): %v",
+					originalTipHash.String()[:16], originalTipHeight, err)
+			}
+		}()
 
 		log.Printf("rpc: dumptxoutset rolling back from height %d to %d (%s)",
 			originalTipHeight, targetNode.Height, targetNode.Hash.String()[:16])
+		// ReorgTo(target), target an ancestor of the tip: disconnects
+		// tip-first down to target (FindFork == target, nothing reconnected).
 		if err := s.chainMgr.ReorgTo(targetNode); err != nil {
 			return nil, &RPCError{
 				Code:    RPCErrInternal,
 				Message: fmt.Sprintf("Failed to roll back to target height %d: %v", targetNode.Height, err),
 			}
 		}
-		// Defensive: confirm the chain actually moved to where we asked.
-		gotHash, gotHeight := s.chainMgr.BestBlock()
-		if gotHash != targetNode.Hash || gotHeight != targetNode.Height {
-			log.Printf("rpc: dumptxoutset rolled back to %d/%s but expected %d/%s",
-				gotHeight, gotHash.String()[:16],
-				targetNode.Height, targetNode.Hash.String()[:16])
-			// Best-effort: try to restore original tip and bail.
-			if originalTipNode != nil {
-				_ = s.chainMgr.ReorgTo(originalTipNode)
-			}
-			return nil, &RPCError{Code: RPCErrInternal, Message: "Rollback target was not reached"}
+		if gotHash, _ := s.chainMgr.BestBlock(); gotHash != targetNode.Hash {
+			// Core: "Could not roll back to requested height."
+			return nil, &RPCError{Code: RPCErrMisc, Message: "Could not roll back to requested height."}
 		}
-	}
 
-	// Now snapshot the UTXO set at the (possibly rolled-back) tip.
-	dumpTipHash, dumpTipHeight := s.chainMgr.BestBlock()
-
-	dumpResult, dumpErr := s.writeUtxoSnapshotFile(path, us, dumpTipHash, dumpTipHeight)
-
-	// Re-apply blocks back to the original tip if we rolled back.
-	if rolledBack && originalTipNode != nil {
-		if err := s.chainMgr.ReorgTo(originalTipNode); err != nil {
-			// We've already written the snapshot if dumpErr == nil. Surface
-			// this as a hard error so the operator notices the chain is
-			// stuck below the original tip.
-			log.Printf("rpc: dumptxoutset failed to roll forward to original tip %s (height %d): %v",
-				originalTipHash.String()[:16], originalTipHeight, err)
+		dumpResult, dumpErr := s.dumpUtxoSnapshotAt(path, targetNode)
+		if err := restore(); err != nil {
 			return nil, &RPCError{
 				Code: RPCErrInternal,
-				Message: fmt.Sprintf(
-					"Snapshot dumped at height %d but failed to restore tip to height %d: %v",
-					dumpTipHeight, originalTipHeight, err),
+				Message: fmt.Sprintf("Snapshot dumped at height %d but failed to restore tip to height %d: %v",
+					targetNode.Height, originalTipHeight, err),
 			}
 		}
+		if dumpErr != nil {
+			return nil, dumpErr
+		}
+		logDumpComplete(dumpResult)
+		return dumpResult, nil
 	}
 
+	// latest: no rollback, no pause. One storage snapshot, labelled from its
+	// own coins marker (BB-2b: the label used to come from BestBlock() read
+	// before three separately flushed passes).
+	dumpResult, dumpErr := s.dumpUtxoSnapshotAt(path, nil)
 	if dumpErr != nil {
 		return nil, dumpErr
 	}
-	// Log the result too: a multi-minute dump outlives impatient HTTP
-	// clients (and any write deadline), and the operator needs the hash
-	// even when the response connection is gone (2026-08-14 R4 capture).
-	log.Printf("rpc: dumptxoutset COMPLETE path=%s coins=%d base_height=%d base_hash=%s txoutset_hash=%s",
-		dumpResult.Path, dumpResult.CoinsWritten, dumpResult.BaseHeight,
-		dumpResult.BaseHash, dumpResult.TxOutSetHash)
+	logDumpComplete(dumpResult)
 	return dumpResult, nil
+}
+
+// chainWrite runs one external chain mutation (submitblock, generateblock,
+// invalidate/reconsider/precious) under the chain-writer gate, so it waits
+// while a dumptxoutset rollback holds the chain rewound (Core: these RPCs
+// queue on cs_main; P2P is NetworkDisable'd).
+func (s *Server) chainWrite(fn func() error) error {
+	release := s.chainMgr.ExternalWriter()
+	defer release()
+	return fn()
+}
+
+// logDumpComplete logs the result too: a multi-minute dump outlives impatient
+// HTTP clients (and any write deadline), and the operator needs the hash even
+// when the response connection is gone (2026-08-14 R4 capture).
+func logDumpComplete(r *DumpTxOutSetResult) {
+	log.Printf("rpc: dumptxoutset COMPLETE path=%s coins=%d base_height=%d base_hash=%s txoutset_hash=%s",
+		r.Path, r.CoinsWritten, r.BaseHeight, r.BaseHash, r.TxOutSetHash)
+}
+
+// checkSnapshotDestination refuses an existing destination — Core's
+// "already exists. If you are sure this is what you want, move it out of the
+// way first". The .incomplete temp is fine to overwrite (a previous crashed
+// dump's leftover).
+func checkSnapshotDestination(path string) *RPCError {
+	if _, statErr := os.Stat(path); statErr == nil {
+		return &RPCError{
+			Code:    RPCErrInvalidParams,
+			Message: fmt.Sprintf("%s already exists. If you are sure this is what you want, move it out of the way first.", path),
+		}
+	} else if !os.IsNotExist(statErr) {
+		return &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to stat %s: %v", path, statErr)}
+	}
+	return nil
+}
+
+// dumpUtxoSnapshotAt is Core's PrepareUTXOSnapshot + WriteUTXOSnapshot: under
+// the chain locks, flush and open ONE storage snapshot of the coins DB
+// (cm.OpenUTXOSnapshot), then — with no lock held — count, hash and write
+// every coin from that snapshot, labelled from the snapshot's own coins
+// marker. A block connecting meanwhile can neither tear the file nor relabel
+// it, and nothing here flushes the live cache outside the chain lock (BB-1:
+// the old path called ScanUTXOs three times, each flushing under u.mu only,
+// so a flush could land mid-ConnectBlock and persist a partial block under the
+// previous block's marker).
+//
+// want, when non-nil, is the block the caller rolled back to; a snapshot
+// labelled differently is refused (Core: "Could not roll back to requested
+// height").
+func (s *Server) dumpUtxoSnapshotAt(path string, want *consensus.BlockNode) (*DumpTxOutSetResult, *RPCError) {
+	if rerr := checkSnapshotDestination(path); rerr != nil {
+		return nil, rerr
+	}
+	snap, err := s.chainMgr.OpenUTXOSnapshot()
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to open UTXO snapshot: %v", err)}
+	}
+	defer snap.Close()
+	if want != nil && (snap.BestHash != want.Hash || snap.BestHeight != want.Height) {
+		return nil, &RPCError{Code: RPCErrMisc, Message: fmt.Sprintf(
+			"Could not roll back to requested height (coins snapshot is at %d/%s, wanted %d/%s)",
+			snap.BestHeight, snap.BestHash.String(), want.Height, want.Hash.String())}
+	}
+	baseHash, baseHeight := snap.BestHash, snap.BestHeight
+
+	tempPath := snapshotTempPath(path)
+	cleanupTemp := func() {
+		if rmErr := os.Remove(tempPath); rmErr != nil && !os.IsNotExist(rmErr) {
+			log.Printf("rpc: dumptxoutset failed to remove temp file %s: %v", tempPath, rmErr)
+		}
+	}
+	f, err := createSnapshotFile(tempPath)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrInvalidParams, Message: fmt.Sprintf("Failed to create file: %v", err)}
+	}
+
+	scan := func(visit func(wire.OutPoint, *consensus.UTXOEntry) bool) (uint64, error) {
+		return snap.Scan(nil, visit)
+	}
+	stats, utxoHash, err := consensus.WriteSnapshotFromScan(f, scan, baseHash, s.chainParams.NetworkMagic)
+	if err != nil {
+		_ = f.Close()
+		cleanupTemp()
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to write snapshot: %v", err)}
+	}
+
+	// fsync so durability is guaranteed before the atomic rename. Without
+	// this, a power loss between rename and the OS flushing dirty pages
+	// could leave <path> visible but with zero-length / torn contents.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanupTemp()
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to fsync snapshot: %v", err)}
+	}
+	if err := f.Close(); err != nil {
+		cleanupTemp()
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to close snapshot: %v", err)}
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		cleanupTemp()
+		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to rename snapshot to final path: %v", err)}
+	}
+
+	// nchaintx = the base block's m_chain_tx_count (Core result field), not
+	// the coin count.
+	var nChainTx uint64
+	if s.headerIndex != nil {
+		if node := s.headerIndex.GetNode(baseHash); node != nil {
+			if n, known := s.chainTxCount(node); known {
+				nChainTx = n
+			}
+		}
+	}
+
+	return &DumpTxOutSetResult{
+		CoinsWritten: stats.CoinsWritten,
+		BaseHash:     baseHash.String(),
+		BaseHeight:   baseHeight,
+		Path:         path,
+		TxOutSetHash: utxoHash.String(),
+		NChainTx:     nChainTx,
+	}, nil
 }
 
 // resolveRollbackTarget parses the `rollback` named-option value, which Core
@@ -4517,7 +4662,7 @@ func (s *Server) handleGenerateBlock(params json.RawMessage) (interface{}, *RPCE
 
 	if s.chainMgr != nil {
 		// Through the marker gate, for the same reason as handleSubmitBlockBatch.
-		if err := s.chainMgr.ConnectOrAdoptBlock(block); err != nil {
+		if err := s.chainWrite(func() error { return s.chainMgr.ConnectOrAdoptBlock(block) }); err != nil {
 			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Block connection failed: %v", err)}
 		}
 	}
@@ -4599,7 +4744,7 @@ func (s *Server) handleInvalidateBlock(params json.RawMessage) (interface{}, *RP
 	}
 
 	// Invalidate the block
-	if err := s.chainMgr.InvalidateBlock(hash); err != nil {
+	if err := s.chainWrite(func() error { return s.chainMgr.InvalidateBlock(hash) }); err != nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
 	}
 
@@ -4641,7 +4786,7 @@ func (s *Server) handleReconsiderBlock(params json.RawMessage) (interface{}, *RP
 	}
 
 	// Reconsider the block
-	if err := s.chainMgr.ReconsiderBlock(hash); err != nil {
+	if err := s.chainWrite(func() error { return s.chainMgr.ReconsiderBlock(hash) }); err != nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
 	}
 
@@ -4868,7 +5013,7 @@ func (s *Server) handlePreciousBlock(params json.RawMessage) (interface{}, *RPCE
 	}
 
 	// Mark the block as precious
-	if err := s.chainMgr.PreciousBlock(hash); err != nil {
+	if err := s.chainWrite(func() error { return s.chainMgr.PreciousBlock(hash) }); err != nil {
 		return nil, &RPCError{Code: RPCErrInternal, Message: err.Error()}
 	}
 

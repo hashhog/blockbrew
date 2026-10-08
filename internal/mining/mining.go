@@ -718,7 +718,15 @@ func (m *BlockMiner) GenerateBlock(coinbaseScript []byte, txs []*wire.MsgTx, max
 		// true after a halted recovery: the tip then sits below the coins
 		// marker, and generatetoaddress on regtest can re-assemble a block
 		// the set already contains. Re-applying it re-adds a coinbase.
-		if err := m.chainMgr.ConnectOrAdoptBlock(block); err != nil {
+		// Under the chain-writer gate: waits while a dumptxoutset rollback
+		// holds the chain rewound (Core: generate* queues on cs_main).
+		release := func() {}
+		if g, ok := m.chainMgr.(interface{ ExternalWriter() func() }); ok {
+			release = g.ExternalWriter()
+		}
+		err := m.chainMgr.ConnectOrAdoptBlock(block)
+		release()
+		if err != nil {
 			return wire.Hash256{}, err
 		}
 	}

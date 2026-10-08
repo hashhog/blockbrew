@@ -151,6 +151,17 @@ type ChainManager struct {
 	mutationWG sync.WaitGroup
 	quiescing  atomic.Bool
 
+	// extWriters is the chain-level pause of a TemporaryRollback (Core:
+	// NetworkDisable + the rewound chainstate in rpc/blockchain.cpp
+	// dumptxoutset). Every EXTERNAL chain writer — the P2P connect loop,
+	// submitblock, generate*, invalidate/reconsider/precious — holds it
+	// shared (ExternalWriter) for the call; a dumptxoutset rollback holds it
+	// exclusive (PauseExternalWriters) from the rewind through the dump to
+	// the restore, and drives ReorgTo itself. Never taken inside
+	// ChainManager methods, so the rollback's own ReorgTo cannot deadlock.
+	extWriters     sync.RWMutex
+	rollbackPaused atomic.Bool
+
 	// reorgBatch, when non-nil, redirects all per-block persistence writes
 	// inside ConnectBlock / DisconnectBlock into the named batch instead of
 	// committing to disk per-block. Set by ReorgTo for the duration of a
