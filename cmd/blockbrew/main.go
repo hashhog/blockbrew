@@ -1294,6 +1294,45 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// immediately. Mirrors Bitcoin Core's
 	// BaseIndex::BlockDisconnected → CustomRemove fan-out — Core also
 	// composes the deletion + state-row write into a single CDBBatch.
+	// Chain -> mempool consistency, run by the chain manager UNDER its chain
+	// lock at the points Bitcoin Core runs them under cs_main
+	// (validation.cpp): ConnectTip -> removeForBlock for every connected
+	// block on every path (P2P, submitblock, generate, reorg replay,
+	// reconsiderblock); DisconnectTip -> stash the block's transactions; and
+	// MaybeUpdateMempoolForReorg once a reorg completes / after each block
+	// invalidateblock disconnects: re-accept the stash earliest-first,
+	// removeRecursive what fails, removeForReorg (non-final, BIP68-locked,
+	// immature-coinbase spends at tip+1), trim. Before this the disconnected
+	// transactions were re-added one block at a time against intermediate
+	// tips and removeForReorg had no caller, so invalidateblock left
+	// immature / non-final / sequence-locked transactions in
+	// getblocktemplate (audit 2026-10-07 BB-6).
+	//
+	// FIX-47 BUG-10 ordering preserved: FeeEstimator.ProcessBlock records
+	// the confirmed txids BEFORE mp.BlockConnected removes them, so the
+	// OnTxEvicted -> UnregisterTransaction callback is a no-op for them.
+	chainMgr.SetMempoolHooks(consensus.MempoolHooks{
+		BlockConnected: func(block *wire.MsgBlock, height int32) {
+			if feeEstimator != nil {
+				confirmedTxids := make([]wire.Hash256, 0, len(block.Transactions))
+				for _, tx := range block.Transactions {
+					confirmedTxids = append(confirmedTxids, tx.TxHash())
+				}
+				feeEstimator.ProcessBlock(height, confirmedTxids)
+			}
+			mp.BlockConnected(block)
+		},
+		BlockDisconnected: func(block *wire.MsgBlock, height int32) {
+			mp.BlockDisconnected(block)
+		},
+		UpdateForReorg: func(addToMempool bool) {
+			readded, removed := mp.UpdateForReorg(addToMempool)
+			if readded > 0 || removed > 0 {
+				log.Printf("mempool: reorg update re-accepted %d disconnected txs, removed %d invalid at the new tip", readded, removed)
+			}
+		},
+	})
+
 	chainMgr.SetOnBlockDisconnected(func(block *wire.MsgBlock, height int32) {
 		// Wallet UTXO ledger: reverse this block's credits so a reorg cannot
 		// leave the ledger over-counting coins that no longer exist on the
@@ -1306,7 +1345,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		if w != nil {
 			w.UnscanBlock(block, height)
 		}
-		mp.BlockDisconnected(block)
+		// The mempool is NOT updated here: it runs under the chain lock via
+		// chainMgr.SetMempoolHooks below (stash on disconnect, re-accept once
+		// the reorg / invalidation reaches its tip).
 		if cfg.TxIndex && chainDB != nil {
 			for _, tx := range block.Transactions {
 				txid := tx.TxHash()
@@ -1438,27 +1479,8 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			w.ScanBlock(block, height)
 		}
 
-		// Per-connect notification fan-out, moved here from the SyncManager's
-		// own onBlockConnected callback so it fires on EVERY connect path —
-		// crucially the locally mined (generatetoaddress) path, which never
-		// reaches the SyncManager. This is what clears confirmed txs from the
-		// mempool after a locally mined block (the pre-fix bug: a wallet-native
-		// sendtoaddress tx stayed in getrawmempool forever once mined locally,
-		// because mp.BlockConnected was only on the P2P path). Placed BEFORE the
-		// index writes because the blockfilterindex arm can early-return.
-		//
-		// FIX-47 BUG-10 ordering preserved: FeeEstimator.ProcessBlock records
-		// confirmed txids BEFORE mp.BlockConnected removes them, so the
-		// OnTxEvicted → UnregisterTransaction callback is a safe no-op for
-		// confirmed txs.
-		if feeEstimator != nil {
-			confirmedTxids := make([]wire.Hash256, 0, len(block.Transactions))
-			for _, tx := range block.Transactions {
-				confirmedTxids = append(confirmedTxids, tx.TxHash())
-			}
-			feeEstimator.ProcessBlock(height, confirmedTxids)
-		}
-		mp.BlockConnected(block)
+		// Fee estimation + mempool removeForBlock run under the chain lock
+		// via chainMgr.SetMempoolHooks below, on every connect path.
 		if zmqPub != nil {
 			zmqPub.PublishBlockConnected(block, height)
 		}
