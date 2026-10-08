@@ -1078,6 +1078,14 @@ func largeSerializedNearMaxBlock(t *testing.T, prev wire.Hash256, timestamp uint
 		padding.TxOut = append(padding.TxOut, &wire.TxOut{Value: 0, PkScript: pad})
 	}
 	witChunk := bytes.Repeat([]byte{0x00}, 20000)
+	// The padding tx carries witness data, so the block needs a BIP-141
+	// commitment or it is MUTATED ("unexpected-witness", Core
+	// CheckWitnessMalleation) and the receipt check rightly drops it.
+	// Placeholder commitment now (same size) so the weight loop accounts for it.
+	witnessNonce := make([]byte, 32)
+	coinbase.TxIn[0].Witness = [][]byte{witnessNonce}
+	commitOut := &wire.TxOut{Value: 0, PkScript: append([]byte{0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed}, make([]byte, 32)...)}
+	coinbase.TxOut = append(coinbase.TxOut, commitOut)
 	block := &wire.MsgBlock{Transactions: []*wire.MsgTx{coinbase, padding}}
 	for i := 0; i < 200; i++ {
 		var ser bytes.Buffer
@@ -1106,6 +1114,8 @@ func largeSerializedNearMaxBlock(t *testing.T, prev wire.Hash256, timestamp uint
 		}
 		padding.TxOut = append(padding.TxOut, &wire.TxOut{Value: 0, PkScript: pad})
 	}
+	commit := consensus.CalcWitnessCommitment([]wire.Hash256{{}, padding.WTxHash()}, witnessNonce)
+	copy(commitOut.PkScript[6:], commit[:])
 	hashes := []wire.Hash256{coinbase.TxHash(), padding.TxHash()}
 	block.Header = wire.BlockHeader{
 		Version:    1,

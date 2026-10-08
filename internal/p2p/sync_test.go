@@ -1015,6 +1015,21 @@ func TestHandleBlockAdvancesSyncedBlocks(t *testing.T) {
 			},
 		},
 	}
+	// The header must commit to the body, or the receipt check (Core
+	// IsBlockMutated) drops it as mutated before anything is credited.
+	block.Header.MerkleRoot = block.Transactions[0].TxHash()
+	block.Header = createTestBlockHeader2(block.Header)
+	blockHash = block.Header.BlockHash()
+	idx2 := consensus.NewHeaderIndex(params)
+	if _, err := idx2.AddHeader(block.Header, true); err != nil {
+		t.Fatalf("failed to add header: %v", err)
+	}
+	sm.headerIndex = idx2
+	sm.mu.Lock()
+	sm.inflight = map[wire.Hash256]*blockRequest{blockHash: {
+		Hash: blockHash, Height: 1, Peer: peer, State: BlockDownloadInFlight, RequestAt: time.Now(),
+	}}
+	sm.mu.Unlock()
 	sm.HandleBlock(peer, &MsgBlock{Block: block})
 
 	if got := peer.SyncedBlocks(); got != 1 {
