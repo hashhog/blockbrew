@@ -330,6 +330,18 @@ func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, blockHei
 	// when the block is already close to full (within BLOCK_FULL_ENOUGH_WEIGHT_DELTA).
 	consecutiveFailed := 0
 
+	// Entries whose parents were not yet selected when their turn came.
+	// They passed the fee, weight, sigops and finality gates already.
+	var waiting []*mempool.TxEntry
+	add := func(entry *mempool.TxEntry, txWeight, txSigOps int64) {
+		selected = append(selected, entry.Tx)
+		sigOpsCosts = append(sigOpsCosts, txSigOps)
+		included[entry.TxHash] = true
+		totalFees += entry.Fee
+		totalWeight += txWeight
+		totalSigOps += txSigOps
+	}
+
 	for _, entry := range entries {
 		if entry.FeeRate < minFeeRate {
 			continue
@@ -378,32 +390,51 @@ func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, blockHei
 		}
 
 		// Ensure all parent transactions are included
-		allParentsIncluded := true
-		for _, dep := range entry.Depends {
-			if !included[dep] {
-				allParentsIncluded = false
-				break
-			}
-		}
-		if !allParentsIncluded {
-			consecutiveFailed++
-			if consecutiveFailed > maxConsecutiveFailures &&
-				totalWeight+blockFullEnoughWeightDelta > maxWeight {
-				break
-			}
-			continue // Skip — parent not yet selected
+		if !parentsIncluded(entry, included) {
+			// Not a failure of this tx: equal ancestor feerates sort in
+			// arbitrary order, so a child can come up before its parent.
+			// Park it and retry once the parent is in (Core selects whole
+			// ancestor packages, so a child never loses to its own parent's
+			// position).
+			waiting = append(waiting, entry)
+			continue
 		}
 
 		consecutiveFailed = 0
-		selected = append(selected, entry.Tx)
-		sigOpsCosts = append(sigOpsCosts, txSigOps)
-		included[entry.TxHash] = true
-		totalFees += entry.Fee
-		totalWeight += txWeight
-		totalSigOps += txSigOps
+		add(entry, txWeight, txSigOps)
+		// A parked child whose parents are now all in goes right after them.
+		for progress := true; progress; {
+			progress = false
+			for i := 0; i < len(waiting); i++ {
+				w := waiting[i]
+				if !parentsIncluded(w, included) {
+					continue
+				}
+				waiting = append(waiting[:i], waiting[i+1:]...)
+				i--
+				wWeight := consensus.CalcTxWeight(w.Tx)
+				wSigOps := computeTxSigOpsCost(w.Tx, utxoView)
+				if totalWeight+wWeight >= maxWeight || totalSigOps+wSigOps >= maxSigOps {
+					continue
+				}
+				add(w, wWeight, wSigOps)
+				progress = true
+			}
+		}
 	}
 
 	return selected, sigOpsCosts, totalFees, totalSigOps
+}
+
+// parentsIncluded reports whether every in-mempool parent of entry is already
+// in the template.
+func parentsIncluded(entry *mempool.TxEntry, included map[wire.Hash256]bool) bool {
+	for _, dep := range entry.Depends {
+		if !included[dep] {
+			return false
+		}
+	}
+	return true
 }
 
 // computeTxSigOpsCost returns the BIP141 sigops cost for a transaction.
