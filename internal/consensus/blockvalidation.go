@@ -642,53 +642,90 @@ func CheckWitnessCommitment(block *wire.MsgBlock) error {
 	return checkWitnessCommitment(block)
 }
 
-// IsBlockMutated returns true if the block's merkle root or witness commitment
-// is inconsistent with its transactions, indicating a possible short-ID collision
-// or block malleation.
+// IsBlockMutated returns true if the block's body is inconsistent with what
+// its header commits to: the txid merkle root (or a CVE-2012-2459 duplicate),
+// the 64-byte-transaction ambiguity for a block whose first tx is not a
+// coinbase, or the segwit witness commitment. A mutated body says NOTHING about
+// the block itself (the hash commits only to the header): the caller must drop
+// the body, punish the peer that sent it, and fetch the block again elsewhere
+// — never mark the block failed and never persist the body.
 //
-// checkWitnessRoot controls whether the segwit witness commitment is validated;
-// pass true when segwit is active for the block's height.
+// checkWitnessRoot: segwit active for the block (DeploymentActiveAfter(prev)).
 //
-// Mirrors Bitcoin Core validation.cpp:4027-4056:
+// Mirrors Bitcoin Core validation.cpp IsBlockMutated (4027-4056) exactly:
 //
-//	bool IsBlockMutated(const CBlock& block, bool check_witness_root)
-//	{
-//	    BlockValidationState state;
-//	    if (!CheckMerkleRoot(block, state)) return true;
-//	    if (!CheckWitnessMalleation(block, check_witness_root, state)) return true;
-//	    return false;
-//	}
+//	if (!CheckMerkleRoot(block, state)) return true;
+//	if (block.vtx.empty() || !block.vtx[0]->IsCoinBase())
+//	    return any_of(vtx, GetSerializeSize(TX_NO_WITNESS(tx)) == 64);
+//	if (!CheckWitnessMalleation(block, check_witness_root, state)) return true;
+//	return false;
+//
+// Called on receipt of every P2P block (net_processing.cpp ProcessMessage
+// "block", before any download state changes) and by compact-block FillBlock.
 func IsBlockMutated(block *wire.MsgBlock, checkWitnessRoot bool) bool {
-	if len(block.Transactions) == 0 {
-		return true
-	}
+	return BlockMutation(block, checkWitnessRoot) != nil
+}
 
-	// Check txid merkle root (CVE-2012-2459 mutation detection).
+// BlockMutation is IsBlockMutated with Core's reject reason as the error
+// (bad-txnmrklroot / bad-txns-duplicate / bad-witness-nonce-size /
+// bad-witness-merkle-match / unexpected-witness; "bad-blk-length" for the
+// 64-byte rule, which Core reports only as "mutated"). nil = not mutated.
+func BlockMutation(block *wire.MsgBlock, checkWitnessRoot bool) error {
+	// CheckMerkleRoot: an empty block has a null root that cannot match a
+	// real header; treat it as mutated (Core's ComputeMerkleRoot of an empty
+	// list is 0, which a mined header never commits to).
+	if len(block.Transactions) == 0 {
+		return ErrBadMerkleRoot
+	}
 	txHashes := make([]wire.Hash256, len(block.Transactions))
 	for i, tx := range block.Transactions {
 		txHashes[i] = tx.TxHash()
 	}
 	root, mutated := CalcMerkleRootMutation(txHashes)
-	if root != block.Header.MerkleRoot || mutated {
-		return true
+	if root != block.Header.MerkleRoot {
+		return ErrBadMerkleRoot
+	}
+	if mutated {
+		return ErrBlockMutated
 	}
 
-	// Check witness malleation when segwit is active.
-	if checkWitnessRoot {
-		if err := checkWitnessCommitment(block); err != nil {
-			return true
-		}
-	} else {
-		// Pre-segwit: no witness data allowed.
+	// First tx not a coinbase: the block is invalid anyway; Core calls it
+	// mutated iff some tx is exactly 64 bytes without witness (a 64-byte tx
+	// can masquerade as an inner merkle node) and otherwise lets CheckBlock
+	// give the verdict. Core returns here without CheckWitnessMalleation.
+	if !IsCoinbaseTx(block.Transactions[0]) {
 		for _, tx := range block.Transactions {
-			if tx.HasWitness() {
-				return true
+			if txNoWitnessSize(tx) == 64 {
+				return fmt.Errorf("%w: 64-byte transaction in a block without a coinbase", ErrBlockMutated)
 			}
 		}
+		return nil
 	}
 
-	return false
+	// CheckWitnessMalleation. With checkWitnessRoot, checkWitnessCommitment
+	// covers both arms (commitment present: nonce size + root; absent: no
+	// witness anywhere). Without it, no tx may carry a witness.
+	if checkWitnessRoot {
+		return checkWitnessCommitment(block)
+	}
+	for _, tx := range block.Transactions {
+		if tx.HasWitness() {
+			return ErrUnexpectedWitnessInBlock
+		}
+	}
+	return nil
 }
+
+// txNoWitnessSize is GetSerializeSize(TX_NO_WITNESS(tx)).
+func txNoWitnessSize(tx *wire.MsgTx) int {
+	var n countWriter
+	_ = tx.SerializeNoWitness(&n)
+	return int(n)
+}
+
+type countWriter int
+
+func (c *countWriter) Write(p []byte) (int, error) { *c += countWriter(len(p)); return len(p), nil }
 
 // AddTxOutputs adds all outputs from a transaction to the UTXO view.
 // This is implemented on InMemoryUTXOView, defined here as a method on the interface

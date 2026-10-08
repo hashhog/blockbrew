@@ -750,6 +750,17 @@ func (idx *HeaderIndex) MarkDataStored(hash wire.Hash256) {
 	}
 }
 
+// ClearDataStored drops StatusDataStored on hash: its stored body was
+// discarded (a mutated body, see storage.ChainDB.ForgetBlockBody), so chain
+// selection must not treat it as having data until a body is stored again.
+func (idx *HeaderIndex) ClearDataStored(hash wire.Hash256) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if node, ok := idx.nodes[hash]; ok {
+		node.Status &^= StatusDataStored
+	}
+}
+
 // MarkUndoStored sets StatusHaveUndo on the node identified by hash.
 // Called by ConnectBlock after undo data is written to disk (all paths:
 // genesis, reorg-batch, regular-batch, and IBD between-flush). Mirrors

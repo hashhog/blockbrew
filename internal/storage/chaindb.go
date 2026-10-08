@@ -229,6 +229,22 @@ func (c *ChainDB) StoreBlockAtBatch(batch Batch, hash wire.Hash256, block *wire.
 	return nil
 }
 
+// ForgetBlockBody drops the body index entry for hash (flat-file position
+// and the legacy "B" blob) so HasBlock is false and the block is downloaded
+// again. Used when a stored body turns out to be MUTATED (it does not match
+// the header's commitments): the honest body has the same hash, and the
+// idempotent StoreBlockAtBatch would otherwise keep the bad bytes forever.
+// The bytes stay in blk*.dat unreferenced (same as a crash before the index
+// write). Never call it for a block on the active chain.
+func (c *ChainDB) ForgetBlockBody(hash wire.Hash256) error {
+	if c.blockStore != nil {
+		if err := c.blockStore.DeleteBlockIndex(hash); err != nil {
+			return err
+		}
+	}
+	return c.db.Delete(MakeBlockDataKey(hash))
+}
+
 // HasBlock returns true if the block data is already persisted, either in
 // the flat-file store (W87) or in the legacy "B"-prefix Pebble blob. Does
 // not read or deserialize the block body.

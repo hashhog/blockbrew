@@ -3488,6 +3488,18 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 
 	hash := msg.Block.Header.BlockHash()
 
+	// Mutation check on receipt, BEFORE any download state, storage or
+	// validation sees the body (Core net_processing.cpp ProcessMessage
+	// "block": IsBlockMutated when the parent is known -> Misbehaving
+	// "mutated block", RemoveBlockRequest(hash, this peer), return). The
+	// body says nothing about the block: it is not stored (a stored body
+	// would satisfy HasBlock and be replayed from disk forever), the block
+	// is not marked failed, and the request goes back to the queue for
+	// another peer.
+	if sm.rejectMutatedOnReceipt(peer, msg.Block, hash) {
+		return
+	}
+
 	sm.mu.Lock()
 	nh := sm.nextHeight
 	req, ok := sm.inflight[hash]
@@ -3675,6 +3687,97 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 	}
 }
 
+// segwitActiveAfter reports DeploymentActiveAfter(prev, SEGWIT): segwit
+// rules apply to the child of prev.
+func (sm *SyncManager) segwitActiveAfter(prev *consensus.BlockNode) bool {
+	if sm.chainParams == nil {
+		return true
+	}
+	return prev.Height+1 >= sm.chainParams.SegwitHeight
+}
+
+// rejectMutatedOnReceipt runs Core's IsBlockMutated on a block that arrived
+// over the wire, when its parent header is known (Core checks only then: the
+// segwit rule set depends on the parent). On mutation it punishes the sender,
+// frees only THAT peer's in-flight entry for the hash (noting it as a failed
+// source so the retry goes elsewhere) and returns true; the caller drops the
+// body. Nothing else changes: the block is not marked failed and nothing is
+// stored. Cost: one txid + wtxid pass over the block (a few ms per MB).
+func (sm *SyncManager) rejectMutatedOnReceipt(peer *Peer, block *wire.MsgBlock, hash wire.Hash256) bool {
+	if sm.headerIndex == nil || block == nil {
+		return false
+	}
+	prev := sm.headerIndex.GetNode(block.Header.PrevBlock)
+	if prev == nil {
+		return false
+	}
+	why := consensus.BlockMutation(block, sm.segwitActiveAfter(prev))
+	if why == nil {
+		return false
+	}
+	addr := ""
+	if peer != nil {
+		addr = peer.Address()
+	}
+	freed := false
+	sm.mu.Lock()
+	if req, ok := sm.inflight[hash]; ok && (req.Peer == nil || req.Peer == peer) {
+		req.noteFailedPeer(addr)
+		releasePeerSlot(req)
+		req.NextRetryAt = time.Time{}
+		delete(sm.inflight, hash)
+		sm.armPeerPipelineHeadLocked(peer)
+		freed = true
+	}
+	sm.mu.Unlock()
+	log.Printf("sync: mutated block %s (height %d) from %s: %v — punishing the sender, not marking the block, re-requesting elsewhere (in-flight freed=%v)",
+		hash.String()[:16], prev.Height+1, addr, why, freed)
+	if peer != nil {
+		peer.Misbehaving(100, fmt.Sprintf("mutated block: %v", why))
+	}
+	return true
+}
+
+// discardMutatedBody handles a body found MUTATED after it was accepted for
+// processing (validation / connect): forget it on disk and in memory, punish
+// the peer that delivered it over the wire (bwr.from; a disk replay punishes
+// nobody), free the request and put it back in the queue for another peer.
+// The block itself is never marked failed (Core BLOCK_MUTATED).
+func (sm *SyncManager) discardMutatedBody(bwr *blockWithRequest, why error) {
+	if bwr == nil || bwr.req == nil {
+		return
+	}
+	hash := bwr.req.Hash
+	if sm.chainDB != nil {
+		if err := sm.chainDB.ForgetBlockBody(hash); err != nil {
+			log.Printf("sync: mutated block %s: forgetting the stored body failed: %v", hash.String()[:16], err)
+		}
+	}
+	if sm.headerIndex != nil {
+		sm.headerIndex.ClearDataStored(hash)
+	}
+	from := bwr.from
+	addr := ""
+	if from != nil {
+		addr = from.Address()
+	}
+	sm.mu.Lock()
+	req := bwr.req
+	req.noteFailedPeer(addr)
+	req.pipelineBlock = nil
+	if cur, ok := sm.inflight[hash]; ok && cur == req {
+		delete(sm.inflight, hash)
+	}
+	releasePeerSlot(req)
+	req.NextRetryAt = time.Time{}
+	sm.mu.Unlock()
+	log.Printf("sync: mutated body for block %d (%s) from %q: %v — body discarded, block NOT marked, re-requesting",
+		req.Height, hash.String()[:16], addr, why)
+	if from != nil {
+		from.Misbehaving(100, fmt.Sprintf("mutated block: %v", why))
+	}
+}
+
 // validationWorker validates blocks from the validation channel.
 func (sm *SyncManager) validationWorker() {
 	defer sm.wg.Done()
@@ -3744,6 +3847,15 @@ func (sm *SyncManager) validationWorker() {
 						errors.Is(err, consensus.ErrBadMerkleRoot) ||
 						errors.Is(err, consensus.ErrBadWitnessNonceSize) ||
 						errors.Is(err, consensus.ErrUnexpectedWitnessInBlock)
+					if transientMutation {
+						// Normally caught on receipt (rejectMutatedOnReceipt);
+						// reached for a block whose parent was unknown then,
+						// or a body replayed from disk. HandleBlock stored the
+						// body before validation: forget it, or the fast path
+						// would replay the same bad bytes forever.
+						sm.discardMutatedBody(bwr, err)
+						return
+					}
 					if !transientMutation {
 						// Mark failed (+ descendants, persisted, best header
 						// recomputed) — the same verdict path as a ConnectBlock
@@ -4249,6 +4361,27 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 					nextHeight, bwr.req.Hash.String()[:16], connectErr)
 				nextHeight = sm.purgeInvalidAndReplan(pending)
 				continue
+			}
+			if connectErr != nil && consensus.IsBlockMutationErr(connectErr) {
+				// BLOCK_MUTATED (bad-witness-nonce-size, bad-witness-merkle-
+				// match, unexpected-witness, bad-txnmrklroot, bad-txns-
+				// duplicate): the BODY does not match the header, which says
+				// nothing about the block. Core (validation.cpp
+				// InvalidBlockFound skips BLOCK_MUTATED; net_processing.cpp
+				// MaybePunishNodeForBlock punishes the source): drop the body
+				// (memory AND disk — HandleBlock pre-stored it, and a stored
+				// body is replayed via the fast path / stall nudge forever),
+				// punish the peer that sent it, never mark the block, and
+				// fetch it again from another peer. Before 2026-10-08 this
+				// fell to the [CHAINSTATE-CORRUPTION] halt below and the
+				// stall detector re-injected the same body every pass
+				// ("block 5 is validated; nudging connect path") — any peer
+				// could wedge the node with one witness-stripped block.
+				log.Printf("sync: block %d (%s) body is mutated: %v — dropping the body, re-requesting from another peer",
+					nextHeight, bwr.req.Hash.String()[:16], connectErr)
+				delete(pending, nextHeight)
+				sm.discardMutatedBody(bwr, connectErr)
+				break
 			}
 			if bie, ok := consensus.AsBlockInvalid(connectErr); ok {
 				// A consensus VERDICT (BlockInvalidError — never a missing
