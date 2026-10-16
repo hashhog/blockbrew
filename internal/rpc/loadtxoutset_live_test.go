@@ -464,3 +464,57 @@ func TestLoadTxOutSet_RestartPersistsActivatedTip(t *testing.T) {
 			restartHash.String(), restartHeight, baseHash.String(), baseHeight)
 	}
 }
+
+// TestLoadTxOutSet_RestartProbeStopsAtSnapshotBase: after loadtxoutset on a
+// headers-only node, the heights at and below the base have no bodies and no
+// undo data. The startup consistency probe on the restarted node must stop at
+// the base instead of reading that range as corruption — before the RPC
+// recorded the base it peeled back and failed with a false
+// [CHAINSTATE-CORRUPTION] "remove chaindata/".
+func TestLoadTxOutSet_RestartProbeStopsAtSnapshotBase(t *testing.T) {
+	consensus.ClearRegtestAssumeUTXO()
+	t.Cleanup(consensus.ClearRegtestAssumeUTXO)
+
+	const nBlocks = 4
+	rig := newHeadersOnlyLoadRig(t, nBlocks)
+	baseNode := rig.tips[nBlocks-1]
+	coins := buildSnapshotCoinsFromIndex(t, rig, baseNode.Height)
+	snapPath, commitment := writeLiveSnapshot(t, t.TempDir(), coins, baseNode.Hash, rig.params.NetworkMagic)
+	consensus.RegisterRegtestAssumeUTXO(consensus.AssumeUTXOData{
+		Height:         baseNode.Height,
+		HashSerialized: commitment,
+		ChainTxCount:   uint64(nBlocks + 1),
+		BlockHash:      baseNode.Hash,
+	})
+	if _, rpcErr := liveLoadTxOutSet(t, rig.server, snapPath); rpcErr != nil {
+		t.Fatalf("loadtxoutset returned error: %+v", rpcErr)
+	}
+
+	sb, err := rig.db.GetSnapshotBase()
+	if err != nil || sb == nil || sb.Height != baseNode.Height || sb.Hash != baseNode.Hash {
+		t.Fatalf("loadtxoutset must record the snapshot base %s@%d, got %+v err=%v",
+			baseNode.Hash.String(), baseNode.Height, sb, err)
+	}
+
+	// Restart: hydrate from disk, then the OnSyncComplete probe.
+	cs, err := rig.db.GetChainState()
+	if err != nil {
+		t.Fatalf("GetChainState: %v", err)
+	}
+	idx := consensus.NewHeaderIndex(rig.params)
+	if _, err := idx.HydrateFromDB(rig.db, cs.BestHash, cs.BestHeight); err != nil {
+		t.Fatalf("HydrateFromDB: %v", err)
+	}
+	cm := consensus.NewChainManager(consensus.ChainManagerConfig{
+		Params: rig.params, HeaderIndex: idx, ChainDB: rig.db, UTXOSet: consensus.NewUTXOSet(rig.db),
+	})
+	if _, err := cm.RecoverFromPersistedBlocks(); err != nil {
+		t.Fatalf("RecoverFromPersistedBlocks: %v", err)
+	}
+	cm.ReloadChainState()
+	res := cm.VerifyChainstateConsistency(200)
+	if _, tip := cm.BestBlock(); res.CorruptionAtHeight != 0 || res.RollbackFailed || res.RolledBackBlocks != 0 || tip != baseNode.Height {
+		t.Fatalf("probe after a loadtxoutset restart must be clean at the base %d, got %+v tip=%d",
+			baseNode.Height, res, tip)
+	}
+}

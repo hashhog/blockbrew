@@ -112,8 +112,11 @@ var (
 	// this key.
 	//
 	// Value: 32-byte hash + int32 LE height + big-endian chain work (variable
-	// length, no leading zero bytes). Absent on every non-snapshot datadir;
-	// readers MUST treat absence as "not snapshot-bootstrapped".
+	// length, no leading zero bytes; empty when no detached band was
+	// persisted). Absent on every non-snapshot datadir; readers MUST treat
+	// absence as "not snapshot-bootstrapped". Every snapshot activation writes
+	// it, band or no band: the startup consistency probe reads the height as
+	// the floor of the body-less range.
 	SnapshotBaseKey = []byte("snapshotbase")
 )
 

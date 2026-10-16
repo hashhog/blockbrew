@@ -4145,6 +4145,20 @@ func (s *Server) persistActivatedSnapshot(meta *consensus.SnapshotMetadata, expe
 		BestHash:   baseHash,
 		BestHeight: baseHeight,
 	})
+	// Record the base so the startup consistency probe stops there: the
+	// heights below it have no bodies or undo data on this datadir. No chain
+	// work — the headers below the base are genesis-rooted (written above),
+	// so there is no detached band for boot to re-graft. Only when the
+	// snapshot actually became the chainstate: a node already at or past the
+	// base keeps its own validated history and its full probe depth.
+	if tipH < baseHeight {
+		if err := s.chainDB.SetSnapshotBaseBatch(batch, &storage.SnapshotBase{
+			Hash:   baseHash,
+			Height: baseHeight,
+		}); err != nil {
+			return fmt.Errorf("persist snapshot base record: %w", err)
+		}
+	}
 	if err := batch.Write(); err != nil {
 		return fmt.Errorf("persist snapshot chain view: %w", err)
 	}
