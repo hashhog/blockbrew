@@ -65,6 +65,11 @@ type Wallet struct {
 	mnemonic   string
 	accounts   []*Account
 	utxos      map[wire.OutPoint]*WalletUTXO
+	// committedSpends remembers wallet coins removed from utxos by RemoveUTXO
+	// (a wallet send commits its inputs before the tx is mined) so the block
+	// scan can still attribute the debit and record a "send" history entry.
+	// In-memory only; entries drop when a block spends the outpoint.
+	committedSpends map[wire.OutPoint]*WalletUTXO
 	txHistory  []*WalletTx
 	nextExtIdx uint32
 	nextIntIdx uint32
@@ -315,6 +320,7 @@ func NewWallet(config WalletConfig) *Wallet {
 	return &Wallet{
 		config:         config,
 		utxos:          make(map[wire.OutPoint]*WalletUTXO),
+		committedSpends: make(map[wire.OutPoint]*WalletUTXO),
 		txHistory:      make([]*WalletTx, 0),
 		gapLimit:       DefaultGapLimit,
 		locked:         true,
@@ -978,6 +984,12 @@ func (w *Wallet) AddUTXO(utxo *WalletUTXO) {
 func (w *Wallet) RemoveUTXO(outpoint wire.OutPoint) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if u, ok := w.utxos[outpoint]; ok {
+		if w.committedSpends == nil {
+			w.committedSpends = make(map[wire.OutPoint]*WalletUTXO)
+		}
+		w.committedSpends[outpoint] = u
+	}
 	delete(w.utxos, outpoint)
 	w.markDirtyLocked()
 }
@@ -2492,7 +2504,10 @@ func (w *Wallet) ScanBlock(block *wire.MsgBlock, height int32) {
 			if utxo, exists := w.utxos[in.PreviousOutPoint]; exists {
 				debit += utxo.Amount
 				spentOutpoints = append(spentOutpoints, in.PreviousOutPoint)
+			} else if utxo, exists := w.committedSpends[in.PreviousOutPoint]; exists {
+				debit += utxo.Amount
 			}
+			delete(w.committedSpends, in.PreviousOutPoint)
 		}
 		isFromMe := debit > 0
 
