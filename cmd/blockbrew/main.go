@@ -994,7 +994,9 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		// below an anchor to stop at, so blocks connected ABOVE the base
 		// rehydrate normally. Without this the node re-loses its tip on every
 		// restart: the DB still says height N, the header index says genesis.
-		if sb, sErr := chainDB.GetSnapshotBase(); sErr == nil && sb != nil {
+		// A record without chain work has no detached band: its headers are
+		// genesis-rooted and the ordinary hydration below covers them.
+		if sb, sErr := chainDB.GetSnapshotBase(); sErr == nil && sb != nil && sb.HasDetachedBand() {
 			n, gErr := headerIndex.HydrateSnapshotBaseFromDB(chainDB, sb.Hash, sb.Height, sb.Chainwork)
 			if gErr != nil {
 				log.Printf("WARNING: snapshot base %s@%d recorded for this datadir but could not be "+
@@ -3175,6 +3177,20 @@ func activateSnapshotChainView(
 	}
 	band := expected.BaseTailHeaders
 	if len(band) == 0 {
+		// Record the base even with nothing to graft. The heights below it
+		// still have no bodies and no undo data, and the startup consistency
+		// probe reads this record to know where that range ends. Without it
+		// every boot after the first walked into the range, read it as
+		// "block body missing", disconnected every block connected above the
+		// base and then printed a false [CHAINSTATE-CORRUPTION] "remove
+		// chaindata/" (regtest 299 entry, 2026-10-16). No chain work: there
+		// is no detached band, the headers come from ordinary header sync.
+		if err := chainDB.SetSnapshotBase(&storage.SnapshotBase{
+			Hash:   baseHash,
+			Height: expected.Height,
+		}); err != nil {
+			return fmt.Errorf("persist snapshot base record: %w", err)
+		}
 		log.Printf("WARNING: [snapshot] base %s@%d has no base_tail_headers/base_header in its "+
 			"assumeutxo entry: the snapshot coins are loaded and durable, but the base block "+
 			"cannot be placed in the header index, so the node will report genesis until "+

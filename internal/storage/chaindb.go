@@ -547,27 +547,67 @@ func (c *ChainDB) GetCoinsFlushWindow() (*CoinsFlushWindow, error) {
 // SnapshotBase is the assumeUTXO snapshot base a datadir was bootstrapped
 // from. See SnapshotBaseKey for why blockbrew has to persist it and Bitcoin
 // Core does not.
+//
+// Chainwork is the cumulative work at the base when the activation persisted a
+// DETACHED header band (the base-tail band from the assumeutxo entry); boot
+// re-grafts that band from it. It is zero when there is no detached band —
+// the entry carried no base-tail headers, or the headers below the base are
+// genesis-rooted (loadtxoutset requires the base header already synced). The
+// record is still written in that case: it is what tells the startup
+// consistency probe where the body-less range ends.
 type SnapshotBase struct {
 	Hash      wire.Hash256
 	Height    int32
-	Chainwork *big.Int // cumulative chain work AT the base (never nil once read back)
+	Chainwork *big.Int // cumulative chain work AT the base; zero = no detached band (never nil once read back)
+}
+
+// HasDetachedBand reports whether the record carries the chain work of a
+// persisted detached band, i.e. whether boot has a band to re-graft.
+func (sb *SnapshotBase) HasDetachedBand() bool {
+	return sb != nil && sb.Chainwork != nil && sb.Chainwork.Sign() > 0
 }
 
 // SetSnapshotBase records the snapshot base. Written once, by the
 // -load-snapshot / loadtxoutset activation path, in the same startup as the
-// coin import it describes.
+// coin import it describes. A nil Chainwork records a base with no detached
+// band (see SnapshotBase).
 func (c *ChainDB) SetSnapshotBase(sb *SnapshotBase) error {
-	if sb == nil || sb.Chainwork == nil {
-		return errors.New("SetSnapshotBase: nil record or nil chainwork")
+	buf, err := serializeSnapshotBase(sb)
+	if err != nil {
+		return err
 	}
-	work := sb.Chainwork.Bytes() // big-endian, minimal
+	return c.db.Put(SnapshotBaseKey, buf)
+}
+
+// SetSnapshotBaseBatch stages the snapshot-base record into an existing batch,
+// so it can ride the same write as the chain view it describes.
+func (c *ChainDB) SetSnapshotBaseBatch(batch Batch, sb *SnapshotBase) error {
+	buf, err := serializeSnapshotBase(sb)
+	if err != nil {
+		return err
+	}
+	batch.Put(SnapshotBaseKey, buf)
+	return nil
+}
+
+func serializeSnapshotBase(sb *SnapshotBase) ([]byte, error) {
+	if sb == nil {
+		return nil, errors.New("SetSnapshotBase: nil record")
+	}
+	if sb.Chainwork != nil && sb.Chainwork.Sign() < 0 {
+		return nil, errors.New("SetSnapshotBase: negative chainwork")
+	}
+	var work []byte
+	if sb.Chainwork != nil {
+		work = sb.Chainwork.Bytes() // big-endian, minimal; empty for zero
+	}
 	buf := make([]byte, 0, 32+4+len(work))
 	buf = append(buf, sb.Hash[:]...)
 	var h [4]byte
 	binary.LittleEndian.PutUint32(h[:], uint32(sb.Height))
 	buf = append(buf, h[:]...)
 	buf = append(buf, work...)
-	return c.db.Put(SnapshotBaseKey, buf)
+	return buf, nil
 }
 
 // GetSnapshotBase returns the recorded snapshot base, or ErrNotFound when the
