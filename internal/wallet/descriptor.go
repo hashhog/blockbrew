@@ -287,6 +287,8 @@ type XPubPubkeyProvider struct {
 	WildcardH  bool     // True if wildcard is hardened (*')
 	OriginInfo *KeyOriginInfo
 	XPubStr    string // Original xpub/xprv string
+	// Network selects the xpub/tpub version bytes String() emits.
+	Network address.Network
 }
 
 // KeyOriginInfo stores BIP32 fingerprint and derivation path for key origin.
@@ -392,9 +394,9 @@ func (p *XPubPubkeyProvider) formatKeyExpr(includePrivate bool) string {
 
 	// Add the xpub/xprv
 	if includePrivate && p.ExtKey.IsPrivate {
-		sb.WriteString(p.ExtKey.Serialize(address.Mainnet))
+		sb.WriteString(p.ExtKey.Serialize(p.Network))
 	} else {
-		sb.WriteString(p.ExtKey.PublicKey().Serialize(address.Mainnet))
+		sb.WriteString(p.ExtKey.PublicKey().Serialize(p.Network))
 	}
 
 	// Add derivation path
@@ -1431,6 +1433,7 @@ func (p *descriptorParser) parseXPubKey(keyStr string, origin *KeyOriginInfo) (P
 		WildcardH:  wildcardH,
 		OriginInfo: origin,
 		XPubStr:    xpubPart,
+		Network:    p.network,
 	}, nil
 }
 
