@@ -2812,6 +2812,14 @@ func (cm *ChainManager) CurrentReorgBatch() storage.Batch {
 // _mempool-refill-on-reorg-fleet-result-2026-05-05.md) and Bitcoin Core's
 // MaybeUpdateMempoolForReorg in validation.cpp.
 func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
+	return cm.disconnectBlock(hash, nil)
+}
+
+// disconnectBlock is DisconnectBlock; on success it also stores the
+// disconnected block in *out (when out is non-nil), so a caller that must
+// replay it later (a failed reorg's rollback) does not depend on reading the
+// body from disk a second time.
+func (cm *ChainManager) disconnectBlock(hash wire.Hash256, out **wire.MsgBlock) error {
 	if !cm.beginMutation() {
 		return mutationRefused()
 	}
@@ -3071,6 +3079,9 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 	// updateMempoolForReorgLocked, once the target tip is reached.
 	if f := cm.mempoolHooks.BlockDisconnected; f != nil {
 		f(block, prevHeight)
+	}
+	if out != nil {
+		*out = block
 	}
 
 	return nil
@@ -3421,17 +3432,19 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 
 	// Disconnect blocks from current tip back to fork.
 	for _, node := range disconnectNodes {
-		if err := cm.DisconnectBlock(node.Hash); err != nil {
+		// The disconnect hands back the block it read, for the rollback
+		// replay. Re-reading the body here could miss, and a block left out
+		// of the replay stays in the mempool's disconnect pool: the final
+		// update would then evict the in-mempool spenders of transactions
+		// the rollback has confirmed again, and the mempool's height would
+		// stay one short.
+		var disconnected *wire.MsgBlock
+		if err := cm.disconnectBlock(node.Hash, &disconnected); err != nil {
 			rollbackToOriginalTip()
 			return fmt.Errorf("disconnect block %s failed: %w", node.Hash.String()[:16], err)
 		}
-		if cm.mempoolHooks.BlockConnected != nil {
-			// Body for the rollback replay; it was just read by the
-			// disconnect, so this is a cache hit. A miss only costs the
-			// replay of this one block.
-			if b, err := cm.chainDB.GetBlock(node.Hash); err == nil {
-				disconnectedOK = append(disconnectedOK, heightBlock{b, node.Height})
-			}
+		if disconnected != nil {
+			disconnectedOK = append(disconnectedOK, heightBlock{disconnected, node.Height})
 		}
 	}
 

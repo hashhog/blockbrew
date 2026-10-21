@@ -941,7 +941,8 @@ type acceptOpts struct {
 	// reorg is the re-acceptance of a transaction from a disconnected block
 	// (Core MaybeUpdateMempoolForReorg -> AcceptToMemoryPool with
 	// bypass_limits=true): no mempool-min / relay fee floor and no size-limit
-	// trim (the caller trims once at the end, Core LimitMempoolSize), every
+	// trim (the caller trims once at the end, Core LimitMempoolSize), no
+	// TRUC checks (Core skips SingleTRUCChecks under bypass_limits), every
 	// other check unchanged. A transaction whose inputs are missing is
 	// rejected outright rather than parked as an orphan (Core's ATMP never
 	// enrols orphans; that is net_processing's job), and the orphan pool is
@@ -1324,11 +1325,16 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	//      truc_policy.h TRUC_MAX_VSIZE / TRUC_CHILD_MAX_VSIZE.
 	//      Core: SingleTRUCChecks (truc_policy.cpp:171-261), called from
 	//      MemPoolAccept::PreChecks (validation.cpp) before CheckInputScripts.
-	if err := mp.singleTRUCChecks(tx, conflictingTxs); err != nil {
-		// Sibling eviction: caller could attempt RBF eviction of the sibling,
-		// but in the single-tx path we conservatively reject. The caller of
-		// AcceptPackage may handle sibling eviction in the package path.
-		return err
+	//      Skipped on reorg re-acceptance: Core runs it only
+	//      `if (!args.m_bypass_limits)`, so a mined transaction that TRUC
+	//      would refuse still comes back and keeps its in-mempool spenders.
+	if !opts.reorg {
+		if err := mp.singleTRUCChecks(tx, conflictingTxs); err != nil {
+			// Sibling eviction: caller could attempt RBF eviction of the sibling,
+			// but in the single-tx path we conservatively reject. The caller of
+			// AcceptPackage may handle sibling eviction in the package path.
+			return err
+		}
 	}
 
 	// 10. Validate scripts — two-pass STANDARD vs CONSENSUS split (W96).

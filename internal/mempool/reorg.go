@@ -162,17 +162,18 @@ func (mp *Mempool) UpdateForReorg(addToMempool bool) (readded, removed int) {
 
 	// Earliest confirmed first: the most recently disconnected block holds
 	// the earliest transactions and sits last in the stash.
+	var update []wire.Hash256
 	for i := len(stash) - 1; i >= 0; i-- {
 		for _, tx := range stash[i] {
 			if _, ok := mp.pool[tx.TxHash()]; ok && addToMempool {
 				// Relayed back in while the reorg ran (admission does not
 				// take the chain lock): keep it, adopt its children.
-				mp.linkInMempoolChildrenLocked(tx.TxHash())
+				update = append(update, tx.TxHash())
 				continue
 			}
 			if addToMempool {
 				if err := mp.acceptLocked(tx, "", acceptOpts{reorg: true}); err == nil {
-					mp.linkInMempoolChildrenLocked(tx.TxHash())
+					update = append(update, tx.TxHash())
 					readded++
 					continue
 				}
@@ -180,6 +181,7 @@ func (mp *Mempool) UpdateForReorg(addToMempool bool) (readded, removed int) {
 			mp.removeRecursiveLocked(tx, MempoolRemovalReasonReorg)
 		}
 	}
+	mp.updateTransactionsFromBlockLocked(update)
 
 	removed = mp.removeForReorgLocked()
 	mp.maybeEvictLocked()
@@ -202,18 +204,46 @@ func (mp *Mempool) removeRecursiveLocked(tx *wire.MsgTx, reason MemPoolRemovalRe
 	}
 }
 
-// linkInMempoolChildrenLocked makes a transaction that was just re-accepted
-// from a disconnected block the parent of the in-mempool transactions that
-// already spend its outputs. Those children were admitted while the parent
-// was confirmed, so neither side recorded the edge: without it a later
-// removal of the parent (a conflict, removeForReorg) would leave the children
-// behind spending an output that no longer exists, and the cluster and
-// ancestor package the miner sees would be wrong. Core:
-// CTxMemPool::UpdateTransactionsFromBlock. mu must be held.
-func (mp *Mempool) linkInMempoolChildrenLocked(parentHash wire.Hash256) {
+// updateTransactionsFromBlockLocked makes each transaction just re-added from
+// a disconnected block the parent of the in-mempool transactions that already
+// spend its outputs, then trims every merged cluster back under the cluster
+// limits and recomputes its package state. Those children were admitted while
+// the parent was confirmed, so neither side recorded the edge: without it a
+// later removal of the parent (a conflict, removeForReorg) would leave the
+// children behind spending an output that no longer exists, and the cluster
+// and ancestor package the miner sees would be wrong. Core:
+// CTxMemPool::UpdateTransactionsFromBlock — every edge first, then one
+// TxGraph::Trim. mu must be held.
+func (mp *Mempool) updateTransactionsFromBlockLocked(hashes []wire.Hash256) {
+	var roots []wire.Hash256
+	for _, h := range hashes {
+		if mp.linkInMempoolChildrenLocked(h) {
+			roots = append(roots, h)
+		}
+	}
+	done := make(map[wire.Hash256]bool)
+	for _, h := range roots {
+		if done[h] {
+			continue
+		}
+		if _, ok := mp.pool[h]; !ok {
+			continue // trimmed with an earlier component
+		}
+		for m := range mp.rebuildComponentLocked(h) {
+			done[m] = true
+		}
+	}
+}
+
+// linkInMempoolChildrenLocked records the Depends/SpentBy edges between a
+// re-added parent and its in-mempool children (see
+// updateTransactionsFromBlockLocked). The cluster manager is not touched; the
+// caller rebuilds the component. Reports whether any edge was added. mu must
+// be held.
+func (mp *Mempool) linkInMempoolChildrenLocked(parentHash wire.Hash256) bool {
 	parent, ok := mp.pool[parentHash]
 	if !ok {
-		return
+		return false
 	}
 	linked := false
 	seen := make(map[wire.Hash256]bool)
@@ -239,19 +269,12 @@ func (mp *Mempool) linkInMempoolChildrenLocked(parentHash wire.Hash256) {
 			}
 		}
 	}
-	if linked {
-		mp.rebuildComponentLocked(parentHash)
-	}
+	return linked
 }
 
-// rebuildComponentLocked recomputes the derived state of the connected
-// component (by Depends/SpentBy edges) containing root after an edge was
-// added: every member's ancestor and descendant fee/size, and the cluster
-// structure, which is rebuilt in topological order so the merged cluster has
-// every edge. A member that no longer fits the cluster limits is removed with
-// its descendants (Core trims an oversized cluster after
-// UpdateTransactionsFromBlock). mu must be held.
-func (mp *Mempool) rebuildComponentLocked(root wire.Hash256) {
+// componentLocked returns the connected component (by Depends/SpentBy edges)
+// of the pool containing root. mu must be held.
+func (mp *Mempool) componentLocked(root wire.Hash256) map[wire.Hash256]bool {
 	comp := make(map[wire.Hash256]bool)
 	queue := []wire.Hash256{root}
 	for len(queue) > 0 {
@@ -267,6 +290,24 @@ func (mp *Mempool) rebuildComponentLocked(root wire.Hash256) {
 		comp[h] = true
 		queue = append(queue, e.Depends...)
 		queue = append(queue, e.SpentBy...)
+	}
+	return comp
+}
+
+// rebuildComponentLocked brings the component containing root back in line
+// after edges were added: first the component is trimmed to the cluster
+// limits (trimComponentLocked), then every survivor's ancestor and descendant
+// fee/size is recomputed and the cluster structure is rebuilt in topological
+// order so the merged cluster has every edge. Returns the members the
+// component had before the trim. mu must be held.
+func (mp *Mempool) rebuildComponentLocked(root wire.Hash256) map[wire.Hash256]bool {
+	before := mp.componentLocked(root)
+	mp.trimComponentLocked(before)
+	comp := make(map[wire.Hash256]bool, len(before))
+	for h := range before {
+		if _, ok := mp.pool[h]; ok {
+			comp[h] = true
+		}
 	}
 
 	walk := func(start wire.Hash256, next func(*TxEntry) []wire.Hash256) map[wire.Hash256]bool {
@@ -311,19 +352,15 @@ func (mp *Mempool) rebuildComponentLocked(root wire.Hash256) {
 			e.DescendantFee += mp.pool[d].Fee
 			e.DescendantSize += mp.pool[d].Size
 		}
-		adjW, ok := mp.clusters.txAdjWeight[h]
-		if !ok {
-			adjW = e.Size * 4
-		}
 		var parents []wire.Hash256
 		pseen := make(map[wire.Hash256]bool)
 		for _, p := range e.Depends {
-			if !pseen[p] {
+			if !pseen[p] && comp[p] {
 				pseen[p] = true
 				parents = append(parents, p)
 			}
 		}
-		members = append(members, member{hash: h, nAnc: len(anc), adjW: adjW, parent: parents})
+		members = append(members, member{hash: h, nAnc: len(anc), adjW: mp.adjWeightLocked(h), parent: parents})
 	}
 
 	// Ancestor count ascending is a topological order (a parent's ancestor
@@ -344,8 +381,181 @@ func (mp *Mempool) rebuildComponentLocked(root wire.Hash256) {
 		if !ok {
 			continue // removed with an oversized ancestor below
 		}
+		// The trim above leaves every cluster within the limits, so this
+		// cannot fail; the removal is a safety net, not the policy.
 		if _, err := mp.clusters.AddTransaction(m.hash, e.Fee, int32(e.Size), m.adjW, m.parent); err != nil {
 			mp.removeWithDescendantsLocked(m.hash, MempoolRemovalReasonSizeLimit)
+		}
+	}
+	return before
+}
+
+// adjWeightLocked is a member's sigop-adjusted weight as the cluster manager
+// recorded it at admission, or four times its vsize. mu must be held.
+func (mp *Mempool) adjWeightLocked(h wire.Hash256) int64 {
+	if w, ok := mp.clusters.txAdjWeight[h]; ok {
+		return w
+	}
+	return mp.pool[h].Size * 4
+}
+
+// trimComponentLocked removes transactions (with their descendants) from a
+// component whose new edges have made it larger than the cluster limits
+// (MaxClusterCount transactions, MaxClusterSizeWeight sigop-adjusted weight).
+// A no-op when the component fits.
+//
+// Core: TxGraph::Trim (txgraph.cpp), run by UpdateTransactionsFromBlock. Each
+// transaction carries the feerate of its chunk in the cluster it was in
+// before the edges were added, and depends on its new and old parents plus
+// its predecessor in that cluster's linearization. Transactions are taken
+// highest chunk feerate first among those whose dependencies are all taken;
+// one that would push its would-be cluster over either limit is skipped, and
+// so, never becoming eligible, is everything that depends on it. What was not
+// taken is removed (SIZELIMIT). So the lowest-feerate chunks go first, never
+// a parent before its child. Equal feerates are taken in txid order (Core's
+// heap leaves that order unspecified). mu must be held.
+func (mp *Mempool) trimComponentLocked(comp map[wire.Hash256]bool) {
+	var totalW int64
+	for h := range comp {
+		totalW += mp.adjWeightLocked(h)
+	}
+	if len(comp) <= MaxClusterCount && totalW <= MaxClusterSizeWeight {
+		return
+	}
+
+	type trimTx struct {
+		hash     wire.Hash256
+		rate     FeeFrac
+		weight   int64
+		parents  []wire.Hash256
+		children []wire.Hash256
+		left     int
+		taken    bool
+		// union-find over taken transactions
+		up    wire.Hash256
+		count int
+		w     int64
+	}
+	txs := make(map[wire.Hash256]*trimTx, len(comp))
+	for h := range comp {
+		e := mp.pool[h]
+		txs[h] = &trimTx{
+			hash:   h,
+			rate:   FeeFrac{Fee: e.Fee, Size: int32(e.Size)},
+			weight: mp.adjWeightLocked(h),
+		}
+	}
+	addDep := func(parent, child wire.Hash256) {
+		p, c := txs[parent], txs[child]
+		if p == nil || c == nil || parent == child {
+			return
+		}
+		for _, x := range c.parents {
+			if x == parent {
+				return
+			}
+		}
+		c.parents = append(c.parents, parent)
+		p.children = append(p.children, child)
+	}
+
+	// Chunk feerates and implicit linearization edges from the clusters as
+	// they were before the new edges (the cluster manager has not seen them).
+	seenCluster := make(map[*Cluster]bool)
+	for h := range comp {
+		c := mp.clusters.GetCluster(h)
+		if c == nil || seenCluster[c] {
+			continue
+		}
+		seenCluster[c] = true
+		byIdx := make(map[int]wire.Hash256, len(c.Transactions))
+		for th, idx := range c.Transactions {
+			byIdx[idx] = th
+		}
+		var prev *wire.Hash256
+		for _, ch := range c.GetChunks() {
+			for _, idx := range ch.Txs {
+				th, ok := byIdx[idx]
+				if !ok || txs[th] == nil {
+					continue
+				}
+				txs[th].rate = ch.FeeRate
+				if prev != nil {
+					addDep(*prev, th)
+				}
+				cur := th
+				prev = &cur
+			}
+		}
+	}
+	for h := range comp {
+		for _, p := range mp.pool[h].Depends {
+			addDep(p, h)
+		}
+	}
+
+	find := func(t *trimTx) *trimTx {
+		for t.up != t.hash {
+			t = txs[t.up]
+		}
+		return t
+	}
+	better := func(a, b *trimTx) bool {
+		if c := a.rate.Compare(b.rate); c != 0 {
+			return c > 0
+		}
+		return bytes.Compare(a.hash[:], b.hash[:]) < 0
+	}
+	var ready []*trimTx
+	for _, t := range txs {
+		t.left = len(t.parents)
+		if t.left == 0 && t.weight <= MaxClusterSizeWeight {
+			ready = append(ready, t)
+		}
+	}
+	for len(ready) > 0 {
+		bi := 0
+		for i := range ready {
+			if better(ready[i], ready[bi]) {
+				bi = i
+			}
+		}
+		t := ready[bi]
+		ready[bi] = ready[len(ready)-1]
+		ready = ready[:len(ready)-1]
+
+		roots := make(map[wire.Hash256]*trimTx)
+		for _, p := range t.parents {
+			r := find(txs[p])
+			roots[r.hash] = r
+		}
+		count, w := 1, t.weight
+		for _, r := range roots {
+			count += r.count
+			w += r.w
+		}
+		if count > MaxClusterCount || w > MaxClusterSizeWeight {
+			continue
+		}
+		t.taken = true
+		t.up, t.count, t.w = t.hash, count, w
+		for _, r := range roots {
+			r.up = t.hash
+		}
+		for _, ch := range t.children {
+			c := txs[ch]
+			c.left--
+			if c.left == 0 && c.weight <= MaxClusterSizeWeight {
+				ready = append(ready, c)
+			}
+		}
+	}
+
+	for h, t := range txs {
+		if !t.taken {
+			if _, ok := mp.pool[h]; ok {
+				mp.removeWithDescendantsLocked(h, MempoolRemovalReasonSizeLimit)
+			}
 		}
 	}
 }
