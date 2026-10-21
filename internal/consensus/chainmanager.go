@@ -235,6 +235,42 @@ type ChainManager struct {
 	// above) so the hook can take its own locks (chainDB's RocksDB batch
 	// commit) without lock-order risk against cm.mu.
 	onBlockConnected func(block *wire.MsgBlock, height int32)
+
+	// mempoolHooks keep the mempool consistent with the active chain. Unlike
+	// onBlockConnected / onBlockDisconnected they run UNDER cm.mu, at the
+	// points Core runs them under cs_main (see MempoolHooks).
+	mempoolHooks MempoolHooks
+}
+
+// MempoolHooks are the chain -> mempool updates Bitcoin Core makes from inside
+// the chain lock (validation.cpp). Each runs with cm.mu held, so lock order is
+// cm.mu -> mempool lock; the mempool never takes cm.mu (it reads the tip
+// through the lock-free cache). Any nil hook is skipped.
+type MempoolHooks struct {
+	// BlockConnected: ConnectTip -> CTxMemPool::removeForBlock (confirmed
+	// txs, conflicts with descendants, disconnect-pool entries). Every
+	// connected block, every path.
+	BlockConnected func(block *wire.MsgBlock, height int32)
+	// BlockDisconnected: DisconnectTip -> DisconnectedBlockTransactions::
+	// AddTransactionsFromBlock (stash only; height = the disconnected block's).
+	BlockDisconnected func(block *wire.MsgBlock, height int32)
+	// UpdateForReorg: MaybeUpdateMempoolForReorg (re-accept the stash
+	// earliest-first or drop it, removeForReorg, LimitMempoolSize).
+	UpdateForReorg func(addToMempool bool)
+}
+
+// SetMempoolHooks installs the chain -> mempool update hooks.
+func (cm *ChainManager) SetMempoolHooks(h MempoolHooks) {
+	cm.mu.Lock()
+	cm.mempoolHooks = h
+	cm.mu.Unlock()
+}
+
+// updateMempoolForReorgLocked runs MaybeUpdateMempoolForReorg. cm.mu held.
+func (cm *ChainManager) updateMempoolForReorgLocked(addToMempool bool) {
+	if f := cm.mempoolHooks.UpdateForReorg; f != nil {
+		f(addToMempool)
+	}
 }
 
 // ChainManagerConfig configures the chain manager.
@@ -2285,6 +2321,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		connectedCB = cm.onBlockConnected
 	}
 
+	// ConnectTip -> removeForBlock, under the chain lock (Core holds
+	// cs_main + mempool.cs), so no reader sees the new tip with the block's
+	// transactions or their conflicts still in the pool.
+	if f := cm.mempoolHooks.BlockConnected; f != nil {
+		f(block, node.Height)
+	}
+
 	return nil
 }
 
@@ -2769,6 +2812,14 @@ func (cm *ChainManager) CurrentReorgBatch() storage.Batch {
 // _mempool-refill-on-reorg-fleet-result-2026-05-05.md) and Bitcoin Core's
 // MaybeUpdateMempoolForReorg in validation.cpp.
 func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
+	return cm.disconnectBlock(hash, nil)
+}
+
+// disconnectBlock is DisconnectBlock; on success it also stores the
+// disconnected block in *out (when out is non-nil), so a caller that must
+// replay it later (a failed reorg's rollback) does not depend on reading the
+// body from disk a second time.
+func (cm *ChainManager) disconnectBlock(hash wire.Hash256, out **wire.MsgBlock) error {
 	if !cm.beginMutation() {
 		return mutationRefused()
 	}
@@ -3021,6 +3072,16 @@ func (cm *ChainManager) DisconnectBlock(hash wire.Hash256) error {
 		disconnectedBlock = block
 		disconnectedHeight = prevHeight
 		disconnectedCB = cm.onBlockDisconnected
+	}
+
+	// DisconnectTip -> disconnectpool.AddTransactionsFromBlock, under the
+	// chain lock. Re-acceptance waits for the caller's
+	// updateMempoolForReorgLocked, once the target tip is reached.
+	if f := cm.mempoolHooks.BlockDisconnected; f != nil {
+		f(block, prevHeight)
+	}
+	if out != nil {
+		*out = block
 	}
 
 	return nil
@@ -3306,6 +3367,15 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 	// instead the reorg journal (BeginReorgJournal above) recorded a pre-image
 	// of every outpoint the reorg touched, and RollbackReorgJournal reverts
 	// exactly those. currentTip was snapshotted above under cm.mu.
+	// Blocks this reorg has disconnected / connected so far, for the mempool
+	// replay in rollbackToOriginalTip.
+	type heightBlock struct {
+		block  *wire.MsgBlock
+		height int32
+	}
+	var disconnectedOK []heightBlock
+	var connectedOK []*wire.MsgBlock
+
 	rollbackToOriginalTip := func() {
 		cm.mu.Lock()
 		cm.tipNode = currentTip
@@ -3330,6 +3400,28 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 		// connects against a throwaway CCoinsViewCache and only ever flushes
 		// on success (validation.cpp:3191-3262).
 		cm.setAppliedTip(currentTip.Hash, currentTip.Height)
+
+		// The mempool saw every disconnect and connect that succeeded;
+		// replay the way back to currentTip for it (branch blocks out, the
+		// original blocks in, earliest first), then run the reorg update.
+		// Branch transactions removed as confirmed come back, and the
+		// original blocks' transactions leave the disconnect pool, exactly
+		// as if the node had reorged back. Audit BB-6.
+		cm.mu.Lock()
+		if cm.mempoolHooks.BlockConnected != nil || cm.mempoolHooks.BlockDisconnected != nil {
+			for i := len(connectedOK) - 1; i >= 0; i-- {
+				if f := cm.mempoolHooks.BlockDisconnected; f != nil {
+					f(connectedOK[i], fork.Height+int32(i)+1)
+				}
+			}
+			for i := len(disconnectedOK) - 1; i >= 0; i-- {
+				if f := cm.mempoolHooks.BlockConnected; f != nil {
+					f(disconnectedOK[i].block, disconnectedOK[i].height)
+				}
+			}
+		}
+		cm.updateMempoolForReorgLocked(true)
+		cm.mu.Unlock()
 	}
 
 	// Begin recording UTXO pre-images so any failure below can be unwound
@@ -3340,9 +3432,19 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 
 	// Disconnect blocks from current tip back to fork.
 	for _, node := range disconnectNodes {
-		if err := cm.DisconnectBlock(node.Hash); err != nil {
+		// The disconnect hands back the block it read, for the rollback
+		// replay. Re-reading the body here could miss, and a block left out
+		// of the replay stays in the mempool's disconnect pool: the final
+		// update would then evict the in-mempool spenders of transactions
+		// the rollback has confirmed again, and the mempool's height would
+		// stay one short.
+		var disconnected *wire.MsgBlock
+		if err := cm.disconnectBlock(node.Hash, &disconnected); err != nil {
 			rollbackToOriginalTip()
 			return fmt.Errorf("disconnect block %s failed: %w", node.Hash.String()[:16], err)
+		}
+		if disconnected != nil {
+			disconnectedOK = append(disconnectedOK, heightBlock{disconnected, node.Height})
 		}
 	}
 
@@ -3417,6 +3519,7 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 			rollbackToOriginalTip()
 			return fmt.Errorf("connect block %s failed during reorg: %w", node.Hash.String()[:16], err)
 		}
+		connectedOK = append(connectedOK, block)
 	}
 
 	// Stage the in-memory UTXO mutations from every Connect/Disconnect we just
@@ -3471,6 +3574,11 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 	}
 	cm.mu.Lock()
 	staged.Commit()
+	// ActivateBestChainStep -> MaybeUpdateMempoolForReorg once the reorg
+	// is complete, under the chain lock: the disconnected blocks'
+	// transactions are re-accepted against the new tip, then everything the
+	// new tip makes invalid is dropped.
+	cm.updateMempoolForReorgLocked(true)
 	cm.mu.Unlock()
 
 	// Reorg fully applied and durable — the recorded pre-images are no longer
@@ -3527,6 +3635,9 @@ func (cm *ChainManager) reorgInMemoryFallback(
 			return fmt.Errorf("connect block %s failed during reorg: %w", node.Hash.String()[:16], err)
 		}
 	}
+	cm.mu.Lock()
+	cm.updateMempoolForReorgLocked(true)
+	cm.mu.Unlock()
 	return nil
 }
 
@@ -3760,11 +3871,11 @@ func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
 			}
 			disconnected++
 
-			// Limit transactions being readded to mempool during deep reorgs
-			if disconnected > 10 {
-				// For deep reorgs, mempool updates become expensive
-				// In a full implementation, we'd stop adding txs back to mempool
-			}
+			// Core InvalidateBlock: MaybeUpdateMempoolForReorg after EACH
+			// disconnected block, re-accepting only for the first 10 (a
+			// deeper invalidation drops the rest, with their in-mempool
+			// descendants). cm.mu is held here.
+			cm.updateMempoolForReorgLocked(disconnected <= 10)
 		}
 	}
 
@@ -4344,6 +4455,10 @@ func (cm *ChainManager) VerifyChainstateConsistency(maxDepth int) ChainstateCons
 			break
 		}
 	}
+	// The peeled blocks are re-fetched and re-applied, not re-mined: drop
+	// their transactions (and anything spending them) rather than
+	// re-accepting them against a chainstate just found corrupt.
+	cm.updateMempoolForReorgLocked(false)
 
 	res.TipAfter = cm.tipHeight
 	if res.RollbackFailed {

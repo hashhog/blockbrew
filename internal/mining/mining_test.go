@@ -514,13 +514,20 @@ func TestSelectTransactions(t *testing.T) {
 
 		txs, _, _, _ := selectTransactions(mp, consensus.MaxBlockWeight, consensus.MaxBlockSigOpsCost, 1, 0, 0, nil)
 
-		// Parent should be included (comes later in sorted order)
-		// Child should be skipped because parent isn't included yet when we check child
-		if len(txs) != 1 {
-			t.Fatalf("expected 1 transaction, got %d", len(txs))
+		// Both are included, parent first. The child comes up first in
+		// sorted order; it used to be dropped from the template for good
+		// because its parent was not in yet (a CPFP child, or a child tied
+		// with its parent on ancestor feerate, lost to map order — the
+		// mempool-reorg sweep's GBT (e) row missed D that way). Core selects
+		// whole ancestor packages, so the child follows its parent.
+		if len(txs) != 2 {
+			t.Fatalf("expected 2 transactions, got %d", len(txs))
 		}
 		if txs[0].TxHash() != parentHash {
-			t.Error("parent should be included")
+			t.Error("parent should come first")
+		}
+		if txs[1].TxHash() != childTx.TxHash() {
+			t.Error("child should follow its parent")
 		}
 	})
 }
