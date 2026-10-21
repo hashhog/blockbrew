@@ -491,11 +491,9 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 // initialised (early startup, or unit tests that wire chainDB without
 // a chain manager).  Out-of-range heights (height < 0 or height > tip)
 // return Core's "Block height out of range" with RPC_INVALID_PARAMETER
-// (-8). An in-range height whose body we do not retain returns -1
-// "Block not available (pruned data)" — not a floor cutoff: consult
-// the body store. A hole above FirstBody still had an index row, so a
-// cutoff handed out a hash for a missing body; an island below
-// pruneheight is still served.
+// (-8). Body presence is irrelevant: any height the chain index knows is
+// answered. -1 "Block not available (pruned data)" is only returned when
+// no chain manager is wired and the height row is absent from chainDB.
 func (s *Server) handleGetBlockHash(params json.RawMessage) (interface{}, *RPCError) {
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil {
@@ -536,16 +534,9 @@ func (s *Server) handleGetBlockHash(params json.RawMessage) (interface{}, *RPCEr
 
 	hash, found := s.hashAtHeight(height)
 	if found {
-		// Floor cutoff over-claimed: a hole above FirstBody still had
-		// an index row, so getblockhash handed out a hash for a body
-		// we do not hold. Ask the body store. Height 0 is genesis
-		// (Core GetPruneHeight does not treat genesis as pruned).
-		if height > 0 && s.chainDB != nil && !s.chainDB.HasBlockBody(hash) {
-			return nil, &RPCError{
-				Code:    RPCErrMisc,
-				Message: "Block not available (pruned data)",
-			}
-		}
+		// Core answers from the active chain index (m_chain[height]),
+		// never from block data: a missing body is getblock's problem
+		// ("Block not available (pruned data)"), not getblockhash's.
 		return hash.String(), nil
 	}
 
