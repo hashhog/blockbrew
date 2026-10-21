@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/hashhog/blockbrew/internal/storage"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -135,5 +136,71 @@ func TestMempoolHooksInvalidateReconsiderReorg(t *testing.T) {
 	r.expect(t, "failed reorg to 8''",
 		"D7'", "D6'", "D5'", "C5''", "C6''", // the attempt
 		"D6''", "D5''", "C5'", "C6'", "C7'", // the replay back to 7'
+		"Utrue")
+}
+
+// A failed reorg must replay EVERY block it disconnected back into the
+// mempool, including one whose body can no longer be read from disk after the
+// disconnect (review of blockbrew#13, point 3). The disconnect already holds
+// the block; if the replay re-reads it and misses, the block's transactions
+// stay in the disconnect pool and the final update removeRecursive-drops the
+// in-mempool spenders of transactions the rollback has just confirmed again
+// (and the mempool's chain height is left one block short). Here the body of
+// block 6 is deleted from the store the moment the reorg disconnects it, and
+// the reorg then fails because the branch block at height 7 has no body.
+func TestMempoolHooksFailedReorgReplaysUnreadableBlock(t *testing.T) {
+	cm, idx, nodes, blocks := newStickyChain(t, 6)
+	names := make(map[wire.Hash256]string)
+	for i := 1; i < len(blocks); i++ {
+		names[blocks[i].Header.BlockHash()] = fmt.Sprint(i)
+	}
+	r := &hookRecorder{cm: cm, heights: names}
+	b6 := blocks[6].Header.BlockHash()
+	deleted := false
+	cm.SetMempoolHooks(MempoolHooks{
+		BlockConnected: func(b *wire.MsgBlock, _ int32) { r.note("C" + r.name(b)) },
+		BlockDisconnected: func(b *wire.MsgBlock, _ int32) {
+			r.note("D" + r.name(b))
+			if b.Header.BlockHash() == b6 && !deleted {
+				deleted = true
+				if err := cm.chainDB.DB().Delete(storage.MakeBlockDataKey(b6)); err != nil {
+					t.Fatalf("delete body of 6: %v", err)
+				}
+			}
+		},
+		UpdateForReorg: func(add bool) { r.note(fmt.Sprintf("U%v", add)) },
+	})
+
+	params := RegtestParams()
+	parent := nodes[4]
+	var branch []*BlockNode
+	for i := 5; i <= 8; i++ {
+		b := createTestBlockWithCoinbaseValue(t, params, parent, CalcBlockSubsidy(int32(i))-2)
+		n, err := idx.AddHeader(b.Header, true)
+		if err != nil {
+			t.Fatalf("AddHeader %d'': %v", i, err)
+		}
+		if i != 7 {
+			if err := cm.chainDB.StoreBlock(b.Header.BlockHash(), b); err != nil {
+				t.Fatalf("StoreBlock %d'': %v", i, err)
+			}
+		}
+		names[b.Header.BlockHash()] = fmt.Sprintf("%d''", i)
+		branch = append(branch, n)
+		parent = n
+	}
+	if err := cm.ReorgTo(branch[3]); err == nil {
+		t.Fatal("ReorgTo 8'' with 7'' missing succeeded")
+	}
+	if cm.TipNode() != nodes[6] {
+		t.Fatalf("failed reorg left tip at %d, want 6", cm.TipNode().Height)
+	}
+	// Instrument check: the body really is unreadable, so a re-read misses.
+	if _, err := cm.chainDB.GetBlock(b6); err == nil {
+		t.Fatal("body of block 6 still readable; the test does not exercise the miss")
+	}
+	r.expect(t, "failed reorg to 8'' with block 6's body gone",
+		"D6", "D5", "C5''", "C6''", // the attempt
+		"D6''", "D5''", "C5", "C6", // the replay back to 6, block 6 included
 		"Utrue")
 }

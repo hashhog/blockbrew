@@ -1,6 +1,8 @@
 package mempool
 
 import (
+	"bytes"
+	"errors"
 	"sort"
 	"testing"
 
@@ -358,5 +360,218 @@ func TestReorgUpdate_DeepInvalidateDropsDescendants(t *testing.T) {
 	assertPool(t, "after a no-add disconnect of 112", f.pool(), "M2", "M3")
 	if d, ok := any(f.mp).(interface{ DisconnectPoolSize() int }); !ok || d.DisconnectPoolSize() != 0 {
 		t.Fatal("disconnect pool not drained")
+	}
+}
+
+func reorgTestMempool(c *reorgChain) *Mempool {
+	return New(Config{
+		MaxSize:                300_000_000,
+		MinRelayFeeRate:        1000,
+		IncrementalRelayFee:    1000,
+		MaxOrphanTxs:           10,
+		ChainParams:            consensus.RegtestParams(),
+		ChainState:             c.cs,
+		MempoolFullRBF:         true,
+		MempoolFullRBFExplicit: true,
+	}, c.utxos)
+}
+
+// fanOut is a transaction with one input and n equal P2SH(OP_TRUE) outputs,
+// paying at least fee.
+func fanOut(prev wire.OutPoint, value, fee int64, n int, version int32) *wire.MsgTx {
+	tx := &wire.MsgTx{
+		Version: version,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: prev,
+			SignatureScript:  []byte{0x01, 0x51},
+			Sequence:         0xfffffffe,
+		}},
+	}
+	per := (value - fee) / int64(n)
+	for i := 0; i < n; i++ {
+		tx.TxOut = append(tx.TxOut, &wire.TxOut{Value: per, PkScript: p2shAnyoneCanSpendScript()})
+	}
+	return tx
+}
+
+// spendFee spends prev (worth value) into one P2SH(OP_TRUE) output paying fee.
+func spendFee(prev wire.OutPoint, value, fee int64, version int32) *wire.MsgTx {
+	return &wire.MsgTx{
+		Version: version,
+		TxIn: []*wire.TxIn{{
+			PreviousOutPoint: prev,
+			SignatureScript:  []byte{0x01, 0x51},
+			Sequence:         0xfffffffe,
+		}},
+		TxOut: []*wire.TxOut{{Value: value - fee, PkScript: p2shAnyoneCanSpendScript()}},
+	}
+}
+
+// TestReorgUpdate_ClusterTrimDropsLowestFeerateChunk (review of
+// blockbrew#13, point 1): a parent P confirmed in a block has 64 in-mempool
+// children. invalidateblock re-adds P and links the children to it, a
+// 65-transaction cluster, one over MaxClusterCount. Core's
+// UpdateTransactionsFromBlock -> TxGraph::Trim (txgraph.cpp) includes
+// transactions highest chunk feerate first among those whose parents are
+// already included, and drops whatever no longer fits: P, then the 63 best
+// children; the lowest-feerate child is the one removed. Dropping by txid
+// instead removes a high-feerate child and keeps the low one.
+func TestReorgUpdate_ClusterTrimDropsLowestFeerateChunk(t *testing.T) {
+	c := newReorgChain(t)
+	cb := reorgCoinbaseOutpoint(1)
+	c.utxos.utxos[cb] = &consensus.UTXOEntry{
+		Amount: 50_0000_0000, PkScript: p2shAnyoneCanSpendScript(), Height: 1, IsCoinbase: true,
+	}
+	c.cs.height = 110
+	const nKids = MaxClusterCount
+	p := fanOut(cb, 50_0000_0000, reorgFee, nKids, 2)
+	b111 := c.block('t', 111, p)
+	c.apply(b111, 111)
+	per := p.TxOut[0].Value
+	pHash := p.TxHash()
+
+	const highFee, lowFee = 20_000, 5_000
+	kids := make([]*wire.MsgTx, nKids)
+	for i := range kids {
+		kids[i] = spendFee(wire.OutPoint{Hash: pHash, Index: uint32(i)}, per, highFee, 2)
+	}
+	// The low-feerate child must not be the one a txid order would drop
+	// (the largest txid), or the test cannot tell the two policies apart.
+	maxOf := func() int {
+		m := 0
+		for i := range kids {
+			hi, hm := kids[i].TxHash(), kids[m].TxHash()
+			if bytes.Compare(hi[:], hm[:]) > 0 {
+				m = i
+			}
+		}
+		return m
+	}
+	low := -1
+	for i := range kids {
+		saved := kids[i]
+		kids[i] = spendFee(wire.OutPoint{Hash: pHash, Index: uint32(i)}, per, lowFee, 2)
+		if maxOf() != i {
+			low = i
+			break
+		}
+		kids[i] = saved
+	}
+	if low < 0 {
+		t.Fatal("no child index gives a low-feerate child that is not the max txid")
+	}
+	maxKid := maxOf()
+
+	mp := reorgTestMempool(c)
+	for i, k := range kids {
+		if err := mp.AddTransaction(k); err != nil {
+			t.Fatalf("admit child %d at tip 111: %v", i, err)
+		}
+	}
+
+	c.unapply(b111, 111)
+	mp.BlockDisconnected(b111)
+	runReorgUpdate(mp, true)
+
+	if !mp.HasTransaction(pHash) {
+		t.Fatal("P not re-added")
+	}
+	if mp.HasTransaction(kids[low].TxHash()) {
+		t.Errorf("lowest-feerate child %d still in the pool; Core's trim removes it", low)
+	}
+	for i, k := range kids {
+		if i != low && !mp.HasTransaction(k.TxHash()) {
+			t.Errorf("child %d (feerate above the lowest; max-txid child is %d) was trimmed; Core keeps it", i, maxKid)
+		}
+	}
+	if n := mp.Count(); n != MaxClusterCount {
+		t.Errorf("pool has %d transactions, want %d (P + 63 children)", n, MaxClusterCount)
+	}
+	if cl := mp.GetCluster(pHash); cl == nil || cl.Size() != MaxClusterCount {
+		t.Errorf("P's cluster = %v, want %d members", cl, MaxClusterCount)
+	}
+	// The survivors' package state is P plus the kept children.
+	if e := mp.GetEntry(pHash); e != nil {
+		want := e.Fee + int64(nKids-1)*highFee
+		if e.DescendantFee != want {
+			t.Errorf("P descendant fee = %d, want %d", e.DescendantFee, want)
+		}
+	}
+}
+
+// TestReorgUpdate_ReaddSkipsTRUCChecks (review of blockbrew#13, point 2):
+// Core re-accepts disconnected transactions with bypass_limits, and
+// SingleTRUCChecks only runs `if (!args.m_bypass_limits)` (validation.cpp
+// PreChecks). T is a version-3 transaction over TRUC_MAX_VSIZE, so relay
+// rejects it, but it was mined. After invalidateblock it must come back, and
+// its in-mempool child K must stay: failing T on TRUC would removeRecursive K.
+func TestReorgUpdate_ReaddSkipsTRUCChecks(t *testing.T) {
+	c := newReorgChain(t)
+	cb := reorgCoinbaseOutpoint(1)
+	c.utxos.utxos[cb] = &consensus.UTXOEntry{
+		Amount: 50_0000_0000, PkScript: p2shAnyoneCanSpendScript(), Height: 1, IsCoinbase: true,
+	}
+	c.cs.height = 110
+	tx := fanOut(cb, 50_0000_0000, 50_000, 340, 3)
+	mp := reorgTestMempool(c)
+
+	// Control: T is non-standard only under TRUC (too big for a v3 tx).
+	if err := mp.AddTransaction(tx); !errors.Is(err, ErrTRUCTooBig) {
+		t.Fatalf("relay of T at tip 110: err = %v, want ErrTRUCTooBig", err)
+	}
+
+	b111 := c.block('t', 111, tx)
+	c.apply(b111, 111)
+	k := spendFee(wire.OutPoint{Hash: tx.TxHash(), Index: 0}, tx.TxOut[0].Value, reorgFee, 2)
+	if err := mp.AddTransaction(k); err != nil {
+		t.Fatalf("admit K at tip 111: %v", err)
+	}
+
+	c.unapply(b111, 111)
+	mp.BlockDisconnected(b111)
+	runReorgUpdate(mp, true)
+
+	if !mp.HasTransaction(tx.TxHash()) {
+		t.Error("T (mined, TRUC-oversized) not re-added after invalidateblock; Core bypasses TRUC on re-accept")
+	}
+	if !mp.HasTransaction(k.TxHash()) {
+		t.Error("K (in-mempool child of T) removed after invalidateblock; Core keeps it")
+	}
+}
+
+// TestReorgUpdate_FailedReorgReplayKeepsSpendersOfReconfirmedTxs (review of
+// blockbrew#13, point 3): the mempool side of a failed reorg. Disconnect 112,
+// connect a branch 112b, the reorg fails, and the chain manager replays the
+// way back (112b out, 112 in) before the update. Block 112 is confirmed again,
+// so M1 (spends A2:0, A2 is in 112) must stay, nothing from 112 may come back
+// into the pool, and the mempool's chain height is 112 again.
+// TestMempoolHooksFailedReorgReplaysUnreadableBlock (internal/consensus)
+// proves the chain manager emits this replay even when block 112's body
+// cannot be re-read; without the "C112" step M1 is removed here.
+func TestReorgUpdate_FailedReorgReplayKeepsSpendersOfReconfirmedTxs(t *testing.T) {
+	f := newReorgFixture(t)
+	v := f.cbValue
+	y := spend1(f.cbs[7], v, 0xfffffffe, 0)
+	f.names[y.TxHash()] = "Y"
+	b112b := f.chain.block('b', 112, y)
+	f.mp.SetChainHeight(112)
+
+	// The attempt.
+	f.chain.unapply(f.b112, 112)
+	f.mp.BlockDisconnected(f.b112)
+	f.chain.apply(b112b, 112)
+	f.mp.BlockConnected(b112b)
+	// The rollback replay.
+	f.chain.unapply(b112b, 112)
+	f.mp.BlockDisconnected(b112b)
+	f.chain.apply(f.b112, 112)
+	f.mp.BlockConnected(f.b112)
+	runReorgUpdate(f.mp, true)
+
+	// Y was only in the failed branch: Core re-accepts it from the
+	// disconnect pool like any other disconnected transaction.
+	assertPool(t, "after failed reorg to 112b", f.pool(), "M1", "M2", "M3", "Y")
+	if h := f.mp.ChainHeight(); h != 112 {
+		t.Errorf("mempool chain height = %d after the rollback, want 112", h)
 	}
 }
