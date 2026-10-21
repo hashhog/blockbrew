@@ -22,8 +22,9 @@ import (
 // Core (rpc/blockchain.cpp): pruned is true when the node does not hold the
 // full chain; pruneheight is the first height with complete block data.
 // getblockhash -8 is only for height < 0 or height > tip; an in-range height
-// the node simply does not retain is -1 "Block not available (pruned data)"
-// (same string Core's getblock uses for pruned bodies).
+// the index row is missing for (no chain manager wired) is -1 "Block not
+// available (pruned data)". A known height whose BODY is gone still returns
+// its hash: Core reads m_chain[height], only getblock needs block data.
 //
 // pruneheight is the first height of the contiguous run to the tip
 // (Core GetFirstBlock), NOT the first stored body. An interior hole
@@ -315,15 +316,9 @@ func TestPrunedHistory_DenseIndexMissingBodiesReportsPrunedTrue(t *testing.T) {
 	if int32(got) != prunedHistoryFloor {
 		t.Fatalf("pruneheight = %v, want %d", m["pruneheight"], prunedHistoryFloor)
 	}
-	// Headers are dense but the body is gone: getblockhash consults the
-	// body store, not a floor cutoff, and must not hand out the index hash.
-	resp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(5)}, "", "")
-	if resp.Error == nil {
-		t.Fatal("getblockhash(5) must not return a hash for a body we do not hold")
-	}
-	if resp.Error.Code != RPCErrMisc || resp.Error.Message != prunedDataMsg {
-		t.Fatalf("got %v, want -1 %q", resp.Error, prunedDataMsg)
-	}
+	// Headers are dense but the body is gone: Core answers getblockhash
+	// from the active chain index (m_chain[height]), never from block data.
+	requireGetBlockHash(t, rig, 5)
 }
 
 func TestPrunedHistory_GetBlockHashBelowFloorIsMinus1NotMinus8(t *testing.T) {
@@ -488,19 +483,13 @@ func TestPrunedHistory_TwoSidedProbeAtPruneheight(t *testing.T) {
 	}
 }
 
-func TestPrunedHistory_GetBlockHashAtInteriorHoleIsMinus1NotIndexHash(t *testing.T) {
+func TestPrunedHistory_GetBlockHashAtInteriorHoleReturnsIndexHash(t *testing.T) {
 	rig := newGappedRetentionRig(t, 6, 11, 13, 20)
 	// Height index / header walk still resolves 11.
 	if _, ok := rig.server.hashAtHeight(11); !ok {
 		t.Fatal("height 11 must still be in the index")
 	}
-	resp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(11)}, "", "")
-	if resp.Error == nil {
-		t.Fatalf("getblockhash(11) must not hand out a hash for a body we do not hold, got %v", resp.Result)
-	}
-	if resp.Error.Code != RPCErrMisc || resp.Error.Message != prunedDataMsg {
-		t.Fatalf("got %v, want -1 %q", resp.Error, prunedDataMsg)
-	}
+	requireGetBlockHash(t, rig, 11)
 	atFloor := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(14)}, "", "")
 	if atFloor.Error != nil {
 		t.Fatalf("getblockhash(14) at contiguous floor: %v", atFloor.Error)
@@ -524,14 +513,24 @@ func TestPrunedHistory_GetBlockHashOnIslandBelowHoleReturnsHash(t *testing.T) {
 	}
 }
 
-func TestPrunedHistory_GetBlockHashBelowFirstBodyOnDenseHeadersIsMinus1(t *testing.T) {
+func TestPrunedHistory_GetBlockHashBelowFirstBodyOnDenseHeadersReturnsHash(t *testing.T) {
 	rig := newConnectedBodyHoleRig(t, prunedHistoryFloor, prunedHistoryTip)
-	resp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(5)}, "", "")
-	if resp.Error == nil {
-		t.Fatal("getblockhash(5) must not return a hash for a body we do not hold")
+	for h := int32(1); h < prunedHistoryFloor; h++ {
+		requireGetBlockHash(t, rig, h)
 	}
-	if resp.Error.Code != RPCErrMisc || resp.Error.Message != prunedDataMsg {
-		t.Fatalf("got %v, want -1 %q", resp.Error, prunedDataMsg)
+}
+
+// requireGetBlockHash asserts getblockhash(height) returns the active-chain
+// hash even though the body is not held (Core rpc/blockchain.cpp getblockhash
+// reads m_chain[height]; only getblock needs block data).
+func requireGetBlockHash(t *testing.T, rig *connectedBodyHoleRig, height int32) {
+	t.Helper()
+	resp := testRPCRequest(t, rig.server.handleRPC, "getblockhash", []interface{}{float64(height)}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("getblockhash(%d) errored: %v (want the active-chain hash)", height, resp.Error)
+	}
+	if got, want := resp.Result, rig.hashAt(t, height); got != want {
+		t.Fatalf("getblockhash(%d) = %v, want %s", height, got, want)
 	}
 }
 
