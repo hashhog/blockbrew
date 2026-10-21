@@ -571,6 +571,12 @@ type Mempool struct {
 	totalSize   int64                          // Total virtual size of all mempool txs
 	utxoSet     consensus.UTXOView
 	chainHeight int32
+	// disconnectPool holds the non-coinbase transactions of blocks the chain
+	// has disconnected but whose re-acceptance has not run yet, one slice per
+	// block, most recently disconnected (= earliest confirmed) LAST. Core
+	// DisconnectedBlockTransactions. Drained by UpdateForReorg.
+	disconnectPool  [][]*wire.MsgTx
+	disconnectBytes int64 // weight-based size of disconnectPool, see MaxDisconnectedTxPoolBytes
 	clusters    *ClusterManager               // Cluster-based mempool structure
 
 	// Rolling minimum fee state (mirrors Core txmempool.cpp).
@@ -924,11 +930,30 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) (retErr e
 			retErr = fmt.Errorf("%w (suppressed: %v)", consensus.ErrNodeAborted, retErr)
 		}
 	}()
-	txHash := tx.TxHash()
-	wtxid := tx.WTxHash()
-
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
+	return mp.acceptLocked(tx, fromPeer, acceptOpts{})
+}
+
+// acceptOpts selects the admission variant. The zero value is ordinary relay
+// / RPC admission.
+type acceptOpts struct {
+	// reorg is the re-acceptance of a transaction from a disconnected block
+	// (Core MaybeUpdateMempoolForReorg -> AcceptToMemoryPool with
+	// bypass_limits=true): no mempool-min / relay fee floor and no size-limit
+	// trim (the caller trims once at the end, Core LimitMempoolSize), every
+	// other check unchanged. A transaction whose inputs are missing is
+	// rejected outright rather than parked as an orphan (Core's ATMP never
+	// enrols orphans; that is net_processing's job), and the orphan pool is
+	// not consulted, because the orphan step drops mp.mu and the reorg update
+	// must hold it throughout.
+	reorg bool
+}
+
+// acceptLocked is AddTransactionFrom's body. Must be called with mp.mu held.
+func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts) error {
+	txHash := tx.TxHash()
+	wtxid := tx.WTxHash()
 
 	// 1. Wtxid-aware duplicate detection (W96, mirrors Core validation.cpp:823-830).
 	// Core makes two distinct exists() probes — first against the wtxid, then
@@ -1172,6 +1197,9 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) (retErr e
 	}
 
 	// If we have missing inputs, treat as orphan
+	if len(missingInputs) > 0 && opts.reorg {
+		return fmt.Errorf("%w: %d missing inputs", ErrMissingInputs, len(missingInputs))
+	}
 	if len(missingInputs) > 0 {
 		mp.addOrphanLocked(txHash, tx, missingInputs, fromPeer)
 		return fmt.Errorf("%w: added as orphan with %d missing inputs", ErrMissingInputs, len(missingInputs))
@@ -1190,7 +1218,7 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) (retErr e
 	// 8. Check minimum fee rate (dynamic, accounts for mempool fullness)
 	feeRate := float64(fee) / float64(vsize) * 1000 // sat/kvB
 	minFeeRate := mp.getMinFeeRateLocked()
-	if int64(feeRate) < minFeeRate {
+	if !opts.reorg && int64(feeRate) < minFeeRate {
 		return fmt.Errorf("%w: %.1f sat/kvB below minimum %d sat/kvB",
 			ErrInsufficientFee, feeRate, minFeeRate)
 	}
@@ -1409,6 +1437,13 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) (retErr e
 		// entry and now have to tell subscribers we yanked it).
 		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonSizeLimit)
 		return clusterErr
+	}
+
+	if opts.reorg {
+		// The reorg update links in-mempool children of this re-added
+		// transaction (Core UpdateTransactionsFromBlock) and trims once at
+		// the end; the orphan step would drop mp.mu mid-update.
+		return nil
 	}
 
 	// 12. Evict if mempool too large
@@ -2714,60 +2749,9 @@ func (mp *Mempool) GetOrphanTransactions() []OrphanTxInfo {
 
 // Block connection/disconnection
 
-// BlockConnected removes transactions that were included in a new block.
-// Also arms the rolling-fee decay timer (blockSinceLastRollingFeeBump = true)
-// so GetMinFeeRate will decay the rate back toward zero over the next 12 hours.
-// Core: txmempool.cpp:405-431 (removeForBlock sets lastRollingFeeUpdate +
-// blockSinceLastRollingFeeBump = true).
-func (mp *Mempool) BlockConnected(block *wire.MsgBlock) {
-	mp.mu.Lock()
-	defer mp.mu.Unlock()
-
-	// Increment chain height
-	mp.chainHeight++
-
-	// Remove confirmed transactions.
-	// FIX-73: distinguish BLOCK (the confirmed tx itself) from CONFLICT
-	// (any in-mempool tx whose input was spent by a tx in this block, i.e.
-	// double-spend resolved by the chain). Mirrors Core's two-arm
-	// removeForBlock:
-	//   txmempool.cpp::removeForBlock — confirmed:  REASON::BLOCK
-	//   txmempool.cpp::removeConflicts — conflicts:  REASON::CONFLICT
-	for _, tx := range block.Transactions {
-		txHash := tx.TxHash()
-		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonBlock)
-
-		// Also remove conflicting transactions (double spends)
-		for _, in := range tx.TxIn {
-			if spendingTx, ok := mp.outpoints[in.PreviousOutPoint]; ok {
-				mp.removeWithDescendantsLocked(spendingTx, MempoolRemovalReasonConflict)
-			}
-		}
-	}
-
-	// Arm the rolling-fee decay timer.  Core resets lastRollingFeeUpdate to
-	// GetTime() here; we do the same so the 10-second cooldown in
-	// getMinFeeRateLocked is measured from the block arrival time, not from
-	// the last call to GetMinFeeRate.
-	mp.lastRollingFeeUpdate = time.Now().Unix()
-	mp.blockSinceLastRollingFeeBump = true
-}
-
-// BlockDisconnected re-adds transactions from a disconnected block
-// (if they are still valid).
-func (mp *Mempool) BlockDisconnected(block *wire.MsgBlock) {
-	mp.mu.Lock()
-	mp.chainHeight--
-	mp.mu.Unlock()
-
-	// Re-add transactions from the disconnected block (skip coinbase)
-	for i, tx := range block.Transactions {
-		if i == 0 {
-			continue // Skip coinbase
-		}
-		_ = mp.AddTransaction(tx) // Ignore errors
-	}
-}
+// BlockConnected / BlockDisconnected / UpdateForReorg / RemoveForReorg live in
+// reorg.go (Core removeForBlock, DisconnectedBlockTransactions,
+// MaybeUpdateMempoolForReorg, removeForReorg).
 
 // Expire removes transactions that were added before cutoff, along with all of
 // their in-mempool descendants.  Returns the number of transactions removed.
@@ -2805,92 +2789,6 @@ func (mp *Mempool) Expire(cutoff time.Time) int {
 		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonExpiry)
 	}
 	return len(stage)
-}
-
-// RemoveForReorg evicts mempool transactions that are no longer valid after a
-// chain reorganisation.  A transaction becomes invalid when:
-//
-//  (a) It is non-final at the new chain tip (nLockTime / BIP-68 sequence locks
-//      no longer satisfied at the new tip height + median-time-past).
-//  (b) It directly spends a coinbase output that has become immature again
-//      (fewer than CoinbaseMaturity = 100 confirmations at the new tip).
-//
-// All descendants of an invalid transaction are also removed.
-//
-// This mirrors Core's CTxMemPool::removeForReorg (txmempool.cpp:360-386).
-// The function is a no-op when ChainState is not wired; in that case the
-// caller is responsible for validity.
-func (mp *Mempool) RemoveForReorg() int {
-	mp.mu.Lock()
-	defer mp.mu.Unlock()
-
-	if mp.config.ChainState == nil {
-		return 0
-	}
-
-	tipHeight := mp.config.ChainState.TipHeight()
-	tipMTP := uint32(mp.config.ChainState.TipMTP())
-
-	var invalid []wire.Hash256
-	for txHash, entry := range mp.pool {
-		if mp.txInvalidAtTip(entry.Tx, tipHeight, tipMTP) {
-			invalid = append(invalid, txHash)
-		}
-	}
-
-	visited := make(map[wire.Hash256]bool)
-	stage := make([]wire.Hash256, 0)
-	for _, txHash := range invalid {
-		if !visited[txHash] {
-			descs := mp.collectDescendantsLocked(txHash, visited)
-			stage = append(stage, descs...)
-			stage = append(stage, txHash)
-			visited[txHash] = true
-		}
-	}
-
-	// FIX-73: RemoveForReorg → REORG reason.
-	for _, txHash := range stage {
-		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonReorg)
-	}
-	return len(stage)
-}
-
-// txInvalidAtTip reports whether tx must be evicted after a reorg to the
-// current chain tip.
-//
-// Two conditions checked (Core: txmempool.cpp:360-386, check_final_and_mature
-// callback passed to removeForReorg):
-//  1. Non-final: IsFinalTx fails at (tipHeight+1, tipMTP).
-//     Core uses the *next* block's height/time to match the mempool-accept gate.
-//  2. Immature coinbase spend: any input that spends a coinbase output with
-//     fewer than CoinbaseMaturity (100) confirmations at the new tip.
-//
-// Must be called with mp.mu held.
-func (mp *Mempool) txInvalidAtTip(tx *wire.MsgTx, tipHeight int32, tipMTP uint32) bool {
-	// Gate 1 — non-final tx.
-	// Core evaluates at nBlockHeight = active_chain.Height()+1 and
-	// nBlockTime = active_chain.Tip()->GetMedianTimePast().
-	if !consensus.IsFinalTx(tx, tipHeight+1, tipMTP) {
-		return true
-	}
-
-	// Gate 2 — immature coinbase spend.
-	// A confirmed coinbase output at height H has (tipHeight - H + 1)
-	// confirmations.  It is spendable when that value >= CoinbaseMaturity.
-	if mp.utxoSet != nil {
-		for _, in := range tx.TxIn {
-			utxo := mp.utxoSet.GetUTXO(in.PreviousOutPoint)
-			if utxo != nil && utxo.IsCoinbase {
-				confirmations := tipHeight - utxo.Height + 1
-				if confirmations < consensus.CoinbaseMaturity {
-					return true
-				}
-			}
-		}
-	}
-
-	return false
 }
 
 // Fee estimation
