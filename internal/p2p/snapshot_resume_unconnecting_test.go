@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"testing"
+	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -172,5 +173,140 @@ func TestUnconnectingHeadersThrottleClearsOnConnect(t *testing.T) {
 	}
 	if !peer.IsConnected() || peer.MisbehaviorScore() != 0 {
 		t.Fatalf("peer punished for unconnecting headers")
+	}
+}
+
+// unconnectingSetup is one regtest header index at genesis, a sync manager
+// whose sync peer is the first of peers, and a 3-header chain that connects.
+func unconnectingSetup(t *testing.T, peers ...*Peer) (*SyncManager, *consensus.HeaderIndex, []wire.BlockHeader) {
+	t.Helper()
+	params := consensus.RegtestParams()
+	idx := consensus.NewHeaderIndex(params)
+	hdrs := regtestChainHeaders(t, params, 3)
+	pm := &PeerManager{peers: make(map[string]*PeerInfo)}
+	for _, p := range peers {
+		pm.InsertConnectedPeer(p)
+	}
+	sm := NewSyncManager(SyncManagerConfig{ChainParams: params, HeaderIndex: idx, PeerManager: pm})
+	sm.mu.Lock()
+	sm.syncPeer = peers[0]
+	sm.mu.Unlock()
+	return sm, idx, hdrs
+}
+
+// Unconnecting headers are only excused once they pass Core's CheckHeadersPoW
+// (net_processing.cpp ProcessHeadersMessage runs it, and Misbehaving on
+// failure, before HandleUnconnectingHeaders). A header with an unknown parent
+// that also fails its own nBits target is a protocol violation, not a
+// possible BIP 130 announcement.
+func TestUnconnectingHeadersInvalidPoWDisconnects(t *testing.T) {
+	peer := createMockPeer("10.0.0.2:8333", 3)
+	sm, _, hdrs := unconnectingSetup(t, peer)
+
+	bad := createTestBlockHeader(wire.Hash256{0xcd}, hdrs[3].Timestamp+600, 1)
+	bad.Bits = 0x1d00ffff // mainnet-genesis target: within regtest's powLimit, unmet by this nonce
+	if consensus.CheckProofOfWork(bad.BlockHash(), bad.Bits, consensus.RegtestParams().PowLimit) == nil {
+		t.Fatalf("test header unexpectedly meets its target")
+	}
+	sm.HandleHeaders(peer, &MsgHeaders{Headers: []wire.BlockHeader{bad}})
+
+	if peer.IsConnected() {
+		t.Fatalf("peer still connected after an unconnecting header with invalid proof of work")
+	}
+	if s := peer.MisbehaviorScore(); s < ScoreInvalidBlock {
+		t.Fatalf("misbehavior score %d for invalid proof of work, want >= %d", s, ScoreInvalidBlock)
+	}
+	if n := len(forwardGetHeaders(drainBackfillGetHeaders(peer))); n != 0 {
+		t.Fatalf("%d getheaders sent in answer to invalid proof of work, want 0", n)
+	}
+}
+
+// Core CheckHeadersAreContinuous: a batch whose headers do not chain to each
+// other is punished even when its first header merely does not connect.
+func TestUnconnectingHeadersNonContinuousDisconnects(t *testing.T) {
+	peer := createMockPeer("10.0.0.3:8333", 3)
+	sm, _, hdrs := unconnectingSetup(t, peer)
+
+	first := createTestBlockHeader(wire.Hash256{0xce}, hdrs[3].Timestamp+600, 1)
+	second := createTestBlockHeader(wire.Hash256{0xcf}, hdrs[3].Timestamp+1200, 1) // does not build on first
+	sm.HandleHeaders(peer, &MsgHeaders{Headers: []wire.BlockHeader{first, second}})
+
+	if peer.IsConnected() {
+		t.Fatalf("peer still connected after a non-continuous unconnecting batch")
+	}
+	if s := peer.MisbehaviorScore(); s < ScoreInvalidBlock {
+		t.Fatalf("misbehavior score %d for non-continuous headers, want >= %d", s, ScoreInvalidBlock)
+	}
+}
+
+// The getheaders sent for an unconnecting message goes unanswered and no
+// further unconnecting message arrives. With no other peer to sync from, the
+// sync loop re-asks once HeadersResponseTime has passed (Core: the header
+// sync timeout resets sync state instead of disconnecting when there is no
+// other peer), and does not drop the only peer.
+func TestUnconnectingReAskUnansweredIsRepeatedByTimer(t *testing.T) {
+	peer := createMockPeer("10.0.0.4:8333", 3)
+	sm, _, hdrs := unconnectingSetup(t, peer)
+
+	sm.HandleHeaders(peer, &MsgHeaders{Headers: []wire.BlockHeader{
+		createTestBlockHeader(wire.Hash256{0xd0}, hdrs[3].Timestamp+600, 1),
+	}})
+	if n := len(forwardGetHeaders(drainBackfillGetHeaders(peer))); n != 1 {
+		t.Fatalf("%d getheaders for the unconnecting message, want 1", n)
+	}
+
+	start := time.Now()
+	sm.syncTick(start.Add(HeadersResponseTime / 2))
+	if n := len(forwardGetHeaders(drainBackfillGetHeaders(peer))); n != 0 {
+		t.Fatalf("%d getheaders before HeadersResponseTime expired, want 0", n)
+	}
+
+	sm.syncTick(start.Add(HeadersResponseTime + time.Second))
+	if n := len(forwardGetHeaders(drainBackfillGetHeaders(peer))); n != 1 {
+		t.Fatalf("%d getheaders after the unanswered re-ask expired, want 1 (IBD stalls otherwise)", n)
+	}
+	if !peer.IsConnected() || peer.MisbehaviorScore() != 0 || sm.SyncPeer() != peer {
+		t.Fatalf("only peer dropped or punished on the re-ask timeout")
+	}
+}
+
+// Same unanswered re-ask, but another peer is connected. The sync peer holds
+// the only header-sync slot (HandleHeaders drops other peers' headers until
+// headersSynced), so after HeadersResponseTime it is released and
+// disconnected without a misbehaviour score (Core m_headers_sync_timeout:
+// disconnect the sync peer when another could be used instead), and the
+// second peer syncs.
+func TestUnconnectingReAskUnansweredReleasesSyncPeer(t *testing.T) {
+	stuck := createMockPeer("10.0.0.5:8333", 3)
+	good := createMockPeer("10.0.0.6:8333", 3)
+	sm, idx, hdrs := unconnectingSetup(t, stuck, good)
+
+	sm.HandleHeaders(stuck, &MsgHeaders{Headers: []wire.BlockHeader{
+		createTestBlockHeader(wire.Hash256{0xd1}, hdrs[3].Timestamp+600, 1),
+	}})
+	drainBackfillGetHeaders(stuck)
+
+	// While stuck holds the slot, good's headers are ignored.
+	sm.HandleHeaders(good, &MsgHeaders{Headers: hdrs[1:4]})
+	if idx.BestHeight() != 0 {
+		t.Fatalf("non-sync peer's headers accepted during initial sync")
+	}
+
+	sm.syncTick(time.Now().Add(HeadersResponseTime + time.Second))
+	if stuck.IsConnected() {
+		t.Fatalf("sync peer kept the header-sync slot after its re-ask went unanswered past HeadersResponseTime")
+	}
+	if s := stuck.MisbehaviorScore(); s != 0 {
+		t.Fatalf("released sync peer scored %d, want 0 (a timeout is not misbehaviour)", s)
+	}
+	if sm.SyncPeer() != good {
+		t.Fatalf("sync peer %v after release, want the second peer", sm.SyncPeer())
+	}
+	if n := len(forwardGetHeaders(drainBackfillGetHeaders(good))); n != 1 {
+		t.Fatalf("%d getheaders to the new sync peer, want 1", n)
+	}
+	sm.HandleHeaders(good, &MsgHeaders{Headers: hdrs[1:4]})
+	if idx.BestHeight() != 3 {
+		t.Fatalf("header tip %d from the new sync peer, want 3", idx.BestHeight())
 	}
 }
