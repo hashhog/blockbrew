@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -97,13 +98,46 @@ func IsHeaderTimeFutureErr(err error) bool {
 	return errors.Is(err, ErrTimestampTooFar)
 }
 
+// ErrUnclassifiedScriptFailure marks a failure of the script-validation pass
+// that carries no Core ScriptError code (or carries ErrCodeInternal): the
+// engine or the check queue was handed something no transaction can produce.
+// It is a local fault, never a verdict on the block.
+var ErrUnclassifiedScriptFailure = errors.New("script check failed without a Core ScriptError")
+
+// scriptVerdict classifies a failure of the script-validation pass by TYPE,
+// not by call site. It is an allow-list:
+//
+//   - a prevout missing from the view (ErrScriptPrevoutMissing) and a typed
+//     system fault keep their existing non-verdict handling;
+//   - a script.Error whose code is one of Core's ScriptError_t values is a
+//     consensus verdict (Core CheckInputScripts -> BLOCK_CONSENSUS);
+//   - anything else (ErrCodeInternal, an error from outside the engine) is a
+//     system fault, latched at the source like every other one (gate 6).
+//
+// Every failure the engine can return for a transaction carries a Core code
+// (internal/script scripterror_test.go checks each failure site and that the
+// engine constructs no untyped error), so the last case is unreachable from
+// block contents: a crafted block gets a verdict, never a halt.
+func scriptVerdict(hash wire.Hash256, err error) error {
+	if err == nil || isLocalUTXOGap(err) || IsSystemFault(err) {
+		return err
+	}
+	if code, ok := script.ErrorCodeOf(err); ok && code.IsConsensus() {
+		return blockVerdict(hash, err)
+	}
+	fault := SystemFault("script check", fmt.Errorf("%w: %v", ErrUnclassifiedScriptFailure, err))
+	AbortNode(fault)
+	return fault
+}
+
 // blockVerdict wraps err as a BlockInvalidError for block `hash` when it is a
 // consensus verdict on that block, and returns it unchanged otherwise.
 //
 // The allow-list is the CALL SITE: blockVerdict is applied only to the output
 // of the pure consensus-rule checks in ConnectBlock (CheckBlockSanity,
 // CheckBlockContext, CheckBIP30, CheckTransactionSanity, CheckTransactionInputs,
-// BIP-68, the sigop cap, script validation, the coinbase-value check). Their
+// BIP-68, the sigop cap, the coinbase-value check; script validation goes
+// through scriptVerdict, which classifies by type before calling this). Their
 // only non-rule failure channels are a coins-DB read error and a panic, and
 // both now latch AbortNode at the source (gate 6). So, in addition to the
 // non-verdict classes below, NOTHING is a verdict once the node is aborted —

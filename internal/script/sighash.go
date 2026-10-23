@@ -3,7 +3,6 @@ package script
 import (
 	"bytes"
 	"crypto/sha256"
-	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -199,7 +198,7 @@ func CalcTaprootSignatureHash(hashType SigHashType, tx *wire.MsgTx, idx int, pre
 
 	// Validate hash_type: must be one of 0x00, 0x01, 0x02, 0x03, 0x81, 0x82, 0x83
 	if !(hashType <= 0x03 || (hashType >= 0x81 && hashType <= 0x83)) {
-		return [32]byte{}, fmt.Errorf("invalid taproot sighash type: 0x%02x", hashType)
+		return [32]byte{}, errorf(ErrCodeSchnorrSigHashType, "invalid taproot sighash type: 0x%02x", hashType)
 	}
 
 	// Determine output type for behavior: DEFAULT behaves like ALL
@@ -299,8 +298,11 @@ func CalcTaprootSignatureHash(hashType SigHashType, tx *wire.MsgTx, idx int, pre
 
 	// Output specific data for SIGHASH_SINGLE
 	if outputType == SigHashSingle {
+		// Core SignatureHashSchnorr returns false here, which the checker
+		// reports as SCRIPT_ERR_SCHNORR_SIG_HASHTYPE: a property of the
+		// transaction, not the caller bug ErrInvalidIndex stands for.
 		if idx >= len(tx.TxOut) {
-			return [32]byte{}, ErrInvalidIndex
+			return [32]byte{}, ErrTaprootSigHashSingleNoOutput
 		}
 		var buf bytes.Buffer
 		tx.TxOut[idx].Serialize(&buf)

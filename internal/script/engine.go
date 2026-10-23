@@ -2,60 +2,73 @@ package script
 
 import (
 	"bytes"
-	"errors"
-	"fmt"
 
 	"github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
-// Script validation errors
+// Script validation errors. Each carries the Core ScriptError_t it mirrors
+// (scripterror.go); a failure without one would be unclassifiable. Where
+// blockbrew uses one error for several Core codes the code is the closest
+// one; every Core code is a verdict, so that choice never changes a
+// classification. ErrScriptNumOverflow is SCRIPT_ERR_UNKNOWN_ERROR because
+// Core's scriptnum_error is caught by EvalScript's catch-all.
 var (
-	ErrScriptTooLong        = errors.New("script too long")
-	ErrScriptNotClean       = errors.New("stack not clean after execution")
-	ErrScriptFailed         = errors.New("script evaluation failed")
-	ErrInvalidIndex         = errors.New("invalid input index")
-	ErrDisabledOpcode       = errors.New("disabled opcode")
-	ErrInvalidOpcode        = errors.New("invalid opcode")
-	ErrOpCount              = errors.New("too many operations")
-	ErrPushSize             = errors.New("push data too large")
-	ErrUnbalancedConditional = errors.New("unbalanced conditional")
-	ErrVerifyFailed         = errors.New("verify operation failed")
-	ErrOpReturn             = errors.New("OP_RETURN executed")
-	ErrEqualVerify          = errors.New("OP_EQUALVERIFY failed")
-	ErrCheckSigFailed       = errors.New("signature verification failed")
-	ErrCheckMultiSigFailed  = errors.New("multisig verification failed")
-	ErrNullDummy            = errors.New("multisig dummy must be empty")
-	ErrInvalidPubKeyCount   = errors.New("invalid public key count")
-	ErrInvalidSigCount      = errors.New("invalid signature count")
-	ErrWitnessProgram       = errors.New("invalid witness program")
-	ErrWitnessMismatch      = errors.New("witness data mismatch")
-	ErrWitnessMalleated       = errors.New("witness malleated")
-	ErrWitnessMalleatedP2SH   = errors.New("witness malleated P2SH: scriptSig is not an exact single push of the redeemScript")
-	ErrTaprootSigVerify         = errors.New("taproot signature verification failed")
-	ErrDiscourageUpgradableTaprootVersion = errors.New("upgradable taproot leaf version (discouraged)")
-	ErrDiscourageUpgradablePubKeyType     = errors.New("upgradable tapscript pubkey type (discouraged)")
-	ErrTapscriptEmptyPubKey               = errors.New("tapscript: empty pubkey not allowed")
-	ErrTapscriptInvalidSigSize            = errors.New("tapscript: invalid schnorr signature size")
-	ErrTapscriptValidationWeight          = errors.New("tapscript validation weight budget exceeded")
-	ErrInitialStackSize                   = errors.New("witness initial stack size exceeds limit")
-	ErrInitialPushSize                    = errors.New("witness initial element size exceeds limit")
-	ErrMinimalData              = errors.New("non-minimal data push")
-	ErrCLTVFailed               = errors.New("OP_CHECKLOCKTIMEVERIFY failed")
-	ErrCSVFailed                = errors.New("OP_CHECKSEQUENCEVERIFY failed")
-	ErrTapscriptCheckMultiSig   = errors.New("OP_CHECKMULTISIG(VERIFY) not allowed in tapscript")
-	ErrTaprootControlBlockSize  = errors.New("taproot control block wrong size")
-	ErrNullFail                 = errors.New("non-empty signature on failed CHECKSIG when NULLFAIL is active")
-	ErrSigPushOnly              = errors.New("scriptSig contains non-push opcode")
-	ErrWitnessUnexpected        = errors.New("unexpected witness data for non-witness script")
-	ErrSigDER                   = errors.New("signature is not valid DER encoding")
-	ErrSigHighS                 = errors.New("signature S value is not low")
-	ErrSigHashType              = errors.New("signature has undefined hashtype")
-	ErrPubKeyType               = errors.New("public key is not compressed or uncompressed")
-	ErrWitnessPubKeyType        = errors.New("witness v0 requires compressed public key")
-	ErrEvalFalse                = errors.New("script evaluated to false")
-	ErrCleanStack               = errors.New("stack not clean after witness script execution")
-	ErrSigFindAndDelete         = errors.New("signature found in script with CONST_SCRIPTCODE active")
+	ErrScriptTooLong        = newError(ErrCodeScriptSize, "script too long")
+	ErrScriptNotClean       = newError(ErrCodeCleanStack, "stack not clean after execution")
+	ErrScriptFailed         = newError(ErrCodeEvalFalse, "script evaluation failed")
+	ErrInvalidIndex         = newError(ErrCodeInternal, "invalid input index")
+	ErrDisabledOpcode       = newError(ErrCodeDisabledOpcode, "disabled opcode")
+	ErrInvalidOpcode        = newError(ErrCodeBadOpcode, "invalid opcode")
+	ErrOpCount              = newError(ErrCodeOpCount, "too many operations")
+	ErrPushSize             = newError(ErrCodePushSize, "push data too large")
+	ErrUnbalancedConditional = newError(ErrCodeUnbalancedConditional, "unbalanced conditional")
+	ErrVerifyFailed         = newError(ErrCodeVerify, "verify operation failed")
+	ErrOpReturn             = newError(ErrCodeOpReturn, "OP_RETURN executed")
+	ErrEqualVerify          = newError(ErrCodeEqualVerify, "OP_EQUALVERIFY failed")
+	ErrCheckSigFailed       = newError(ErrCodeCheckSigVerify, "signature verification failed")
+	ErrCheckMultiSigFailed  = newError(ErrCodeCheckMultiSigVerify, "multisig verification failed")
+	ErrNullDummy            = newError(ErrCodeSigNullDummy, "multisig dummy must be empty")
+	ErrInvalidPubKeyCount   = newError(ErrCodePubKeyCount, "invalid public key count")
+	ErrInvalidSigCount      = newError(ErrCodeSigCount, "invalid signature count")
+	ErrWitnessProgram       = newError(ErrCodeWitnessProgramWrongLength, "invalid witness program")
+	ErrWitnessMismatch      = newError(ErrCodeWitnessProgramMismatch, "witness data mismatch")
+	ErrWitnessMalleated       = newError(ErrCodeWitnessMalleated, "witness malleated")
+	ErrWitnessMalleatedP2SH   = newError(ErrCodeWitnessMalleatedP2SH, "witness malleated P2SH: scriptSig is not an exact single push of the redeemScript")
+	ErrTaprootSigVerify         = newError(ErrCodeSchnorrSig, "taproot signature verification failed")
+	ErrDiscourageUpgradableTaprootVersion = newError(ErrCodeDiscourageUpgradableTaprootVersion, "upgradable taproot leaf version (discouraged)")
+	ErrDiscourageUpgradablePubKeyType     = newError(ErrCodeDiscourageUpgradablePubKeyType, "upgradable tapscript pubkey type (discouraged)")
+	ErrTapscriptEmptyPubKey               = newError(ErrCodeTapscriptEmptyPubKey, "tapscript: empty pubkey not allowed")
+	ErrTapscriptInvalidSigSize            = newError(ErrCodeSchnorrSigSize, "tapscript: invalid schnorr signature size")
+	ErrTapscriptValidationWeight          = newError(ErrCodeTapscriptValidationWeight, "tapscript validation weight budget exceeded")
+	ErrInitialStackSize                   = newError(ErrCodeStackSize, "witness initial stack size exceeds limit")
+	ErrInitialPushSize                    = newError(ErrCodePushSize, "witness initial element size exceeds limit")
+	ErrMinimalData              = newError(ErrCodeMinimalData, "non-minimal data push")
+	ErrCLTVFailed               = newError(ErrCodeUnsatisfiedLocktime, "OP_CHECKLOCKTIMEVERIFY failed")
+	ErrCSVFailed                = newError(ErrCodeUnsatisfiedLocktime, "OP_CHECKSEQUENCEVERIFY failed")
+	ErrTapscriptCheckMultiSig   = newError(ErrCodeTapscriptCheckMultiSig, "OP_CHECKMULTISIG(VERIFY) not allowed in tapscript")
+	ErrTaprootControlBlockSize  = newError(ErrCodeTaprootWrongControlSize, "taproot control block wrong size")
+	ErrNullFail                 = newError(ErrCodeSigNullFail, "non-empty signature on failed CHECKSIG when NULLFAIL is active")
+	ErrSigPushOnly              = newError(ErrCodeSigPushOnly, "scriptSig contains non-push opcode")
+	ErrWitnessUnexpected        = newError(ErrCodeWitnessUnexpected, "unexpected witness data for non-witness script")
+	ErrSigDER                   = newError(ErrCodeSigDER, "signature is not valid DER encoding")
+	ErrSigHighS                 = newError(ErrCodeSigHighS, "signature S value is not low")
+	ErrSigHashType              = newError(ErrCodeSigHashType, "signature has undefined hashtype")
+	ErrPubKeyType               = newError(ErrCodePubKeyType, "public key is not compressed or uncompressed")
+	ErrWitnessPubKeyType        = newError(ErrCodeWitnessPubKeyType, "witness v0 requires compressed public key")
+	ErrEvalFalse                = newError(ErrCodeEvalFalse, "script evaluated to false")
+	ErrCleanStack               = newError(ErrCodeCleanStack, "stack not clean after witness script execution")
+	ErrSigFindAndDelete         = newError(ErrCodeSigFindAndDelete, "signature found in script with CONST_SCRIPTCODE active")
+
+	// Failures that used to be built inline with errors.New / fmt.Errorf.
+	// The text is unchanged; the code is Core's.
+	ErrDiscourageOpSuccess      = newError(ErrCodeDiscourageOpSuccess, "discouraged OP_SUCCESS opcode in tapscript")
+	ErrOpCodeSeparator          = newError(ErrCodeOpCodeSeparator, "OP_CODESEPARATOR in legacy script with CONST_SCRIPTCODE")
+	ErrDiscourageUpgradableNops = newError(ErrCodeDiscourageUpgradableNops, "discouraged upgradable NOP")
+	ErrTapscriptMinimalIf       = newError(ErrCodeTapscriptMinimalIf, "tapscript requires minimal IF/NOTIF argument")
+	ErrMinimalIf                = newError(ErrCodeMinimalIf, "tapscript requires minimal IF/NOTIF argument")
+	// Text kept from the ErrInvalidIndex this site used to return.
+	ErrTaprootSigHashSingleNoOutput = newError(ErrCodeSchnorrSigHashType, "invalid input index")
 )
 
 // ScriptFlags control which script validation rules are enabled.
@@ -655,7 +668,7 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 				scanPC += 4 + dataLen
 			} else if IsOpSuccess(op) {
 				if e.flags&ScriptVerifyDiscourageOpSuccess != 0 {
-					return errors.New("discouraged OP_SUCCESS opcode in tapscript")
+					return ErrDiscourageOpSuccess
 				}
 				return nil
 			}
@@ -826,24 +839,24 @@ func (e *Engine) executeScript(script []byte) error {
 				scanPC += int(op)
 			} else if op == OP_PUSHDATA1 {
 				if scanPC >= len(script) {
-					return errors.New("script too short for OP_PUSHDATA1")
+					return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA1")
 				}
 				scanPC += 1 + int(script[scanPC])
 			} else if op == OP_PUSHDATA2 {
 				if scanPC+2 > len(script) {
-					return errors.New("script too short for OP_PUSHDATA2")
+					return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA2")
 				}
 				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8
 				scanPC += 2 + dataLen
 			} else if op == OP_PUSHDATA4 {
 				if scanPC+4 > len(script) {
-					return errors.New("script too short for OP_PUSHDATA4")
+					return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA4")
 				}
 				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8 | int(script[scanPC+2])<<16 | int(script[scanPC+3])<<24
 				scanPC += 4 + dataLen
 			} else if IsOpSuccess(op) {
 				if e.flags&ScriptVerifyDiscourageOpSuccess != 0 {
-					return errors.New("discouraged OP_SUCCESS opcode in tapscript")
+					return ErrDiscourageOpSuccess
 				}
 				// Signal to the caller (executeTaprootScriptPath) that this
 				// invocation short-circuited via OP_SUCCESSx so it can skip
@@ -874,7 +887,7 @@ func (e *Engine) executeScript(script []byte) error {
 		if op == OP_CODESEPARATOR &&
 			e.sigVersion == SigVersionBase &&
 			e.flags&ScriptVerifyConstScriptCode != 0 {
-			return errors.New("OP_CODESEPARATOR in legacy script with CONST_SCRIPTCODE")
+			return ErrOpCodeSeparator
 		}
 
 		// Determine if we're in an executing branch
@@ -896,7 +909,7 @@ func (e *Engine) executeScript(script []byte) error {
 			// Direct push: op is the number of bytes to push
 			dataLen := int(op)
 			if pc+dataLen > len(script) {
-				return fmt.Errorf("script too short for push of %d bytes", dataLen)
+				return errorf(ErrCodeBadOpcode, "script too short for push of %d bytes", dataLen)
 			}
 			if dataLen > MaxScriptElementSize {
 				return ErrPushSize
@@ -919,12 +932,12 @@ func (e *Engine) executeScript(script []byte) error {
 
 		if op == OP_PUSHDATA1 {
 			if pc >= len(script) {
-				return errors.New("script too short for OP_PUSHDATA1")
+				return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA1")
 			}
 			dataLen := int(script[pc])
 			pc++
 			if pc+dataLen > len(script) {
-				return errors.New("script too short for OP_PUSHDATA1 data")
+				return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA1 data")
 			}
 			if dataLen > MaxScriptElementSize {
 				return ErrPushSize
@@ -947,12 +960,12 @@ func (e *Engine) executeScript(script []byte) error {
 
 		if op == OP_PUSHDATA2 {
 			if pc+2 > len(script) {
-				return errors.New("script too short for OP_PUSHDATA2")
+				return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA2")
 			}
 			dataLen := int(script[pc]) | int(script[pc+1])<<8
 			pc += 2
 			if pc+dataLen > len(script) {
-				return errors.New("script too short for OP_PUSHDATA2 data")
+				return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA2 data")
 			}
 			if dataLen > MaxScriptElementSize {
 				return ErrPushSize
@@ -975,12 +988,12 @@ func (e *Engine) executeScript(script []byte) error {
 
 		if op == OP_PUSHDATA4 {
 			if pc+4 > len(script) {
-				return errors.New("script too short for OP_PUSHDATA4")
+				return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA4")
 			}
 			dataLen := int(script[pc]) | int(script[pc+1])<<8 | int(script[pc+2])<<16 | int(script[pc+3])<<24
 			pc += 4
 			if pc+dataLen > len(script) {
-				return errors.New("script too short for OP_PUSHDATA4 data")
+				return newError(ErrCodeBadOpcode, "script too short for OP_PUSHDATA4 data")
 			}
 			if dataLen > MaxScriptElementSize {
 				return ErrPushSize
@@ -1049,7 +1062,10 @@ func (e *Engine) executeScript(script []byte) error {
 				if e.sigVersion == SigVersionTapscript ||
 					(e.sigVersion == SigVersionWitnessV0 && e.flags&ScriptVerifyMinimalIf != 0) {
 					if len(val) > 1 || (len(val) == 1 && val[0] != 1) {
-						return fmt.Errorf("tapscript requires minimal IF/NOTIF argument")
+						if e.sigVersion == SigVersionTapscript {
+							return ErrTapscriptMinimalIf
+						}
+						return ErrMinimalIf
 					}
 				}
 
@@ -1143,7 +1159,7 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int, opcodePos uint32)
 	case OP_NOP1, OP_NOP4, OP_NOP5, OP_NOP6, OP_NOP7, OP_NOP8, OP_NOP9, OP_NOP10:
 		// Reserved for future upgrades, treated as NOP for now
 		if e.flags&ScriptVerifyDiscourageUpgradableNops != 0 {
-			return errors.New("discouraged upgradable NOP")
+			return ErrDiscourageUpgradableNops
 		}
 		return nil
 
@@ -1353,7 +1369,7 @@ func (e *Engine) executeOpcode(op byte, script []byte, pc int, opcodePos uint32)
 		return e.opRoll()
 
 	default:
-		return fmt.Errorf("unimplemented opcode: 0x%02x (%s)", op, OpcodeName(op))
+		return errorf(ErrCodeBadOpcode, "unimplemented opcode: 0x%02x (%s)", op, OpcodeName(op))
 	}
 }
 

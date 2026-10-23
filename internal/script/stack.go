@@ -1,15 +1,11 @@
 package script
 
-import (
-	"errors"
-)
-
 // Stack errors
 var (
-	ErrStackUnderflow   = errors.New("stack underflow")
-	ErrStackOverflow    = errors.New("stack overflow")
-	ErrInvalidStackOp   = errors.New("invalid stack operation")
-	ErrScriptNumOverflow = errors.New("script number overflow")
+	ErrStackUnderflow   = newError(ErrCodeInvalidStackOperation, "stack underflow")
+	ErrStackOverflow    = newError(ErrCodeStackSize, "stack overflow")
+	ErrInvalidStackOp   = newError(ErrCodeInvalidStackOperation, "invalid stack operation")
+	ErrScriptNumOverflow = newError(ErrCodeUnknownError, "script number overflow")
 )
 
 // Stack represents the Bitcoin Script execution stack.
