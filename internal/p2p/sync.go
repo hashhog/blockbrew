@@ -1007,11 +1007,13 @@ func (sm *SyncManager) syncTick(now time.Time) {
 // (HandleHeaders drops other peers' headers), so leaving it there would stall
 // IBD. Core bounds this with m_headers_sync_timeout (net_processing.cpp
 // SendMessages): disconnect the sync peer when another peer could be used,
-// otherwise reset so headers are requested again. Same here: with another
-// connected peer the sync peer is disconnected (no misbehaviour — a slow or
-// confused peer is not malicious) and syncTick starts sync with the next
-// peer; as the only peer it is asked again, so a snapshot backfill riding
-// that connection keeps going. Caller must hold sm.mu.
+// otherwise reset so headers are requested again. Same here: when another
+// connected peer is ahead of the header tip the sync peer is disconnected (no
+// misbehaviour — a slow or confused peer is not malicious) and syncTick
+// starts sync with that peer. Otherwise it is asked again: a peer at or below
+// the tip cannot take over (selectSyncPeer would pick nobody or mark headers
+// synced), and a snapshot backfill riding the connection keeps going.
+// Caller must hold sm.mu.
 func (sm *SyncManager) expireUnconnectingAsksLocked(now time.Time) {
 	for addr, asked := range sm.unconnectingAskedAt {
 		if now.Sub(asked) <= HeadersResponseTime {
@@ -1023,7 +1025,7 @@ func (sm *SyncManager) expireUnconnectingAsksLocked(now time.Time) {
 		if sm.headersSynced || sp == nil || sp.Address() != addr {
 			continue
 		}
-		if sm.hasOtherConnectedPeer(sp) {
+		if sm.hasOtherPeerAheadLocked(sp) {
 			log.Printf("sync: no connecting headers from sync peer %s within %v, disconnecting to sync from another peer",
 				addr, HeadersResponseTime)
 			sp.DisconnectAsync()
@@ -1040,13 +1042,16 @@ func (sm *SyncManager) expireUnconnectingAsksLocked(now time.Time) {
 	}
 }
 
-// hasOtherConnectedPeer reports whether a connected peer other than p exists.
-func (sm *SyncManager) hasOtherConnectedPeer(p *Peer) bool {
+// hasOtherPeerAheadLocked reports whether a connected peer other than p has a
+// start height above the header tip, i.e. one selectSyncPeer would pick.
+// Caller must hold sm.mu.
+func (sm *SyncManager) hasOtherPeerAheadLocked(p *Peer) bool {
 	if sm.peerMgr == nil {
 		return false
 	}
+	tip := sm.headerIndex.BestHeight()
 	for _, q := range sm.peerMgr.ConnectedPeers() {
-		if q != p {
+		if q != p && q.StartHeight() > tip {
 			return true
 		}
 	}
