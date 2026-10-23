@@ -1,7 +1,6 @@
 package consensus
 
-// Script failures through the block-connect verdict path
-// (receipts/blockbrew-gate6-2026-10-04.md deferred item; QUEUES blockbrew 0).
+// Script failures through the block-connect verdict path.
 //
 // Each case plants a coin whose scriptPubKey (or the spending scriptSig)
 // reaches one script-engine failure site, connects a block spending it at the
