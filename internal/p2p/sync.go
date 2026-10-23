@@ -967,21 +967,7 @@ func (sm *SyncManager) syncHandler() {
 	for {
 		select {
 		case <-ticker.C:
-			sm.mu.Lock()
-			synced := sm.headersSynced
-			syncPeer := sm.syncPeer
-			sm.maybeRequestBackfillLocked(nil, false)
-			sm.mu.Unlock()
-
-			if !synced && syncPeer == nil {
-				// Not yet synced — try to start header sync
-				sm.startHeaderSync()
-			} else if synced {
-				// Already synced — send periodic getheaders to discover
-				// new blocks.  This catches blocks missed by inv messages.
-				// Reference: Bitcoin Core SendMessages() periodic header fetch.
-				sm.sendPeriodicGetHeaders()
-			}
+			sm.syncTick(time.Now())
 
 		case <-staleTipTicker.C:
 			sm.checkStaleTip()
@@ -989,6 +975,25 @@ func (sm *SyncManager) syncHandler() {
 		case <-sm.quit:
 			return
 		}
+	}
+}
+
+// syncTick is one SyncRetryInterval pass of the sync loop.
+func (sm *SyncManager) syncTick(now time.Time) {
+	sm.mu.Lock()
+	synced := sm.headersSynced
+	syncPeer := sm.syncPeer
+	sm.maybeRequestBackfillLocked(nil, false)
+	sm.mu.Unlock()
+
+	if !synced && syncPeer == nil {
+		// Not yet synced — try to start header sync
+		sm.startHeaderSync()
+	} else if synced {
+		// Already synced — send periodic getheaders to discover
+		// new blocks.  This catches blocks missed by inv messages.
+		// Reference: Bitcoin Core SendMessages() periodic header fetch.
+		sm.sendPeriodicGetHeaders()
 	}
 }
 
