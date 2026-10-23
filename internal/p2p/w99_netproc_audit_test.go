@@ -209,7 +209,7 @@ func TestW99_G5_PresyncRedownloadPipelinePresent(t *testing.T) {
 	// Verify that SyncManager has the peerHeadersSync map
 	sm := &SyncManager{
 		peerHeadersSync:     make(map[string]*HeadersSyncState),
-		unconnectingHeaders: make(map[string]int),
+		unconnectingAskedAt: make(map[string]time.Time),
 	}
 	if sm.peerHeadersSync == nil {
 		t.Error("G5 FAIL: peerHeadersSync map absent")
@@ -257,17 +257,16 @@ func TestW99_G7_LowWorkHeaderNoBan(t *testing.T) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// G8 — Unconnecting-headers limit = 8 (Core) but blockbrew uses 10
+// G8 — Unconnecting headers are never counted toward a disconnect
 //
-// Core's MAX_NUM_UNCONNECTING_HEADERS_MSGS = 10 (net_processing.cpp constant).
-// blockbrew MaxNumUnconnectingHeadersMsgs = 10 (sync.go:32).  PASS.
-// But Core disconnects when count > MAX (i.e., on the 11th), while blockbrew
-// disconnects when count > MaxNumUnconnectingHeadersMsgs (also 11th). PASS.
+// Core v31 has no MAX_NUM_UNCONNECTING_HEADERS_MSGS: HandleUnconnectingHeaders
+// only re-asks via MaybeSendGetHeaders, one getheaders in flight per peer per
+// HEADERS_RESPONSE_TIME (2 min). blockbrew HeadersResponseTime must match.
 // ─────────────────────────────────────────────────────────────────────────────
 func TestW99_G8_UnconnectingHeadersLimit(t *testing.T) {
-	if MaxNumUnconnectingHeadersMsgs != 10 {
-		t.Errorf("G8: MaxNumUnconnectingHeadersMsgs = %d, want 10 (Core MAX_NUM_UNCONNECTING_HEADERS_MSGS)",
-			MaxNumUnconnectingHeadersMsgs)
+	if HeadersResponseTime != 2*time.Minute {
+		t.Errorf("G8: HeadersResponseTime = %s, want 2m (Core HEADERS_RESPONSE_TIME)",
+			HeadersResponseTime)
 	}
 }
 
