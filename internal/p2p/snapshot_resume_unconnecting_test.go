@@ -310,3 +310,67 @@ func TestUnconnectingReAskUnansweredReleasesSyncPeer(t *testing.T) {
 		t.Fatalf("header tip %d from the new sync peer, want 3", idx.BestHeight())
 	}
 }
+
+// The re-ask timeout only hands the header-sync slot over when another peer
+// could take it: one whose start height is above the header tip. A connected
+// peer that is behind or level with the tip cannot (selectSyncPeer picks
+// nobody, or declares headers synced and starts block download), so
+// disconnecting the only peer ahead would end forward sync — the 940k wedge in
+// a new form. Core drops the headers-sync peer only when another preferred
+// download peer exists; otherwise it keeps the peer and asks again.
+func TestUnconnectingReAskUnansweredKeepsOnlyPeerAhead(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		tip         int
+		otherHeight int32
+	}{
+		{"other at height 0, tip 0", 0, 0},
+		{"other at height 0, tip 3", 3, 0},
+		{"other at tip height 3", 3, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ahead := createMockPeer("10.0.0.7:8333", 100)
+			level := createMockPeer("10.0.0.8:8333", tc.otherHeight)
+			sm, idx, hdrs := unconnectingSetup(t, ahead, level)
+			// Seed the tip directly: a short connecting batch from the sync
+			// peer would itself end initial header sync.
+			for _, h := range hdrs[1 : tc.tip+1] {
+				if _, err := idx.AddHeader(h, true); err != nil {
+					t.Fatalf("seed header: %v", err)
+				}
+			}
+			if idx.BestHeight() != int32(tc.tip) {
+				t.Fatalf("header tip %d, want %d", idx.BestHeight(), tc.tip)
+			}
+			drainBackfillGetHeaders(ahead)
+
+			sm.HandleHeaders(ahead, &MsgHeaders{Headers: []wire.BlockHeader{
+				createTestBlockHeader(wire.Hash256{0xd2}, hdrs[3].Timestamp+600, 1),
+			}})
+			if n := len(forwardGetHeaders(drainBackfillGetHeaders(ahead))); n != 1 {
+				t.Fatalf("%d getheaders for the unconnecting message, want 1", n)
+			}
+
+			sm.syncTick(time.Now().Add(HeadersResponseTime + time.Second))
+			if !ahead.IsConnected() {
+				t.Fatalf("only peer ahead of the tip disconnected on the re-ask timeout while the other peer (height %d) cannot sync us",
+					tc.otherHeight)
+			}
+			if s := ahead.MisbehaviorScore(); s != 0 {
+				t.Fatalf("sync peer scored %d on the re-ask timeout, want 0", s)
+			}
+			if sm.SyncPeer() != ahead {
+				t.Fatalf("sync peer %v after the re-ask timeout, want the peer ahead", sm.SyncPeer())
+			}
+			sm.mu.Lock()
+			synced := sm.headersSynced
+			sm.mu.Unlock()
+			if synced {
+				t.Fatalf("headersSynced set at tip %d while the sync peer is at 100", tc.tip)
+			}
+			if n := len(forwardGetHeaders(drainBackfillGetHeaders(ahead))); n != 1 {
+				t.Fatalf("%d getheaders to the sync peer after the timeout, want 1", n)
+			}
+		})
+	}
+}
