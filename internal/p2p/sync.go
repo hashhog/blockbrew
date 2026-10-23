@@ -22,17 +22,14 @@ const (
 	// MaxHeadersPerRequest is the maximum headers we can receive per request.
 	MaxHeadersPerRequest = 2000
 
-	// MaxNumUnconnectingHeadersMsgs caps how many *successive* unconnecting-
-	// headers messages a peer may send before we disconnect (and ban via
-	// the existing misbehavior pipeline).  Mirrors Bitcoin Core's
-	// MAX_NUM_UNCONNECTING_HEADERS_MSGS in net_processing.cpp.
-	//
-	// Per the 2026-05-06 header-sync DoS audit (Pattern B), blockbrew used
-	// to bake misbehavior(20) + Disconnect() into the very first
-	// ErrOrphanHeader message — five honest unconnecting batches in a
-	// row hit the +100 ban threshold and dropped the peer.  Core tolerates
-	// up to 10 (>1 reorg attempt) before disconnecting.
-	MaxNumUnconnectingHeadersMsgs = 10
+	// HeadersResponseTime is how long a getheaders sent in answer to an
+	// unconnecting headers message is treated as in flight: no second one
+	// goes to the same peer until it connects, comes back empty, or this
+	// expires. Core HEADERS_RESPONSE_TIME (net_processing.cpp,
+	// MaybeSendGetHeaders). Unconnecting headers are never counted or
+	// punished — Core dropped MAX_NUM_UNCONNECTING_HEADERS_MSGS; see
+	// HandleUnconnectingHeaders and p2p_sendheaders.py part 5.
+	HeadersResponseTime = 2 * time.Minute
 
 	// HeaderSyncTimeout is the timeout for receiving headers from a peer.
 	HeaderSyncTimeout = 2 * time.Minute
@@ -694,13 +691,11 @@ type SyncManager struct {
 	// `notfound` reply (BIP-159 peer-served-blocks gate).
 	pruner *storage.Pruner
 
-	// unconnectingHeaders tracks per-peer counters of consecutive
-	// unconnecting-headers messages.  Protected by `mu`.  Mirrors
-	// Bitcoin Core's nUnconnectingHeaders state machine.  The counter
-	// is incremented on every ErrOrphanHeader from the first header
-	// in a batch, reset on the first connecting batch, and triggers
-	// disconnect once it would exceed MaxNumUnconnectingHeadersMsgs.
-	unconnectingHeaders map[string]int
+	// unconnectingAskedAt is, per peer address, when the last
+	// getheaders answering an unconnecting headers message was sent.
+	// Cleared when the peer's headers connect or come back empty.
+	// Protected by `mu`. Core: Peer::m_last_getheaders_timestamp.
+	unconnectingAskedAt map[string]time.Time
 
 	// peerHeadersSync tracks the per-peer HeadersSyncState for the
 	// PRESYNC/REDOWNLOAD pipeline (Bitcoin Core headerssync.cpp, Core 24+).
@@ -887,7 +882,7 @@ func NewSyncManager(config SyncManagerConfig) *SyncManager {
 		pruner:              config.Pruner,
 		mempool:             config.Mempool,
 		txInflight:          make(map[wire.Hash256]time.Time),
-		unconnectingHeaders: make(map[string]int),
+		unconnectingAskedAt: make(map[string]time.Time),
 		peerHeadersSync:     make(map[string]*HeadersSyncState),
 	}
 	// IBD starts true from the moment the sync manager is created; it is
@@ -972,21 +967,7 @@ func (sm *SyncManager) syncHandler() {
 	for {
 		select {
 		case <-ticker.C:
-			sm.mu.Lock()
-			synced := sm.headersSynced
-			syncPeer := sm.syncPeer
-			sm.maybeRequestBackfillLocked(nil, false)
-			sm.mu.Unlock()
-
-			if !synced && syncPeer == nil {
-				// Not yet synced — try to start header sync
-				sm.startHeaderSync()
-			} else if synced {
-				// Already synced — send periodic getheaders to discover
-				// new blocks.  This catches blocks missed by inv messages.
-				// Reference: Bitcoin Core SendMessages() periodic header fetch.
-				sm.sendPeriodicGetHeaders()
-			}
+			sm.syncTick(time.Now())
 
 		case <-staleTipTicker.C:
 			sm.checkStaleTip()
@@ -995,6 +976,100 @@ func (sm *SyncManager) syncHandler() {
 			return
 		}
 	}
+}
+
+// syncTick is one SyncRetryInterval pass of the sync loop.
+func (sm *SyncManager) syncTick(now time.Time) {
+	sm.mu.Lock()
+	sm.expireUnconnectingAsksLocked(now)
+	synced := sm.headersSynced
+	syncPeer := sm.syncPeer
+	sm.maybeRequestBackfillLocked(nil, false)
+	sm.mu.Unlock()
+
+	if !synced && syncPeer == nil {
+		// Not yet synced — try to start header sync
+		sm.startHeaderSync()
+	} else if synced {
+		// Already synced — send periodic getheaders to discover
+		// new blocks.  This catches blocks missed by inv messages.
+		// Reference: Bitcoin Core SendMessages() periodic header fetch.
+		sm.sendPeriodicGetHeaders()
+	}
+}
+
+// expireUnconnectingAsksLocked handles getheaders sent for an unconnecting
+// headers message that got no connecting (or empty) reply within
+// HeadersResponseTime — the peer never answered, or answered with more
+// unconnecting headers, which the in-flight throttle does not re-ask for.
+//
+// During initial sync the sync peer holds the only header-sync slot
+// (HandleHeaders drops other peers' headers), so leaving it there would stall
+// IBD. Core bounds this with m_headers_sync_timeout (net_processing.cpp
+// SendMessages): disconnect the sync peer when another peer could be used,
+// otherwise reset so headers are requested again. Same here: when another
+// connected peer is ahead of the header tip the sync peer is disconnected (no
+// misbehaviour — a slow or confused peer is not malicious) and syncTick
+// starts sync with that peer. Otherwise it is asked again: a peer at or below
+// the tip cannot take over (selectSyncPeer would pick nobody or mark headers
+// synced), and a snapshot backfill riding the connection keeps going.
+// Caller must hold sm.mu.
+func (sm *SyncManager) expireUnconnectingAsksLocked(now time.Time) {
+	for addr, asked := range sm.unconnectingAskedAt {
+		if now.Sub(asked) <= HeadersResponseTime {
+			continue
+		}
+		delete(sm.unconnectingAskedAt, addr)
+		// At tip the periodic getheaders already re-asks every peer.
+		sp := sm.syncPeer
+		if sm.headersSynced || sp == nil || sp.Address() != addr {
+			continue
+		}
+		if sm.hasOtherPeerAheadLocked(sp) {
+			log.Printf("sync: no connecting headers from sync peer %s within %v, disconnecting to sync from another peer",
+				addr, HeadersResponseTime)
+			sp.DisconnectAsync()
+			sm.syncPeer = nil
+			continue
+		}
+		if len(sm.peerHeadersSync) > 0 {
+			continue
+		}
+		log.Printf("sync: no connecting headers from sync peer %s within %v, re-requesting headers",
+			addr, HeadersResponseTime)
+		sm.sendGetHeaders(sp, sm.headerIndex.BestTip().BuildLocator())
+		sm.unconnectingAskedAt[addr] = now
+	}
+}
+
+// hasOtherPeerAheadLocked reports whether a connected peer other than p has a
+// start height above the header tip, i.e. one selectSyncPeer would pick.
+// Caller must hold sm.mu.
+func (sm *SyncManager) hasOtherPeerAheadLocked(p *Peer) bool {
+	if sm.peerMgr == nil {
+		return false
+	}
+	tip := sm.headerIndex.BestHeight()
+	for _, q := range sm.peerMgr.ConnectedPeers() {
+		if q != p && q.StartHeight() > tip {
+			return true
+		}
+	}
+	return false
+}
+
+// checkHeadersPoW is Core's CheckHeadersPoW (net_processing.cpp): every
+// header meets its own nBits target and each builds on the one before it.
+func checkHeadersPoW(headers []wire.BlockHeader, powLimit *big.Int) error {
+	for i := range headers {
+		if err := consensus.CheckProofOfWork(headers[i].BlockHash(), headers[i].Bits, powLimit); err != nil {
+			return fmt.Errorf("header %d: %w", i, err)
+		}
+		if i > 0 && headers[i].PrevBlock != headers[i-1].BlockHash() {
+			return fmt.Errorf("non-continuous headers at index %d", i)
+		}
+	}
+	return nil
 }
 
 // startHeaderSync begins downloading headers from the best peer.
@@ -1463,18 +1538,22 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 			}
 
 			// Special case: ErrOrphanHeader on the FIRST header of a batch
-			// is the Core "headers don't connect" path.  Bitcoin Core
-			// tolerates up to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10
-			// successive unconnecting messages from a peer before
-			// disconnecting (net_processing.cpp::ProcessHeadersMessage).
-			// Pre-fix, blockbrew immediately Misbehaving(20)+Disconnect on
-			// the first orphan, which is stricter than Core and drops
-			// honest peers caught in a transient reorg.  See
-			// CORE-PARITY-AUDIT/_header-sync-dos-cross-impl-audit-2026-05-06-part1.md
-			// (Pattern B).
+			// is the Core "headers don't connect" path
+			// (net_processing.cpp HandleUnconnectingHeaders): possibly a
+			// BIP 130 announcement, so never a misbehaviour. Re-ask with
+			// a getheaders, at most one in flight per peer
+			// (MaybeSendGetHeaders, HeadersResponseTime).
+			//
+			// This used to count to MAX_NUM_UNCONNECTING_HEADERS_MSGS=10,
+			// re-ask on every message, and disconnect on the 11th. A peer
+			// whose header chain does not connect at its tip answered each
+			// re-ask with the same unconnecting reply, so the count ran out
+			// in milliseconds and the peer was dropped right after every
+			// reconnect. On a snapshot resume that starved the pre-base
+			// header backfill riding the same connection, and block
+			// connection — held until the backfill finishes — sat at
+			// base+1 for ~43 min (940k R4 arms, 2026-10-05).
 			if err == consensus.ErrOrphanHeader && i == 0 {
-				sm.unconnectingHeaders[addr]++
-				count := sm.unconnectingHeaders[addr]
 				// Flush any earlier-good headers before bailing.
 				if sm.chainDB != nil && len(pendingHeaders) > 0 {
 					if ferr := sm.chainDB.StoreBlockHeadersBatch(pendingHeaders); ferr != nil {
@@ -1482,24 +1561,27 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 							len(pendingHeaders), ferr)
 					}
 				}
-				if count > MaxNumUnconnectingHeadersMsgs {
-					log.Printf("sync: peer %s exceeded MAX_NUM_UNCONNECTING_HEADERS_MSGS=%d, disconnecting",
-						addr, MaxNumUnconnectingHeadersMsgs)
-					peer.Misbehaving(ScoreHeadersDontConnect,
-						fmt.Sprintf("too many unconnecting headers (count=%d)", count))
-					// ASYNC: this runs on the peer's own readHandler goroutine
-					// and holds sm.mu — joining here waits for itself forever.
+				// Only valid-PoW, continuous headers may be a BIP 130
+				// announcement. Core runs CheckHeadersPoW and Misbehaving
+				// before HandleUnconnectingHeaders; without this a peer could
+				// flood bad-PoW or non-linking headers for the life of the
+				// connection, since an unconnecting first header returns
+				// from AddHeader before its PoW is checked.
+				if perr := checkHeadersPoW(headers, sm.chainParams.PowLimit); perr != nil {
+					log.Printf("sync: bad unconnecting headers from %s: %v", addr, perr)
+					peer.Misbehaving(ScoreInvalidBlock, fmt.Sprintf("invalid header: %v", perr))
+					// ASYNC: peer goroutine + sm.mu held. See Peer.Disconnect.
 					peer.DisconnectAsync()
-					delete(sm.unconnectingHeaders, addr)
-					sm.syncPeer = nil
-					go sm.startHeaderSync()
+					delete(sm.unconnectingAskedAt, addr)
+					if sm.syncPeer == peer {
+						sm.syncPeer = nil
+						go sm.startHeaderSync()
+					}
 					return
 				}
-				// Under threshold: do NOT misbehave / disconnect.  Re-issue
-				// getheaders so the peer can find a common ancestor (Core's
-				// FindForkInGlobalIndex behavior).
-				log.Printf("sync: orphan header from %s (unconnecting #%d/%d), re-requesting headers",
-					addr, count, MaxNumUnconnectingHeadersMsgs)
+				if last, ok := sm.unconnectingAskedAt[addr]; ok && time.Since(last) <= HeadersResponseTime {
+					return
+				}
 				// Do NOT send a tip-rooted getheaders while a headerssync pipeline
 				// is active for any peer: it would re-enter the live HeadersSyncState
 				// out of order and trip the continuity check (false "non-continuous"
@@ -1511,8 +1593,10 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 				if len(sm.peerHeadersSync) > 0 {
 					return
 				}
+				log.Printf("sync: orphan header from %s, re-requesting headers", addr)
 				locator := sm.headerIndex.BestTip().BuildLocator()
 				sm.sendGetHeaders(peer, locator)
+				sm.unconnectingAskedAt[addr] = time.Now()
 				return
 			}
 
@@ -1602,14 +1686,14 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 		}
 	}
 
+	// Every header here connected (or the message was empty): treat it as
+	// the answer to any outstanding getheaders (Core clears
+	// m_last_getheaders_timestamp on connecting and on empty headers).
+	delete(sm.unconnectingAskedAt, addr)
+
 	newHeight := sm.headerIndex.BestHeight()
 	if headersAdded > 0 {
 		log.Printf("sync: added %d headers (%d -> %d)", headersAdded, startHeight, newHeight)
-		// Core parity: reset the unconnecting-headers counter on any
-		// successfully-connecting batch from this peer.  Mirrors
-		// nUnconnectingHeaders = 0 in the success path of
-		// net_processing.cpp::ProcessHeadersMessage.
-		delete(sm.unconnectingHeaders, addr)
 	}
 
 	// W17 chainmgr-startup recovery: if the chain manager is still holding
@@ -1727,6 +1811,7 @@ func (sm *SyncManager) HandlePeerDisconnected(peer *Peer) {
 	// Clean up any PRESYNC/REDOWNLOAD state for this peer.
 	addr := peer.Address()
 	delete(sm.peerHeadersSync, addr)
+	delete(sm.unconnectingAskedAt, addr)
 
 	// If our sync peer disconnected, find a new one
 	if peer == sm.syncPeer {
