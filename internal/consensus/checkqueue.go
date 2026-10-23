@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"errors"
 	"fmt"
 	"runtime"
 	"sync"
@@ -273,9 +274,14 @@ func (q *ScriptCheckQueue) processJobs(jobs []ScriptCheckJob) {
 	}
 }
 
+// errInvalidScriptCheck is a job no block can produce (CollectScriptChecks
+// fills every field). It carries no Core code, so scriptVerdict makes it a
+// system fault.
+var errInvalidScriptCheck = errors.New("invalid script check")
+
 func (q *ScriptCheckQueue) runOne(job *ScriptCheckJob) {
 	if job.PrevOut == nil || job.Tx == nil || job.InputIdx < 0 || job.InputIdx >= len(job.Tx.TxIn) {
-		job.err = fmt.Errorf("invalid script check")
+		job.err = errInvalidScriptCheck
 		return
 	}
 	if job.Cache != nil {

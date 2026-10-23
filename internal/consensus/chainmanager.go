@@ -1980,16 +1980,16 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			jobs, err := CollectScriptChecks(block, scriptUTXOView, flags, cm.sigCache)
 			if err != nil {
 				rollbackUTXOs()
-				return blockVerdict(hash, fmt.Errorf("script validation failed: %w", err))
+				return scriptVerdict(hash, fmt.Errorf("script validation failed: %w", err))
 			}
 			if res := cm.scriptCheckQueue.Run(jobs); !res.OK {
 				rollbackUTXOs()
-				return blockVerdict(hash, fmt.Errorf("script validation failed: %w", res.FirstFailErr))
+				return scriptVerdict(hash, fmt.Errorf("script validation failed: %w", res.FirstFailErr))
 			}
 		} else if cm.parallelScripts {
 			if err := ParallelScriptValidationCached(block, scriptUTXOView, flags, cm.sigCache); err != nil {
 				rollbackUTXOs()
-				return blockVerdict(hash, fmt.Errorf("script validation failed: %w", err))
+				return scriptVerdict(hash, fmt.Errorf("script validation failed: %w", err))
 			}
 		} else {
 			for i, tx := range block.Transactions {
@@ -1998,7 +1998,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				}
 				if err := ValidateTransactionScripts(tx, scriptUTXOView, flags); err != nil {
 					rollbackUTXOs()
-					return blockVerdict(hash, fmt.Errorf("tx %d script validation failed: %w", i, err))
+					return scriptVerdict(hash, fmt.Errorf("tx %d script validation failed: %w", i, err))
 				}
 			}
 		}
