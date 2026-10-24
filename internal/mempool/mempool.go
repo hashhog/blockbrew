@@ -631,6 +631,14 @@ type Mempool struct {
 	// PrioritiseTransaction so the same shape is restored. See
 	// persist.go::Dump / Load and the FIX-76 tests for the round-trip.
 	mapDeltas map[wire.Hash256]int64
+
+	// unbroadcast holds txids of locally submitted transactions (RPC
+	// sendrawtransaction) that no peer has requested yet. Mirrors Core's
+	// CTxMemPool::m_unbroadcast_txids: added by AddUnbroadcastTx, cleared
+	// when a peer getdata fetches the tx (net_processing.cpp ProcessGetData)
+	// or when the tx leaves the pool (txmempool.cpp removeUnchecked).
+	// Persisted in the mempool.dat tail.
+	unbroadcast map[wire.Hash256]struct{}
 }
 
 // New creates a new mempool.
@@ -671,6 +679,7 @@ func New(config Config, utxoSet consensus.UTXOView) *Mempool {
 		clusters:             NewClusterManager(),
 		lastRollingFeeUpdate: time.Now().Unix(),
 		mapDeltas:            make(map[wire.Hash256]int64),
+		unbroadcast:          make(map[wire.Hash256]struct{}),
 	}
 }
 
@@ -2235,6 +2244,7 @@ func (mp *Mempool) removeSingleTxLocked(txHash wire.Hash256, reason MemPoolRemov
 
 	// Remove from pool
 	delete(mp.pool, txHash)
+	delete(mp.unbroadcast, txHash)
 
 	// Notify fee estimator (and any other subscriber) that this tx has left
 	// the mempool.  Called after the pool delete so the callback sees a

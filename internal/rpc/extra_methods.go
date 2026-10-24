@@ -190,7 +190,7 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 		Depends:           depends,
 		SpentBy:           spentBy,
 		BIP125Replaceable: replaceable,
-		Unbroadcast:       false, // not tracked yet; Core pool.IsUnbroadcastTx()
+		Unbroadcast:       s.mempool != nil && s.mempool.IsUnbroadcastTx(entry.TxHash),
 	}
 }
 
@@ -397,7 +397,15 @@ func (s *Server) handleImportMempool(params json.RawMessage) (interface{}, *RPCE
 	if _, err := os.Stat(path); err != nil {
 		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to import mempool file, see debug log for details."}
 	}
-	res, err := s.mempool.LoadFile(path, mempool.LoadOptions{MaxAge: 14 * 24 * time.Hour})
+	// options.apply_unbroadcast_set (default false) re-marks the file's
+	// unbroadcast txids, as Core's importmempool does.
+	apply := false
+	if len(args) > 1 {
+		if opts, ok := args[1].(map[string]interface{}); ok {
+			apply, _ = opts["apply_unbroadcast_set"].(bool)
+		}
+	}
+	res, err := s.mempool.LoadFile(path, mempool.LoadOptions{MaxAge: 14 * 24 * time.Hour, ApplyUnbroadcastSet: apply})
 	if err != nil || res == nil {
 		return nil, &RPCError{Code: RPCErrMisc, Message: "Unable to import mempool file, see debug log for details."}
 	}

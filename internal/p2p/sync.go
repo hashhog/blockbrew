@@ -2498,6 +2498,11 @@ func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
 			// MSG_TX (no witness flag) is answered without witness data
 			// (Core: inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS).
 			peer.SendMessage(&MsgTx{Tx: tx, NoWitness: inv.Type == InvTypeTx})
+			// A peer has now fetched the tx: it is no longer unbroadcast
+			// (Core ProcessGetData -> m_mempool.RemoveUnbroadcastTx).
+			if u, ok := sm.mempool.(interface{ RemoveUnbroadcastTx(wire.Hash256) }); ok {
+				u.RemoveUnbroadcastTx(tx.TxHash())
+			}
 		}
 	}
 	if len(notFound) > 0 {

@@ -1591,7 +1591,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	// 6c. Reload persisted mempool. Match Bitcoin Core's
 	//     DEFAULT_MEMPOOL_EXPIRY = 336 hours (2 weeks).
-	if res, err := mp.Load(cfg.DataDir, mempool.LoadOptions{MaxAge: 14 * 24 * time.Hour}); err != nil {
+	if res, err := mp.Load(cfg.DataDir, mempool.LoadOptions{MaxAge: 14 * 24 * time.Hour, ApplyUnbroadcastSet: true}); err != nil {
 		log.Printf("Warning: mempool.dat reload failed: %v", err)
 	} else if res != nil {
 		log.Printf("Reloaded mempool.dat: %d read, %d accepted, %d failed, %d expired",
