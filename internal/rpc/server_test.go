@@ -490,11 +490,14 @@ func TestGetRawMempool(t *testing.T) {
 
 // TestMempoolEntryBIP125Replaceable asserts that the W120 BUG-1 / FIX-68
 // `bip125-replaceable` JSON field on `MempoolEntry` is wired through
-// `mempoolEntryFromTxEntry` and computes from the mempool's fullrbf state
-// plus the tx's signaling behaviour.
+// `mempoolEntryFromTxEntry` and reports BIP-125 opt-in SIGNALING only.
+// Core's entryToJSON takes the value from IsRBFOptIn, which looks at the
+// tx's and its in-mempool ancestors' nSequence and never at the full-RBF
+// policy, so a non-signaling tx is false even though full RBF would let a
+// conflict replace it (Core 31 has no -mempoolfullrbf switch at all).
 //
-// Reference: bitcoin-core/src/rpc/mempool.cpp::MempoolEntryToJSON;
-// BIP-125 §"Signaling implementation"; Core v28+ DEFAULT_MEMPOOL_FULL_RBF.
+// Reference: bitcoin-core/src/rpc/mempool.cpp::entryToJSON;
+// src/policy/rbf.cpp::IsRBFOptIn; BIP-125 §"Signaling implementation".
 func TestMempoolEntryBIP125Replaceable(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -509,10 +512,10 @@ func TestMempoolEntryBIP125Replaceable(t *testing.T) {
 			want:           true,
 		},
 		{
-			name:           "non_signaling_under_fullrbf_true_yes",
+			name:           "non_signaling_under_fullrbf_true_no",
 			mempoolFullRBF: true,
 			txSequence:     0xFFFFFFFE, // anti-fee-snipe, no RBF intent
-			want:           true,
+			want:           false,
 		},
 		{
 			name:           "non_signaling_under_fullrbf_false_no",
@@ -533,10 +536,10 @@ func TestMempoolEntryBIP125Replaceable(t *testing.T) {
 			want:           false,
 		},
 		{
-			name:           "all_final_under_fullrbf_true_yes",
+			name:           "all_final_under_fullrbf_true_no",
 			mempoolFullRBF: true,
 			txSequence:     0xFFFFFFFF,
-			want:           true,
+			want:           false,
 		},
 	}
 	for _, tc := range cases {

@@ -520,14 +520,16 @@ func TestW120_G18_FullRBFFlag_Wired(t *testing.T) {
 			t.Errorf("not-in-mempool tx: got %q, want %q", got, "unknown")
 		}
 
-		// fullrbf=true: every in-mempool tx (regardless of nSeq) is "yes".
+		// fullrbf=true: the answer is still the tx's signaling. Core's
+		// IsRBFOptIn (policy/rbf.cpp) never consults the full-RBF policy;
+		// full RBF changes what may be replaced, not what signals.
 		mp2 := newTestMempool(utxoSet)
 		mp2.mu.Lock()
 		addPoolEntry(mp2, &TxEntry{TxHash: finalHash, Tx: finalTx, Fee: 1000, Size: 150})
 		mp2.mu.Unlock()
-		if got := mp2.SignalsBIP125Replaceable(finalHash); got != "yes" {
+		if got := mp2.SignalsBIP125Replaceable(finalHash); got != "no" {
 			t.Errorf("non-signaling tx under fullrbf=true: got %q, want %q "+
-				"(fullrbf bypasses Rule 1 — every conflict replaceable)", got, "yes")
+				"(Core IsRBFOptIn reports signaling, not full-RBF policy)", got, "no")
 		}
 	})
 }
