@@ -145,8 +145,20 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 	// FIX-72 this field always equalled Fee (no prioritisetransaction
 	// support, W120 BUG-10).
 	modifiedFee := entry.Fee
+	// ancestor*/descendant* and fees.ancestor/descendant come from a walk of
+	// the whole in-mempool ancestor/descendant set, self included, summing
+	// modified fees: Core's CalculateAncestorData/CalculateDescendantData.
+	anc := mempool.RelativesData{Count: 1, Size: entry.Size, ModifiedFee: entry.Fee}
+	desc := anc
 	if s.mempool != nil {
 		modifiedFee = s.mempool.GetModifiedFee(entry)
+		anc.ModifiedFee, desc.ModifiedFee = modifiedFee, modifiedFee
+		if d, ok := s.mempool.CalculateAncestorData(entry.TxHash); ok {
+			anc = d
+		}
+		if d, ok := s.mempool.CalculateDescendantData(entry.TxHash); ok {
+			desc = d
+		}
 	}
 	// weight is Core's GetTxWeight, the BIP-141 weight; vsize*4 rounds a
 	// segwit tx's weight up to the next multiple of 4.
@@ -155,16 +167,16 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 		Weight:          consensus.CalcTxWeight(entry.Tx),
 		Time:            entry.Time.Unix(),
 		Height:          entry.Height,
-		DescendantCount: len(entry.SpentBy) + 1,
-		DescendantSize:  entry.DescendantSize,
-		AncestorCount:   len(entry.Depends) + 1,
-		AncestorSize:    entry.AncestorSize,
+		DescendantCount: desc.Count,
+		DescendantSize:  desc.Size,
+		AncestorCount:   anc.Count,
+		AncestorSize:    anc.Size,
 		WTxID:           entry.Tx.WTxHash().String(),
 		Fees: MempoolEntryFees{
 			Base:       float64(entry.Fee) / satoshiPerBitcoin,
 			Modified:   float64(modifiedFee) / satoshiPerBitcoin,
-			Ancestor:   float64(entry.AncestorFee) / satoshiPerBitcoin,
-			Descendant: float64(entry.DescendantFee) / satoshiPerBitcoin,
+			Ancestor:   float64(anc.ModifiedFee) / satoshiPerBitcoin,
+			Descendant: float64(desc.ModifiedFee) / satoshiPerBitcoin,
 		},
 		Depends:           depends,
 		SpentBy:           spentBy,

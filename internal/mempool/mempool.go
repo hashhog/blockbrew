@@ -2298,6 +2298,65 @@ func (mp *Mempool) GetDescendants(txHash wire.Hash256) []wire.Hash256 {
 	return mp.collectDescendantsLocked(txHash, visited)
 }
 
+// RelativesData is the count, total vsize and total modified fee of a set
+// of mempool transactions. Returned by CalculateAncestorData and
+// CalculateDescendantData.
+type RelativesData struct {
+	Count       int
+	Size        int64
+	ModifiedFee int64
+}
+
+// CalculateAncestorData returns the count, vsize and modified fee of the
+// transaction plus every in-mempool ancestor, each counted once. Mirrors
+// Core's CTxMemPool::CalculateAncestorData (txmempool.cpp), which entryToJSON
+// uses for ancestorcount / ancestorsize / fees.ancestor. ok is false when
+// txHash is not in the pool.
+//
+// This walks the graph at call time instead of reading the TxEntry's
+// AncestorFee/AncestorSize fields: those hold raw fees and are only as good
+// as the incremental updates at admission.
+func (mp *Mempool) CalculateAncestorData(txHash wire.Hash256) (RelativesData, bool) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.relativesDataLocked(txHash, mp.collectAncestorsLocked)
+}
+
+// CalculateDescendantData is CalculateAncestorData for the descendant set.
+// Mirrors Core's CTxMemPool::CalculateDescendantData.
+func (mp *Mempool) CalculateDescendantData(txHash wire.Hash256) (RelativesData, bool) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.relativesDataLocked(txHash, mp.collectDescendantsLocked)
+}
+
+// relativesDataLocked sums txHash and the set collect returns. collect may
+// return a hash more than once (a diamond, or a parent spent twice), so the
+// set is de-duplicated first. Must be called with mu held.
+func (mp *Mempool) relativesDataLocked(
+	txHash wire.Hash256,
+	collect func(wire.Hash256, map[wire.Hash256]bool) []wire.Hash256,
+) (RelativesData, bool) {
+	if _, ok := mp.pool[txHash]; !ok {
+		return RelativesData{}, false
+	}
+	set := map[wire.Hash256]bool{txHash: true}
+	for _, h := range collect(txHash, make(map[wire.Hash256]bool)) {
+		set[h] = true
+	}
+	var d RelativesData
+	for h := range set {
+		e, ok := mp.pool[h]
+		if !ok {
+			continue
+		}
+		d.Count++
+		d.Size += e.Size
+		d.ModifiedFee = saturatingAddInt64(d.ModifiedFee, mp.getModifiedFeeLocked(e))
+	}
+	return d, true
+}
+
 // HasTransaction returns true if the transaction is in the mempool.
 func (mp *Mempool) HasTransaction(txHash wire.Hash256) bool {
 	mp.mu.RLock()
