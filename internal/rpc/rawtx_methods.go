@@ -1411,8 +1411,10 @@ func (s *Server) testMempoolAcceptPackage(rawTxsArg []interface{}, maxFeeRate fl
 		if err != nil {
 			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %s Make sure the tx has at least one input.", rawTxHex)}
 		}
-		tx := &wire.MsgTx{}
-		if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		// Core's DecodeHexTx, as single-tx testmempoolaccept: trailing
+		// bytes fail the decode and the witness/legacy tie-break is the same.
+		tx, err := decodeRawTxBytes(txBytes, true, true)
+		if err != nil {
 			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %s Make sure the tx has at least one input.", rawTxHex)}
 		}
 		txns = append(txns, tx)

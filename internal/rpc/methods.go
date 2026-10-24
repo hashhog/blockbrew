@@ -1269,8 +1269,10 @@ func (s *Server) handleSubmitPackage(params json.RawMessage) (interface{}, *RPCE
 			}
 		}
 
-		tx := &wire.MsgTx{}
-		if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		// Core's DecodeHexTx, as sendrawtransaction: trailing bytes fail
+		// the decode and the witness/legacy tie-break is the same.
+		tx, err := decodeRawTxBytes(txBytes, true, true)
+		if err != nil {
 			return nil, &RPCError{
 				Code:    RPCErrDeserialization,
 				Message: fmt.Sprintf("Transaction %d: decode failed: %v", i, err),
