@@ -148,9 +148,11 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 	if s.mempool != nil {
 		modifiedFee = s.mempool.GetModifiedFee(entry)
 	}
+	// weight is Core's GetTxWeight, the BIP-141 weight; vsize*4 rounds a
+	// segwit tx's weight up to the next multiple of 4.
 	return MempoolEntry{
 		VSize:           entry.Size,
-		Weight:          entry.Size * 4,
+		Weight:          consensus.CalcTxWeight(entry.Tx),
 		Time:            entry.Time.Unix(),
 		Height:          entry.Height,
 		DescendantCount: len(entry.SpentBy) + 1,
