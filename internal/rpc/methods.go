@@ -1365,7 +1365,7 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		Bytes:      s.mempool.TotalSize(),
 		Usage:      s.mempool.TotalSize(), // Simplified: actual usage would include overhead
 		TotalFee:   totalFee,
-		MaxMempool: 300_000_000, // 300 MB default
+		MaxMempool: s.mempool.MaxSize(),
 		// Fee fields READ the live mempool policy so display == policy (no
 		// hardcoded drift). Mirrors Core rpc/mempool.cpp:1054-1056:
 		//   mempoolminfee  = max(rolling-eviction floor, minrelaytxfee)

@@ -864,6 +864,12 @@ func (mp *Mempool) FullRBF() bool {
 	return mp.config.MempoolFullRBF
 }
 
+// MaxSize returns the configured mempool size limit in bytes (-maxmempool).
+// Lock-free read on an immutable config field.
+func (mp *Mempool) MaxSize() int64 {
+	return mp.config.MaxSize
+}
+
 // SetChainHeight updates the chain height (called when blocks are connected/disconnected).
 func (mp *Mempool) SetChainHeight(height int32) {
 	mp.mu.Lock()
