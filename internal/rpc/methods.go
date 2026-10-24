@@ -273,7 +273,15 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 
 	verbosity := 1 // Default verbosity
 	if len(args) >= 2 {
-		if v, ok := args[1].(float64); ok {
+		switch v := args[1].(type) {
+		case bool:
+			// Core ParseVerbosity(allow_bool=true): false=0 (hex), true=1.
+			if v {
+				verbosity = 1
+			} else {
+				verbosity = 0
+			}
+		case float64:
 			// Conversion before the block lookup: this answered -5
 			// "Block not found" for a value Core refuses with -1.
 			n, rpcErr := coreGetIntArg(v)
@@ -318,7 +326,7 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 	}
 
 	// Verbosity 0: return hex-encoded block
-	if verbosity == 0 {
+	if verbosity <= 0 {
 		var buf bytes.Buffer
 		if err := block.Serialize(&buf); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to serialize block"}
@@ -393,7 +401,7 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 			if blockUndo != nil && i > 0 && i-1 < len(blockUndo.TxUndos) {
 				txUndo = &blockUndo.TxUndos[i-1]
 			}
-			txList = append(txList, buildGetBlockTxJSON(tx, i == 0, txUndo, s.getNetwork()))
+			txList = append(txList, buildGetBlockTxJSON(tx, i == 0, txUndo, verbosity >= 3, s.getNetwork()))
 		}
 	}
 
