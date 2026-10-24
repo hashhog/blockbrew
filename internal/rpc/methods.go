@@ -2645,6 +2645,16 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 		if err := s.chainDB.StoreBlock(hash, block); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to store block: %v", err)}
 		}
+		// The body is on disk: record it on the index node, as Core's
+		// AcceptBlock does via ReceivedBlockTransactions (BLOCK_HAVE_DATA)
+		// right after WriteBlock and before ActivateBestChain. Without it a
+		// lighter side-branch block stayed "header only" in the index, so the
+		// already-have check above (Core's fAlreadyHave) missed on a resubmit
+		// and answered "inconclusive" again where Core answers "duplicate".
+		s.headerIndex.MarkDataStored(hash)
+		if s.chainMgr != nil {
+			s.chainMgr.GetHeaderIndex().MarkDataStored(hash)
+		}
 	}
 
 	// Add header to index before connecting (ignore duplicate — headers may
