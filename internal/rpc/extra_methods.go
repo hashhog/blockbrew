@@ -111,12 +111,21 @@ func (s *Server) handleGetTxOut(params json.RawMessage) (interface{}, *RPCError)
 
 // mempoolEntryFromTxEntry builds an RPC MempoolEntry from a mempool.TxEntry.
 func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
-	depends := make([]string, len(entry.Depends))
-	for i, d := range entry.Depends {
+	// depends: each in-mempool parent once, hex order (Core's
+	// std::set<std::string>). spentby: each child once, Core txid order
+	// (GetChildren). TxEntry.Depends/SpentBy hold one hash per spent output
+	// in admission order.
+	parents, children := entry.Depends, entry.SpentBy
+	if s.mempool != nil && s.mempool.HasTransaction(entry.TxHash) {
+		parents = s.mempool.GetParents(entry.TxHash)
+		children = s.mempool.GetChildren(entry.TxHash)
+	}
+	depends := make([]string, len(parents))
+	for i, d := range parents {
 		depends[i] = d.String()
 	}
-	spentBy := make([]string, len(entry.SpentBy))
-	for i, sb := range entry.SpentBy {
+	spentBy := make([]string, len(children))
+	for i, sb := range children {
 		spentBy[i] = sb.String()
 	}
 	// bip125-replaceable is Core's IsRBFOptIn (policy/rbf.cpp): true iff

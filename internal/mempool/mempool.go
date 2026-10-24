@@ -2298,6 +2298,52 @@ func (mp *Mempool) GetDescendants(txHash wire.Hash256) []wire.Hash256 {
 	return mp.collectDescendantsLocked(txHash, visited)
 }
 
+// GetChildren returns the in-mempool transactions that spend an output of
+// txHash, each once, sorted by txid the way Core's CTxMemPool::GetChildren
+// does (CompareIteratorByHash: uint256 operator<, a memcmp of the internal
+// little-endian bytes, which is not the order of the hex strings). This is
+// what entryToJSON lists as spentby. nil when txHash is not in the pool.
+func (mp *Mempool) GetChildren(txHash wire.Hash256) []wire.Hash256 {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	entry, ok := mp.pool[txHash]
+	if !ok {
+		return nil
+	}
+	return uniqueSortedHashes(entry.SpentBy, func(a, b wire.Hash256) bool {
+		return bytes.Compare(a[:], b[:]) < 0
+	})
+}
+
+// GetParents returns the in-mempool transactions txHash spends from, each
+// once, sorted by their hex txid: entryToJSON collects depends into a
+// std::set<std::string>. nil when txHash is not in the pool.
+func (mp *Mempool) GetParents(txHash wire.Hash256) []wire.Hash256 {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	entry, ok := mp.pool[txHash]
+	if !ok {
+		return nil
+	}
+	return uniqueSortedHashes(entry.Depends, func(a, b wire.Hash256) bool {
+		return a.String() < b.String()
+	})
+}
+
+// uniqueSortedHashes returns a sorted copy of hs without duplicates.
+func uniqueSortedHashes(hs []wire.Hash256, less func(a, b wire.Hash256) bool) []wire.Hash256 {
+	seen := make(map[wire.Hash256]bool, len(hs))
+	out := make([]wire.Hash256, 0, len(hs))
+	for _, h := range hs {
+		if !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return less(out[i], out[j]) })
+	return out
+}
+
 // RelativesData is the count, total vsize and total modified fee of a set
 // of mempool transactions. Returned by CalculateAncestorData and
 // CalculateDescendantData.
