@@ -1846,9 +1846,10 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		result, err := mp.AcceptPackage(msg.Txs)
 		if err != nil {
 			log.Printf("[mempool] Rejected pkgtxns from %s: %v", peer.Address(), err)
-			return
 		}
 		// Relay each tx that was newly accepted (skip already-in / failed).
+		// A member valid on its own enters the mempool even when the rest of
+		// the package fails (Core AcceptPackage), so this runs on error too.
 		if result == nil {
 			return
 		}

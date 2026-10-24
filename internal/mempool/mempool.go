@@ -523,6 +523,11 @@ type PackageResult struct {
 	// PackageError is a package-level error, if any.
 	PackageError error
 
+	// PackageMsg is Core's submitpackage package_msg for a failed package
+	// ("transaction failed", "too-large-cluster", "TRUC-violation, ..."),
+	// empty when the failure has no Core token here.
+	PackageMsg string
+
 	// TxResults contains per-transaction results.
 	TxResults map[wire.Hash256]*TxAcceptResult
 
@@ -557,6 +562,14 @@ type TxAcceptResult struct {
 	// For package transactions, this is the package aggregate feerate.
 	EffectiveFeerate float64
 
+	// EffectiveFee / EffectiveVSize are the fee and vsize EffectiveFeerate is
+	// computed from (this transaction's own, or its subpackage's), kept as
+	// integers so callers can report Core's truncated sat/kvB. Zero for a
+	// transaction that was already in the mempool (Core reports no effective
+	// feerate for it).
+	EffectiveFee   int64
+	EffectiveVSize int64
+
 	// EffectiveIncludes lists wtxids included in the effective feerate calculation.
 	EffectiveIncludes []wire.Hash256
 }
@@ -578,6 +591,13 @@ type Mempool struct {
 	disconnectPool  [][]*wire.MsgTx
 	disconnectBytes int64 // weight-based size of disconnectPool, see MaxDisconnectedTxPoolBytes
 	clusters    *ClusterManager               // Cluster-based mempool structure
+
+	// pkgView holds the package members validated so far while a package is
+	// being evaluated before anything is added (Core
+	// CCoinsViewMemPool::PackageAddTransaction, validation.cpp:1476): their
+	// outputs are visible to later members as unconfirmed coins. Set and
+	// cleared under mu by the package paths only; nil otherwise.
+	pkgView map[wire.Hash256]*wire.MsgTx
 
 	// Rolling minimum fee state (mirrors Core txmempool.cpp).
 	// rollingMinimumFeeRate is the current floor in sat/kvB as a float64;
@@ -961,6 +981,36 @@ type acceptOpts struct {
 	// not consulted, because the orphan step drops mp.mu and the reorg update
 	// must hold it throughout.
 	reorg bool
+
+	// inPackage is admission of one member of a submitpackage / pkgtxns
+	// package (Core ATMPArgs::SingleInPackageAccept and the package members
+	// of AcceptMultipleTransactions). A missing input is returned as
+	// ErrMissingInputs without enrolling the transaction as an orphan — its
+	// parent is usually an earlier member that is retried as a package — and
+	// the size-limit trim and orphan step are left to the package caller,
+	// which runs LimitMempoolSize once at the end (validation.cpp:1731).
+	inPackage bool
+
+	// testOnly runs every check and stops before the transaction is added
+	// (Core m_test_accept): no entry, no RBF eviction. The fee and vsize
+	// reach the caller through out.
+	testOnly bool
+
+	// skipFeeFloor drops the per-transaction min relay / mempool min fee
+	// gate. Only for members of a multi-transaction subpackage, whose feerate
+	// is checked in aggregate instead (Core m_package_feerates: PreChecks
+	// skips CheckFeeRate, AcceptMultipleTransactionsInternal checks the
+	// package feerate, validation.cpp:1507).
+	skipFeeFloor bool
+
+	// out receives the fee and vsize of a transaction that passed.
+	out *acceptOut
+}
+
+// acceptOut carries the fee and vsize computed by acceptLocked.
+type acceptOut struct {
+	fee   int64
+	vsize int64
 }
 
 // acceptLocked is AddTransactionFrom's body. Must be called with mp.mu held.
@@ -1210,7 +1260,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	}
 
 	// If we have missing inputs, treat as orphan
-	if len(missingInputs) > 0 && opts.reorg {
+	if len(missingInputs) > 0 && (opts.reorg || opts.inPackage) {
 		return fmt.Errorf("%w: %d missing inputs", ErrMissingInputs, len(missingInputs))
 	}
 	if len(missingInputs) > 0 {
@@ -1231,7 +1281,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	// 8. Check minimum fee rate (dynamic, accounts for mempool fullness)
 	feeRate := float64(fee) / float64(vsize) * 1000 // sat/kvB
 	minFeeRate := mp.getMinFeeRateLocked()
-	if !opts.reorg && int64(feeRate) < minFeeRate {
+	if !opts.reorg && !opts.skipFeeFloor && int64(feeRate) < minFeeRate {
 		return fmt.Errorf("%w: %.1f sat/kvB below minimum %d sat/kvB",
 			ErrInsufficientFee, feeRate, minFeeRate)
 	}
@@ -1384,6 +1434,14 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 		}
 	}
 
+	if opts.out != nil {
+		opts.out.fee = fee
+		opts.out.vsize = vsize
+	}
+	if opts.testOnly {
+		return nil
+	}
+
 	// 11. Create entry and add to mempool
 	entry := &TxEntry{
 		Tx:             tx,
@@ -1457,10 +1515,11 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 		return clusterErr
 	}
 
-	if opts.reorg {
+	if opts.reorg || opts.inPackage {
 		// The reorg update links in-mempool children of this re-added
 		// transaction (Core UpdateTransactionsFromBlock) and trims once at
-		// the end; the orphan step would drop mp.mu mid-update.
+		// the end; the orphan step would drop mp.mu mid-update. A package
+		// member likewise leaves the trim to the package caller.
 		return nil
 	}
 
@@ -1499,6 +1558,21 @@ func (mp *Mempool) lookupOutputLocked(outpoint wire.OutPoint) *consensus.UTXOEnt
 				// at its zero value (false) is correct.
 			}
 		}
+	}
+	// Then an earlier member of the package under evaluation, at the same
+	// height a mempool parent gets.
+	if ptx, ok := mp.pkgView[outpoint.Hash]; ok {
+		if int(outpoint.Index) < len(ptx.TxOut) {
+			out := ptx.TxOut[outpoint.Index]
+			pk := make([]byte, len(out.PkScript))
+			copy(pk, out.PkScript)
+			return &consensus.UTXOEntry{
+				Amount:   out.Value,
+				PkScript: pk,
+				Height:   mp.chainHeight,
+			}
+		}
+		return nil
 	}
 	// Fall back to the UTXO set
 	if mp.utxoSet != nil {
@@ -2088,6 +2162,10 @@ func (mp *Mempool) checkSequenceLocksLocked(tx *wire.MsgTx) error {
 		// Mempool parent: would be in the same block as this tx, so use
 		// nextHeight (Core uses tip+1 for unconfirmed parents).
 		if _, ok := mp.pool[in.PreviousOutPoint.Hash]; ok {
+			prevHeights[i] = nextHeight
+			continue
+		}
+		if _, ok := mp.pkgView[in.PreviousOutPoint.Hash]; ok {
 			prevHeights[i] = nextHeight
 			continue
 		}
@@ -3862,9 +3940,7 @@ func (mp *Mempool) acceptSingleTxPackage(tx *wire.MsgTx, result *PackageResult) 
 		if entry != nil {
 			txResult.Fee = entry.Fee
 			txResult.VSize = entry.Size
-			txResult.EffectiveFeerate = entry.FeeRate
 		}
-		txResult.EffectiveIncludes = []wire.Hash256{wtxid}
 		return result, nil
 	}
 
@@ -3892,6 +3968,7 @@ func (mp *Mempool) acceptSingleTxPackage(tx *wire.MsgTx, result *PackageResult) 
 	if err := mp.AddTransaction(tx); err != nil {
 		txResult.Error = err
 		result.PackageError = err
+		result.PackageMsg = PackageMsgTxFailed
 		return result, err
 	}
 
@@ -3899,17 +3976,28 @@ func (mp *Mempool) acceptSingleTxPackage(tx *wire.MsgTx, result *PackageResult) 
 	txResult.Accepted = true
 	entry := mp.GetEntry(txid)
 	if entry != nil {
-		txResult.Fee = entry.Fee
-		txResult.VSize = entry.Size
-		txResult.EffectiveFeerate = entry.FeeRate
+		txResult.setAccepted(entry.Fee, entry.Size, entry.Fee, entry.Size, []wire.Hash256{wtxid})
 		result.PackageFeerate = entry.FeeRate
+	} else {
+		txResult.EffectiveIncludes = []wire.Hash256{wtxid}
 	}
-	txResult.EffectiveIncludes = []wire.Hash256{wtxid}
 
 	return result, nil
 }
 
-// acceptMultiTxPackage handles multi-transaction package acceptance.
+// acceptMultiTxPackage handles multi-transaction package acceptance, in the
+// order Core's MemPoolAccept::AcceptPackage uses (validation.cpp:1622-1771):
+//
+//  1. A member already in the mempool is reported as such and takes no
+//     further part; its fee is never counted again.
+//  2. Every other member is first tried on its own. One that is valid alone
+//     enters the mempool now and is reported with its own feerate.
+//  3. One that failed only for its feerate or for missing inputs (its parent
+//     is an earlier member that is itself deferred) is retried with the other
+//     deferred members as a subpackage. Any other failure ends the package
+//     ("transaction failed"); the members already accepted stay.
+//  4. The subpackage's feerate is Σ fee / Σ vsize over exactly its members,
+//     checked against min relay / mempool min fee (acceptSubpackageLocked).
 func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResult) (*PackageResult, error) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
@@ -3930,136 +4018,304 @@ func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResul
 	}
 	defer func() { mp.OnTxEvicted = prevCb }()
 
-	// Track transactions that need package evaluation
-	var toEvaluate []*wire.MsgTx
-	var totalFee int64
-	var totalVSize int64
-	var allWtxids []wire.Hash256
-
-	// First pass: try each transaction individually
+	var deferred []*wire.MsgTx
+	var quitErr error
 	for _, tx := range txns {
 		txid := tx.TxHash()
 		wtxid := tx.WTxHash()
-
-		txResult := &TxAcceptResult{
-			TxID:  txid,
-			WTxID: wtxid,
-		}
+		txResult := &TxAcceptResult{TxID: txid, WTxID: wtxid}
 		result.TxResults[wtxid] = txResult
 
-		// Already in mempool?
+		// Already in the mempool (Core MempoolTx / MempoolTxDifferentWitness):
+		// no effective feerate, because it is unknown whether a package
+		// feerate was used when it was submitted.
 		if entry, ok := mp.pool[txid]; ok {
 			txResult.AlreadyInMempool = true
 			txResult.Accepted = true
 			txResult.Fee = entry.Fee
 			txResult.VSize = entry.Size
-			txResult.EffectiveFeerate = entry.FeeRate
-			txResult.EffectiveIncludes = []wire.Hash256{wtxid}
-			totalFee += entry.Fee
-			totalVSize += entry.Size
-			allWtxids = append(allWtxids, wtxid)
 			continue
 		}
 
-		// Try to validate individually (without actually adding yet)
-		fee, vsize, err := mp.validateTransactionLocked(tx, false)
-		if err != nil {
-			// Check if this is a retryable error (missing inputs or fee issues)
-			if isRetryablePackageError(err) {
-				// Defer to package evaluation
-				toEvaluate = append(toEvaluate, tx)
-				allWtxids = append(allWtxids, wtxid)
-				continue
-			}
-			// Non-retryable error - fail the package
-			txResult.Error = err
-			result.PackageError = fmt.Errorf("transaction %s failed: %w", txid, err)
-			return result, result.PackageError
+		var out acceptOut
+		err := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, out: &out})
+		if err == nil {
+			txResult.setAccepted(out.fee, out.vsize, out.fee, out.vsize, []wire.Hash256{wtxid})
+			continue
 		}
-
-		// Transaction would be valid individually
-		txResult.Fee = fee
-		txResult.VSize = vsize
-		txResult.EffectiveFeerate = float64(fee) / float64(vsize)
-		totalFee += fee
-		totalVSize += vsize
-		allWtxids = append(allWtxids, wtxid)
-		toEvaluate = append(toEvaluate, tx)
+		txResult.Error = mp.packageTxErrorLocked(tx, err)
+		if isReconsiderablePackageError(err) {
+			deferred = append(deferred, tx)
+			continue
+		}
+		// Not fixable by a fee-bumping child: the package cannot succeed,
+		// but keep trying the remaining members on their own (Core
+		// quit_early, validation.cpp:1697-1711).
+		if quitErr == nil {
+			quitErr = fmt.Errorf("transaction %s failed: %w", txid, err)
+		}
 	}
 
-	// Calculate package feerate
-	if totalVSize > 0 {
-		result.PackageFeerate = float64(totalFee) / float64(totalVSize)
+	var err error
+	switch {
+	case quitErr != nil:
+		err = quitErr
+	case len(deferred) == 1:
+		// A one-member subpackage is a plain single accept (Core
+		// AcceptSubPackage, validation.cpp:1601-1611).
+		tx := deferred[0]
+		txResult := result.TxResults[tx.WTxHash()]
+		var out acceptOut
+		if aerr := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, out: &out}); aerr != nil {
+			txResult.Error = mp.packageTxErrorLocked(tx, aerr)
+			err = fmt.Errorf("transaction %s failed: %w", tx.TxHash(), aerr)
+		} else {
+			txResult.setAccepted(out.fee, out.vsize, out.fee, out.vsize, []wire.Hash256{tx.WTxHash()})
+		}
+	case len(deferred) > 1:
+		err = mp.acceptSubpackageLocked(deferred, result)
 	}
 
-	// Check package feerate against minimum
-	minFeeRate := float64(mp.config.MinRelayFeeRate) / 1000 // Convert to sat/vB
-	if result.PackageFeerate < minFeeRate {
-		result.PackageError = fmt.Errorf("%w: package feerate %.2f sat/vB < minimum %.2f sat/vB",
-			ErrPackageInsufficientFee, result.PackageFeerate, minFeeRate)
-		return result, result.PackageError
+	// Core LimitMempoolSize once, after the package (validation.cpp:1731). A
+	// member it evicts is reported "mempool full".
+	mp.maybeEvictLocked()
+	for _, tx := range txns {
+		txResult := result.TxResults[tx.WTxHash()]
+		if txResult.Accepted && !txResult.AlreadyInMempool {
+			if _, ok := mp.pool[tx.TxHash()]; !ok {
+				txResult.Accepted = false
+				txResult.Error = ErrMempoolFull
+				if err == nil {
+					err = fmt.Errorf("transaction %s failed: %w", tx.TxHash(), ErrMempoolFull)
+				}
+			}
+		}
 	}
 
-	// Now validate and add all transactions that need package evaluation
-	// We need to add them in order, making parent outputs available for children
-	for _, tx := range toEvaluate {
+	if err != nil {
+		if result.PackageMsg == "" {
+			result.PackageMsg = PackageMsgTxFailed
+		}
+		result.PackageError = err
+		return result, err
+	}
+	return result, nil
+}
+
+// PackageMsgTxFailed is Core's package_msg for a package that failed because
+// of one of its transactions (PackageValidationResult::PCKG_TX).
+const PackageMsgTxFailed = "transaction failed"
+
+// setAccepted records a member that is in (or, under test accept, would enter)
+// the mempool. effFee / effVSize are the fee and vsize its effective feerate is
+// computed from: its own, or its subpackage's.
+func (r *TxAcceptResult) setAccepted(fee, vsize, effFee, effVSize int64, includes []wire.Hash256) {
+	r.Accepted = true
+	r.Error = nil
+	r.Fee = fee
+	r.VSize = vsize
+	r.EffectiveFee = effFee
+	r.EffectiveVSize = effVSize
+	r.EffectiveFeerate = float64(effFee) / float64(effVSize)
+	r.EffectiveIncludes = includes
+}
+
+// acceptSubpackageLocked is Core's AcceptMultipleTransactionsInternal for the
+// deferred members of a package (validation.cpp:1432-1564): validate every
+// member against the mempool plus the earlier members' outputs, check the
+// subpackage feerate, then add them in order. Nothing is added unless every
+// member passes. Must be called with mu held.
+func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResult) error {
+	fees := make([]int64, len(sub))
+	vsizes := make([]int64, len(sub))
+	wtxids := make([]wire.Hash256, len(sub))
+	var totalFee, totalVSize int64
+
+	mp.pkgView = make(map[wire.Hash256]*wire.MsgTx, len(sub))
+	defer func() { mp.pkgView = nil }()
+
+	for i, tx := range sub {
 		txid := tx.TxHash()
 		wtxid := tx.WTxHash()
 		txResult := result.TxResults[wtxid]
 
-		// Skip if already processed
-		if txResult.Accepted || txResult.AlreadyInMempool {
-			continue
+		// Package RBF (Core PackageRBFChecks) is not implemented. A member
+		// that conflicts with the mempool would otherwise be added next to the
+		// transaction it double-spends, because addTransactionLocked does not
+		// evict, so the package is refused; the member keeps its individual
+		// result.
+		for _, in := range tx.TxIn {
+			if conflict, ok := mp.outpoints[in.PreviousOutPoint]; ok {
+				return fmt.Errorf("transaction %s failed: %w: package member conflicts with mempool tx %s (package RBF not supported)",
+					txid, ErrDoubleSpend, conflict)
+			}
 		}
 
-		// Validate with package context (parent outputs now available)
-		fee, vsize, err := mp.validateTransactionLocked(tx, true)
-		if err != nil {
-			txResult.Error = err
-			result.PackageError = fmt.Errorf("transaction %s failed validation: %w", txid, err)
-			// Rollback: remove any transactions we added
-			mp.rollbackPackageLocked(toEvaluate[:indexOf(toEvaluate, tx)])
-			return result, result.PackageError
+		var out acceptOut
+		if err := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, testOnly: true, skipFeeFloor: true, out: &out}); err != nil {
+			txResult.Error = mp.packageTxErrorLocked(tx, err)
+			return fmt.Errorf("transaction %s failed validation: %w", txid, err)
 		}
+		mp.pkgView[txid] = tx
+		fees[i], vsizes[i], wtxids[i] = out.fee, out.vsize, wtxid
+		totalFee += out.fee
+		totalVSize += out.vsize
+	}
+
+	result.PackageFeerate = float64(totalFee) / float64(totalVSize)
+	if err := mp.checkFeeRateLocked(totalVSize, totalFee); err != nil {
+		// Core reports the fee failure on the last member only; the others
+		// keep their individual results (validation.cpp:1510).
+		result.TxResults[wtxids[len(sub)-1]].Error = err
+		return fmt.Errorf("%w: %v", ErrPackageInsufficientFee, err)
+	}
+
+	// Add in order: each member's parents are in the pool by the time it is
+	// added, so the cluster limits and dependency links see them.
+	mp.pkgView = nil
+	for i, tx := range sub {
+		txid := tx.TxHash()
+		txResult := result.TxResults[wtxids[i]]
 
 		// BIP-431 PackageTRUCChecks: enforce TRUC topology rules with the full
 		// package context. Core: PackageTRUCChecks (truc_policy.cpp:57-169).
-		pkgIdx := indexOf(toEvaluate, tx)
 		sigopVsize := mp.trucSigopVsize(tx)
-		if err := mp.packageTRUCChecks(tx, sigopVsize, toEvaluate, pkgIdx); err != nil {
+		if err := mp.packageTRUCChecks(tx, sigopVsize, sub, i); err != nil {
 			txResult.Error = err
-			result.PackageError = fmt.Errorf("transaction %s failed TRUC package check: %w", txid, err)
-			mp.rollbackPackageLocked(toEvaluate[:pkgIdx])
-			return result, result.PackageError
+			result.PackageMsg = "TRUC-violation, " + err.Error()
+			mp.rollbackPackageLocked(sub[:i])
+			return fmt.Errorf("transaction %s failed TRUC package check: %w", txid, err)
 		}
 
-		// Add to mempool
-		if err := mp.addTransactionLocked(tx, fee, vsize); err != nil {
-			txResult.Error = err
-			result.PackageError = fmt.Errorf("failed to add %s: %w", txid, err)
-			mp.rollbackPackageLocked(toEvaluate[:indexOf(toEvaluate, tx)])
-			return result, result.PackageError
-		}
-
-		txResult.Accepted = true
-		txResult.Fee = fee
-		txResult.VSize = vsize
-		txResult.EffectiveFeerate = result.PackageFeerate
-		txResult.EffectiveIncludes = allWtxids
-	}
-
-	// Update effective feerate for all transactions in the package
-	for _, wtxid := range allWtxids {
-		if txResult, ok := result.TxResults[wtxid]; ok {
-			txResult.EffectiveFeerate = result.PackageFeerate
-			txResult.EffectiveIncludes = allWtxids
+		if err := mp.addTransactionLocked(tx, fees[i], vsizes[i]); err != nil {
+			if errors.Is(err, ErrClusterTooLarge) {
+				result.PackageMsg = ErrClusterTooLarge.Error()
+			} else {
+				txResult.Error = err
+			}
+			mp.rollbackPackageLocked(sub[:i])
+			return fmt.Errorf("failed to add %s: %w", txid, err)
 		}
 	}
 
-	// Evict if needed
-	mp.maybeEvictLocked()
+	for i := range sub {
+		result.TxResults[wtxids[i]].setAccepted(fees[i], vsizes[i], totalFee, totalVSize, wtxids)
+	}
+	return nil
+}
 
-	return result, nil
+// TestAcceptPackage is testmempoolaccept for more than one transaction (Core
+// ProcessNewPackage with test_accept=true → AcceptMultipleTransactions with
+// ATMPArgs::PackageTestAccept, validation.cpp:1818-1820). Each member is
+// checked in order against the mempool plus the earlier members' outputs and
+// at its OWN feerate (m_package_feerates=false, so no CPFP); the first failure
+// ends the evaluation and later members are returned as nil (Core:
+// "validation unfinished"). The mempool is not modified.
+//
+// A non-nil error is a package-wide (PCKG_POLICY) failure of the context-free
+// package checks; then no member has a result.
+func (mp *Mempool) TestAcceptPackage(txns []*wire.MsgTx) ([]*TxAcceptResult, error) {
+	if consensus.IsAborted() {
+		return nil, consensus.ErrNodeAborted
+	}
+	if err := CheckPackage(txns); err != nil {
+		return nil, err
+	}
+
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	mp.pkgView = make(map[wire.Hash256]*wire.MsgTx, len(txns))
+	defer func() { mp.pkgView = nil }()
+
+	results := make([]*TxAcceptResult, len(txns))
+	for i, tx := range txns {
+		txid := tx.TxHash()
+		wtxid := tx.WTxHash()
+		r := &TxAcceptResult{TxID: txid, WTxID: wtxid}
+		results[i] = r
+		var out acceptOut
+		if err := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, testOnly: true, out: &out}); err != nil {
+			r.Error = mp.packageTxErrorLocked(tx, err)
+			break
+		}
+		mp.pkgView[txid] = tx
+		r.setAccepted(out.fee, out.vsize, out.fee, out.vsize, []wire.Hash256{wtxid})
+	}
+	return results, nil
+}
+
+// FeeRateError is Core's CheckFeeRate failure (validation.cpp:703-711):
+// Reason is "mempool min fee not met" or "min relay fee not met", and the
+// message is Core's state string "<reason>, <fee> < <required fee>". It wraps
+// ErrInsufficientFee.
+type FeeRateError struct {
+	Reason   string
+	Fee      int64
+	Required int64
+}
+
+func (e *FeeRateError) Error() string {
+	return fmt.Sprintf("%s, %d < %d", e.Reason, e.Fee, e.Required)
+}
+
+func (e *FeeRateError) Unwrap() error { return ErrInsufficientFee }
+
+// feeForVSize is CFeeRate::GetFee: the fee at rate sat/kvB for vsize vbytes,
+// rounded up.
+func feeForVSize(rateSatKvB float64, vsize int64) int64 {
+	return int64(math.Ceil(rateSatKvB * float64(vsize) / 1000))
+}
+
+// checkFeeRateLocked is Core's CheckFeeRate for a fee paid over vsize vbytes:
+// the mempool minimum first, then the min relay feerate. Must be called with
+// mu held.
+func (mp *Mempool) checkFeeRateLocked(vsize, fee int64) error {
+	if floor := mp.getMinFeeRateLocked(); floor > mp.config.MinRelayFeeRate {
+		if req := feeForVSize(float64(floor), vsize); req > 0 && fee < req {
+			return &FeeRateError{Reason: "mempool min fee not met", Fee: fee, Required: req}
+		}
+	}
+	if req := feeForVSize(float64(mp.config.MinRelayFeeRate), vsize); fee < req {
+		return &FeeRateError{Reason: "min relay fee not met", Fee: fee, Required: req}
+	}
+	return nil
+}
+
+// packageTxErrorLocked turns acceptLocked's per-transaction fee-floor error
+// into Core's CheckFeeRate state (reason + "fee < required"), which is what
+// Core reports for that member in submitpackage / testmempoolaccept. Other
+// errors are returned unchanged. Must be called with mu held.
+func (mp *Mempool) packageTxErrorLocked(tx *wire.MsgTx, err error) error {
+	if !errors.Is(err, ErrInsufficientFee) {
+		return err
+	}
+	var in, out int64
+	for _, txIn := range tx.TxIn {
+		utxo := mp.lookupOutputLocked(txIn.PreviousOutPoint)
+		if utxo == nil {
+			return err
+		}
+		in += utxo.Amount
+	}
+	for _, txOut := range tx.TxOut {
+		out += txOut.Value
+	}
+	vsize := (consensus.CalcTxWeight(tx) + 3) / 4
+	if ferr := mp.checkFeeRateLocked(vsize, in-out); ferr != nil {
+		return ferr
+	}
+	return err
+}
+
+// isReconsiderablePackageError reports whether a member that failed on its own
+// may still be accepted with the other members of its package: Core retries
+// only TX_RECONSIDERABLE (feerate below min relay / mempool min, a replacement
+// that does not pay enough) and TX_MISSING_INPUTS (validation.cpp:1697-1715).
+func isReconsiderablePackageError(err error) bool {
+	return errors.Is(err, ErrMissingInputs) ||
+		errors.Is(err, ErrInsufficientFee) ||
+		errors.Is(err, ErrRBFInsufficientFee) ||
+		errors.Is(err, ErrRBFFeerateDiagram)
 }
 
 // validateTransactionLocked validates a transaction without adding it.
@@ -4331,48 +4587,4 @@ func (mp *Mempool) rollbackPackageLocked(txns []*wire.MsgTx) {
 		txHash := txns[i].TxHash()
 		mp.removeSingleTxLocked(txHash, MempoolRemovalReasonSizeLimit)
 	}
-}
-
-// isRetryablePackageError returns true if the error might be resolved
-// by evaluating the transaction as part of a package.
-func isRetryablePackageError(err error) bool {
-	if err == nil {
-		return false
-	}
-	errStr := err.Error()
-	// Missing inputs might be satisfied by earlier package transactions
-	if errors.Is(err, ErrMissingInputs) {
-		return true
-	}
-	if containsSubstr(errStr, "missing") {
-		return true
-	}
-	// Insufficient fee might be covered by aggregate package feerate
-	if errors.Is(err, ErrInsufficientFee) {
-		return true
-	}
-	if containsSubstr(errStr, "fee") {
-		return true
-	}
-	return false
-}
-
-// containsSubstr checks if s contains substr.
-func containsSubstr(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
-
-// indexOf returns the index of tx in txns, or -1 if not found.
-func indexOf(txns []*wire.MsgTx, tx *wire.MsgTx) int {
-	for i, t := range txns {
-		if t == tx {
-			return i
-		}
-	}
-	return -1
 }

@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -1270,52 +1271,63 @@ func (s *Server) handleSubmitPackage(params json.RawMessage) (interface{}, *RPCE
 
 	// Build result
 	result := &SubmitPackageResult{
-		TxResults: make(map[string]*SubmitPackageTxResult),
+		TxResults:            make(map[string]*SubmitPackageTxResult),
+		ReplacedTransactions: []string{},
 	}
 
-	// Set package message
-	if err != nil {
-		result.PackageMsg = err.Error()
-	} else {
+	// Set package message: Core's PackageValidationState string when the
+	// mempool supplied one ("transaction failed", "too-large-cluster", ...).
+	switch {
+	case err == nil:
 		result.PackageMsg = "success"
+	case pkgResult != nil && pkgResult.PackageMsg != "":
+		result.PackageMsg = pkgResult.PackageMsg
+	default:
+		result.PackageMsg = err.Error()
 	}
 
-	// Add replaced transactions
+	// Replaced transactions: Core collects them in a std::set<Txid>, so the
+	// list is de-duplicated and ordered by the txid's internal byte order.
 	if pkgResult != nil && len(pkgResult.ReplacedTxs) > 0 {
-		result.ReplacedTransactions = make([]string, len(pkgResult.ReplacedTxs))
-		for i, txid := range pkgResult.ReplacedTxs {
-			result.ReplacedTransactions[i] = txid.String()
+		replaced := make([]wire.Hash256, 0, len(pkgResult.ReplacedTxs))
+		seen := make(map[wire.Hash256]bool, len(pkgResult.ReplacedTxs))
+		for _, h := range pkgResult.ReplacedTxs {
+			if !seen[h] {
+				seen[h] = true
+				replaced = append(replaced, h)
+			}
+		}
+		sort.Slice(replaced, func(i, j int) bool {
+			return bytes.Compare(replaced[i][:], replaced[j][:]) < 0
+		})
+		for _, h := range replaced {
+			result.ReplacedTransactions = append(result.ReplacedTransactions, h.String())
 		}
 	}
 
-	// Add per-transaction results
-	if pkgResult != nil {
-		for wtxid, txResult := range pkgResult.TxResults {
-			txResultRPC := &SubmitPackageTxResult{
-				TxID:  txResult.TxID.String(),
-				WTxID: wtxid.String(),
-			}
+	// Per-transaction results, one per package member keyed by wtxid. Core:
+	// vsize + fees for a transaction in the mempool (effective-* only if it
+	// was validated now), error otherwise, "package-not-validated" when the
+	// package failed before any member was looked at.
+	for _, tx := range txns {
+		wtxid := tx.WTxHash()
+		txResultRPC := &SubmitPackageTxResult{TxID: tx.TxHash().String()}
+		result.TxResults[wtxid.String()] = txResultRPC
 
-			if txResult.Accepted || txResult.AlreadyInMempool {
-				txResultRPC.VSize = txResult.VSize
-				txResultRPC.Fees = &TxFees{
-					Base: float64(txResult.Fee) / satoshiPerBitcoin,
-				}
-				// Effective feerate in BTC/kvB
-				txResultRPC.EffectiveFeerate = txResult.EffectiveFeerate / satoshiPerBitcoin * 1000
-
-				// List of wtxids included in feerate calculation
-				txResultRPC.EffectiveIncludes = make([]string, len(txResult.EffectiveIncludes))
-				for i, w := range txResult.EffectiveIncludes {
-					txResultRPC.EffectiveIncludes[i] = w.String()
-				}
-			}
-
-			if txResult.Error != nil {
-				txResultRPC.Error = txResult.Error.Error()
-			}
-
-			result.TxResults[wtxid.String()] = txResultRPC
+		var txResult *mempool.TxAcceptResult
+		if pkgResult != nil {
+			txResult = pkgResult.TxResults[wtxid]
+		}
+		switch {
+		case txResult == nil:
+			txResultRPC.Error = "package-not-validated"
+		case txResult.Accepted || txResult.AlreadyInMempool:
+			txResultRPC.VSize = txResult.VSize
+			txResultRPC.Fees = packageTxFees(txResult)
+		case txResult.Error != nil:
+			txResultRPC.Error = packageTxErrorString(txResult.Error)
+		default:
+			txResultRPC.Error = "package-not-validated"
 		}
 	}
 
@@ -1336,6 +1348,51 @@ func (s *Server) handleSubmitPackage(params json.RawMessage) (interface{}, *RPCE
 	}
 
 	return result, nil
+}
+
+// packageTxFees builds the fees object for a package member: base fee, plus
+// effective-feerate and effective-includes when the member was validated now.
+// effective-feerate is Core's CFeeRate(fee, vsize).GetFeePerK() — sat/kvB
+// truncated toward zero — as BTC/kvB.
+func packageTxFees(r *mempool.TxAcceptResult) *TxFees {
+	fees := &TxFees{Base: float64(r.Fee) / satoshiPerBitcoin}
+	if r.EffectiveVSize > 0 {
+		perK := float64(r.EffectiveFee*1000/r.EffectiveVSize) / satoshiPerBitcoin
+		fees.EffectiveFeerate = &perK
+		fees.EffectiveIncludes = make([]string, len(r.EffectiveIncludes))
+		for i, w := range r.EffectiveIncludes {
+			fees.EffectiveIncludes[i] = w.String()
+		}
+	}
+	return fees
+}
+
+// packageTxRejectReason maps a package member's mempool error onto Core's
+// TxValidationState reject reason and its ToString() ("reason, debug"). The
+// reasons Core shares with blockbrew's error sentinels are mapped; any other
+// error is reported as its own text.
+func packageTxRejectReason(err error) (reason, details string) {
+	var feeErr *mempool.FeeRateError
+	switch {
+	case errors.As(err, &feeErr):
+		return feeErr.Reason, feeErr.Error()
+	case errors.Is(err, mempool.ErrMissingInputs):
+		return "bad-txns-inputs-missingorspent", "bad-txns-inputs-missingorspent"
+	case errors.Is(err, mempool.ErrMempoolFull):
+		return "mempool full", "mempool full"
+	case errors.Is(err, mempool.ErrAlreadyInMempool):
+		return "txn-already-in-mempool", "txn-already-in-mempool"
+	case errors.Is(err, mempool.ErrSameTxidDifferentWitness):
+		return "txn-same-nonwitness-data-in-mempool", "txn-same-nonwitness-data-in-mempool"
+	}
+	return err.Error(), err.Error()
+}
+
+// packageTxErrorString is a submitpackage tx-results error: Core's
+// TxValidationState::ToString().
+func packageTxErrorString(err error) string {
+	_, details := packageTxRejectReason(err)
+	return details
 }
 
 // isUnspendable checks if a script is unspendable (OP_RETURN or invalid).
