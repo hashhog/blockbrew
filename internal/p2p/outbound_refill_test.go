@@ -23,9 +23,11 @@ type refillRig struct {
 	conns     []net.Conn
 }
 
-// newRefillRig seeds the address book with n addresses, one per /16, of which
-// failPct percent refuse the connection. latency delays every dial.
-func newRefillRig(t *testing.T, n, failPct int, latency time.Duration) *refillRig {
+// newRefillRig seeds the address book with n addresses, one per /16. Only every
+// successEvery-th dial connects; the others are refused (0 = all connect).
+// latency delays every dial. Counting dials, not addresses, keeps the number
+// of successes deterministic however the book is sampled.
+func newRefillRig(t *testing.T, n, successEvery int, latency time.Duration) *refillRig {
 	t.Helper()
 	r := &refillRig{pm: NewPeerManager(PeerManagerConfig{Network: MainnetMagic})}
 	r.pm.dialFn = func(addr string, cfg PeerConfig) (*Peer, error) {
@@ -33,6 +35,7 @@ func newRefillRig(t *testing.T, n, failPct int, latency time.Duration) *refillRi
 		defer atomic.AddInt32(&r.inflight, -1)
 		r.mu.Lock()
 		r.started++
+		ok := successEvery == 0 || r.started%successEvery == 0
 		if cfg.DisableRelayTx {
 			r.blockOnly++
 		} else {
@@ -40,9 +43,7 @@ func newRefillRig(t *testing.T, n, failPct int, latency time.Duration) *refillRi
 		}
 		r.mu.Unlock()
 		time.Sleep(latency)
-		var o1, o2 int
-		fmt.Sscanf(addr, "%d.%d.", &o1, &o2)
-		if o2%100 < failPct {
+		if !ok {
 			return nil, fmt.Errorf("dial %s: connection refused", addr)
 		}
 		client, server := net.Pipe()
@@ -84,8 +85,8 @@ func newRefillRig(t *testing.T, n, failPct int, latency time.Duration) *refillRi
 			c.Close()
 		}
 		r.mu.Unlock()
-		for _, info := range r.pm.peers {
-			info.peer.Disconnect()
+		for _, p := range r.pm.ConnectedPeers() {
+			p.Disconnect()
 		}
 	})
 	return r
@@ -103,12 +104,24 @@ func (r *refillRig) attempts() (full, blockOnly int) {
 	return r.full, r.blockOnly
 }
 
-// settle waits for every launched dial to finish.
+// settle waits until no dial is running and no new one has started for a
+// while, so goroutines the scheduler has not run yet cannot be mistaken for
+// dials that were never launched.
 func (r *refillRig) settle(t *testing.T) {
 	t.Helper()
-	time.Sleep(20 * time.Millisecond)
-	waitUntil(t, 20*time.Second, func() bool { return atomic.LoadInt32(&r.inflight) == 0 })
-	time.Sleep(50 * time.Millisecond)
+	quiet := 0
+	last := -1
+	waitUntil(t, 30*time.Second, func() bool {
+		f, b := r.attempts()
+		n := f + b
+		if atomic.LoadInt32(&r.inflight) == 0 && n == last {
+			quiet++
+		} else {
+			quiet = 0
+		}
+		last = n
+		return quiet >= 20 // 20 polls x 5 ms
+	})
 }
 
 // One refill pass with every slot empty must go after every empty slot, not
@@ -127,11 +140,11 @@ func TestOutboundRefillPassFillsAllEmptySlots(t *testing.T) {
 }
 
 // With most of the address book unreachable, the slots must still fill in a
-// handful of passes. Before: 1 dial per type per pass at 30% success needs
-// ~27 passes for 8 slots.
+// handful of passes. Before: 1 dial per type per pass at one success in three
+// needs ~24 passes for 8 slots.
 func TestOutboundRefillConvergesWithUnreachableAddresses(t *testing.T) {
-	r := newRefillRig(t, 120, 70, 0)
-	const maxPasses = 12
+	r := newRefillRig(t, 200, 3, 0)
+	const maxPasses = 10
 	passes := 0
 	for ; passes < maxPasses; passes++ {
 		full, block := r.counts()
@@ -143,8 +156,9 @@ func TestOutboundRefillConvergesWithUnreachableAddresses(t *testing.T) {
 	}
 	full, block := r.counts()
 	if full != DefaultMaxOutbound || block != DefaultMaxBlockRelayOnly {
-		t.Fatalf("after %d passes: full-relay=%d block-relay-only=%d, want %d and %d",
-			passes, full, block, DefaultMaxOutbound, DefaultMaxBlockRelayOnly)
+		af, ab := r.attempts()
+		t.Fatalf("after %d passes: full-relay=%d block-relay-only=%d, want %d and %d (attempts %d/%d, book %d)",
+			passes, full, block, DefaultMaxOutbound, DefaultMaxBlockRelayOnly, af, ab, r.pm.addrBook.Size())
 	}
 }
 
