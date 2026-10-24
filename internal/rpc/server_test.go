@@ -2047,3 +2047,28 @@ func TestBIP22ResultStringForBlock(t *testing.T) {
 		t.Errorf("fallthrough = %q, want bad-txns-vout-empty", got)
 	}
 }
+
+// getmempoolinfo.maxmempool must report the configured -maxmempool, not a
+// hardcoded 300 MB (Core rpc/mempool.cpp: maxmempool = m_opts.max_size_bytes).
+func TestGetMempoolInfoMaxMempoolFollowsConfig(t *testing.T) {
+	cfg := mempool.DefaultConfig()
+	cfg.MaxSize = 5_000_000
+	mp := mempool.New(cfg, nil)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithMempool(mp),
+	)
+
+	resp := testRPCRequest(t, server.handleRPC, "getmempoolinfo", []interface{}{}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	result, ok := resp.Result.(map[string]interface{})
+	if !ok {
+		t.Fatalf("unexpected result type: %T", resp.Result)
+	}
+	if got, _ := result["maxmempool"].(float64); got != 5_000_000 {
+		t.Errorf("getmempoolinfo.maxmempool = %v, want 5000000", result["maxmempool"])
+	}
+}
