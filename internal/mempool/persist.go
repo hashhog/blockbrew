@@ -205,7 +205,14 @@ func (mp *Mempool) Dump(dataDir string) error {
 		}
 		tailDeltas = append(tailDeltas, tailDelta{txid: txid, amount: amount})
 	}
+	unbroadcastTxids := make([]wire.Hash256, 0, len(mp.unbroadcast))
+	for txid := range mp.unbroadcast {
+		unbroadcastTxids = append(unbroadcastTxids, txid)
+	}
 	mp.mu.RUnlock()
+	sort.Slice(unbroadcastTxids, func(i, j int) bool {
+		return bytes.Compare(unbroadcastTxids[i][:], unbroadcastTxids[j][:]) < 0
+	})
 
 	// Stable order for the tail-block deltas eases regression diffs.
 	sort.Slice(tailDeltas, func(i, j int) bool {
@@ -253,10 +260,15 @@ func (mp *Mempool) Dump(dataDir string) error {
 			return fmt.Errorf("mempool dump: write mapDeltas amount: %w", err)
 		}
 	}
-	// Unbroadcast set: still zero — blockbrew does not yet track an
-	// unbroadcast set (out of scope for FIX-76).
-	if err := wire.WriteCompactSize(xw, 0); err != nil {
-		return fmt.Errorf("mempool dump: write unbroadcast: %w", err)
+	// Unbroadcast set (mempool_persist.cpp:205 `file << unbroadcast_txids`).
+	if err := wire.WriteCompactSize(xw, uint64(len(unbroadcastTxids))); err != nil {
+		return fmt.Errorf("mempool dump: write unbroadcast count: %w", err)
+	}
+	for _, txid := range unbroadcastTxids {
+		t := txid // local copy: Serialize takes a pointer
+		if err := t.Serialize(xw); err != nil {
+			return fmt.Errorf("mempool dump: write unbroadcast txid: %w", err)
+		}
 	}
 
 	if err := f.Sync(); err != nil {
@@ -289,6 +301,10 @@ type LoadOptions struct {
 	// MaxAge skips entries whose stored timestamp is older than now-MaxAge.
 	// Zero disables the check.
 	MaxAge time.Duration
+	// ApplyUnbroadcastSet re-marks the file's unbroadcast txids that are in
+	// the pool after the load. Core applies it at startup and defaults it to
+	// false for importmempool (mempool_persist.cpp:136).
+	ApplyUnbroadcastSet bool
 }
 
 // Load reads <dataDir>/mempool.dat (Core MEMPOOL_DUMP_VERSION = 1 or 2) and
@@ -427,6 +443,9 @@ func (mp *Mempool) LoadFile(path string, opts LoadOptions) (*LoadResult, error) 
 		var txid wire.Hash256
 		if err := txid.Deserialize(xr); err != nil {
 			return res, fmt.Errorf("mempool load: unbroadcast[%d]: %w", i, err)
+		}
+		if opts.ApplyUnbroadcastSet {
+			mp.AddUnbroadcastTx(txid)
 		}
 	}
 	return res, nil

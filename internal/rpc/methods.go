@@ -1113,6 +1113,10 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		}
 	}
 
+	// Core BroadcastTransaction (node/transaction.cpp) tracks a freshly
+	// accepted local tx as unbroadcast until a peer requests it.
+	s.mempool.AddUnbroadcastTx(txid)
+
 	// Broadcast to peers via inv message
 	// Pass empty string for fromPeer since this originated locally via RPC
 	if s.peerMgr != nil {
@@ -1377,7 +1381,7 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		MempoolMinFee:       float64(s.mempool.GetMinFeeRate()) / satoshiPerBitcoin,
 		MinRelayTxFee:       float64(s.mempool.MinRelayFeeRateKvB()) / satoshiPerBitcoin,
 		IncrementalRelayFee: float64(s.mempool.IncrementalRelayFeeKvB()) / satoshiPerBitcoin,
-		UnbroadcastCount:    0,
+		UnbroadcastCount:    s.mempool.UnbroadcastCount(),
 		// FullRBF reflects the actual `-mempoolfullrbf` policy in force at
 		// runtime, not a hardcoded constant (W120 BUG-5 / FIX-68). Core's
 		// `getmempoolinfo` field is marked DEPRECATED at
