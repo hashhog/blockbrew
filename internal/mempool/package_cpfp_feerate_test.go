@@ -22,8 +22,10 @@ package mempool
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
+	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -228,5 +230,121 @@ func TestPackageBadScriptParentAdmitsNothing(t *testing.T) {
 		if mp.Count() != 0 {
 			t.Errorf("parentFee=%d: mempool has %d txs, want 0", parentFee, mp.Count())
 		}
+	}
+}
+
+// Package RBF (Core PackageRBFChecks, validation.cpp). Fixture: O spends the
+// funding coin paying 1,000 sat, D spends O paying 1,000 sat; P double-spends
+// the funding coin paying too little to replace O+D alone, C spends P.
+
+func rbfFixture(t *testing.T, seed byte) (mp *Mempool, op wire.OutPoint, o, d *wire.MsgTx) {
+	t.Helper()
+	mp, op = spendableMempool(seed, cpfpFunding)
+	o = spendableTx(op, cpfpFunding-1_000, 2) // two outputs so it differs from P
+	o.TxOut[0].Value = cpfpFunding - 1_000 - 10_000
+	o.TxOut[1].Value = 10_000
+	d = spendableTx(wire.OutPoint{Hash: o.TxHash(), Index: 0}, o.TxOut[0].Value-1_000, 1)
+	for _, tx := range []*wire.MsgTx{o, d} {
+		if err := mp.AddTransaction(tx); err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+	}
+	return mp, op, o, d
+}
+
+// TestPackageRBFReplacesConflictsWithCPFP: P (500 sat) cannot replace O+D
+// (2,000 sat) alone; with C (10,000 sat) the package pays for the
+// replacement, is its own chunk and improves the diagram. Core accepts it and
+// reports O and D as replaced.
+func TestPackageRBFReplacesConflictsWithCPFP(t *testing.T) {
+	mp, op, o, d := rbfFixture(t, 0xe1)
+	p, c := cpfpPair(op, cpfpFunding, 500, 10_000)
+
+	res, err := mp.AcceptPackage([]*wire.MsgTx{p, c})
+	if err != nil {
+		t.Fatalf("package RBF refused: %v", err)
+	}
+	if !mp.HasTransaction(p.TxHash()) || !mp.HasTransaction(c.TxHash()) {
+		t.Fatal("package members not in mempool")
+	}
+	if mp.HasTransaction(o.TxHash()) || mp.HasTransaction(d.TxHash()) {
+		t.Fatal("replaced transactions still in mempool")
+	}
+	replaced := map[wire.Hash256]bool{}
+	for _, h := range res.ReplacedTxs {
+		replaced[h] = true
+	}
+	if len(replaced) != 2 || !replaced[o.TxHash()] || !replaced[d.TxHash()] {
+		t.Errorf("ReplacedTxs = %v, want O and D", res.ReplacedTxs)
+	}
+}
+
+// TestPackageRBFMustPayForConflicts: negative control. P+C pay 1,500 sat <
+// O+D's 2,000: Core refuses with "insufficient anti-DoS fees" and O, D stay.
+func TestPackageRBFMustPayForConflicts(t *testing.T) {
+	mp, op, o, d := rbfFixture(t, 0xe2)
+	p, c := cpfpPair(op, cpfpFunding, 500, 1_000)
+
+	_, err := mp.AcceptPackage([]*wire.MsgTx{p, c})
+	if err == nil {
+		t.Fatal("underpaying package RBF accepted")
+	}
+	if !mp.HasTransaction(o.TxHash()) || !mp.HasTransaction(d.TxHash()) {
+		t.Error("conflicts were evicted by a refused package")
+	}
+	if mp.HasTransaction(p.TxHash()) || mp.HasTransaction(c.TxHash()) {
+		t.Error("refused package members are in the mempool")
+	}
+	if want := "package RBF failed: insufficient anti-DoS fees"; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("err = %q, want prefix %q", err, want)
+	}
+}
+
+// TestPackageRBFPackageMustBeItsOwnChunk: negative control. P pays 1,900 sat
+// (22.35 sat/vB, still short of O+D alone), C only 200: the package pays for
+// the replacement but its feerate (12.35 sat/vB) is below the parent's, so the
+// child is only paying anti-DoS fees. Core refuses.
+func TestPackageRBFPackageMustBeItsOwnChunk(t *testing.T) {
+	mp, op, o, _ := rbfFixture(t, 0xe3)
+	p, c := cpfpPair(op, cpfpFunding, 1_900, 200)
+
+	_, err := mp.AcceptPackage([]*wire.MsgTx{p, c})
+	if err == nil {
+		t.Fatal("package whose feerate is below its parent's replaced the conflicts")
+	}
+	if !mp.HasTransaction(o.TxHash()) {
+		t.Error("conflict was evicted by a refused package")
+	}
+	if want := "package RBF failed: package feerate is less than or equal to parent feerate"; !strings.HasPrefix(err.Error(), want) {
+		t.Errorf("err = %q, want prefix %q", err, want)
+	}
+}
+
+// TestPackageRBFOnlyOneParentOneChild: negative control. A conflicting
+// subpackage of three is not a package RBF Core considers.
+func TestPackageRBFOnlyOneParentOneChild(t *testing.T) {
+	mp, op, o, _ := rbfFixture(t, 0xe4)
+	p1 := spendableTx(op, cpfpFunding-500, 1)
+	// A second parent, funded from its own confirmed coin (a package RBF
+	// member may not have mempool parents).
+	var h2 wire.Hash256
+	h2[0] = 0xe5
+	op2 := wire.OutPoint{Hash: h2, Index: 0}
+	mp.utxoSet.(*testUTXOSet).AddUTXO(op2, &consensus.UTXOEntry{Amount: cpfpFunding, PkScript: p2shAnyoneCanSpendScript(), Height: 1})
+	p2 := spendableTx(op2, cpfpFunding-1, 1) // 1 sat: deferred too
+	c := spendableTxMulti([]wire.OutPoint{
+		{Hash: p1.TxHash(), Index: 0},
+		{Hash: p2.TxHash(), Index: 0},
+	}, 2*cpfpFunding-501-50_000, 1)
+
+	_, err := mp.AcceptPackage([]*wire.MsgTx{p1, p2, c})
+	if err == nil {
+		t.Fatal("three-transaction package RBF accepted")
+	}
+	if !mp.HasTransaction(o.TxHash()) {
+		t.Error("conflict was evicted by a refused package")
+	}
+	if want := "package RBF failed: package must be 1-parent-1-child"; err.Error() != want {
+		t.Errorf("err = %q, want %q", err, want)
 	}
 }
