@@ -810,15 +810,17 @@ func (mp *Mempool) GetPrioritisedTransactions() []PrioritisedDeltaInfo {
 // `bip125-replaceable` JSON field:
 //
 //	"yes" - the transaction (or any of its in-mempool ancestors) signals
-//	         BIP-125 opt-in, OR -mempoolfullrbf is enabled so every conflict
-//	         is replaceable regardless of signaling.
+//	         BIP-125 opt-in.
 //	"no"  - the transaction is in our mempool and neither it nor any of its
-//	         in-mempool ancestors signal RBF, AND -mempoolfullrbf is off.
+//	         in-mempool ancestors signal RBF.
 //	"unknown" - the transaction is NOT in our mempool (caller passed a txid
 //	         we have no entry for). Mirrors Core's RBFTransactionState::UNKNOWN.
 //
 // Walking unconfirmed ancestors matches BIP-125 §"Signaling implementation":
-// a tx inherits its parents' opt-in status. Reference: Bitcoin Core
+// a tx inherits its parents' opt-in status. The full-RBF policy is NOT
+// consulted: Core's IsRBFOptIn reports signaling only, so under full RBF a
+// non-signaling tx is "no" even though a conflict may still replace it.
+// Reference: Bitcoin Core
 // `src/policy/rbf.cpp::IsRBFOptIn` (the walker) and
 // `MempoolEntryToJSON`'s "bip125-replaceable" emission for the string form.
 func (mp *Mempool) SignalsBIP125Replaceable(txHash wire.Hash256) string {
@@ -834,11 +836,6 @@ func (mp *Mempool) signalsBIP125ReplaceableLocked(txHash wire.Hash256) string {
 	entry, ok := mp.pool[txHash]
 	if !ok {
 		return "unknown"
-	}
-	// Full RBF disables the signaling requirement entirely — every
-	// in-mempool tx is replaceable.
-	if mp.config.MempoolFullRBF {
-		return "yes"
 	}
 	if signalsRBF(entry.Tx) {
 		return "yes"

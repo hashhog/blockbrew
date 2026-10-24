@@ -119,12 +119,9 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 	for i, sb := range entry.SpentBy {
 		spentBy[i] = sb.String()
 	}
-	// BIP-125 §"Signaling implementation": a tx is replaceable iff it (or
-	// any in-mempool ancestor) signals AND -mempoolfullrbf=false; OR
-	// -mempoolfullrbf=true (Core v28+ default, any conflict replaceable).
-	// signalsBIP125Replaceable returns one of {"yes","no","unknown"};
-	// the entry is by construction in our mempool here so the value is
-	// always "yes" or "no" — we map to the bool the JSON shape calls for.
+	// bip125-replaceable is Core's IsRBFOptIn (policy/rbf.cpp): true iff
+	// the tx or an in-mempool ancestor signals BIP-125. Full RBF does not
+	// enter into it, so Core 31 reports false for every non-signaling tx.
 	// W120 BUG-1 / FIX-68.
 	replaceable := false
 	if s.mempool != nil {
@@ -137,9 +134,9 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 			// "unknown" can occur in a race where the entry was just
 			// evicted between the verbose-listing snapshot and the
 			// per-entry lookup. Fall back to inspecting the tx directly
-			// + the configured fullrbf bit so the JSON shape is always
-			// consistent with the rest of the response.
-			replaceable = s.mempool.FullRBF() || mempool.SignalsRBFForRPC(entry.Tx)
+			// so the JSON shape is always consistent with the rest of
+			// the response.
+			replaceable = mempool.SignalsRBFForRPC(entry.Tx)
 		}
 	}
 	// `modifiedfee` is the entry's raw fee PLUS any operator delta applied
