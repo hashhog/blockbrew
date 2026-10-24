@@ -897,27 +897,24 @@ func TestW116_G22_CPFP_PackageAcceptance_Bug3_Confirmed(t *testing.T) {
 	}
 
 	_, err := mp.AcceptPackage([]*wire.MsgTx{parentTx, childTx})
-	// BUG-3 CONFIRMED: package is rejected with ErrPackageInsufficientFee
-	// because totalFee=0 and totalVSize=0 after the 1st pass (both txns deferred).
-	// PackageFeerate = 0/0 → 0.0 sat/vB < 1.0 sat/vB minimum → rejected.
-	// The correct behaviour is to compute feerate AFTER the 2nd pass where
-	// parent and child are both validated with their actual fees resolved.
-	if err != nil && errors.Is(err, ErrPackageInsufficientFee) {
-		t.Logf("BUG-3 CONFIRMED: CPFP package incorrectly rejected → %v", err)
-		t.Log("(This is the expected failure from the bug; fix = compute PackageFeerate after 2nd pass)")
-		// Mark as expected failure - this test documents a known bug.
-		// When BUG-3 is fixed, this check should be inverted.
-		return
+	// BUG-3 FIXED: the package feerate is now (0 + 20000) / (parent + child
+	// vsize), well above the minimum, so the package must NOT be refused for
+	// its feerate. (The fixture's fake signatures still fail script
+	// validation, so the package fails, but for its scripts.) The CPFP accept
+	// itself is pinned with valid scripts by
+	// TestPackageCPFPLowFeeParentPaidForByChild.
+	if errors.Is(err, ErrPackageInsufficientFee) {
+		t.Fatalf("BUG-3: CPFP package refused for its feerate: %v", err)
 	}
-	// If we get here, either the bug is fixed or a different error occurred.
 	if err != nil {
 		t.Logf("AcceptPackage error (non-ErrPackageInsufficientFee): %v", err)
 	}
 }
 
-// TestW116_G23_CPFP_EffectiveIncludes verifies that AcceptPackage populates
-// EffectiveIncludes with all wtxids in the package, enabling clients to
-// understand which txns were included in the feerate calculation.
+// TestW116_G23_CPFP_EffectiveIncludes verifies that AcceptPackage reports no
+// effective feerate for a member that was already in the mempool (Core
+// MEMPOOL_ENTRY). Members accepted now are covered in
+// package_cpfp_feerate_test.go.
 func TestW116_G23_CPFP_EffectiveIncludes(t *testing.T) {
 	utxoSet := newTestUTXOSet()
 	var h wire.Hash256
@@ -947,13 +944,19 @@ func TestW116_G23_CPFP_EffectiveIncludes(t *testing.T) {
 	if !ok {
 		t.Fatal("no result for wtxid")
 	}
-	// For a single already-in-pool tx, EffectiveIncludes should contain the wtxid.
-	if len(txResult.EffectiveIncludes) == 0 {
-		t.Error("EffectiveIncludes should not be empty for accepted package tx")
+	// A tx that was already in the mempool is Core's MEMPOOL_ENTRY result:
+	// vsize and fees.base only, NO effective-feerate / effective-includes,
+	// "because it is unknown whether package feerate was used when it was
+	// originally submitted" (rpc/mempool.cpp submitpackage). This test used
+	// to assert the wtxid was listed, which is the field Core omits.
+	if !txResult.AlreadyInMempool {
+		t.Error("already-in-pool tx should report AlreadyInMempool")
 	}
-	if len(txResult.EffectiveIncludes) > 0 && txResult.EffectiveIncludes[0] != txWTxID {
-		t.Errorf("EffectiveIncludes[0] = %s, want %s", txResult.EffectiveIncludes[0], txWTxID)
+	if len(txResult.EffectiveIncludes) != 0 {
+		t.Errorf("already-in-pool tx reports effective-includes %v; Core omits it",
+			txResult.EffectiveIncludes)
 	}
+	_ = txWTxID
 }
 
 // ============================================================================
