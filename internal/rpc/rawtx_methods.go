@@ -767,6 +767,25 @@ type TestMempoolAcceptResult struct {
 	VSize        int64    `json:"vsize,omitempty"`
 	Fees         *FeeInfo `json:"fees,omitempty"`
 	RejectReason string   `json:"reject-reason,omitempty"`
+	// RejectDetails is Core's TxValidationState::ToString(). Only the script
+	// checks fill it so far.
+	RejectDetails string `json:"reject-details,omitempty"`
+
+	// unfinished marks a package member left unvalidated after an earlier
+	// member failed: Core returns only its txid and wtxid.
+	unfinished bool
+}
+
+// MarshalJSON writes an unfinished member as {"txid", "wtxid"} only.
+func (r *TestMempoolAcceptResult) MarshalJSON() ([]byte, error) {
+	if r.unfinished {
+		return json.Marshal(struct {
+			TxID  string `json:"txid"`
+			WTxID string `json:"wtxid"`
+		}{r.TxID, r.WTxID})
+	}
+	type plain TestMempoolAcceptResult
+	return json.Marshal((*plain)(r))
 }
 
 // FeeInfo contains fee information for testmempoolaccept.
@@ -841,6 +860,9 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 	}
 
 	results := make([]*TestMempoolAcceptResult, 0, len(rawTxsArg))
+	// Core (rpc/mempool.cpp) stops at the first member that fails: the ones
+	// after it are left unvalidated and carry only txid and wtxid.
+	exitEarly := false
 
 	for _, rawTxInterface := range rawTxsArg {
 		rawTxHex, ok := rawTxInterface.(string)
@@ -867,6 +889,13 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		result.TxID = txHash.String()
 		// Core always emits wtxid (mempool.cpp:359), even when wtxid == txid.
 		result.WTxID = tx.WTxHash().String()
+
+		if n := len(results); exitEarly || (n > 0 && !results[n-1].Allowed) {
+			exitEarly = true
+			result.unfinished = true
+			results = append(results, result)
+			continue
+		}
 
 		// Check if already in mempool
 		if s.mempool.HasTransaction(txHash) {
@@ -1160,6 +1189,24 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if conflicts, rbfErr := s.mempool.TestReplacement(tx); conflicts && rbfErr != nil {
 			result.Allowed = false
 			result.RejectReason = classifyRBFReject(rbfErr)
+			results = append(results, result)
+			continue
+		}
+
+		// PolicyScriptChecks / ConsensusScriptChecks (validation.cpp): Core's
+		// test accept evaluates every input script after the RBF checks, so
+		// an invalid signature is refused with
+		// mempool-script-verify-flag-failed. The dry-run used to stop short
+		// of the scripts and report such a tx allowed with fees.
+		if err := s.mempool.CheckInputScripts(tx, prevoutView); err != nil {
+			result.Allowed = false
+			var se *mempool.ScriptCheckError
+			if errors.As(err, &se) {
+				result.RejectReason = se.Reason
+				result.RejectDetails = se.Error()
+			} else {
+				result.RejectReason = err.Error()
+			}
 			results = append(results, result)
 			continue
 		}
