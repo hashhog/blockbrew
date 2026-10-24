@@ -171,3 +171,42 @@ func TestClusterRBF_RPC_FiveClusterReplacement(t *testing.T) {
 		t.Errorf("pool holds %d txs after the sweep, want only the sweep", n)
 	}
 }
+
+// TestClusterRBF_RPC_TooLargeCluster: a replacement that merges two
+// 40-transaction chains into an 81-transaction cluster. Core's
+// CheckMemPoolPolicyLimits refuses it TX_MEMPOOL_POLICY "too-large-cluster"
+// (validation.cpp ReplacementChecks): testmempoolaccept reject-reason and
+// reject-details "too-large-cluster", sendrawtransaction -26
+// "too-large-cluster". blockbrew answered "txn-mempool-conflict" and -25
+// "Transaction rejected: too-large-cluster".
+func TestClusterRBF_RPC_TooLargeCluster(t *testing.T) {
+	srv, ops := clusterRBFServer(2)
+	var ins []wire.OutPoint
+	var total int64
+	for _, op := range ops {
+		prev, value := op, int64(clusterRBFValue)
+		for i := 0; i < 40; i++ {
+			value -= 1_000
+			tx := clusterRBFTx([]wire.OutPoint{prev}, value, 1)
+			if resp := clusterRBFSend(t, srv, tx); resp.Error != nil {
+				t.Fatalf("chain tx %d: %+v", i, resp.Error)
+			}
+			prev = wire.OutPoint{Hash: tx.TxHash(), Index: 0}
+		}
+		if resp := clusterRBFSend(t, srv, clusterRBFTx([]wire.OutPoint{prev}, value-1_000, 1)); resp.Error != nil {
+			t.Fatalf("child: %+v", resp.Error)
+		}
+		ins = append(ins, prev)
+		total += value
+	}
+	r := clusterRBFTx(ins, total-1_000_000, 1)
+
+	got := clusterRBFAccept(t, srv, r)
+	if got["allowed"] != false || got["reject-reason"] != "too-large-cluster" || got["reject-details"] != "too-large-cluster" {
+		t.Errorf("testmempoolaccept = %v, want allowed=false reject-reason/reject-details %q", got, "too-large-cluster")
+	}
+	resp := clusterRBFSend(t, srv, r)
+	if resp.Error == nil || resp.Error.Code != -26 || resp.Error.Message != "too-large-cluster" {
+		t.Errorf("sendrawtransaction error = %+v, want code -26 message %q", resp.Error, "too-large-cluster")
+	}
+}

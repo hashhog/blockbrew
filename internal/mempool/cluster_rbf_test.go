@@ -286,3 +286,59 @@ func TestClusterRBF_MergedClusterOverCountLimit(t *testing.T) {
 		t.Fatalf("refused replacement changed the pool: %d txs, want %d", got, before)
 	}
 }
+
+// TestClusterRBF_SurvivorCutOffByEvictionNotCounted: the limit counts only the
+// component the replacement re-anchors to, not every survivor of a joined
+// cluster. Cluster A is P1 and a 35-transaction side chain, joined by J,
+// which spends P1 and the side chain's tip. Cluster B is a 29-transaction
+// chain plus one child. The replacement spends P1's output and B's tip, so it
+// evicts J and the child. With J gone the side chain is its own cluster; the
+// replacement's cluster is P1 + B's chain + itself = 31 transactions, under
+// MaxClusterCount, and Core accepts. Counting every survivor of A (36) plus
+// B's chain (29) plus the replacement made 66 and refused it
+// "too-large-cluster" before the diagram.
+func TestClusterRBF_SurvivorCutOffByEvictionNotCounted(t *testing.T) {
+	mp, ops := clusterRBFMempool(3)
+
+	p1 := spendableTx(ops[0], clusterRBFFunding-1_000, 1)
+	if err := mp.AddTransaction(p1); err != nil {
+		t.Fatalf("P1 rejected: %v", err)
+	}
+	p1Out := wire.OutPoint{Hash: p1.TxHash(), Index: 0}
+	sideTip, sideValue := chainOf(t, mp, ops[1], 35, 1_000)
+	joiner := sweepTx([]wire.OutPoint{p1Out, {Hash: sideTip, Index: 0}},
+		clusterRBFFunding-1_000+sideValue, 1_000)
+	if err := mp.AddTransaction(joiner); err != nil {
+		t.Fatalf("joiner rejected: %v", err)
+	}
+
+	bTip, bValue := chainOf(t, mp, ops[2], 29, 1_000)
+	bOut := wire.OutPoint{Hash: bTip, Index: 0}
+	if err := mp.AddTransaction(spendableTx(bOut, bValue-1_000, 1)); err != nil {
+		t.Fatalf("B child rejected: %v", err)
+	}
+	if got := mp.Count(); got != 67 {
+		t.Fatalf("fixture: pool holds %d txs, want 67", got)
+	}
+
+	r := sweepTx([]wire.OutPoint{p1Out, bOut}, clusterRBFFunding-1_000+bValue, 500_000)
+	removals := mp.replacementRemovalSetLocked(map[wire.Hash256]bool{joiner.TxHash(): true, mp.outpoints[bOut]: true})
+	count, _ := mp.clusters.ProspectiveCluster(mp.clusterAdjWeightLocked(r), mp.mempoolParentsLocked(r), removals)
+	if count != 31 {
+		t.Fatalf("fixture: ProspectiveCluster count %d, want 31", count)
+	}
+
+	if conflicts, err := mp.TestReplacement(r); !conflicts || err != nil {
+		t.Fatalf("TestReplacement = (%v, %v), want (true, nil)", conflicts, err)
+	}
+	if err := mp.AddTransaction(r); err != nil {
+		t.Fatalf("replacement rejected: %v", err)
+	}
+	if got := mp.Count(); got != 66 || mp.HasTransaction(joiner.TxHash()) {
+		t.Fatalf("pool holds %d txs (joiner present %v), want 66 without the joiner",
+			got, mp.HasTransaction(joiner.TxHash()))
+	}
+	if got := mp.CountDistinctClusters(mp.GetAllTxHashes()); got != 2 {
+		t.Fatalf("pool holds %d clusters, want 2 (side chain; P1+B+replacement)", got)
+	}
+}
