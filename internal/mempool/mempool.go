@@ -810,15 +810,17 @@ func (mp *Mempool) GetPrioritisedTransactions() []PrioritisedDeltaInfo {
 // `bip125-replaceable` JSON field:
 //
 //	"yes" - the transaction (or any of its in-mempool ancestors) signals
-//	         BIP-125 opt-in, OR -mempoolfullrbf is enabled so every conflict
-//	         is replaceable regardless of signaling.
+//	         BIP-125 opt-in.
 //	"no"  - the transaction is in our mempool and neither it nor any of its
-//	         in-mempool ancestors signal RBF, AND -mempoolfullrbf is off.
+//	         in-mempool ancestors signal RBF.
 //	"unknown" - the transaction is NOT in our mempool (caller passed a txid
 //	         we have no entry for). Mirrors Core's RBFTransactionState::UNKNOWN.
 //
 // Walking unconfirmed ancestors matches BIP-125 §"Signaling implementation":
-// a tx inherits its parents' opt-in status. Reference: Bitcoin Core
+// a tx inherits its parents' opt-in status. The full-RBF policy is NOT
+// consulted: Core's IsRBFOptIn reports signaling only, so under full RBF a
+// non-signaling tx is "no" even though a conflict may still replace it.
+// Reference: Bitcoin Core
 // `src/policy/rbf.cpp::IsRBFOptIn` (the walker) and
 // `MempoolEntryToJSON`'s "bip125-replaceable" emission for the string form.
 func (mp *Mempool) SignalsBIP125Replaceable(txHash wire.Hash256) string {
@@ -834,11 +836,6 @@ func (mp *Mempool) signalsBIP125ReplaceableLocked(txHash wire.Hash256) string {
 	entry, ok := mp.pool[txHash]
 	if !ok {
 		return "unknown"
-	}
-	// Full RBF disables the signaling requirement entirely — every
-	// in-mempool tx is replaceable.
-	if mp.config.MempoolFullRBF {
-		return "yes"
 	}
 	if signalsRBF(entry.Tx) {
 		return "yes"
@@ -2305,6 +2302,111 @@ func (mp *Mempool) GetDescendants(txHash wire.Hash256) []wire.Hash256 {
 	}
 	visited := make(map[wire.Hash256]bool)
 	return mp.collectDescendantsLocked(txHash, visited)
+}
+
+// GetChildren returns the in-mempool transactions that spend an output of
+// txHash, each once, sorted by txid the way Core's CTxMemPool::GetChildren
+// does (CompareIteratorByHash: uint256 operator<, a memcmp of the internal
+// little-endian bytes, which is not the order of the hex strings). This is
+// what entryToJSON lists as spentby. nil when txHash is not in the pool.
+func (mp *Mempool) GetChildren(txHash wire.Hash256) []wire.Hash256 {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	entry, ok := mp.pool[txHash]
+	if !ok {
+		return nil
+	}
+	return uniqueSortedHashes(entry.SpentBy, func(a, b wire.Hash256) bool {
+		return bytes.Compare(a[:], b[:]) < 0
+	})
+}
+
+// GetParents returns the in-mempool transactions txHash spends from, each
+// once, sorted by their hex txid: entryToJSON collects depends into a
+// std::set<std::string>. nil when txHash is not in the pool.
+func (mp *Mempool) GetParents(txHash wire.Hash256) []wire.Hash256 {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	entry, ok := mp.pool[txHash]
+	if !ok {
+		return nil
+	}
+	return uniqueSortedHashes(entry.Depends, func(a, b wire.Hash256) bool {
+		return a.String() < b.String()
+	})
+}
+
+// uniqueSortedHashes returns a sorted copy of hs without duplicates.
+func uniqueSortedHashes(hs []wire.Hash256, less func(a, b wire.Hash256) bool) []wire.Hash256 {
+	seen := make(map[wire.Hash256]bool, len(hs))
+	out := make([]wire.Hash256, 0, len(hs))
+	for _, h := range hs {
+		if !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return less(out[i], out[j]) })
+	return out
+}
+
+// RelativesData is the count, total vsize and total modified fee of a set
+// of mempool transactions. Returned by CalculateAncestorData and
+// CalculateDescendantData.
+type RelativesData struct {
+	Count       int
+	Size        int64
+	ModifiedFee int64
+}
+
+// CalculateAncestorData returns the count, vsize and modified fee of the
+// transaction plus every in-mempool ancestor, each counted once. Mirrors
+// Core's CTxMemPool::CalculateAncestorData (txmempool.cpp), which entryToJSON
+// uses for ancestorcount / ancestorsize / fees.ancestor. ok is false when
+// txHash is not in the pool.
+//
+// This walks the graph at call time instead of reading the TxEntry's
+// AncestorFee/AncestorSize fields: those hold raw fees and are only as good
+// as the incremental updates at admission.
+func (mp *Mempool) CalculateAncestorData(txHash wire.Hash256) (RelativesData, bool) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.relativesDataLocked(txHash, mp.collectAncestorsLocked)
+}
+
+// CalculateDescendantData is CalculateAncestorData for the descendant set.
+// Mirrors Core's CTxMemPool::CalculateDescendantData.
+func (mp *Mempool) CalculateDescendantData(txHash wire.Hash256) (RelativesData, bool) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.relativesDataLocked(txHash, mp.collectDescendantsLocked)
+}
+
+// relativesDataLocked sums txHash and the set collect returns. collect may
+// return a hash more than once (a diamond, or a parent spent twice), so the
+// set is de-duplicated first. Must be called with mu held.
+func (mp *Mempool) relativesDataLocked(
+	txHash wire.Hash256,
+	collect func(wire.Hash256, map[wire.Hash256]bool) []wire.Hash256,
+) (RelativesData, bool) {
+	if _, ok := mp.pool[txHash]; !ok {
+		return RelativesData{}, false
+	}
+	set := map[wire.Hash256]bool{txHash: true}
+	for _, h := range collect(txHash, make(map[wire.Hash256]bool)) {
+		set[h] = true
+	}
+	var d RelativesData
+	for h := range set {
+		e, ok := mp.pool[h]
+		if !ok {
+			continue
+		}
+		d.Count++
+		d.Size += e.Size
+		d.ModifiedFee = saturatingAddInt64(d.ModifiedFee, mp.getModifiedFeeLocked(e))
+	}
+	return d, true
 }
 
 // HasTransaction returns true if the transaction is in the mempool.

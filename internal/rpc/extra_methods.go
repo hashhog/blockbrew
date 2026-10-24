@@ -111,20 +111,26 @@ func (s *Server) handleGetTxOut(params json.RawMessage) (interface{}, *RPCError)
 
 // mempoolEntryFromTxEntry builds an RPC MempoolEntry from a mempool.TxEntry.
 func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
-	depends := make([]string, len(entry.Depends))
-	for i, d := range entry.Depends {
+	// depends: each in-mempool parent once, hex order (Core's
+	// std::set<std::string>). spentby: each child once, Core txid order
+	// (GetChildren). TxEntry.Depends/SpentBy hold one hash per spent output
+	// in admission order.
+	parents, children := entry.Depends, entry.SpentBy
+	if s.mempool != nil && s.mempool.HasTransaction(entry.TxHash) {
+		parents = s.mempool.GetParents(entry.TxHash)
+		children = s.mempool.GetChildren(entry.TxHash)
+	}
+	depends := make([]string, len(parents))
+	for i, d := range parents {
 		depends[i] = d.String()
 	}
-	spentBy := make([]string, len(entry.SpentBy))
-	for i, sb := range entry.SpentBy {
+	spentBy := make([]string, len(children))
+	for i, sb := range children {
 		spentBy[i] = sb.String()
 	}
-	// BIP-125 §"Signaling implementation": a tx is replaceable iff it (or
-	// any in-mempool ancestor) signals AND -mempoolfullrbf=false; OR
-	// -mempoolfullrbf=true (Core v28+ default, any conflict replaceable).
-	// signalsBIP125Replaceable returns one of {"yes","no","unknown"};
-	// the entry is by construction in our mempool here so the value is
-	// always "yes" or "no" — we map to the bool the JSON shape calls for.
+	// bip125-replaceable is Core's IsRBFOptIn (policy/rbf.cpp): true iff
+	// the tx or an in-mempool ancestor signals BIP-125. Full RBF does not
+	// enter into it, so Core 31 reports false for every non-signaling tx.
 	// W120 BUG-1 / FIX-68.
 	replaceable := false
 	if s.mempool != nil {
@@ -137,9 +143,9 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 			// "unknown" can occur in a race where the entry was just
 			// evicted between the verbose-listing snapshot and the
 			// per-entry lookup. Fall back to inspecting the tx directly
-			// + the configured fullrbf bit so the JSON shape is always
-			// consistent with the rest of the response.
-			replaceable = s.mempool.FullRBF() || mempool.SignalsRBFForRPC(entry.Tx)
+			// so the JSON shape is always consistent with the rest of
+			// the response.
+			replaceable = mempool.SignalsRBFForRPC(entry.Tx)
 		}
 	}
 	// `modifiedfee` is the entry's raw fee PLUS any operator delta applied
@@ -148,24 +154,38 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 	// FIX-72 this field always equalled Fee (no prioritisetransaction
 	// support, W120 BUG-10).
 	modifiedFee := entry.Fee
+	// ancestor*/descendant* and fees.ancestor/descendant come from a walk of
+	// the whole in-mempool ancestor/descendant set, self included, summing
+	// modified fees: Core's CalculateAncestorData/CalculateDescendantData.
+	anc := mempool.RelativesData{Count: 1, Size: entry.Size, ModifiedFee: entry.Fee}
+	desc := anc
 	if s.mempool != nil {
 		modifiedFee = s.mempool.GetModifiedFee(entry)
+		anc.ModifiedFee, desc.ModifiedFee = modifiedFee, modifiedFee
+		if d, ok := s.mempool.CalculateAncestorData(entry.TxHash); ok {
+			anc = d
+		}
+		if d, ok := s.mempool.CalculateDescendantData(entry.TxHash); ok {
+			desc = d
+		}
 	}
+	// weight is Core's GetTxWeight, the BIP-141 weight; vsize*4 rounds a
+	// segwit tx's weight up to the next multiple of 4.
 	return MempoolEntry{
 		VSize:           entry.Size,
-		Weight:          entry.Size * 4,
+		Weight:          consensus.CalcTxWeight(entry.Tx),
 		Time:            entry.Time.Unix(),
 		Height:          entry.Height,
-		DescendantCount: len(entry.SpentBy) + 1,
-		DescendantSize:  entry.DescendantSize,
-		AncestorCount:   len(entry.Depends) + 1,
-		AncestorSize:    entry.AncestorSize,
+		DescendantCount: desc.Count,
+		DescendantSize:  desc.Size,
+		AncestorCount:   anc.Count,
+		AncestorSize:    anc.Size,
 		WTxID:           entry.Tx.WTxHash().String(),
 		Fees: MempoolEntryFees{
 			Base:       float64(entry.Fee) / satoshiPerBitcoin,
 			Modified:   float64(modifiedFee) / satoshiPerBitcoin,
-			Ancestor:   float64(entry.AncestorFee) / satoshiPerBitcoin,
-			Descendant: float64(entry.DescendantFee) / satoshiPerBitcoin,
+			Ancestor:   float64(anc.ModifiedFee) / satoshiPerBitcoin,
+			Descendant: float64(desc.ModifiedFee) / satoshiPerBitcoin,
 		},
 		Depends:           depends,
 		SpentBy:           spentBy,
