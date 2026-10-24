@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -149,6 +150,9 @@ var (
 	ErrPackageConflict         = errors.New("package contains conflicting transactions")
 	ErrPackageNotChildWithParents = errors.New("package topology must be child-with-unconfirmed-parents")
 	ErrPackageInsufficientFee  = errors.New("package feerate below minimum relay fee")
+	// ErrPackageRBF is a package that conflicts with the mempool and fails
+	// Core's PackageRBFChecks.
+	ErrPackageRBF = errors.New("package RBF failed")
 
 	// W96 ATMP gates (mirrors Bitcoin Core MemPoolAccept).
 
@@ -1003,6 +1007,13 @@ type acceptOpts struct {
 	// package feerate, validation.cpp:1507).
 	skipFeeFloor bool
 
+	// packageRBF leaves mempool conflicts to the caller's package RBF checks
+	// instead of judging the transaction as a single-transaction replacement
+	// (Core runs ReplacementChecks only for single transactions; a
+	// subpackage's conflicts go through PackageRBFChecks,
+	// validation.cpp:1515). Only with testOnly: nothing is evicted here.
+	packageRBF bool
+
 	// out receives the fee and vsize of a transaction that passed.
 	out *acceptOut
 }
@@ -1230,7 +1241,9 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	}
 
 	// If there are conflicting transactions, check RBF rules
-	if len(conflictingTxs) > 0 && len(missingInputs) == 0 {
+	if len(conflictingTxs) > 0 && len(missingInputs) == 0 && opts.packageRBF {
+		// Judged with the whole subpackage by packageRBFChecksLocked.
+	} else if len(conflictingTxs) > 0 && len(missingInputs) == 0 {
 		rbfErr := mp.checkRBFLocked(tx, conflictingTxs, totalInputValue)
 		if rbfErr != nil {
 			return rbfErr
@@ -4139,20 +4152,8 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 		wtxid := tx.WTxHash()
 		txResult := result.TxResults[wtxid]
 
-		// Package RBF (Core PackageRBFChecks) is not implemented. A member
-		// that conflicts with the mempool would otherwise be added next to the
-		// transaction it double-spends, because addTransactionLocked does not
-		// evict, so the package is refused; the member keeps its individual
-		// result.
-		for _, in := range tx.TxIn {
-			if conflict, ok := mp.outpoints[in.PreviousOutPoint]; ok {
-				return fmt.Errorf("transaction %s failed: %w: package member conflicts with mempool tx %s (package RBF not supported)",
-					txid, ErrDoubleSpend, conflict)
-			}
-		}
-
 		var out acceptOut
-		if err := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, testOnly: true, skipFeeFloor: true, out: &out}); err != nil {
+		if err := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, testOnly: true, skipFeeFloor: true, packageRBF: true, out: &out}); err != nil {
 			txResult.Error = mp.packageTxErrorLocked(tx, err)
 			return fmt.Errorf("transaction %s failed validation: %w", txid, err)
 		}
@@ -4170,9 +4171,23 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 		return fmt.Errorf("%w: %v", ErrPackageInsufficientFee, err)
 	}
 
+	// Package RBF (Core PackageRBFChecks, validation.cpp:1515): judged with
+	// the members' outputs still in pkgView, before anything changes.
+	conflicts := mp.packageConflictsLocked(sub)
+	if len(conflicts) > 0 {
+		if msg, err := mp.packageRBFChecksLocked(sub, fees, vsizes, totalFee, totalVSize, conflicts); err != nil {
+			result.PackageMsg = msg
+			return err
+		}
+	}
+
 	// Add in order: each member's parents are in the pool by the time it is
-	// added, so the cluster limits and dependency links see them.
+	// added, so the cluster limits and dependency links see them. The
+	// replaced transactions go first, with REPLACED (Core FinalizeSubpackage).
 	mp.pkgView = nil
+	for conflict := range conflicts {
+		mp.removeWithDescendantsLocked(conflict, MempoolRemovalReasonReplaced)
+	}
 	for i, tx := range sub {
 		txid := tx.TxHash()
 		txResult := result.TxResults[wtxids[i]]
@@ -4202,6 +4217,126 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 		result.TxResults[wtxids[i]].setAccepted(fees[i], vsizes[i], totalFee, totalVSize, wtxids)
 	}
 	return nil
+}
+
+// packageConflictsLocked returns the mempool transactions that the members of
+// sub directly conflict with. Must be called with mu held.
+func (mp *Mempool) packageConflictsLocked(sub []*wire.MsgTx) map[wire.Hash256]bool {
+	conflicts := make(map[wire.Hash256]bool)
+	for _, tx := range sub {
+		for _, in := range tx.TxIn {
+			if h, ok := mp.outpoints[in.PreviousOutPoint]; ok {
+				conflicts[h] = true
+			}
+		}
+	}
+	return conflicts
+}
+
+// packageRBFChecksLocked is Core's PackageRBFChecks (validation.cpp): a
+// subpackage that conflicts with the mempool may replace those transactions
+// only as a 1-parent-1-child package with no mempool ancestors that pays for
+// the replacement, is a chunk of its own, keeps its cluster within the limits
+// and improves the feerate diagram. On failure it returns Core's package_msg
+// (PackageValidationState::ToString) and an error. Must be called with mu held
+// and the members' outputs in pkgView.
+func (mp *Mempool) packageRBFChecksLocked(sub []*wire.MsgTx, fees, vsizes []int64, totalFee, totalVSize int64, conflicts map[wire.Hash256]bool) (string, error) {
+	// The error reads exactly as Core's package_msg and wraps ErrPackageRBF.
+	fail := func(msg string) (string, error) {
+		return msg, fmt.Errorf("%w%s", ErrPackageRBF, strings.TrimPrefix(msg, ErrPackageRBF.Error()))
+	}
+
+	if len(sub) != 2 || !IsChildWithParents(sub) {
+		return fail("package RBF failed: package must be 1-parent-1-child")
+	}
+	// A mempool parent would make the new cluster larger than the package.
+	for _, tx := range sub {
+		for _, in := range tx.TxIn {
+			if _, ok := mp.pool[in.PreviousOutPoint.Hash]; ok {
+				return fail("package RBF failed: new transaction cannot have mempool ancestors")
+			}
+		}
+	}
+
+	// Everything that leaves: the direct conflicts and their descendants.
+	evicted := make(map[wire.Hash256]bool)
+	for h := range conflicts {
+		evicted[h] = true
+		for _, d := range mp.collectDescendantsLocked(h, make(map[wire.Hash256]bool)) {
+			evicted[d] = true
+		}
+	}
+	if len(evicted) > MaxRBFReplacedTxs {
+		return fail(fmt.Sprintf("package RBF failed: too many potential replacements, rejecting replacement %s; too many potential replacements (%d > %d)",
+			sub[1].TxHash(), len(evicted), MaxRBFReplacedTxs))
+	}
+	var conflictFees int64
+	for h := range evicted {
+		if e, ok := mp.pool[h]; ok {
+			conflictFees += mp.getModifiedFeeLocked(e)
+		}
+	}
+
+	// PaysForRBF (policy/rbf.cpp), errors attributed to the child.
+	child := sub[1].TxHash()
+	if totalFee < conflictFees {
+		return fail(fmt.Sprintf("package RBF failed: insufficient anti-DoS fees, rejecting replacement %s, less fees than conflicting txs; %s < %s",
+			child, formatMoney(totalFee), formatMoney(conflictFees)))
+	}
+	if req := feeForVSize(float64(mp.config.IncrementalRelayFee), totalVSize); totalFee-conflictFees < req {
+		return fail(fmt.Sprintf("package RBF failed: insufficient anti-DoS fees, rejecting replacement %s, not enough additional fees to relay; %s < %s",
+			child, formatMoney(totalFee-conflictFees), formatMoney(req)))
+	}
+
+	// The package must be a chunk of its own: the child cannot be paying only
+	// the anti-DoS fees. Compared as CFeeRate, i.e. truncated sat/kvB.
+	parentPerK := fees[0] * 1000 / vsizes[0]
+	packagePerK := totalFee * 1000 / totalVSize
+	if packagePerK <= parentPerK {
+		return fail(fmt.Sprintf("package RBF failed: package feerate is less than or equal to parent feerate, package feerate %s <= parent feerate is %s",
+			feeRateString(packagePerK), feeRateString(parentPerK)))
+	}
+
+	// Cluster limits: with no mempool ancestors and every conflict removed,
+	// the new cluster is exactly the two members (Core
+	// ChangeSet::CheckMemPoolPolicyLimits; strict ">" on each axis).
+	var adjWeight int64
+	for _, tx := range sub {
+		adjWeight += mp.clusterAdjWeightLocked(tx)
+	}
+	if len(sub) > MaxClusterCount || adjWeight > MaxClusterSizeWeight {
+		return ErrClusterTooLarge.Error(), fmt.Errorf("%w: package cluster weight %d > %d", ErrClusterTooLarge, adjWeight, MaxClusterSizeWeight)
+	}
+
+	// ImprovesFeerateDiagram, with the package as one chunk. The parent
+	// stands in for the package: neither member has a mempool parent, so the
+	// parent's inputs carry the only cluster linkage.
+	if err := mp.checkRBFImprovesFeerateDiagramLocked(sub[0], evicted, totalFee, totalVSize); err != nil {
+		return fail("package RBF failed: " + ErrRBFFeerateDiagram.Error())
+	}
+	return "", nil
+}
+
+// formatMoney is Core's FormatMoney: BTC with trailing zeros trimmed down to
+// two decimals.
+func formatMoney(sats int64) string {
+	neg := sats < 0
+	if neg {
+		sats = -sats
+	}
+	s := fmt.Sprintf("%d.%08d", sats/100_000_000, sats%100_000_000)
+	for strings.HasSuffix(s, "0") && len(s)-strings.IndexByte(s, '.') > 3 {
+		s = s[:len(s)-1]
+	}
+	if neg {
+		return "-" + s
+	}
+	return s
+}
+
+// feeRateString is CFeeRate::ToString for a rate in sat/kvB: "N.NNN sat/vB".
+func feeRateString(perK int64) string {
+	return fmt.Sprintf("%d.%03d sat/vB", perK/1000, perK%1000)
 }
 
 // TestAcceptPackage is testmempoolaccept for more than one transaction (Core
