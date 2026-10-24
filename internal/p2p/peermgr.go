@@ -62,8 +62,12 @@ const (
 	// DefaultMaxInbound is the default maximum number of inbound connections.
 	DefaultMaxInbound = 117
 
-	// ConnectionAttemptInterval is how often to try connecting to new peers.
-	ConnectionAttemptInterval = 30 * time.Second
+	// ConnectionAttemptInterval is how often the outbound refill pass runs.
+	// A pass only dials for slots below target (it is a cheap check when the
+	// slots are full), and many mainnet addrman entries are unreachable, so a
+	// long interval turns every burst of disconnects into minutes below target.
+	// Core's ThreadOpenConnections retries within a second.
+	ConnectionAttemptInterval = 2 * time.Second
 
 	// FeelerInterval is how often to make feeler connections.
 	// Bitcoin Core: FEELER_INTERVAL = 2min
@@ -248,6 +252,18 @@ type PeerManager struct {
 	subnetCounts   map[string]int       // subnet -> count of outbound connections (for diversity)
 	rng            *rand.Rand           // Random number generator
 	asmap          []byte               // Loaded asmap trie bytes (nil = disabled)
+
+	// dialFn creates an outbound peer. nil means NewOutboundPeer; tests
+	// substitute an in-memory dialer.
+	dialFn func(addr string, cfg PeerConfig) (*Peer, error)
+
+	// Outbound dials launched by the refill pass that have not yet registered
+	// a peer. Counted against the targets so a pass that runs while earlier
+	// dials are still connecting does not launch more than the open slots.
+	// dialing also keeps two dials off the same address. Guarded by mu.
+	pendingFull  int
+	pendingBlock int
+	dialing      map[string]struct{}
 
 	// fixedSeedsAdded is the one-shot guard for the last-resort fixed-seed
 	// fallback. Set true after addFixedSeeds() has injected the curated
@@ -635,6 +651,24 @@ func (pm *PeerManager) InsertConnectedPeer(p *Peer) {
 	pm.peers[p.Address()] = &PeerInfo{
 		peer:        p,
 		connType:    ConnFullRelay,
+		connectedAt: time.Now(),
+	}
+}
+
+// InsertConnectedPeerWithType is InsertConnectedPeer for a peer of a given
+// connection type. Tests use it to drive getpeerinfo's connection_type.
+func (pm *PeerManager) InsertConnectedPeerWithType(p *Peer, ct ConnType) {
+	if pm == nil || p == nil {
+		return
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if pm.peers == nil {
+		pm.peers = make(map[string]*PeerInfo)
+	}
+	pm.peers[p.Address()] = &PeerInfo{
+		peer:        p,
+		connType:    ct,
 		connectedAt: time.Now(),
 	}
 }
@@ -1170,6 +1204,29 @@ func (pm *PeerManager) GetConnType(addr string) ConnType {
 	return ConnInbound // Default
 }
 
+// ConnTypeName is the getpeerinfo connection_type string for a peer ("" when
+// the peer is unknown).
+func (pm *PeerManager) ConnTypeName(addr string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	info, ok := pm.peers[addr]
+	if !ok {
+		return ""
+	}
+	switch info.connType {
+	case ConnInbound:
+		return "inbound"
+	case ConnBlockRelayOnly:
+		return "block-relay-only"
+	case ConnFeeler:
+		return "feeler"
+	case ConnManual:
+		return "manual"
+	default:
+		return "outbound-full-relay"
+	}
+}
+
 // String returns a string representation of the connection type.
 func (ct ConnType) String() string {
 	switch ct {
@@ -1492,26 +1549,7 @@ func (pm *PeerManager) connectionHandler() {
 				continue
 			}
 
-			pm.mu.RLock()
-			needFullRelay := pm.outbound < pm.config.MaxOutbound
-			needBlockRelay := pm.blockRelayOnly < pm.config.MaxBlockRelayOnly
-			pm.mu.RUnlock()
-
-			// Try to make a full-relay connection
-			if needFullRelay {
-				ka := pm.pickAddressWithDiversity(ConnFullRelay)
-				if ka != nil {
-					go pm.connectToPeerWithType(ka, ConnFullRelay)
-				}
-			}
-
-			// Try to make a block-relay-only connection
-			if needBlockRelay {
-				ka := pm.pickAddressWithDiversity(ConnBlockRelayOnly)
-				if ka != nil {
-					go pm.connectToPeerWithType(ka, ConnBlockRelayOnly)
-				}
-			}
+			pm.openConnectionsTick()
 
 		case <-feelerTicker.C:
 			// Network-active gate: feeler + extra-block-relay establishment is
@@ -1597,6 +1635,77 @@ func (pm *PeerManager) connectionHandler() {
 			return
 		}
 	}
+}
+
+// openConnectionsTick is one pass of the outbound refill: dial for any
+// full-relay / block-relay-only slot that is below target.
+func (pm *PeerManager) openConnectionsTick() {
+	pm.mu.RLock()
+	needFull := pm.config.MaxOutbound - pm.outbound - pm.pendingFull
+	needBlock := pm.config.MaxBlockRelayOnly - pm.blockRelayOnly - pm.pendingBlock
+	pm.mu.RUnlock()
+
+	pm.launchOutbound(ConnFullRelay, needFull)
+	pm.launchOutbound(ConnBlockRelayOnly, needBlock)
+}
+
+// launchOutbound starts up to n dials of the given type, in parallel.
+func (pm *PeerManager) launchOutbound(connType ConnType, n int) {
+	// A pick can come back as an address that is already connected or being
+	// dialed; bound the picks so a small book cannot spin here.
+	for picks := 0; n > 0 && picks < 4*n+8; picks++ {
+		ka := pm.pickAddressWithDiversity(connType)
+		if ka == nil {
+			return
+		}
+		release, ok := pm.reserveDial(ka.Key(), connType)
+		if !ok {
+			continue
+		}
+		n--
+		go pm.connectOutbound(ka, connType, release)
+	}
+}
+
+// reserveDial claims an outbound slot of connType for a dial to addr. It fails
+// when the slot is no longer open or addr is already connected or being dialed.
+func (pm *PeerManager) reserveDial(addr string, connType ConnType) (release func(), ok bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if _, connected := pm.peers[addr]; connected {
+		return nil, false
+	}
+	if _, busy := pm.dialing[addr]; busy {
+		return nil, false
+	}
+	switch connType {
+	case ConnFullRelay:
+		if pm.outbound+pm.pendingFull >= pm.config.MaxOutbound {
+			return nil, false
+		}
+		pm.pendingFull++
+	case ConnBlockRelayOnly:
+		if pm.blockRelayOnly+pm.pendingBlock >= pm.config.MaxBlockRelayOnly {
+			return nil, false
+		}
+		pm.pendingBlock++
+	default:
+		return nil, false
+	}
+	if pm.dialing == nil {
+		pm.dialing = make(map[string]struct{})
+	}
+	pm.dialing[addr] = struct{}{}
+	return func() {
+		pm.mu.Lock()
+		defer pm.mu.Unlock()
+		delete(pm.dialing, addr)
+		if connType == ConnFullRelay {
+			pm.pendingFull--
+		} else {
+			pm.pendingBlock--
+		}
+	}, true
 }
 
 // poissonDuration returns a random duration with exponential distribution.
@@ -1805,6 +1914,20 @@ func (pm *PeerManager) connectToPeer(ka *KnownAddress) {
 
 // connectToPeerWithType attempts to connect to a known address with a specific connection type.
 func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType) {
+	pm.connectOutbound(ka, connType, nil)
+}
+
+// connectOutbound is connectToPeerWithType for a dial that holds a reservation
+// from reserveDial. release (nil for none) is called once the dial has either
+// registered its peer or given up, whichever comes first.
+func (pm *PeerManager) connectOutbound(ka *KnownAddress, connType ConnType, release func()) {
+	if release == nil {
+		release = func() {}
+	}
+	var once sync.Once
+	releaseOnce := func() { once.Do(release) }
+	defer releaseOnce()
+
 	addr := ka.Key()
 
 	// Mark the attempt (but not for feelers — feeler probes should not
@@ -1849,7 +1972,11 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 	}
 
 	// Attempt connection
-	peer, err := NewOutboundPeer(addr, peerConfig)
+	dial := pm.dialFn
+	if dial == nil {
+		dial = NewOutboundPeer
+	}
+	peer, err := dial(addr, peerConfig)
 	if err != nil {
 		// Connection failed. Mark the outcome so Attempts doesn't climb
 		// unbounded toward the IsBad cliff (MarkAttempt already incremented
@@ -1894,6 +2021,7 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 	pm.peers[addr] = peerInfo
 	pm.updatePeerCounts(peerInfo, +1)
 	pm.mu.Unlock()
+	releaseOnce()
 
 	// Start the peer (this does the handshake)
 	err = peer.Start()

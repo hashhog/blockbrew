@@ -858,11 +858,34 @@ type TestMempoolAcceptResult struct {
 	VSize        int64    `json:"vsize,omitempty"`
 	Fees         *FeeInfo `json:"fees,omitempty"`
 	RejectReason string   `json:"reject-reason,omitempty"`
+	// RejectDetails is Core's TxValidationState::ToString(). Only the script
+	// and replacement checks fill it so far.
+	RejectDetails string `json:"reject-details,omitempty"`
+
+	// unfinished marks a package member left unvalidated after an earlier
+	// member failed: Core returns only its txid and wtxid.
+	unfinished bool
+}
+
+// MarshalJSON writes an unfinished member as {"txid", "wtxid"} only.
+func (r *TestMempoolAcceptResult) MarshalJSON() ([]byte, error) {
+	if r.unfinished {
+		return json.Marshal(struct {
+			TxID  string `json:"txid"`
+			WTxID string `json:"wtxid"`
+		}{r.TxID, r.WTxID})
+	}
+	type plain TestMempoolAcceptResult
+	return json.Marshal((*plain)(r))
 }
 
 // FeeInfo contains fee information for testmempoolaccept.
 type FeeInfo struct {
 	Base float64 `json:"base"`
+	// EffectiveFeerate (BTC/kvB) and EffectiveIncludes (wtxids) are Core's
+	// single-transaction values: the tx's own CFeeRate and its own wtxid.
+	EffectiveFeerate  *float64 `json:"effective-feerate,omitempty"`
+	EffectiveIncludes []string `json:"effective-includes,omitempty"`
 }
 
 // classifyRBFReject maps a checkRBFLocked error sentinel onto the Bitcoin Core
@@ -870,16 +893,22 @@ type FeeInfo struct {
 // report for the same condition. The categories here are exactly the ones the
 // RBF differential harness normalises against:
 //
-//   - Rule 3 (lower absolute fee) AND Rule 4 (insufficient fee bump) both
-//     surface as "insufficient fee" in Core (rbf.cpp:109-123 → the
-//     ReplacementChecks "insufficient fee" state in validation.cpp). blockbrew
-//     folds both into ErrRBFInsufficientFee, as does the feerate-diagram gate.
+//   - Rule 3 / Rule 4 ("insufficient fee"), Rule 5 ("too many potential
+//     replacements") and the feerate diagram ("replacement-failed") come back
+//     as mempool.RBFRejectError carrying Core's reason (validation.cpp
+//     ReplacementChecks); its Reason is used as is.
 //   - A non-signaling conflict with full-RBF disabled is Core
 //     "txn-mempool-conflict" (validation.cpp PreChecks).
 //   - Rule 2 (new unconfirmed input) → "replacement-adds-unconfirmed".
 //   - Rule 5 (too many candidates) → "too many potential replacements".
 //   - Spending a conflicting tx → "bad-txns-spends-conflicting-tx".
+//   - CheckMemPoolPolicyLimits (the cluster the replacement would join is
+//     past a limit) → "too-large-cluster" (validation.cpp ReplacementChecks).
 func classifyRBFReject(err error) string {
+	var rej *mempool.RBFRejectError
+	if errors.As(err, &rej) {
+		return rej.Reason
+	}
 	switch {
 	case errors.Is(err, mempool.ErrRBFInsufficientFee),
 		errors.Is(err, mempool.ErrRBFFeerateDiagram):
@@ -892,6 +921,8 @@ func classifyRBFReject(err error) string {
 		return "too many potential replacements"
 	case errors.Is(err, mempool.ErrRBFAncestorConflict):
 		return "bad-txns-spends-conflicting-tx"
+	case errors.Is(err, mempool.ErrClusterTooLarge):
+		return "too-large-cluster"
 	default:
 		// Any other conflict condition (e.g. unresolved inputs) — report the
 		// generic conflict token rather than an opaque error string.
@@ -912,7 +943,11 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 	// Parse raw transactions array
 	rawTxsArg, ok := args[0].([]interface{})
 	if !ok {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "rawtxs must be an array"}
+		return nil, wrongTypeError(1, "rawtxs", args[0], "array")
+	}
+	// Core (rpc/mempool.cpp): 1..MAX_PACKAGE_COUNT (25) members.
+	if len(rawTxsArg) < 1 || len(rawTxsArg) > 25 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Array must contain between 1 and 25 transactions."}
 	}
 
 	// Parse optional maxfeerate (BTC/kvB)
@@ -928,6 +963,9 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 	}
 
 	results := make([]*TestMempoolAcceptResult, 0, len(rawTxsArg))
+	// Core (rpc/mempool.cpp) stops at the first member that fails: the ones
+	// after it are left unvalidated and carry only txid and wtxid.
+	exitEarly := false
 
 	for _, rawTxInterface := range rawTxsArg {
 		rawTxHex, ok := rawTxInterface.(string)
@@ -954,6 +992,13 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		result.TxID = txHash.String()
 		// Core always emits wtxid (mempool.cpp:359), even when wtxid == txid.
 		result.WTxID = tx.WTxHash().String()
+
+		if n := len(results); exitEarly || (n > 0 && !results[n-1].Allowed) {
+			exitEarly = true
+			result.unfinished = true
+			results = append(results, result)
+			continue
+		}
 
 		// Check if already in mempool
 		if s.mempool.HasTransaction(txHash) {
@@ -1088,6 +1133,16 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 				results = append(results, result)
 				continue
 			}
+		}
+
+		// Core PreChecks "txn-already-known": any output already a coin means
+		// the tx is confirmed. Runs before input lookup, which would otherwise
+		// say missing-inputs for a tx whose parents were spent on commit.
+		if s.mempool.TxOutputsInUTXOSet(tx) {
+			result.Allowed = false
+			result.RejectReason = "txn-already-known"
+			results = append(results, result)
+			continue
 		}
 
 		// Look up each input's UTXO, building a prevout VIEW (outpoint -> full
@@ -1247,6 +1302,32 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if conflicts, rbfErr := s.mempool.TestReplacement(tx); conflicts && rbfErr != nil {
 			result.Allowed = false
 			result.RejectReason = classifyRBFReject(rbfErr)
+			var rej *mempool.RBFRejectError
+			if errors.As(rbfErr, &rej) {
+				result.RejectDetails = rej.Error()
+			} else if errors.Is(rbfErr, mempool.ErrClusterTooLarge) {
+				// Core: state.Invalid(TX_MEMPOOL_POLICY, "too-large-cluster", ""),
+				// so ToString() is the bare reason.
+				result.RejectDetails = "too-large-cluster"
+			}
+			results = append(results, result)
+			continue
+		}
+
+		// PolicyScriptChecks / ConsensusScriptChecks (validation.cpp): Core's
+		// test accept evaluates every input script after the RBF checks, so
+		// an invalid signature is refused with
+		// mempool-script-verify-flag-failed. The dry-run used to stop short
+		// of the scripts and report such a tx allowed with fees.
+		if err := s.mempool.CheckInputScripts(tx, prevoutView); err != nil {
+			result.Allowed = false
+			var se *mempool.ScriptCheckError
+			if errors.As(err, &se) {
+				result.RejectReason = se.Reason
+				result.RejectDetails = se.Error()
+			} else {
+				result.RejectReason = err.Error()
+			}
 			results = append(results, result)
 			continue
 		}
@@ -1263,8 +1344,12 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		// Transaction passed validation
 		result.Allowed = true
 		result.VSize = vsize
+		// Core CFeeRate(fee, vsize).GetFeePerK(): sat/kvB, rounded down.
+		effFeerate := float64(fee*1000/vsize) / satoshiPerBitcoin
 		result.Fees = &FeeInfo{
-			Base: float64(fee) / satoshiPerBitcoin,
+			Base:              float64(fee) / satoshiPerBitcoin,
+			EffectiveFeerate:  &effFeerate,
+			EffectiveIncludes: []string{result.WTxID},
 		}
 		results = append(results, result)
 	}
@@ -1749,6 +1834,16 @@ func (s *Server) addressNetwork() address.Network {
 
 // jsonTypeName names a decoded JSON value with Core's UniValue type
 // vocabulary, used in the -3 timestamp type error (uvTypeName).
+// wrongTypeError is Core's RPCTypeCheckArgument failure: RPC_TYPE_ERROR (-3)
+// with the "Wrong type passed" body naming the 1-based position and argument.
+func wrongTypeError(pos int, name string, v interface{}, want string) *RPCError {
+	return &RPCError{
+		Code: RPCErrTypeError,
+		Message: fmt.Sprintf("Wrong type passed:\n{\n    \"Position %d (%s)\": \"JSON value of type %s is not of expected type %s\"\n}",
+			pos, name, jsonTypeName(v), want),
+	}
+}
+
 func jsonTypeName(v interface{}) string {
 	switch v.(type) {
 	case nil:

@@ -273,7 +273,15 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 
 	verbosity := 1 // Default verbosity
 	if len(args) >= 2 {
-		if v, ok := args[1].(float64); ok {
+		switch v := args[1].(type) {
+		case bool:
+			// Core ParseVerbosity(allow_bool=true): false=0 (hex), true=1.
+			if v {
+				verbosity = 1
+			} else {
+				verbosity = 0
+			}
+		case float64:
 			// Conversion before the block lookup: this answered -5
 			// "Block not found" for a value Core refuses with -1.
 			n, rpcErr := coreGetIntArg(v)
@@ -318,7 +326,7 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 	}
 
 	// Verbosity 0: return hex-encoded block
-	if verbosity == 0 {
+	if verbosity <= 0 {
 		var buf bytes.Buffer
 		if err := block.Serialize(&buf); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: "Failed to serialize block"}
@@ -393,7 +401,7 @@ func (s *Server) handleGetBlock(params json.RawMessage) (interface{}, *RPCError)
 			if blockUndo != nil && i > 0 && i-1 < len(blockUndo.TxUndos) {
 				txUndo = &blockUndo.TxUndos[i-1]
 			}
-			txList = append(txList, buildGetBlockTxJSON(tx, i == 0, txUndo, s.getNetwork()))
+			txList = append(txList, buildGetBlockTxJSON(tx, i == 0, txUndo, verbosity >= 3, s.getNetwork()))
 		}
 	}
 
@@ -622,11 +630,15 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid block hash"}
 	}
 
+	// RPCTypeCheckArgument runs before the handler body: a non-bool verbose
+	// is -3, ahead of the hash parse and the lookup.
 	verbose := true
-	if len(args) >= 2 {
-		if v, ok := args[1].(bool); ok {
-			verbose = v
+	if len(args) >= 2 && args[1] != nil {
+		v, ok := args[1].(bool)
+		if !ok {
+			return nil, wrongTypeError(2, "verbose", args[1], "bool")
 		}
+		verbose = v
 	}
 
 	// ParseHashV(blockhash): malformed hash -> -8 at the parse boundary,
@@ -1043,22 +1055,6 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hex string"}
 	}
 
-	// Parse maxfeerate parameter (optional, default 0.10 BTC/kvB)
-	// 0 means no limit
-	maxFeeRate := 0.10 * satoshiPerBitcoin // Default: 0.10 BTC/kvB = 10,000,000 sat/kvB
-	if len(args) >= 2 {
-		switch v := args[1].(type) {
-		case float64:
-			maxFeeRate = v * satoshiPerBitcoin // Convert from BTC/kvB to sat/kvB
-		case string:
-			// Some clients may pass as string
-			var f float64
-			if _, err := fmt.Sscanf(v, "%f", &f); err == nil {
-				maxFeeRate = f * satoshiPerBitcoin
-			}
-		}
-	}
-
 	// Core's DecodeHexTx (rpc/mempool.cpp:96): bad hex, trailing bytes and
 	// undecodable txs all give the same -22.
 	txBytes, err := hex.DecodeString(hexStr)
@@ -1068,6 +1064,18 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 	tx, err := decodeRawTxBytes(txBytes, true, true)
 	if err != nil {
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: "TX decode failed. Make sure the tx has at least one input."}
+	}
+
+	// maxfeerate is an AMOUNT (AmountFromValue): a string that is not an
+	// amount is -3 "Invalid amount", not a silent fall back to the default.
+	// 0 means no limit; default 0.10 BTC/kvB.
+	maxFeeRate := 0.10 * satoshiPerBitcoin
+	if len(args) >= 2 && args[1] != nil {
+		sats, rerr := amountFromValue(args[1])
+		if rerr != nil {
+			return nil, rerr
+		}
+		maxFeeRate = float64(sats) // BTC/kvB in sats == sat/kvB
 	}
 
 	txid := tx.TxHash()
@@ -1090,8 +1098,31 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		return txid.String(), nil
 	}
 
-	// Add to mempool via AcceptToMemoryPool (canonical Bitcoin Core entry point)
-	if err := s.mempool.AcceptToMemoryPool(tx); err != nil {
+	// Core BroadcastTransaction (node/transaction.cpp): a tx not in the
+	// mempool whose outputs already exist in the UTXO set is confirmed.
+	if s.mempool.TxOutputsInUTXOSet(tx) {
+		return nil, &RPCError{Code: RPCErrVerifyAlreadyInUTXOSet, Message: "Transaction outputs already in utxo set"}
+	}
+
+	// Add to mempool via AcceptToMemoryPool (canonical Bitcoin Core entry
+	// point). An RPC tx with missing inputs is refused, never orphaned.
+	if err := s.mempool.AcceptToMemoryPoolNoOrphan(tx); err != nil {
+		// A refused replacement is Core's MEMPOOL_REJECTED:
+		// RPC_TRANSACTION_REJECTED (-26) with state.ToString().
+		var rej *mempool.RBFRejectError
+		if errors.As(err, &rej) {
+			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: rej.Error()}
+		}
+		// CheckMemPoolPolicyLimits: TX_MEMPOOL_POLICY "too-large-cluster"
+		// with no debug message, also MEMPOOL_REJECTED.
+		if errors.Is(err, mempool.ErrClusterTooLarge) {
+			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: "too-large-cluster"}
+		}
+		// TX_MISSING_INPUTS is TransactionError::MISSING_INPUTS: -25 with
+		// state.ToString(), the bare reject token.
+		if errors.Is(err, mempool.ErrMissingInputs) {
+			return nil, &RPCError{Code: RPCErrVerify, Message: "bad-txns-inputs-missingorspent"}
+		}
 		return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Transaction rejected: %v", err)}
 	}
 
@@ -1526,9 +1557,12 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 
 	for i, p := range peers {
 		services := p.Services()
-		connType := "outbound-full-relay"
-		if p.Inbound() {
-			connType = "inbound"
+		connType := s.peerMgr.ConnTypeName(p.Address())
+		if connType == "" {
+			connType = "outbound-full-relay"
+			if p.Inbound() {
+				connType = "inbound"
+			}
 		}
 		mappedAS := s.peerMgr.GetMappedASForAddr(p.Address())
 		presyncedHeaders := int32(-1)

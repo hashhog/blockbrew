@@ -489,8 +489,11 @@ func TestRBFRule4PassesWithSufficientBump(t *testing.T) {
 
 // ---- Boundary: MAX_REPLACEMENT_CANDIDATES eviction count -------------------
 
-// TestRBFRule5MaxReplacementCandidates verifies that attempting to evict more
-// than MaxRBFReplacedTxs (100) transactions is rejected.
+// TestRBFRule5MaxReplacementCandidates verifies that evicting more than
+// MaxRBFReplacedTxs (100) transactions from ONE conflicting cluster passes
+// Rule 5. Core 31 GetEntriesForConflicts (policy/rbf.cpp) counts the distinct
+// clusters of the direct conflicts, not the evicted transactions; the BIP125
+// eviction count this test used to assert is gone.
 func TestRBFRule5MaxReplacementCandidates(t *testing.T) {
 	utxoSet := newTestUTXOSet()
 
@@ -531,16 +534,16 @@ func TestRBFRule5MaxReplacementCandidates(t *testing.T) {
 		prevHash = descHash
 	}
 
-	// Replacement conflicts only with the root (hashConflict), but eviction
-	// would include all 100 descendants → 101 total.
+	// Replacement conflicts only with the root (hashConflict): one cluster,
+	// although eviction would include all 100 descendants → 101 total.
 	replacement := makeRBFTx([]wire.OutPoint{opSeed}, 5_000_000)
 	conflicts := map[wire.Hash256]bool{hashConflict: true}
 
 	err := mp.checkRBFLocked(replacement, conflicts, 10_000_000)
 	mp.mu.Unlock()
 
-	if !errors.Is(err, ErrRBFTooManyConflicts) {
-		t.Fatalf("expected ErrRBFTooManyConflicts for 101-eviction scenario, got: %v", err)
+	if errors.Is(err, ErrRBFTooManyConflicts) {
+		t.Fatalf("101 evictions from one conflicting cluster must pass Rule 5, got: %v", err)
 	}
 }
 

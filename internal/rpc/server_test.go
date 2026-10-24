@@ -2075,3 +2075,30 @@ func TestGetMempoolInfoMaxMempoolFollowsConfig(t *testing.T) {
 		t.Errorf("getmempoolinfo.maxmempool = %v, want 5000000", result["maxmempool"])
 	}
 }
+
+// getpeerinfo must report block-relay-only peers as such, not as
+// outbound-full-relay (anything counting full-relay peers reads this field).
+func TestGetPeerInfoConnectionTypePerPeer(t *testing.T) {
+	params := consensus.RegtestParams()
+	pm := p2p.NewPeerManager(p2p.PeerManagerConfig{ChainParams: params})
+	pm.InsertConnectedPeerWithType(p2p.NewTestPeer("192.168.1.5:8333", 800000), p2p.ConnFullRelay)
+	pm.InsertConnectedPeerWithType(p2p.NewTestPeer("192.168.1.6:8333", 800000), p2p.ConnBlockRelayOnly)
+
+	server := NewServer(
+		RPCConfig{ListenAddr: "127.0.0.1:0"},
+		WithChainParams(params),
+		WithPeerManager(pm),
+	)
+	resp := testRPCRequest(t, server.handleRPC, "getpeerinfo", []interface{}{}, "", "")
+	if resp.Error != nil {
+		t.Fatalf("unexpected error: %v", resp.Error)
+	}
+	got := map[string]string{}
+	for _, raw := range resp.Result.([]interface{}) {
+		m := raw.(map[string]interface{})
+		got[m["addr"].(string)], _ = m["connection_type"].(string)
+	}
+	if got["192.168.1.5:8333"] != "outbound-full-relay" || got["192.168.1.6:8333"] != "block-relay-only" {
+		t.Errorf("connection_type = %v, want full-relay and block-relay-only", got)
+	}
+}

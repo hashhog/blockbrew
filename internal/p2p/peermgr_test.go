@@ -1,6 +1,7 @@
 package p2p
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"testing"
@@ -738,5 +739,28 @@ func TestPeerManagerCleanupBans(t *testing.T) {
 	}
 	if !active {
 		t.Error("active ban should not have been cleaned up")
+	}
+}
+
+// getpeerinfo's connection_type comes from ConnTypeName; every outbound peer
+// used to be reported as "outbound-full-relay", so block-relay-only peers were
+// counted as full-relay by anything reading getpeerinfo.
+func TestConnTypeNameMatchesCoreStrings(t *testing.T) {
+	pm := NewPeerManager(PeerManagerConfig{})
+	want := map[ConnType]string{
+		ConnFullRelay:      "outbound-full-relay",
+		ConnBlockRelayOnly: "block-relay-only",
+		ConnFeeler:         "feeler",
+		ConnManual:         "manual",
+		ConnInbound:        "inbound",
+	}
+	i := 0
+	for ct, name := range want {
+		i++
+		addr := fmt.Sprintf("10.0.0.%d:8333", i)
+		pm.InsertConnectedPeerWithType(&Peer{addr: addr}, ct)
+		if got := pm.ConnTypeName(addr); got != name {
+			t.Errorf("ConnTypeName(%v) = %q, want %q", ct, got, name)
+		}
 	}
 }

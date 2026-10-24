@@ -560,7 +560,8 @@ func buildDecodeRawTxJSON(tx *wire.MsgTx, net address.Network) *omap {
 		Set("vout", vout)
 }
 
-// buildGetBlockTxJSON builds the per-tx JSON for getblock verbosity=2.
+// buildGetBlockTxJSON builds the per-tx JSON for getblock verbosity>=2
+// (showPrevout adds vin[].prevout for verbosity>=3).
 //
 // Mirrors Bitcoin Core's TxToUniv(tx, block_hash=null, include_hex=true, txundo, verbosity=SHOW_DETAILS)
 // in core_io.cpp. Key properties vs buildDecodeRawTxJSON:
@@ -570,7 +571,7 @@ func buildDecodeRawTxJSON(tx *wire.MsgTx, net address.Network) *omap {
 //   - `confirmations`, `time`, `blocktime` are NOT emitted (those are getrawtransaction extras)
 //   - Coinbase vin emits `txinwitness` array if present (TxToUniv always checks this)
 //   - Non-coinbase vin always emits `scriptSig: {asm, hex}` even when empty
-func buildGetBlockTxJSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo, net address.Network) *omap {
+func buildGetBlockTxJSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo, showPrevout bool, net address.Network) *omap {
 	// Serialize for size/weight
 	var buf bytes.Buffer
 	tx.Serialize(&buf)
@@ -605,6 +606,16 @@ func buildGetBlockTxJSON(tx *wire.MsgTx, isCoinbase bool, txUndo *storage.TxUndo
 				witness[j] = hex.EncodeToString(w)
 			}
 			vinObj.Set("txinwitness", witness)
+		}
+		// prevout sits between txinwitness and sequence (core_io.cpp), and is
+		// emitted only for getblock verbosity >= 3 with undo data.
+		if showPrevout && !isCoinbase && haveUndo && i < len(txUndo.SpentCoins) {
+			spent := &txUndo.SpentCoins[i]
+			vinObj.Set("prevout", newOMap().
+				Set("generated", spent.Coinbase).
+				Set("height", spent.Height).
+				Set("value", btcAmount(spent.TxOut.Value)).
+				Set("scriptPubKey", scriptPubKeyToUniv(spent.TxOut.PkScript, net)))
 		}
 		vinObj.Set("sequence", in.Sequence)
 		vin[i] = vinObj
