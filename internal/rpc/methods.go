@@ -2008,10 +2008,16 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 		return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Template generation failed: %v", err)}
 	}
 
-	// Build transaction list. Per-tx sigops cost comes from the template's
-	// TxSigOpsCost slice (parallel to non-coinbase txs); see mining.selectTransactions.
+	// Build transaction list (Core rpc/mining.cpp:897-935). Per-tx fee and
+	// sigops cost come from the template's TxFees / TxSigOpsCost slices
+	// (parallel to non-coinbase txs); see mining.selectPackages. depends lists,
+	// for every input, the block index of its prevout's tx when that tx is
+	// earlier in the block (setTxIndex; the coinbase is index 0).
 	txs := make([]BlockTemplateTx, 0, len(template.Block.Transactions)-1)
+	txIndex := make(map[wire.Hash256]int, len(template.Block.Transactions))
 	for i, tx := range template.Block.Transactions {
+		txHash := tx.TxHash()
+		txIndex[txHash] = i
 		if i == 0 {
 			continue // Skip coinbase
 		}
@@ -2019,17 +2025,27 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 		var buf bytes.Buffer
 		tx.Serialize(&buf)
 
-		var sigOps int64
-		if idx := i - 1; idx >= 0 && idx < len(template.TxSigOpsCost) {
+		depends := []int{}
+		for _, in := range tx.TxIn {
+			if idx, ok := txIndex[in.PreviousOutPoint.Hash]; ok {
+				depends = append(depends, idx)
+			}
+		}
+
+		var sigOps, fee int64
+		if idx := i - 1; idx < len(template.TxSigOpsCost) {
 			sigOps = template.TxSigOpsCost[idx]
+		}
+		if idx := i - 1; idx < len(template.TxFees) {
+			fee = template.TxFees[idx]
 		}
 
 		txs = append(txs, BlockTemplateTx{
 			Data:    hex.EncodeToString(buf.Bytes()),
-			TxID:    tx.TxHash().String(),
+			TxID:    txHash.String(),
 			Hash:    tx.WTxHash().String(),
-			Depends: []int{}, // Simplified
-			Fee:     0,       // Would need fee tracking per tx
+			Depends: depends,
+			Fee:     fee,
 			SigOps:  sigOps,
 			Weight:  int64(consensus.CalcTxWeight(tx)),
 		})
@@ -2039,10 +2055,15 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 	target := consensus.CompactToBig(template.Block.Header.Bits)
 	targetHex := fmt.Sprintf("%064x", target)
 
-	// Build witness commitment hex if present
+	// default_witness_commitment is the coinbase commitment output script
+	// the miner places verbatim: OP_RETURN, push 36, aa21a9ed, 32-byte
+	// commitment (Core rpc/mining.cpp:1028-1031, validation.cpp
+	// GenerateCoinbaseCommitment).
 	var witnessCommitment string
 	if template.WitnessCommitment != nil {
-		witnessCommitment = hex.EncodeToString(template.WitnessCommitment)
+		commitScript := append([]byte{0x6a, 0x24}, consensus.WitnessCommitmentMagic...)
+		commitScript = append(commitScript, template.WitnessCommitment...)
+		witnessCommitment = hex.EncodeToString(commitScript)
 	}
 
 	// Build rules[] and vbavailable{} per BIP-9 / Core rpc/mining.cpp:950-983.
