@@ -1101,6 +1101,17 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 
 	// Add to mempool via AcceptToMemoryPool (canonical Bitcoin Core entry point)
 	if err := s.mempool.AcceptToMemoryPool(tx); err != nil {
+		// A refused replacement is Core's MEMPOOL_REJECTED:
+		// RPC_TRANSACTION_REJECTED (-26) with state.ToString().
+		var rej *mempool.RBFRejectError
+		if errors.As(err, &rej) {
+			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: rej.Error()}
+		}
+		// CheckMemPoolPolicyLimits: TX_MEMPOOL_POLICY "too-large-cluster"
+		// with no debug message, also MEMPOOL_REJECTED.
+		if errors.Is(err, mempool.ErrClusterTooLarge) {
+			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: "too-large-cluster"}
+		}
 		return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Transaction rejected: %v", err)}
 	}
 
