@@ -717,6 +717,97 @@ func (s *Server) lookupCombineCoin(outpoint wire.OutPoint) *consensus.UTXOEntry 
 	return nil
 }
 
+// scriptHasValidOps mirrors Core's CScript::HasValidOps: every push opcode's
+// length prefix and payload must fit inside the script.
+func scriptHasValidOps(sc []byte) bool {
+	for i := 0; i < len(sc); {
+		op := sc[i]
+		i++
+		var n int
+		switch {
+		case op <= 0x4b:
+			n = int(op)
+		case op == 0x4c: // OP_PUSHDATA1
+			if i+1 > len(sc) {
+				return false
+			}
+			n = int(sc[i])
+			i++
+		case op == 0x4d: // OP_PUSHDATA2
+			if i+2 > len(sc) {
+				return false
+			}
+			n = int(sc[i]) | int(sc[i+1])<<8
+			i += 2
+		case op == 0x4e: // OP_PUSHDATA4
+			if i+4 > len(sc) {
+				return false
+			}
+			n = int(sc[i]) | int(sc[i+1])<<8 | int(sc[i+2])<<16 | int(sc[i+3])<<24
+			i += 4
+		}
+		if n < 0 || n > len(sc)-i {
+			return false
+		}
+		i += n
+	}
+	return true
+}
+
+// txScriptsSane mirrors Core's CheckTxScriptsSanity (core_io.cpp).
+func txScriptsSane(tx *wire.MsgTx) bool {
+	coinbase := len(tx.TxIn) == 1 && tx.TxIn[0].PreviousOutPoint.Hash == (wire.Hash256{}) &&
+		tx.TxIn[0].PreviousOutPoint.Index == 0xffffffff
+	if !coinbase {
+		for _, in := range tx.TxIn {
+			if !scriptHasValidOps(in.SignatureScript) || len(in.SignatureScript) > 10000 {
+				return false
+			}
+		}
+	}
+	for _, out := range tx.TxOut {
+		if !scriptHasValidOps(out.PkScript) || len(out.PkScript) > 10000 {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeRawTxBytes mirrors Core's DecodeTx (core_io.cpp): the witness-extended
+// and legacy decodings are each only accepted when they consume every byte, so
+// trailing data is a failure. When both succeed the one passing the script
+// sanity check wins, the extended one on a tie.
+func decodeRawTxBytes(raw []byte, tryNoWitness, tryWitness bool) (*wire.MsgTx, error) {
+	var ext, leg *wire.MsgTx
+	if tryWitness {
+		t := &wire.MsgTx{}
+		r := bytes.NewReader(raw)
+		if t.Deserialize(r) == nil && r.Len() == 0 {
+			ext = t
+		}
+	}
+	if ext != nil && txScriptsSane(ext) {
+		return ext, nil
+	}
+	if tryNoWitness {
+		t := &wire.MsgTx{}
+		r := bytes.NewReader(raw)
+		if t.DeserializeNoWitness(r) == nil && r.Len() == 0 {
+			leg = t
+		}
+	}
+	if leg != nil && txScriptsSane(leg) {
+		return leg, nil
+	}
+	if ext != nil {
+		return ext, nil
+	}
+	if leg != nil {
+		return leg, nil
+	}
+	return nil, fmt.Errorf("TX decode failed")
+}
+
 // decodeCombineVariant decodes one hex-encoded raw tx for combinerawtransaction,
 // mirroring Core's DecodeHexTx default (try_no_witness=false, try_witness=true):
 // witness-extended decoding is attempted first; if that fails to consume the
@@ -768,7 +859,7 @@ type TestMempoolAcceptResult struct {
 	Fees         *FeeInfo `json:"fees,omitempty"`
 	RejectReason string   `json:"reject-reason,omitempty"`
 	// RejectDetails is Core's TxValidationState::ToString(). Only the script
-	// checks fill it so far.
+	// and replacement checks fill it so far.
 	RejectDetails string `json:"reject-details,omitempty"`
 
 	// unfinished marks a package member left unvalidated after an earlier
@@ -791,6 +882,10 @@ func (r *TestMempoolAcceptResult) MarshalJSON() ([]byte, error) {
 // FeeInfo contains fee information for testmempoolaccept.
 type FeeInfo struct {
 	Base float64 `json:"base"`
+	// EffectiveFeerate (BTC/kvB) and EffectiveIncludes (wtxids) are Core's
+	// single-transaction values: the tx's own CFeeRate and its own wtxid.
+	EffectiveFeerate  *float64 `json:"effective-feerate,omitempty"`
+	EffectiveIncludes []string `json:"effective-includes,omitempty"`
 }
 
 // classifyRBFReject maps a checkRBFLocked error sentinel onto the Bitcoin Core
@@ -798,16 +893,22 @@ type FeeInfo struct {
 // report for the same condition. The categories here are exactly the ones the
 // RBF differential harness normalises against:
 //
-//   - Rule 3 (lower absolute fee) AND Rule 4 (insufficient fee bump) both
-//     surface as "insufficient fee" in Core (rbf.cpp:109-123 → the
-//     ReplacementChecks "insufficient fee" state in validation.cpp). blockbrew
-//     folds both into ErrRBFInsufficientFee, as does the feerate-diagram gate.
+//   - Rule 3 / Rule 4 ("insufficient fee"), Rule 5 ("too many potential
+//     replacements") and the feerate diagram ("replacement-failed") come back
+//     as mempool.RBFRejectError carrying Core's reason (validation.cpp
+//     ReplacementChecks); its Reason is used as is.
 //   - A non-signaling conflict with full-RBF disabled is Core
 //     "txn-mempool-conflict" (validation.cpp PreChecks).
 //   - Rule 2 (new unconfirmed input) → "replacement-adds-unconfirmed".
 //   - Rule 5 (too many candidates) → "too many potential replacements".
 //   - Spending a conflicting tx → "bad-txns-spends-conflicting-tx".
+//   - CheckMemPoolPolicyLimits (the cluster the replacement would join is
+//     past a limit) → "too-large-cluster" (validation.cpp ReplacementChecks).
 func classifyRBFReject(err error) string {
+	var rej *mempool.RBFRejectError
+	if errors.As(err, &rej) {
+		return rej.Reason
+	}
 	switch {
 	case errors.Is(err, mempool.ErrRBFInsufficientFee),
 		errors.Is(err, mempool.ErrRBFFeerateDiagram):
@@ -820,6 +921,8 @@ func classifyRBFReject(err error) string {
 		return "too many potential replacements"
 	case errors.Is(err, mempool.ErrRBFAncestorConflict):
 		return "bad-txns-spends-conflicting-tx"
+	case errors.Is(err, mempool.ErrClusterTooLarge):
+		return "too-large-cluster"
 	default:
 		// Any other conflict condition (e.g. unresolved inputs) — report the
 		// generic conflict token rather than an opaque error string.
@@ -840,7 +943,11 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 	// Parse raw transactions array
 	rawTxsArg, ok := args[0].([]interface{})
 	if !ok {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "rawtxs must be an array"}
+		return nil, wrongTypeError(1, "rawtxs", args[0], "array")
+	}
+	// Core (rpc/mempool.cpp): 1..MAX_PACKAGE_COUNT (25) members.
+	if len(rawTxsArg) < 1 || len(rawTxsArg) > 25 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Array must contain between 1 and 25 transactions."}
 	}
 
 	// Parse optional maxfeerate (BTC/kvB)
@@ -880,8 +987,8 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %s Make sure the tx has at least one input.", rawTxHex)}
 		}
 
-		tx := &wire.MsgTx{}
-		if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
+		tx, err := decodeRawTxBytes(txBytes, true, true)
+		if err != nil {
 			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %s Make sure the tx has at least one input.", rawTxHex)}
 		}
 
@@ -1030,6 +1137,16 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 				results = append(results, result)
 				continue
 			}
+		}
+
+		// Core PreChecks "txn-already-known": any output already a coin means
+		// the tx is confirmed. Runs before input lookup, which would otherwise
+		// say missing-inputs for a tx whose parents were spent on commit.
+		if s.mempool.TxOutputsInUTXOSet(tx) {
+			result.Allowed = false
+			result.RejectReason = "txn-already-known"
+			results = append(results, result)
+			continue
 		}
 
 		// Look up each input's UTXO, building a prevout VIEW (outpoint -> full
@@ -1189,6 +1306,14 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if conflicts, rbfErr := s.mempool.TestReplacement(tx); conflicts && rbfErr != nil {
 			result.Allowed = false
 			result.RejectReason = classifyRBFReject(rbfErr)
+			var rej *mempool.RBFRejectError
+			if errors.As(rbfErr, &rej) {
+				result.RejectDetails = rej.Error()
+			} else if errors.Is(rbfErr, mempool.ErrClusterTooLarge) {
+				// Core: state.Invalid(TX_MEMPOOL_POLICY, "too-large-cluster", ""),
+				// so ToString() is the bare reason.
+				result.RejectDetails = "too-large-cluster"
+			}
 			results = append(results, result)
 			continue
 		}
@@ -1223,8 +1348,12 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		// Transaction passed validation
 		result.Allowed = true
 		result.VSize = vsize
+		// Core CFeeRate(fee, vsize).GetFeePerK(): sat/kvB, rounded down.
+		effFeerate := float64(fee*1000/vsize) / satoshiPerBitcoin
 		result.Fees = &FeeInfo{
-			Base: float64(fee) / satoshiPerBitcoin,
+			Base:              float64(fee) / satoshiPerBitcoin,
+			EffectiveFeerate:  &effFeerate,
+			EffectiveIncludes: []string{result.WTxID},
 		}
 		results = append(results, result)
 	}
@@ -1814,6 +1943,16 @@ func (s *Server) addressNetwork() address.Network {
 
 // jsonTypeName names a decoded JSON value with Core's UniValue type
 // vocabulary, used in the -3 timestamp type error (uvTypeName).
+// wrongTypeError is Core's RPCTypeCheckArgument failure: RPC_TYPE_ERROR (-3)
+// with the "Wrong type passed" body naming the 1-based position and argument.
+func wrongTypeError(pos int, name string, v interface{}, want string) *RPCError {
+	return &RPCError{
+		Code: RPCErrTypeError,
+		Message: fmt.Sprintf("Wrong type passed:\n{\n    \"Position %d (%s)\": \"JSON value of type %s is not of expected type %s\"\n}",
+			pos, name, jsonTypeName(v), want),
+	}
+}
+
 func jsonTypeName(v interface{}) string {
 	switch v.(type) {
 	case nil:

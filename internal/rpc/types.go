@@ -26,6 +26,8 @@ const (
 	RPCErrWalletAlreadyExists     = -36    // Wallet already exists (Core protocol.h RPC_WALLET_ALREADY_EXISTS)
 	RPCErrDeserialization         = -22    // Error parsing or validating structure in raw format
 	RPCErrVerify                  = -25    // Error during verification
+	RPCErrVerifyAlreadyInUTXOSet  = -27    // Transaction outputs already in utxo set (Core RPC_VERIFY_ALREADY_IN_UTXO_SET)
+	RPCErrVerifyRejected          = -26    // Transaction or block rejected by network rules (Core RPC_TRANSACTION_REJECTED)
 	RPCErrInWarmup                = -28    // Client still warming up
 	RPCErrClientNodeNotConnected  = -29    // Node to disconnect not found in connected nodes
 	RPCErrClientP2PDisabled       = -31    // No valid connection manager instance found (Core protocol.h:64)
