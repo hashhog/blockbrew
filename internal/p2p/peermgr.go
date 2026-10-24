@@ -643,6 +643,24 @@ func (pm *PeerManager) InsertConnectedPeer(p *Peer) {
 	}
 }
 
+// InsertConnectedPeerWithType is InsertConnectedPeer for a peer of a given
+// connection type. Tests use it to drive getpeerinfo's connection_type.
+func (pm *PeerManager) InsertConnectedPeerWithType(p *Peer, ct ConnType) {
+	if pm == nil || p == nil {
+		return
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	if pm.peers == nil {
+		pm.peers = make(map[string]*PeerInfo)
+	}
+	pm.peers[p.Address()] = &PeerInfo{
+		peer:        p,
+		connType:    ct,
+		connectedAt: time.Now(),
+	}
+}
+
 // GetTotalBytes returns the cumulative bytes received and sent across the
 // node's P2P connections, for the `getnettotals` RPC.
 //
@@ -1172,6 +1190,21 @@ func (pm *PeerManager) GetConnType(addr string) ConnType {
 		return info.connType
 	}
 	return ConnInbound // Default
+}
+
+// ConnTypeName is the getpeerinfo connection_type string for a peer ("" when
+// the peer is unknown).
+func (pm *PeerManager) ConnTypeName(addr string) string {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	info, ok := pm.peers[addr]
+	if !ok {
+		return ""
+	}
+	if info.connType == ConnInbound {
+		return "inbound"
+	}
+	return "outbound-full-relay"
 }
 
 // String returns a string representation of the connection type.
