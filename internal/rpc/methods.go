@@ -1055,16 +1055,15 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hex string"}
 	}
 
-	// Decode hex
+	// Core's DecodeHexTx (rpc/mempool.cpp:96): bad hex, trailing bytes and
+	// undecodable txs all give the same -22.
 	txBytes, err := hex.DecodeString(hexStr)
 	if err != nil {
-		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Invalid hex encoding"}
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "TX decode failed. Make sure the tx has at least one input."}
 	}
-
-	// Deserialize transaction
-	tx := &wire.MsgTx{}
-	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
-		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %v", err)}
+	tx, err := decodeRawTxBytes(txBytes, true, true)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "TX decode failed. Make sure the tx has at least one input."}
 	}
 
 	// maxfeerate is an AMOUNT (AmountFromValue): a string that is not an
@@ -1175,14 +1174,25 @@ func (s *Server) handleDecodeRawTransaction(params json.RawMessage) (interface{}
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hex string"}
 	}
 
-	txBytes, err := hex.DecodeString(hexStr)
-	if err != nil {
-		return nil, &RPCError{Code: RPCErrDeserialization, Message: "Invalid hex encoding"}
+	// iswitness (Core rawtransaction.cpp decoderawtransaction): when given,
+	// only the witness (true) or only the legacy (false) decoding is tried.
+	tryWitness, tryNoWitness := true, true
+	if len(args) > 1 && args[1] != nil {
+		iswitness, ok := args[1].(bool)
+		if !ok {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "iswitness must be of type bool"}
+		}
+		tryWitness, tryNoWitness = iswitness, !iswitness
 	}
 
-	tx := &wire.MsgTx{}
-	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
-		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %v", err)}
+	txBytes, err := hex.DecodeString(hexStr)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "TX decode failed"}
+	}
+
+	tx, err := decodeRawTxBytes(txBytes, tryNoWitness, tryWitness)
+	if err != nil {
+		return nil, &RPCError{Code: RPCErrDeserialization, Message: "TX decode failed"}
 	}
 
 	// Use buildDecodeRawTxJSON (W55): full Core-parity output with
