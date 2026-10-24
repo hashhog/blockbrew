@@ -1535,9 +1535,12 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 
 	for i, p := range peers {
 		services := p.Services()
-		connType := "outbound-full-relay"
-		if p.Inbound() {
-			connType = "inbound"
+		connType := s.peerMgr.ConnTypeName(p.Address())
+		if connType == "" {
+			connType = "outbound-full-relay"
+			if p.Inbound() {
+				connType = "inbound"
+			}
 		}
 		mappedAS := s.peerMgr.GetMappedASForAddr(p.Address())
 		presyncedHeaders := int32(-1)
