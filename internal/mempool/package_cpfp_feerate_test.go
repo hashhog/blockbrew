@@ -348,3 +348,41 @@ func TestPackageRBFOnlyOneParentOneChild(t *testing.T) {
 		t.Errorf("err = %q, want %q", err, want)
 	}
 }
+
+// TestPackageReportsSigopAdjustedVSize: Core's package results and package
+// feerate use GetVirtualTransactionSize(weight, sigop cost, 20), not the
+// serialized vsize. A child with 30 bare 1-of-1 multisig outputs (20 legacy
+// sigops each, cost 2,400) has a sigop-adjusted vsize of 2,400*20/4 = 12,000
+// vB, far above its serialized size.
+func TestPackageReportsSigopAdjustedVSize(t *testing.T) {
+	mp, op := spendableMempool(0xf1, cpfpFunding)
+	parent := spendableTx(op, cpfpFunding-1, 1)
+	pub := make([]byte, 33)
+	pub[0] = 0x02
+	pub[32] = 0x01
+	multisig := append(append([]byte{0x51, 0x21}, pub...), 0x51, 0xae) // OP_1 <pub> OP_1 OP_CHECKMULTISIG
+	child := spendableTx(wire.OutPoint{Hash: parent.TxHash(), Index: 0}, 1_000, 31)
+	for i := 1; i < 31; i++ {
+		child.TxOut[i].PkScript = multisig
+	}
+	childFee := int64(50_000)
+	child.TxOut[0].Value = cpfpFunding - 1 - childFee - 30*1_000
+
+	res, err := mp.AcceptPackage([]*wire.MsgTx{parent, child})
+	if err != nil {
+		t.Fatalf("package refused: %v", err)
+	}
+	const wantChild = 2_400 * 20 / 4
+	if raw := (consensus.CalcTxWeight(child) + 3) / 4; raw >= wantChild {
+		t.Fatalf("fixture: serialized vsize %d is not below the sigop-adjusted %d", raw, wantChild)
+	}
+	if got := res.TxResults[child.WTxHash()].VSize; got != wantChild {
+		t.Errorf("child vsize = %d, want sigop-adjusted %d", got, wantChild)
+	}
+	if got := res.TxResults[parent.WTxHash()].VSize; got != 85 {
+		t.Errorf("parent vsize = %d, want 85", got)
+	}
+	if want := float64(1+childFee) / float64(85+wantChild); res.PackageFeerate != want {
+		t.Errorf("package feerate = %v, want %v (sigop-adjusted)", res.PackageFeerate, want)
+	}
+}
