@@ -840,7 +840,11 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 	// Parse raw transactions array
 	rawTxsArg, ok := args[0].([]interface{})
 	if !ok {
-		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "rawtxs must be an array"}
+		return nil, wrongTypeError(1, "rawtxs", args[0], "array")
+	}
+	// Core (rpc/mempool.cpp): 1..MAX_PACKAGE_COUNT (25) members.
+	if len(rawTxsArg) < 1 || len(rawTxsArg) > 25 {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Array must contain between 1 and 25 transactions."}
 	}
 
 	// Parse optional maxfeerate (BTC/kvB)
@@ -1705,6 +1709,16 @@ func (s *Server) addressNetwork() address.Network {
 
 // jsonTypeName names a decoded JSON value with Core's UniValue type
 // vocabulary, used in the -3 timestamp type error (uvTypeName).
+// wrongTypeError is Core's RPCTypeCheckArgument failure: RPC_TYPE_ERROR (-3)
+// with the "Wrong type passed" body naming the 1-based position and argument.
+func wrongTypeError(pos int, name string, v interface{}, want string) *RPCError {
+	return &RPCError{
+		Code: RPCErrTypeError,
+		Message: fmt.Sprintf("Wrong type passed:\n{\n    \"Position %d (%s)\": \"JSON value of type %s is not of expected type %s\"\n}",
+			pos, name, jsonTypeName(v), want),
+	}
+}
+
 func jsonTypeName(v interface{}) string {
 	switch v.(type) {
 	case nil:
