@@ -46,6 +46,9 @@ type BlockTemplate struct {
 	// CBlockTemplate::vTxSigOpsCost (see node/miner.cpp). Used by getblocktemplate
 	// to populate the per-tx `sigops` field.
 	TxSigOpsCost []int64
+	// TxFees is the per-tx fee in satoshis, parallel to TxSigOpsCost. Mirrors
+	// Core's CBlockTemplate::vTxFees; getblocktemplate's per-tx `fee`.
+	TxFees []int64
 	// MinTime is the minimum timestamp valid for the next block, per
 	// GetMinimumTime (Core node/miner.cpp:36-47). Always MTP+1; at difficulty
 	// adjustment boundaries also bounded below by prevBlock.time − MAX_TIMEWARP
@@ -230,8 +233,9 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 		utxoView = tg.utxoSrc.UTXOSet()
 	}
 
-	selectedTxs, txSigOpsCost, totalFees, totalSigOps := selectTransactions(
+	sel := selectPackages(
 		tg.mp, availableWeight, maxSigOps, newHeight, uint32(mtp), config.MinTxFeeRate, utxoView)
+	selectedTxs, totalFees := sel.txs, sel.totalFees
 
 	// 5. Calculate the subsidy. Use the NETWORK-AWARE halving interval from
 	// chain params (regtest halves every 150 blocks, not the mainnet 210,000)
@@ -292,10 +296,11 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 		},
 		Height:            newHeight,
 		Fees:              totalFees,
-		SigOpsCost:        totalSigOps,
+		SigOpsCost:        sel.totalSigOps,
 		CoinbaseValue:     coinbaseValue,
 		WitnessCommitment: witnessCommitment,
-		TxSigOpsCost:      txSigOpsCost,
+		TxSigOpsCost:      sel.sigOps,
+		TxFees:            sel.fees,
 		MinTime:           minTime,
 	}, nil
 }
@@ -303,25 +308,51 @@ func (tg *TemplateGenerator) GenerateTemplate(config TemplateConfig) (*BlockTemp
 // selectTransactions selects transactions from the mempool using the
 // ancestor fee rate algorithm (CPFP-aware). Returns the selected txs, a
 // parallel slice of per-tx sigops cost (sigops cost units, already scaled),
-// total fees, and total sigops cost.
+// total fees, and total sigops cost. See selectPackages.
+func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, blockHeight int32, lockTimeCutoff uint32, minFeeRate float64, utxoView consensus.UTXOView) ([]*wire.MsgTx, []int64, int64, int64) {
+	sel := selectPackages(mp, maxWeight, maxSigOps, blockHeight, lockTimeCutoff, minFeeRate, utxoView)
+	return sel.txs, sel.sigOps, sel.totalFees, sel.totalSigOps
+}
+
+// templateSelection is the result of selectPackages. txs, sigOps and fees are
+// parallel and in block order (coinbase excluded), mirroring Core's
+// CBlockTemplate vtx / vTxSigOpsCost / vTxFees.
+type templateSelection struct {
+	txs         []*wire.MsgTx
+	sigOps      []int64
+	fees        []int64
+	totalFees   int64
+	totalSigOps int64
+}
+
+// selectPackages walks the mempool by descending ancestor fee rate and, at
+// each entry's turn, adds the entry together with every in-mempool ancestor
+// not yet in the block, parents first. This is Core's BlockAssembler: a child
+// whose package outscores an unrelated tx goes in with its parents ahead of
+// that tx (node/miner.cpp addChunks: a chunk is added whole, in topological
+// order). The package is tested as a unit against the weight and sigops
+// limits (TestChunkBlockLimits) and every member must be final
+// (TestChunkTransactions); otherwise none of it is added.
 //
 // blockHeight and lockTimeCutoff are the height and MTP of the block being
-// built; they are forwarded to IsFinalTx to reject non-final transactions.
-// Core reference: TestChunkTransactions (miner.cpp:252-260).
+// built; they are forwarded to IsFinalTx.
 //
-// If utxoView is non-nil, sigops counting matches Bitcoin Core's
-// GetTransactionSigOpCost: legacy (vin+vout) scaled by 4 + P2SH redeem-script
-// sigops scaled by 4 + witness sigops (unscaled). If utxoView is nil, falls
-// back to the conservative output-script estimate so callers without a UTXO
-// view (e.g. early-init regtest tests) still get budget enforcement and
-// non-zero per-tx reporting.
-func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, blockHeight int32, lockTimeCutoff uint32, minFeeRate float64, utxoView consensus.UTXOView) ([]*wire.MsgTx, []int64, int64, int64) {
+// Per-tx sigops cost is GetTransactionSigOpCost: legacy (vin+vout) scaled by
+// 4 + P2SH redeem-script sigops scaled by 4 + witness sigops (unscaled).
+// Prevouts are resolved against the mempool's own outputs first and then
+// utxoView, the view Core uses when it stores the cost on the mempool entry
+// (validation.cpp PreChecks). With a nil utxoView only prevouts created by
+// mempool transactions resolve.
+func selectPackages(mp MempoolProvider, maxWeight, maxSigOps int64, blockHeight int32, lockTimeCutoff uint32, minFeeRate float64, utxoView consensus.UTXOView) templateSelection {
 	entries := mp.GetSortedByAncestorFeeRate()
 
-	var selected []*wire.MsgTx
-	var sigOpsCosts []int64
-	var totalFees int64
-	var totalSigOps int64
+	byHash := make(map[wire.Hash256]*mempool.TxEntry, len(entries))
+	for _, e := range entries {
+		byHash[e.TxHash] = e
+	}
+	view := &mempoolOutputsView{entries: byHash, base: utxoView}
+
+	var sel templateSelection
 	var totalWeight int64
 	included := make(map[wire.Hash256]bool)
 
@@ -329,112 +360,128 @@ func selectTransactions(mp MempoolProvider, maxWeight, maxSigOps int64, blockHei
 	// Core miner.cpp:284-316 — give up after MAX_CONSECUTIVE_FAILURES skips
 	// when the block is already close to full (within BLOCK_FULL_ENOUGH_WEIGHT_DELTA).
 	consecutiveFailed := 0
-
-	// Entries whose parents were not yet selected when their turn came.
-	// They passed the fee, weight, sigops and finality gates already.
-	var waiting []*mempool.TxEntry
-	add := func(entry *mempool.TxEntry, txWeight, txSigOps int64) {
-		selected = append(selected, entry.Tx)
-		sigOpsCosts = append(sigOpsCosts, txSigOps)
-		included[entry.TxHash] = true
-		totalFees += entry.Fee
-		totalWeight += txWeight
-		totalSigOps += txSigOps
+	fail := func() bool {
+		consecutiveFailed++
+		return consecutiveFailed > maxConsecutiveFailures &&
+			totalWeight+blockFullEnoughWeightDelta > maxWeight
 	}
 
 	for _, entry := range entries {
-		if entry.FeeRate < minFeeRate {
+		if included[entry.TxHash] {
+			continue // already added as an ancestor of an earlier package
+		}
+
+		pkg, ok := ancestorPackage(entry, byHash, included)
+		if !ok {
+			// An in-mempool parent the provider did not list: the child
+			// cannot be placed after it, so it cannot go in.
 			continue
 		}
 
-		txWeight := consensus.CalcTxWeight(entry.Tx)
+		var pkgFee, pkgSize, pkgWeight, pkgSigOps int64
+		weights := make([]int64, len(pkg))
+		sigOps := make([]int64, len(pkg))
+		final := true
+		for i, e := range pkg {
+			weights[i] = consensus.CalcTxWeight(e.Tx)
+			sigOps[i] = computeTxSigOpsCost(e.Tx, view)
+			pkgFee += e.Fee
+			pkgSize += e.Size
+			pkgWeight += weights[i]
+			pkgSigOps += sigOps[i]
+			// IsFinalTx check: reject non-final transactions.
+			// Core miner.cpp:252-260 TestChunkTransactions: each tx must pass
+			// IsFinalTx(tx, nHeight, m_lock_time_cutoff) where m_lock_time_cutoff
+			// = pindexPrev->GetMedianTimePast() (BIP-113).
+			if !consensus.IsFinalTx(e.Tx, blockHeight, lockTimeCutoff) {
+				final = false
+			}
+		}
 
-		// Weight limit: use >= to match Core's TestChunkBlockLimits.
+		// Package fee rate against the block minimum (Core compares the
+		// chunk's fee rate). For a lone tx this is its own fee rate.
+		pkgFeeRate := entry.FeeRate
+		if len(pkg) > 1 && pkgSize > 0 {
+			pkgFeeRate = float64(pkgFee) / float64(pkgSize)
+		}
+		if pkgFeeRate < minFeeRate {
+			continue
+		}
+
+		// Weight / sigops limits use >= to match Core's TestChunkBlockLimits.
 		// Core miner.cpp:241: if (nBlockWeight + chunk.size >= nBlockMaxWeight)
-		// Bug fixed: was > (strictly greater), allowing exactly-at-limit blocks.
-		if totalWeight+txWeight >= maxWeight {
-			consecutiveFailed++
-			if consecutiveFailed > maxConsecutiveFailures &&
-				totalWeight+blockFullEnoughWeightDelta > maxWeight {
-				break
-			}
-			continue
-		}
-
-		txSigOps := computeTxSigOpsCost(entry.Tx, utxoView)
-
-		// Sigops limit: use >= to match Core's TestChunkBlockLimits.
 		// Core miner.cpp:244: if (nBlockSigOpsCost + chunk_sigops_cost >= MAX_BLOCK_SIGOPS_COST)
-		// Bug fixed: was > (strictly greater), allowing exactly-at-limit blocks.
-		if totalSigOps+txSigOps >= maxSigOps {
-			consecutiveFailed++
-			if consecutiveFailed > maxConsecutiveFailures &&
-				totalWeight+blockFullEnoughWeightDelta > maxWeight {
+		if totalWeight+pkgWeight >= maxWeight || sel.totalSigOps+pkgSigOps >= maxSigOps || !final {
+			if fail() {
 				break
 			}
-			continue
-		}
-
-		// IsFinalTx check: reject non-final transactions.
-		// Core miner.cpp:252-260 TestChunkTransactions: each tx must pass
-		// IsFinalTx(tx, nHeight, m_lock_time_cutoff) where m_lock_time_cutoff
-		// = pindexPrev->GetMedianTimePast() (BIP-113).
-		// Bug fixed: IsFinalTx was never called during template building.
-		if !consensus.IsFinalTx(entry.Tx, blockHeight, lockTimeCutoff) {
-			consecutiveFailed++
-			if consecutiveFailed > maxConsecutiveFailures &&
-				totalWeight+blockFullEnoughWeightDelta > maxWeight {
-				break
-			}
-			continue
-		}
-
-		// Ensure all parent transactions are included
-		if !parentsIncluded(entry, included) {
-			// Not a failure of this tx: equal ancestor feerates sort in
-			// arbitrary order, so a child can come up before its parent.
-			// Park it and retry once the parent is in (Core selects whole
-			// ancestor packages, so a child never loses to its own parent's
-			// position).
-			waiting = append(waiting, entry)
 			continue
 		}
 
 		consecutiveFailed = 0
-		add(entry, txWeight, txSigOps)
-		// A parked child whose parents are now all in goes right after them.
-		for progress := true; progress; {
-			progress = false
-			for i := 0; i < len(waiting); i++ {
-				w := waiting[i]
-				if !parentsIncluded(w, included) {
-					continue
-				}
-				waiting = append(waiting[:i], waiting[i+1:]...)
-				i--
-				wWeight := consensus.CalcTxWeight(w.Tx)
-				wSigOps := computeTxSigOpsCost(w.Tx, utxoView)
-				if totalWeight+wWeight >= maxWeight || totalSigOps+wSigOps >= maxSigOps {
-					continue
-				}
-				add(w, wWeight, wSigOps)
-				progress = true
-			}
+		for i, e := range pkg {
+			sel.txs = append(sel.txs, e.Tx)
+			sel.sigOps = append(sel.sigOps, sigOps[i])
+			sel.fees = append(sel.fees, e.Fee)
+			sel.totalFees += e.Fee
+			sel.totalSigOps += sigOps[i]
+			totalWeight += weights[i]
+			included[e.TxHash] = true
 		}
 	}
 
-	return selected, sigOpsCosts, totalFees, totalSigOps
+	return sel
 }
 
-// parentsIncluded reports whether every in-mempool parent of entry is already
-// in the template.
-func parentsIncluded(entry *mempool.TxEntry, included map[wire.Hash256]bool) bool {
-	for _, dep := range entry.Depends {
-		if !included[dep] {
-			return false
+// ancestorPackage returns entry and every ancestor of it not yet included,
+// ordered so each parent precedes its children. ok is false when an ancestor
+// named in Depends is not among the mempool entries.
+func ancestorPackage(entry *mempool.TxEntry, byHash map[wire.Hash256]*mempool.TxEntry, included map[wire.Hash256]bool) ([]*mempool.TxEntry, bool) {
+	var pkg []*mempool.TxEntry
+	visited := make(map[wire.Hash256]bool)
+	ok := true
+	var visit func(e *mempool.TxEntry)
+	visit = func(e *mempool.TxEntry) {
+		if visited[e.TxHash] {
+			return
 		}
+		visited[e.TxHash] = true
+		for _, dep := range e.Depends {
+			if included[dep] {
+				continue
+			}
+			parent, found := byHash[dep]
+			if !found {
+				ok = false
+				continue
+			}
+			visit(parent)
+		}
+		pkg = append(pkg, e) // post-order: after all its parents
 	}
-	return true
+	visit(entry)
+	return pkg, ok
+}
+
+// mempoolOutputsView resolves an outpoint created by a mempool transaction
+// from that transaction, and any other outpoint from base (may be nil).
+type mempoolOutputsView struct {
+	entries map[wire.Hash256]*mempool.TxEntry
+	base    consensus.UTXOView
+}
+
+func (v *mempoolOutputsView) GetUTXO(op wire.OutPoint) *consensus.UTXOEntry {
+	if e, ok := v.entries[op.Hash]; ok {
+		if int(op.Index) < len(e.Tx.TxOut) {
+			out := e.Tx.TxOut[op.Index]
+			return &consensus.UTXOEntry{Amount: out.Value, PkScript: out.PkScript, Height: e.Height}
+		}
+		return nil
+	}
+	if v.base == nil {
+		return nil
+	}
+	return v.base.GetUTXO(op)
 }
 
 // computeTxSigOpsCost returns the BIP141 sigops cost for a transaction.
@@ -443,9 +490,7 @@ func parentsIncluded(entry *mempool.TxEntry, included map[wire.Hash256]bool) boo
 // redeem-script sigops (also scaled), plus witness sigops (unscaled).
 //
 // When utxoView is nil, only legacy sigops are counted (P2SH and witness
-// sigops require resolving the prevout's scriptPubKey). This is a conservative
-// over- or under-estimate depending on script type, but it keeps behavior
-// sensible in tests / pre-UTXO-init paths.
+// sigops require resolving the prevout's scriptPubKey).
 func computeTxSigOpsCost(tx *wire.MsgTx, utxoView consensus.UTXOView) int64 {
 	if consensus.IsCoinbaseTx(tx) {
 		return 0
