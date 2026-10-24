@@ -902,6 +902,41 @@ func (mp *Mempool) AcceptToMemoryPool(tx *wire.MsgTx) error {
 	return mp.AddTransactionFrom(tx, "")
 }
 
+// TxOutputsInUTXOSet reports whether any output of tx is already a coin in the
+// chainstate view, i.e. the tx is confirmed (Core BroadcastTransaction's
+// AccessCoin loop; MemPoolAccept::PreChecks "txn-already-known").
+func (mp *Mempool) TxOutputsInUTXOSet(tx *wire.MsgTx) bool {
+	if mp.utxoSet == nil {
+		return false
+	}
+	txid := tx.TxHash()
+	for i := range tx.TxOut {
+		if mp.utxoSet.GetUTXO(wire.OutPoint{Hash: txid, Index: uint32(i)}) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// AcceptToMemoryPoolNoOrphan is AcceptToMemoryPool for RPC submissions
+// (sendrawtransaction). Core's BroadcastTransaction calls ATMP, which never
+// enrols orphans (that is net_processing's job for P2P txs), so a tx with
+// missing inputs is refused with ErrMissingInputs and left out of the orphan
+// pool.
+func (mp *Mempool) AcceptToMemoryPoolNoOrphan(tx *wire.MsgTx) (retErr error) {
+	if consensus.IsAborted() {
+		return consensus.ErrNodeAborted
+	}
+	defer func() {
+		if retErr != nil && consensus.IsAborted() && !errors.Is(retErr, consensus.ErrNodeAborted) {
+			retErr = fmt.Errorf("%w (suppressed: %v)", consensus.ErrNodeAborted, retErr)
+		}
+	}()
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
+	return mp.acceptLocked(tx, "", acceptOpts{noOrphan: true})
+}
+
 // AcceptToMemoryPoolFrom is AcceptToMemoryPool with peer attribution. fromPeer
 // is the address of the peer that announced the tx (empty for locally-originated
 // / RPC txs). When the tx is parked in the orphan pool, fromPeer is recorded so
@@ -964,6 +999,11 @@ type acceptOpts struct {
 	// not consulted, because the orphan step drops mp.mu and the reorg update
 	// must hold it throughout.
 	reorg bool
+
+	// noOrphan refuses a tx with missing inputs instead of parking it in the
+	// orphan pool (RPC submissions; see AcceptToMemoryPoolNoOrphan). Unlike
+	// reorg it changes nothing else.
+	noOrphan bool
 }
 
 // acceptLocked is AddTransactionFrom's body. Must be called with mp.mu held.
@@ -1213,7 +1253,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	}
 
 	// If we have missing inputs, treat as orphan
-	if len(missingInputs) > 0 && opts.reorg {
+	if len(missingInputs) > 0 && (opts.reorg || opts.noOrphan) {
 		return fmt.Errorf("%w: %d missing inputs", ErrMissingInputs, len(missingInputs))
 	}
 	if len(missingInputs) > 0 {
