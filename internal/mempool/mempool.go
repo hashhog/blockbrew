@@ -3288,6 +3288,14 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 			evictedFull[descHash] = true
 		}
 	}
+	// Core runs CheckMemPoolPolicyLimits before the diagram
+	// (validation.cpp ReplacementChecks): the cluster the replacement would
+	// sit in, with the evictions applied, must stay within both limits.
+	// ProspectiveCluster counts only the component the replacement
+	// re-anchors to; a survivor the eviction cuts off is its own cluster.
+	if err := mp.clusters.CheckLimits(mp.clusterAdjWeightLocked(newTx), mp.mempoolParentsLocked(newTx), evictedFull); err != nil {
+		return err
+	}
 	if err := mp.checkRBFImprovesFeerateDiagramLocked(newTx, evictedFull, newFee, int64(newVSize)); err != nil {
 		// Core ReplacementChecks: state.Invalid(TX_RECONSIDERABLE,
 		// "replacement-failed", <ImprovesFeerateDiagram message>).
@@ -3567,7 +3575,10 @@ func (mp *Mempool) checkRBFImprovesFeerateDiagramLocked(
 	// side. Before this, a replacement conflicting with more than one
 	// cluster and spending only confirmed coins was left out of the "after"
 	// diagram, and could never improve it.
-	joined := make(map[uint64]bool)
+	// Within a joined cluster only the component the replacement's parents
+	// sit in after the eviction merges with it (the same component
+	// ProspectiveCluster counts); the rest becomes clusters of their own.
+	joined := make(map[uint64][]int)
 	for _, in := range newTx.TxIn {
 		parent := in.PreviousOutPoint.Hash
 		if _, inPool := mp.pool[parent]; !inPool || evicted[parent] {
@@ -3575,7 +3586,11 @@ func (mp *Mempool) checkRBFImprovesFeerateDiagramLocked(
 		}
 		if c := mp.clusters.GetCluster(parent); c != nil {
 			if _, ok := affectedClusters[c.ID]; ok {
-				joined[c.ID] = true
+				seeds := joined[c.ID]
+				if idx, ok := c.Transactions[parent]; ok {
+					seeds = append(seeds, idx)
+				}
+				joined[c.ID] = seeds
 			}
 		}
 	}
@@ -3588,21 +3603,30 @@ func (mp *Mempool) checkRBFImprovesFeerateDiagramLocked(
 	newSimIdx := make(map[wire.Hash256]int)
 	for _, cluster := range affectedClusters {
 		beforeChunks = append(beforeChunks, cluster.GetChunks()...)
-		if joined[cluster.ID] {
-			mp.addSurvivorsToSimLocked(cluster, evicted, newSim, newSimIdx)
-			// Core runs CheckMemPoolPolicyLimits before the diagram: a merged
-			// cluster past the count limit is too-large-cluster. Checked per
-			// cluster (each holds at most MaxClusterCount), so newSim never
-			// outgrows its 128-bit BitSet.
-			if newSim.TxCount()+1 > MaxClusterCount {
-				return ErrClusterTooLarge
+		var anchored BitSet
+		if seeds, ok := joined[cluster.ID]; ok {
+			survivors, _ := mp.clusters.survivingPositions(cluster, evicted)
+			// With no resolvable seed take every survivor, as
+			// ProspectiveCluster does.
+			anchored = survivors
+			if len(seeds) > 0 {
+				anchored = cluster.DepGraph.ComponentAfterRemoval(survivors, seeds)
 			}
-			continue
+			// The caller's CheckLimits bounds this component, with every
+			// other one merged in, by MaxClusterCount, so newSim stays
+			// within its BitSet.
+			mp.addSurvivorsToSimLocked(cluster, func(h wire.Hash256, idx int) bool {
+				return anchored.Has(idx)
+			}, newSim, newSimIdx)
 		}
 		sim := NewDepGraph()
 		simIdx := make(map[wire.Hash256]int)
-		mp.addSurvivorsToSimLocked(cluster, evicted, sim, simIdx)
-		afterChunks = append(afterChunks, simChunks(cluster.ID, sim, simIdx)...)
+		mp.addSurvivorsToSimLocked(cluster, func(h wire.Hash256, idx int) bool {
+			return !evicted[h] && !anchored.Has(idx)
+		}, sim, simIdx)
+		if len(simIdx) > 0 {
+			afterChunks = append(afterChunks, simChunks(cluster.ID, sim, simIdx)...)
+		}
 	}
 
 	newFR := FeeFrac{Fee: newFee, Size: int32(newVSize)}
@@ -3636,17 +3660,18 @@ func (mp *Mempool) checkRBFImprovesFeerateDiagramLocked(
 	return nil
 }
 
-// addSurvivorsToSimLocked adds the members of cluster that the replacement
-// does not evict to sim, parents before children (the cluster's
-// linearization is topological), with their in-pool spending edges.
-func (mp *Mempool) addSurvivorsToSimLocked(cluster *Cluster, evicted map[wire.Hash256]bool, sim *DepGraph, simIdx map[wire.Hash256]int) {
+// addSurvivorsToSimLocked adds the members of cluster that keep reports
+// true for (by txid and cluster position) to sim, parents before children
+// (the cluster's linearization is topological), with their in-pool
+// spending edges.
+func (mp *Mempool) addSurvivorsToSimLocked(cluster *Cluster, keep func(wire.Hash256, int) bool, sim *DepGraph, simIdx map[wire.Hash256]int) {
 	byIdx := make(map[int]wire.Hash256, len(cluster.Transactions))
 	for h, idx := range cluster.Transactions {
 		byIdx[idx] = h
 	}
 	for _, origIdx := range cluster.GetLinearization() {
 		txHash, ok := byIdx[origIdx]
-		if !ok || evicted[txHash] {
+		if !ok || !keep(txHash, origIdx) {
 			continue
 		}
 		idx := sim.AddTransaction(cluster.DepGraph.FeeRate(origIdx))

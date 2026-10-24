@@ -811,6 +811,8 @@ type FeeInfo struct {
 //   - Rule 2 (new unconfirmed input) → "replacement-adds-unconfirmed".
 //   - Rule 5 (too many candidates) → "too many potential replacements".
 //   - Spending a conflicting tx → "bad-txns-spends-conflicting-tx".
+//   - CheckMemPoolPolicyLimits (the cluster the replacement would join is
+//     past a limit) → "too-large-cluster" (validation.cpp ReplacementChecks).
 func classifyRBFReject(err error) string {
 	var rej *mempool.RBFRejectError
 	if errors.As(err, &rej) {
@@ -828,6 +830,8 @@ func classifyRBFReject(err error) string {
 		return "too many potential replacements"
 	case errors.Is(err, mempool.ErrRBFAncestorConflict):
 		return "bad-txns-spends-conflicting-tx"
+	case errors.Is(err, mempool.ErrClusterTooLarge):
+		return "too-large-cluster"
 	default:
 		// Any other conflict condition (e.g. unresolved inputs) — report the
 		// generic conflict token rather than an opaque error string.
@@ -1196,6 +1200,10 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			var rej *mempool.RBFRejectError
 			if errors.As(rbfErr, &rej) {
 				result.RejectDetails = rej.Error()
+			} else if errors.Is(rbfErr, mempool.ErrClusterTooLarge) {
+				// Core: state.Invalid(TX_MEMPOOL_POLICY, "too-large-cluster", ""),
+				// so ToString() is the bare reason.
+				result.RejectDetails = "too-large-cluster"
 			}
 			results = append(results, result)
 			continue

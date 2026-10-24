@@ -1107,6 +1107,11 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		if errors.As(err, &rej) {
 			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: rej.Error()}
 		}
+		// CheckMemPoolPolicyLimits: TX_MEMPOOL_POLICY "too-large-cluster"
+		// with no debug message, also MEMPOOL_REJECTED.
+		if errors.Is(err, mempool.ErrClusterTooLarge) {
+			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: "too-large-cluster"}
+		}
 		return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Transaction rejected: %v", err)}
 	}
 
