@@ -4436,6 +4436,15 @@ func (mp *Mempool) checkFeeRateLocked(vsize, fee int64) error {
 // Core reports for that member in submitpackage / testmempoolaccept. Other
 // errors are returned unchanged. Must be called with mu held.
 func (mp *Mempool) packageTxErrorLocked(tx *wire.MsgTx, err error) error {
+	if errors.Is(err, ErrScriptValidation) {
+		// Core's state for a failed script check (see ScriptCheckError), as
+		// the single-tx testmempoolaccept reports it.
+		var se *ScriptCheckError
+		if serr := mp.inputScriptsErrorLocked(tx); errors.As(serr, &se) {
+			return &packageScriptError{se}
+		}
+		return err
+	}
 	if !errors.Is(err, ErrInsufficientFee) {
 		return err
 	}

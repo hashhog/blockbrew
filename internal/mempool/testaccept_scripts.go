@@ -52,6 +52,38 @@ func (mp *Mempool) CheckInputScripts(tx *wire.MsgTx, view consensus.UTXOView) er
 	return nil
 }
 
+// packageScriptError is a package member's failed script check: Core's state
+// (errors.As finds the *ScriptCheckError) that still matches
+// ErrScriptValidation like the acceptLocked error it replaces.
+type packageScriptError struct{ *ScriptCheckError }
+
+func (e *packageScriptError) Unwrap() []error {
+	return []error{e.ScriptCheckError, ErrScriptValidation}
+}
+
+// inputScriptsErrorLocked re-runs the two script passes of CheckInputScripts
+// against the mempool view (chain, pool and pkgView) and returns the
+// *ScriptCheckError, or nil if every input passes or a prevout is unknown.
+// Must be called with mu held.
+func (mp *Mempool) inputScriptsErrorLocked(tx *wire.MsgTx) error {
+	prevOuts := make([]*wire.TxOut, len(tx.TxIn))
+	for i, in := range tx.TxIn {
+		utxo := mp.lookupOutputLocked(in.PreviousOutPoint)
+		if utxo == nil {
+			return nil
+		}
+		prevOuts[i] = &wire.TxOut{Value: utxo.Amount, PkScript: utxo.PkScript}
+	}
+	policyFlags := mp.getStandardScriptFlags()
+	if err := checkInputScripts(tx, prevOuts, policyFlags, "mempool-script-verify-flag-failed"); err != nil {
+		return err
+	}
+	if consensusFlags := mp.getConsensusScriptFlags(); consensusFlags != policyFlags {
+		return checkInputScripts(tx, prevOuts, consensusFlags, "block-script-verify-flag-failed")
+	}
+	return nil
+}
+
 func checkInputScripts(tx *wire.MsgTx, prevOuts []*wire.TxOut, flags script.ScriptFlags, prefix string) error {
 	for i, in := range tx.TxIn {
 		err := script.VerifyScript(in.SignatureScript, prevOuts[i].PkScript, tx, i, flags, prevOuts[i].Value, prevOuts)

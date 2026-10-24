@@ -1381,9 +1381,12 @@ func packageTxFees(r *mempool.TxAcceptResult) *TxFees {
 // error is reported as its own text.
 func packageTxRejectReason(err error) (reason, details string) {
 	var feeErr *mempool.FeeRateError
+	var scriptErr *mempool.ScriptCheckError
 	switch {
 	case errors.As(err, &feeErr):
 		return feeErr.Reason, feeErr.Error()
+	case errors.As(err, &scriptErr):
+		return scriptErr.Reason, scriptErr.Error()
 	case errors.Is(err, mempool.ErrMissingInputs):
 		return "bad-txns-inputs-missingorspent", "bad-txns-inputs-missingorspent"
 	case errors.Is(err, mempool.ErrMempoolFull):
