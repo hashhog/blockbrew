@@ -386,3 +386,74 @@ func TestPackageReportsSigopAdjustedVSize(t *testing.T) {
 		t.Errorf("package feerate = %v, want %v (sigop-adjusted)", res.PackageFeerate, want)
 	}
 }
+
+// TRUC (version 3) packages. Core runs PackageTRUCChecks over every member of
+// the subpackage before any member is submitted and before any conflict is
+// evicted (validation.cpp:1479-1486, ahead of FinalizeSubpackage). blockbrew
+// ran it member by member AFTER adding the previous member, so the just-added
+// in-package parent was counted twice (as a mempool parent and as an
+// in-package parent) and every 1-parent-1-child TRUC package was refused with
+// "too many ancestors" — after the package RBF eviction had already run.
+
+// trucPair is cpfpPair with the parent at version 3 and the child at
+// childVersion.
+func trucPair(in wire.OutPoint, amount, parentFee, childFee int64, childVersion int32) (*wire.MsgTx, *wire.MsgTx) {
+	parent := spendableTx(in, amount-parentFee, 1)
+	parent.Version = TRUCVersion
+	child := spendableTx(wire.OutPoint{Hash: parent.TxHash(), Index: 0}, amount-parentFee-childFee, 1)
+	child.Version = childVersion
+	return parent, child
+}
+
+// TestPackageTRUCCPFPAccepted: a 1-sat version-3 parent and a 20,000-sat
+// version-3 child (85 vB, under TRUC_CHILD_MAX_VSIZE) have two ancestors
+// counting the child itself, which is the TRUC limit. Core accepts both.
+func TestPackageTRUCCPFPAccepted(t *testing.T) {
+	mp, op := spendableMempool(0xd1, cpfpFunding)
+	parent, child := trucPair(op, cpfpFunding, 1, 20_000, TRUCVersion)
+
+	if _, err := mp.AcceptPackage([]*wire.MsgTx{parent, child}); err != nil {
+		t.Fatalf("TRUC CPFP package refused: %v", err)
+	}
+	if !mp.HasTransaction(parent.TxHash()) || !mp.HasTransaction(child.TxHash()) {
+		t.Fatalf("TRUC package members not in mempool: parent=%v child=%v",
+			mp.HasTransaction(parent.TxHash()), mp.HasTransaction(child.TxHash()))
+	}
+}
+
+// TestPackageTRUCRBFReplacesConflicts is the version-3 shape of
+// TestPackageRBFReplacesConflictsWithCPFP: Core accepts it and replaces O, D.
+func TestPackageTRUCRBFReplacesConflicts(t *testing.T) {
+	mp, op, o, d := rbfFixture(t, 0xd2)
+	p, c := trucPair(op, cpfpFunding, 500, 10_000, TRUCVersion)
+
+	if _, err := mp.AcceptPackage([]*wire.MsgTx{p, c}); err != nil {
+		t.Fatalf("TRUC package RBF refused: %v", err)
+	}
+	if !mp.HasTransaction(p.TxHash()) || !mp.HasTransaction(c.TxHash()) {
+		t.Fatal("package members not in mempool")
+	}
+	if mp.HasTransaction(o.TxHash()) || mp.HasTransaction(d.TxHash()) {
+		t.Fatal("replaced transactions still in mempool")
+	}
+}
+
+// TestPackageTRUCViolationKeepsConflicts: a package that pays for the
+// replacement of O+D but breaks a TRUC rule (a version-2 child spending a
+// version-3 parent) is refused, and refusing it must not have evicted O or D:
+// Core judges TRUC before anything is removed.
+func TestPackageTRUCViolationKeepsConflicts(t *testing.T) {
+	mp, op, o, d := rbfFixture(t, 0xd3)
+	p, c := trucPair(op, cpfpFunding, 500, 10_000, 2)
+
+	if _, err := mp.AcceptPackage([]*wire.MsgTx{p, c}); err == nil {
+		t.Fatal("version-2 child of a version-3 parent was accepted")
+	}
+	if mp.HasTransaction(p.TxHash()) || mp.HasTransaction(c.TxHash()) {
+		t.Error("refused package left a member in the mempool")
+	}
+	if !mp.HasTransaction(o.TxHash()) || !mp.HasTransaction(d.TxHash()) {
+		t.Errorf("refused package evicted its conflicts: O=%v D=%v",
+			mp.HasTransaction(o.TxHash()), mp.HasTransaction(d.TxHash()))
+	}
+}
