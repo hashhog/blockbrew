@@ -249,6 +249,10 @@ type PeerManager struct {
 	rng            *rand.Rand           // Random number generator
 	asmap          []byte               // Loaded asmap trie bytes (nil = disabled)
 
+	// dialFn creates an outbound peer. nil means NewOutboundPeer; tests
+	// substitute an in-memory dialer.
+	dialFn func(addr string, cfg PeerConfig) (*Peer, error)
+
 	// fixedSeedsAdded is the one-shot guard for the last-resort fixed-seed
 	// fallback. Set true after addFixedSeeds() has injected the curated
 	// bootstrap IPs so they are never re-injected (Core net.cpp:2641 sets
@@ -1492,26 +1496,7 @@ func (pm *PeerManager) connectionHandler() {
 				continue
 			}
 
-			pm.mu.RLock()
-			needFullRelay := pm.outbound < pm.config.MaxOutbound
-			needBlockRelay := pm.blockRelayOnly < pm.config.MaxBlockRelayOnly
-			pm.mu.RUnlock()
-
-			// Try to make a full-relay connection
-			if needFullRelay {
-				ka := pm.pickAddressWithDiversity(ConnFullRelay)
-				if ka != nil {
-					go pm.connectToPeerWithType(ka, ConnFullRelay)
-				}
-			}
-
-			// Try to make a block-relay-only connection
-			if needBlockRelay {
-				ka := pm.pickAddressWithDiversity(ConnBlockRelayOnly)
-				if ka != nil {
-					go pm.connectToPeerWithType(ka, ConnBlockRelayOnly)
-				}
-			}
+			pm.openConnectionsTick()
 
 		case <-feelerTicker.C:
 			// Network-active gate: feeler + extra-block-relay establishment is
@@ -1595,6 +1580,31 @@ func (pm *PeerManager) connectionHandler() {
 
 		case <-pm.quit:
 			return
+		}
+	}
+}
+
+// openConnectionsTick is one pass of the outbound refill: dial for any
+// full-relay / block-relay-only slot that is below target.
+func (pm *PeerManager) openConnectionsTick() {
+	pm.mu.RLock()
+	needFullRelay := pm.outbound < pm.config.MaxOutbound
+	needBlockRelay := pm.blockRelayOnly < pm.config.MaxBlockRelayOnly
+	pm.mu.RUnlock()
+
+	// Try to make a full-relay connection
+	if needFullRelay {
+		ka := pm.pickAddressWithDiversity(ConnFullRelay)
+		if ka != nil {
+			go pm.connectToPeerWithType(ka, ConnFullRelay)
+		}
+	}
+
+	// Try to make a block-relay-only connection
+	if needBlockRelay {
+		ka := pm.pickAddressWithDiversity(ConnBlockRelayOnly)
+		if ka != nil {
+			go pm.connectToPeerWithType(ka, ConnBlockRelayOnly)
 		}
 	}
 }
@@ -1849,7 +1859,11 @@ func (pm *PeerManager) connectToPeerWithType(ka *KnownAddress, connType ConnType
 	}
 
 	// Attempt connection
-	peer, err := NewOutboundPeer(addr, peerConfig)
+	dial := pm.dialFn
+	if dial == nil {
+		dial = NewOutboundPeer
+	}
+	peer, err := dial(addr, peerConfig)
 	if err != nil {
 		// Connection failed. Mark the outcome so Attempts doesn't climb
 		// unbounded toward the IsBad cliff (MarkAttempt already incremented
