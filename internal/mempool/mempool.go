@@ -188,8 +188,11 @@ var (
 
 // RBF constants (BIP125).
 const (
-	// MaxRBFReplacedTxs is the maximum number of transactions that can be
-	// replaced by a single RBF replacement (including descendants).
+	// MaxRBFReplacedTxs is the maximum number of distinct mempool clusters a
+	// replacement may conflict with directly (Core MAX_REPLACEMENT_CANDIDATES,
+	// policy/rbf.h). Since cluster mempool it bounds clusters, not evicted
+	// transactions: GetEntriesForConflicts counts GetUniqueClusterCount of the
+	// direct conflicts.
 	MaxRBFReplacedTxs = 100
 
 	// SequenceFinal is the maximum sequence number (disables RBF signaling).
@@ -3109,8 +3112,8 @@ func (mp *Mempool) Clear() {
 //   3. Replacement's in-mempool ancestors must not overlap with direct conflicts
 //      (replacement cannot spend an output of the tx it replaces).
 //      Core: EntriesAndTxidsDisjoint (rbf.cpp:85-98, validation.cpp:1356).
-//   4. Rule #5: total evicted transactions ≤ MAX_REPLACEMENT_CANDIDATES (100).
-//      Core: GetEntriesForConflicts (rbf.cpp:64-75).
+//   4. Rule #5: direct conflicts span ≤ MAX_REPLACEMENT_CANDIDATES (100)
+//      distinct clusters. Core: GetEntriesForConflicts (policy/rbf.cpp).
 //   5. Rule #3: replacement_fees >= original_fees (rbf.cpp:109-112).
 //   6. Rule #4: additional_fees >= incremental_relay_fee × replacement_vsize
 //      (rbf.cpp:114-123). Uses IncrementalRelayFee (not MinRelayFeeRate).
@@ -3219,13 +3222,20 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 		}
 	}
 
-	// Gate 5: BIP-125 Rule #5 — total evicted transactions must not exceed
-	// MAX_REPLACEMENT_CANDIDATES (100). Mirrors GetEntriesForConflicts
-	// (rbf.cpp:64-75). Core counts unique clusters; blockbrew counts individual
-	// txs (equivalent for non-cluster-mempool deployments).
-	if totalEvicted > MaxRBFReplacedTxs {
-		return fmt.Errorf("%w: would evict %d transactions (max %d)",
-			ErrRBFTooManyConflicts, totalEvicted, MaxRBFReplacedTxs)
+	// Gate 5: Rule #5 — the direct conflicts must span at most
+	// MAX_REPLACEMENT_CANDIDATES (100) distinct clusters. Mirrors Core 31
+	// GetEntriesForConflicts (policy/rbf.cpp), which counts
+	// GetUniqueClusterCount(iters_conflicting). The number of evicted
+	// transactions is not limited here: the cluster count limit already
+	// bounds each cluster, so five conflicting clusters of 21 transactions
+	// each are one replacement Core accepts.
+	if n := mp.conflictingClusterCountLocked(conflicting); n > MaxRBFReplacedTxs {
+		return &RBFRejectError{
+			Reason: "too many potential replacements",
+			Detail: fmt.Sprintf("rejecting replacement %s; too many conflicting clusters (%d > %d)",
+				newTx.TxHash(), n, MaxRBFReplacedTxs),
+			Err: ErrRBFTooManyConflicts,
+		}
 	}
 
 	// Calculate new transaction fee.
@@ -3242,8 +3252,12 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 	// incorrectly rejected equal-fee replacements; pre-FIX-72 it also used
 	// raw conflict fees instead of modified fees (W120 BUG-10).
 	if newFee < totalConflictingFee {
-		return fmt.Errorf("%w: rejecting replacement, less fees than conflicting txs; %d < %d",
-			ErrRBFInsufficientFee, newFee, totalConflictingFee)
+		return &RBFRejectError{
+			Reason: "insufficient fee",
+			Detail: fmt.Sprintf("rejecting replacement %s, less fees than conflicting txs; %s < %s",
+				newTx.TxHash(), formatMoney(newFee), formatMoney(totalConflictingFee)),
+			Err: ErrRBFInsufficientFee,
+		}
 	}
 
 	// Gate 6b: BIP-125 Rule #4 — additional_fees >= incremental_relay_fee × vsize.
@@ -3253,8 +3267,12 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 	newVSize := (weight + 3) / 4
 	minFeeBump := (newVSize * mp.config.IncrementalRelayFee + 999) / 1000
 	if newFee-totalConflictingFee < minFeeBump {
-		return fmt.Errorf("%w: rejecting replacement, not enough additional fees to relay; %d < %d",
-			ErrRBFInsufficientFee, newFee-totalConflictingFee, minFeeBump)
+		return &RBFRejectError{
+			Reason: "insufficient fee",
+			Detail: fmt.Sprintf("rejecting replacement %s, not enough additional fees to relay; %s < %s",
+				newTx.TxHash(), formatMoney(newFee-totalConflictingFee), formatMoney(minFeeBump)),
+			Err: ErrRBFInsufficientFee,
+		}
 	}
 
 	// Gate 7: ImprovesFeerateDiagram — the replacement must strictly improve
@@ -3271,10 +3289,71 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 		}
 	}
 	if err := mp.checkRBFImprovesFeerateDiagramLocked(newTx, evictedFull, newFee, int64(newVSize)); err != nil {
+		// Core ReplacementChecks: state.Invalid(TX_RECONSIDERABLE,
+		// "replacement-failed", <ImprovesFeerateDiagram message>).
+		if errors.Is(err, ErrRBFFeerateDiagram) {
+			return &RBFRejectError{Reason: "replacement-failed", Detail: ErrRBFFeerateDiagram.Error(), Err: ErrRBFFeerateDiagram}
+		}
 		return err
 	}
 
 	return nil
+}
+
+// RBFRejectError is a replacement refusal in Core's TxValidationState shape:
+// Reason is the reject reason ("insufficient fee", "too many potential
+// replacements", "replacement-failed") and Detail the debug message. Err is
+// the ErrRBF* sentinel, so errors.Is keeps matching it.
+type RBFRejectError struct {
+	Reason string
+	Detail string
+	Err    error
+}
+
+// Error renders Core's TxValidationState::ToString(): "reason, detail".
+func (e *RBFRejectError) Error() string {
+	if e.Detail == "" {
+		return e.Reason
+	}
+	return e.Reason + ", " + e.Detail
+}
+
+func (e *RBFRejectError) Unwrap() error { return e.Err }
+
+// conflictingClusterCountLocked is Core's GetUniqueClusterCount over the
+// direct conflicts: the number of distinct clusters they belong to. A
+// conflict the cluster manager does not know is its own cluster.
+func (mp *Mempool) conflictingClusterCountLocked(conflicting map[wire.Hash256]bool) int {
+	clusters := make(map[uint64]bool, len(conflicting))
+	loose := 0
+	for txHash := range conflicting {
+		if _, ok := mp.pool[txHash]; !ok {
+			continue
+		}
+		if id, ok := mp.clusters.txToCluster[txHash]; ok {
+			clusters[id] = true
+		} else {
+			loose++
+		}
+	}
+	return len(clusters) + loose
+}
+
+// formatMoney is Core's FormatMoney (util/moneystr.cpp): satoshis as BTC
+// with trailing zeros trimmed down to two decimals.
+func formatMoney(sats int64) string {
+	neg := sats < 0
+	if neg {
+		sats = -sats
+	}
+	s := fmt.Sprintf("%d.%08d", sats/100_000_000, sats%100_000_000)
+	for len(s) > 0 && s[len(s)-1] == '0' && s[len(s)-3] != '.' {
+		s = s[:len(s)-1]
+	}
+	if neg {
+		s = "-" + s
+	}
+	return s
 }
 
 // TestReplacement is the read-only, NON-mutating dry-run analogue of the
@@ -3480,154 +3559,67 @@ func (mp *Mempool) checkRBFImprovesFeerateDiagramLocked(
 		return nil
 	}
 
-	// For each affected cluster, build before/after diagrams and compare.
-	//
-	// We concatenate all chunks across affected clusters into one combined
-	// before/after diagram. This is conservative: the combined diagram is
-	// dominated iff every individual cluster's diagram is dominated, because
-	// chunks are already sorted in descending feerate order.
+	// The replacement joins the clusters of its surviving in-mempool parents
+	// (merging them if there are several). With no surviving parent it is a
+	// cluster of its own. Core's CalculateChunksForRBF compares the old
+	// chunks of every affected cluster with the new chunks of the clusters
+	// the staged change produces, so the replacement is always on the new
+	// side. Before this, a replacement conflicting with more than one
+	// cluster and spending only confirmed coins was left out of the "after"
+	// diagram, and could never improve it.
+	joined := make(map[uint64]bool)
+	for _, in := range newTx.TxIn {
+		parent := in.PreviousOutPoint.Hash
+		if _, inPool := mp.pool[parent]; !inPool || evicted[parent] {
+			continue
+		}
+		if c := mp.clusters.GetCluster(parent); c != nil {
+			if _, ok := affectedClusters[c.ID]; ok {
+				joined[c.ID] = true
+			}
+		}
+	}
+
+	// Concatenate the chunks of all affected clusters into one before and
+	// one after diagram, each sorted in descending feerate order below.
 	var beforeChunks, afterChunks []Chunk
 
+	newSim := NewDepGraph()
+	newSimIdx := make(map[wire.Hash256]int)
 	for _, cluster := range affectedClusters {
-		// --- BEFORE: current cluster chunks ---
-		for _, ch := range cluster.GetChunks() {
-			beforeChunks = append(beforeChunks, ch)
-		}
-
-		// --- AFTER: simulate removal of evicted txs + insertion of newTx ---
-		//
-		// Build a fresh DepGraph containing only the surviving transactions in
-		// this cluster, then add newTx (if any of its inputs are in this cluster).
-
-		// Step 1: identify surviving txs (cluster txs minus evicted).
-		type simTx struct {
-			txHash  wire.Hash256
-			fee     int64
-			size    int32
-			origIdx int // index in cluster.DepGraph
-		}
-		var survivors []simTx
-		for txHash, idx := range cluster.Transactions {
-			if !evicted[txHash] {
-				fr := cluster.DepGraph.FeeRate(idx)
-				survivors = append(survivors, simTx{
-					txHash:  txHash,
-					fee:     fr.Fee,
-					size:    fr.Size,
-					origIdx: idx,
-				})
+		beforeChunks = append(beforeChunks, cluster.GetChunks()...)
+		if joined[cluster.ID] {
+			mp.addSurvivorsToSimLocked(cluster, evicted, newSim, newSimIdx)
+			// Core runs CheckMemPoolPolicyLimits before the diagram: a merged
+			// cluster past the count limit is too-large-cluster. Checked per
+			// cluster (each holds at most MaxClusterCount), so newSim never
+			// outgrows its 128-bit BitSet.
+			if newSim.TxCount()+1 > MaxClusterCount {
+				return ErrClusterTooLarge
 			}
+			continue
 		}
+		sim := NewDepGraph()
+		simIdx := make(map[wire.Hash256]int)
+		mp.addSurvivorsToSimLocked(cluster, evicted, sim, simIdx)
+		afterChunks = append(afterChunks, simChunks(cluster.ID, sim, simIdx)...)
+	}
 
-		// Step 2: Check if newTx has any in-cluster parents (that survive).
-		// A parent is in this cluster if one of newTx's inputs spends a tx in
-		// the cluster that was NOT evicted.
-		survivorSet := make(map[wire.Hash256]bool, len(survivors))
-		for _, s := range survivors {
-			survivorSet[s.txHash] = true
-		}
-		newTxParentsInCluster := false
+	newFR := FeeFrac{Fee: newFee, Size: int32(newVSize)}
+	if len(joined) == 0 {
+		afterChunks = append(afterChunks, Chunk{FeeRate: newFR})
+	} else {
+		idx := newSim.AddTransaction(newFR)
+		var parentSet BitSet
 		for _, in := range newTx.TxIn {
-			if survivorSet[in.PreviousOutPoint.Hash] {
-				newTxParentsInCluster = true
-				break
+			if pIdx, ok := newSimIdx[in.PreviousOutPoint.Hash]; ok {
+				parentSet.Set(pIdx)
 			}
 		}
-
-		// If newTx has no parents in this cluster AND there are survivors, the
-		// new tx will form its own new cluster later. We still need the after
-		// diagram for survivors in this cluster to be at least as good as before.
-		// newTx's contribution is added only to the cluster it actually joins.
-		//
-		// Determine whether newTx "joins" this cluster:
-		// It joins if it has at least one parent (surviving) in this cluster,
-		// OR if this is the sole affected cluster and newTx has no mempool parents
-		// at all (i.e. it's a standalone replacement of a root tx).
-		newTxJoinsCluster := newTxParentsInCluster
-		if !newTxJoinsCluster && len(affectedClusters) == 1 {
-			// Check if newTx has any surviving mempool parent at all.
-			hasAnyMempoolParent := false
-			for _, in := range newTx.TxIn {
-				if _, inPool := mp.pool[in.PreviousOutPoint.Hash]; inPool {
-					if !evicted[in.PreviousOutPoint.Hash] {
-						hasAnyMempoolParent = true
-						break
-					}
-				}
-			}
-			if !hasAnyMempoolParent {
-				// newTx is a root in the cluster (replaces the root conflict).
-				newTxJoinsCluster = true
-			}
+		if parentSet.Any() {
+			newSim.AddDependencies(parentSet, idx)
 		}
-
-		// Step 3: Build a simulated DepGraph for the after-state.
-		simGraph := NewDepGraph()
-		simIdxMap := make(map[wire.Hash256]int, len(survivors)+1) // txHash -> simIdx
-
-		// Add survivors in topological order (parents before children).
-		// We use the original topological order from the cluster's linearization.
-		origLinear := cluster.GetLinearization() // already in topological order
-		for _, origIdx := range origLinear {
-			// Find txHash for this origIdx.
-			var txHash wire.Hash256
-			found := false
-			for h, idx := range cluster.Transactions {
-				if idx == origIdx {
-					txHash = h
-					found = true
-					break
-				}
-			}
-			if !found || !survivorSet[txHash] {
-				continue
-			}
-			fr := cluster.DepGraph.FeeRate(origIdx)
-			simIdx := simGraph.AddTransaction(fr)
-			simIdxMap[txHash] = simIdx
-
-			// Add dependencies to parents that are already in simGraph.
-			var parentSet BitSet
-			for _, in := range mp.pool[txHash].Tx.TxIn {
-				if pSimIdx, ok := simIdxMap[in.PreviousOutPoint.Hash]; ok {
-					parentSet.Set(pSimIdx)
-				}
-			}
-			if parentSet.Any() {
-				simGraph.AddDependencies(parentSet, simIdx)
-			}
-		}
-
-		// Add newTx if it joins this cluster.
-		if newTxJoinsCluster {
-			newSimIdx := simGraph.AddTransaction(FeeFrac{Fee: newFee, Size: int32(newVSize)})
-			if newSimIdx >= 0 {
-				var parentSet BitSet
-				for _, in := range newTx.TxIn {
-					if pSimIdx, ok := simIdxMap[in.PreviousOutPoint.Hash]; ok {
-						parentSet.Set(pSimIdx)
-					}
-				}
-				if parentSet.Any() {
-					simGraph.AddDependencies(parentSet, newSimIdx)
-				}
-			}
-		}
-
-		// Step 4: Compute after-chunks from the simulated DepGraph using the
-		// same greedy linearisation algorithm as Cluster.recomputeLinearization.
-		simCluster := &Cluster{
-			ID:           cluster.ID,
-			Transactions: make(map[wire.Hash256]int),
-			DepGraph:     simGraph,
-			dirty:        true,
-		}
-		for txHash, simIdx := range simIdxMap {
-			simCluster.Transactions[txHash] = simIdx
-		}
-		for _, ch := range simCluster.GetChunks() {
-			afterChunks = append(afterChunks, ch)
-		}
+		afterChunks = append(afterChunks, simChunks(0, newSim, newSimIdx)...)
 	}
 
 	// Sort both chunk slices in descending feerate order so the combined
@@ -3642,6 +3634,48 @@ func (mp *Mempool) checkRBFImprovesFeerateDiagramLocked(
 		return ErrRBFFeerateDiagram
 	}
 	return nil
+}
+
+// addSurvivorsToSimLocked adds the members of cluster that the replacement
+// does not evict to sim, parents before children (the cluster's
+// linearization is topological), with their in-pool spending edges.
+func (mp *Mempool) addSurvivorsToSimLocked(cluster *Cluster, evicted map[wire.Hash256]bool, sim *DepGraph, simIdx map[wire.Hash256]int) {
+	byIdx := make(map[int]wire.Hash256, len(cluster.Transactions))
+	for h, idx := range cluster.Transactions {
+		byIdx[idx] = h
+	}
+	for _, origIdx := range cluster.GetLinearization() {
+		txHash, ok := byIdx[origIdx]
+		if !ok || evicted[txHash] {
+			continue
+		}
+		idx := sim.AddTransaction(cluster.DepGraph.FeeRate(origIdx))
+		simIdx[txHash] = idx
+		var parentSet BitSet
+		for _, in := range mp.pool[txHash].Tx.TxIn {
+			if pIdx, ok := simIdx[in.PreviousOutPoint.Hash]; ok {
+				parentSet.Set(pIdx)
+			}
+		}
+		if parentSet.Any() {
+			sim.AddDependencies(parentSet, idx)
+		}
+	}
+}
+
+// simChunks chunks a simulated graph with the same linearization the live
+// clusters use.
+func simChunks(id uint64, sim *DepGraph, simIdx map[wire.Hash256]int) []Chunk {
+	c := &Cluster{
+		ID:           id,
+		Transactions: make(map[wire.Hash256]int, len(simIdx)),
+		DepGraph:     sim,
+		dirty:        true,
+	}
+	for h, idx := range simIdx {
+		c.Transactions[h] = idx
+	}
+	return c.GetChunks()
 }
 
 // sortChunksDesc sorts chunks in descending feerate order (highest feerate first).

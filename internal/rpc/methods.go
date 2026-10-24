@@ -1093,6 +1093,12 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 
 	// Add to mempool via AcceptToMemoryPool (canonical Bitcoin Core entry point)
 	if err := s.mempool.AcceptToMemoryPool(tx); err != nil {
+		// A refused replacement is Core's MEMPOOL_REJECTED:
+		// RPC_TRANSACTION_REJECTED (-26) with state.ToString().
+		var rej *mempool.RBFRejectError
+		if errors.As(err, &rej) {
+			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: rej.Error()}
+		}
 		return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Transaction rejected: %v", err)}
 	}
 
