@@ -1099,8 +1099,15 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		return txid.String(), nil
 	}
 
-	// Add to mempool via AcceptToMemoryPool (canonical Bitcoin Core entry point)
-	if err := s.mempool.AcceptToMemoryPool(tx); err != nil {
+	// Core BroadcastTransaction (node/transaction.cpp): a tx not in the
+	// mempool whose outputs already exist in the UTXO set is confirmed.
+	if s.mempool.TxOutputsInUTXOSet(tx) {
+		return nil, &RPCError{Code: RPCErrVerifyAlreadyInUTXOSet, Message: "Transaction outputs already in utxo set"}
+	}
+
+	// Add to mempool via AcceptToMemoryPool (canonical Bitcoin Core entry
+	// point). An RPC tx with missing inputs is refused, never orphaned.
+	if err := s.mempool.AcceptToMemoryPoolNoOrphan(tx); err != nil {
 		// A refused replacement is Core's MEMPOOL_REJECTED:
 		// RPC_TRANSACTION_REJECTED (-26) with state.ToString().
 		var rej *mempool.RBFRejectError
@@ -1111,6 +1118,11 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		// with no debug message, also MEMPOOL_REJECTED.
 		if errors.Is(err, mempool.ErrClusterTooLarge) {
 			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: "too-large-cluster"}
+		}
+		// TX_MISSING_INPUTS is TransactionError::MISSING_INPUTS: -25 with
+		// state.ToString(), the bare reject token.
+		if errors.Is(err, mempool.ErrMissingInputs) {
+			return nil, &RPCError{Code: RPCErrVerify, Message: "bad-txns-inputs-missingorspent"}
 		}
 		return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("Transaction rejected: %v", err)}
 	}

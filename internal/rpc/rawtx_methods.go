@@ -1040,6 +1040,16 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			}
 		}
 
+		// Core PreChecks "txn-already-known": any output already a coin means
+		// the tx is confirmed. Runs before input lookup, which would otherwise
+		// say missing-inputs for a tx whose parents were spent on commit.
+		if s.mempool.TxOutputsInUTXOSet(tx) {
+			result.Allowed = false
+			result.RejectReason = "txn-already-known"
+			results = append(results, result)
+			continue
+		}
+
 		// Look up each input's UTXO, building a prevout VIEW (outpoint -> full
 		// entry: scriptPubKey, amount, height, coinbase flag). The pre-fix dry-run
 		// summed only .Amount here and discarded the rest, which is exactly the
