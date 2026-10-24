@@ -457,3 +457,22 @@ func TestPackageTRUCViolationKeepsConflicts(t *testing.T) {
 			mp.HasTransaction(o.TxHash()), mp.HasTransaction(d.TxHash()))
 	}
 }
+
+// TestPackageTRUCChecksCountsPoolMemberParentOnce: packageTRUCChecks called
+// with a package parent that is also in the pool counts that parent once (as
+// an in-package parent), so a 1-parent-1-child TRUC package is within the
+// ancestor limit however the caller orders the check and the insert.
+func TestPackageTRUCChecksCountsPoolMemberParentOnce(t *testing.T) {
+	mp, op := spendableMempool(0xd4, cpfpFunding)
+	parent, child := trucPair(op, cpfpFunding, 1_000, 20_000, TRUCVersion)
+	if err := mp.AddTransaction(parent); err != nil {
+		t.Fatalf("fixture: %v", err)
+	}
+
+	mp.mu.Lock()
+	err := mp.packageTRUCChecks(child, mp.trucSigopVsize(child), []*wire.MsgTx{parent, child}, 1)
+	mp.mu.Unlock()
+	if err != nil {
+		t.Fatalf("1-parent-1-child TRUC package refused with its parent in the pool: %v", err)
+	}
+}
