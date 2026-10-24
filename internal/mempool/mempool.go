@@ -1298,8 +1298,12 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 		if rbfErr != nil {
 			return rbfErr
 		}
-	} else if len(conflictingTxs) > 0 {
-		// Can't do RBF with missing inputs
+	} else if len(conflictingTxs) > 0 && !opts.inPackage {
+		// Can't do RBF with missing inputs. A package member falls through
+		// to the missing-inputs return instead: Core's PreChecks records
+		// the conflicts and then fails on the missing coin
+		// (TX_MISSING_INPUTS), so the member is retried with its parent and
+		// its conflicts are judged by PackageRBFChecks.
 		for txHash := range conflictingTxs {
 			return fmt.Errorf("%w: input already spent by mempool tx %s",
 				ErrDoubleSpend, txHash)
@@ -4380,9 +4384,13 @@ func (mp *Mempool) packageRBFChecksLocked(sub []*wire.MsgTx, fees, vsizes []int6
 			evicted[d] = true
 		}
 	}
-	if len(evicted) > MaxRBFReplacedTxs {
-		return fail(fmt.Sprintf("package RBF failed: too many potential replacements, rejecting replacement %s; too many potential replacements (%d > %d)",
-			sub[1].TxHash(), len(evicted), MaxRBFReplacedTxs))
+	// Rule 5 as in checkRBFLocked: the merged direct conflicts of both
+	// members may span at most MaxRBFReplacedTxs clusters (Core
+	// GetEntriesForConflicts -> GetUniqueClusterCount). The number of
+	// evicted transactions is not limited.
+	if n := mp.conflictingClusterCountLocked(conflicts); n > MaxRBFReplacedTxs {
+		return fail(fmt.Sprintf("package RBF failed: too many potential replacements, rejecting replacement %s; too many conflicting clusters (%d > %d)",
+			sub[1].TxHash(), n, MaxRBFReplacedTxs))
 	}
 	var conflictFees int64
 	for h := range evicted {
