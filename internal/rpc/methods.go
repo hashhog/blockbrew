@@ -630,11 +630,15 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid block hash"}
 	}
 
+	// RPCTypeCheckArgument runs before the handler body: a non-bool verbose
+	// is -3, ahead of the hash parse and the lookup.
 	verbose := true
-	if len(args) >= 2 {
-		if v, ok := args[1].(bool); ok {
-			verbose = v
+	if len(args) >= 2 && args[1] != nil {
+		v, ok := args[1].(bool)
+		if !ok {
+			return nil, wrongTypeError(2, "verbose", args[1], "bool")
 		}
+		verbose = v
 	}
 
 	// ParseHashV(blockhash): malformed hash -> -8 at the parse boundary,
@@ -1051,22 +1055,6 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid hex string"}
 	}
 
-	// Parse maxfeerate parameter (optional, default 0.10 BTC/kvB)
-	// 0 means no limit
-	maxFeeRate := 0.10 * satoshiPerBitcoin // Default: 0.10 BTC/kvB = 10,000,000 sat/kvB
-	if len(args) >= 2 {
-		switch v := args[1].(type) {
-		case float64:
-			maxFeeRate = v * satoshiPerBitcoin // Convert from BTC/kvB to sat/kvB
-		case string:
-			// Some clients may pass as string
-			var f float64
-			if _, err := fmt.Sscanf(v, "%f", &f); err == nil {
-				maxFeeRate = f * satoshiPerBitcoin
-			}
-		}
-	}
-
 	// Decode hex
 	txBytes, err := hex.DecodeString(hexStr)
 	if err != nil {
@@ -1077,6 +1065,18 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 	tx := &wire.MsgTx{}
 	if err := tx.Deserialize(bytes.NewReader(txBytes)); err != nil {
 		return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %v", err)}
+	}
+
+	// maxfeerate is an AMOUNT (AmountFromValue): a string that is not an
+	// amount is -3 "Invalid amount", not a silent fall back to the default.
+	// 0 means no limit; default 0.10 BTC/kvB.
+	maxFeeRate := 0.10 * satoshiPerBitcoin
+	if len(args) >= 2 && args[1] != nil {
+		sats, rerr := amountFromValue(args[1])
+		if rerr != nil {
+			return nil, rerr
+		}
+		maxFeeRate = float64(sats) // BTC/kvB in sats == sat/kvB
 	}
 
 	txid := tx.TxHash()
