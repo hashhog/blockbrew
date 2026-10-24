@@ -556,7 +556,9 @@ type TxAcceptResult struct {
 	// Fee is the transaction fee in satoshis (if accepted).
 	Fee int64
 
-	// VSize is the virtual size in vbytes (if accepted).
+	// VSize is the virtual size in vbytes (if accepted). On the multi-tx
+	// package path it is Core's sigop-adjusted vsize (GetVirtualTransactionSize),
+	// which equals the serialized vsize unless the transaction is sigop-heavy.
 	VSize int64
 
 	// Error is the rejection reason (if not accepted).
@@ -1018,10 +1020,15 @@ type acceptOpts struct {
 	out *acceptOut
 }
 
-// acceptOut carries the fee and vsize computed by acceptLocked.
+// acceptOut carries the fee and vsizes computed by acceptLocked. vsize is the
+// serialized vsize (what the mempool entry stores); adjVSize is Core's
+// GetVirtualTransactionSize(weight, sigop cost, bytes_per_sigop) — the vsize
+// Core reports in package results and uses for package feerates and package
+// RBF. They differ only for a sigop-heavy transaction.
 type acceptOut struct {
-	fee   int64
-	vsize int64
+	fee      int64
+	vsize    int64
+	adjVSize int64
 }
 
 // acceptLocked is AddTransactionFrom's body. Must be called with mp.mu held.
@@ -1450,6 +1457,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	if opts.out != nil {
 		opts.out.fee = fee
 		opts.out.vsize = vsize
+		opts.out.adjVSize = (clusterAdjWeight + consensus.WitnessScaleFactor - 1) / consensus.WitnessScaleFactor
 	}
 	if opts.testOnly {
 		return nil
@@ -4046,14 +4054,14 @@ func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResul
 			txResult.AlreadyInMempool = true
 			txResult.Accepted = true
 			txResult.Fee = entry.Fee
-			txResult.VSize = entry.Size
+			txResult.VSize = (mp.clusterAdjWeightLocked(tx) + consensus.WitnessScaleFactor - 1) / consensus.WitnessScaleFactor
 			continue
 		}
 
 		var out acceptOut
 		err := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, out: &out})
 		if err == nil {
-			txResult.setAccepted(out.fee, out.vsize, out.fee, out.vsize, []wire.Hash256{wtxid})
+			txResult.setAccepted(out.fee, out.adjVSize, out.fee, out.adjVSize, []wire.Hash256{wtxid})
 			continue
 		}
 		txResult.Error = mp.packageTxErrorLocked(tx, err)
@@ -4083,7 +4091,7 @@ func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResul
 			txResult.Error = mp.packageTxErrorLocked(tx, aerr)
 			err = fmt.Errorf("transaction %s failed: %w", tx.TxHash(), aerr)
 		} else {
-			txResult.setAccepted(out.fee, out.vsize, out.fee, out.vsize, []wire.Hash256{tx.WTxHash()})
+			txResult.setAccepted(out.fee, out.adjVSize, out.fee, out.adjVSize, []wire.Hash256{tx.WTxHash()})
 		}
 	case len(deferred) > 1:
 		err = mp.acceptSubpackageLocked(deferred, result)
@@ -4140,7 +4148,8 @@ func (r *TxAcceptResult) setAccepted(fee, vsize, effFee, effVSize int64, include
 // member passes. Must be called with mu held.
 func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResult) error {
 	fees := make([]int64, len(sub))
-	vsizes := make([]int64, len(sub))
+	vsizes := make([]int64, len(sub))    // serialized, for the mempool entry
+	adjVSizes := make([]int64, len(sub)) // sigop-adjusted, for feerates and results
 	wtxids := make([]wire.Hash256, len(sub))
 	var totalFee, totalVSize int64
 
@@ -4158,9 +4167,9 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 			return fmt.Errorf("transaction %s failed validation: %w", txid, err)
 		}
 		mp.pkgView[txid] = tx
-		fees[i], vsizes[i], wtxids[i] = out.fee, out.vsize, wtxid
+		fees[i], vsizes[i], adjVSizes[i], wtxids[i] = out.fee, out.vsize, out.adjVSize, wtxid
 		totalFee += out.fee
-		totalVSize += out.vsize
+		totalVSize += out.adjVSize
 	}
 
 	result.PackageFeerate = float64(totalFee) / float64(totalVSize)
@@ -4175,7 +4184,7 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 	// the members' outputs still in pkgView, before anything changes.
 	conflicts := mp.packageConflictsLocked(sub)
 	if len(conflicts) > 0 {
-		if msg, err := mp.packageRBFChecksLocked(sub, fees, vsizes, totalFee, totalVSize, conflicts); err != nil {
+		if msg, err := mp.packageRBFChecksLocked(sub, fees, adjVSizes, totalFee, totalVSize, conflicts); err != nil {
 			result.PackageMsg = msg
 			return err
 		}
@@ -4214,7 +4223,7 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 	}
 
 	for i := range sub {
-		result.TxResults[wtxids[i]].setAccepted(fees[i], vsizes[i], totalFee, totalVSize, wtxids)
+		result.TxResults[wtxids[i]].setAccepted(fees[i], adjVSizes[i], totalFee, totalVSize, wtxids)
 	}
 	return nil
 }
@@ -4374,7 +4383,7 @@ func (mp *Mempool) TestAcceptPackage(txns []*wire.MsgTx) ([]*TxAcceptResult, err
 			break
 		}
 		mp.pkgView[txid] = tx
-		r.setAccepted(out.fee, out.vsize, out.fee, out.vsize, []wire.Hash256{wtxid})
+		r.setAccepted(out.fee, out.adjVSize, out.fee, out.adjVSize, []wire.Hash256{wtxid})
 	}
 	return results, nil
 }
