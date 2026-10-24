@@ -4172,6 +4172,18 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 		totalVSize += out.adjVSize
 	}
 
+	// BIP-431 PackageTRUCChecks over every member, with the full package as
+	// context, BEFORE any member is added or any conflict evicted (Core
+	// validation.cpp:1479-1486). Run after a member was inserted, its
+	// in-package parent would also be found in the pool and counted twice.
+	for i, tx := range sub {
+		if err := mp.packageTRUCChecks(tx, mp.trucSigopVsize(tx), sub, i); err != nil {
+			result.TxResults[wtxids[i]].Error = err
+			result.PackageMsg = "TRUC-violation, " + err.Error()
+			return fmt.Errorf("transaction %s failed TRUC package check: %w", tx.TxHash(), err)
+		}
+	}
+
 	result.PackageFeerate = float64(totalFee) / float64(totalVSize)
 	if err := mp.checkFeeRateLocked(totalVSize, totalFee); err != nil {
 		// Core reports the fee failure on the last member only; the others
@@ -4193,6 +4205,10 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 	// Add in order: each member's parents are in the pool by the time it is
 	// added, so the cluster limits and dependency links see them. The
 	// replaced transactions go first, with REPLACED (Core FinalizeSubpackage).
+	// Every check that can refuse the package has run by now: TRUC above, and
+	// for a replacement the read-only cluster-limit probe in
+	// packageRBFChecksLocked, so the eviction is never followed by a refusal
+	// that leaves the conflicts gone and the package out.
 	mp.pkgView = nil
 	for conflict := range conflicts {
 		mp.removeWithDescendantsLocked(conflict, MempoolRemovalReasonReplaced)
@@ -4200,16 +4216,6 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 	for i, tx := range sub {
 		txid := tx.TxHash()
 		txResult := result.TxResults[wtxids[i]]
-
-		// BIP-431 PackageTRUCChecks: enforce TRUC topology rules with the full
-		// package context. Core: PackageTRUCChecks (truc_policy.cpp:57-169).
-		sigopVsize := mp.trucSigopVsize(tx)
-		if err := mp.packageTRUCChecks(tx, sigopVsize, sub, i); err != nil {
-			txResult.Error = err
-			result.PackageMsg = "TRUC-violation, " + err.Error()
-			mp.rollbackPackageLocked(sub[:i])
-			return fmt.Errorf("transaction %s failed TRUC package check: %w", txid, err)
-		}
 
 		if err := mp.addTransactionLocked(tx, fees[i], vsizes[i]); err != nil {
 			if errors.Is(err, ErrClusterTooLarge) {
