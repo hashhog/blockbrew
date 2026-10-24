@@ -767,11 +767,18 @@ type TestMempoolAcceptResult struct {
 	VSize        int64    `json:"vsize,omitempty"`
 	Fees         *FeeInfo `json:"fees,omitempty"`
 	RejectReason string   `json:"reject-reason,omitempty"`
+	// RejectDetails is Core's TxValidationState::ToString(). Only the
+	// replacement checks fill it so far.
+	RejectDetails string `json:"reject-details,omitempty"`
 }
 
 // FeeInfo contains fee information for testmempoolaccept.
 type FeeInfo struct {
 	Base float64 `json:"base"`
+	// EffectiveFeerate (BTC/kvB) and EffectiveIncludes (wtxids) are Core's
+	// single-transaction values: the tx's own CFeeRate and its own wtxid.
+	EffectiveFeerate  *float64 `json:"effective-feerate,omitempty"`
+	EffectiveIncludes []string `json:"effective-includes,omitempty"`
 }
 
 // classifyRBFReject maps a checkRBFLocked error sentinel onto the Bitcoin Core
@@ -779,16 +786,20 @@ type FeeInfo struct {
 // report for the same condition. The categories here are exactly the ones the
 // RBF differential harness normalises against:
 //
-//   - Rule 3 (lower absolute fee) AND Rule 4 (insufficient fee bump) both
-//     surface as "insufficient fee" in Core (rbf.cpp:109-123 → the
-//     ReplacementChecks "insufficient fee" state in validation.cpp). blockbrew
-//     folds both into ErrRBFInsufficientFee, as does the feerate-diagram gate.
+//   - Rule 3 / Rule 4 ("insufficient fee"), Rule 5 ("too many potential
+//     replacements") and the feerate diagram ("replacement-failed") come back
+//     as mempool.RBFRejectError carrying Core's reason (validation.cpp
+//     ReplacementChecks); its Reason is used as is.
 //   - A non-signaling conflict with full-RBF disabled is Core
 //     "txn-mempool-conflict" (validation.cpp PreChecks).
 //   - Rule 2 (new unconfirmed input) → "replacement-adds-unconfirmed".
 //   - Rule 5 (too many candidates) → "too many potential replacements".
 //   - Spending a conflicting tx → "bad-txns-spends-conflicting-tx".
 func classifyRBFReject(err error) string {
+	var rej *mempool.RBFRejectError
+	if errors.As(err, &rej) {
+		return rej.Reason
+	}
 	switch {
 	case errors.Is(err, mempool.ErrRBFInsufficientFee),
 		errors.Is(err, mempool.ErrRBFFeerateDiagram):
@@ -1156,6 +1167,10 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if conflicts, rbfErr := s.mempool.TestReplacement(tx); conflicts && rbfErr != nil {
 			result.Allowed = false
 			result.RejectReason = classifyRBFReject(rbfErr)
+			var rej *mempool.RBFRejectError
+			if errors.As(rbfErr, &rej) {
+				result.RejectDetails = rej.Error()
+			}
 			results = append(results, result)
 			continue
 		}
@@ -1172,8 +1187,12 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		// Transaction passed validation
 		result.Allowed = true
 		result.VSize = vsize
+		// Core CFeeRate(fee, vsize).GetFeePerK(): sat/kvB, rounded down.
+		effFeerate := float64(fee*1000/vsize) / satoshiPerBitcoin
 		result.Fees = &FeeInfo{
-			Base: float64(fee) / satoshiPerBitcoin,
+			Base:              float64(fee) / satoshiPerBitcoin,
+			EffectiveFeerate:  &effFeerate,
+			EffectiveIncludes: []string{result.WTxID},
 		}
 		results = append(results, result)
 	}

@@ -692,12 +692,14 @@ func TestW106_G15_RBFRule4_NotEnoughAdditionalFee(t *testing.T) {
 }
 
 // ============================================================================
-// G16 — RBF Rule 5: too many conflicts (>100 evictions)
+// G16 — RBF Rule 5: >100 evictions from one conflicting cluster pass
 // ============================================================================
 
-// TestW106_G16_RBFRule5_TooManyConflicts verifies that when the replacement
-// would evict more than MaxRBFReplacedTxs (100) transactions it is rejected
-// with ErrRBFTooManyConflicts.
+// TestW106_G16_RBFRule5_TooManyConflicts verifies that a replacement evicting
+// more than MaxRBFReplacedTxs (100) transactions through a single direct
+// conflict is NOT refused by Rule 5: Core 31 GetEntriesForConflicts
+// (policy/rbf.cpp) counts conflicting clusters, and here there is one. The
+// many-clusters refusal is TestClusterRBF_101ConflictingClustersRefused.
 func TestW106_G16_RBFRule5_TooManyConflicts(t *testing.T) {
 	mp, ops := setupFundedMempool(1)
 	utxos := mp.utxoSet.(*testUTXOSet)
@@ -744,8 +746,8 @@ func TestW106_G16_RBFRule5_TooManyConflicts(t *testing.T) {
 	err := mp.checkRBFLocked(replaceTx, conflictMap, 10_000_000)
 	mp.mu.RUnlock()
 
-	if !errors.Is(err, ErrRBFTooManyConflicts) {
-		t.Errorf("G16: expected ErrRBFTooManyConflicts for >100 evictions, got %v", err)
+	if errors.Is(err, ErrRBFTooManyConflicts) {
+		t.Errorf("G16: >100 evictions from one conflicting cluster must pass Rule 5, got %v", err)
 	}
 }
 
