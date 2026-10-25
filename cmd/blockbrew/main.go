@@ -433,7 +433,8 @@ func main() {
 		debug.SetGCPercent(400)
 	}
 	if os.Getenv("GOMEMLIMIT") == "" {
-		debug.SetMemoryLimit(12 * 1024 * 1024 * 1024) // 12 GiB soft limit
+		// 12 GiB soft limit; run() lowers it to fit a cgroup memory.max.
+		debug.SetMemoryLimit(12 * 1024 * 1024 * 1024)
 	}
 
 	// Check for subcommands first
@@ -896,8 +897,21 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		consensus.StartProfileServer(cfg.PprofAddr)
 	}
 
-	// 1. Open the database with the configured cache budget.
-	utxoCacheBytes, pebbleBlockCacheBytes := computeCacheSplit(cfg.DBCache)
+	// 1. Open the database with the configured cache budget, shrunk to fit
+	// the cgroup memory limit if the node runs under one (membudget.go).
+	budget := planMemoryBudget(cfg.DBCache, cgroupMemoryMax(os.Getenv(cgroupFSRootEnv)))
+	utxoCacheBytes, pebbleBlockCacheBytes := budget.utxoCacheBytes, budget.pebbleBlockCacheBytes
+	if budget.clamped {
+		log.Printf("WARNING: -dbcache=%d MiB does not fit the cgroup memory limit (memory.max=%d MiB); using -dbcache=%d MiB. Raise the unit's MemoryMax to use a larger cache.",
+			cfg.DBCache, budget.capBytes>>20, budget.effectiveDBCacheMiB)
+	}
+	if budget.capBytes > 0 {
+		if os.Getenv("GOMEMLIMIT") == "" && budget.goMemLimit < debug.SetMemoryLimit(-1) {
+			debug.SetMemoryLimit(budget.goMemLimit)
+		}
+		log.Printf("Memory budget: cgroup memory.max=%d MiB → Go soft limit %d MiB (GOMEMLIMIT env overrides)",
+			budget.capBytes>>20, debug.SetMemoryLimit(-1)>>20)
+	}
 	dbPath := filepath.Join(cfg.DataDir, "chaindata")
 	pebbleCfg := storage.DefaultPebbleDBConfig()
 	pebbleCfg.BlockCacheSize = pebbleBlockCacheBytes
