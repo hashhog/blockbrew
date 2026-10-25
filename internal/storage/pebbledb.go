@@ -215,6 +215,12 @@ type PebbleDBConfig struct {
 	l0CompactionThreshold int
 }
 
+// MemTableStopWritesThreshold is how many memtables Pebble may hold before it
+// stalls writes. With MemTableSize it bounds the memtable memory, which Pebble
+// allocates outside the Go heap (C calloc), so the process memory budget must
+// count it separately.
+const MemTableStopWritesThreshold = 4
+
 // DefaultPebbleDBConfig returns the default configuration optimized for Bitcoin workloads.
 func DefaultPebbleDBConfig() PebbleDBConfig {
 	return PebbleDBConfig{
@@ -274,7 +280,7 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		FS:                          afs,
 		Cache:                       cache,
 		MemTableSize:                uint64(cfg.MemTableSize),
-		MemTableStopWritesThreshold: 4, // Allow 4 memtables before stalling
+		MemTableStopWritesThreshold: MemTableStopWritesThreshold, // Allow 4 memtables before stalling
 		Levels:                      levelOpts,
 		MaxOpenFiles:                cfg.MaxOpenFiles,
 		WALBytesPerSync:             1024 * 1024, // Sync WAL every 1MB
