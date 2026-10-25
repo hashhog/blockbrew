@@ -32,9 +32,18 @@ func TestGetChainTipsActiveIsValidatedTip(t *testing.T) {
 		t.Fatal("no tips returned")
 	}
 
-	active := tips[0]
-	if active.Status != "active" {
-		t.Fatalf("tips[0].Status = %q, want active", active.Status)
+	// Core orders tips by height, highest first (CompareBlocksByHeight), so
+	// the h5 header tip precedes the active h3 tip: find it by status.
+	var active ChainTip
+	nActive := 0
+	for _, tip := range tips {
+		if tip.Status == "active" {
+			active = tip
+			nActive++
+		}
+	}
+	if nActive != 1 {
+		t.Fatalf("%d active tips in %v, want exactly 1", nActive, tips)
 	}
 	if active.Height != 3 {
 		t.Errorf("active tip height = %d, want 3 (the VALIDATED tip, not the header tip)", active.Height)
