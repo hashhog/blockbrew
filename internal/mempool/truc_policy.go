@@ -298,9 +298,18 @@ func (mp *Mempool) packageTRUCChecks(tx *wire.MsgTx, sigopVsize int64, pkgTxs []
 	// appear before children). Core: FindInPackageParents (truc_policy.cpp:18-37).
 	inPkgParentIndices := findInPackageParents(pkgTxs, pkgIdx)
 
-	// Collect mempool parents.
+	// Collect mempool parents. A parent that is itself a package member is an
+	// in-package parent only, even if it is already in the pool, so it is
+	// never counted twice towards the ancestor limit.
+	inPkg := make(map[wire.Hash256]bool, len(pkgTxs))
+	for _, ptx := range pkgTxs {
+		inPkg[ptx.TxHash()] = true
+	}
 	var mempoolParents []*TxEntry
 	for _, in := range tx.TxIn {
+		if inPkg[in.PreviousOutPoint.Hash] {
+			continue
+		}
 		if entry, ok := mp.pool[in.PreviousOutPoint.Hash]; ok {
 			found := false
 			for _, p := range mempoolParents {

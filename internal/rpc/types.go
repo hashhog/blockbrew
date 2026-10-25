@@ -645,27 +645,32 @@ type AddressByLabelResult struct {
 	Purpose string `json:"purpose"`
 }
 
-// SubmitPackageResult is the result of the submitpackage RPC.
+// SubmitPackageResult is the result of the submitpackage RPC. Core always
+// returns replaced-transactions, empty when nothing was replaced.
 type SubmitPackageResult struct {
 	PackageMsg           string                            `json:"package_msg"`
 	TxResults            map[string]*SubmitPackageTxResult `json:"tx-results"`
-	ReplacedTransactions []string                          `json:"replaced-transactions,omitempty"`
+	ReplacedTransactions []string                          `json:"replaced-transactions"`
 }
 
-// SubmitPackageTxResult is the per-transaction result in submitpackage.
+// SubmitPackageTxResult is the per-transaction result in submitpackage, keyed
+// by wtxid in tx-results (Core rpc/mempool.cpp submitpackage): txid, then
+// vsize + fees for a transaction in the mempool, or error.
 type SubmitPackageTxResult struct {
-	TxID              string   `json:"txid"`
-	WTxID             string   `json:"wtxid,omitempty"`
-	VSize             int64    `json:"vsize,omitempty"`
-	Fees              *TxFees  `json:"fees,omitempty"`
-	Error             string   `json:"error,omitempty"`
-	EffectiveFeerate  float64  `json:"effective-feerate,omitempty"`
-	EffectiveIncludes []string `json:"effective-includes,omitempty"`
+	TxID  string  `json:"txid"`
+	VSize int64   `json:"vsize,omitempty"`
+	Fees  *TxFees `json:"fees,omitempty"`
+	Error string  `json:"error,omitempty"`
 }
 
-// TxFees represents fees for a transaction in submitpackage results.
+// TxFees represents fees for a transaction in submitpackage and package
+// testmempoolaccept results. effective-feerate / effective-includes are
+// present for a transaction validated now and absent for one that was already
+// in the mempool.
 type TxFees struct {
-	Base float64 `json:"base"`
+	Base              float64  `json:"base"`
+	EffectiveFeerate  *float64 `json:"effective-feerate,omitempty"`
+	EffectiveIncludes []string `json:"effective-includes,omitempty"`
 }
 
 // DescriptorInfoResult represents the result of getdescriptorinfo.

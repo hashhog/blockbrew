@@ -962,6 +962,10 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
 	}
 
+	if len(rawTxsArg) > 1 {
+		return s.testMempoolAcceptPackage(rawTxsArg, maxFeeRate)
+	}
+
 	results := make([]*TestMempoolAcceptResult, 0, len(rawTxsArg))
 	// Core (rpc/mempool.cpp) stops at the first member that fails: the ones
 	// after it are left unvalidated and carry only txid and wtxid.
@@ -1354,6 +1358,113 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		results = append(results, result)
 	}
 
+	return results, nil
+}
+
+// testMempoolAcceptPackageResult is one entry of a multi-transaction
+// testmempoolaccept (Core rpc/mempool.cpp l.357-404). Allowed is a pointer
+// because a member left unvalidated after an earlier failure carries only
+// txid and wtxid.
+type testMempoolAcceptPackageResult struct {
+	TxID          string  `json:"txid"`
+	WTxID         string  `json:"wtxid"`
+	PackageError  string  `json:"package-error,omitempty"`
+	Allowed       *bool   `json:"allowed,omitempty"`
+	VSize         int64   `json:"vsize,omitempty"`
+	Fees          *TxFees `json:"fees,omitempty"`
+	RejectReason  string  `json:"reject-reason,omitempty"`
+	RejectDetails string  `json:"reject-details,omitempty"`
+}
+
+// corePackageError maps a context-free package check failure onto Core's
+// PackageValidationState reject reason (policy/packages.cpp
+// IsWellFormedPackage).
+func corePackageError(err error) string {
+	switch {
+	case errors.Is(err, mempool.ErrPackageTooManyTxs):
+		return "package-too-many-transactions"
+	case errors.Is(err, mempool.ErrPackageTooLarge):
+		return "package-too-large"
+	case errors.Is(err, mempool.ErrPackageDuplicateTx):
+		return "package-contains-duplicates"
+	case errors.Is(err, mempool.ErrPackageNotSorted):
+		return "package-not-sorted"
+	case errors.Is(err, mempool.ErrPackageConflict):
+		return "conflict-in-package"
+	}
+	return err.Error()
+}
+
+// testMempoolAcceptPackage is testmempoolaccept for more than one raw
+// transaction. Core validates the list as a package (ProcessNewPackage with
+// test_accept=true): later members may spend earlier members' outputs, each
+// member must pay min relay on its own (no CPFP under test accept), and the
+// first failure leaves the remaining members unvalidated (txid + wtxid only).
+func (s *Server) testMempoolAcceptPackage(rawTxsArg []interface{}, maxFeeRate float64) (interface{}, *RPCError) {
+	txns := make([]*wire.MsgTx, 0, len(rawTxsArg))
+	for _, rawTxInterface := range rawTxsArg {
+		rawTxHex, ok := rawTxInterface.(string)
+		if !ok {
+			return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid transaction hex"}
+		}
+		txBytes, err := hex.DecodeString(rawTxHex)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %s Make sure the tx has at least one input.", rawTxHex)}
+		}
+		// Core's DecodeHexTx, as single-tx testmempoolaccept: trailing
+		// bytes fail the decode and the witness/legacy tie-break is the same.
+		tx, err := decodeRawTxBytes(txBytes, true, true)
+		if err != nil {
+			return nil, &RPCError{Code: RPCErrDeserialization, Message: fmt.Sprintf("TX decode failed: %s Make sure the tx has at least one input.", rawTxHex)}
+		}
+		txns = append(txns, tx)
+	}
+
+	memResults, pkgErr := s.mempool.TestAcceptPackage(txns)
+	if errors.Is(pkgErr, consensus.ErrNodeAborted) {
+		return nil, &RPCError{Code: RPCErrInternal, Message: pkgErr.Error()}
+	}
+
+	results := make([]*testMempoolAcceptPackageResult, 0, len(txns))
+	exitEarly := false
+	for i, tx := range txns {
+		r := &testMempoolAcceptPackageResult{
+			TxID:  tx.TxHash().String(),
+			WTxID: tx.WTxHash().String(),
+		}
+		results = append(results, r)
+		if pkgErr != nil {
+			r.PackageError = corePackageError(pkgErr)
+			continue
+		}
+		if exitEarly || i >= len(memResults) || memResults[i] == nil {
+			continue
+		}
+		m := memResults[i]
+		allowed := m.Accepted
+		r.Allowed = &allowed
+		if !m.Accepted {
+			if errors.Is(m.Error, mempool.ErrMissingInputs) {
+				r.RejectReason = "missing-inputs"
+			} else if m.Error != nil {
+				r.RejectReason, r.RejectDetails = packageTxRejectReason(m.Error)
+			}
+			continue
+		}
+		// Core: a fee above maxfeerate.GetFee(vsize) is refused and ends the
+		// evaluation for the members after it.
+		if maxFeeRate > 0 {
+			maxFee := int64(math.Ceil(maxFeeRate * satoshiPerBitcoin * float64(m.VSize) / 1000))
+			if maxFee > 0 && m.Fee > maxFee {
+				allowed = false
+				r.RejectReason = "max-fee-exceeded"
+				exitEarly = true
+				continue
+			}
+		}
+		r.VSize = m.VSize
+		r.Fees = packageTxFees(m)
+	}
 	return results, nil
 }
 
