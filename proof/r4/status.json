@@ -15,5 +15,16 @@
   "lineage_binary_and_datadir": "GONE",
   "ledger_250000_overall": "FAIL@250000",
   "ledger_250000_wedge_height": 231020,
-  "blocker": "Matching 08-14 capture binary and datadir are gone. No from-genesis reproduction of C(958794) exists for HEAD. Re-hashing Core's dumptxoutset is file-integrity, not a lineage. Snapshot-booted range-runner CLOSED rows do not count."
+  "blocker": "Matching 08-14 capture binary and datadir are gone. No from-genesis reproduction of C(958794) exists for HEAD. Re-hashing Core's dumptxoutset is file-integrity, not a lineage. Snapshot-booted range-runner CLOSED rows do not count.",
+  "slice_chain": {
+    "bar": "mixed-build slice chain (TRUST-ANCHOR.md, Max 2026-10-07)",
+    "closed_reach_height": 481807,
+    "closing_row_on_anchor": false,
+    "not_closed": [
+      "550000-575000 NO-ORACLE-SURFACE",
+      "815000-825000 NO-ORACLE-SURFACE"
+    ],
+    "artifacts": "tools/range-artifacts/blockbrew/ (meta-repo)",
+    "as_of": "2026-10-26"
+  }
 }

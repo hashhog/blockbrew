@@ -31,9 +31,12 @@ node. The files here are the captured results of those commands.
 ### Provenance — `provenance.txt`
 
 The parent commit this bundle was assembled on (`5ccdd59`), the sha256 of
-the **deployed** binary (`4ba0d7c4dbb7c4a902cafd8380782dee495024e52e9270315bb869262ac7ede1`),
-and the toolchain (go1.24.1 linux/amd64). That sha256 is byte-identical to
+the binary deployed **at assembly** (`4ba0d7c4dbb7c4a902cafd8380782dee495024e52e9270315bb869262ac7ede1`),
+and the toolchain (go1.24.1 linux/amd64). That sha256 was byte-identical to
 the promoted pin and, at assembly, to the live unit's `/proc/<pid>/exe`.
+The pin has moved since: `deploy/blockbrew/MANIFEST` on the meta-repo records
+`c9405da` (sha256 `3cc4abca…ad03`, promoted 2026-10-08T13:32:38Z). The files
+in this bundle were captured on `5ccdd59` and were not re-captured on `c9405da`.
 **Does not prove** bit-exact reproducible builds across toolchains — see
 `REPRODUCIBLE-BUILD.md`.
 
@@ -48,6 +51,20 @@ gone does not count for HEAD.
 
 `r4/status.json` says `DISPUTED`. `r4/C958794.json` records the pin and
 both captures with `match=false` for HEAD.
+
+**Slice-chain progress since this bundle was assembled (not captured here).**
+Since 2026-10-04 blockbrew's R4 bar is a mixed-build slice chain
+(`receipts/blockbrew-r4-dispute-2026-10-04.md`; ruling in
+`receipts/TRUST-ANCHOR.md`, "blockbrew and hotbuns ... keep the mixed-build
+slice chain as their R4 bar", Max, 2026-10-07). Every slice artifact in
+`tools/range-artifacts/blockbrew/` from 0 to 481,807 is `CLOSED` (49.86% of
+C(958794)'s chain per the meta-repo STATE.md, 2026-10-26). The builds differ
+by slice (`impl_commit` 416cbeb, 7daf81b, af1219a, b7da8a2; slice 91705-91795
+records none). Two later artifacts are not CLOSED and leave gaps
+(550000-575000 and 815000-825000: `NO-ORACLE-SURFACE`). The chain does not
+reach 958,794 and there is no closing row on the anchor, so R4 **stays
+DISPUTED**; `verify.sh` still enforces that. Those artifacts live in the
+meta-repo, not in this bundle.
 
 | file | what it proves | what it does not prove |
 |---|---|---|
@@ -102,6 +119,8 @@ Adversarial corpus, accept/reject vs live `bitcoind`.
   tip proves serialization, PoW, headers-first sync and UTXO bookkeeping
   on the assumevalid-skipped prefix. R1/R2/R4 are the consensus proof.
 - **Blocks after 958794** have no from-genesis UTXO-hash capture.
+- **Blocks 481,807 to 958,794 as a slice chain.** Only 0 to 481,807 is closed
+  (see above).
 - **Snapshot-boot / assumeUTXO activation** is not a substitute for the
   lineage above.
 - **Bitcoin Core fullblocktests, stale-block replay, BIP90 asserts,
