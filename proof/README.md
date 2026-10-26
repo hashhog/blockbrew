@@ -34,9 +34,9 @@ The parent commit this bundle was assembled on (`5ccdd59`), the sha256 of
 the binary deployed **at assembly** (`4ba0d7c4dbb7c4a902cafd8380782dee495024e52e9270315bb869262ac7ede1`),
 and the toolchain (go1.24.1 linux/amd64). That sha256 was byte-identical to
 the promoted pin and, at assembly, to the live unit's `/proc/<pid>/exe`.
-The public pin has moved since: the hashhog repository's `blockbrew` gitlink
-is `c9405da4872f18b2859a8a8646c741a3ca8683f9`, set in hashhog `3e62bfa4`
-(2026-10-08T14:10:26Z). That is an older commit than blockbrew `master`. The
+The pin has moved since: the project's pinned blockbrew commit is
+`c9405da4872f18b2859a8a8646c741a3ca8683f9` (pinned 2026-10-08T14:10:26Z),
+which is in this repository and older than blockbrew `master`. The
 files in this bundle were captured on `5ccdd59` and were not re-captured on
 `c9405da`; `provenance.txt` still records `5ccdd59` and the `4ba0d7c4…` binary.
 **Does not prove** bit-exact reproducible builds across toolchains — see
@@ -55,21 +55,23 @@ gone does not count for HEAD.
 both captures with `match=false` for HEAD.
 
 **Slice-chain progress since this bundle was assembled (not captured here).**
-blockbrew's R4 bar is a mixed-build slice chain (ruling in the hashhog anchor
-ledger `TRUST-ANCHOR.md`, "blockbrew and hotbuns ... keep the mixed-build
-slice chain as their R4 bar", Max, 2026-10-07). The hashhog repository's
-`tools/range-artifacts/blockbrew/` holds 25 slice artifacts, every one
-`CLOSED`, contiguous from height 0 to 481,807. The builds differ by slice
-(`impl_commit` 416cbeba0f7c, 7daf81b14d8c, af1219accac8, b7da8a2edd18; slice
-91705-91795 records none). There is no artifact after 481,807, so the slice
-chain has no final link at 958,794.
+blockbrew's R4 bar is a mixed-build slice chain: the project's ruling of
+2026-10-07 keeps blockbrew and hotbuns on that bar. Outside this bundle, 25
+slice artifacts exist for blockbrew, every one `CLOSED`, contiguous from
+height 0 to 481,807. The builds differ by slice (`impl_commit` 416cbeba0f7c,
+7daf81b14d8c, af1219accac8, b7da8a2edd18; slice 91705-91795 records none).
+There is no artifact after 481,807, so the slice chain has no final link at
+958,794.
 
-The anchor ledger does have a blockbrew row: 2026-08-14T18:20:25Z, match ✓,
-hash `29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0`,
-lineage marker `--commit`, captured at tip 958794. That is the 08-14 capture above, whose binary and datadir are gone,
+The project's anchor record for blockbrew is the 08-14 capture above:
+2026-08-14T18:20:25Z, match ✓, hash
+`29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0`, lineage
+marker `--commit`, captured at tip 958794. Its binary and datadir are gone,
 and there is no from-genesis reproduction for HEAD. R4 therefore **stays
 DISPUTED** on that blocker; `verify.sh` still enforces it. The slice
-artifacts and the ledger are in the hashhog repository, not in this bundle.
+artifacts are not part of this bundle and are not publicly available, so
+nothing above is verifiable from this repository; it is stated only so the
+DISPUTED status is not read as "no progress".
 
 | file | what it proves | what it does not prove |
 |---|---|---|
