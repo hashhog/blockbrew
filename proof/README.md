@@ -34,9 +34,11 @@ The parent commit this bundle was assembled on (`5ccdd59`), the sha256 of
 the binary deployed **at assembly** (`4ba0d7c4dbb7c4a902cafd8380782dee495024e52e9270315bb869262ac7ede1`),
 and the toolchain (go1.24.1 linux/amd64). That sha256 was byte-identical to
 the promoted pin and, at assembly, to the live unit's `/proc/<pid>/exe`.
-The pin has moved since: `deploy/blockbrew/MANIFEST` on the meta-repo records
-`c9405da` (sha256 `3cc4abca…ad03`, promoted 2026-10-08T13:32:38Z). The files
-in this bundle were captured on `5ccdd59` and were not re-captured on `c9405da`.
+The public pin has moved since: the hashhog repository's `blockbrew` gitlink
+is `c9405da4872f18b2859a8a8646c741a3ca8683f9`, set in hashhog `3e62bfa4`
+(2026-10-08T14:10:26Z). That is an older commit than blockbrew `master`. The
+files in this bundle were captured on `5ccdd59` and were not re-captured on
+`c9405da`; `provenance.txt` still records `5ccdd59` and the `4ba0d7c4…` binary.
 **Does not prove** bit-exact reproducible builds across toolchains — see
 `REPRODUCIBLE-BUILD.md`.
 
@@ -53,18 +55,21 @@ gone does not count for HEAD.
 both captures with `match=false` for HEAD.
 
 **Slice-chain progress since this bundle was assembled (not captured here).**
-Since 2026-10-04 blockbrew's R4 bar is a mixed-build slice chain
-(`receipts/blockbrew-r4-dispute-2026-10-04.md`; ruling in
-`receipts/TRUST-ANCHOR.md`, "blockbrew and hotbuns ... keep the mixed-build
-slice chain as their R4 bar", Max, 2026-10-07). Every slice artifact in
-`tools/range-artifacts/blockbrew/` from 0 to 481,807 is `CLOSED` (49.86% of
-C(958794)'s chain per the meta-repo STATE.md, 2026-10-26). The builds differ
-by slice (`impl_commit` 416cbeb, 7daf81b, af1219a, b7da8a2; slice 91705-91795
-records none). Two later artifacts are not CLOSED and leave gaps
-(550000-575000 and 815000-825000: `NO-ORACLE-SURFACE`). The chain does not
-reach 958,794 and there is no closing row on the anchor, so R4 **stays
-DISPUTED**; `verify.sh` still enforces that. Those artifacts live in the
-meta-repo, not in this bundle.
+blockbrew's R4 bar is a mixed-build slice chain (ruling in the hashhog anchor
+ledger `TRUST-ANCHOR.md`, "blockbrew and hotbuns ... keep the mixed-build
+slice chain as their R4 bar", Max, 2026-10-07). The hashhog repository's
+`tools/range-artifacts/blockbrew/` holds 25 slice artifacts, every one
+`CLOSED`, contiguous from height 0 to 481,807. The builds differ by slice
+(`impl_commit` 416cbeba0f7c, 7daf81b14d8c, af1219accac8, b7da8a2edd18; slice
+91705-91795 records none). There is no artifact after 481,807, so the slice
+chain has no final link at 958,794.
+
+The anchor ledger does have a blockbrew row: 2026-08-14T18:20:25Z, match ✓,
+hash `29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0`,
+lineage marker `--commit`, captured at tip 958794. That is the 08-14 capture above, whose binary and datadir are gone,
+and there is no from-genesis reproduction for HEAD. R4 therefore **stays
+DISPUTED** on that blocker; `verify.sh` still enforces it. The slice
+artifacts and the ledger are in the hashhog repository, not in this bundle.
 
 | file | what it proves | what it does not prove |
 |---|---|---|
@@ -119,8 +124,8 @@ Adversarial corpus, accept/reject vs live `bitcoind`.
   tip proves serialization, PoW, headers-first sync and UTXO bookkeeping
   on the assumevalid-skipped prefix. R1/R2/R4 are the consensus proof.
 - **Blocks after 958794** have no from-genesis UTXO-hash capture.
-- **Blocks 481,807 to 958,794 as a slice chain.** Only 0 to 481,807 is closed
-  (see above).
+- **Blocks 481,807 to 958,794 as a slice chain.** Only 0 to 481,807 is closed;
+  there is no artifact after 481,807 (see above).
 - **Snapshot-boot / assumeUTXO activation** is not a substitute for the
   lineage above.
 - **Bitcoin Core fullblocktests, stale-block replay, BIP90 asserts,

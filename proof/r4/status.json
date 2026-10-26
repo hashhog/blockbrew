@@ -17,14 +17,30 @@
   "ledger_250000_wedge_height": 231020,
   "blocker": "Matching 08-14 capture binary and datadir are gone. No from-genesis reproduction of C(958794) exists for HEAD. Re-hashing Core's dumptxoutset is file-integrity, not a lineage. Snapshot-booted range-runner CLOSED rows do not count.",
   "slice_chain": {
-    "bar": "mixed-build slice chain (TRUST-ANCHOR.md, Max 2026-10-07)",
+    "bar": "mixed-build slice chain (anchor ledger TRUST-ANCHOR.md, Max 2026-10-07)",
+    "artifacts": "hashhog tools/range-artifacts/blockbrew/",
+    "artifact_count": 25,
+    "all_verdicts": "CLOSED",
     "closed_reach_height": 481807,
-    "closing_row_on_anchor": false,
-    "not_closed": [
-      "550000-575000 NO-ORACLE-SURFACE",
-      "815000-825000 NO-ORACLE-SURFACE"
+    "impl_commits": [
+      "416cbeba0f7c",
+      "7daf81b14d8c",
+      "af1219accac8",
+      "b7da8a2edd18"
     ],
-    "artifacts": "tools/range-artifacts/blockbrew/ (meta-repo)",
-    "as_of": "2026-10-26"
+    "impl_commit_missing": [
+      "91705-91795"
+    ],
+    "after_481807": "no artifact after 481807",
+    "final_link_at_958794": false,
+    "checked_against": "hashhog master b96e05eabe57d5ac9f123c4bc815956c009afe5d"
+  },
+  "anchor_ledger_row": {
+    "utc": "2026-08-14T18:20:25Z",
+    "match": true,
+    "hash_serialized_3": "29692050559b8f064a03af9cd605040e71d1d978fa22947c079cc7e5546e7af0",
+    "lineage_marker": "--commit",
+    "capture_tip": 958794,
+    "counts_for_head": false
   }
 }
