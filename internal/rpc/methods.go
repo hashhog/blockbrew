@@ -779,49 +779,30 @@ func (s *Server) handleGetDifficulty() (interface{}, *RPCError) {
 }
 
 func (s *Server) handleGetChainTips() (interface{}, *RPCError) {
-	if s.headerIndex == nil {
+	if s.headerIndex == nil || s.chainMgr == nil {
 		return nil, &RPCError{Code: RPCErrInWarmup, Message: "Node is warming up"}
 	}
 
-	// The ACTIVE tip is the VALIDATED chain tip (block data connected), not
-	// the header-index best tip.  Core's getchaintips reports the
-	// active-chain tip (m_chain.Tip(), which requires BLOCK_VALID_TRANSACTIONS)
-	// as "active"; a header-only tip is reported separately as "headers-only".
-	// The old code labelled headerIndex.BestTip() "active" even when the
-	// header chain was ahead of the validated chain (normal mid-IBD / bodies
-	// pending) — a header-tip-as-active divergence (#43).
-	validated := s.chainMgr.BestBlockNode()
-	if validated == nil {
-		return []ChainTip{}, nil
+	// Every tip in the block index, as Core's getchaintips enumerates them
+	// (rpc/blockchain.cpp): the active tip — the VALIDATED chain tip, not the
+	// header-index best tip (#43) — plus every index entry off the active
+	// chain with no child, each with its own status and branchlen.
+	//
+	// This used to report only the active tip and, when the best header was
+	// ahead of it on the same lineage, that one header tip as
+	// "headers-only". Side branches, invalidated blocks and stored-but-never-
+	// connected blocks were all missing, and a failed block at the best
+	// header was reported "headers-only" where Core says "invalid".
+	infos := s.chainMgr.ChainTips()
+	tips := make([]ChainTip, 0, len(infos))
+	for _, t := range infos {
+		tips = append(tips, ChainTip{
+			Height:    t.Height,
+			Hash:      t.Hash.String(),
+			BranchLen: t.BranchLen,
+			Status:    t.Status,
+		})
 	}
-	tips := []ChainTip{
-		{
-			Height:    validated.Height,
-			Hash:      validated.Hash.String(),
-			BranchLen: 0,
-			Status:    "active",
-		},
-	}
-
-	// If the best HEADER tip is ahead of the validated tip on the same
-	// lineage (headers-first sync with bodies still pending), report it as a
-	// distinct "headers-only" tip — its BranchLen is the count of headers
-	// above the validated tip.  (Full enumeration of sibling side-branch
-	// tips remains a completeness gap — Core walks every leaf; documented.)
-	headerTip := s.headerIndex.BestTip()
-	if headerTip != nil && headerTip.Hash != validated.Hash &&
-		headerTip.Height > validated.Height {
-		anc := headerTip.GetAncestor(validated.Height)
-		if anc != nil && anc.Hash == validated.Hash {
-			tips = append(tips, ChainTip{
-				Height:    headerTip.Height,
-				Hash:      headerTip.Hash.String(),
-				BranchLen: headerTip.Height - validated.Height,
-				Status:    "headers-only",
-			})
-		}
-	}
-
 	return tips, nil
 }
 
