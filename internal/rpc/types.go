@@ -255,17 +255,17 @@ type ScriptPubKey struct {
 
 // MempoolInfo represents the result of getmempoolinfo.
 type MempoolInfo struct {
-	Loaded              bool    `json:"loaded"`
-	Size                int     `json:"size"`
-	Bytes               int64   `json:"bytes"`
-	Usage               int64   `json:"usage"`
-	TotalFee            float64 `json:"total_fee"`
-	MaxMempool          int64   `json:"maxmempool"`
-	MempoolMinFee       float64 `json:"mempoolminfee"`
-	MinRelayTxFee       float64 `json:"minrelaytxfee"`
-	IncrementalRelayFee float64 `json:"incrementalrelayfee"`
-	UnbroadcastCount    int     `json:"unbroadcastcount"`
-	FullRBF             bool    `json:"fullrbf"`
+	Loaded              bool      `json:"loaded"`
+	Size                int       `json:"size"`
+	Bytes               int64     `json:"bytes"`
+	Usage               int64     `json:"usage"`
+	TotalFee            btcAmount `json:"total_fee"`
+	MaxMempool          int64     `json:"maxmempool"`
+	MempoolMinFee       float64   `json:"mempoolminfee"`
+	MinRelayTxFee       float64   `json:"minrelaytxfee"`
+	IncrementalRelayFee float64   `json:"incrementalrelayfee"`
+	UnbroadcastCount    int       `json:"unbroadcastcount"`
+	FullRBF             bool      `json:"fullrbf"`
 	// Core v31.99 added five fields after fullrbf (rpc/mempool.cpp:1059-1063,
 	// MempoolInfoToJSON pushKV order). Emitted in Core's order, after fullrbf.
 	PermitBareMultisig bool  `json:"permitbaremultisig"`
