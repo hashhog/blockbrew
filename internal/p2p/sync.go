@@ -1,6 +1,8 @@
 package p2p
 
 import (
+	crand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -1998,26 +2000,7 @@ func (sm *SyncManager) CreatePeerListeners() *PeerListeners {
 			p.SendMessage(inv)
 		},
 		OnGetBlockTxn: func(p *Peer, msg *MsgGetBlockTxn) {
-			// Peer requesting missing transactions for compact block reconstruction.
-			// MAX_BLOCKTXN_DEPTH guard (Bitcoin Core net_processing.cpp):
-			// If the requested block is more than MaxBlocktxnDepth below our best
-			// tip, fall back to sending the full block instead of serving blocktxn.
-			// We don't serve compact blocks yet, so in either case we ignore, but
-			// the depth check ensures correct behaviour once serving is implemented.
-			if sm.headerIndex != nil {
-				tipHeight := sm.headerIndex.BestHeight()
-				if node := sm.headerIndex.GetNode(msg.BlockHash); node != nil {
-					depth := tipHeight - node.Height
-					if depth > MaxBlocktxnDepth {
-						log.Printf("[compact] getblocktxn from %s for block %s is %d deep (limit %d), would fall back to full block",
-							p.Address(), msg.BlockHash, depth, MaxBlocktxnDepth)
-						// TODO(BUG-3): once OnGetBlockTxn serving is implemented,
-						// send full block via getdata here instead of blocktxn.
-						return
-					}
-				}
-			}
-			log.Printf("[compact] Received getblocktxn from %s, ignoring", p.Address())
+			sm.HandleGetBlockTxn(p, msg)
 		},
 		OnBlockTxn: func(p *Peer, _ *MsgBlockTxn) {
 			// Response to our getblocktxn request. Since we fall back to full
@@ -2416,6 +2399,83 @@ func (sm *SyncManager) HandleNotFound(peer *Peer, msg *MsgNotFound) {
 	}
 }
 
+// blockDepth returns how many blocks below our best tip the given block's
+// height is (negative if above), and whether the block is in the header index.
+func (sm *SyncManager) blockDepth(hash wire.Hash256) (int32, bool) {
+	if sm.headerIndex == nil || sm.chainMgr == nil {
+		return 0, false
+	}
+	node := sm.headerIndex.GetNode(hash)
+	if node == nil {
+		return 0, false
+	}
+	_, tipHeight := sm.chainMgr.BestBlock()
+	return tipHeight - node.Height, true
+}
+
+// buildCmpctBlockReply builds the BIP-152 cmpctblock Core would send for a
+// getdata(MSG_CMPCT_BLOCK) at the given depth below the tip, or nil when the
+// block is too deep (Core: pindex->nHeight >= tip - MAX_CMPCTBLOCK_DEPTH),
+// in which case the caller sends the full block. The nonce is random per
+// message.
+func buildCmpctBlockReply(block *wire.MsgBlock, depth int32) *MsgCmpctBlock {
+	if depth > MaxCmpctBlockDepth {
+		return nil
+	}
+	var nb [8]byte
+	if _, err := crand.Read(nb[:]); err != nil {
+		return nil
+	}
+	nonce := binary.LittleEndian.Uint64(nb[:])
+	return NewCompactBlockBuilder(&block.Header, nonce).Build(block)
+}
+
+// HandleGetBlockTxn answers getblocktxn with blocktxn, mirroring Core's
+// net_processing.cpp ProcessMessage("getblocktxn"): unknown/unstored block ->
+// ignore; deeper than MAX_BLOCKTXN_DEPTH below the tip -> the full block
+// instead; any index out of range -> misbehaving.
+func (sm *SyncManager) HandleGetBlockTxn(p *Peer, msg *MsgGetBlockTxn) {
+	depth, ok := sm.blockDepth(msg.BlockHash)
+	if !ok || sm.chainDB == nil {
+		log.Printf("[compact] getblocktxn from %s for unknown block %s, ignoring", p.Address(), msg.BlockHash)
+		return
+	}
+	block, err := sm.chainDB.GetBlock(msg.BlockHash)
+	if err != nil {
+		log.Printf("[compact] getblocktxn from %s: block %s not available: %v", p.Address(), msg.BlockHash, err)
+		return
+	}
+	if depth > MaxBlocktxnDepth {
+		log.Printf("[compact] getblocktxn from %s for block %s is %d deep (limit %d), sending full block",
+			p.Address(), msg.BlockHash, depth, MaxBlocktxnDepth)
+		p.SendMessage(&MsgBlock{Block: block})
+		return
+	}
+	reply, err := buildBlockTxnReply(block, msg)
+	if err != nil {
+		p.Misbehaving(100, "getblocktxn with out-of-range index")
+		return
+	}
+	p.SendMessage(reply)
+}
+
+// buildBlockTxnReply decodes the differentially-encoded indexes of a
+// getblocktxn and returns the matching blocktxn, or an error if any index is
+// outside the block.
+func buildBlockTxnReply(block *wire.MsgBlock, msg *MsgGetBlockTxn) (*MsgBlockTxn, error) {
+	var idx []uint32
+	last := int64(-1)
+	for _, d := range msg.Indexes {
+		v := last + int64(d) + 1
+		if v >= int64(len(block.Transactions)) {
+			return nil, fmt.Errorf("index %d out of range (%d txs)", v, len(block.Transactions))
+		}
+		idx = append(idx, uint32(v))
+		last = v
+	}
+	return CreateBlockTxn(block, idx)
+}
+
 // HandleGetData responds to getdata requests by sending requested blocks and transactions.
 //
 // BIP-159 peer-served-blocks gate: when prune mode is on, refuse to serve
@@ -2467,9 +2527,23 @@ func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
 				}
 				continue
 			}
+			// MSG_CMPCT_BLOCK within MAX_CMPCTBLOCK_DEPTH of our tip is answered
+			// with a BIP-152 cmpctblock (Core ProcessGetBlockData); deeper
+			// blocks fall through to the full block below.
+			if inv.Type == InvTypeCmpctBlock {
+				if depth, ok := sm.blockDepth(inv.Hash); ok && peer.CompactBlockState() != nil &&
+					peer.CompactBlockState().ProvidesCompactBlocks() {
+					if cb := buildCmpctBlockReply(block, depth); cb != nil {
+						log.Printf("sync: serving cmpctblock at %x to peer %s", inv.Hash[:4], peer.Address())
+						peer.SendMessage(cb)
+						continue
+					}
+				}
+			}
 			log.Printf("sync: serving block at %x to peer %s", inv.Hash[:4], peer.Address())
 			// MSG_BLOCK (no witness flag) is answered without witness data,
 			// as Core does; only MSG_WITNESS_BLOCK gets the witness form.
+			// MSG_CMPCT_BLOCK beyond the depth limit gets the witness block.
 			peer.SendMessage(&MsgBlock{Block: block, NoWitness: inv.Type == InvTypeBlock})
 		case InvTypeTx, InvTypeWtx:
 			// Serve a transaction from the mempool. Mirrors Bitcoin Core's
