@@ -504,22 +504,58 @@ func (s *Server) handleGetAddressInfo(params json.RawMessage) (interface{}, *RPC
 	return s.buildAddressInfo(s.wallet, addr)
 }
 
+// walletDefaultMinFeeKvB is Core's DEFAULT_TRANSACTION_MINFEE (-mintxfee),
+// in sat/kvB (wallet/wallet.h).
+const walletDefaultMinFeeKvB = 1000
+
 // walletFeeRate picks the feerate (sat/vB) a wallet spend uses when the
 // caller supplied none, in Bitcoin Core's order (wallet/fees.cpp
-// GetMinimumFeeRate): the fee estimator's answer, else -fallbackfee. With no
-// estimate and no fallback it fails like Core's CreateTransaction:
-// -6 "Fee estimation failed. Fallbackfee is disabled. ...".
+// GetMinimumFeeRate): the fee estimator's answer, else -fallbackfee, then
+// raised to the mempool minimum fee and to the required feerate
+// max(-mintxfee, -minrelaytxfee). With no estimate and no fallback it fails
+// like Core's CreateTransaction: -6 "Fee estimation failed. Fallbackfee is
+// disabled. ..." (send and fundrawtransaction report it as -4, see
+// walletFeeRateErr).
 func (s *Server) walletFeeRate() (float64, *RPCError) {
+	rate := 0.0
 	if s.feeEstimator != nil {
 		if est, _ := s.feeEstimator.EstimateSmartFee(6); est > 0 {
-			return est, nil
+			rate = est
 		}
 	}
-	if s.config.FallbackFee > 0 {
-		return s.config.FallbackFee, nil
+	if rate == 0 {
+		if s.config.FallbackFee <= 0 {
+			return 0, &RPCError{
+				Code:    RPCErrWalletInsufficientFunds,
+				Message: "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee.",
+			}
+		}
+		rate = s.config.FallbackFee
 	}
-	return 0, &RPCError{
-		Code:    RPCErrWalletInsufficientFunds,
-		Message: "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee.",
+	requiredKvB := int64(walletDefaultMinFeeKvB)
+	if s.mempool != nil {
+		if min := float64(s.mempool.GetMinFeeRate()) / 1000; rate < min {
+			rate = min
+		}
+		if relay := s.mempool.MinRelayFeeRateKvB(); relay > requiredKvB {
+			requiredKvB = relay
+		}
 	}
+	if req := float64(requiredKvB) / 1000; rate < req {
+		rate = req
+	}
+	return rate, nil
+}
+
+// walletFeeRateErr is walletFeeRate for the send and fundrawtransaction /
+// walletcreatefundedpsbt paths, where Core throws the fallback failure as
+// RPC_WALLET_ERROR (-4): send checks it itself before CreateTransaction and
+// FundTransaction's error is thrown as -4 (wallet/rpc/spend.cpp).
+// sendtoaddress/sendmany keep -6 (SendMoney).
+func (s *Server) walletFeeRateErr() (float64, *RPCError) {
+	rate, rpcErr := s.walletFeeRate()
+	if rpcErr != nil {
+		return 0, &RPCError{Code: RPCErrWalletError, Message: rpcErr.Message}
+	}
+	return rate, nil
 }

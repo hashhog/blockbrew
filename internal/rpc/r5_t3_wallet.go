@@ -144,7 +144,7 @@ func (s *Server) handleSend(params json.RawMessage, walletName string) (interfac
 	// their own error codes.
 	if feeRate == 0 {
 		var rpcErr *RPCError
-		if feeRate, rpcErr = s.walletFeeRate(); rpcErr != nil {
+		if feeRate, rpcErr = s.walletFeeRateErr(); rpcErr != nil {
 			return nil, rpcErr
 		}
 	}

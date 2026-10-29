@@ -551,7 +551,7 @@ func (s *Server) fundTxSkeleton(
 		feeRate = (*opts.FeeRateLegacy) * satoshiPerBitcoin / 1000.0
 	} else {
 		var rpcErr *RPCError
-		if feeRate, rpcErr = s.walletFeeRate(); rpcErr != nil {
+		if feeRate, rpcErr = s.walletFeeRateErr(); rpcErr != nil {
 			return nil, rpcErr
 		}
 	}
