@@ -576,12 +576,9 @@ func (s *Server) handleSendToAddressWithWallet(params json.RawMessage, walletNam
 		return nil, rpcAmtErr
 	}
 
-	feeRate := 10.0
-	if s.mempool != nil {
-		estimated := s.mempool.EstimateFee(6)
-		if estimated > feeRate {
-			feeRate = estimated
-		}
+	feeRate, rpcErr := s.walletFeeRate()
+	if rpcErr != nil {
+		return nil, rpcErr
 	}
 
 	tipHeight := int32(0)

@@ -100,19 +100,9 @@ func (s *Server) handleSendToAddress(params json.RawMessage) (interface{}, *RPCE
 
 	amountSat := int64(amountBTC * satoshiPerBitcoin)
 
-	// Default fee rate: 10 sat/vB
-	feeRate := 10.0
-	if len(args) >= 3 {
-		// args[2] is comment (ignored), args[3] is comment_to (ignored)
-		// For custom fee rate, we could add an extension
-	}
-
-	// Estimate fee rate from mempool if available
-	if s.mempool != nil {
-		estimated := s.mempool.EstimateFee(6)
-		if estimated > feeRate {
-			feeRate = estimated
-		}
+	feeRate, rpcErr := s.walletFeeRate()
+	if rpcErr != nil {
+		return nil, rpcErr
 	}
 
 	// Get current tip height for coinbase maturity check
@@ -512,4 +502,24 @@ func (s *Server) handleGetAddressInfo(params json.RawMessage) (interface{}, *RPC
 	}
 
 	return s.buildAddressInfo(s.wallet, addr)
+}
+
+// walletFeeRate picks the feerate (sat/vB) a wallet spend uses when the
+// caller supplied none, in Bitcoin Core's order (wallet/fees.cpp
+// GetMinimumFeeRate): the fee estimator's answer, else -fallbackfee. With no
+// estimate and no fallback it fails like Core's CreateTransaction:
+// -6 "Fee estimation failed. Fallbackfee is disabled. ...".
+func (s *Server) walletFeeRate() (float64, *RPCError) {
+	if s.feeEstimator != nil {
+		if est, _ := s.feeEstimator.EstimateSmartFee(6); est > 0 {
+			return est, nil
+		}
+	}
+	if s.config.FallbackFee > 0 {
+		return s.config.FallbackFee, nil
+	}
+	return 0, &RPCError{
+		Code:    RPCErrWalletInsufficientFunds,
+		Message: "Fee estimation failed. Fallbackfee is disabled. Wait a few blocks or enable -fallbackfee.",
+	}
 }

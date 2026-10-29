@@ -109,14 +109,13 @@ func (s *Server) handleSend(params json.RawMessage, walletName string) (interfac
 		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "No recipient addresses specified"}
 	}
 
-	feeRate := 10.0
+	feeRate := 0.0
 	if len(args) >= 4 && string(args[3]) != "null" {
 		var fr float64
 		if err := json.Unmarshal(args[3], &fr); err == nil && fr > 0 {
 			feeRate = fr
 		}
 	}
-
 	var dest string
 	var amountSat int64
 	nOut := 0
@@ -139,6 +138,15 @@ func (s *Server) handleSend(params json.RawMessage, walletName string) (interfac
 	}
 	if _, err := address.DecodeAddress(dest, w.Network()); err != nil {
 		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: fmt.Sprintf("Invalid Bitcoin address: %s", dest)}
+	}
+
+	// Resolved after output validation, as in Core, so bad outputs keep
+	// their own error codes.
+	if feeRate == 0 {
+		var rpcErr *RPCError
+		if feeRate, rpcErr = s.walletFeeRate(); rpcErr != nil {
+			return nil, rpcErr
+		}
 	}
 
 	tipHeight := int32(0)

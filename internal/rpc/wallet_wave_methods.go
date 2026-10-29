@@ -543,15 +543,16 @@ func (s *Server) fundTxSkeleton(
 
 	// 8. Determine fee rate. Order of precedence (matches Core):
 	//    fee_rate (sat/vB) > feeRate (BTC/kvB) > wallet estimate.
-	feeRate := 10.0 // sat/vB default
+	var feeRate float64 // sat/vB
 	if opts.FeeRate != nil {
 		feeRate = *opts.FeeRate
 	} else if opts.FeeRateLegacy != nil {
 		// BTC/kvB → sat/vB: (BTC * 100_000_000 sat/BTC) / 1000 vB/kvB
 		feeRate = (*opts.FeeRateLegacy) * satoshiPerBitcoin / 1000.0
-	} else if s.mempool != nil {
-		if est := s.mempool.EstimateFee(6); est > feeRate {
-			feeRate = est
+	} else {
+		var rpcErr *RPCError
+		if feeRate, rpcErr = s.walletFeeRate(); rpcErr != nil {
+			return nil, rpcErr
 		}
 	}
 	if feeRate < 0 {
