@@ -1439,11 +1439,14 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		return &MempoolInfo{Loaded: false}, nil
 	}
 
-	// Calculate total fees
-	totalFee := 0.0
+	// Sum fees as integer satoshis and render once with btcAmount, as Core
+	// does (m_total_fee is a CAmount rendered by ValueFromAmount, so an empty
+	// pool is 0.00000000, not 0). A float64 running sum depends on
+	// GetAllTxHashes' map-iteration order and can land one ulp off Core.
+	var totalFeeSat int64
 	for _, h := range s.mempool.GetAllTxHashes() {
 		if entry := s.mempool.GetEntry(h); entry != nil {
-			totalFee += float64(entry.Fee) / satoshiPerBitcoin
+			totalFeeSat += entry.Fee
 		}
 	}
 
@@ -1452,7 +1455,7 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		Size:       s.mempool.Count(),
 		Bytes:      s.mempool.TotalSize(),
 		Usage:      s.mempool.TotalSize(), // Simplified: actual usage would include overhead
-		TotalFee:   totalFee,
+		TotalFee:   btcAmount(totalFeeSat),
 		MaxMempool: s.mempool.MaxSize(),
 		// Fee fields READ the live mempool policy so display == policy (no
 		// hardcoded drift). Mirrors Core rpc/mempool.cpp:1054-1056:

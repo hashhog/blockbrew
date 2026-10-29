@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 
 	"github.com/hashhog/blockbrew/internal/address"
@@ -53,6 +54,17 @@ func (a btcAmount) MarshalJSON() ([]byte, error) {
 	q := v / coin
 	r := v % coin
 	return []byte(fmt.Sprintf("%s%d.%08d", neg, q, r)), nil
+}
+
+// UnmarshalJSON reads a BTC JSON number back into satoshis, so result
+// structs that carry a btcAmount can be decoded (tests, clients).
+func (a *btcAmount) UnmarshalJSON(b []byte) error {
+	var f float64
+	if err := json.Unmarshal(b, &f); err != nil {
+		return err
+	}
+	*a = btcAmount(math.Round(f * satoshiPerBitcoin))
+	return nil
 }
 
 // Compile-time check: btcAmount must satisfy json.Marshaler.
