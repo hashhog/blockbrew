@@ -175,7 +175,7 @@ func (s *Server) scanTxOutSetStart(args []json.RawMessage) (interface{}, *RPCErr
 
 	count, err := snap.Scan(s.shutdown, func(outpoint wire.OutPoint, entry *consensus.UTXOEntry) bool {
 		spkHex := hex.EncodeToString(entry.PkScript)
-		desc, matched := needles[spkHex]
+		_, matched := needles[spkHex]
 		if !matched {
 			return true
 		}
@@ -183,7 +183,8 @@ func (s *Server) scanTxOutSetStart(args []json.RawMessage) (interface{}, *RPCErr
 			TxID:          outpoint.Hash.String(),
 			Vout:          outpoint.Index,
 			ScriptPubKey:  spkHex,
-			Desc:          desc,
+			// Core reports InferDescriptor(coin script), not the scan object.
+			Desc:          inferDescriptor(entry.PkScript, s.getNetwork()),
 			Amount:        btcAmount(entry.Amount),
 			Coinbase:      entry.IsCoinbase,
 			Height:        entry.Height,
