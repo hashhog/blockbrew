@@ -31,6 +31,11 @@ type RPCConfig struct {
 	Username    string // Basic auth username
 	Password    string // Basic auth password
 	TxIndex     bool   // Whether txindex is enabled
+
+	// FallbackFee is the wallet feerate (sat/vB) used when the fee estimator
+	// has no data (-fallbackfee, given in BTC/kvB on the command line). Zero
+	// disables it, as in Core: wallet spends then fail with -6.
+	FallbackFee float64
 	RESTEnabled bool   // Whether REST API is enabled
 
 	// TLS termination (W119 BUG / FIX-64). When both TLSCertFile and

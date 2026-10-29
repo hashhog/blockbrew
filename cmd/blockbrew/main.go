@@ -232,6 +232,14 @@ type Config struct {
 	// the only one Core implements server-side.
 	BlockFilterIndex bool
 
+	// FallbackFeeArg is the raw -fallbackfee (BTC/kvB), CLI or conf file.
+	// parseFlags checks it with Core's ParseMoney rules and fills
+	// FallbackFeeSatKvB (exact) and FallbackFee (BTC/kvB); 0 disables it
+	// (Core default).
+	FallbackFeeArg    string
+	FallbackFeeSatKvB int64
+	FallbackFee       float64
+
 	// CoinStatsIndex maintains a per-height UTXO-set commitment (MuHash3072 +
 	// txouts/bogosize/total_amount). Default OFF, matching Bitcoin Core's
 	// `-coinstatsindex=0`. When ON, gettxoutsetinfo can be queried for a
@@ -656,6 +664,7 @@ func parseFlags() *Config {
 	flag.BoolVar(&cfg.RPCReadyNotify, "rpcready-notify", true, "On systemd hosts, send READY=1 to NOTIFY_SOCKET once RPC is bound. No-op when NOTIFY_SOCKET is unset.")
 	flag.IntVar(&cfg.HealthPort, "healthport", 0, "If non-zero, bind a /healthz HTTP endpoint on 127.0.0.1:<port> for liveness/readiness probes. 0 disables.")
 	flag.StringVar(&cfg.LoadSnapshot, "load-snapshot", "", loadSnapshotFlagHelp)
+	flag.StringVar(&cfg.FallbackFeeArg, "fallbackfee", "0", "Wallet feerate (BTC/kvB) used when fee estimation has no data (Core -fallbackfee). Default 0 = disabled, so wallet spends without an estimate fail like Core (sendtoaddress -6, send and fundrawtransaction -4). Parsed with Core's ParseMoney rules; an invalid amount refuses startup.")
 	flag.BoolVar(&cfg.BlockFilterIndex, "blockfilterindex", false, "Maintain the BIP-157/158 basic compact-block-filter index. Default OFF (matches Bitcoin Core's `-blockfilterindex=0`). When ON, blockbrew populates the index on every connected block, rewinds it on disconnect (Phase 2 reorg-aware), and exposes the resulting filters via /rest/blockfilter, /rest/blockfilterheaders, and the getblockfilter RPC.")
 	flag.BoolVar(&cfg.CoinStatsIndex, "coinstatsindex", false, "Maintain the coinstatsindex (per-height UTXO-set MuHash + counts: txouts, bogosize, total_amount). Default OFF (matches Bitcoin Core's `-coinstatsindex=0`). When ON, gettxoutsetinfo can be queried for a specific block height/hash with hash_type muhash|none, served from the index; getindexinfo reports it.")
 	flag.BoolVar(&cfg.TxoSpenderIndex, "txospenderindex", false, "Maintain a transaction output spender index (spent outpoint -> spending txid), used by the gettxspendingprevout RPC call. Default OFF (matches Bitcoin Core's `-txospenderindex=0`). When ON, gettxspendingprevout can resolve confirmed spends (mempool_only=false); getindexinfo reports it. The RPC's mempool form works regardless of this flag.")
@@ -698,6 +707,19 @@ func parseFlags() *Config {
 					fmt.Fprintf(os.Stderr, "blockbrew: "+format+"\n", args...)
 				})
 		}
+	}
+
+	// -fallbackfee is parsed after the config merge so a bad value refuses
+	// startup from either source, as Core's wallet load does.
+	if sat, warn, err := parseFallbackFee(cfg.FallbackFeeArg); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	} else {
+		if warn != "" {
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", warn)
+		}
+		cfg.FallbackFeeSatKvB = sat
+		cfg.FallbackFee = float64(sat) / 1e8
 	}
 
 	// Validate -prune (Bitcoin Core init.cpp:524 / blockmanager_args.cpp:22):
@@ -2113,6 +2135,8 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			// flag was passed on the command line. See chainMgr.SetOnBlockConnected
 			// wiring above (the storage-side counterpart).
 			TxIndex: cfg.TxIndex,
+			// -fallbackfee sat/kvB -> sat/vB.
+			FallbackFee: float64(cfg.FallbackFeeSatKvB) / 1000,
 			// REST surface (`/rest/...`). Off by default (Core parity).
 			// See `internal/rpc/rest.go` for the handler set; the audit
 			// at `_rest-api-cross-impl-audit-2026-05-06-part1.md` flagged
