@@ -12,7 +12,7 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
-// Security audit C1 (audits/security/blockbrew-2026-10-30.md in hashhog/hashhog):
+// Security audit C1:
 // an 89-byte merkleblock payload with TxCount=0xFFFFFFFF and a hash count of
 // 0x02000000 made MsgMerkleBlock.Deserialize reserve 32M × 32 B = 1 GiB before
 // reading a single hash. Core never sizes a vector from an untrusted count
