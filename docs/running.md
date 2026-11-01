@@ -77,8 +77,8 @@ Flags use Go's syntax: `-flag=value` or `-flag value`, and booleans as `-flag` o
 | Flag | Default | Meaning |
 |---|---|---|
 | `-rpcbind` | `127.0.0.1:<network RPC port>` | RPC listen address |
-| `-rpcuser` | `blockbrew` | RPC user name |
-| `-rpcpassword` | empty | RPC password. Cookie auth works regardless |
+| `-rpcuser` | `blockbrew` | RPC user name; ignored when `-rpcpassword` is empty |
+| `-rpcpassword` | empty | RPC password. Empty means cookie-only auth, as in Core. Cookie auth works regardless |
 | `-rest` | false | serve unauthenticated REST under `/rest/` on the RPC port |
 | `-rpc-tls-cert`, `-rpc-tls-key` | | serve RPC and REST over HTTPS; both must be given |
 | `-rpcready-notify` | true | send systemd `READY=1` once RPC is up, when `NOTIFY_SOCKET` is set |

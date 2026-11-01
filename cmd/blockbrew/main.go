@@ -605,7 +605,7 @@ func main() {
 
 	// Warn if RPC password is empty
 	if cfg.RPCPassword == "" {
-		log.Printf("WARNING: RPC password is empty, consider setting --rpcpassword for security")
+		log.Printf("RPC password is empty: using cookie authentication only (__cookie__ from <datadir>/.cookie); --rpcuser is ignored")
 	}
 
 	if err := run(cfg, chainParams); err != nil {
@@ -2115,11 +2115,13 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	// 11. Initialize RPC server
 	// Generate a cookie file so local tools can authenticate without an
 	// explicit password (mirrors Bitcoin Core's .cookie mechanism).
-	cookiePassword, err := rpc.GenerateCookie(cfg.DataDir)
+	// With no -rpcpassword the cookie is the only RPC credential, so a
+	// failed write is fatal (Core parity; security audit L7).
+	cookiePassword, err := rpc.InitCookieAuth(cfg.DataDir, cfg.RPCPassword)
 	if err != nil {
-		log.Printf("WARNING: could not write RPC cookie file: %v", err)
-		cookiePassword = ""
-	} else {
+		return fmt.Errorf("RPC auth: %w", err)
+	}
+	if cookiePassword != "" {
 		log.Printf("RPC cookie written to %s/.cookie", cfg.DataDir)
 	}
 
@@ -3317,8 +3319,8 @@ func printHelp() {
 	fmt.Println("  --network       Network: mainnet, testnet, regtest, signet (default: mainnet)")
 	fmt.Println("  --listen        P2P listen address (default: based on network)")
 	fmt.Println("  --rpcbind       RPC listen address (default: based on network)")
-	fmt.Println("  --rpcuser       RPC username (default: blockbrew)")
-	fmt.Println("  --rpcpassword   RPC password")
+	fmt.Println("  --rpcuser       RPC username (default: blockbrew; ignored without --rpcpassword)")
+	fmt.Println("  --rpcpassword   RPC password (empty: cookie-only auth via <datadir>/.cookie)")
 	fmt.Println("  --maxoutbound   Maximum outbound connections (default: 8)")
 	fmt.Println("  --maxinbound    Maximum inbound connections (default: 117)")
 	fmt.Println("  --nolisten      Disable inbound P2P connections")

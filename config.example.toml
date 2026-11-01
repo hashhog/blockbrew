@@ -15,7 +15,8 @@ txindex = false
 [rpc]
 # RPC listen address (host:port)
 rpcbind = "127.0.0.1:8332"
-# RPC authentication
+# RPC authentication. With an empty rpcpassword only the .cookie
+# credential is accepted and rpcuser is ignored (Core parity).
 rpcuser = "blockbrew"
 rpcpassword = ""
 
