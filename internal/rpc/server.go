@@ -340,6 +340,24 @@ func GenerateCookie(datadir string) (string, error) {
 	return password, nil
 }
 
+// InitCookieAuth writes the RPC auth cookie for datadir and returns its
+// password. With an empty rpcPassword the cookie is the only credential
+// checkAuth accepts, so a failed write is returned as an error and must
+// stop startup (Core: GenerateAuthCookieResult::ERR fails init). With an
+// explicit rpcPassword a failed write is logged and the node runs on the
+// explicit credentials alone.
+func InitCookieAuth(datadir, rpcPassword string) (string, error) {
+	cookiePassword, err := GenerateCookie(datadir)
+	if err != nil {
+		if rpcPassword == "" {
+			return "", fmt.Errorf("%w (no -rpcpassword set, so the cookie is the only RPC credential)", err)
+		}
+		log.Printf("WARNING: could not write RPC cookie file: %v", err)
+		return "", nil
+	}
+	return cookiePassword, nil
+}
+
 // DeleteCookie removes the .cookie file from datadir.  Call on clean
 // shutdown so stale cookies are not left on disk.
 func DeleteCookie(datadir string) {
@@ -721,9 +739,15 @@ func (s *Server) getWalletForRPC(walletName string) (*wallet.Wallet, *RPCError) 
 
 // checkAuth verifies basic authentication.
 // It accepts two credential pairs:
-//  1. The configured rpcuser/rpcpassword (explicit credentials).
+//  1. The configured rpcuser/rpcpassword (explicit credentials), only when
+//     rpcpassword is non-empty.
 //  2. The "__cookie__" username with the generated cookie password
 //     (used by local tools that read the .cookie file).
+//
+// With an empty rpcpassword, auth is cookie-only and rpcuser is ignored,
+// as in Core (httprpc.cpp InitRPCAuthentication). Accepting
+// "<rpcuser>:" there made the default "blockbrew:" a working login for any
+// local process or DNS-rebinding web page (security audit C2, 2026-10-30).
 func (s *Server) checkAuth(r *http.Request) bool {
 	// If no credentials are configured at all, allow every request.
 	if s.config.Username == "" && s.config.Password == "" && s.cookiePassword == "" {
@@ -740,7 +764,10 @@ func (s *Server) checkAuth(r *http.Request) bool {
 		return pass == s.cookiePassword
 	}
 
-	// Explicit rpcuser/rpcpassword auth.
+	// Explicit rpcuser/rpcpassword auth: never with an empty password.
+	if s.config.Password == "" {
+		return false
+	}
 	return user == s.config.Username && pass == s.config.Password
 }
 
