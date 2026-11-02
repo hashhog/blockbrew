@@ -2984,19 +2984,11 @@ func (cm *ChainManager) disconnectBlock(hash wire.Hash256, out **wire.MsgBlock) 
 			hash.String()[:16], tipHeight)
 	}
 
-	// Delete undo data from database.
-	//
-	// Pattern D (multi-block reorg atomicity, 2026-05-05): when cm.reorgBatch
-	// is set, the delete rides the shared batch so the multi-block reorg is
-	// one atomic Pebble commit. Outside ReorgTo we still issue an individual
-	// Delete (preserves the pre-existing single-disconnect API).
-	if cm.reorgBatch != nil {
-		cm.chainDB.DeleteBlockUndoBatch(cm.reorgBatch, hash)
-	} else {
-		if err := cm.chainDB.DeleteBlockUndo(hash); err != nil {
-			log.Printf("chainmgr: warning: failed to delete undo data for %s: %v", hash.String()[:16], err)
-		}
-	}
+	// The block's undo data is KEPT. Core never erases rev data on disconnect
+	// (DisconnectTip only reads it). Deleting it here used to be a separate,
+	// immediate disk write: a crash before the coins were flushed left a block
+	// whose effects were still in the persisted set with no undo to remove
+	// them (security audit H4). A reconnect rewrites it (ConnectBlock).
 
 	// Clear signature cache since cached entries may no longer be valid after reorg.
 	// A transaction that was valid in the old chain might reference UTXOs that
@@ -3027,7 +3019,18 @@ func (cm *ChainManager) disconnectBlock(hash wire.Hash256, out **wire.MsgBlock) 
 	// to the shared batch — it will be overwritten by later DisconnectBlock
 	// peels and finally by the new-tip ConnectBlock writes within the same
 	// batch. Pebble's batch dedups in-key Puts, so only the final value lands
-	// on disk. Outside ReorgTo we issue a direct Put as before.
+	// on disk. ReorgTo stages the UTXO delta into that batch once, at the end.
+	//
+	// Outside ReorgTo (invalidateblock, the boot consistency probe's peel) the
+	// coin delta, the coins marker, the height-row delete and the tip pointer
+	// go into ONE synced batch, so they reach disk together or not at all.
+	// They used to be written separately, with the coins left in the cache
+	// until the next connect or flush: a crash in between booted the node at
+	// the parent over the disconnected block's coins (security audit H4).
+	// Core: DisconnectTip flushes the view into CoinsTip(), whose best block
+	// moves with it, and CCoinsViewDB::BatchWrite writes the coins and
+	// DB_BEST_BLOCK in one batch (validation.cpp DisconnectTip, txdb.cpp
+	// BatchWrite). Same shape as AdoptAppliedBlock.
 	//
 	// The disconnected height also leaves the active-chain height index ("N").
 	// A stale N:<h> above the tip is read by RecoverFromPersistedBlocks as an
@@ -3044,21 +3047,39 @@ func (cm *ChainManager) disconnectBlock(hash wire.Hash256, out **wire.MsgBlock) 
 				BestHeight: parent.Height,
 			})
 		} else {
-			if err := cm.chainDB.DeleteBlockHeight(prevHeight); err != nil {
-				log.Printf("chainmgr: warning: failed to drop height index %d on disconnect: %v", prevHeight, err)
+			// Gate 6: write before forget, retry once, then AbortNode. A
+			// failed write leaves disk at the pre-disconnect state while
+			// memory has undone the block; the latch keeps the torn view from
+			// ever being flushed, and the restart resumes from disk.
+			write := func() error {
+				batch := cm.chainDB.NewBatch()
+				var staged *StagedFlush
+				if f, ok := cm.utxoSet.(batchStager); ok {
+					st, err := f.StageFlush(batch)
+					if err != nil {
+						return fmt.Errorf("stage disconnect UTXO delta: %w", err)
+					}
+					staged = st
+				}
+				cm.chainDB.DeleteBlockHeightBatch(batch, prevHeight)
+				cm.chainDB.SetChainStateBatch(batch, &storage.ChainState{
+					BestHash:   parent.Hash,
+					BestHeight: parent.Height,
+				})
+				if err := batch.Write(); err != nil {
+					return fmt.Errorf("write disconnect batch: %w", err)
+				}
+				staged.Commit()
+				return nil
 			}
-			// Gate 6: this write used to be fire-and-forget. A failed tip
-			// write leaves disk at the pre-disconnect state while memory has
-			// undone the block; latch AbortNode so the torn pair can never be
-			// flushed, and the restart resumes from disk.
-			if err := cm.chainDB.SetChainState(&storage.ChainState{
-				BestHash:   parent.Hash,
-				BestHeight: parent.Height,
-			}); err != nil {
-				fault := SystemFault("persist tip after disconnect",
-					fmt.Errorf("%w: %v", ErrChainstateWrite, err))
-				AbortNode(fault)
-				return fault
+			if err := write(); err != nil {
+				log.Printf("chainmgr: persisting disconnect of %s failed: %v — retrying once", hash.String()[:16], err)
+				if err2 := write(); err2 != nil {
+					fault := SystemFault("persist tip after disconnect",
+						fmt.Errorf("%w: %v (retry: %v)", ErrChainstateWrite, err, err2))
+					AbortNode(fault)
+					return fault
+				}
 			}
 		}
 	}
