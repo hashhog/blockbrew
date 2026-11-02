@@ -139,6 +139,9 @@ type PebbleDB struct {
 	bg         *bgWork
 	closeTrace atomic.Pointer[closeTrace]
 	closeBase  atomic.Pointer[closeBaseline]
+
+	// path is the directory the database was opened at (see Path).
+	path string
 }
 
 // noteNoSyncCommit records a NoSync commit that has returned.
@@ -319,8 +322,12 @@ func NewPebbleDBWithConfig(path string, cfg PebbleDBConfig) (*PebbleDB, error) {
 		return nil, fmt.Errorf("pebble open failed: %w", err)
 	}
 
-	return &PebbleDB{db: db, cache: cache, fs: afs, compactSlots: slots, closing: make(chan struct{}), bg: bg}, nil
+	return &PebbleDB{db: db, path: path, cache: cache, fs: afs, compactSlots: slots, closing: make(chan struct{}), bg: bg}, nil
 }
+
+// Path is the directory the database was opened at. -load-snapshot puts its
+// scratch coins database next to it.
+func (p *PebbleDB) Path() string { return p.path }
 
 // Get retrieves a value by key. Returns nil, nil if key does not exist.
 func (p *PebbleDB) Get(key []byte) ([]byte, error) {
