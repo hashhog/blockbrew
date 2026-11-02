@@ -4180,33 +4180,42 @@ func (cm *ChainManager) restoreBlockFailures() int {
 		return 0
 	}
 
-	// Re-add missing headers, parents before children (repeat while progress).
-	pending := make([]storage.BlockFailure, 0, len(fails))
-	for _, f := range fails {
-		if cm.headerIndex.GetNode(f.Hash) == nil {
-			pending = append(pending, f)
+	// Re-add missing headers, parents before children. A failed block's
+	// parent is often NOT itself flagged (invalidateblock(e4a) flags e4a, not
+	// its stored parent e3a), so the missing ancestors are rebuilt from disk
+	// too, walking up until a block already in the index. Without them the
+	// failed block would be an orphan and be dropped: after a restart
+	// getblockheader/reconsiderblock on it answered "Block not found"
+	// where Core still knows it.
+	headerOnDisk := func(h wire.Hash256) *wire.BlockHeader {
+		if hdr, err := cm.chainDB.GetBlockHeader(h); err == nil && hdr != nil {
+			return hdr
 		}
+		if b, err := cm.chainDB.GetBlock(h); err == nil && b != nil {
+			return &b.Header
+		}
+		return nil
 	}
-	for progress := true; progress && len(pending) > 0; {
-		progress = false
-		rest := pending[:0]
-		for _, f := range pending {
-			var hdr *wire.BlockHeader
-			if h, err := cm.chainDB.GetBlockHeader(f.Hash); err == nil && h != nil {
-				hdr = h
-			} else if b, err := cm.chainDB.GetBlock(f.Hash); err == nil && b != nil {
-				hdr = &b.Header
-			}
-			if hdr == nil {
-				continue // nothing on disk to rebuild it from; drop it
-			}
-			if _, err := cm.headerIndex.AddHeader(*hdr, true); err != nil && !errors.Is(err, ErrDuplicateHeader) {
-				rest = append(rest, f)
-				continue
-			}
-			progress = true
+	for _, f := range fails {
+		if cm.headerIndex.GetNode(f.Hash) != nil {
+			continue
 		}
-		pending = rest
+		var chain []*wire.BlockHeader // child first
+		h := f.Hash
+		for cm.headerIndex.GetNode(h) == nil {
+			hdr := headerOnDisk(h)
+			if hdr == nil {
+				chain = nil // nothing on disk to rebuild it from; drop it
+				break
+			}
+			chain = append(chain, hdr)
+			h = hdr.PrevBlock
+		}
+		for i := len(chain) - 1; i >= 0; i-- {
+			if _, err := cm.headerIndex.AddHeader(*chain[i], true); err != nil && !errors.Is(err, ErrDuplicateHeader) {
+				break
+			}
+		}
 	}
 
 	cm.mu.Lock()

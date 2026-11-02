@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/storage"
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 // TestInvalidateBlock_FailedSideBranchKeepsValidPrefix pins the Core regtest
@@ -144,5 +145,70 @@ func TestReconsiderBlock_EqualWorkEarlierReceivedReturns(t *testing.T) {
 	if best, _ := cm.BestBlock(); best != m[3].Hash {
 		t.Fatalf("after reconsiderblock(m4) tip = %s, want m4 %s (equal work, m4 received first)",
 			best.String()[:16], m[3].Hash.String()[:16])
+	}
+}
+
+// TestInvalidatedBlockWithUnflaggedParentSurvivesRestart pins failed_reorg
+// scenario E: m1-m2-m3a-m4a is the chain and s3-s4 an equal-work side branch.
+// invalidateblock(m4a) flags only m4a; its parent m3a stays unflagged and off
+// the active chain. After a restart m4a used to be an orphan at header
+// restore and was dropped, so getblockheader / reconsiderblock answered
+// "Block not found" where Core still has the block.
+func TestInvalidatedBlockWithUnflaggedParentSurvivesRestart(t *testing.T) {
+	base := *RegtestParams()
+	base.SubsidyHalvingInterval = 210000
+	params := &base
+
+	idx := NewHeaderIndex(params)
+	chainDB := storage.NewChainDB(storage.NewMemDB())
+	utxoSet := NewUTXOSet(chainDB)
+	cm := NewChainManager(ChainManagerConfig{
+		Params: params, HeaderIndex: idx, ChainDB: chainDB, UTXOSet: utxoSet,
+	})
+	cm.SetIBD(false)
+
+	prev := idx.Genesis()
+	var m []*BlockNode
+	for h := 1; h <= 4; h++ {
+		b := createTestBlock(t, params, prev, nil)
+		if _, err := idx.AddHeader(b.Header, true); err != nil {
+			t.Fatalf("AddHeader: %v", err)
+		}
+		if err := cm.ConnectBlock(b); err != nil {
+			t.Fatalf("ConnectBlock h=%d: %v", h, err)
+		}
+		prev = idx.GetNode(b.Header.BlockHash())
+		m = append(m, prev)
+	}
+	sp := m[1]
+	var s []*BlockNode
+	for i := 0; i < 2; i++ {
+		b := createTestBlockWithCoinbaseValue(t, params, sp, 49*100000000)
+		if _, err := idx.AddHeader(b.Header, true); err != nil {
+			t.Fatalf("AddHeader side: %v", err)
+		}
+		if err := chainDB.StoreBlock(b.Header.BlockHash(), b); err != nil {
+			t.Fatalf("StoreBlock side: %v", err)
+		}
+		idx.MarkDataStored(b.Header.BlockHash())
+		sp = idx.GetNode(b.Header.BlockHash())
+		s = append(s, sp)
+	}
+	if err := cm.InvalidateBlock(m[3].Hash); err != nil {
+		t.Fatalf("InvalidateBlock: %v", err)
+	}
+	cleanStop(t, cm, utxoSet, chainDB)
+
+	cm2, _ := reboot(t, params, chainDB)
+	for _, h := range []wire.Hash256{m[3].Hash, m[2].Hash} {
+		if cm2.GetHeaderIndex().GetNode(h) == nil {
+			t.Fatalf("after restart: block %s missing from the index", h.String()[:16])
+		}
+	}
+	if n := cm2.GetHeaderIndex().GetNode(m[3].Hash); !n.Status.IsInvalid() {
+		t.Errorf("after restart: invalidated m4 not marked invalid")
+	}
+	if err := cm2.ReconsiderBlock(m[3].Hash); err != nil {
+		t.Fatalf("ReconsiderBlock after restart: %v", err)
 	}
 }
