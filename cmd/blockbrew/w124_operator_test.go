@@ -403,6 +403,9 @@ func TestW124_G28_NoStartupShutdownNotifyHooks_BUG10(t *testing.T) {
 
 // ────────────────────────────────────────────────────────────────────────
 // G11 — BUG-11: Prometheus metrics bound on 0.0.0.0 by default.
+// FIXED (security audit 2026-10-30 H3): -metricsbind, default 127.0.0.1.
+// The behaviour is tested from outside the process in metrics_bind_test.go;
+// this pins the source so the hard-coded wildcard bind cannot come back.
 // ────────────────────────────────────────────────────────────────────────
 
 func TestW124_G_MetricsBindsOnAllInterfaces_BUG11(t *testing.T) {
@@ -411,19 +414,15 @@ func TestW124_G_MetricsBindsOnAllInterfaces_BUG11(t *testing.T) {
 		t.Fatalf("read main.go: %v", err)
 	}
 	src := string(body)
-	if !strings.Contains(src, `"0.0.0.0:%d", cfg.MetricsPort`) {
-		// Pattern may have been refactored — verify by checking for any
-		// metricsAddr binding that isn't loopback.
-		if strings.Contains(src, `metricsAddr := fmt.Sprintf("127.0.0.1`) {
-			t.Fatalf("BUG-11 may be fixed: metricsAddr now bound on loopback")
-		}
-		t.Fatalf("metrics-bind pattern changed; re-audit (no 0.0.0.0 or 127.0.0.1 sprintf found)")
+	if strings.Contains(src, `"0.0.0.0:%d", cfg.MetricsPort`) {
+		t.Fatalf("BUG-11 regressed: metrics listener hard-bound to 0.0.0.0")
 	}
-	t.Skip("BUG-11 (P1): cmd/blockbrew/main.go:1436 binds Prometheus metrics on " +
-		"`0.0.0.0:<port>` (default port 9332). Exposes bitcoin_blocks_total, " +
-		"bitcoin_peers_connected, bitcoin_mempool_size to any host on the network " +
-		"with no auth. Information disclosure. Fix: default to 127.0.0.1; add " +
-		"-metricsbind=<addr> for explicit override (mirrors -rpcbind).")
+	if !strings.Contains(src, `flag.StringVar(&cfg.MetricsBind, "metricsbind", "127.0.0.1"`) {
+		t.Fatalf("BUG-11: -metricsbind flag with default 127.0.0.1 not found")
+	}
+	if !strings.Contains(src, `metricsAddr := net.JoinHostPort(cfg.MetricsBind,`) {
+		t.Fatalf("BUG-11: metrics address no longer built from cfg.MetricsBind")
+	}
 }
 
 // ────────────────────────────────────────────────────────────────────────
@@ -472,7 +471,7 @@ func TestW124_G_MetricsBindFailureNotFatal_BUG13(t *testing.T) {
 	if len(region) > 2500 {
 		region = region[:2500]
 	}
-	if !strings.Contains(region, "go func()") || !strings.Contains(region, "http.ListenAndServe(metricsAddr") {
+	if !strings.Contains(region, "go func()") || !strings.Contains(region, "NewSideHTTPServer(metricsAddr, metricsMux).ListenAndServe()") {
 		t.Fatalf("metrics-endpoint pattern changed; re-audit. region:\n%s", region)
 	}
 	t.Skip("BUG-13 (P2): same anti-pattern as BUG-12, applied to -metricsport. " +

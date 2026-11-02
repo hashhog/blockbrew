@@ -114,8 +114,11 @@ type Config struct {
 	// never make the node accept a block Core would reject.
 	AssumeValid string
 
-	// Prometheus metrics
+	// Prometheus metrics. MetricsBind is the listen address (default
+	// 127.0.0.1); the listener is unauthenticated, so exposing it beyond
+	// loopback is an explicit operator choice.
 	MetricsPort int
+	MetricsBind string
 
 	// Cache budget. -dbcache is in MiB and is split between the in-memory
 	// UTXO cache (80%) and Pebble's block cache (20%). The skew toward the
@@ -643,6 +646,7 @@ func parseFlags() *Config {
 	flag.IntVar(&cfg.Par, "par", 0, "Script verification threads (0 = auto = every core, 1 = serial, n = n threads including master, n<0 = leave |n| cores free). Bitcoin Core -par (init.cpp:513).")
 	flag.StringVar(&cfg.AssumeValid, "assumevalid", "", "Assume-valid block hash (display hex). Below this block, script verification is skipped during IBD. Empty (default) uses the network's built-in value. `-assumevalid=0` DISABLES the skip so ALL history is fully script-verified (used by the mainnet-replay harness). Mirrors Bitcoin Core's -assumevalid.")
 	flag.IntVar(&cfg.MetricsPort, "metricsport", 9332, "Prometheus metrics port (0 to disable)")
+	flag.StringVar(&cfg.MetricsBind, "metricsbind", "127.0.0.1", "Address the Prometheus metrics listener binds to. The endpoint has no authentication; set e.g. 0.0.0.0 only if a remote scraper needs it and the port is firewalled.")
 	flag.IntVar(&cfg.DBCache, "dbcache", 2560, dbcacheFlagHelp)
 	flag.BoolVar(&cfg.BIP324V2, "bip324v2", true, "Enable BIP-324 v2 encrypted transport (outbound + inbound; v1 fall-through). Default ON; pass `-bip324v2=false` to opt out. Also settable via BLOCKBREW_BIP324_V2=0/1.")
 	flag.BoolVar(&cfg.EnablePackageRelay, "packagerelay", false, "Enable BIP-331 package relay (sendpackages). Default OFF — Bitcoin Core v31.99 has no package-relay wire protocol. Pass `-packagerelay=true` to opt in. Also settable via BLOCKBREW_PACKAGE_RELAY=1.")
@@ -2225,7 +2229,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 
 	// Start Prometheus metrics server
 	if cfg.MetricsPort > 0 {
-		metricsAddr := fmt.Sprintf("0.0.0.0:%d", cfg.MetricsPort)
+		metricsAddr := net.JoinHostPort(cfg.MetricsBind, strconv.Itoa(cfg.MetricsPort))
 		metricsMux := http.NewServeMux()
 		metricsMux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 			_, height := chainMgr.BestBlock()
@@ -2246,7 +2250,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 		})
 		go func() {
 			log.Printf("Prometheus metrics server listening on %s", metricsAddr)
-			if err := http.ListenAndServe(metricsAddr, metricsMux); err != nil {
+			if err := consensus.NewSideHTTPServer(metricsAddr, metricsMux).ListenAndServe(); err != nil {
 				log.Printf("Metrics server error: %v", err)
 			}
 		}()

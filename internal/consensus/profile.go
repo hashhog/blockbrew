@@ -3,9 +3,50 @@ package consensus
 import (
 	"log"
 	"net/http"
-	_ "net/http/pprof" // Register pprof handlers
+	"net/http/pprof"
 	"runtime"
+	"time"
 )
+
+// Timeouts for the node's side HTTP listeners (metrics, pprof). Without them
+// a client that half-sends a request holds an fd and a goroutine forever
+// (security audit 2026-10-30, H3/M2).
+const (
+	SideHTTPReadHeaderTimeout = 5 * time.Second
+	SideHTTPReadTimeout       = 10 * time.Second
+	SideHTTPWriteTimeout      = 10 * time.Second
+	SideHTTPIdleTimeout       = 30 * time.Second
+
+	// pprof streams CPU profiles and traces for ?seconds=N (default 30), and
+	// net/http/pprof refuses any N at or above the server's WriteTimeout, so
+	// the pprof server gets a longer write window than the metrics server.
+	pprofWriteTimeout = 120 * time.Second
+)
+
+// NewSideHTTPServer returns an http.Server for addr with the side-listener
+// timeouts applied.
+func NewSideHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: SideHTTPReadHeaderTimeout,
+		ReadTimeout:       SideHTTPReadTimeout,
+		WriteTimeout:      SideHTTPWriteTimeout,
+		IdleTimeout:       SideHTTPIdleTimeout,
+	}
+}
+
+// profileMux serves the pprof handlers on a dedicated mux, so nothing else
+// registered on http.DefaultServeMux is exposed through the pprof port.
+func profileMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	return mux
+}
 
 // StartProfileServer starts the pprof HTTP server on the given address.
 // Access profiles at:
@@ -15,11 +56,13 @@ import (
 //   - http://addr/debug/pprof/profile?seconds=30 - CPU profile
 //   - http://addr/debug/pprof/trace?seconds=5    - execution trace
 func StartProfileServer(addr string) {
+	srv := NewSideHTTPServer(addr, profileMux())
+	srv.WriteTimeout = pprofWriteTimeout
 	go func() {
 		log.Printf("pprof server listening on %s", addr)
 		log.Printf("  CPU profile: go tool pprof http://%s/debug/pprof/profile?seconds=30", addr)
 		log.Printf("  Heap profile: go tool pprof http://%s/debug/pprof/heap", addr)
-		if err := http.ListenAndServe(addr, nil); err != nil {
+		if err := srv.ListenAndServe(); err != nil {
 			log.Printf("pprof server error: %v", err)
 		}
 	}()
