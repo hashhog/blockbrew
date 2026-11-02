@@ -2705,6 +2705,50 @@ func (mp *Mempool) GetTransactionsForMining() []*TxEntry {
 	return result
 }
 
+// ChunkData returns the modified fee and sigops-adjusted weight of the chunk
+// holding txHash in its cluster's linearization. Mirrors the
+// GetMainChunkFeerate (FeePerWeight{fee, size}) that Core's entryToJSON
+// emits as `fees.chunk` and `chunkweight`. ok is false when txHash is not in
+// the pool or its cluster.
+func (mp *Mempool) ChunkData(txHash wire.Hash256) (fee, weight int64, ok bool) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	if _, in := mp.pool[txHash]; !in {
+		return 0, 0, false
+	}
+	c := mp.clusters.GetCluster(txHash)
+	if c == nil {
+		return 0, 0, false
+	}
+	byIdx := make(map[int]wire.Hash256, len(c.Transactions))
+	for h, i := range c.Transactions {
+		byIdx[i] = h
+	}
+	self := c.Transactions[txHash]
+	for _, ch := range c.GetChunks() {
+		found := false
+		for _, i := range ch.Txs {
+			if i == self {
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		for _, i := range ch.Txs {
+			e, in := mp.pool[byIdx[i]]
+			if !in {
+				continue
+			}
+			fee = saturatingAddInt64(fee, mp.getModifiedFeeLocked(e))
+			weight += mp.clusterAdjWeightLocked(e.Tx)
+		}
+		return fee, weight, true
+	}
+	return 0, 0, false
+}
+
 // GetCluster returns the cluster containing the specified transaction.
 func (mp *Mempool) GetCluster(txHash wire.Hash256) *Cluster {
 	mp.mu.RLock()

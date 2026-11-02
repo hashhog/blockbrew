@@ -169,6 +169,14 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 			desc = d
 		}
 	}
+	// chunk fee/weight: the entry's chunk in the cluster linearization,
+	// Core's GetMainChunkFeerate.
+	chunkFee, chunkWeight := modifiedFee, consensus.CalcTxWeight(entry.Tx)
+	if s.mempool != nil {
+		if f, w, ok := s.mempool.ChunkData(entry.TxHash); ok {
+			chunkFee, chunkWeight = f, w
+		}
+	}
 	// weight is Core's GetTxWeight, the BIP-141 weight; vsize*4 rounds a
 	// segwit tx's weight up to the next multiple of 4.
 	return MempoolEntry{
@@ -180,12 +188,14 @@ func (s *Server) mempoolEntryFromTxEntry(entry *mempool.TxEntry) MempoolEntry {
 		DescendantSize:  desc.Size,
 		AncestorCount:   anc.Count,
 		AncestorSize:    anc.Size,
+		ChunkWeight:     chunkWeight,
 		WTxID:           entry.Tx.WTxHash().String(),
 		Fees: MempoolEntryFees{
 			Base:       float64(entry.Fee) / satoshiPerBitcoin,
 			Modified:   float64(modifiedFee) / satoshiPerBitcoin,
 			Ancestor:   float64(anc.ModifiedFee) / satoshiPerBitcoin,
 			Descendant: float64(desc.ModifiedFee) / satoshiPerBitcoin,
+			Chunk:      float64(chunkFee) / satoshiPerBitcoin,
 		},
 		Depends:           depends,
 		SpentBy:           spentBy,
