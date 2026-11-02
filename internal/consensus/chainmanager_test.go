@@ -634,14 +634,15 @@ func TestBlockUndoPersistence(t *testing.T) {
 		t.Errorf("TxUndos count = %d, want 0 (coinbase-only block)", len(undo.TxUndos))
 	}
 
-	// After disconnect, undo data should be deleted
+	// After disconnect, undo data must still be there: Core never erases rev
+	// data on disconnect, and erasing it outside the coins batch is what let a
+	// crash strand the block's effects in the set (security audit H4).
 	if err := cm.DisconnectBlock(block1Hash); err != nil {
 		t.Fatalf("failed to disconnect block: %v", err)
 	}
 
-	_, err = db.ReadBlockUndo(block1Hash)
-	if err != storage.ErrNotFound {
-		t.Errorf("undo data should be deleted after disconnect, got err=%v", err)
+	if _, err = db.ReadBlockUndo(block1Hash); err != nil {
+		t.Errorf("undo data must survive a disconnect, got err=%v", err)
 	}
 }
 
