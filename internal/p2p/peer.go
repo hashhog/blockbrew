@@ -197,6 +197,10 @@ type Peer struct {
 	verAckRecvd       bool
 	peerVersion       *MsgVersion    // Received version message
 	sendQueue         chan Message   // Outbound message queue
+	getDataMu         sync.Mutex     // guards getDataQueue, getDataDraining
+	getDataQueue      []*InvVect     // getdata items not yet served (Core Peer::m_getdata_requests)
+	getDataDraining   bool           // a drain goroutine owns the rest of getDataQueue
+	getDataServeMu    sync.Mutex     // serializes serving so replies keep request order
 	quit              chan struct{}  // Signal to stop goroutines
 	quitOnce          sync.Once      // Ensure quit is closed only once
 	discMu            sync.Mutex     // guards discBy / discReason

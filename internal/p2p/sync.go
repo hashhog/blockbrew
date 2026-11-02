@@ -2476,7 +2476,167 @@ func buildBlockTxnReply(block *wire.MsgBlock, msg *MsgGetBlockTxn) (*MsgBlockTxn
 	return CreateBlockTxn(block, idx)
 }
 
-// HandleGetData responds to getdata requests by sending requested blocks and transactions.
+// getdata serving limits (Core net_processing.cpp ProcessGetData).
+const (
+	// maxGetDataQueue caps a peer's unserved getdata items. Core needs no cap
+	// because it reads no further message from a peer while its queue is
+	// non-empty; blockbrew keeps reading (pings, headers), so it bounds the
+	// queue at one full getdata instead.
+	maxGetDataQueue = MaxInvVects
+
+	// getDataPauseDepth is blockbrew's fPauseSend: serving stops while this
+	// many messages are already waiting in the peer's send queue, and resumes
+	// as the peer reads them. Half the queue is left free so pings, headers
+	// and our own getdata requests are not dropped behind served blocks.
+	getDataPauseDepth = SendQueueSize / 2
+
+	// getDataResumePoll is how often a paused drain re-checks the send queue.
+	getDataResumePoll = 10 * time.Millisecond
+)
+
+// HandleGetData queues a getdata's items on the peer and serves the first
+// step of them (Core ProcessMessage GETDATA: append to m_getdata_requests,
+// then ProcessGetData).
+//
+// One step serves the run of tx items at the head of the queue and then at
+// most ONE block item ("Only process one BLOCK item per call, since they're
+// uncommon and can be expensive to process"), and stops while the send queue
+// is backed up instead of reading blocks only to drop them. Whatever is left
+// is served by a per-peer drain goroutine, one block per step, paced by the
+// peer reading what we send. It used to loop over the whole list in the
+// peer's read goroutine: a 50,000-entry getdata of one recent block hash cost
+// 50,000 disk reads and block builds, nearly all dropped on the full queue.
+func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
+	var overflow []*InvVect
+	peer.getDataMu.Lock()
+	room := maxGetDataQueue - len(peer.getDataQueue)
+	if room < 0 {
+		room = 0
+	}
+	items := msg.InvList
+	if len(items) > room {
+		overflow = items[room:]
+		items = items[:room]
+	}
+	peer.getDataQueue = append(peer.getDataQueue, items...)
+	peer.getDataMu.Unlock()
+	if len(overflow) > 0 {
+		log.Printf("sync: getdata queue for %s full (%d), declining %d items",
+			peer.Address(), maxGetDataQueue, len(overflow))
+		peer.SendMessage(&MsgNotFound{InvList: overflow})
+	}
+
+	if !peer.getDataSendPaused() {
+		sm.processGetDataStep(peer)
+	}
+
+	peer.getDataMu.Lock()
+	start := len(peer.getDataQueue) > 0 && !peer.getDataDraining
+	if start {
+		peer.getDataDraining = true
+	}
+	peer.getDataMu.Unlock()
+	if start {
+		go sm.drainGetData(peer)
+	}
+}
+
+// drainGetData serves the rest of a peer's getdata queue one step at a time,
+// waiting while the send queue is backed up. It exits when the queue is empty
+// or the peer disconnects; getDataDraining is cleared under the queue lock in
+// the same critical section that sees the queue empty, so an append from
+// HandleGetData either sees the flag set or starts a new drain.
+func (sm *SyncManager) drainGetData(peer *Peer) {
+	for {
+		select {
+		case <-peer.quit:
+			peer.getDataMu.Lock()
+			peer.getDataQueue = nil
+			peer.getDataDraining = false
+			peer.getDataMu.Unlock()
+			return
+		default:
+		}
+		if peer.getDataSendPaused() {
+			select {
+			case <-peer.quit:
+			case <-time.After(getDataResumePoll):
+			}
+			continue
+		}
+		sm.processGetDataStep(peer)
+		peer.getDataMu.Lock()
+		if len(peer.getDataQueue) == 0 {
+			peer.getDataDraining = false
+			peer.getDataMu.Unlock()
+			return
+		}
+		peer.getDataMu.Unlock()
+	}
+}
+
+// getDataSendPaused reports whether the peer's send queue is too full to
+// serve more getdata replies (Core CNode::fPauseSend).
+func (p *Peer) getDataSendPaused() bool {
+	return len(p.sendQueue) >= getDataPauseDepth
+}
+
+// popGetData removes and returns the head of the peer's getdata queue when
+// pred accepts it.
+func (p *Peer) popGetData(pred func(*InvVect) bool) (*InvVect, bool) {
+	p.getDataMu.Lock()
+	defer p.getDataMu.Unlock()
+	if len(p.getDataQueue) == 0 || !pred(p.getDataQueue[0]) {
+		return nil, false
+	}
+	inv := p.getDataQueue[0]
+	p.getDataQueue[0] = nil
+	p.getDataQueue = p.getDataQueue[1:]
+	if len(p.getDataQueue) == 0 {
+		p.getDataQueue = nil
+	}
+	return inv, true
+}
+
+func isTxGetData(inv *InvVect) bool {
+	base := inv.Type &^ InvWitnessFlag
+	return base == InvTypeTx || base == InvTypeWtx
+}
+
+// processGetDataStep is one Core ProcessGetData call: the tx items at the
+// head of the queue, then at most one other item (served if it is a block,
+// discarded otherwise), stopping early while the send queue is backed up.
+func (sm *SyncManager) processGetDataStep(peer *Peer) {
+	peer.getDataServeMu.Lock()
+	defer peer.getDataServeMu.Unlock()
+
+	var notFound []*InvVect
+	for !peer.getDataSendPaused() {
+		inv, ok := peer.popGetData(isTxGetData)
+		if !ok {
+			break
+		}
+		if !sm.serveGetDataTx(peer, inv) {
+			notFound = append(notFound, inv)
+		}
+	}
+	if !peer.getDataSendPaused() {
+		if inv, ok := peer.popGetData(func(*InvVect) bool { return true }); ok {
+			switch inv.Type &^ InvWitnessFlag {
+			case InvTypeBlock, InvTypeCmpctBlock:
+				if !sm.serveGetDataBlock(peer, inv) {
+					notFound = append(notFound, inv)
+				}
+			}
+		}
+	}
+	if len(notFound) > 0 {
+		peer.SendMessage(&MsgNotFound{InvList: notFound})
+	}
+}
+
+// serveGetDataBlock answers one block item. It returns false when the peer
+// should get a notfound for it.
 //
 // BIP-159 peer-served-blocks gate: when prune mode is on, refuse to serve
 // blocks below the prune horizon (tip - MIN_BLOCKS_TO_KEEP).  Mirrors Core's
@@ -2484,8 +2644,7 @@ func buildBlockTxnReply(block *wire.MsgBlock, msg *MsgGetBlockTxn) (*MsgBlockTxn
 // `notfound` for any historical block the pruned node no longer has.  Without
 // this gate a pruned node would attempt a disk read for a deleted block and
 // either return a stale error to the peer or hang the request.
-func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
-	// Determine the prune horizon once for the whole batch.
+func (sm *SyncManager) serveGetDataBlock(peer *Peer, inv *InvVect) bool {
 	pruneHorizon := int32(-1) // -1 = no gate
 	if sm.pruner != nil && sm.pruner.TargetBytes() > 0 && sm.chainMgr != nil {
 		_, tipHeight := sm.chainMgr.BestBlock()
@@ -2494,94 +2653,85 @@ func (sm *SyncManager) HandleGetData(peer *Peer, msg *MsgGetData) {
 		}
 	}
 
-	var notFound []*InvVect
-	for _, inv := range msg.InvList {
-		// Strip witness flag to get base type
-		baseType := inv.Type &^ InvWitnessFlag
-		switch baseType {
-		// InvTypeCmpctBlock (MSG_CMPCT_BLOCK, 4): how a Core peer fetches a
-		// single directly-announced tip from a peer that sent sendcmpct
-		// (HeadersDirectFetchBlocks). It used to hit no case at all -- no
-		// block, no notfound -- so the peer waited out its download timeout.
-		// Serve the full witness block, which is Core's own reply outside
-		// MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData, IsMsgCmpctBlk arm).
-		case InvTypeBlock, InvTypeCmpctBlock:
-			// Prune-mode gate: if we're a NODE_NETWORK_LIMITED node and the
-			// requested block is below tip-288, decline with notfound.
-			if pruneHorizon >= 0 && sm.headerIndex != nil {
-				if node := sm.headerIndex.GetNode(inv.Hash); node != nil &&
-					node.Height < pruneHorizon {
-					notFound = append(notFound, inv)
-					continue
-				}
-			}
-			block, err := sm.chainDB.GetBlock(inv.Hash)
-			if err != nil {
-				// On any read error in prune mode, send a notfound so the
-				// peer can re-request from a NODE_NETWORK peer instead of
-				// hanging.  Outside prune mode we keep the legacy log+skip.
-				if pruneHorizon >= 0 {
-					notFound = append(notFound, inv)
-				} else {
-					log.Printf("sync: getdata block %x not found: %v", inv.Hash[:4], err)
-				}
-				continue
-			}
-			// MSG_CMPCT_BLOCK within MAX_CMPCTBLOCK_DEPTH of our tip is answered
-			// with a BIP-152 cmpctblock (Core ProcessGetBlockData); deeper
-			// blocks fall through to the full block below.
-			if inv.Type == InvTypeCmpctBlock {
-				if depth, ok := sm.blockDepth(inv.Hash); ok && peer.CompactBlockState() != nil &&
-					peer.CompactBlockState().ProvidesCompactBlocks() {
-					if cb := buildCmpctBlockReply(block, depth); cb != nil {
-						log.Printf("sync: serving cmpctblock at %x to peer %s", inv.Hash[:4], peer.Address())
-						peer.SendMessage(cb)
-						continue
-					}
-				}
-			}
-			log.Printf("sync: serving block at %x to peer %s", inv.Hash[:4], peer.Address())
-			// MSG_BLOCK (no witness flag) is answered without witness data,
-			// as Core does; only MSG_WITNESS_BLOCK gets the witness form.
-			// MSG_CMPCT_BLOCK beyond the depth limit gets the witness block.
-			peer.SendMessage(&MsgBlock{Block: block, NoWitness: inv.Type == InvTypeBlock})
-		case InvTypeTx, InvTypeWtx:
-			// Serve a transaction from the mempool. Mirrors Bitcoin Core's
-			// net_processing.cpp ProcessGetData -> FindTxForGetData: look the
-			// tx up in the mempool and send it as a `tx` message, or append to
-			// `notfound` on a miss so the peer can ask elsewhere. baseType is
-			// InvTypeTx (MSG_TX / MSG_WITNESS_TX -> txid lookup) or InvTypeWtx
-			// (MSG_WTX -> wtxid lookup, BIP-339). blockbrew always serializes
-			// transactions with their witness, so both branches return the
-			// full witness tx (no separate witness-stripping like Core's
-			// legacy MSG_TX path).
-			if sm.mempool == nil {
-				notFound = append(notFound, inv)
-				continue
-			}
-			var tx *wire.MsgTx
-			if baseType == InvTypeWtx {
-				tx = sm.mempool.GetTxByWTxid(inv.Hash)
-			} else {
-				tx = sm.mempool.GetTransaction(inv.Hash)
-			}
-			if tx == nil {
-				notFound = append(notFound, inv)
-				continue
-			}
-			// MSG_TX (no witness flag) is answered without witness data
-			// (Core: inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS).
-			peer.SendMessage(&MsgTx{Tx: tx, NoWitness: inv.Type == InvTypeTx})
-			// A peer has now fetched the tx: it is no longer unbroadcast
-			// (Core ProcessGetData -> m_mempool.RemoveUnbroadcastTx).
-			if u, ok := sm.mempool.(interface{ RemoveUnbroadcastTx(wire.Hash256) }); ok {
-				u.RemoveUnbroadcastTx(tx.TxHash())
+	// InvTypeCmpctBlock (MSG_CMPCT_BLOCK, 4): how a Core peer fetches a
+	// single directly-announced tip from a peer that sent sendcmpct
+	// (HeadersDirectFetchBlocks). It used to hit no case at all -- no
+	// block, no notfound -- so the peer waited out its download timeout.
+	// Serve the full witness block, which is Core's own reply outside
+	// MAX_CMPCTBLOCK_DEPTH (ProcessGetBlockData, IsMsgCmpctBlk arm).
+	//
+	// Prune-mode gate: if we're a NODE_NETWORK_LIMITED node and the
+	// requested block is below tip-288, decline with notfound.
+	if pruneHorizon >= 0 && sm.headerIndex != nil {
+		if node := sm.headerIndex.GetNode(inv.Hash); node != nil &&
+			node.Height < pruneHorizon {
+			return false
+		}
+	}
+	block, err := sm.chainDB.GetBlock(inv.Hash)
+	if err != nil {
+		// On any read error in prune mode, send a notfound so the
+		// peer can re-request from a NODE_NETWORK peer instead of
+		// hanging.  Outside prune mode we keep the legacy log+skip.
+		if pruneHorizon >= 0 {
+			return false
+		}
+		log.Printf("sync: getdata block %x not found: %v", inv.Hash[:4], err)
+		return true
+	}
+	// MSG_CMPCT_BLOCK within MAX_CMPCTBLOCK_DEPTH of our tip is answered
+	// with a BIP-152 cmpctblock (Core ProcessGetBlockData); deeper
+	// blocks fall through to the full block below.
+	if inv.Type == InvTypeCmpctBlock {
+		if depth, ok := sm.blockDepth(inv.Hash); ok && peer.CompactBlockState() != nil &&
+			peer.CompactBlockState().ProvidesCompactBlocks() {
+			if cb := buildCmpctBlockReply(block, depth); cb != nil {
+				log.Printf("sync: serving cmpctblock at %x to peer %s", inv.Hash[:4], peer.Address())
+				peer.SendMessage(cb)
+				return true
 			}
 		}
 	}
-	if len(notFound) > 0 {
-		peer.SendMessage(&MsgNotFound{InvList: notFound})
+	log.Printf("sync: serving block at %x to peer %s", inv.Hash[:4], peer.Address())
+	// MSG_BLOCK (no witness flag) is answered without witness data,
+	// as Core does; only MSG_WITNESS_BLOCK gets the witness form.
+	// MSG_CMPCT_BLOCK beyond the depth limit gets the witness block.
+	peer.SendMessage(&MsgBlock{Block: block, NoWitness: inv.Type == InvTypeBlock})
+	return true
+}
+
+// serveGetDataTx answers one tx item from the mempool. It returns false when
+// the peer should get a notfound for it.
+//
+// Mirrors Bitcoin Core's net_processing.cpp ProcessGetData ->
+// FindTxForGetData: look the tx up in the mempool and send it as a `tx`
+// message, or append to `notfound` on a miss so the peer can ask elsewhere.
+// The base type is InvTypeTx (MSG_TX / MSG_WITNESS_TX -> txid lookup) or
+// InvTypeWtx (MSG_WTX -> wtxid lookup, BIP-339). blockbrew always serializes
+// transactions with their witness, so both branches return the full witness
+// tx (no separate witness-stripping like Core's legacy MSG_TX path).
+func (sm *SyncManager) serveGetDataTx(peer *Peer, inv *InvVect) bool {
+	if sm.mempool == nil {
+		return false
 	}
+	var tx *wire.MsgTx
+	if inv.Type&^InvWitnessFlag == InvTypeWtx {
+		tx = sm.mempool.GetTxByWTxid(inv.Hash)
+	} else {
+		tx = sm.mempool.GetTransaction(inv.Hash)
+	}
+	if tx == nil {
+		return false
+	}
+	// MSG_TX (no witness flag) is answered without witness data
+	// (Core: inv.IsMsgTx() ? TX_NO_WITNESS : TX_WITH_WITNESS).
+	peer.SendMessage(&MsgTx{Tx: tx, NoWitness: inv.Type == InvTypeTx})
+	// A peer has now fetched the tx: it is no longer unbroadcast
+	// (Core ProcessGetData -> m_mempool.RemoveUnbroadcastTx).
+	if u, ok := sm.mempool.(interface{ RemoveUnbroadcastTx(wire.Hash256) }); ok {
+		u.RemoveUnbroadcastTx(tx.TxHash())
+	}
+	return true
 }
 
 // ============================================================================
