@@ -1055,6 +1055,25 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 			loaded, headerIndex.BestHeight(), time.Since(hStart).Round(time.Millisecond))
 	}
 
+	// 3c. A chainstate at genesis has connected no block, so coins no marker
+	// accounts for are foreign: what an interrupted -load-snapshot copy (or a
+	// rejected load by an older binary, audit H5) left behind. They would make
+	// the genuine snapshot hash wrong forever and plain IBD reject block 1
+	// with bad-txns-BIP30. Remove them, and any stale snapshot scratch DB.
+	if freshChainstate {
+		removeStaleSnapshotScratch(chainDB)
+		n, err := discardOrphanCoinsAtGenesis(chainDB)
+		if err != nil {
+			return fmt.Errorf("chainstate is at genesis but the coin set could not be checked for "+
+				"coins left by an interrupted -load-snapshot: %w", err)
+		}
+		if n > 0 {
+			log.Printf("WARNING: [snapshot] chainstate is at genesis but the UTXO set held %d coins "+
+				"with no coins marker (left by an interrupted or rejected -load-snapshot); "+
+				"deleted them so the datadir can load a snapshot or sync from genesis", n)
+		}
+	}
+
 	// 4. Initialize UTXO set with the configured cache budget.
 	utxoSet := consensus.NewUTXOSetWithMaxCache(chainDB, utxoCacheBytes)
 	log.Printf("UTXO set initialized (cache_max=%d MiB)", utxoCacheBytes>>20)
@@ -3124,11 +3143,22 @@ func loadSnapshotFromFile(
 	// Bound the in-memory coins cache to the node's -dbcache UTXO share
 	// (Core PopulateAndValidateSnapshot CRITICAL flush). Without this a
 	// 6.23 GB snapshot pinned 33 GB RSS (receipt 2026-09-20).
+	//
+	// The coins go into a SCRATCH database next to chaindata/, never into the
+	// live UTXO keyspace (audit H5; Core's separate chainstate_snapshot DB,
+	// validation.cpp:5650-5714). Every failure below returns through the
+	// deferred cleanup, which deletes the scratch DB, so a rejected or
+	// unparsable file leaves the live coin set exactly as it found it.
 	maxCache := int64(consensus.DefaultCacheMaxBytes)
 	if utxoSet != nil {
 		maxCache = utxoSet.MaxCacheBytes()
 	}
-	loaded, stats, err := consensus.LoadSnapshotCoinsWithCache(sr, chainDB, expected.Height, maxCache)
+	scratchDB, dropScratch, err := openSnapshotScratch(chainDB)
+	if err != nil {
+		return err
+	}
+	defer dropScratch()
+	loaded, stats, err := consensus.LoadSnapshotCoinsWithCache(sr, scratchDB, expected.Height, maxCache)
 	if err != nil {
 		return fmt.Errorf("LoadSnapshotCoins: %w", err)
 	}
@@ -3141,6 +3171,7 @@ func loadSnapshotFromFile(
 	// the same flavour produced by `dumptxoutset`'s txoutset_hash field
 	// + tools/compute-snapshot-hash.py + every other hashhog impl
 	// (lunarblock src/utxo.lua, hotbuns src/consensus/utxoHash.ts, etc).
+	// It walks the scratch DB, so it hashes the file's coins and nothing else.
 	computed, _, err := consensus.ComputeHashSerialized(loaded)
 	if err != nil {
 		return fmt.Errorf("ComputeHashSerialized: %w", err)
@@ -3154,46 +3185,26 @@ func loadSnapshotFromFile(
 			expected.HashSerialized.String(), computed.String())
 	}
 
-	// --- Step 10: flush and promote chainstate.
+	// --- Step 10: promote the authenticated coins and the chainstate.
 	//
-	// LoadSnapshotCoins already flushed dirty coins in -dbcache-sized
-	// batches (and discarded the cache after each, matching Core
-	// CCoinsViewCache::Flush). ComputeHashSerialized walks the DB via
-	// ScanUTXOs, so it does not need the whole set resident. This final
-	// Flush commits any remainder and stamps the applied-through marker
-	// in the same write as those last coins.
-	//
-	// Stamp the coins marker BEFORE the flush so it rides the same write as
-	// the coins it describes: after this flush the persisted set reflects
-	// exactly the snapshot's base block. Without it a snapshot-started node
-	// carries no marker (or a stale one from a previous datadir), and crash
-	// recovery falls back to connect-first — the path that re-applies
-	// coinbase-only blocks. Core sets the equivalent best-block on the
-	// snapshot chainstate in ActivateSnapshot (validation.cpp).
-	loaded.SetAppliedTip(stats.BlockHash, expected.Height)
+	// Only now do the coins reach the live keyspace. promoteSnapshotCoins
+	// copies them in bounded batches and stamps the coins marker, the chain
+	// pointer and the base's height entry in the same write as the last of
+	// them, so the persisted set reflects exactly the snapshot's base block
+	// the moment the datadir names it. Without the marker a snapshot-started
+	// node falls back to connect-first crash recovery, the path that
+	// re-applies coinbase-only blocks. Core sets the equivalent best-block on
+	// the snapshot chainstate in ActivateSnapshot (validation.cpp).
 	if err := loaded.Flush(); err != nil {
-		return fmt.Errorf("flush snapshot UTXOs: %w", err)
+		return fmt.Errorf("flush scratch snapshot coins: %w", err)
+	}
+	if _, err := promoteSnapshotCoins(scratchDB, chainDB, stats.BlockHash, expected.Height); err != nil {
+		return fmt.Errorf("promote snapshot coins: %w", err)
 	}
 
-	// Promote the snapshot to the active chainstate by recording the
-	// base block as the chain tip + height mapping.  Subsequent IBD
-	// will continue from this point.
-	if err := chainDB.SetChainState(&storage.ChainState{
-		BestHash:   stats.BlockHash,
-		BestHeight: expected.Height,
-	}); err != nil {
-		return fmt.Errorf("SetChainState: %w", err)
-	}
-	if err := chainDB.SetBlockHeight(expected.Height, stats.BlockHash); err != nil {
-		return fmt.Errorf("SetBlockHeight: %w", err)
-	}
-
-	// Replace the in-memory utxoSet caller's contents by re-reading
-	// from the database.  We don't have a direct "swap" API; instead,
-	// the snapshot's UTXOSet (`loaded`) now shares the same backing
-	// chainDB as the active utxoSet, so subsequent GetUTXO calls on
-	// utxoSet will hit the newly-persisted coins via the database.
-	_ = utxoSet // placeholder: shared chainDB, no extra wiring needed
+	// The live utxoSet shares chainDB, so it reads the promoted coins from
+	// the database; nothing was cached in it before the load.
+	_ = utxoSet
 
 	log.Printf("[snapshot] loaded %d coins; tip=%s height=%d hash_serialized=%s",
 		stats.CoinsLoaded, stats.BlockHash.String(), expected.Height, computed.String())
