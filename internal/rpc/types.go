@@ -285,6 +285,7 @@ type MempoolEntryFees struct {
 	Modified   float64 `json:"modified"`
 	Ancestor   float64 `json:"ancestor"`
 	Descendant float64 `json:"descendant"`
+	Chunk      float64 `json:"chunk"`
 }
 
 // MempoolEntry represents a mempool entry (verbose getrawmempool /
@@ -299,6 +300,7 @@ type MempoolEntry struct {
 	DescendantSize  int64  `json:"descendantsize"`
 	AncestorCount   int    `json:"ancestorcount"`
 	AncestorSize    int64  `json:"ancestorsize"`
+	ChunkWeight     int64  `json:"chunkweight"`
 	WTxID           string `json:"wtxid"`
 	// Fees is the nested fee sub-object matching Core's fees{base, modified,
 	// ancestor, descendant} shape. Replaces the old flat fee/modifiedfee/
