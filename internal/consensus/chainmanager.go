@@ -2107,6 +2107,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// but the reorg-as-a-whole is atomic — if it fails, the entire
 			// in-memory chain state is rolled back. Setting the bits here
 			// keeps the reorg path symmetric with the regular path.
+			cm.headerIndex.noteBlockReceived(node)
 			node.Status |= StatusDataStored
 			if generateUndo {
 				node.Status |= StatusHaveUndo
@@ -2193,6 +2194,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// chainstate are atomically durable, set the in-memory
 			// HAVE_DATA + HAVE_UNDO flags. Mirrors Bitcoin Core's
 			// ReceivedBlockTransactions + blockstorage.cpp:1029 ordering.
+			cm.headerIndex.noteBlockReceived(node)
 			node.Status |= StatusDataStored
 			if generateUndo {
 				node.Status |= StatusHaveUndo
@@ -2207,6 +2209,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// but downstream callers that probe StatusDataStored treat "nil
 		// chainDB" as "always durable" (see the pre-#126 HasBlock guard).
 		// Preserve that behavior so the test paths don't regress.
+		cm.headerIndex.noteBlockReceived(node)
 		node.Status |= StatusDataStored
 		if generateUndo {
 			node.Status |= StatusHaveUndo
@@ -3917,17 +3920,32 @@ func (cm *ChainManager) InvalidateBlock(hash wire.Hash256) error {
 	bestTip := cm.headerIndex.BestTip()
 	cm.headerIndex.RecalculateBestHeader()
 
-	// If the new best tip has more work than current tip, reorg to it
-	if bestTip != nil && !bestTip.Status.IsInvalid() && bestTip.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
+	// If the new best tip has more work than current tip, reorg to it.
+	//
+	// A candidate branch can fail partway (its last block violates a
+	// consensus rule while the stored bodies were never validated). The reorg
+	// is rolled back and the failed block marked invalid; Core's
+	// ActivateBestChain then loops, re-running FindMostWorkChain, so the valid
+	// prefix of that branch (or another stored branch) with more work than the
+	// current tip still wins. Do the same: re-select after every verdict
+	// failure. Each pass marks one more block failed, so this terminates.
+	for bestTip != nil && !bestTip.Status.IsInvalid() && bestTip.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
 		// Need to activate the best valid chain.
 		// reorgToLocked, not ReorgTo: we already hold cm.reorgMu for the whole
 		// of InvalidateBlock, and Go mutexes are not reentrant.
 		cm.mu.Unlock()
 		err := cm.reorgToLocked(bestTip)
 		cm.mu.Lock()
-		if err != nil {
-			log.Printf("chainmgr: failed to reorg to best chain after invalidation: %v", err)
+		if err == nil {
+			break
 		}
+		log.Printf("chainmgr: failed to reorg to best chain after invalidation: %v", err)
+		var verdict *BlockInvalidError
+		if !errors.As(err, &verdict) {
+			break
+		}
+		cm.headerIndex.RecalculateBestTip()
+		bestTip = cm.headerIndex.BestTip()
 	}
 
 	log.Printf("chainmgr: invalidated block %s at height %d", hash.String()[:16], node.Height)
@@ -4055,8 +4073,12 @@ func (cm *ChainManager) ReconsiderBlock(hash wire.Hash256) error {
 	// If the reconsidered chain now has more work, reorg to it
 	bestTip := cm.headerIndex.BestTip()
 	if bestTip != nil && !bestTip.Status.IsInvalid() {
-		// Only reorg if the new best has more work
-		if bestTip.TotalWork.Cmp(cm.tipNode.TotalWork) > 0 {
+		// Only reorg if the new best sorts before the tip: more work, or
+		// equal work and a lower (earlier received) sequence id. Core's
+		// CBlockIndexWorkComparator, so reconsiderblock on a block that ties
+		// the tip and arrived first returns to it (validation.cpp
+		// FindMostWorkChain / ActivateBestChain).
+		if blockSortsBeforeTip(bestTip, cm.tipNode) {
 			cm.mu.Unlock()
 			err := cm.ReorgTo(bestTip)
 			cm.mu.Lock()
@@ -4068,6 +4090,17 @@ func (cm *ChainManager) ReconsiderBlock(hash wire.Hash256) error {
 
 	log.Printf("chainmgr: reconsidered block %s at height %d", hash.String()[:16], node.Height)
 	return nil
+}
+
+// blockSortsBeforeTip reports whether candidate is a better chain tip than tip
+// under Core's CBlockIndexWorkComparator: strictly more work, or equal work
+// and a strictly lower sequence id. Equal on both keys is not better: the
+// current tip stays.
+func blockSortsBeforeTip(candidate, tip *BlockNode) bool {
+	if c := candidate.TotalWork.Cmp(tip.TotalWork); c != 0 {
+		return c > 0
+	}
+	return candidate.SequenceID < tip.SequenceID
 }
 
 // clearDescendantInvalidFlags clears both failure flags from all descendants
@@ -4147,33 +4180,42 @@ func (cm *ChainManager) restoreBlockFailures() int {
 		return 0
 	}
 
-	// Re-add missing headers, parents before children (repeat while progress).
-	pending := make([]storage.BlockFailure, 0, len(fails))
-	for _, f := range fails {
-		if cm.headerIndex.GetNode(f.Hash) == nil {
-			pending = append(pending, f)
+	// Re-add missing headers, parents before children. A failed block's
+	// parent is often NOT itself flagged (invalidateblock(e4a) flags e4a, not
+	// its stored parent e3a), so the missing ancestors are rebuilt from disk
+	// too, walking up until a block already in the index. Without them the
+	// failed block would be an orphan and be dropped: after a restart
+	// getblockheader/reconsiderblock on it answered "Block not found"
+	// where Core still knows it.
+	headerOnDisk := func(h wire.Hash256) *wire.BlockHeader {
+		if hdr, err := cm.chainDB.GetBlockHeader(h); err == nil && hdr != nil {
+			return hdr
 		}
+		if b, err := cm.chainDB.GetBlock(h); err == nil && b != nil {
+			return &b.Header
+		}
+		return nil
 	}
-	for progress := true; progress && len(pending) > 0; {
-		progress = false
-		rest := pending[:0]
-		for _, f := range pending {
-			var hdr *wire.BlockHeader
-			if h, err := cm.chainDB.GetBlockHeader(f.Hash); err == nil && h != nil {
-				hdr = h
-			} else if b, err := cm.chainDB.GetBlock(f.Hash); err == nil && b != nil {
-				hdr = &b.Header
-			}
-			if hdr == nil {
-				continue // nothing on disk to rebuild it from; drop it
-			}
-			if _, err := cm.headerIndex.AddHeader(*hdr, true); err != nil && !errors.Is(err, ErrDuplicateHeader) {
-				rest = append(rest, f)
-				continue
-			}
-			progress = true
+	for _, f := range fails {
+		if cm.headerIndex.GetNode(f.Hash) != nil {
+			continue
 		}
-		pending = rest
+		var chain []*wire.BlockHeader // child first
+		h := f.Hash
+		for cm.headerIndex.GetNode(h) == nil {
+			hdr := headerOnDisk(h)
+			if hdr == nil {
+				chain = nil // nothing on disk to rebuild it from; drop it
+				break
+			}
+			chain = append(chain, hdr)
+			h = hdr.PrevBlock
+		}
+		for i := len(chain) - 1; i >= 0; i-- {
+			if _, err := cm.headerIndex.AddHeader(*chain[i], true); err != nil && !errors.Is(err, ErrDuplicateHeader) {
+				break
+			}
+		}
 	}
 
 	cm.mu.Lock()

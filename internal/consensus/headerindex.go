@@ -310,6 +310,7 @@ type HeaderIndex struct {
 	preciousBlock    *BlockNode // The block designated as precious (ephemeral)
 	lastPreciousWork *big.Int   // Chainwork when last precious call was made
 	blockSequenceID  int32      // Sequence counter for precious block tie-breaking
+	receiveSeq       int32      // Last receipt-order sequence id handed out (Core nBlockSequenceId)
 
 	// Lock-free best height cache for RPC reads (updated atomically when best tip changes).
 	// This avoids RLock contention with header validation during rapid header sync in IBD.
@@ -746,8 +747,28 @@ func (idx *HeaderIndex) MarkDataStored(hash wire.Hash256) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 	if node, ok := idx.nodes[hash]; ok {
+		if node.Status&StatusDataStored == 0 && node.SequenceID == 0 && node.Height != 0 {
+			idx.receiveSeq++
+			node.SequenceID = idx.receiveSeq
+		}
 		node.Status |= StatusDataStored
 	}
+}
+
+// noteBlockReceived gives node the next receipt-order sequence id the first
+// time its body arrives. Core's ReceivedBlockTransactions does the same
+// (nSequenceId = nBlockSequenceId++), so on equal work the block received
+// first wins chain selection. Ids start at 1; nodes loaded from disk at boot
+// keep 0 and so sort before anything received since, as in Core (the id is
+// not persisted). Precious blocks use negative ids and still win.
+func (idx *HeaderIndex) noteBlockReceived(node *BlockNode) {
+	idx.mu.Lock()
+	defer idx.mu.Unlock()
+	if node.Status&StatusDataStored != 0 || node.SequenceID != 0 || node.Height == 0 {
+		return
+	}
+	idx.receiveSeq++
+	node.SequenceID = idx.receiveSeq
 }
 
 // ClearDataStored drops StatusDataStored on hash: its stored body was
