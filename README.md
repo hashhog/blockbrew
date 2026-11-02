@@ -64,7 +64,8 @@ subdirectory named after the network (`$DATADIR/regtest`, `$DATADIR/testnet4`, .
 | regtest | 18444 | 18443 |
 
 RPC binds to `127.0.0.1` by default. A Prometheus metrics endpoint listens on
-`0.0.0.0:9332` unless you pass `-metricsport=0` or another port.
+`127.0.0.1:9332` unless you pass `-metricsport=0` or another port; `-metricsbind`
+changes the address.
 
 A full mainnet node keeps every block, like Core without pruning: plan for at least
 1 TB of fast disk. `-prune=550` (or larger, in MiB) keeps only recent blocks. The UTXO cache

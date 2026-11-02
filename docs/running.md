@@ -92,7 +92,8 @@ Flags use Go's syntax: `-flag=value` or `-flag value`, and booleans as `-flag` o
 | `-debug` | | log categories (repeatable): `net`, `mempool`, `validation`, `rpc`, ..., `all`, `none`, `-<cat>` to negate |
 | `-logfile` | stderr | log file; `SIGHUP` reopens it |
 | `-printtoconsole` | false | also log to the console when `-logfile` is set |
-| `-metricsport` | 9332 | Prometheus `/metrics` on `0.0.0.0:<port>`; 0 disables |
+| `-metricsport` | 9332 | Prometheus `/metrics` on `<metricsbind>:<port>`; 0 disables |
+| `-metricsbind` | `127.0.0.1` | metrics listen address; the endpoint has no auth, so bind wider only behind a firewall |
 | `-healthport` | 0 | `/healthz` and `/readyz` on `127.0.0.1:<port>`; 0 disables |
 | `-pprof` | | Go pprof server address, e.g. `localhost:6060` |
 | `-zmqpubhashblock`, `-zmqpubhashtx`, `-zmqpubrawblock`, `-zmqpubrawtx`, `-zmqpubsequence` | | ZMQ endpoints, as in Core (e.g. `tcp://127.0.0.1:28332`) |
