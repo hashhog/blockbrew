@@ -849,7 +849,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 	var blockHashParam *wire.Hash256
 	if len(args) >= 3 {
 		if bhStr, ok := args[2].(string); ok && bhStr != "" {
-			bh, perr := parseHashV(bhStr, "blockhash")
+			bh, perr := parseHashV(bhStr, "parameter 3")
 			if perr != nil {
 				return nil, perr
 			}
@@ -859,7 +859,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 
 	// ParseHashV(txid): malformed txid -> -8 BEFORE any lookup (Core
 	// rpc/util.cpp:117). A well-formed-but-absent txid stays -5 below.
-	txid, perr := parseHashV(txidStr, "txid")
+	txid, perr := parseHashV(txidStr, "parameter 1")
 	if perr != nil {
 		return nil, perr
 	}
@@ -908,7 +908,7 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 		}
 
 		if tx == nil {
-			return nil, &RPCError{Code: RPCErrTxNotFound, Message: "No such transaction found in the provided block"}
+			return nil, &RPCError{Code: RPCErrTxNotFound, Message: "No such transaction found in the provided block. Use gettransaction for wallet transactions."}
 		}
 
 		blockHash = *blockHashParam
@@ -963,10 +963,10 @@ func (s *Server) handleGetRawTransaction(params json.RawMessage) (interface{}, *
 			if !s.config.TxIndex {
 				return nil, &RPCError{
 					Code:    RPCErrTxNotFound,
-					Message: "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries",
+					Message: "No such mempool transaction. Use -txindex or provide a block hash to enable blockchain transaction queries. Use gettransaction for wallet transactions.",
 				}
 			}
-			return nil, &RPCError{Code: RPCErrTxNotFound, Message: "No such mempool or blockchain transaction"}
+			return nil, &RPCError{Code: RPCErrTxNotFound, Message: "No such mempool or blockchain transaction. Use gettransaction for wallet transactions."}
 		}
 	}
 
