@@ -5187,25 +5187,11 @@ func (sm *SyncManager) updateIBDStatus() {
 		return
 	}
 
-	// Regtest parity: Core's IsTipRecent reads Now<NodeSeconds>(), which honors
-	// -mocktime. Regtest chains are mined under a pinned mocktime (e.g.
-	// 1700000000), so Core sees the freshly-mined tip as recent and latches
-	// m_cached_is_ibd=false even though the block timestamp is years behind real
-	// wall-clock. blockbrew has no mock clock, so the wall-clock gate above never
-	// fires on a mocktime regtest chain. We match Core's effective regtest
-	// outcome WITHOUT a mock clock: a regtest node whose connected block tip has
-	// caught up to its best-header tip (nothing left to download) and whose
-	// chainwork meets the bar (regtest MinimumChainWork == 0) is fully synced, so
-	// it is not in IBD. Scoped to regtest ONLY — mainnet/testnet keep the exact
-	// Core wall-clock tip-age gate above, and their large MinimumChainWork keeps a
-	// genuinely-behind node in IBD via the header-sync work check.
-	if sm.chainParams != nil && sm.chainParams.Name == "regtest" &&
-		sm.headerIndex != nil && tipHeight == sm.headerIndex.BestHeight() {
-		if sm.ibdActive.CompareAndSwap(true, false) {
-			log.Printf("sync: leaving InitialBlockDownload (regtest tip caught up to headers, height %d)",
-				tipHeight)
-		}
-	}
+	// No other exit, on any network. Core's UpdateIBDStatus latches only on
+	// CChain::IsTipRecent (chain.h); there is no regtest rule for a block tip
+	// that has caught up to the best header, so a regtest chain whose tip is
+	// older than max_tip_age stays in IBD (getblockchaininfo
+	// initialblockdownload=true).
 }
 
 // BlocksInFlight returns the number of blocks currently being downloaded.
