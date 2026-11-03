@@ -917,6 +917,8 @@ func (s *Server) dispatch(method string, params json.RawMessage, walletName stri
 		return s.handleGetNetworkInfo()
 	case "getnettotals":
 		return s.handleGetNetTotals(params)
+	case "setmocktime":
+		return s.handleSetMockTime(params)
 	case "setnetworkactive":
 		return s.handleSetNetworkActive(params)
 	case "addnode":

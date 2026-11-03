@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"github.com/hashhog/blockbrew/internal/clock"
 	"bytes"
 	"errors"
 	"fmt"
@@ -8,7 +9,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -61,7 +61,7 @@ func IsMissingAncestorErr(err error) bool {
 // headerNowUnix returns the current wall-clock time in seconds since epoch.
 // It is a package variable so tests can substitute a deterministic clock when
 // exercising the future-time gate in AddHeader.
-var headerNowUnix = func() int64 { return time.Now().Unix() }
+var headerNowUnix = clock.Unix
 
 // BlockStatus tracks the validation state of a block.
 type BlockStatus uint32

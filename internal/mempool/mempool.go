@@ -2,6 +2,7 @@
 package mempool
 
 import (
+	"github.com/hashhog/blockbrew/internal/clock"
 	"bytes"
 	"errors"
 	"fmt"
@@ -706,7 +707,7 @@ func New(config Config, utxoSet consensus.UTXOView) *Mempool {
 		orphans:              make(map[wire.Hash256]*orphanEntry),
 		utxoSet:              utxoSet,
 		clusters:             NewClusterManager(),
-		lastRollingFeeUpdate: time.Now().Unix(),
+		lastRollingFeeUpdate: clock.Unix(),
 		mapDeltas:            make(map[wire.Hash256]int64),
 		unbroadcast:          make(map[wire.Hash256]struct{}),
 	}
@@ -1517,7 +1518,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 		Fee:            fee,
 		Size:           vsize,
 		FeeRate:        float64(fee) / float64(vsize),
-		Time:           time.Now(),
+		Time:           clock.Now(),
 		Height:         mp.chainHeight,
 		AncestorFee:    fee,
 		AncestorSize:   vsize,
@@ -2892,7 +2893,7 @@ func (mp *Mempool) addOrphanLocked(txHash wire.Hash256, tx *wire.MsgTx, missingO
 	mp.orphans[txHash] = &orphanEntry{
 		tx:         tx,
 		txHash:     txHash,
-		addedTime:  time.Now(),
+		addedTime:  clock.Now(),
 		missingOut: missingOuts,
 		fromPeer:   fromPeer,
 	}
@@ -2906,7 +2907,7 @@ func (mp *Mempool) evictRandomOrphanLocked() {
 	}
 
 	// First try to evict expired orphans (older than OrphanTxExpireTime)
-	expiry := time.Now().Add(-OrphanTxExpireTime)
+	expiry := clock.Now().Add(-OrphanTxExpireTime)
 	for hash, orphan := range mp.orphans {
 		if orphan.addedTime.Before(expiry) {
 			delete(mp.orphans, hash)
@@ -2968,7 +2969,7 @@ func (mp *Mempool) ExpireOrphans() {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
-	expiry := time.Now().Add(-OrphanTxExpireTime)
+	expiry := clock.Now().Add(-OrphanTxExpireTime)
 	for hash, orphan := range mp.orphans {
 		if orphan.addedTime.Before(expiry) {
 			delete(mp.orphans, hash)
@@ -3206,7 +3207,7 @@ func (mp *Mempool) getMinFeeRateLocked() int64 {
 		return max64(rolling, mp.config.MinRelayFeeRate)
 	}
 
-	now := time.Now().Unix()
+	now := clock.Unix()
 	if now > mp.lastRollingFeeUpdate+10 {
 		// Choose halflife based on current mempool fullness.
 		// Core: txmempool.cpp:836-840.
@@ -4808,7 +4809,7 @@ func (mp *Mempool) addTransactionLocked(tx *wire.MsgTx, fee, vsize int64) error 
 		Fee:            fee,
 		Size:           vsize,
 		FeeRate:        float64(fee) / float64(vsize),
-		Time:           time.Now(),
+		Time:           clock.Now(),
 		Height:         mp.chainHeight,
 		AncestorFee:    fee,
 		AncestorSize:   vsize,
