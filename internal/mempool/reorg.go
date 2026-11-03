@@ -1,9 +1,9 @@
 package mempool
 
 import (
+	"github.com/hashhog/blockbrew/internal/clock"
 	"bytes"
 	"sort"
-	"time"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -84,7 +84,7 @@ func (mp *Mempool) BlockConnected(block *wire.MsgBlock) {
 
 	// Core resets lastRollingFeeUpdate to GetTime() in removeForBlock so the
 	// 10-second cooldown in getMinFeeRateLocked is measured from the block.
-	mp.lastRollingFeeUpdate = time.Now().Unix()
+	mp.lastRollingFeeUpdate = clock.Unix()
 	mp.blockSinceLastRollingFeeBump = true
 }
 

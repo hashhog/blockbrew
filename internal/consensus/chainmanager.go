@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"github.com/hashhog/blockbrew/internal/clock"
 	"bytes"
 	"errors"
 	"fmt"
@@ -2057,7 +2058,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// latched: once false, nothing here sets it true again. Decided against
 	// the block being connected; applied only after it is durable.
 	const maxTipAgeSecs = 24 * 60 * 60 // Core DEFAULT_MAX_TIP_AGE
-	tipRecent := int64(node.Header.Timestamp) >= time.Now().Unix()-maxTipAgeSecs
+	tipRecent := int64(node.Header.Timestamp) >= clock.Unix()-maxTipAgeSecs
 	// G22 (W101): height-based assume-valid exit uses >= (Core semantics), not ==.
 	pastAssumeValid := cm.assumeValidHeight > 0 && node.Height >= cm.assumeValidHeight
 	exitIBD := cm.isIBD && (tipRecent || pastAssumeValid)

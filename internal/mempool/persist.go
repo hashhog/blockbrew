@@ -41,6 +41,7 @@
 package mempool
 
 import (
+	"github.com/hashhog/blockbrew/internal/clock"
 	"bytes"
 	"errors"
 	"fmt"
@@ -364,7 +365,7 @@ func (mp *Mempool) LoadFile(path string, opts LoadOptions) (*LoadResult, error) 
 		return nil, fmt.Errorf("mempool load: count %d exceeds %d", count, maxLoadCount)
 	}
 
-	now := time.Now()
+	now := clock.Now()
 	res := &LoadResult{}
 	for i := uint64(0); i < count; i++ {
 		tx := &wire.MsgTx{}

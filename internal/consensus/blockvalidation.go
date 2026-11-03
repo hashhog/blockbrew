@@ -1,11 +1,11 @@
 package consensus
 
 import (
+	"github.com/hashhog/blockbrew/internal/clock"
 	"bytes"
 	"errors"
 	"fmt"
 	"math/big"
-	"time"
 
 	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -105,7 +105,7 @@ func CheckBlockSanity(block *wire.MsgBlock, powLimit *big.Int, skipPOW ...bool) 
 	// Default-preserving: every production caller passes skipPOW=false, so the
 	// future-time gate stays fully active in real validation.
 	if !skip {
-		maxTime := time.Now().Unix() + MaxTimeAdjustment
+		maxTime := clock.Unix() + MaxTimeAdjustment
 		if int64(block.Header.Timestamp) > maxTime {
 			return fmt.Errorf("%w: block time %d, max allowed %d",
 				ErrTimestampTooFar, block.Header.Timestamp, maxTime)
