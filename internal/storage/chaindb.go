@@ -822,6 +822,16 @@ func (c *ChainDB) ReadBlockUndoFromBatch(batch Batch, hash wire.Hash256) (*Block
 	return DeserializeBlockUndo(data)
 }
 
+// HasBlockUndo reports whether undo data is stored for a block, without
+// deserialising it. ConnectBlock writes undo keyed by hash and disconnect
+// leaves it in place, so a block with undo is a block that connected once.
+func (c *ChainDB) HasBlockUndo(hash wire.Hash256) bool {
+	if has, _ := c.db.Has(MakeUndoBlockKey(hash)); has {
+		return true
+	}
+	return c.blockStore != nil && c.blockStore.HasUndo(hash)
+}
+
 // DeleteBlockUndo removes undo data for a block.
 func (c *ChainDB) DeleteBlockUndo(hash wire.Hash256) error {
 	key := MakeUndoBlockKey(hash)
