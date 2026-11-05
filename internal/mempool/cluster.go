@@ -805,6 +805,31 @@ func (c *Cluster) findBestChunk(remaining BitSet) BitSet {
 		// Compute aggregate feerate
 		rate := c.DepGraph.AggregateFeeFrac(candidate)
 
+		// Core's best chunk is the highest-feerate topologically closed
+		// subset, which can be a UNION of ancestor sets (a low-fee parent
+		// with several high-fee children). Grow the seed by the ancestor
+		// set of any other remaining tx while that strictly raises the
+		// aggregate feerate (cluster_linearize.h, ancestor-set candidates).
+		for {
+			var growSet BitSet
+			var growRate FeeFrac
+			grew := false
+			remaining.ForEach(func(j int) {
+				if candidate.Has(j) {
+					return
+				}
+				next := candidate.Union(c.DepGraph.Ancestors(j).Intersection(remaining))
+				nr := c.DepGraph.AggregateFeeFrac(next)
+				if nr.Compare(rate) > 0 && (!grew || nr.Compare(growRate) > 0) {
+					growSet, growRate, grew = next, nr, true
+				}
+			})
+			if !grew {
+				break
+			}
+			candidate, rate = growSet, growRate
+		}
+
 		// Keep if better
 		if !haveBest || rate.Compare(bestRate) > 0 {
 			bestSet = candidate
