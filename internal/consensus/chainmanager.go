@@ -4160,6 +4160,11 @@ func failureSubtree(node *BlockNode) []*BlockNode {
 // failureFlagMask is the part of BlockStatus that is persisted per block.
 const failureFlagMask = StatusInvalid | StatusInvalidChild
 
+// failureKnownMarker is stored in place of failure flags for a block that was
+// invalidated and later reconsidered: "rebuild this block into the index at
+// boot", with no failure to re-apply. It lies outside failureFlagMask.
+const failureKnownMarker byte = 0x80
+
 // persistFailureFlagsLocked writes the CURRENT failure flags of nodes to the
 // chain DB (absent flags delete the entry). Core's equivalent is the dirty
 // block-index flush (BlockManager::WriteBatchSync); blockbrew kept these
@@ -4170,7 +4175,17 @@ func (cm *ChainManager) persistFailureFlagsLocked(nodes []*BlockNode) {
 	}
 	entries := make([]storage.BlockFailure, 0, len(nodes))
 	for _, n := range nodes {
-		entries = append(entries, storage.BlockFailure{Hash: n.Hash, Flags: byte(n.Status & failureFlagMask)})
+		// A cleared block (reconsiderblock) keeps an entry carrying only
+		// failureKnownMarker instead of being deleted: Core's block index
+		// keeps every block it ever stored, while blockbrew's boot only
+		// hydrates the active chain, so without the marker a displaced
+		// block would be forgotten at the next restart (getblockheader
+		// -5 "Block not found" where Core answers confirmations -1).
+		flags := byte(n.Status & failureFlagMask)
+		if flags == 0 {
+			flags = failureKnownMarker
+		}
+		entries = append(entries, storage.BlockFailure{Hash: n.Hash, Flags: flags})
 	}
 	if err := cm.chainDB.WriteBlockFailures(entries); err != nil {
 		log.Printf("chainmgr: WARNING: failed to persist block failure flags for %d block(s): %v", len(entries), err)
