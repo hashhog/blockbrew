@@ -2403,7 +2403,23 @@ func (cm *ChainManager) ProcessSubmittedBlock(block *wire.MsgBlock) error {
 	// claim as "is not already in the persisted UTXO set" whenever the tip sits
 	// below the coins marker (a halted recovery). See ConnectOrAdoptBlock.
 	if newNode.Parent == tipNode {
-		return cm.ConnectOrAdoptBlock(block)
+		err := cm.ConnectOrAdoptBlock(block)
+		// A consensus verdict on the block itself leaves it FAILED in the
+		// index, as Core's ConnectTip failure does: InvalidBlockFound sets
+		// BLOCK_FAILED_VALID (persisted), unless the result is BLOCK_MUTATED,
+		// and InvalidChainFound recalculates the best header
+		// (validation.cpp). blockVerdict only wraps a BlockInvalidError
+		// around a real verdict — never a missing ancestor, a local UTXO gap,
+		// an I/O fault or an aborted node — and a mutated body is excluded
+		// here like Core excludes it. Without the mark, getchaintips listed
+		// the block "headers-only" where Core says "invalid",
+		// getblockchaininfo.headers stayed one above Core, and a resubmission
+		// was re-validated instead of answering "duplicate-invalid".
+		if bie, ok := AsBlockInvalid(err); ok && bie.Hash == hash && !IsBlockMutationErr(err) &&
+			!IsSystemFault(err) && !IsAborted() {
+			cm.MarkBlockFailed(hash)
+		}
+		return err
 	}
 
 	// Side-branch: parent is in the header index but not the active tip.
