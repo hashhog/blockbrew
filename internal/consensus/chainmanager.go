@@ -4197,6 +4197,7 @@ func (cm *ChainManager) restoreBlockFailures() int {
 		}
 		return nil
 	}
+	var rebuilt []wire.Hash256
 	for _, f := range fails {
 		if cm.headerIndex.GetNode(f.Hash) != nil {
 			continue
@@ -4216,6 +4217,7 @@ func (cm *ChainManager) restoreBlockFailures() int {
 			if _, err := cm.headerIndex.AddHeader(*chain[i], true); err != nil && !errors.Is(err, ErrDuplicateHeader) {
 				break
 			}
+			rebuilt = append(rebuilt, chain[i].BlockHash())
 		}
 	}
 
@@ -4229,6 +4231,23 @@ func (cm *ChainManager) restoreBlockFailures() int {
 		n.Status |= StatusDataStored
 	}
 
+	// Blocks re-added above (a flagged block and its unflagged side-branch
+	// ancestors) come back header-only from AddHeader. Give them back what
+	// the disk says they had before the restart, as Core's LoadBlockIndex
+	// does from the persisted nStatus: BLOCK_HAVE_DATA when the body is
+	// stored, and BLOCK_HAVE_UNDO + BLOCK_VALID_SCRIPTS when undo data is
+	// stored. Undo is only ever written by ConnectBlock and never deleted on
+	// disconnect, so it marks a block that connected once (Core raises
+	// BLOCK_VALID_SCRIPTS and sets BLOCK_HAVE_UNDO in the same ConnectBlock).
+	// Without this, after reconsiderblock getchaintips reported such a
+	// branch "headers-only" (the ancestor had no data flag) where Core says
+	// "valid-fork".
+	for _, h := range rebuilt {
+		if n := cm.headerIndex.GetNode(h); n != nil {
+			cm.restoreStoredFlagsLocked(n)
+		}
+	}
+
 	applied := 0
 	var roots []*BlockNode
 	for _, f := range fails {
@@ -4237,9 +4256,7 @@ func (cm *ChainManager) restoreBlockFailures() int {
 			continue
 		}
 		n.Status |= BlockStatus(f.Flags) & failureFlagMask
-		if cm.chainDB.HasBlock(n.Hash) {
-			n.Status |= StatusDataStored
-		}
+		cm.restoreStoredFlagsLocked(n)
 		if n.Status&StatusInvalid != 0 {
 			roots = append(roots, n)
 		}
@@ -4252,6 +4269,21 @@ func (cm *ChainManager) restoreBlockFailures() int {
 	log.Printf("chainmgr: restored %d persisted block failure flag(s) (%d invalidated root(s), %d without a header on disk)",
 		applied, len(roots), len(fails)-applied)
 	return applied
+}
+
+// restoreStoredFlagsLocked sets the on-disk-derived status of a block rebuilt
+// at boot: StatusDataStored if its body is stored, and StatusHaveUndo +
+// StatusFullyValid if its undo data is stored (it connected once). Caller
+// holds cm.mu and cm.chainDB is non-nil. The failure flags are not touched,
+// so a block that is still invalid stays invalid.
+func (cm *ChainManager) restoreStoredFlagsLocked(n *BlockNode) {
+	if !cm.chainDB.HasBlock(n.Hash) {
+		return
+	}
+	n.Status |= StatusDataStored
+	if cm.chainDB.HasBlockUndo(n.Hash) {
+		n.Status |= StatusHaveUndo | StatusFullyValid
+	}
 }
 
 // PreciousBlock gives a block temporary priority in chain selection.
