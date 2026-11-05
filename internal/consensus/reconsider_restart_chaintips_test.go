@@ -140,3 +140,65 @@ func TestReconsiderAfterRestart_NeverConnectedBranchIsValidHeaders(t *testing.T)
 		t.Errorf("after reconsiderblock(s4): s4 status %q, want %q (stored, never connected)", st, ChainTipValidHeaders)
 	}
 }
+
+// TestReconsiderAfterRestart_HeaderOnlySideBlockStaysHeadersOnly pins the
+// other edge of restoreStoredFlagsLocked: a rebuilt block whose body is NOT
+// stored (a header-only side block: header store entry, no body, no undo)
+// must come back with no data or validity flags. h3 forks off m2 and only its
+// header is on disk. invalidateblock(h3), restart: h3 is rebuilt from the
+// header store and is still "invalid". reconsiderblock(h3): the failure flag
+// is cleared and Core lists it "headers-only" (rpc/blockchain.cpp
+// getchaintips: !HaveNumChainTxs -> headers-only), so blockbrew must not
+// claim block data (StatusDataStored) or validity it does not have.
+func TestReconsiderAfterRestart_HeaderOnlySideBlockStaysHeadersOnly(t *testing.T) {
+	params, cm, utxoSet, chainDB, m, _ := reconsiderRestartFixture(t)
+	idx := cm.headerIndex
+	b := createTestBlockWithCoinbaseValue(t, params, m[1], 48*100000000)
+	h3 := b.Header.BlockHash()
+	if _, err := idx.AddHeader(b.Header, true); err != nil {
+		t.Fatalf("AddHeader h3: %v", err)
+	}
+	if err := chainDB.StoreBlockHeader(h3, &b.Header); err != nil {
+		t.Fatalf("StoreBlockHeader h3: %v", err)
+	}
+	if chainDB.HasBlock(h3) {
+		t.Fatalf("fixture: h3 must be header-only (no body)")
+	}
+	if u, err := chainDB.ReadBlockUndo(h3); err == nil && u != nil {
+		t.Fatalf("fixture: h3 must be header-only (no undo)")
+	}
+	if err := cm.InvalidateBlock(h3); err != nil {
+		t.Fatalf("InvalidateBlock(h3): %v", err)
+	}
+	if best, _ := cm.BestBlock(); best != m[3].Hash {
+		t.Fatalf("tip after invalidateblock(h3) = %s, want m4a", best.String()[:16])
+	}
+	cleanStop(t, cm, utxoSet, chainDB)
+
+	cm2, _ := reboot(t, params, chainDB)
+	n := cm2.headerIndex.GetNode(h3)
+	if n == nil {
+		t.Fatalf("after restart: h3 was dropped from the index (header is on disk)")
+	}
+	if st, _ := tipStatus(t, cm2, h3); st != ChainTipInvalid {
+		t.Errorf("after restart, before reconsider: h3 status %q, want %q", st, ChainTipInvalid)
+	}
+	if n.Status&(StatusDataStored|StatusHaveUndo|StatusFullyValid) != 0 {
+		t.Errorf("after restart: header-only h3 status %#x claims data/undo/validity it does not have", n.Status)
+	}
+	if err := cm2.ReconsiderBlock(h3); err != nil {
+		t.Fatalf("ReconsiderBlock(h3) after restart: %v", err)
+	}
+	if best, _ := cm2.BestBlock(); best != m[3].Hash {
+		t.Fatalf("tip after reconsiderblock(h3) = %s, want m4a", best.String()[:16])
+	}
+	if st, _ := tipStatus(t, cm2, h3); st != ChainTipHeadersOnly {
+		t.Errorf("after reconsiderblock(h3): h3 status %q, want %q (Core: no block data)", st, ChainTipHeadersOnly)
+	}
+	if n.Status&StatusDataStored != 0 {
+		t.Errorf("after reconsiderblock(h3): StatusDataStored set on a header-only block (status %#x)", n.Status)
+	}
+	if n.Status&StatusInvalid != 0 {
+		t.Errorf("after reconsiderblock(h3): failure flag not cleared (status %#x)", n.Status)
+	}
+}
