@@ -643,9 +643,9 @@ func (s *Server) handleGetBlockHeader(params json.RawMessage) (interface{}, *RPC
 	}
 
 	// ParseHashV(blockhash): malformed hash -> -8 at the parse boundary,
-	// BEFORE any lookup (Core rpc/util.cpp:117). A well-formed-but-absent
+	// BEFORE any lookup (Core rpc/util.cpp:117; arg named "hash", blockchain.cpp:639). A well-formed-but-absent
 	// hash stays -5 "Block not found" below.
-	hash, perr := parseHashV(hashStr, "blockhash")
+	hash, perr := parseHashV(hashStr, "hash")
 	if perr != nil {
 		return nil, perr
 	}
