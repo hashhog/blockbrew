@@ -2644,9 +2644,24 @@ func (cm *ChainManager) RecoverFromPersistedBlocks() (int, error) {
 	//
 	// Datadirs written before the marker existed report it absent, and fall back
 	// to exactly the previous behaviour.
+	// Phase 2a — reload every other block-index entry on disk (side branches,
+	// submitheader headers, stored-but-unconnected blocks), as Core's
+	// LoadBlockIndexGuts does. Before the failure flags so that pass finds
+	// each flagged block and its ancestors already in the index.
+	reloaded := cm.restoreStoredBlockIndex()
+
 	// Phase 2b — re-apply persisted invalidateblock flags BEFORE replaying, so
 	// the replay below can never reconnect a block the operator invalidated.
 	cm.restoreBlockFailures()
+
+	// With entries reloaded, the best header is the most-work header that is
+	// not failed, whether or not its body is stored (Core LoadBlockIndex sets
+	// m_best_header from every loaded entry without BLOCK_FAILED_MASK).
+	// restoreBlockFailures left it at the best stored-data tip, which made
+	// getblockchaininfo.headers drop the submitheader headers after a restart.
+	if reloaded > 0 {
+		cm.headerIndex.RecalculateBestHeader()
+	}
 
 	replayed := 0
 	coinsHash, coinsHeight, haveCoinsMarker := cm.durableCoinsTip()
@@ -4185,7 +4200,12 @@ func (cm *ChainManager) persistFailureFlagsLocked(nodes []*BlockNode) {
 		if flags == 0 {
 			flags = failureKnownMarker
 		}
-		entries = append(entries, storage.BlockFailure{Hash: n.Hash, Flags: flags})
+		// The header goes in the same batch: a block that failed ConnectBlock
+		// at the tip has no stored body, and without a header on disk the
+		// boot could not rebuild it, so the persisted flag was dropped and
+		// getchaintips lost Core's "invalid" tip after a restart.
+		hdr := n.Header
+		entries = append(entries, storage.BlockFailure{Hash: n.Hash, Flags: flags, Header: &hdr})
 	}
 	if err := cm.chainDB.WriteBlockFailures(entries); err != nil {
 		log.Printf("chainmgr: WARNING: failed to persist block failure flags for %d block(s): %v", len(entries), err)
@@ -4300,6 +4320,103 @@ func (cm *ChainManager) restoreBlockFailures() int {
 	log.Printf("chainmgr: restored %d persisted block failure flag(s) (%d invalidated root(s), %d without a header on disk)",
 		applied, len(roots), len(fails)-applied)
 	return applied
+}
+
+// restoreStoredBlockIndex reloads at boot every block-index entry blockbrew
+// has on disk that the active-chain hydration did not reach: headers in the
+// header store (P2P headers, submitheader, failure-flagged blocks) and blocks
+// with a stored body (submitblock side branches, displaced branches). Each is
+// added parents first through AddHeader (PoW + contextual checks again) and
+// given back its stored data / undo flags, so getchaintips and
+// getblockchaininfo.headers answer the same after a restart as before it.
+//
+// Core: LoadBlockIndexGuts (node/blockstorage.cpp) loads every
+// DB_BLOCK_INDEX record, and LoadBlockIndex (validation.cpp) re-adds each one
+// to m_best_header / setBlockIndexCandidates; nothing is dropped because it is
+// off the active chain. Only header and data flags are restored here; failure
+// flags are re-applied by restoreBlockFailures, which runs next. An entry
+// whose parent is not on disk, or whose header no longer passes AddHeader, is
+// skipped (Core would fail the load; blockbrew degrades to not knowing it).
+// Returns how many entries were added.
+func (cm *ChainManager) restoreStoredBlockIndex() int {
+	if cm.chainDB == nil {
+		return 0
+	}
+	missing := make(map[wire.Hash256]struct{})
+	err := cm.chainDB.ForEachPersistedBlockHash(func(h wire.Hash256) {
+		if _, seen := missing[h]; seen {
+			return
+		}
+		if cm.headerIndex.GetNode(h) == nil {
+			missing[h] = struct{}{}
+		}
+	})
+	if err != nil {
+		log.Printf("chainmgr: WARNING: listing stored block-index entries: %v", err)
+	}
+	if len(missing) == 0 {
+		return 0
+	}
+
+	headers := make(map[wire.Hash256]*wire.BlockHeader, len(missing))
+	for h := range missing {
+		if hdr, err := cm.chainDB.GetBlockHeader(h); err == nil && hdr != nil {
+			headers[h] = hdr
+		} else if b, err := cm.chainDB.GetBlock(h); err == nil && b != nil {
+			headers[h] = &b.Header
+		}
+	}
+
+	// Parents first: walk each entry up through the on-disk set until a
+	// header already in the index, then add that run top-down. done records
+	// every hash already settled (added or given up on) so each is walked once.
+	done := make(map[wire.Hash256]bool, len(headers))
+	var added []wire.Hash256
+	for start := range headers {
+		var run []*wire.BlockHeader // child first
+		h := start
+		connects := false
+		for {
+			if cm.headerIndex.GetNode(h) != nil {
+				connects = true
+				break
+			}
+			if done[h] {
+				break // settled earlier and not in the index: it was dropped
+			}
+			hdr, ok := headers[h]
+			if !ok {
+				break // parent not on disk: the run cannot connect
+			}
+			run = append(run, hdr)
+			h = hdr.PrevBlock
+		}
+		for _, hdr := range run {
+			done[hdr.BlockHash()] = true
+		}
+		if !connects {
+			continue
+		}
+		for i := len(run) - 1; i >= 0; i-- {
+			if _, err := cm.headerIndex.AddHeader(*run[i], true); err != nil && !errors.Is(err, ErrDuplicateHeader) {
+				log.Printf("chainmgr: boot: stored header %s no longer passes AddHeader (%v); dropping it and its descendants",
+					run[i].BlockHash().String()[:16], err)
+				break
+			}
+			added = append(added, run[i].BlockHash())
+		}
+	}
+
+	cm.mu.Lock()
+	for _, h := range added {
+		if n := cm.headerIndex.GetNode(h); n != nil {
+			cm.restoreStoredFlagsLocked(n)
+		}
+	}
+	cm.mu.Unlock()
+	log.Printf("chainmgr: boot: reloaded %d stored block-index entr(ies) off the active chain (%d on disk not in the index)",
+		len(added), len(missing))
+	return len(added)
 }
 
 // restoreStoredFlagsLocked sets the on-disk-derived status of a block rebuilt
