@@ -43,7 +43,7 @@ var parseHashMethods = []struct {
 	{"getrawtransaction", "parameter 1", func(h string) []interface{} { return []interface{}{h} }},
 	{"gettxout", "txid", func(h string) []interface{} { return []interface{}{h, float64(0)} }},
 	{"getblock", "blockhash", func(h string) []interface{} { return []interface{}{h} }},
-	{"getblockheader", "blockhash", func(h string) []interface{} { return []interface{}{h} }},
+	{"getblockheader", "hash", func(h string) []interface{} { return []interface{}{h} }},
 	{"getmempoolentry", "txid", func(h string) []interface{} { return []interface{}{h} }},
 }
 
