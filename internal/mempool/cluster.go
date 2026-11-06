@@ -788,32 +788,241 @@ func (c *Cluster) recomputeLinearization() {
 	c.dirty = false
 }
 
-// findBestChunk finds the highest-feerate topologically valid subset.
-// A topologically valid subset contains all ancestors of any transaction in it.
+// findBestChunk returns the next chunk Core's cluster linearization would
+// emit (cluster_linearize.h): a highest-feerate subset of remaining that is
+// topologically closed within remaining (it holds every remaining ancestor of
+// each member), and among those a minimal one, since Core keeps equal-feerate
+// pieces as separate chunks (ChunkLinearization merges only on a strictly
+// higher feerate). The best set can be any closed set, not just one ancestor
+// set or a greedy union of them.
+//
+// It is found exactly by Dinkelbach iteration on the feerate: start from the
+// best single ancestor set S, then ask for the closed set T maximizing
+// sum(fee*S.Size - S.Fee*size) (a maximum-weight closure, solved as a minimum
+// s-t cut). A positive maximum means feerate(T) > feerate(S), so S = T and
+// repeat; a zero maximum proves no closed set beats S. The feerate rises
+// strictly each round over finitely many sets, so the loop terminates. S is
+// then cut down to the smallest closed set at the same feerate.
 func (c *Cluster) findBestChunk(remaining BitSet) BitSet {
-	// For each transaction, compute its ancestor set within remaining
-	// The best chunk is the one with highest aggregate feerate
-
 	var bestSet BitSet
 	var bestRate FeeFrac
 	haveBest := false
 
 	remaining.ForEach(func(i int) {
-		// Candidate chunk: ancestors of i that are in remaining
 		candidate := c.DepGraph.Ancestors(i).Intersection(remaining)
-
-		// Compute aggregate feerate
 		rate := c.DepGraph.AggregateFeeFrac(candidate)
-
-		// Keep if better
 		if !haveBest || rate.Compare(bestRate) > 0 {
-			bestSet = candidate
-			bestRate = rate
-			haveBest = true
+			bestSet, bestRate, haveBest = candidate, rate, true
 		}
 	})
+	if !haveBest || !c.closureArithmeticSafe(remaining) {
+		// Products of modified fees and sizes could leave int64 (only
+		// reachable with enormous prioritisetransaction deltas, where
+		// FeeFrac.Compare is near its own limit too): keep the best
+		// ancestor set, which is always closed, rather than run a
+		// min-cut on wrapped capacities.
+		return bestSet
+	}
 
+	for {
+		better := c.minClosure(remaining, bestRate, -1)
+		if better.None() {
+			break
+		}
+		rate := c.DepGraph.AggregateFeeFrac(better)
+		if rate.Compare(bestRate) <= 0 {
+			break // zero maximum: nothing beats bestSet
+		}
+		bestSet, bestRate = better, rate
+	}
+
+	// The minimal max-weight closure containing tx i is contained in every
+	// optimal closed set holding i, so the smallest of these over i in
+	// bestSet is a minimal optimal chunk.
+	if bestSet.Count() > 1 {
+		minimal := bestSet
+		bestSet.ForEach(func(i int) {
+			// The forced closure holds i's remaining ancestors, so it
+			// cannot be smaller than the current pick when they are not.
+			if c.DepGraph.Ancestors(i).Intersection(remaining).Count() >= minimal.Count() {
+				return
+			}
+			t := c.minClosure(remaining, bestRate, i)
+			if t.Has(i) && t.Count() < minimal.Count() &&
+				c.DepGraph.AggregateFeeFrac(t).Compare(bestRate) == 0 {
+				minimal = t
+			}
+		})
+		bestSet = minimal
+	}
 	return bestSet
+}
+
+// closureArithmeticSafe reports whether every value minClosure computes stays
+// well inside int64 for this remaining set. Each weight is
+// fee_i*D - N*size_i with |N| <= F and D <= S (F = sum of |fee|, S = sum of
+// size over remaining), so every capacity, flow and their sums are bounded by
+// 2*F*S + 1; require that below 2^60.
+func (c *Cluster) closureArithmeticSafe(remaining BitSet) bool {
+	const limit = int64(1) << 60
+	var feeAbs, sizeSum int64
+	ok := true
+	remaining.ForEach(func(i int) {
+		fr := c.DepGraph.FeeRate(i)
+		f := fr.Fee
+		if f < 0 {
+			f = -f
+		}
+		if f < 0 || f >= limit || feeAbs >= limit-f {
+			ok = false
+			return
+		}
+		feeAbs += f
+		sizeSum += int64(fr.Size)
+	})
+	if !ok {
+		return false
+	}
+	if feeAbs == 0 || sizeSum <= 0 {
+		return true
+	}
+	return feeAbs <= (limit/2-1)/sizeSum
+}
+
+// minClosure returns the minimal closed subset of remaining that maximizes
+// sum(fee_i*rate.Size - rate.Fee*size_i), restricted to sets containing tx
+// force when force >= 0. Without force it returns the empty set when no
+// closed subset has a positive total (none has a feerate above rate). The
+// caller must have checked closureArithmeticSafe(remaining).
+func (c *Cluster) minClosure(remaining BitSet, rate FeeFrac, force int) BitSet {
+	elems := remaining.Elements()
+	n := len(elems)
+	pos := make(map[int]int, n)
+	for k, e := range elems {
+		pos[e] = k
+	}
+	src, sink := n, n+1
+	v := n + 2
+	capm := make([][]int64, v)
+	for k := range capm {
+		capm[k] = make([]int64, v)
+	}
+	var sumPos, sumAbs int64
+	for k, e := range elems {
+		fr := c.DepGraph.FeeRate(e)
+		w := fr.Fee*int64(rate.Size) - rate.Fee*int64(fr.Size)
+		if w > 0 {
+			capm[src][k] = w
+			sumPos += w
+			sumAbs += w
+		} else if w < 0 {
+			capm[k][sink] = -w
+			sumAbs -= w
+		}
+	}
+	if force < 0 && sumPos == 0 {
+		return BitSet{}
+	}
+	inf := sumAbs + 1
+	for k, e := range elems {
+		c.DepGraph.Ancestors(e).Intersection(remaining).ForEach(func(a int) {
+			if a != e {
+				capm[k][pos[a]] = inf // e in the closure forces its ancestor a
+			}
+		})
+	}
+	if force >= 0 {
+		k, ok := pos[force]
+		if !ok {
+			return BitSet{}
+		}
+		capm[src][k] = inf
+	}
+
+	maxFlowDinic(capm, src, sink)
+
+	// The source side of the minimum cut (reachable in the residual graph)
+	// is the minimal maximum-weight closure.
+	seen := make([]bool, v)
+	seen[src] = true
+	queue := []int{src}
+	for len(queue) > 0 {
+		u := queue[0]
+		queue = queue[1:]
+		for w := 0; w < v; w++ {
+			if !seen[w] && capm[u][w] > 0 {
+				seen[w] = true
+				queue = append(queue, w)
+			}
+		}
+	}
+	var out BitSet
+	for k, e := range elems {
+		if seen[k] {
+			out.Set(e)
+		}
+	}
+	return out
+}
+
+// maxFlowDinic runs Dinic's algorithm on the dense capacity matrix capm,
+// leaving residual capacities in it, and returns the maximum flow value.
+func maxFlowDinic(capm [][]int64, src, sink int) int64 {
+	v := len(capm)
+	level := make([]int, v)
+	iter := make([]int, v)
+	var total int64
+	var dfs func(u int, f int64) int64
+	dfs = func(u int, f int64) int64 {
+		if u == sink {
+			return f
+		}
+		for ; iter[u] < v; iter[u]++ {
+			w := iter[u]
+			if capm[u][w] > 0 && level[w] == level[u]+1 {
+				d := f
+				if capm[u][w] < d {
+					d = capm[u][w]
+				}
+				if got := dfs(w, d); got > 0 {
+					capm[u][w] -= got
+					capm[w][u] += got
+					return got
+				}
+			}
+		}
+		return 0
+	}
+	for {
+		for i := range level {
+			level[i] = -1
+		}
+		level[src] = 0
+		queue := []int{src}
+		for len(queue) > 0 {
+			u := queue[0]
+			queue = queue[1:]
+			for w := 0; w < v; w++ {
+				if level[w] < 0 && capm[u][w] > 0 {
+					level[w] = level[u] + 1
+					queue = append(queue, w)
+				}
+			}
+		}
+		if level[sink] < 0 {
+			return total
+		}
+		for i := range iter {
+			iter[i] = 0
+		}
+		for {
+			f := dfs(src, 1<<62)
+			if f == 0 {
+				break
+			}
+			total += f
+		}
+	}
 }
 
 // topologicalSort returns transactions in topological order (parents before children).
