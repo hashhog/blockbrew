@@ -124,8 +124,17 @@ func TestReconsiderBlockClearsDescendantsAndSurvivesRestart(t *testing.T) {
 	if got, h := cm3.BestBlock(); got != a2 {
 		t.Fatalf("after reconsider + restart: tip height %d, want A2 (7)", h)
 	}
-	if f, err := chainDB.ReadBlockFailures(); err != nil || len(f) != 0 {
-		t.Errorf("persisted failure flags after reconsiderblock = %v (err %v), want none", f, err)
+	// Reconsidered blocks keep a "known" marker (no failure bits) so the next
+	// restart rebuilds them; what must be gone is every failure flag.
+	f, err := chainDB.ReadBlockFailures()
+	if err != nil {
+		t.Fatalf("ReadBlockFailures: %v", err)
+	}
+	for _, e := range f {
+		if e.Flags&byte(failureFlagMask) != 0 {
+			t.Errorf("persisted failure flags after reconsiderblock = %v, want none", f)
+			break
+		}
 	}
 }
 
