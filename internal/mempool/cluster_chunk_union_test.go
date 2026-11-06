@@ -3,6 +3,7 @@ package mempool
 import (
 	"math/rand"
 	"testing"
+	"time"
 )
 
 // TestChunkMergesParentWithAllCPFPChildren pins Core's cluster-mempool
@@ -117,6 +118,29 @@ func checkChunksOptimal(t *testing.T, c *Cluster) {
 			t.Errorf("chunk %d: txs=%v fee/size %d/%d, best closed subset of the remainder is %d/%d",
 				ci, ch.Txs, ch.FeeRate.Fee, ch.FeeRate.Size, want.Fee, want.Size)
 		}
+		// Core keeps equal-feerate pieces apart (ChunkLinearization merges
+		// only on a strictly higher feerate), so a chunk must not contain a
+		// smaller non-empty closed subset of the remainder at its feerate.
+		elems := s.Elements()
+		for mask := 1; mask < 1<<len(elems)-1; mask++ {
+			var sub BitSet
+			for k, e := range elems {
+				if mask&(1<<k) != 0 {
+					sub.Set(e)
+				}
+			}
+			closed := true
+			sub.ForEach(func(i int) {
+				if !g.Ancestors(i).Intersection(rem).IsSubsetOf(sub) {
+					closed = false
+				}
+			})
+			if closed && g.AggregateFeeFrac(sub).Compare(ch.FeeRate) >= 0 {
+				t.Errorf("chunk %d txs=%v is not minimal: closed subset %v has the same feerate",
+					ci, ch.Txs, sub.Elements())
+				break
+			}
+		}
 		if ci > 0 && ch.FeeRate.Compare(chunks[ci-1].FeeRate) > 0 {
 			t.Errorf("chunk %d feerate %d/%d exceeds chunk %d feerate %d/%d",
 				ci, ch.FeeRate.Fee, ch.FeeRate.Size, ci-1, chunks[ci-1].FeeRate.Fee, chunks[ci-1].FeeRate.Size)
@@ -159,29 +183,124 @@ func TestChunkIsBestClosedSubsetWardenCluster(t *testing.T) {
 	checkChunksOptimal(t, c)
 }
 
+// TestChunkSplitsEqualFeerateGroups: a parent at 1000/10 with two 0/10
+// children, each with two 15/10 children. After the parent, the two 3-tx
+// groups both have feerate 30/30 and are independent; Core emits them as two
+// chunks, so eviction drops 3 txs, not 6, and each tx reports a 30/30 chunk.
+func TestChunkSplitsEqualFeerateGroups(t *testing.T) {
+	c := NewCluster(1)
+	add := func(h int, fee int64, parents []int) int {
+		idx, err := c.AddTransaction(makeTestHash(h), FeeFrac{Fee: fee, Size: 10}, parents)
+		if err != nil {
+			t.Fatalf("add: %v", err)
+		}
+		return idx
+	}
+	p := add(1, 1000, nil)
+	a := add(2, 0, []int{p})
+	b := add(3, 0, []int{p})
+	add(4, 15, []int{a})
+	add(5, 15, []int{a})
+	add(6, 15, []int{b})
+	add(7, 15, []int{b})
+	chunks := c.GetChunks()
+	for i, ch := range chunks {
+		t.Logf("chunk %d: txs=%v fee/size %d/%d", i, ch.Txs, ch.FeeRate.Fee, ch.FeeRate.Size)
+	}
+	if len(chunks) != 3 {
+		t.Errorf("got %d chunks, want 3 ([p], then two 30/30 groups)", len(chunks))
+	}
+	checkChunksOptimal(t, c)
+}
+
 // TestChunkIsBestClosedSubsetRandom checks the same property against every
 // closed subset on random clusters (fixed seed, n <= 12, dense parents),
 // including negative modified fees (prioritisetransaction can lower them).
 func TestChunkIsBestClosedSubsetRandom(t *testing.T) {
-	rng := rand.New(rand.NewSource(50))
-	for iter := 0; iter < 2000; iter++ {
-		n := 1 + rng.Intn(12)
+	configs := []struct {
+		name               string
+		parentOneIn        int
+		feeLo, feeHi, size int
+	}{
+		{"dense", 2, -10, 30, 30},
+		// Sparse parents and tiny values make equal-feerate groups common,
+		// which exercises the minimal-chunk split.
+		{"ties", 4, 0, 5, 3},
+	}
+	for _, cfg := range configs {
+		rng := rand.New(rand.NewSource(50))
+		for iter := 0; iter < 2000; iter++ {
+			n := 1 + rng.Intn(12)
+			c := NewCluster(1)
+			for i := 0; i < n; i++ {
+				var ps []int
+				for j := 0; j < i; j++ {
+					if rng.Intn(cfg.parentOneIn) == 0 {
+						ps = append(ps, j)
+					}
+				}
+				fr := FeeFrac{Fee: int64(cfg.feeLo + rng.Intn(cfg.feeHi-cfg.feeLo)), Size: int32(1 + rng.Intn(cfg.size))}
+				if _, err := c.AddTransaction(makeTestHash(1000*iter+i), fr, ps); err != nil {
+					t.Fatalf("add: %v", err)
+				}
+			}
+			checkChunksOptimal(t, c)
+			if t.Failed() {
+				t.Fatalf("%s: iteration %d (n=%d) failed", cfg.name, iter, n)
+			}
+		}
+	}
+}
+
+// TestChunkHugeModifiedFeesStayClosed: prioritisetransaction can push a
+// modified fee far past any real fee. The closure search multiplies fees by
+// sizes; where those products could leave int64 it must still finish and
+// return closed chunks that place every tx (wrapped min-cut capacities made
+// it spin forever).
+func TestChunkHugeModifiedFeesStayClosed(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	for iter := 0; iter < 300; iter++ {
+		n := 2 + rng.Intn(8)
 		c := NewCluster(1)
 		for i := 0; i < n; i++ {
 			var ps []int
 			for j := 0; j < i; j++ {
-				if rng.Intn(2) == 0 {
+				if rng.Intn(3) == 0 {
 					ps = append(ps, j)
 				}
 			}
-			fr := FeeFrac{Fee: int64(rng.Intn(40) - 10), Size: int32(1 + rng.Intn(30))}
+			fr := FeeFrac{Fee: rng.Int63n(1<<46) - (1 << 45), Size: int32(1 + rng.Intn(400000))}
 			if _, err := c.AddTransaction(makeTestHash(1000*iter+i), fr, ps); err != nil {
 				t.Fatalf("add: %v", err)
 			}
 		}
-		checkChunksOptimal(t, c)
-		if t.Failed() {
-			t.Fatalf("iteration %d (n=%d) failed", iter, n)
+		done := make(chan []Chunk, 1)
+		go func() { done <- c.GetChunks() }()
+		var chunks []Chunk
+		select {
+		case chunks = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("iteration %d (n=%d): GetChunks did not finish in 10s", iter, n)
+		}
+		g := c.DepGraph
+		rem := g.Positions()
+		for ci, ch := range chunks {
+			var set BitSet
+			for _, i := range ch.Txs {
+				set.Set(i)
+			}
+			if set.None() {
+				t.Fatalf("iteration %d: chunk %d is empty", iter, ci)
+			}
+			set.ForEach(func(i int) {
+				if !g.Ancestors(i).Intersection(rem).IsSubsetOf(set) {
+					t.Fatalf("iteration %d: chunk %d txs=%v is not closed (tx %d)", iter, ci, ch.Txs, i)
+				}
+			})
+			rem = rem.Difference(set)
+		}
+		if rem.Any() {
+			t.Fatalf("iteration %d: txs %v never placed", iter, rem.Elements())
 		}
 	}
 }
