@@ -151,11 +151,17 @@ func TestChunkIsBestClosedSubsetWardenCluster(t *testing.T) {
 	if got := chunks[0].FeeRate; got.Fee != 74 || got.Size != 114 {
 		t.Errorf("first chunk fee/size %d/%d, want 74/114 ({0,1,2,3,4,5,8,9})", got.Fee, got.Size)
 	}
+	// Eviction reads the worst chunk: it must be the 35/56 tail {6,7,10,11},
+	// not one 12-tx blob that hides it.
+	if got := c.WorstChunkFeeRate(); got.Fee != 35 || got.Size != 56 {
+		t.Errorf("worst chunk fee/size %d/%d, want 35/56 ({6,7,10,11})", got.Fee, got.Size)
+	}
 	checkChunksOptimal(t, c)
 }
 
 // TestChunkIsBestClosedSubsetRandom checks the same property against every
-// closed subset on random clusters (fixed seed, n <= 12, dense parents).
+// closed subset on random clusters (fixed seed, n <= 12, dense parents),
+// including negative modified fees (prioritisetransaction can lower them).
 func TestChunkIsBestClosedSubsetRandom(t *testing.T) {
 	rng := rand.New(rand.NewSource(50))
 	for iter := 0; iter < 2000; iter++ {
@@ -168,7 +174,7 @@ func TestChunkIsBestClosedSubsetRandom(t *testing.T) {
 					ps = append(ps, j)
 				}
 			}
-			fr := FeeFrac{Fee: int64(rng.Intn(30)), Size: int32(1 + rng.Intn(30))}
+			fr := FeeFrac{Fee: int64(rng.Intn(40) - 10), Size: int32(1 + rng.Intn(30))}
 			if _, err := c.AddTransaction(makeTestHash(1000*iter+i), fr, ps); err != nil {
 				t.Fatalf("add: %v", err)
 			}
