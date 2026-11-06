@@ -1008,6 +1008,7 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if s.mempool.HasTransaction(txHash) {
 			result.Allowed = false
 			result.RejectReason = "txn-already-in-mempool"
+			result.RejectDetails = "txn-already-in-mempool"
 			results = append(results, result)
 			continue
 		}
@@ -1145,6 +1146,7 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if s.mempool.TxOutputsInUTXOSet(tx) {
 			result.Allowed = false
 			result.RejectReason = "txn-already-known"
+			result.RejectDetails = "txn-already-known"
 			results = append(results, result)
 			continue
 		}
