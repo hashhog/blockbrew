@@ -58,7 +58,7 @@ func TestW124_G10RPC_HandleStopRequestsDaemonShutdown(t *testing.T) {
 	if rpcErr != nil {
 		t.Fatalf("handleStop returned RPCError: %v", rpcErr)
 	}
-	if res != "blockbrew server stopping" {
+	if res != "Bitcoin Core stopping" {
 		t.Errorf("handleStop reply %v", res)
 	}
 	select {

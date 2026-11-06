@@ -3040,9 +3040,10 @@ func (s *Server) handleEstimateSmartFee(params json.RawMessage) (interface{}, *R
 // then ran Stop a second time and panicked on the already-closed channel. Now
 // it only signals; the daemon's main loop runs the full shutdown, which stops
 // this server exactly once.
+// The reply string is Core's CLIENT_NAME " stopping" (rpc/server.cpp:147).
 func (s *Server) handleStop() (interface{}, *RPCError) {
 	s.RequestStop()
-	return "blockbrew server stopping", nil
+	return "Bitcoin Core stopping", nil
 }
 
 // handleFlushChainState durably flushes the chainstate memtable to disk and
