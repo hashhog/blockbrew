@@ -788,18 +788,21 @@ func (c *Cluster) recomputeLinearization() {
 	c.dirty = false
 }
 
-// findBestChunk returns the highest-feerate subset of remaining that is
+// findBestChunk returns the next chunk Core's cluster linearization would
+// emit (cluster_linearize.h): a highest-feerate subset of remaining that is
 // topologically closed within remaining (it holds every remaining ancestor of
-// each member). This is the chunk Core's cluster linearization emits next
-// (cluster_linearize.h): the best closed subset, which can be any closed set,
-// not just one ancestor set or a greedy union of them.
+// each member), and among those a minimal one, since Core keeps equal-feerate
+// pieces as separate chunks (ChunkLinearization merges only on a strictly
+// higher feerate). The best set can be any closed set, not just one ancestor
+// set or a greedy union of them.
 //
 // It is found exactly by Dinkelbach iteration on the feerate: start from the
 // best single ancestor set S, then ask for the closed set T maximizing
 // sum(fee*S.Size - S.Fee*size) (a maximum-weight closure, solved as a minimum
 // s-t cut). A positive maximum means feerate(T) > feerate(S), so S = T and
 // repeat; a zero maximum proves no closed set beats S. The feerate rises
-// strictly each round over finitely many sets, so the loop terminates.
+// strictly each round over finitely many sets, so the loop terminates. S is
+// then cut down to the smallest closed set at the same feerate.
 func (c *Cluster) findBestChunk(remaining BitSet) BitSet {
 	var bestSet BitSet
 	var bestRate FeeFrac
@@ -812,31 +815,86 @@ func (c *Cluster) findBestChunk(remaining BitSet) BitSet {
 			bestSet, bestRate, haveBest = candidate, rate, true
 		}
 	})
-	if !haveBest {
+	if !haveBest || !c.closureArithmeticSafe(remaining) {
+		// Products of modified fees and sizes could leave int64 (only
+		// reachable with enormous prioritisetransaction deltas, where
+		// FeeFrac.Compare is near its own limit too): keep the best
+		// ancestor set, which is always closed, rather than run a
+		// min-cut on wrapped capacities.
 		return bestSet
 	}
 
 	for {
-		better := c.maxWeightClosure(remaining, bestRate)
+		better := c.minClosure(remaining, bestRate, -1)
 		if better.None() {
-			return bestSet
+			break
 		}
 		rate := c.DepGraph.AggregateFeeFrac(better)
 		if rate.Compare(bestRate) <= 0 {
-			// Cannot happen for a positive-weight closure; stop rather
-			// than loop if arithmetic ever disagrees.
-			return bestSet
+			break // zero maximum: nothing beats bestSet
 		}
 		bestSet, bestRate = better, rate
 	}
+
+	// The minimal max-weight closure containing tx i is contained in every
+	// optimal closed set holding i, so the smallest of these over i in
+	// bestSet is a minimal optimal chunk.
+	if bestSet.Count() > 1 {
+		minimal := bestSet
+		bestSet.ForEach(func(i int) {
+			// The forced closure holds i's remaining ancestors, so it
+			// cannot be smaller than the current pick when they are not.
+			if c.DepGraph.Ancestors(i).Intersection(remaining).Count() >= minimal.Count() {
+				return
+			}
+			t := c.minClosure(remaining, bestRate, i)
+			if t.Has(i) && t.Count() < minimal.Count() &&
+				c.DepGraph.AggregateFeeFrac(t).Compare(bestRate) == 0 {
+				minimal = t
+			}
+		})
+		bestSet = minimal
+	}
+	return bestSet
 }
 
-// maxWeightClosure returns the minimal closed subset of remaining with the
-// largest positive total of fee_i*rate.Size - rate.Fee*size_i, or the empty
-// set when no closed subset has a positive total (no closed subset has a
-// feerate above rate). Products stay within int64 under the same bounds
-// FeeFrac.Compare already relies on.
-func (c *Cluster) maxWeightClosure(remaining BitSet, rate FeeFrac) BitSet {
+// closureArithmeticSafe reports whether every value minClosure computes stays
+// well inside int64 for this remaining set. Each weight is
+// fee_i*D - N*size_i with |N| <= F and D <= S (F = sum of |fee|, S = sum of
+// size over remaining), so every capacity, flow and their sums are bounded by
+// 2*F*S + 1; require that below 2^60.
+func (c *Cluster) closureArithmeticSafe(remaining BitSet) bool {
+	const limit = int64(1) << 60
+	var feeAbs, sizeSum int64
+	ok := true
+	remaining.ForEach(func(i int) {
+		fr := c.DepGraph.FeeRate(i)
+		f := fr.Fee
+		if f < 0 {
+			f = -f
+		}
+		if f < 0 || f >= limit || feeAbs >= limit-f {
+			ok = false
+			return
+		}
+		feeAbs += f
+		sizeSum += int64(fr.Size)
+	})
+	if !ok {
+		return false
+	}
+	if feeAbs == 0 || sizeSum <= 0 {
+		return true
+	}
+	return feeAbs <= (limit/2-1)/sizeSum
+}
+
+// minClosure returns the minimal closed subset of remaining that maximizes
+// sum(fee_i*rate.Size - rate.Fee*size_i), restricted to sets containing tx
+// force when force >= 0. Without force it returns the empty set when no
+// closed subset has a positive total (none has a feerate above rate). The
+// caller must have checked closureArithmeticSafe(remaining).
+func (c *Cluster) minClosure(remaining BitSet, rate FeeFrac, force int) BitSet {
 	elems := remaining.Elements()
 	n := len(elems)
 	pos := make(map[int]int, n)
@@ -849,21 +907,23 @@ func (c *Cluster) maxWeightClosure(remaining BitSet, rate FeeFrac) BitSet {
 	for k := range capm {
 		capm[k] = make([]int64, v)
 	}
-	var sumPos int64
+	var sumPos, sumAbs int64
 	for k, e := range elems {
 		fr := c.DepGraph.FeeRate(e)
 		w := fr.Fee*int64(rate.Size) - rate.Fee*int64(fr.Size)
 		if w > 0 {
 			capm[src][k] = w
 			sumPos += w
+			sumAbs += w
 		} else if w < 0 {
 			capm[k][sink] = -w
+			sumAbs -= w
 		}
 	}
-	if sumPos == 0 {
+	if force < 0 && sumPos == 0 {
 		return BitSet{}
 	}
-	inf := sumPos + 1
+	inf := sumAbs + 1
 	for k, e := range elems {
 		c.DepGraph.Ancestors(e).Intersection(remaining).ForEach(func(a int) {
 			if a != e {
@@ -871,8 +931,15 @@ func (c *Cluster) maxWeightClosure(remaining BitSet, rate FeeFrac) BitSet {
 			}
 		})
 	}
+	if force >= 0 {
+		k, ok := pos[force]
+		if !ok {
+			return BitSet{}
+		}
+		capm[src][k] = inf
+	}
 
-	flow := maxFlowDinic(capm, src, sink)
+	maxFlowDinic(capm, src, sink)
 
 	// The source side of the minimum cut (reachable in the residual graph)
 	// is the minimal maximum-weight closure.
@@ -888,9 +955,6 @@ func (c *Cluster) maxWeightClosure(remaining BitSet, rate FeeFrac) BitSet {
 				queue = append(queue, w)
 			}
 		}
-	}
-	if sumPos-flow <= 0 {
-		return BitSet{}
 	}
 	var out BitSet
 	for k, e := range elems {
