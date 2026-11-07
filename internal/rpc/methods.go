@@ -2260,6 +2260,10 @@ func bip22ResultString(err error) string {
 		return "duplicate-invalid"
 	case errors.Is(err, consensus.ErrInvalidParentHeader):
 		return "bad-prevblk"
+	// Core AcceptBlockHeader: parent not in the block index is
+	// BLOCK_MISSING_PREV "prev-blk-not-found" (validation.cpp:4217).
+	case errors.Is(err, consensus.ErrOrphanHeader):
+		return "prev-blk-not-found"
 	// Proof-of-work failure (hash above target)
 	case errors.Is(err, consensus.ErrDifficultyTooLow),
 		errors.Is(err, consensus.ErrNegativeTarget),
