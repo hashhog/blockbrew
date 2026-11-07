@@ -573,6 +573,7 @@ type DecodeScriptResult struct {
 
 // BlockTemplateResult represents the result of getblocktemplate.
 type BlockTemplateResult struct {
+	Capabilities             []string          `json:"capabilities"`
 	Version                  int32             `json:"version"`
 	Rules                    []string          `json:"rules"`
 	Vbavailable              map[string]int    `json:"vbavailable"`
