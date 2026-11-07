@@ -160,7 +160,18 @@ func TestInvalidatedBlockWithUnflaggedParentSurvivesRestart(t *testing.T) {
 	params := &base
 
 	idx := NewHeaderIndex(params)
-	chainDB := storage.NewChainDB(storage.NewMemDB())
+	// Pebble, not MemDB: MemDB applies a batch's deletes after its puts, so
+	// the invalidate reorg's delete+re-put of the height keys 3 and 4 left them
+	// deleted and the reboot came back at height 2 under a coin set at height
+	// 4 (s3 and s4 applied), a state the daemon cannot reach. The reconsider
+	// below then connected m3a/m4a onto coins that still held s3/s4. Pebble
+	// keeps batch order, as the daemon sees it (see reconsiderRestartFixture).
+	pdb, err := storage.NewPebbleDB(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewPebbleDB: %v", err)
+	}
+	t.Cleanup(func() { pdb.Close() })
+	chainDB := storage.NewChainDB(pdb)
 	utxoSet := NewUTXOSet(chainDB)
 	cm := NewChainManager(ChainManagerConfig{
 		Params: params, HeaderIndex: idx, ChainDB: chainDB, UTXOSet: utxoSet,

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/wire"
@@ -115,6 +116,17 @@ func (s *Server) handleSubmitHeader(params json.RawMessage) (result interface{},
 		// All other failures are validation failures -> RPC_VERIFY_ERROR (-25)
 		// with the Core reject reason string.
 		return nil, &RPCError{Code: RPCErrVerify, Message: headerRejectReason(err)}
+	}
+
+	// Core writes the accepted header to the block index on disk (it is a
+	// dirty CBlockIndex flushed by the next FlushStateToDisk), so it survives
+	// a restart and still counts in getblockchaininfo.headers and
+	// getchaintips "headers-only". The P2P headers path already writes the
+	// header store; this path did not, and a restart forgot the header.
+	if s.chainDB != nil {
+		if err := s.chainDB.StoreBlockHeader(header.BlockHash(), header); err != nil {
+			log.Printf("rpc: submitheader: persisting header %s: %v", header.BlockHash().String()[:16], err)
+		}
 	}
 
 	// Success: header accepted into the index -> JSON null.

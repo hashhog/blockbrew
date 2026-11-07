@@ -664,6 +664,11 @@ func (c *ChainDB) DeleteBlockHeight(height int32) error {
 type BlockFailure struct {
 	Hash  wire.Hash256
 	Flags byte
+	// Header, when set, is written to the header store in the same batch,
+	// so the flagged block can be rebuilt into the index at boot even when
+	// its body was never stored (a block that failed ConnectBlock at the
+	// tip). Core keeps the header in the same block-index record as nStatus.
+	Header *wire.BlockHeader
 }
 
 // WriteBlockFailures persists failure flags (flags != 0 -> put, flags == 0 ->
@@ -680,8 +685,42 @@ func (c *ChainDB) WriteBlockFailures(entries []BlockFailure) error {
 		} else {
 			batch.Put(MakeBlockFailedKey(e.Hash), []byte{e.Flags})
 		}
+		if e.Header != nil {
+			var buf bytes.Buffer
+			if err := e.Header.Serialize(&buf); err != nil {
+				batch.Reset()
+				return err
+			}
+			batch.Put(MakeBlockHeaderKey(e.Hash), buf.Bytes())
+		}
 	}
 	return batch.Write()
+}
+
+// ForEachPersistedBlockHash calls fn once per persisted key of every block
+// that has a stored header (header store, "H") or a stored body (flat-file
+// position index "P", legacy blob "B"). A block with both is reported more
+// than once; callers dedupe. This is the on-disk set Core's
+// LoadBlockIndexGuts reloads at boot (every DB_BLOCK_INDEX record).
+func (c *ChainDB) ForEachPersistedBlockHash(fn func(wire.Hash256)) error {
+	for _, prefix := range [][]byte{BlockHeaderPrefix, BlockPosPrefix, BlockDataPrefix} {
+		it := c.db.NewIterator(prefix)
+		for it.Next() {
+			k := it.Key()
+			if len(k) != 1+32 {
+				continue
+			}
+			var h wire.Hash256
+			copy(h[:], k[1:])
+			fn(h)
+		}
+		err := it.Error()
+		it.Release()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReadBlockFailures returns every persisted block-index failure flag.
