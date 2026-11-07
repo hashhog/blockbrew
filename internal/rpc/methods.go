@@ -2219,6 +2219,8 @@ func (s *Server) handleGetBlockTemplate(params json.RawMessage) (interface{}, *R
 	}
 
 	return &BlockTemplateResult{
+		// Core rpc/mining.cpp:948 always lists "proposal" (BIP-23 mode=proposal).
+		Capabilities:      []string{"proposal"},
 		Version:           template.Block.Header.Version,
 		Rules:             gbtRules,
 		Vbavailable:       gbtVbavailable,
