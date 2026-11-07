@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net"
 	"runtime"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1567,6 +1568,38 @@ func (p *Peer) SendMessageWait(msg Message) error {
 // Address returns the peer's remote address.
 func (p *Peer) Address() string {
 	return p.addr
+}
+
+// AddrBind returns the local socket address of the connection ("ip:port"),
+// or "" when there is no socket. Core getpeerinfo "addrbind"
+// (rpc/net.cpp:229, CNode::addrBind).
+func (p *Peer) AddrBind() string {
+	if p.conn == nil {
+		return ""
+	}
+	la := p.conn.LocalAddr()
+	if la == nil {
+		return ""
+	}
+	return la.String()
+}
+
+// AddrLocalString returns the address the peer says it sees us at, from the
+// addr_recv field of its version message ("ip:port"), or "" before the
+// version arrived or when that address is not valid. Core getpeerinfo
+// "addrlocal" (CNode::SetAddrLocal(addrMe), net_processing.cpp:3670).
+func (p *Peer) AddrLocalString() string {
+	p.mu.RLock()
+	v := p.peerVersion
+	p.mu.RUnlock()
+	if v == nil {
+		return ""
+	}
+	ip := v.AddrRecv.IP
+	if ip == nil || ip.IsUnspecified() || ip.Equal(net.IPv4bcast) {
+		return ""
+	}
+	return net.JoinHostPort(ip.String(), strconv.Itoa(int(v.AddrRecv.Port)))
 }
 
 // ProtocolVersion returns the negotiated protocol version.
