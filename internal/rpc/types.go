@@ -321,8 +321,12 @@ type MempoolEntry struct {
 
 // PeerInfo represents peer information in RPC responses.
 type PeerInfo struct {
-	ID            int      `json:"id"`
-	Addr          string   `json:"addr"`
+	ID   int    `json:"id"`
+	Addr string `json:"addr"`
+	// AddrBind / AddrLocal are omitted when empty, as Core does
+	// (rpc/net.cpp:229-234).
+	AddrBind      string   `json:"addrbind,omitempty"`
+	AddrLocal     string   `json:"addrlocal,omitempty"`
 	Network       string   `json:"network"`
 	Services      string   `json:"services"`
 	ServicesNames []string `json:"servicesnames"`

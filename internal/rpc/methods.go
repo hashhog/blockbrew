@@ -1620,6 +1620,8 @@ func (s *Server) handleGetPeerInfo() (interface{}, *RPCError) {
 		result = append(result, PeerInfo{
 			ID:                    i,
 			Addr:                  p.Address(),
+			AddrBind:              p.AddrBind(),
+			AddrLocal:             p.AddrLocalString(),
 			Network:               peerNetworkFromAddr(p.Address()),
 			Services:              fmt.Sprintf("%016x", services),
 			ServicesNames:         decodeServiceNames(services),
