@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"encoding/json"
+	"math"
 	"math/rand"
 	"net"
 	"os"
@@ -134,6 +135,11 @@ type KnownAddress struct {
 	LastSuccess time.Time  // When we last successfully connected
 	Attempts    int        // Number of connection attempts
 	LastSeen    time.Time  // When we last saw this address advertised
+
+	// lastCountAttempt is when a failed attempt was last counted into
+	// Attempts by MarkAttemptCounted (Core m_last_count_attempt). Not
+	// persisted, as in Core.
+	lastCountAttempt time.Time
 }
 
 // Key returns a unique string key for this address (ip:port).
@@ -198,7 +204,7 @@ func (ka *KnownAddress) Chance() float64 {
 		// If we've successfully connected before, still allow selection
 		// with a reduced score rather than excluding entirely
 		if !ka.LastSuccess.IsZero() {
-			return 0.5
+			return 0.5 * attemptDecay(ka.Attempts)
 		}
 		return 0
 	}
@@ -214,10 +220,12 @@ func (ka *KnownAddress) Chance() float64 {
 		chance *= 2.0
 	}
 
-	// Penalty for failed attempts
-	if ka.Attempts > 0 && ka.LastSuccess.IsZero() {
-		chance /= float64(ka.Attempts + 1)
-	}
+	// Penalty for failed attempts. Attempts counts failures since the last
+	// success (MarkSuccess resets it), so this applies to proven addresses
+	// too: a peer that connected once and has failed fifty times since is no
+	// longer a good pick. Exempting them kept such entries at full weight and
+	// sent about half of mainnet refill dials to dead hosts.
+	chance *= attemptDecay(ka.Attempts)
 
 	// Small bonus for recently seen addresses
 	if !ka.LastSeen.IsZero() && time.Since(ka.LastSeen) < 3*time.Hour {
@@ -227,11 +235,29 @@ func (ka *KnownAddress) Chance() float64 {
 	return chance
 }
 
+// attemptDecay is Core's per-failure selection penalty (AddrInfo::GetChance,
+// addrman.cpp): 0.66 per failed attempt, capped at 8 attempts (~1/28) so an
+// outage does not bury an address for good.
+func attemptDecay(attempts int) float64 {
+	if attempts > 8 {
+		attempts = 8
+	}
+	if attempts < 0 {
+		attempts = 0
+	}
+	return math.Pow(0.66, float64(attempts))
+}
+
 // AddressBook manages known peer addresses.
 type AddressBook struct {
 	mu    sync.RWMutex
 	addrs map[string]*KnownAddress // key -> KnownAddress
 	rand  *rand.Rand
+
+	// lastGood is when any address last connected successfully (Core
+	// m_last_good). MarkAttemptCounted counts at most one failure per
+	// address between two such successes.
+	lastGood time.Time
 }
 
 // NewAddressBook creates a new address book.
@@ -399,13 +425,36 @@ func (ab *AddressBook) MarkAttempt(addr string) {
 	}
 }
 
+// MarkAttemptCounted records an outbound connection attempt the way Core's
+// AddrManImpl::Attempt_ does: the try time always moves, but Attempts grows
+// only when countFailure is set and no failure has been counted for this
+// address since the last successful connection to any address. With the
+// 0.66-per-attempt pick penalty in Chance(), this keeps a local outage (no
+// successes anywhere) from burying every known address: each one is counted
+// at most once until something connects again.
+func (ab *AddressBook) MarkAttemptCounted(addr string, countFailure bool) {
+	ab.mu.Lock()
+	defer ab.mu.Unlock()
+
+	if ka, ok := ab.addrs[addr]; ok {
+		now := time.Now()
+		ka.LastAttempt = now
+		if countFailure && !ka.lastCountAttempt.After(ab.lastGood) {
+			ka.lastCountAttempt = now
+			ka.Attempts++
+		}
+	}
+}
+
 // MarkSuccess records a successful connection.
 func (ab *AddressBook) MarkSuccess(addr string) {
 	ab.mu.Lock()
 	defer ab.mu.Unlock()
 
+	now := time.Now()
+	ab.lastGood = now
 	if ka, ok := ab.addrs[addr]; ok {
-		ka.LastSuccess = time.Now()
+		ka.LastSuccess = now
 		ka.Attempts = 0 // Reset attempts on success
 	}
 }
