@@ -427,6 +427,11 @@ type TxEntry struct {
 	// removeForReorg, validation.cpp:1191-1232) to re-scan transactions whose
 	// coinbase parents may now be immature after a chain rewind.
 	SpendsCoinbase bool
+
+	// memInner is this entry's share of Core's cachedInnerUsage
+	// (RecursiveDynamicUsage of the transaction), set when the entry enters
+	// the pool. See memusage.go.
+	memInner int64
 }
 
 // AncestorFeeRate returns the ancestor fee rate (sat/vB).
@@ -661,6 +666,14 @@ type Mempool struct {
 	// PrioritiseTransaction so the same shape is restored. See
 	// persist.go::Dump / Load and the FIX-76 tests for the round-trip.
 	mapDeltas map[wire.Hash256]int64
+
+	// randomizedCap is the capacity Core's txns_randomized vector would have
+	// after the same sequence of adds and removes. DynamicMemoryUsage charges
+	// that vector by capacity, which the live entry count does not determine.
+	randomizedCap int64
+	// cachedInnerUsage is Core's CTxMemPool::cachedInnerUsage: the sum of
+	// memInner over the pool, kept up to date on every add and remove.
+	cachedInnerUsage int64
 
 	// unbroadcast holds txids of locally submitted transactions (RPC
 	// sendrawtransaction) that no peer has requested yet. Mirrors Core's
@@ -1552,6 +1565,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 
 	// Add to pool
 	mp.pool[txHash] = entry
+	mp.noteEntryAddedLocked(entry)
 	for _, in := range tx.TxIn {
 		mp.outpoints[in.PreviousOutPoint] = txHash
 	}
@@ -2391,6 +2405,7 @@ func (mp *Mempool) removeSingleTxLocked(txHash wire.Hash256, reason MemPoolRemov
 
 	// Remove from pool
 	delete(mp.pool, txHash)
+	mp.noteEntryRemovedLocked(entry)
 	delete(mp.unbroadcast, txHash)
 
 	// Notify fee estimator (and any other subscriber) that this tx has left
@@ -2799,7 +2814,9 @@ func (mp *Mempool) trackPackageRemovedLocked(feeRateSatKvB float64) {
 	}
 }
 
-// maybeEvictLocked evicts transactions if the mempool is too large.
+// maybeEvictLocked evicts transactions while the mempool's
+// DynamicMemoryUsage exceeds -maxmempool (Core TrimToSize compares
+// DynamicMemoryUsage(), not the transactions' total vsize, to the limit).
 // Uses cluster-based eviction: removes the lowest-feerate chunk from the worst
 // cluster.  After each eviction the rolling minimum fee rate is bumped via
 // trackPackageRemovedLocked so that subsequent adds must pay incremental relay
@@ -2807,7 +2824,7 @@ func (mp *Mempool) trackPackageRemovedLocked(feeRateSatKvB float64) {
 // Core: txmempool.cpp:861-911 (CTxMemPool::TrimToSize).
 // Must be called with mu held.
 func (mp *Mempool) maybeEvictLocked() {
-	for mp.totalSize > mp.config.MaxSize && len(mp.pool) > 0 {
+	for len(mp.pool) > 0 && mp.dynamicMemoryUsageLocked() > mp.config.MaxSize {
 		// Use cluster-based eviction: find the worst chunk across all clusters
 		worstCluster, worstChunk := mp.clusters.GetWorstChunkForEviction()
 
@@ -2830,8 +2847,8 @@ func (mp *Mempool) maybeEvictLocked() {
 
 			// Bump rolling minimum: feerate of removed tx + incremental relay fee.
 			// Core: txmempool.cpp:876-878.
-			removedRateKvB := worst.DescendantFeeRate() * 1000
-			mp.trackPackageRemovedLocked(removedRateKvB + float64(mp.config.IncrementalRelayFee))
+			removedRateKvB := feePerKFloor(worst.DescendantFee, worst.DescendantSize)
+			mp.trackPackageRemovedLocked(float64(removedRateKvB + mp.config.IncrementalRelayFee))
 
 			// FIX-73: TrimToSize → SIZELIMIT reason.
 			mp.removeWithDescendantsLocked(worst.TxHash, MempoolRemovalReasonSizeLimit)
@@ -2857,9 +2874,11 @@ func (mp *Mempool) maybeEvictLocked() {
 		// Bump rolling minimum: chunk feerate + incremental relay fee.
 		// Core: txmempool.cpp:870-878 (removed += incremental_relay_feerate;
 		// trackPackageRemoved(removed)).
+		// CFeeRate{fee, vsize}.GetFeePerK() is whole sat/kvB rounded down
+		// (EvaluateFeeDown), and CFeeRate += adds whole sat/kvB.
 		if chunkSize > 0 {
-			chunkRateKvB := float64(chunkFee) / float64(chunkSize) * 1000
-			mp.trackPackageRemovedLocked(chunkRateKvB + float64(mp.config.IncrementalRelayFee))
+			chunkRateKvB := feePerKFloor(chunkFee, chunkSize)
+			mp.trackPackageRemovedLocked(float64(chunkRateKvB + mp.config.IncrementalRelayFee))
 		}
 
 		// Remove all transactions in the worst chunk.
@@ -3156,8 +3175,10 @@ func (mp *Mempool) CalcMinFee(vsize int64) int64 {
 // fee rate increases to the lowest-feerate transaction plus the incremental relay fee.
 // This value should be broadcast to peers via feefilter (BIP133).
 func (mp *Mempool) GetMinFeeRate() int64 {
-	mp.mu.RLock()
-	defer mp.mu.RUnlock()
+	// Write lock: the read decays the rolling rate and measures
+	// DynamicMemoryUsage, which may relinearize a dirty cluster.
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
 	return mp.getMinFeeRateLocked()
 }
 
@@ -3211,11 +3232,13 @@ func (mp *Mempool) getMinFeeRateLocked() int64 {
 	if now > mp.lastRollingFeeUpdate+10 {
 		// Choose halflife based on current mempool fullness.
 		// Core: txmempool.cpp:836-840.
+		// Fullness is DynamicMemoryUsage against -maxmempool, as in Core.
 		halflife := rollingFeeHalflife
 		sizelimit := mp.config.MaxSize
-		if mp.totalSize*4 < sizelimit { // < sizelimit/4
+		usage := mp.dynamicMemoryUsageLocked()
+		if usage*4 < sizelimit { // < sizelimit/4
 			halflife /= 4
-		} else if mp.totalSize*2 < sizelimit { // < sizelimit/2
+		} else if usage*2 < sizelimit { // < sizelimit/2
 			halflife /= 2
 		}
 
@@ -3256,8 +3279,8 @@ func max64(a, b int64) int64 {
 // GetMinFee returns the minimum fee required for a transaction of given vsize.
 // This uses the dynamic minimum fee rate (accounting for mempool fullness).
 func (mp *Mempool) GetMinFee(vsize int64) int64 {
-	mp.mu.RLock()
-	defer mp.mu.RUnlock()
+	mp.mu.Lock()
+	defer mp.mu.Unlock()
 
 	minRate := mp.getMinFeeRateLocked()
 	// Convert from sat/kvB to satoshis for this transaction size
@@ -3285,6 +3308,7 @@ func (mp *Mempool) Clear() {
 	mp.outpoints = make(map[wire.OutPoint]wire.Hash256)
 	mp.orphans = make(map[wire.Hash256]*orphanEntry)
 	mp.totalSize = 0
+	mp.cachedInnerUsage = 0
 	mp.clusters.Clear()
 }
 
@@ -3674,6 +3698,7 @@ func InjectTestEntry(mp *Mempool, entry *TxEntry) {
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 	mp.pool[entry.TxHash] = entry
+	mp.noteEntryAddedLocked(entry)
 	for _, in := range entry.Tx.TxIn {
 		mp.outpoints[in.PreviousOutPoint] = entry.TxHash
 	}
@@ -4831,6 +4856,7 @@ func (mp *Mempool) addTransactionLocked(tx *wire.MsgTx, fee, vsize int64) error 
 
 	// Add to pool
 	mp.pool[txHash] = entry
+	mp.noteEntryAddedLocked(entry)
 	for _, in := range tx.TxIn {
 		mp.outpoints[in.PreviousOutPoint] = txHash
 	}
