@@ -1454,7 +1454,7 @@ func (s *Server) handleGetMempoolInfo() (interface{}, *RPCError) {
 		Loaded:     true,
 		Size:       s.mempool.Count(),
 		Bytes:      s.mempool.TotalSize(),
-		Usage:      s.mempool.TotalSize(), // Simplified: actual usage would include overhead
+		Usage:      s.mempool.DynamicMemoryUsage(), // Core CTxMemPool::DynamicMemoryUsage
 		TotalFee:   btcAmount(totalFeeSat),
 		MaxMempool: s.mempool.MaxSize(),
 		// Fee fields READ the live mempool policy so display == policy (no

@@ -115,29 +115,31 @@ func TestTrimToSize_PoolWithinLimit(t *testing.T) {
 	now := time.Now()
 	injectEntry(mp, wire.Hash256{1}, 300, 300, now) // 300 sat / 300 vB = 1000 sat/kvB
 	injectEntry(mp, wire.Hash256{2}, 100, 100, now) // lower feerate
-	// total = 400 — still within 500, no eviction yet
+	// 400 vB, but 976 bytes of Core memory: over the 500 limit
 
 	mp.mu.Lock()
 	mp.maybeEvictLocked()
-	total := mp.totalSize
+	usage := mp.dynamicMemoryUsageLocked()
 	mp.mu.Unlock()
 
-	if total > mp.config.MaxSize {
-		t.Errorf("totalSize = %d after eviction, want <= %d", total, mp.config.MaxSize)
+	if usage > mp.config.MaxSize {
+		t.Errorf("DynamicMemoryUsage = %d after eviction, want <= %d", usage, mp.config.MaxSize)
 	}
 }
 
 // Gate T2 — lower-feerate transaction is evicted before higher-feerate one.
 // Core: TrimToSize evicts the worst chunk (lowest feerate).
 func TestTrimToSize_EvictsLowerFeeFirst(t *testing.T) {
-	mp := newW86Pool(300)
+	// The limit is DynamicMemoryUsage, as in Core: one of these input-less
+	// entries is 504 bytes of Core memory, two are 976. 750 fits one.
+	mp := newW86Pool(750)
 
 	now := time.Now()
 	// High-fee tx: 500 sat / 150 vB ≈ 3.33 sat/vB
 	injectEntry(mp, wire.Hash256{0xAA}, 500, 150, now)
 	// Low-fee tx:  50 sat / 200 vB = 0.25 sat/vB
 	injectEntry(mp, wire.Hash256{0xBB}, 50, 200, now)
-	// total = 350 > 300 → eviction fires
+	// usage 976 > 750 → eviction fires
 
 	mp.mu.Lock()
 	mp.maybeEvictLocked()
@@ -212,6 +214,9 @@ func TestTrimToSize_ExactlyAtLimit(t *testing.T) {
 	injectEntry(mp, wire.Hash256{0xFF}, 100, 100, time.Now())
 
 	mp.mu.Lock()
+	// Core evicts only while DynamicMemoryUsage() > sizelimit: put the
+	// limit exactly at the pool's usage.
+	mp.config.MaxSize = mp.dynamicMemoryUsageLocked()
 	sizeBefore := mp.totalSize
 	mp.maybeEvictLocked()
 	sizeAfter := mp.totalSize
@@ -445,7 +450,7 @@ func TestGetMinFeeRateLocked_HalflifeQuarterWhenQuarterFull(t *testing.T) {
 	}
 }
 
-// Gate F4 — halflife /2 when sizelimit/4 <= totalSize < sizelimit/2.
+// Gate F4 — halflife /2 when sizelimit/4 <= DynamicMemoryUsage < sizelimit/2.
 // Core: txmempool.cpp:839-840.
 func TestGetMinFeeRateLocked_HalflifeHalfWhenHalfFull(t *testing.T) {
 	const maxSize = int64(1_000_000)
@@ -458,8 +463,12 @@ func TestGetMinFeeRateLocked_HalflifeHalfWhenHalfFull(t *testing.T) {
 	mp.blockSinceLastRollingFeeBump = true
 	// elapsed = 6h = 21600s; halflife = 6h = 21600s → pow(2,1) = 2
 	mp.lastRollingFeeUpdate = time.Now().Unix() - 6*60*60
-	// Between 1/4 and 1/2 of maxSize
-	mp.totalSize = maxSize / 3
+	mp.mu.Unlock()
+	// Between 1/4 and 1/2 of the limit, measured as Core does
+	// (DynamicMemoryUsage): one entry, limit three times its usage.
+	injectEntry(mp, wire.Hash256{0x46}, 100, 100, time.Now())
+	mp.mu.Lock()
+	mp.config.MaxSize = 3 * mp.dynamicMemoryUsageLocked()
 	mp.mu.Unlock()
 
 	rate := mp.GetMinFeeRate()

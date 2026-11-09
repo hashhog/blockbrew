@@ -572,7 +572,10 @@ func TestEvictionPolicy(t *testing.T) {
 		mp.outpoints[in.PreviousOutPoint] = tx3.TxHash()
 	}
 
-	mp.totalSize = 600 // 3 x 200 bytes, exceeds 500 byte limit
+	mp.totalSize = 600 // 3 x 200 vB
+	// Core's limit is DynamicMemoryUsage: put it one byte under the pool's
+	// usage so that exactly one eviction brings the pool back under.
+	mp.config.MaxSize = mp.dynamicMemoryUsageLocked() - 1
 	mp.mu.Unlock()
 
 	// Trigger eviction
@@ -1539,9 +1542,17 @@ func TestGetMinFeeRate(t *testing.T) {
 	mp.totalSize = 0 // empty → use /4 halflife = 3h
 	// At <sizelimit/4, halflife = 3h, elapsed = 12h+1s → pow(2, (12*3600+1)/3/3600)
 	// ≈ pow(2, 4.0003) ≈ 16.00; 2500/16 ≈ 156.25 < 500 → zeroed to 0.
-	// But we want to test the non-zero path, so set size to 600 (> maxsize/2=500)
-	// → halflife = 12h; 2500 / pow(2, (43201/43200)) ≈ 2500/2.0 = 1250.
-	mp.totalSize = 600
+	// But we want to test the non-zero path, so make the pool at least half
+	// full → halflife = 12h; 2500 / pow(2, (43201/43200)) ≈ 2500/2.0 = 1250.
+	// Fullness is DynamicMemoryUsage, as in Core: one entry, and a limit
+	// 1.5 times its usage.
+	mp.mu.Unlock()
+	var fillHash wire.Hash256
+	fillHash[0] = 0x4d
+	fill := createTestTransaction([]wire.OutPoint{{Hash: fillHash}}, 1000, 1)
+	InjectTestEntry(mp, &TxEntry{Tx: fill, TxHash: fill.TxHash(), Fee: 1000, Size: 200, Time: time.Now()})
+	mp.mu.Lock()
+	mp.config.MaxSize = mp.dynamicMemoryUsageLocked() * 3 / 2
 	mp.mu.Unlock()
 
 	minRate = mp.GetMinFeeRate()
