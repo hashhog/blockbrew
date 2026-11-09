@@ -180,6 +180,66 @@ func (ka *KnownAddress) IsBad() bool {
 	return false
 }
 
+// Core addrman horizons used by isTerrible (bitcoin-core/src/addrman.h).
+const (
+	addrHorizon     = 30 * 24 * time.Hour // ADDRMAN_HORIZON
+	addrRetries     = 3                   // ADDRMAN_RETRIES
+	addrMaxFailures = 10                  // ADDRMAN_MAX_FAILURES
+	addrMinFail     = 7 * 24 * time.Hour  // ADDRMAN_MIN_FAIL
+
+	// addrBookEvictScan bounds how many entries a full-book insert inspects
+	// for a terrible one to replace. Core checks the one slot the new address
+	// hashes to (a bucket holds 64); a bounded random scan is the flat-map
+	// analogue and keeps a 1000-address gossip message cheap.
+	addrBookEvictScan = 64
+)
+
+// isTerrible mirrors Core's AddrInfo::IsTerrible (addrman.cpp): a new-table
+// entry that may be overwritten by a newly learned address. It is NOT a selection filter
+// (IsBad / Chance keep their own, more lenient, rules); it only decides which
+// entries make room when the book is full.
+func (ka *KnownAddress) isTerrible(now time.Time) bool {
+	if !ka.LastAttempt.IsZero() && now.Sub(ka.LastAttempt) <= time.Minute {
+		return false // never remove things tried in the last minute
+	}
+	if ka.LastSeen.After(now.Add(10 * time.Minute)) {
+		return true // timestamp from the future
+	}
+	if now.Sub(ka.LastSeen) > addrHorizon {
+		return true // not seen in recent history
+	}
+	if ka.LastSuccess.IsZero() && ka.Attempts >= addrRetries {
+		return true // tried N times and never a success
+	}
+	if now.Sub(ka.LastSuccess) > addrMinFail && ka.Attempts >= addrMaxFailures {
+		return true // N successive failures in the last week
+	}
+	return false
+}
+
+// findTerribleLocked returns the key of a terrible entry among up to
+// addrBookEvictScan entries (Go map iteration starts at a random bucket, so
+// the scan is a cheap, not uniform, sample), or "" if none was found.
+//
+// Only never-connected entries are candidates. In Core an address that has
+// completed a connection lives in the tried table, and AddSingle only ever
+// overwrites new-table occupants, so gossip cannot push a proven peer out
+// (that is the tried table's eclipse protection). In this flat map a set
+// LastSuccess is the stand-in for "in tried". Caller holds ab.mu.
+func (ab *AddressBook) findTerribleLocked(now time.Time) string {
+	scanned := 0
+	for key, ka := range ab.addrs {
+		if ka.LastSuccess.IsZero() && ka.isTerrible(now) {
+			return key
+		}
+		scanned++
+		if scanned >= addrBookEvictScan {
+			break
+		}
+	}
+	return ""
+}
+
 // IsRecentlyAttempted returns true if we've tried this address recently.
 func (ka *KnownAddress) IsRecentlyAttempted() bool {
 	if ka.LastAttempt.IsZero() {
@@ -300,10 +360,17 @@ func (ab *AddressBook) AddAddress(addr NetAddress, source string) {
 		return
 	}
 
-	// Don't exceed max size
+	// Don't exceed max size. A full book makes room by overwriting a terrible
+	// never-connected entry, as Core's AddrManImpl::AddSingle overwrites a
+	// terrible occupant of the new-table slot. Rejecting outright froze the book once it filled
+	// with dead addresses, so fresh gossip could never replace them and every
+	// outbound refill kept dialling the same unreachable hosts.
 	if len(ab.addrs) >= AddressBookMaxSize {
-		// Could implement eviction here, for now just reject
-		return
+		victim := ab.findTerribleLocked(now)
+		if victim == "" {
+			return
+		}
+		delete(ab.addrs, victim)
 	}
 
 	ab.addrs[key] = &KnownAddress{
