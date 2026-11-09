@@ -1930,13 +1930,6 @@ func (pm *PeerManager) connectOutbound(ka *KnownAddress, connType ConnType, rele
 
 	addr := ka.Key()
 
-	// Mark the attempt (but not for feelers — feeler probes should not
-	// prevent the address from being selected for full-relay or block-relay
-	// connections, especially on networks with small address pools like testnet4)
-	if connType != ConnFeeler {
-		pm.addrBook.MarkAttempt(addr)
-	}
-
 	// Check if already connected or banned
 	pm.mu.RLock()
 	if _, ok := pm.peers[addr]; ok {
@@ -1963,7 +1956,24 @@ func (pm *PeerManager) connectOutbound(ka *KnownAddress, connType ConnType, rele
 	case ConnFeeler, ConnManual:
 		// Feelers and manual connections always proceed (manual bypasses cap).
 	}
+	// Core (net.cpp ThreadOpenConnections) counts a failed attempt only
+	// while it already has outbound peers in at least min(max automatic - 1,
+	// 2) distinct netgroups: with fewer, the fault is more likely local than
+	// the address's, and counting it would push every known address down
+	// the 0.66-per-attempt pick penalty during an outage. blockbrew counts
+	// outbound peers rather than netgroups (it allows 2 per /16), so it can
+	// start counting slightly earlier than Core.
+	countFailure := pm.outbound+pm.blockRelayOnly >= 2
 	pm.mu.RUnlock()
+
+	// Mark the attempt only now that a dial will really happen (Core calls
+	// AddrMan::Attempt from ConnectNode, never for a connected, banned or
+	// unneeded address). Feelers are not marked: a feeler probe should not
+	// keep the address from being selected for full-relay or block-relay
+	// connections, especially on small networks like testnet4.
+	if connType != ConnFeeler {
+		pm.addrBook.MarkAttemptCounted(addr, countFailure)
+	}
 
 	// Create peer config - block-relay-only peers don't relay txs
 	peerConfig := pm.makePeerConfig()
