@@ -437,6 +437,10 @@ func (s *Server) handleListUnspentWithWallet(params json.RawMessage, walletName 
 	minConf := int32(1)
 	maxConf := int32(9999999)
 	var filterAddrs map[string]struct{}
+	// Core CoinFilterParams::include_immature_coinbase defaults to false
+	// (wallet/spend.h:86): AvailableCoins (spend.cpp:357) skips a coinbase
+	// while IsTxImmatureCoinBase, i.e. below COINBASE_MATURITY+1 confs.
+	includeImmatureCoinbase := false
 	if len(params) > 0 && string(params) != "null" {
 		var args []interface{}
 		if err := json.Unmarshal(params, &args); err != nil {
@@ -477,6 +481,28 @@ func (s *Server) handleListUnspentWithWallet(params json.RawMessage, walletName 
 				filterAddrs[addr] = struct{}{}
 			}
 		}
+		// query_options (Core coins.cpp listunspent: params[4].get_obj(),
+		// then RPCTypeCheckObj types include_immature_coinbase as VBOOL:
+		// a non-bool is RPC_TYPE_ERROR. RPCTypeCheckObj allows null, but the
+		// key still exists, so get_bool() throws UniValue::type_error, which
+		// rpc/server.cpp:512 also reports as RPC_TYPE_ERROR (without the
+		// "for field" part).
+		if len(args) >= 5 && args[4] != nil {
+			opts, ok := args[4].(map[string]interface{})
+			if !ok {
+				return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type " + jsonTypeName(args[4]) + " is not of expected type object"}
+			}
+			if v, present := opts["include_immature_coinbase"]; present {
+				if v == nil {
+					return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type null is not of expected type bool"}
+				}
+				b, ok := v.(bool)
+				if !ok {
+					return nil, &RPCError{Code: RPCErrTypeError, Message: "JSON value of type " + jsonTypeName(v) + " for field include_immature_coinbase is not of expected type bool"}
+				}
+				includeImmatureCoinbase = b
+			}
+		}
 	}
 
 	utxos := w.ListUnspent()
@@ -501,7 +527,12 @@ func (s *Server) handleListUnspentWithWallet(params json.RawMessage, walletName 
 			}
 		}
 
-		spendable := !w.IsLocked() && w.IsUTXOSpendable(u, tipHeight)
+		// Immature coinbase outputs are left out unless asked for. Only the
+		// RPC listing is filtered: wallet.ListUnspent is shared with other
+		// callers, and coin selection already applies its own maturity rule.
+		if u.IsCoinbase && !includeImmatureCoinbase && !w.IsUTXOSpendable(u, tipHeight) {
+			continue
+		}
 
 		// Solvability comes from the ownership record, not a hardcoded true:
 		// watch-only addr() imports are ISMINE but NOT solvable (Core
@@ -531,7 +562,7 @@ func (s *Server) handleListUnspentWithWallet(params json.RawMessage, walletName 
 			ScriptPubKey:  hex.EncodeToString(spk),
 			Amount:        float64(u.Amount) / satoshiPerBitcoin,
 			Confirmations: confs,
-			Spendable:     spendable,
+			Spendable:     true, // Core coins.cpp: "(DEPRECATED) Always true"
 			Solvable:      det.Solvable,
 			Desc:          desc,
 			ParentDescs:   parentDescs,
