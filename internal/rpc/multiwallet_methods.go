@@ -977,7 +977,6 @@ func (s *Server) handleGetWalletInfoWithWallet(walletName string) (interface{}, 
 		return nil, rpcErr
 	}
 
-	confirmed, unconfirmed := w.GetBalance()
 	history := w.GetHistory()
 
 	tipHeight := int32(0)
@@ -990,8 +989,6 @@ func (s *Server) handleGetWalletInfoWithWallet(walletName string) (interface{}, 
 		WalletName:         w.Name(),
 		WalletVersion:      169900, // Latest legacy wallet version for compatibility
 		Format:             "sqlite",
-		Balance:            float64(confirmed) / satoshiPerBitcoin,
-		UnconfirmedBalance: float64(unconfirmed) / satoshiPerBitcoin,
 		TxCount:            len(history),
 		KeypoolSize:        20,
 		PayTxFee:           0,

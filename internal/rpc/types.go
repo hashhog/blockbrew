@@ -436,8 +436,6 @@ type WalletInfo struct {
 	WalletName            string             `json:"walletname"`
 	WalletVersion         int                `json:"walletversion"`
 	Format                string             `json:"format,omitempty"`
-	Balance               float64            `json:"balance"`
-	UnconfirmedBalance    float64            `json:"unconfirmed_balance"`
 	TxCount               int                `json:"txcount"`
 	KeypoolSize           int                `json:"keypoolsize"`
 	KeypoolSizeHDInternal int                `json:"keypoolsize_hd_internal,omitempty"`
