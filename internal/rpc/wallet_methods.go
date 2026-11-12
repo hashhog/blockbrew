@@ -393,14 +393,11 @@ func (s *Server) handleGetWalletInfo() (interface{}, *RPCError) {
 		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
 	}
 
-	confirmed, unconfirmed := s.wallet.GetBalance()
 	history := s.wallet.GetHistory()
 
 	return &WalletInfo{
 		WalletName:         "default",
 		WalletVersion:      1,
-		Balance:            float64(confirmed) / satoshiPerBitcoin,
-		UnconfirmedBalance: float64(unconfirmed) / satoshiPerBitcoin,
 		TxCount:            len(history),
 		KeypoolSize:        20,
 		PayTxFee:           0,
