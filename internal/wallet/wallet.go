@@ -2571,6 +2571,16 @@ func (w *Wallet) ScanBlock(block *wire.MsgBlock, height int32) {
 					Amount:   out.Value,
 					Vout:     uint32(idx),
 				})
+				// Core CachedTxGetAmounts: an owned non-change output of a
+				// tx we paid for is listed as a receive too (send-to-self).
+				if isOurs {
+					details = append(details, WalletTxDetail{
+						Address:  addr,
+						Category: "receive",
+						Amount:   out.Value,
+						Vout:     uint32(idx),
+					})
+				}
 			} else if isOurs {
 				if primaryAddr == "" {
 					primaryAddr = addr
@@ -2931,6 +2941,16 @@ func (w *Wallet) rescanBlockLocked(block *wire.MsgBlock, height int32, derivedId
 					Amount:   out.Value,
 					Vout:     uint32(idx),
 				})
+				// Core CachedTxGetAmounts: an owned non-change output of a
+				// tx we paid for is listed as a receive too (send-to-self).
+				if isOurs {
+					details = append(details, WalletTxDetail{
+						Address:  addr,
+						Category: "receive",
+						Amount:   out.Value,
+						Vout:     uint32(idx),
+					})
+				}
 			} else if isOurs {
 				if primaryAddr == "" {
 					primaryAddr = addr
