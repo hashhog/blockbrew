@@ -3341,6 +3341,7 @@ func printHelp() {
 	fmt.Println("  --rpcpassword   RPC password (empty: cookie-only auth via <datadir>/.cookie)")
 	fmt.Println("  --maxoutbound   Maximum outbound connections (default: 8)")
 	fmt.Println("  --maxinbound    Maximum inbound connections (default: 117)")
+	fmt.Println("  --timeout       Outbound connect timeout in ms (default: 5000, Core -timeout)")
 	fmt.Println("  --nolisten      Disable inbound P2P connections")
 	fmt.Println("  --mineraddress  Address for mining rewards")
 	fmt.Println("  --wallet        Wallet file name (default: wallet.dat)")
