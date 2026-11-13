@@ -46,6 +46,21 @@ var (
 	ErrTooManyLocators  = errors.New("p2p: too many block locators")
 )
 
+// DeserializeError is a checksum-valid message whose payload did not parse.
+// The bytes came off the socket intact, so even when the parser ran out of
+// payload (io.EOF / io.ErrUnexpectedEOF, which Unwrap still exposes) this is
+// the peer sending a malformed message, not the peer hanging up.
+type DeserializeError struct {
+	Command string
+	Err     error
+}
+
+func (e *DeserializeError) Error() string {
+	return fmt.Sprintf("deserialize %s: %v", e.Command, e.Err)
+}
+
+func (e *DeserializeError) Unwrap() error { return e.Err }
+
 // NonFatalMessageError indicates a deserialization failure for a non-critical
 // message where the TCP stream remains valid (payload was fully consumed and
 // checksum verified). The peer connection should NOT be killed for this error.
@@ -292,7 +307,7 @@ func readMessage(r io.Reader, magic uint32, afterHeader MessageHeaderHook) (Mess
 		if isNonCriticalMessage(cmd) {
 			return nil, &NonFatalMessageError{Command: cmd, Err: err}
 		}
-		return nil, fmt.Errorf("deserialize %s: %w", cmd, err)
+		return nil, &DeserializeError{Command: cmd, Err: err}
 	}
 
 	return msg, nil

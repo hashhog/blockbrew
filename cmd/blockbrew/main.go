@@ -49,6 +49,7 @@ type Config struct {
 	RPCPassword  string
 	MaxOutbound  int
 	MaxInbound   int
+	TimeoutMs    int // -timeout: outbound TCP dial timeout in ms
 	NoListen     bool
 	MinerAddress string
 	WalletFile   string
@@ -629,6 +630,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.RPCPassword, "rpcpassword", "", "RPC password")
 	flag.IntVar(&cfg.MaxOutbound, "maxoutbound", 8, "Maximum outbound connections")
 	flag.IntVar(&cfg.MaxInbound, "maxinbound", 117, "Maximum inbound connections")
+	flag.IntVar(&cfg.TimeoutMs, "timeout", int(p2p.DefaultConnectTimeout/time.Millisecond), "Specify socket connection timeout in milliseconds. If an initial attempt to connect is unsuccessful after this amount of time, drop it (minimum: 1). Mirrors Bitcoin Core -timeout (DEFAULT_CONNECT_TIMEOUT 5000).")
 	flag.BoolVar(&cfg.NoListen, "nolisten", false, "Disable inbound P2P connections")
 	flag.StringVar(&cfg.MinerAddress, "mineraddress", "", "Address for mining rewards")
 	flag.StringVar(&cfg.WalletFile, "wallet", "wallet.dat", "Wallet file name")
@@ -1675,6 +1677,7 @@ func run(cfg *Config, chainParams *consensus.ChainParams) error {
 	}
 
 	// 7. Initialize peer manager
+	p2p.ConnectTimeout = connectTimeoutFromMs(cfg.TimeoutMs)
 	listenAddr := cfg.ListenP2P
 	if cfg.NoListen {
 		listenAddr = ""
@@ -3338,6 +3341,7 @@ func printHelp() {
 	fmt.Println("  --rpcpassword   RPC password (empty: cookie-only auth via <datadir>/.cookie)")
 	fmt.Println("  --maxoutbound   Maximum outbound connections (default: 8)")
 	fmt.Println("  --maxinbound    Maximum inbound connections (default: 117)")
+	fmt.Println("  --timeout       Outbound connect timeout in ms (default: 5000, Core -timeout)")
 	fmt.Println("  --nolisten      Disable inbound P2P connections")
 	fmt.Println("  --mineraddress  Address for mining rewards")
 	fmt.Println("  --wallet        Wallet file name (default: wallet.dat)")
@@ -3395,4 +3399,14 @@ func printHelp() {
 	fmt.Println("  blockbrew import-blocks --network mainnet < blocks  Import blocks from stdin")
 	fmt.Println("  blockbrew --load-snapshot=utxo.dat                  Load Core-format UTXO snapshot at boot")
 	fmt.Println("  blockbrew --version                                 Print version")
+}
+
+// connectTimeoutFromMs turns -timeout into the dial timeout. Like Core
+// (init.cpp: "if (nConnectTimeout <= 0) nConnectTimeout = DEFAULT_CONNECT_TIMEOUT"),
+// a value that is not positive falls back to the default.
+func connectTimeoutFromMs(ms int) time.Duration {
+	if ms <= 0 {
+		return p2p.DefaultConnectTimeout
+	}
+	return time.Duration(ms) * time.Millisecond
 }
