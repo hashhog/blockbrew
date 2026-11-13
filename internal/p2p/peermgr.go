@@ -2046,7 +2046,7 @@ func (pm *PeerManager) connectOutbound(ka *KnownAddress, connType ConnType, rele
 	// Start the peer (this does the handshake)
 	err = peer.Start()
 	if err != nil {
-		if connType != ConnFeeler {
+		if connType == ConnFullRelay || connType == ConnBlockRelayOnly {
 			logOutboundDisconnect(peer, connType, peerInfo.connectedAt, "handshake")
 		}
 		pm.removePeer(peer)

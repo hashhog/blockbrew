@@ -1519,8 +1519,7 @@ func (p *Peer) noteLocalCaller() {
 func (p *Peer) noteIOError(op string, err error) {
 	switch {
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
-		errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE),
-		errors.Is(err, io.ErrClosedPipe):
+		errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
 		p.noteDisconnect("remote", op+": "+err.Error())
 	default:
 		var ne net.Error
