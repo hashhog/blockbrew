@@ -1576,11 +1576,10 @@ func (pm *PeerManager) connectionHandler() {
 			}
 
 			// Extra block-relay-only connections (for partition resistance)
-			if now.After(nextBlockRelay) {
+			// A rotation deferred because full-relay is short stays due, so it
+			// runs on the first feeler tick after the full-relay slots fill.
+			if now.After(nextBlockRelay) && !pm.maybeRotateBlockRelayPeer() {
 				nextBlockRelay = now.Add(poissonDuration(ExtraBlockRelayInterval, pm.rng))
-
-				// Occasionally rotate a block-relay-only connection
-				pm.maybeRotateBlockRelayPeer()
 			}
 
 		case <-fixedSeedsTicker.C:
@@ -1731,15 +1730,25 @@ func poissonDuration(mean time.Duration, rng *rand.Rand) time.Duration {
 	return time.Duration(delay)
 }
 
-// maybeRotateBlockRelayPeer disconnects a random block-relay-only peer to allow
-// connecting to a new one. This improves partition resistance by regularly
-// testing different parts of the network.
-func (pm *PeerManager) maybeRotateBlockRelayPeer() {
+// maybeRotateBlockRelayPeer disconnects the oldest block-relay-only peer to
+// allow connecting to a new one. This improves partition resistance by
+// regularly testing different parts of the network.
+//
+// It returns true when it deferred the rotation because a full-relay slot is
+// open or being dialed: Core (net.cpp ThreadOpenConnections) only makes its
+// extra block-relay connection once every full-relay slot is filled, so a
+// rotation never competes with refilling full relay. The caller keeps the
+// rotation due and retries.
+func (pm *PeerManager) maybeRotateBlockRelayPeer() (deferred bool) {
 	pm.mu.RLock()
+	if pm.outbound < pm.config.MaxOutbound {
+		pm.mu.RUnlock()
+		return true
+	}
 	// Only rotate if we're at the limit
 	if pm.blockRelayOnly < pm.config.MaxBlockRelayOnly {
 		pm.mu.RUnlock()
-		return
+		return false
 	}
 
 	// Don't rotate if we have very few total peers — rotating our only
@@ -1747,7 +1756,7 @@ func (pm *PeerManager) maybeRotateBlockRelayPeer() {
 	totalOutbound := pm.outbound + pm.blockRelayOnly
 	if totalOutbound <= 2 {
 		pm.mu.RUnlock()
-		return
+		return false
 	}
 
 	// Find a block-relay-only peer to disconnect
@@ -1760,7 +1769,7 @@ func (pm *PeerManager) maybeRotateBlockRelayPeer() {
 	pm.mu.RUnlock()
 
 	if len(candidates) == 0 {
-		return
+		return false
 	}
 
 	// Pick oldest block-relay-only connection to disconnect
@@ -1772,7 +1781,8 @@ func (pm *PeerManager) maybeRotateBlockRelayPeer() {
 	}
 
 	log.Printf("rotating block-relay-only peer %s", oldest.peer.Address())
-	oldest.peer.Disconnect()
+	oldest.peer.DisconnectFor("block-relay rotation")
+	return false
 }
 
 // resolveDNSSeeds queries DNS seeds and adds addresses to the address book.
@@ -2036,6 +2046,9 @@ func (pm *PeerManager) connectOutbound(ka *KnownAddress, connType ConnType, rele
 	// Start the peer (this does the handshake)
 	err = peer.Start()
 	if err != nil {
+		if connType != ConnFeeler {
+			logOutboundDisconnect(peer, connType, peerInfo.connectedAt, "handshake")
+		}
 		pm.removePeer(peer)
 		if connType != ConnFeeler {
 			pm.addrBook.MarkFailed(addr)
@@ -2170,12 +2183,33 @@ func (pm *PeerManager) waitForPeerDisconnect(peer *Peer) {
 	// Wait until the peer's quit channel is closed
 	<-peer.quit
 
+	pm.mu.RLock()
+	info, ok := pm.peers[peer.Address()]
+	pm.mu.RUnlock()
+	if ok && info.peer == peer && (info.connType == ConnFullRelay || info.connType == ConnBlockRelayOnly) {
+		logOutboundDisconnect(peer, info.connType, info.connectedAt, "connected")
+	}
+
 	pm.removePeer(peer)
 
 	// Notify listener
 	if pm.config.OnPeerDisconnected != nil {
 		pm.config.OnPeerDisconnected(peer)
 	}
+}
+
+// logOutboundDisconnect writes one info line per lost automatic outbound
+// connection: who closed it (by=remote: the peer hung up; by=local: we
+// dropped it) and why, so the remote-hangup share of slot churn can be
+// counted from the log. stage is "handshake" when the connection never
+// completed the version handshake.
+func logOutboundDisconnect(peer *Peer, connType ConnType, connectedAt time.Time, stage string) {
+	by, reason := peer.DisconnectReason()
+	if by == "" {
+		by, reason = "unknown", "no reason recorded"
+	}
+	log.Printf("outbound disconnect peer=%s type=%s stage=%s by=%s after=%s reason=%q",
+		peer.Address(), connType, stage, by, time.Since(connectedAt).Round(time.Second), reason)
 }
 
 // EvictionCandidate holds eviction scoring data for an inbound peer.

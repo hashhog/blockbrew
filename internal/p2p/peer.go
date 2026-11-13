@@ -5,19 +5,31 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand"
 	"net"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
+// DefaultConnectTimeout is how long an outbound TCP dial may take before it is
+// given up: Core's DEFAULT_CONNECT_TIMEOUT (netbase.h, 5000 ms, -timeout).
+// Each dial holds a reserved outbound slot until it fails, so a 30 s timeout
+// kept a lost full-relay slot open for minutes when the first picks were
+// unreachable.
+const DefaultConnectTimeout = 5 * time.Second
+
+// ConnectTimeout is the dial timeout in use; -timeout sets it at startup.
+var ConnectTimeout = DefaultConnectTimeout
+
 // Connection timeouts.
 const (
-	ConnectTimeout   = 30 * time.Second
 	HandshakeTimeout = 60 * time.Second
 	IdleTimeout      = 5 * time.Minute
 	PingInterval     = 2 * time.Minute
@@ -187,6 +199,9 @@ type Peer struct {
 	sendQueue         chan Message   // Outbound message queue
 	quit              chan struct{}  // Signal to stop goroutines
 	quitOnce          sync.Once      // Ensure quit is closed only once
+	discMu            sync.Mutex     // guards discBy / discReason
+	discBy            string         // "remote" or "local": who closed the connection
+	discReason        string         // why; the first recorded reason wins
 	wg                sync.WaitGroup // Wait for goroutines to finish
 	ownedMu           sync.Mutex     // guards owned
 	owned             map[uint64]int // goroutine ids of this peer's own handlers
@@ -548,6 +563,7 @@ func (p *Peer) Start() error {
 	// For outbound connections, we initiate the handshake
 	if !p.inbound {
 		if err := p.sendVersionMessage(); err != nil {
+			p.noteIOError("send version", err)
 			p.Disconnect()
 			return fmt.Errorf("send version: %w", err)
 		}
@@ -559,7 +575,7 @@ func (p *Peer) Start() error {
 		// Handshake completed successfully
 		return nil
 	case <-time.After(HandshakeTimeout):
-		p.Disconnect()
+		p.DisconnectFor(fmt.Sprintf("handshake not done after %s", HandshakeTimeout))
 		return ErrHandshakeFailed
 	case <-p.quit:
 		return ErrPeerDisconnected
@@ -730,6 +746,7 @@ func (p *Peer) readHandler() {
 			}
 			// Fatal errors (IO errors, bad magic, bad checksum) kill the connection
 			log.Printf("peer %s: read error: %v", p.addr, err)
+			p.noteIOError("read", err)
 			return
 		}
 
@@ -769,6 +786,7 @@ func (p *Peer) writeHandler() {
 
 			err := p.transport.WriteMessage(msg)
 			if err != nil {
+				p.noteIOError("write "+msg.Command(), err)
 				return
 			}
 
@@ -1029,6 +1047,7 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 	if msg.ProtocolVersion < MinPeerProtoVersion {
 		p.mu.Unlock()
 		log.Printf("peer %s using obsolete version %d, disconnecting", p.addr, msg.ProtocolVersion)
+		p.noteDisconnect("local", fmt.Sprintf("obsolete version %d", msg.ProtocolVersion))
 		p.signalDisconnect()
 		return
 	}
@@ -1036,6 +1055,7 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 	// Check for self-connection
 	if msg.Nonce == p.localNonce {
 		p.mu.Unlock()
+		p.noteDisconnect("local", "connected to self")
 		p.signalDisconnect()
 		return
 	}
@@ -1412,6 +1432,17 @@ const disconnectJoinTimeout = 5 * time.Second
 // The wait is bounded so that a caller which gets this wrong degrades into a
 // 5-second stall and a loud log line instead of a permanent, silent wedge.
 func (p *Peer) Disconnect() {
+	p.noteLocalCaller()
+	p.disconnectAndJoin()
+}
+
+// DisconnectFor is Disconnect with the reason recorded for the disconnect log.
+func (p *Peer) DisconnectFor(reason string) {
+	p.noteDisconnect("local", reason)
+	p.disconnectAndJoin()
+}
+
+func (p *Peer) disconnectAndJoin() {
 	p.signalDisconnect()
 
 	// A message handler runs on readHandler, which is in p.wg. Waiting here
@@ -1448,7 +1479,65 @@ func (p *Peer) Disconnect() {
 // ever needs — it has no reason to wait for its own unwinding, and waiting is
 // exactly what deadlocks it.
 func (p *Peer) DisconnectAsync() {
+	p.noteLocalCaller()
 	p.signalDisconnect()
+}
+
+// noteDisconnect records who closed the connection and why. Only the first
+// call counts: later ones are the fallout of the first (our own Close makes
+// the read loop fail with "use of closed network connection").
+func (p *Peer) noteDisconnect(by, reason string) {
+	p.discMu.Lock()
+	defer p.discMu.Unlock()
+	if p.discBy == "" {
+		p.discBy, p.discReason = by, reason
+	}
+}
+
+// noteLocalCaller records a local disconnect that gave no reason, naming the
+// function that asked for it (the caller of Disconnect / DisconnectAsync).
+func (p *Peer) noteLocalCaller() {
+	reason := "disconnect requested"
+	// Skip runtime.Callers, noteLocalCaller and Disconnect/DisconnectAsync.
+	// CallersFrames (unlike FuncForPC) resolves inlined frames correctly.
+	pcs := make([]uintptr, 1)
+	if runtime.Callers(3, pcs) == 1 {
+		frame, _ := runtime.CallersFrames(pcs).Next()
+		if name := frame.Function; name != "" {
+			if i := strings.LastIndex(name, "/"); i >= 0 {
+				name = name[i+1:]
+			}
+			reason = "disconnect requested by " + name
+		}
+	}
+	p.noteDisconnect("local", reason)
+}
+
+// noteIOError records a socket error. A clean or reset close from the far end
+// is the remote hanging up; anything else (timeouts, framing errors) is our
+// decision to drop the connection.
+func (p *Peer) noteIOError(op string, err error) {
+	switch {
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
+		errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE),
+		errors.Is(err, io.ErrClosedPipe):
+		p.noteDisconnect("remote", op+": "+err.Error())
+	default:
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			p.noteDisconnect("local", op+" timeout: "+err.Error())
+			return
+		}
+		p.noteDisconnect("local", op+" error: "+err.Error())
+	}
+}
+
+// DisconnectReason reports who closed the connection ("remote" or "local")
+// and why. Both are empty while the peer is connected.
+func (p *Peer) DisconnectReason() (by, reason string) {
+	p.discMu.Lock()
+	defer p.discMu.Unlock()
+	return p.discBy, p.discReason
 }
 
 // enterPeerGoroutine records that the current goroutine is one of this
