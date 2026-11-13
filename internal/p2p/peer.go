@@ -1517,7 +1517,11 @@ func (p *Peer) noteLocalCaller() {
 // is the remote hanging up; anything else (timeouts, framing errors) is our
 // decision to drop the connection.
 func (p *Peer) noteIOError(op string, err error) {
+	var de *DeserializeError
 	switch {
+	case errors.As(err, &de):
+		// Checked first: a truncated payload unwraps to io.EOF too.
+		p.noteDisconnect("local", op+": malformed "+de.Command+": "+de.Err.Error())
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF),
 		errors.Is(err, syscall.ECONNRESET), errors.Is(err, syscall.EPIPE):
 		p.noteDisconnect("remote", op+": "+err.Error())

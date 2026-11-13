@@ -2,6 +2,7 @@ package p2p
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/hashhog/blockbrew/internal/crypto"
 )
 
 // Tests for how fast a lost full-relay outbound slot is refilled, and for the
@@ -288,5 +291,33 @@ func TestPeerDisconnectReasonNamesCaller(t *testing.T) {
 	by, reason := dr.DisconnectReason()
 	if by != "local" || !strings.Contains(reason, "TestPeerDisconnectReasonNamesCaller") {
 		t.Fatalf("DisconnectReason() = %q, %q; want local and the calling function", by, reason)
+	}
+}
+
+// rawV1Frame builds a v1 message frame with a correct checksum.
+func rawV1Frame(magic uint32, cmd string, payload []byte) []byte {
+	var hdr [24]byte
+	binary.LittleEndian.PutUint32(hdr[0:4], magic)
+	copy(hdr[4:16], cmd)
+	binary.LittleEndian.PutUint32(hdr[16:20], uint32(len(payload)))
+	sum := crypto.DoubleSHA256(payload)
+	copy(hdr[20:24], sum[:4])
+	return append(hdr[:], payload...)
+}
+
+// A peer that sends a checksum-valid but truncated headers message is dropped
+// by us for a malformed message. Its parser runs out of payload with io.EOF,
+// which must not be counted as the remote hanging up.
+func TestOutboundDisconnectTruncatedMessageIsLocal(t *testing.T) {
+	r := fullRig(t)
+	buf := captureLog(t)
+	p := r.peersOfType(ConnFullRelay)[0]
+	srv := r.serverSide(t, p)
+	// headers: count 1, then no header bytes.
+	frame := rawV1Frame(MainnetMagic, "headers", []byte{0x01})
+	go func() { _, _ = srv.Write(frame) }()
+	line := waitLogLine(t, buf, "outbound disconnect", p.Address())
+	if !strings.Contains(line, "by=local") || !strings.Contains(line, "malformed headers") {
+		t.Fatalf("disconnect line %q: want by=local and reason malformed headers", line)
 	}
 }

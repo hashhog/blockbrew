@@ -490,7 +490,7 @@ func (t *V2Transport) ReadMessage() (Message, error) {
 
 		// Deserialize payload
 		if err := msg.Deserialize(bytes.NewReader(payload)); err != nil {
-			return nil, fmt.Errorf("deserialize %s: %w", command, err)
+			return nil, &DeserializeError{Command: command, Err: err}
 		}
 
 		return msg, nil
