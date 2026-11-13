@@ -630,7 +630,7 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.RPCPassword, "rpcpassword", "", "RPC password")
 	flag.IntVar(&cfg.MaxOutbound, "maxoutbound", 8, "Maximum outbound connections")
 	flag.IntVar(&cfg.MaxInbound, "maxinbound", 117, "Maximum inbound connections")
-	flag.IntVar(&cfg.TimeoutMs, "timeout", int(p2p.DefaultConnectTimeout/time.Millisecond), "Specify socket connection timeout in milliseconds. If an initial attempt to connect is unsuccessful after this amount of time, drop it (minimum: 1). Mirrors Bitcoin Core's `-timeout` (DEFAULT_CONNECT_TIMEOUT 5000).")
+	flag.IntVar(&cfg.TimeoutMs, "timeout", int(p2p.DefaultConnectTimeout/time.Millisecond), "Specify socket connection timeout in milliseconds. If an initial attempt to connect is unsuccessful after this amount of time, drop it (minimum: 1). Mirrors Bitcoin Core -timeout (DEFAULT_CONNECT_TIMEOUT 5000).")
 	flag.BoolVar(&cfg.NoListen, "nolisten", false, "Disable inbound P2P connections")
 	flag.StringVar(&cfg.MinerAddress, "mineraddress", "", "Address for mining rewards")
 	flag.StringVar(&cfg.WalletFile, "wallet", "wallet.dat", "Wallet file name")
