@@ -42,7 +42,27 @@ const (
 	// attempt to deserialize (slightly above MAX_BLOCK_SERIALIZED_SIZE to
 	// allow for witness discount, matching Bitcoin Core's 4MB limit).
 	MaxBlockSerializedSize = 4_000_000
+
+	// preallocMaxItems bounds the initial capacity of every slice the
+	// decoder sizes from a peer-declared count (inputs, outputs, witness
+	// items, block transactions). Beyond it the slice grows by append as
+	// elements are actually read, so a short message declaring a huge count
+	// can no longer make us allocate for elements it never sends: a ~70-byte
+	// tx declaring MaxWitnessItems witness items used to allocate ~92 MiB of
+	// slice headers before hitting EOF. Core does the same with
+	// MAX_VECTOR_ALLOCATE batches (serialize.h:674-675). The count limits
+	// above are unchanged.
+	preallocMaxItems = 1024
 )
+
+// preallocCap returns the initial capacity for a slice of count elements
+// read from an untrusted stream.
+func preallocCap(count uint64) int {
+	if count > preallocMaxItems {
+		return preallocMaxItems
+	}
+	return int(count)
+}
 
 // Serializable is the interface for types that can be serialized to and from
 // the Bitcoin wire format.
@@ -351,12 +371,13 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 	if inputCount > MaxTxInputs {
 		return fmt.Errorf("transaction input count %d exceeds maximum %d", inputCount, MaxTxInputs)
 	}
-	tx.TxIn = make([]*TxIn, inputCount)
-	for i := range tx.TxIn {
-		tx.TxIn[i] = &TxIn{}
-		if err := tx.TxIn[i].Deserialize(r); err != nil {
+	tx.TxIn = make([]*TxIn, 0, preallocCap(inputCount))
+	for i := uint64(0); i < inputCount; i++ {
+		in := &TxIn{}
+		if err := in.Deserialize(r); err != nil {
 			return err
 		}
+		tx.TxIn = append(tx.TxIn, in)
 	}
 
 	// Read outputs
@@ -367,12 +388,13 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 	if outputCount > MaxTxOutputs {
 		return fmt.Errorf("transaction output count %d exceeds maximum %d", outputCount, MaxTxOutputs)
 	}
-	tx.TxOut = make([]*TxOut, outputCount)
-	for i := range tx.TxOut {
-		tx.TxOut[i] = &TxOut{}
-		if err := tx.TxOut[i].Deserialize(r); err != nil {
+	tx.TxOut = make([]*TxOut, 0, preallocCap(outputCount))
+	for i := uint64(0); i < outputCount; i++ {
+		out := &TxOut{}
+		if err := out.Deserialize(r); err != nil {
 			return err
 		}
+		tx.TxOut = append(tx.TxOut, out)
 	}
 
 	// Read witness data if present
@@ -385,16 +407,17 @@ func (tx *MsgTx) Deserialize(r io.Reader) error {
 			if witnessCount > MaxWitnessItems {
 				return fmt.Errorf("witness item count %d exceeds maximum %d", witnessCount, MaxWitnessItems)
 			}
-			in.Witness = make([][]byte, witnessCount)
-			for j := range in.Witness {
+			in.Witness = make([][]byte, 0, preallocCap(witnessCount))
+			for j := uint64(0); j < witnessCount; j++ {
 				// Witness items have no per-item consensus size limit beyond the
 				// block weight limit (4M WU). Taproot scripts, inscriptions, and
 				// other witness data can be very large. Use MaxCompactSize (32 MB)
 				// as a safe upper bound to avoid rejecting valid blocks.
-				in.Witness[j], err = ReadVarBytes(r, MaxCompactSize)
+				item, err := ReadVarBytes(r, MaxCompactSize)
 				if err != nil {
 					return err
 				}
+				in.Witness = append(in.Witness, item)
 			}
 		}
 		// Bitcoin Core primitives/transaction.h:228-231: it is illegal to encode
@@ -430,12 +453,13 @@ func (tx *MsgTx) DeserializeNoWitness(r io.Reader) error {
 	if inputCount > MaxTxInputs {
 		return fmt.Errorf("transaction input count %d exceeds maximum %d", inputCount, MaxTxInputs)
 	}
-	tx.TxIn = make([]*TxIn, inputCount)
-	for i := range tx.TxIn {
-		tx.TxIn[i] = &TxIn{}
-		if err := tx.TxIn[i].Deserialize(r); err != nil {
+	tx.TxIn = make([]*TxIn, 0, preallocCap(inputCount))
+	for i := uint64(0); i < inputCount; i++ {
+		in := &TxIn{}
+		if err := in.Deserialize(r); err != nil {
 			return err
 		}
+		tx.TxIn = append(tx.TxIn, in)
 	}
 
 	outputCount, err := ReadCompactSize(r)
@@ -445,12 +469,13 @@ func (tx *MsgTx) DeserializeNoWitness(r io.Reader) error {
 	if outputCount > MaxTxOutputs {
 		return fmt.Errorf("transaction output count %d exceeds maximum %d", outputCount, MaxTxOutputs)
 	}
-	tx.TxOut = make([]*TxOut, outputCount)
-	for i := range tx.TxOut {
-		tx.TxOut[i] = &TxOut{}
-		if err := tx.TxOut[i].Deserialize(r); err != nil {
+	tx.TxOut = make([]*TxOut, 0, preallocCap(outputCount))
+	for i := uint64(0); i < outputCount; i++ {
+		out := &TxOut{}
+		if err := out.Deserialize(r); err != nil {
 			return err
 		}
+		tx.TxOut = append(tx.TxOut, out)
 	}
 
 	tx.LockTime, err = ReadUint32LE(r)
@@ -593,12 +618,13 @@ func (b *MsgBlock) Deserialize(r io.Reader) error {
 	if txCount > MaxBlockTransactions {
 		return fmt.Errorf("block transaction count %d exceeds maximum %d", txCount, MaxBlockTransactions)
 	}
-	b.Transactions = make([]*MsgTx, txCount)
-	for i := range b.Transactions {
-		b.Transactions[i] = &MsgTx{}
-		if err := b.Transactions[i].Deserialize(r); err != nil {
+	b.Transactions = make([]*MsgTx, 0, preallocCap(txCount))
+	for i := uint64(0); i < txCount; i++ {
+		tx := &MsgTx{}
+		if err := tx.Deserialize(r); err != nil {
 			return err
 		}
+		b.Transactions = append(b.Transactions, tx)
 	}
 	return nil
 }
