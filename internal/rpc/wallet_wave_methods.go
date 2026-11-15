@@ -188,9 +188,9 @@ func (s *Server) handleListLockUnspent(walletName string) (interface{}, *RPCErro
 
 // GetBalancesMine is the "mine" sub-object in getbalances.
 type GetBalancesMine struct {
-	Trusted          float64 `json:"trusted"`
-	UntrustedPending float64 `json:"untrusted_pending"`
-	Immature         float64 `json:"immature"`
+	Trusted          btcAmount `json:"trusted"`
+	UntrustedPending btcAmount `json:"untrusted_pending"`
+	Immature         btcAmount `json:"immature"`
 }
 
 // LastProcessedBlock matches Core's RESULT_LAST_PROCESSED_BLOCK shape.
@@ -221,9 +221,9 @@ func (s *Server) handleGetBalances(walletName string) (interface{}, *RPCError) {
 	bal := w.GetBalances(tipHeight)
 	return &GetBalancesResult{
 		Mine: GetBalancesMine{
-			Trusted:          float64(bal.Trusted) / satoshiPerBitcoin,
-			UntrustedPending: float64(bal.UntrustedPending) / satoshiPerBitcoin,
-			Immature:         float64(bal.Immature) / satoshiPerBitcoin,
+			Trusted:          btcAmount(bal.Trusted),
+			UntrustedPending: btcAmount(bal.UntrustedPending),
+			Immature:         btcAmount(bal.Immature),
 		},
 		LastProcessedBlock: LastProcessedBlock{
 			Hash:   tipHash.String(),

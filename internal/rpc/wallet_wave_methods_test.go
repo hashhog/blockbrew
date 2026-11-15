@@ -248,14 +248,14 @@ func TestRPCGetBalances(t *testing.T) {
 	if err := json.Unmarshal(asJSON, &got); err != nil {
 		t.Fatalf("decode getbalances: %v (raw=%s)", err, asJSON)
 	}
-	if got.Mine.Trusted != 1.0 {
-		t.Errorf("Trusted: want 1.0 BTC, got %v", got.Mine.Trusted)
+	if got.Mine.Trusted != btcAmount(100_000_000) {
+		t.Errorf("Trusted: want 1.0 BTC (100000000 sat), got %d sat", got.Mine.Trusted)
 	}
-	if got.Mine.UntrustedPending != 0.5 {
-		t.Errorf("UntrustedPending: want 0.5 BTC, got %v", got.Mine.UntrustedPending)
+	if got.Mine.UntrustedPending != btcAmount(50_000_000) {
+		t.Errorf("UntrustedPending: want 0.5 BTC (50000000 sat), got %d sat", got.Mine.UntrustedPending)
 	}
-	if got.Mine.Immature != 6.25 {
-		t.Errorf("Immature: want 6.25 BTC, got %v", got.Mine.Immature)
+	if got.Mine.Immature != btcAmount(625_000_000) {
+		t.Errorf("Immature: want 6.25 BTC (625000000 sat), got %d sat", got.Mine.Immature)
 	}
 	// lastprocessedblock must be present even with no chainMgr (zero hash, 0).
 	if got.LastProcessedBlock.Height != 0 {

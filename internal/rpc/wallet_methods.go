@@ -34,7 +34,7 @@ func (s *Server) handleGetBalance() (interface{}, *RPCError) {
 	}
 
 	confirmed, _ := s.wallet.GetBalance()
-	return float64(confirmed) / satoshiPerBitcoin, nil
+	return btcAmount(confirmed), nil
 }
 
 func (s *Server) handleListUnspent() (interface{}, *RPCError) {
@@ -63,7 +63,7 @@ func (s *Server) handleListUnspent() (interface{}, *RPCError) {
 			Vout:          u.OutPoint.Index,
 			Address:       u.Address,
 			Label:         s.wallet.GetLabel(u.Address),
-			Amount:        float64(u.Amount) / satoshiPerBitcoin,
+			Amount:        btcAmount(u.Amount),
 			Confirmations: confs,
 			Spendable:     spendable,
 			Solvable:      true,
@@ -350,8 +350,8 @@ func (s *Server) handleListTransactions(params json.RawMessage) (interface{}, *R
 		result = append(result, ListTransactionsResult{
 			Address:       tx.Address,
 			Category:      category,
-			Amount:        float64(tx.Amount) / satoshiPerBitcoin,
-			Fee:           float64(tx.Fee) / satoshiPerBitcoin,
+			Amount:        btcAmount(tx.Amount),
+			Fee:           btcAmount(tx.Fee),
 			Confirmations: confs,
 			TxID:          tx.TxHash.String(),
 			Time:          tx.Timestamp,

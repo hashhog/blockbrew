@@ -454,18 +454,18 @@ type WalletInfo struct {
 
 // ListUnspentResult represents an unspent output for listunspent.
 type ListUnspentResult struct {
-	TxID          string   `json:"txid"`
-	Vout          uint32   `json:"vout"`
-	Address       string   `json:"address"`
-	Label         string   `json:"label"`
-	ScriptPubKey  string   `json:"scriptPubKey"`
-	Amount        float64  `json:"amount"`
-	Confirmations int32    `json:"confirmations"`
-	Spendable     bool     `json:"spendable"`
-	Solvable      bool     `json:"solvable"`
-	Desc          string   `json:"desc,omitempty"`
-	ParentDescs   []string `json:"parent_descs"`
-	Safe          bool     `json:"safe"`
+	TxID          string    `json:"txid"`
+	Vout          uint32    `json:"vout"`
+	Address       string    `json:"address"`
+	Label         string    `json:"label"`
+	ScriptPubKey  string    `json:"scriptPubKey"`
+	Amount        btcAmount `json:"amount"`
+	Confirmations int32     `json:"confirmations"`
+	Spendable     bool      `json:"spendable"`
+	Solvable      bool      `json:"solvable"`
+	Desc          string    `json:"desc,omitempty"`
+	ParentDescs   []string  `json:"parent_descs"`
+	Safe          bool      `json:"safe"`
 }
 
 // ListTransactionsResult represents a wallet transaction for listtransactions.
@@ -474,15 +474,15 @@ type ListUnspentResult struct {
 // category and positive for receive/generate/immature; "fee" is NEGATIVE and
 // present only on "send"; "generated"=true marks a coinbase credit.
 type ListTransactionsResult struct {
-	Address  string  `json:"address"`
-	Category string  `json:"category"` // send / receive / generate / immature
-	Amount   float64 `json:"amount"`
+	Address  string    `json:"address"`
+	Category string    `json:"category"` // send / receive / generate / immature
+	Amount   btcAmount `json:"amount"`
 	// Vout is the index of the output (send/receive) this entry refers to,
 	// matching Core's per-COutputEntry "vout".
 	Vout uint32 `json:"vout"`
 	// Fee is negative and only present on "send" entries (omitempty drops it
 	// for receive/coinbase), matching Core's `ValueFromAmount(-nFee)`.
-	Fee float64 `json:"fee,omitempty"`
+	Fee btcAmount `json:"fee,omitempty"`
 	// Generated is true only for coinbase credits (Core only emits the key
 	// when the tx is coinbase, so it is omitted otherwise).
 	Generated     bool   `json:"generated,omitempty"`
@@ -510,8 +510,8 @@ type ListTransactionsResult struct {
 // on the wallet (nNet - nFee): negative for a spend, positive for a receive.
 // "fee" is present (negative) only for transactions the wallet sent.
 type GetTransactionResult struct {
-	Amount        float64                `json:"amount"`
-	Fee           float64                `json:"fee,omitempty"`
+	Amount        btcAmount              `json:"amount"`
+	Fee           btcAmount              `json:"fee,omitempty"`
 	Confirmations int32                  `json:"confirmations"`
 	Generated     bool                   `json:"generated,omitempty"`
 	BlockHash     string                 `json:"blockhash,omitempty"`
@@ -527,11 +527,11 @@ type GetTransactionResult struct {
 // GetTransactionDetail is one entry of gettransaction.details[], mirroring the
 // per-COutputEntry objects Core renders via ListTransactions(fLong=false).
 type GetTransactionDetail struct {
-	Address  string  `json:"address"`
-	Category string  `json:"category"` // send / receive / generate / immature
-	Amount   float64 `json:"amount"`   // negative for "send"
-	Vout     uint32  `json:"vout"`
-	Fee      float64 `json:"fee,omitempty"` // negative, send only
+	Address  string    `json:"address"`
+	Category string    `json:"category"` // send / receive / generate / immature
+	Amount   btcAmount `json:"amount"`   // negative for "send"
+	Vout     uint32    `json:"vout"`
+	Fee      btcAmount `json:"fee,omitempty"` // negative, send only
 }
 
 // TxOutResult represents the result of gettxout.
