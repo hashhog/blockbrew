@@ -423,7 +423,7 @@ func (s *Server) handleGetBalanceWithWallet(walletName string) (interface{}, *RP
 		_, tipHeight = s.chainMgr.BestBlock()
 	}
 	spendable, _ := w.GetSpendableBalance(tipHeight)
-	return float64(spendable) / satoshiPerBitcoin, nil
+	return btcAmount(spendable), nil
 }
 
 func (s *Server) handleListUnspentWithWallet(params json.RawMessage, walletName string) (interface{}, *RPCError) {
@@ -560,7 +560,7 @@ func (s *Server) handleListUnspentWithWallet(params json.RawMessage, walletName 
 			Address:       u.Address,
 			Label:         w.GetLabel(u.Address),
 			ScriptPubKey:  hex.EncodeToString(spk),
-			Amount:        float64(u.Amount) / satoshiPerBitcoin,
+			Amount:        btcAmount(u.Amount),
 			Confirmations: confs,
 			Spendable:     true, // Core coins.cpp: "(DEPRECATED) Always true"
 			Solvable:      det.Solvable,
@@ -855,11 +855,11 @@ func (s *Server) walletTxToListEntries(tx *wallet.WalletTx, tipHeight int32) []L
 		switch d.Category {
 		case "send":
 			entry.Category = "send"
-			entry.Amount = -float64(d.Amount) / satoshiPerBitcoin // negative
-			entry.Fee = -float64(tx.Fee) / satoshiPerBitcoin      // negative
+			entry.Amount = -btcAmount(d.Amount) // negative
+			entry.Fee = -btcAmount(tx.Fee)       // negative
 		default: // receive / generate / immature
 			entry.Category = coinbaseCategory(d, confs)
-			entry.Amount = float64(d.Amount) / satoshiPerBitcoin // positive
+			entry.Amount = btcAmount(d.Amount) // positive
 			if d.IsCoinbase {
 				entry.Generated = true
 			}
@@ -934,7 +934,7 @@ func (s *Server) handleGetTransactionWithWallet(params json.RawMessage, walletNa
 	// For a receive tx.Fee == 0 so amount == net (positive credit).
 	netSats := tx.Net + tx.Fee
 	res := &GetTransactionResult{
-		Amount:        float64(netSats) / satoshiPerBitcoin,
+		Amount:        btcAmount(netSats),
 		Confirmations: confs,
 		TxID:          tx.TxHash.String(),
 		Time:          tx.Timestamp,
@@ -943,7 +943,7 @@ func (s *Server) handleGetTransactionWithWallet(params json.RawMessage, walletNa
 		Hex:           tx.RawHex,
 	}
 	if tx.IsFromMe {
-		res.Fee = -float64(tx.Fee) / satoshiPerBitcoin // negative, Core convention
+		res.Fee = -btcAmount(tx.Fee) // negative, Core convention
 	}
 	if tx.IsCoinbase {
 		res.Generated = true
