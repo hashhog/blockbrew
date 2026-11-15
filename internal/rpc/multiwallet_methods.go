@@ -1132,7 +1132,13 @@ func (s *Server) buildAddressInfo(w *wallet.Wallet, addr string) (*AddressInfoRe
 		HDKeyPath:    det.HDKeyPath,
 		Labels:       []string{},
 	}
-	if det.Label != "" {
+	// Core (wallet/rpc/addresses.cpp getaddressinfo) lists the label of the
+	// address-book entry, FindAddressBookEntry(dest) with allow_change=false.
+	// getnewaddress always writes an entry (SetAddressBook with label "",
+	// purpose receive), so a handed-out receive address reports [""]; change
+	// and foreign addresses have no entry and report []. blockbrew keeps no
+	// entry for the empty label, so the HD receive path stands in for it.
+	if det.Label != "" || (det.IsMine && det.HDKeyPath != "" && !det.IsChange) {
 		result.Labels = []string{det.Label}
 	}
 	// For single-address (non-ranged) imported descriptors the address's own
