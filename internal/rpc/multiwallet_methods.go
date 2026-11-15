@@ -599,7 +599,9 @@ func (s *Server) handleSendToAddressWithWallet(params json.RawMessage, walletNam
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
 	}
 	if _, err := address.DecodeAddress(addr, w.Network()); err != nil {
-		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid Bitcoin address"}
+		// Core: sendtoaddress -> ParseOutputs (rpc/rawtransaction_util.cpp)
+		// names the rejected string in the message.
+		return nil, &RPCError{Code: RPCErrInvalidAddressOrKey, Message: "Invalid Bitcoin address: " + addr}
 	}
 
 	amountSat, rpcAmtErr := amountFromValue(args[1])
