@@ -59,9 +59,14 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 			opts.Blank = val
 		}
 	}
+	// Core warns about an empty passphrase only when one was supplied:
+	// wallet.cpp createwallet checks `!request.params[3].isNull()` before
+	// `passphrase.empty()`. An absent or null passphrase gets no warning.
+	passphraseGiven := false
 	if len(args) >= 4 {
 		if val, ok := args[3].(string); ok {
 			opts.Passphrase = val
+			passphraseGiven = true
 		}
 	}
 	if len(args) >= 5 {
@@ -120,7 +125,7 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 	}
 
 	var warnings []string
-	if opts.Passphrase == "" {
+	if passphraseGiven && opts.Passphrase == "" {
 		warnings = append(warnings, "Empty string given as passphrase, wallet will not be encrypted.")
 	}
 
