@@ -730,6 +730,32 @@ type SyncManager struct {
 	ttfbSamples   []ttfbSample
 	ttfbRetracted int
 	lastTtfbDist  time.Time
+
+	// blockAnnouncer is the first peer that sent us each newly-added header
+	// in an announcement-sized headers message (≤ MaxBlocksPerPeer). The
+	// body is requested from it first, as Core's HeadersDirectFetchBlocks
+	// sends the getdata to the peer that delivered the headers. Bounded
+	// by maxBlockAnnouncers; entries are dropped when the body arrives.
+	// Guarded by sm.mu.
+	blockAnnouncer map[wire.Hash256]*Peer
+}
+
+// maxBlockAnnouncers bounds blockAnnouncer. At tip one block arrives every
+// ~10 minutes; the map is cleared wholesale if bodies never arrive.
+const maxBlockAnnouncers = 256
+
+// noteBlockAnnouncerLocked records peer as the announcer of hash unless
+// another peer announced it first. Caller holds sm.mu.
+func (sm *SyncManager) noteBlockAnnouncerLocked(hash wire.Hash256, peer *Peer) {
+	if peer == nil {
+		return
+	}
+	if sm.blockAnnouncer == nil || len(sm.blockAnnouncer) >= maxBlockAnnouncers {
+		sm.blockAnnouncer = make(map[wire.Hash256]*Peer)
+	}
+	if _, ok := sm.blockAnnouncer[hash]; !ok {
+		sm.blockAnnouncer[hash] = peer
+	}
 }
 
 // MempoolTxSource is the minimal mempool interface the sync manager needs to
@@ -1670,6 +1696,13 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 
 		headersAdded++
 		peer.UpdateSyncedHeaders(node.Height)
+		// Announcement-sized batch (BIP130 tip announcement or a short
+		// catch-up): remember who sent it so the body is asked of them
+		// first. Full 2000-header IBD batches are not direct-fetch
+		// candidates in Core either (MAX_BLOCKS_IN_TRANSIT_PER_PEER).
+		if len(headers) <= MaxBlocksPerPeer {
+			sm.noteBlockAnnouncerLocked(node.Hash, peer)
+		}
 
 		// Buffer the header for the batched DB write below.
 		if sm.chainDB != nil {
@@ -3443,21 +3476,17 @@ func (sm *SyncManager) requestBlocks() {
 		if req.Peer != nil && req.RetryCount >= MaxRetriesBeforeRotate {
 			lastFailedAddr = req.Peer.Address()
 		}
-
-		// Try all peers starting from the round-robin index
-		for i := 0; i < len(peers); i++ {
-			idx := (peerIdx + i) % len(peers)
-			peer := peers[idx]
-			if !peer.IsConnected() || peer.ShouldBan() {
-				continue
+		eligible := func(peer *Peer) bool {
+			if peer == nil || !peer.IsConnected() || peer.ShouldBan() || !peer.CanServeWitnesses() {
+				return false
 			}
 			addr := peer.Address()
 			if peerInflight[addr] >= MaxBlocksPerPeer {
-				continue
+				return false
 			}
 			// Skip the peer that just timed out on this block
 			if lastFailedAddr != "" && addr == lastFailedAddr {
-				continue
+				return false
 			}
 			// Skip any peer that has already told us (via notfound) it
 			// doesn't have this block — otherwise we round-robin back to
@@ -3465,12 +3494,53 @@ func (sm *SyncManager) requestBlocks() {
 			// produce millions of log lines for the same misses.
 			if req.FailedPeers != nil {
 				if _, failed := req.FailedPeers[addr]; failed {
+					return false
+				}
+			}
+			return true
+		}
+
+		// 1. The peer that sent us this header (Core HeadersDirectFetchBlocks
+		//    asks pfrom). A peer that has not announced the block may not
+		//    have it, and Core's ProcessGetBlockData ignores a getdata for an
+		//    unknown hash without a notfound — so it looks mute while it keeps
+		//    relaying tx (live 975896 on 2026-11-15: two such picks, ~57s).
+		//    Like Core's CanDirectFetch, only once our tip is recent: during
+		//    IBD body download headersSynced is already true, and preferring
+		//    announcers would send every head-of-line body to the few peers
+		//    that have announced anything (the header sync peer).
+		atTip := sm.headersSynced && !sm.ibdActive.Load()
+		if a := sm.blockAnnouncer[req.Hash]; atTip && eligible(a) {
+			selectedPeer = a
+		}
+		// 2. At tip, any other peer whose announced headers cover this height
+		//    (Core FindNextBlocksToDownload only considers peers whose
+		//    pindexBestKnownBlock includes the block). Not during IBD (see
+		//    atTip). SyncedHeaders is a height, not a hash, so a peer on a
+		//    competing branch at the same height also qualifies; if it lacks
+		//    the block, the 16s mute rotation moves on as before.
+		if selectedPeer == nil && atTip {
+			for i := 0; i < len(peers); i++ {
+				idx := (peerIdx + i) % len(peers)
+				peer := peers[idx]
+				if peer.SyncedHeaders() < req.Height || !eligible(peer) {
 					continue
 				}
+				selectedPeer = peer
+				peerIdx = (idx + 1) % len(peers)
+				break
+			}
+		}
+		// 3. Round-robin over every connected peer (none announced it, or
+		//    every announcer is busy / already failed this block).
+		for i := 0; selectedPeer == nil && i < len(peers); i++ {
+			idx := (peerIdx + i) % len(peers)
+			peer := peers[idx]
+			if !eligible(peer) {
+				continue
 			}
 			selectedPeer = peer
 			peerIdx = (idx + 1) % len(peers)
-			break
 		}
 		// If no alternative found, fall back to any available peer
 		// (including FailedPeers — liveness > avoidance when all else fails).
@@ -3815,6 +3885,7 @@ func (sm *SyncManager) HandleBlock(peer *Peer, msg *MsgBlock) {
 	}
 
 	sm.mu.Lock()
+	delete(sm.blockAnnouncer, hash) // body is here; no further direct fetch
 	nh := sm.nextHeight
 	req, ok := sm.inflight[hash]
 	if !ok {
