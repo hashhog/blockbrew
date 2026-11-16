@@ -220,3 +220,48 @@ func TestUnrelatedInvTxBeforeBlockIsNotAFailedFetch(t *testing.T) {
 		t.Fatalf("stall timeout=%s, want %s (inv/tx must not double it)", st, BaseStallTimeout)
 	}
 }
+
+// TestIBDBodiesStillSpreadAcrossPeers: during IBD header catch-up only the
+// sync peer has announced anything, so the synced-height preference must
+// not apply there — otherwise every head-of-line body would queue on that
+// one peer. The lowest heights still go to distinct peers, as before.
+func TestIBDBodiesStillSpreadAcrossPeers(t *testing.T) {
+	params := consensus.RegtestParams()
+	pm := &PeerManager{}
+	syncPeer := createMockPeer("sync.example:8333", 100)
+	syncPeer.UpdateSyncedHeaders(100)
+	pm.InsertConnectedPeer(syncPeer)
+	for i := 0; i < 3; i++ {
+		pm.InsertConnectedPeer(createMockPeer(fmt.Sprintf("ibd%d.example:8333", i), 100))
+	}
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:    params,
+		HeaderIndex:    consensus.NewHeaderIndex(params),
+		PeerManager:    pm,
+		DownloadWindow: 32,
+	})
+	sm.mu.Lock()
+	sm.headersSynced = false
+	sm.syncPeer = syncPeer
+	for h := int32(1); h <= 32; h++ {
+		var hash wire.Hash256
+		hash[0], hash[1] = byte(h), 0xbb
+		sm.blockQueue = append(sm.blockQueue, &blockRequest{Hash: hash, Height: h, State: BlockDownloadPending})
+	}
+	sm.mu.Unlock()
+
+	sm.requestBlocks()
+
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	seen := map[*Peer]bool{}
+	for _, req := range sm.blockQueue[:4] {
+		if req.State != BlockDownloadInFlight || req.Peer == nil {
+			t.Fatalf("height %d not requested (state=%d)", req.Height, req.State)
+		}
+		seen[req.Peer] = true
+	}
+	if len(seen) != 4 {
+		t.Fatalf("lowest 4 IBD heights went to %d distinct peers, want 4 (round-robin, not funnelled to the sync peer)", len(seen))
+	}
+}
