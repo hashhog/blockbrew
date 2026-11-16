@@ -1244,6 +1244,7 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		// had no maturity check. Core reject token:
 		// bad-txns-premature-spend-of-coinbase.
 		immatureCoinbase := false
+		var immatureDepth int32
 		if nextHeight, _, ok := s.mempool.TipContextForAccept(); ok {
 			for _, txIn := range tx.TxIn {
 				utxo := prevoutView.GetUTXO(txIn.PreviousOutPoint)
@@ -1252,6 +1253,7 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 				}
 				if nextHeight-utxo.Height < consensus.CoinbaseMaturity {
 					immatureCoinbase = true
+					immatureDepth = nextHeight - utxo.Height
 					break
 				}
 			}
@@ -1259,6 +1261,9 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if immatureCoinbase {
 			result.Allowed = false
 			result.RejectReason = "bad-txns-premature-spend-of-coinbase"
+			// Core rpc/mempool.cpp: reject-details = state.ToString(), the
+			// reason plus CheckTxInputs' "tried to spend coinbase at depth %d".
+			result.RejectDetails = fmt.Sprintf("bad-txns-premature-spend-of-coinbase, tried to spend coinbase at depth %d", immatureDepth)
 			results = append(results, result)
 			continue
 		}

@@ -1280,8 +1280,14 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 					spendHeight := mp.config.ChainState.TipHeight() + 1
 					depth := spendHeight - utxo.Height
 					if depth < consensus.CoinbaseMaturity {
-						return fmt.Errorf("%w: age %d < %d required",
-							ErrImmatureCoinbaseSpend, depth, consensus.CoinbaseMaturity)
+						// Core Consensus::CheckTxInputs (consensus/tx_verify.cpp):
+						// TX_PREMATURE_SPEND "bad-txns-premature-spend-of-coinbase",
+						// "tried to spend coinbase at depth %d".
+						return &RBFRejectError{
+							Reason: "bad-txns-premature-spend-of-coinbase",
+							Detail: fmt.Sprintf("tried to spend coinbase at depth %d", depth),
+							Err:    ErrImmatureCoinbaseSpend,
+						}
 					}
 				}
 			}
@@ -3520,10 +3526,11 @@ func (mp *Mempool) checkRBFLocked(newTx *wire.MsgTx, conflicting map[wire.Hash25
 	return nil
 }
 
-// RBFRejectError is a replacement refusal in Core's TxValidationState shape:
-// Reason is the reject reason ("insufficient fee", "too many potential
-// replacements", "replacement-failed") and Detail the debug message. Err is
-// the ErrRBF* sentinel, so errors.Is keeps matching it.
+// RBFRejectError is a refusal in Core's TxValidationState shape: Reason is
+// the reject reason ("insufficient fee", "too many potential replacements",
+// "replacement-failed", and also "bad-txns-premature-spend-of-coinbase" for an
+// immature coinbase spend) and Detail the debug message. Err is the sentinel
+// (ErrRBF*, ErrImmatureCoinbaseSpend), so errors.Is keeps matching it.
 type RBFRejectError struct {
 	Reason string
 	Detail string
