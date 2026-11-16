@@ -1089,8 +1089,9 @@ func (s *Server) handleSendRawTransaction(params json.RawMessage) (interface{}, 
 	// Add to mempool via AcceptToMemoryPool (canonical Bitcoin Core entry
 	// point). An RPC tx with missing inputs is refused, never orphaned.
 	if err := s.mempool.AcceptToMemoryPoolNoOrphan(tx); err != nil {
-		// A refused replacement is Core's MEMPOOL_REJECTED:
-		// RPC_TRANSACTION_REJECTED (-26) with state.ToString().
+		// A refused replacement or a premature coinbase spend is Core's
+		// MEMPOOL_REJECTED: RPC_TRANSACTION_REJECTED (-26) with
+		// state.ToString().
 		var rej *mempool.RBFRejectError
 		if errors.As(err, &rej) {
 			return nil, &RPCError{Code: RPCErrVerifyRejected, Message: rej.Error()}
