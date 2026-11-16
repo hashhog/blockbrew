@@ -3504,16 +3504,22 @@ func (sm *SyncManager) requestBlocks() {
 		//    asks pfrom). A peer that has not announced the block may not
 		//    have it, and Core's ProcessGetBlockData ignores a getdata for an
 		//    unknown hash without a notfound — so it looks mute while it keeps
-		//    relaying tx (live 975896 on 2026-11-15: two such picks, ~60s).
-		if a := sm.blockAnnouncer[req.Hash]; eligible(a) {
+		//    relaying tx (live 975896 on 2026-11-15: two such picks, ~57s).
+		//    Like Core's CanDirectFetch, only once our tip is recent: during
+		//    IBD body download headersSynced is already true, and preferring
+		//    announcers would send every head-of-line body to the few peers
+		//    that have announced anything (the header sync peer).
+		atTip := sm.headersSynced && !sm.ibdActive.Load()
+		if a := sm.blockAnnouncer[req.Hash]; atTip && eligible(a) {
 			selectedPeer = a
 		}
 		// 2. At tip, any other peer whose announced headers cover this height
 		//    (Core FindNextBlocksToDownload only considers peers whose
-		//    pindexBestKnownBlock includes the block). Not during IBD header
-		//    catch-up: there only the sync peer has announced anything, and
-		//    sending every head-of-line body to it would serialise IBD.
-		if selectedPeer == nil && sm.headersSynced {
+		//    pindexBestKnownBlock includes the block). Not during IBD (see
+		//    atTip). SyncedHeaders is a height, not a hash, so a peer on a
+		//    competing branch at the same height also qualifies; if it lacks
+		//    the block, the 16s mute rotation moves on as before.
+		if selectedPeer == nil && atTip {
 			for i := 0; i < len(peers); i++ {
 				idx := (peerIdx + i) % len(peers)
 				peer := peers[idx]

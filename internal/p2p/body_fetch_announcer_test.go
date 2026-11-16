@@ -9,15 +9,13 @@ import (
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
-// Live 2026-11-15 04:14Z (mainnet 975896): the header arrived at 04:14:49,
-// but blockbrew sent the getdata to 72.83.184.215, which had not announced
-// the block. That peer kept relaying tx (six v2 "first-byte ... retracted —
-// not a block body" lines) and never sent the body: Core's
-// ProcessGetBlockData returns silently for a hash it does not know
-// (net_processing.cpp, `if (!pindex) return;`). After the 16s mute timeout
-// the round-robin picked [2001:bc8:30c8::], another non-announcer, with the
-// same result; only the third pick (178.51.105.208) delivered, ~60s after
-// the header. Core asks the peer that sent the header
+// Live 2026-11-15 04:14:49Z (mainnet 975896): blockbrew sent the getdata
+// to a peer that had not announced the block. That peer kept relaying tx
+// (eight v2 "first-byte ... retracted — not a block body" lines) and never
+// sent the body: Core's ProcessGetBlockData returns silently for a hash it
+// does not know (net_processing.cpp, `if (!pindex) return;`). After the
+// 16s mute timeout the round-robin picked another non-announcer, with the
+// same result; only the third pick delivered, ~57s after the header. Core asks the peer that sent the header
 // (HeadersDirectFetchBlocks) and only peers whose best-known block covers
 // the request (FindNextBlocksToDownload / pindexBestKnownBlock).
 
@@ -49,6 +47,7 @@ func announcerFixture(t *testing.T, silent int) (*SyncManager, *Peer, []*Peer, *
 	sm.mu.Lock()
 	sm.headersSynced = true // at tip: announcements from any peer
 	sm.mu.Unlock()
+	sm.ibdActive.Store(false) // tip is recent (Core CanDirectFetch)
 
 	hdr := createTestBlockHeader(genesis.Hash, genesis.Header.Timestamp+600, 0)
 	sm.HandleHeaders(announcer, &MsgHeaders{Headers: []wire.BlockHeader{hdr}})
@@ -221,10 +220,13 @@ func TestUnrelatedInvTxBeforeBlockIsNotAFailedFetch(t *testing.T) {
 	}
 }
 
-// TestIBDBodiesStillSpreadAcrossPeers: during IBD header catch-up only the
-// sync peer has announced anything, so the synced-height preference must
-// not apply there — otherwise every head-of-line body would queue on that
-// one peer. The lowest heights still go to distinct peers, as before.
+// TestIBDBodiesStillSpreadAcrossPeers: during IBD body download header
+// sync is already complete (headersSynced=true) but the tip is old
+// (ibdActive). Only the header sync peer, and peers that announced the
+// header tip, have SyncedHeaders set, so the announcer/synced-height
+// preference must not apply there — otherwise every head-of-line body
+// would queue on those few peers. The lowest heights still go to distinct
+// peers via the round-robin, as before.
 func TestIBDBodiesStillSpreadAcrossPeers(t *testing.T) {
 	params := consensus.RegtestParams()
 	pm := &PeerManager{}
@@ -240,9 +242,11 @@ func TestIBDBodiesStillSpreadAcrossPeers(t *testing.T) {
 		PeerManager:    pm,
 		DownloadWindow: 32,
 	})
+	if !sm.IsIBDActive() {
+		t.Fatal("fixture: a new SyncManager must start in IBD")
+	}
 	sm.mu.Lock()
-	sm.headersSynced = false
-	sm.syncPeer = syncPeer
+	sm.headersSynced = true // header sync done; bodies still downloading
 	for h := int32(1); h <= 32; h++ {
 		var hash wire.Hash256
 		hash[0], hash[1] = byte(h), 0xbb
