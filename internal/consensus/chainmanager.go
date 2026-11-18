@@ -68,6 +68,14 @@ type ChainManager struct {
 	tipNode     *BlockNode
 	tipHeight   int32
 
+	// appliedBoundUnproven is set at boot when the datadir already holds a
+	// persisted chain but no coins marker and no flush-window floor (a
+	// datadir written before the marker existed). The view's in-memory
+	// applied tip then comes only from THIS session's connects, while disk
+	// may reflect more, so it is not a bound AdoptAppliedBlock may turn into a
+	// verdict. See adoptionBoundLocked.
+	appliedBoundUnproven bool
+
 	// Lock-free tip cache for RPC reads (updated atomically after tip changes).
 	// This avoids RLock contention with ConnectBlock's write lock during IBD.
 	// cachedTipNode holds the full BlockNode so RPCs like getblockchaininfo,
@@ -912,9 +920,11 @@ var ErrNoAdoptionEvidence = errors.New("no adoption evidence: none of the block'
 // block (Core: bad-txns-inputs-missingorspent), never marker lag.
 var ErrAdoptAboveAppliedTip = errors.New("adopt refused: block is above the UTXO view's applied tip, so it cannot already be applied")
 
-// ErrAdoptNoAppliedBound: AdoptAppliedBlock found neither an applied-through
-// marker nor a floor on the UTXO view, so it cannot bound what the persisted
-// set reflects. Fail closed: no adoption, and no verdict either.
+// ErrAdoptNoAppliedBound: AdoptAppliedBlock found no DURABLE bound on what the
+// persisted set reflects — neither an applied-through marker nor a floor on
+// the UTXO view, or (on a datadir written before the coins marker existed) an
+// applied tip built only from this session's connects. Fail closed: no
+// adoption, and no verdict either.
 var ErrAdoptNoAppliedBound = errors.New("adopt refused: the UTXO view records no applied tip or floor")
 
 // ErrAdoptNotCovered: the block is at or below the applied-through height but
@@ -946,7 +956,13 @@ func (cm *ChainManager) adoptionBoundLocked(node *BlockNode, hash wire.Hash256) 
 	if floorSet && node.Height <= floor {
 		return nil
 	}
-	if !appliedSet && !floorSet {
+	// "Above the bound" is a verdict only when the bound is durable: seeded
+	// from the on-disk marker, held as a floor, or built by connects from a
+	// datadir that had no persisted chain. On a marker-less datadir with a
+	// persisted chain the in-memory applied tip only says what THIS session
+	// connected — a block the prior session applied can sit above it — so
+	// refuse without a verdict instead of blacklisting a valid block.
+	if (!appliedSet && !floorSet) || (cm.appliedBoundUnproven && !floorSet) {
 		return ErrAdoptNoAppliedBound
 	}
 	return ErrAdoptAboveAppliedTip
@@ -1122,6 +1138,14 @@ func (cm *ChainManager) seedAppliedTipFromMarker() {
 	// It never publishes a best block below the window. Neither may we.
 	floor, ok := cm.durableCoinsFloor()
 	if !ok {
+		// No marker and no flush window. On a fresh datadir that is exact —
+		// disk holds nothing beyond what this session will connect. On a
+		// datadir that already has a persisted chain it means the set was
+		// written before the marker existed and may lead the tip by any
+		// amount: nothing here bounds it.
+		if cs, err := cm.chainDB.GetChainState(); err == nil && cs != nil && cs.BestHeight > 0 {
+			cm.appliedBoundUnproven = true
+		}
 		return
 	}
 	cm.raiseAppliedFloor(floor)

@@ -145,3 +145,89 @@ func TestAdoptAppliedBlock_RefusesOffMarkerAncestry(t *testing.T) {
 		t.Fatalf("tip moved on a refused adoption: %d", cm.TipNode().Height)
 	}
 }
+
+// TestAdoptAppliedBlock_MarkerlessDatadirIsNoVerdict: a datadir written before
+// the coins marker existed has a persisted chain but no marker and no floor.
+// After a restart the view's applied tip is set only by this session's
+// connects (here a coinbase-only block, which can never hit a missing input),
+// while disk may already reflect the NEXT block from the prior session. That
+// in-memory tip is not a durable bound: AdoptAppliedBlock must refuse without
+// the above-applied-tip verdict, so the P2P loop never blacklists (and bans
+// the peer for) a block that is valid and merely already applied.
+func TestAdoptAppliedBlock_MarkerlessDatadirIsNoVerdict(t *testing.T) {
+	params := RegtestParams()
+	idx := NewHeaderIndex(params)
+	chainDB := storage.NewChainDB(storage.NewMemDB())
+	cm1 := NewChainManager(ChainManagerConfig{
+		Params: params, HeaderIndex: idx, ChainDB: chainDB, UTXOSet: NewUTXOSet(chainDB),
+	})
+	block1 := createTestBlock(t, params, idx.Genesis(), nil)
+	if _, err := idx.AddHeader(block1.Header, true); err != nil {
+		t.Fatalf("AddHeader block1: %v", err)
+	}
+	if err := cm1.ConnectBlock(block1); err != nil {
+		t.Fatalf("ConnectBlock block1: %v", err)
+	}
+	// Model the pre-marker datadir: persisted chain, no coins marker.
+	hash1, height1 := cm1.BestBlock()
+	if err := chainDB.SetChainState(&storage.ChainState{BestHash: hash1, BestHeight: height1}); err != nil {
+		t.Fatalf("SetChainState: %v", err)
+	}
+	b := chainDB.NewBatch()
+	b.Delete(storage.CoinsTipKey)
+	if err := b.Write(); err != nil {
+		t.Fatalf("drop marker: %v", err)
+	}
+	if cs, err := chainDB.GetChainState(); err != nil || cs.BestHeight != 1 {
+		t.Fatalf("precondition: persisted chain state = %+v, %v; want height 1", cs, err)
+	}
+
+	// Restart on the same database.
+	utxo2 := NewUTXOSet(chainDB)
+	cm2 := NewChainManager(ChainManagerConfig{
+		Params: params, HeaderIndex: idx, ChainDB: chainDB, UTXOSet: utxo2,
+	})
+	cm2.SetIBD(false)
+	if cm2.TipNode().Height != 1 {
+		t.Fatalf("precondition: restart tip = %d, want 1", cm2.TipNode().Height)
+	}
+	node1 := idx.GetNode(block1.Header.BlockHash())
+	block2 := createTestBlock(t, params, node1, nil)
+	if _, err := idx.AddHeader(block2.Header, true); err != nil {
+		t.Fatalf("AddHeader block2: %v", err)
+	}
+	if err := cm2.ConnectBlock(block2); err != nil {
+		t.Fatalf("ConnectBlock block2: %v", err)
+	}
+	if _, h, ok := utxo2.AppliedTip(); !ok || h != 2 {
+		t.Fatalf("precondition: in-memory applied tip = (%d,%v), want 2", h, ok)
+	}
+
+	// Block 3 was applied by the PRIOR session: its coinbase is on disk.
+	node2 := idx.GetNode(block2.Header.BlockHash())
+	block3 := createTestBlock(t, params, node2, nil)
+	if _, err := idx.AddHeader(block3.Header, true); err != nil {
+		t.Fatalf("AddHeader block3: %v", err)
+	}
+	cb3 := block3.Transactions[0]
+	pb := chainDB.NewBatch()
+	pb.Put(storage.MakeUTXOKey(wire.OutPoint{Hash: cb3.TxHash(), Index: 0}),
+		SerializeUTXOEntry(&UTXOEntry{
+			Amount: cb3.TxOut[0].Value, PkScript: cb3.TxOut[0].PkScript,
+			Height: 3, IsCoinbase: true,
+		}))
+	if err := pb.Write(); err != nil {
+		t.Fatalf("plant: %v", err)
+	}
+
+	err := cm2.AdoptAppliedBlock(block3)
+	if err == nil || !strings.Contains(err.Error(), "no applied tip or floor") {
+		t.Fatalf("AdoptAppliedBlock = %v, want the no-durable-bound refusal (no verdict)", err)
+	}
+	if strings.Contains(err.Error(), "above the UTXO view's applied tip") {
+		t.Fatal("a block a marker-less prior session may have applied got the above-applied-tip VERDICT")
+	}
+	if cm2.TipNode().Height != 2 {
+		t.Fatalf("tip moved on a refused adoption: %d", cm2.TipNode().Height)
+	}
+}
