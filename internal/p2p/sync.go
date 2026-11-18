@@ -4974,6 +4974,23 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 						sm.mu.Unlock()
 						nextHeight++
 						continue
+					} else if errors.Is(adoptErr, consensus.ErrAdoptAboveAppliedTip) {
+						// The block is above everything the UTXO view says it
+						// may already reflect, so it cannot have been applied in
+						// a prior session: its input really is missing or spent
+						// on this chain. That is Core's
+						// bad-txns-inputs-missingorspent verdict
+						// (consensus/tx_verify.cpp CheckTxInputs; ConnectBlock
+						// marks the block invalid), not local damage. Mark it,
+						// punish the deliverer, continue on the valid chain —
+						// a block re-including an already-confirmed transaction
+						// used to be "adopted" here on output evidence alone.
+						sm.handleConsensusInvalid(bwr, &consensus.BlockInvalidError{
+							Hash: bwr.req.Hash,
+							Err:  connectErr,
+						})
+						nextHeight = sm.purgeInvalidAndReplan(pending)
+						continue
 					} else if !errors.Is(adoptErr, consensus.ErrNoAdoptionEvidence) {
 						log.Printf("sync: marker-lag adoption failed at height %d: %v (falling through to halt)",
 							nextHeight, adoptErr)

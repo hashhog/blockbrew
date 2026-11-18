@@ -102,6 +102,13 @@ func TestAdoptRollsForwardPartiallyAppliedBlock(t *testing.T) {
 		t.Fatalf("precondition: the un-applied spend's coin should still be durable")
 	}
 
+	// A partial commit is what an INTERRUPTED flush leaves behind, and that
+	// flush is recorded on disk (storage.CoinsFlushKey, Core's DB_HEAD_BLOCKS);
+	// the boot turns it into a floor naming the highest height the persisted
+	// set may reflect (seedAppliedTipFromMarker). AdoptAppliedBlock only treats
+	// a block at or below that bound as a marker-lag candidate, so model it.
+	utxoSet.RaiseAppliedFloor(node1.Height + 1)
+
 	// ---- Adopt --------------------------------------------------------------
 	if err := cm.AdoptAppliedBlock(block2); err != nil {
 		t.Fatalf("AdoptAppliedBlock: %v", err)
@@ -144,7 +151,9 @@ func TestAdoptRefusesWithoutDurableEvidence(t *testing.T) {
 		t.Fatalf("AddHeader: %v", err)
 	}
 
-	// Never applied, nothing durable.
+	// The view's bound covers block 1 (so the evidence probe is reached), but
+	// it was never applied: nothing durable.
+	utxoSet.RaiseAppliedFloor(genesis.Height + 1)
 	if err := cm.AdoptAppliedBlock(block1); err != ErrNoAdoptionEvidence {
 		t.Fatalf("AdoptAppliedBlock = %v, want ErrNoAdoptionEvidence", err)
 	}
@@ -194,6 +203,8 @@ func TestAdoptIgnoresCacheOnlyResidue(t *testing.T) {
 		t.Fatalf("precondition: entry must NOT be durable")
 	}
 
+	// The view's bound covers block 1, so the evidence probe is what decides.
+	utxoSet.RaiseAppliedFloor(genesis.Height + 1)
 	if err := cm.AdoptAppliedBlock(block1); err != ErrNoAdoptionEvidence {
 		t.Fatalf("AdoptAppliedBlock = %v, want ErrNoAdoptionEvidence "+
 			"(cache residue is not evidence)", err)
