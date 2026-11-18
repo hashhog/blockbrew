@@ -68,6 +68,14 @@ type ChainManager struct {
 	tipNode     *BlockNode
 	tipHeight   int32
 
+	// appliedBoundUnproven is set at boot when the datadir already holds a
+	// persisted chain but no coins marker and no flush-window floor (a
+	// datadir written before the marker existed). The view's in-memory
+	// applied tip then comes only from THIS session's connects, while disk
+	// may reflect more, so it is not a bound AdoptAppliedBlock may turn into a
+	// verdict. See adoptionBoundLocked.
+	appliedBoundUnproven bool
+
 	// Lock-free tip cache for RPC reads (updated atomically after tip changes).
 	// This avoids RLock contention with ConnectBlock's write lock during IBD.
 	// cachedTipNode holds the full BlockNode so RPCs like getblockchaininfo,
@@ -731,6 +739,31 @@ func (cm *ChainManager) AdoptAppliedBlock(block *wire.MsgBlock) error {
 			hash.String()[:16], cm.tipNode.Hash.String()[:16])
 	}
 
+	// ── Applied-bound gate: only a block the UTXO view can already reflect. ──
+	//
+	// The output-evidence probe below proves only that SOME transaction with
+	// this txid committed its outputs. It cannot tell this block's commit from
+	// an EARLIER block that confirmed the same transaction: a block that
+	// re-includes an already-confirmed transaction whose outputs are unspent
+	// finds those outputs durable and "proves" itself applied. Where BIP34
+	// short-circuits CheckBIP30 (mainnet, testnet3) nothing else stops it, and
+	// the roll-forward below then applies every spend and output with no
+	// script, amount, coinbase-value or maturity check.
+	//
+	// Core has no such path for a peer-supplied block: CheckTxInputs fails it
+	// with bad-txns-inputs-missingorspent (consensus/tx_verify.cpp) and
+	// ConnectBlock marks it invalid. Its marker-lag repair (ReplayBlocks /
+	// RollforwardBlock, validation.cpp) runs only at startup and only between
+	// the recorded old and new coins heads. Mirror that bound: a block is a
+	// marker-lag candidate only if it sits at or below what the view says it
+	// already reflects — the applied-through marker, or the floor a refused
+	// marker / interrupted flush window left behind. Anything above it is a
+	// fresh connect on a view that does not contain it, so a missing input is
+	// a verdict on the block, not a local gap.
+	if err := cm.adoptionBoundLocked(node, hash); err != nil {
+		return err
+	}
+
 	// Positive already-applied evidence: any of this block's own outputs
 	// present in the UTXO set. Coinbase first (within the 100-block
 	// maturity window it cannot have been spent), then every other output.
@@ -879,6 +912,61 @@ func (cm *ChainManager) AdoptAppliedBlock(block *wire.MsgBlock) error {
 // ErrNoAdoptionEvidence: AdoptAppliedBlock found none of the block's outputs
 // in the UTXO set — cannot prove the block was already applied.
 var ErrNoAdoptionEvidence = errors.New("no adoption evidence: none of the block's outputs are in the UTXO set")
+
+// ErrAdoptAboveAppliedTip: AdoptAppliedBlock was asked to adopt a block ABOVE
+// everything the UTXO view says it may already reflect (its applied-through
+// marker and its floor). Such a block cannot have been applied in a prior
+// session, so a "missing input" on its connect is a consensus verdict on the
+// block (Core: bad-txns-inputs-missingorspent), never marker lag.
+var ErrAdoptAboveAppliedTip = errors.New("adopt refused: block is above the UTXO view's applied tip, so it cannot already be applied")
+
+// ErrAdoptNoAppliedBound: AdoptAppliedBlock found no DURABLE bound on what the
+// persisted set reflects — neither an applied-through marker nor a floor on
+// the UTXO view, or (on a datadir written before the coins marker existed) an
+// applied tip built only from this session's connects. Fail closed: no
+// adoption, and no verdict either.
+var ErrAdoptNoAppliedBound = errors.New("adopt refused: the UTXO view records no applied tip or floor")
+
+// ErrAdoptNotCovered: the block is at or below the applied-through height but
+// is not an ancestor-or-self of the block the marker names, so its effects are
+// not what the view reflects. Fail closed: no adoption, no verdict.
+var ErrAdoptNotCovered = errors.New("adopt refused: block is not an ancestor of the UTXO view's applied tip")
+
+// adoptionBoundLocked decides whether `node` may be treated as a marker-lag
+// candidate by AdoptAppliedBlock. It returns nil only when the block is at or
+// below the UTXO view's applied-through marker (and, when the marker's block is
+// indexed, on its ancestry) or at or below the view's floor. Caller holds cm.mu.
+func (cm *ChainManager) adoptionBoundLocked(node *BlockNode, hash wire.Hash256) error {
+	appliedHash, appliedHeight, appliedSet := cm.viewAppliedTip()
+	floor, floorSet := cm.appliedFloor()
+
+	if appliedSet && node.Height <= appliedHeight {
+		markerNode := cm.headerIndex.GetNode(appliedHash)
+		if markerNode == nil {
+			return nil
+		}
+		if anc := markerNode.GetAncestor(node.Height); anc != nil && anc.Hash == hash {
+			return nil
+		}
+		if floorSet && node.Height <= floor {
+			return nil
+		}
+		return ErrAdoptNotCovered
+	}
+	if floorSet && node.Height <= floor {
+		return nil
+	}
+	// "Above the bound" is a verdict only when the bound is durable: seeded
+	// from the on-disk marker, held as a floor, or built by connects from a
+	// datadir that had no persisted chain. On a marker-less datadir with a
+	// persisted chain the in-memory applied tip only says what THIS session
+	// connected — a block the prior session applied can sit above it — so
+	// refuse without a verdict instead of blacklisting a valid block.
+	if (!appliedSet && !floorSet) || (cm.appliedBoundUnproven && !floorSet) {
+		return ErrAdoptNoAppliedBound
+	}
+	return ErrAdoptAboveAppliedTip
+}
 
 // ErrNoDurableUTXOView: AdoptAppliedBlock was called against a UTXO view with
 // no durable backing store. Marker-lag repair is only meaningful for the real
@@ -1050,6 +1138,14 @@ func (cm *ChainManager) seedAppliedTipFromMarker() {
 	// It never publishes a best block below the window. Neither may we.
 	floor, ok := cm.durableCoinsFloor()
 	if !ok {
+		// No marker and no flush window. On a fresh datadir that is exact —
+		// disk holds nothing beyond what this session will connect. On a
+		// datadir that already has a persisted chain it means the set was
+		// written before the marker existed and may lead the tip by any
+		// amount: nothing here bounds it.
+		if cs, err := cm.chainDB.GetChainState(); err == nil && cs != nil && cs.BestHeight > 0 {
+			cm.appliedBoundUnproven = true
+		}
 		return
 	}
 	cm.raiseAppliedFloor(floor)

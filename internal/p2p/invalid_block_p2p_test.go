@@ -286,11 +286,20 @@ func runAfterScenario(t *testing.T, ibd bool) {
 	}
 }
 
-// TestInvalidBlockP2P_MissingUTXOStillHaltsUnmarked: a block whose input is
-// absent from the local UTXO set is NOT a verdict on the active-tip connect
-// path (blockbrew's documented local-UTXO-damage divergence): no invalid mark,
-// no peer punishment, and the loud halt is kept.
-func TestInvalidBlockP2P_MissingUTXOStillHaltsUnmarked(t *testing.T) {
+// TestInvalidBlockP2P_MissingUTXOAboveAppliedTipIsInvalid: a peer block on the
+// active tip whose input is absent from the UTXO set, ABOVE everything the
+// UTXO view says it already reflects, is Core's bad-txns-inputs-missingorspent
+// verdict (consensus/tx_verify.cpp CheckTxInputs; ConnectBlock marks it
+// invalid): mark it, punish the deliverer, no halt.
+//
+// This test used to assert the opposite — no mark, no punishment, loud
+// [CHAINSTATE-CORRUPTION] halt — as blockbrew's "local UTXO damage"
+// divergence. That divergence is what let a block re-including an
+// already-confirmed transaction be ADOPTED (see adopt_duplicate_txid_test.go),
+// and a block above the view's applied-through marker cannot be explained by
+// marker lag: the coins marker is written in the same batch as the coins it
+// describes. Marker-lag adoption stays available at or below that bound.
+func TestInvalidBlockP2P_MissingUTXOAboveAppliedTipIsInvalid(t *testing.T) {
 	r, a3 := newInvalidBlockRig(t)
 	x := &Peer{addr: "127.0.0.2:40002"}
 	ghost := &wire.OutPoint{Hash: wire.Hash256{0xde, 0xad}, Index: 0}
@@ -303,14 +312,17 @@ func TestInvalidBlockP2P_MissingUTXOStillHaltsUnmarked(t *testing.T) {
 	r.sm.connectPendingBlocks(pending)
 
 	b1n := r.idx.GetNode(b1.Header.BlockHash())
-	if b1n.Status.IsInvalid() {
-		t.Fatal("missing-UTXO failure marked the block invalid — a local-state gap must never blacklist a block")
+	if !b1n.Status.IsInvalid() {
+		t.Fatal("a block spending a missing input above the applied tip was not marked invalid")
 	}
-	if x.ShouldBan() {
-		t.Fatal("peer punished for a missing-UTXO (local-state) failure")
+	if !x.ShouldBan() {
+		t.Fatal("the peer that delivered a block spending a missing input was not punished")
 	}
-	if !r.sm.chainstateCorrupted.Load() {
-		t.Fatal("missing-UTXO failure no longer halts loudly (the deliberate divergence was lost)")
+	if r.sm.chainstateCorrupted.Load() {
+		t.Fatal("a peer's invalid block latched the [CHAINSTATE-CORRUPTION] halt")
+	}
+	if h, _ := r.cm.BestBlock(); h != a3.Hash {
+		t.Fatal("tip moved off A3")
 	}
 }
 
