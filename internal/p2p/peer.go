@@ -43,7 +43,8 @@ const DefaultMaxSendBuffer = 1 * 1000 * 1000
 
 // MaxSendBuffer is the per-peer send budget in bytes. Serving getdata replies
 // pauses while the bytes queued for a peer plus the message being written to
-// it exceed it (Core CNode::fPauseSend, net.cpp). Set once at startup.
+// it exceed it (Core CNode::fPauseSend, net.cpp). There is no -maxsendbuffer
+// flag yet, so it is always Core's default.
 var MaxSendBuffer int64 = DefaultMaxSendBuffer
 
 // BIP133 feefilter constants.
@@ -1706,8 +1707,9 @@ func (p *Peer) tryEnqueue(msg Message, size int64) bool {
 
 // popSendSize returns the size recorded for the message just received from
 // sendQueue. The caller subtracts it from sendBytes once the message is
-// written. Messages put on the channel directly (tests) have no entry and
-// count as 0.
+// written. Every send must go through tryEnqueue: a message put on the
+// channel directly would have no entry and pair later messages with the
+// wrong sizes. Nothing does that today.
 func (p *Peer) popSendSize() int64 {
 	p.sendSizeMu.Lock()
 	defer p.sendSizeMu.Unlock()
