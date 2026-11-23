@@ -22,7 +22,9 @@ const (
 	MaxPkgTxnsCount = MaxGetPkgTxnsCount
 
 	// PackageRelayVersionAncestor is bit 0 of the sendpackages versions
-	// bitfield: "ancestor packages" support (BIP-331 §"sendpackages").
+	// bitfield (BIP-331 §"sendpackages"): getpkgtxns / pkgtxns support,
+	// PKG_RELAY_PKGTXNS in the BIP. Bit 1 is a different version and is
+	// not implemented. The Go name predates this comment.
 	PackageRelayVersionAncestor uint64 = 1 << 0
 )
 
