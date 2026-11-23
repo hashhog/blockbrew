@@ -1006,7 +1006,13 @@ func (mp *Mempool) AddTransaction(tx *wire.MsgTx) error {
 // checks first (sanity, coinbase, IsStandardTx, MIN_STANDARD_TX_NONWITNESS_SIZE,
 // IsFinalTx), then sigops + chain-context (BIP-68 + CheckTxInputs), then
 // expensive script verification last.
-func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) (retErr error) {
+func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) error {
+	return mp.addTransactionOpts(tx, fromPeer, acceptOpts{})
+}
+
+// addTransactionOpts is AddTransactionFrom with an explicit admission
+// variant: the abort gate, then acceptLocked under mu.
+func (mp *Mempool) addTransactionOpts(tx *wire.MsgTx, fromPeer string, opts acceptOpts) (retErr error) {
 	// Gate 6: after AbortNode the mempool admits nothing — the chain view it
 	// validates against may be torn — and any rejection produced while the
 	// latch went up (a coins-DB read error reads as "missing inputs") is
@@ -1022,7 +1028,7 @@ func (mp *Mempool) AddTransactionFrom(tx *wire.MsgTx, fromPeer string) (retErr e
 	}()
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
-	return mp.acceptLocked(tx, fromPeer, acceptOpts{})
+	return mp.acceptLocked(tx, fromPeer, opts)
 }
 
 // acceptOpts selects the admission variant. The zero value is ordinary relay
@@ -1075,6 +1081,14 @@ type acceptOpts struct {
 
 	// out receives the fee and vsize of a transaction that passed.
 	out *acceptOut
+
+	// replaced, when set, receives the txid of every entry this admission
+	// evicts as an RBF replacement (the direct conflicts and their
+	// descendants), in removal order. Per-call state, like Core's
+	// Workspace::m_replaced_transactions: the package paths read it for
+	// replaced-transactions instead of intercepting the shared OnTxEvicted
+	// subscriber, which concurrent callers would race on.
+	replaced *[]wire.Hash256
 }
 
 // acceptOut carries the fee and vsizes computed by acceptLocked. vsize is the
@@ -1565,7 +1579,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	// RemoveStaged is invoked with MemPoolRemovalReason::REPLACED.
 	if len(conflictingTxs) > 0 {
 		for conflictHash := range conflictingTxs {
-			mp.removeWithDescendantsLocked(conflictHash, MempoolRemovalReasonReplaced)
+			mp.removeReplacedLocked(conflictHash, opts.replaced)
 		}
 	}
 
@@ -2344,6 +2358,27 @@ func (mp *Mempool) removeWithDescendantsLocked(txHash wire.Hash256, reason MemPo
 
 	// Remove the transaction itself
 	mp.removeSingleTxLocked(txHash, reason)
+}
+
+// removeReplacedLocked evicts txHash and its descendants with REPLACED, in
+// the same order as removeWithDescendantsLocked, and appends every txid it
+// actually removed to *sink when sink is non-nil. Must be called with mu held.
+func (mp *Mempool) removeReplacedLocked(txHash wire.Hash256, sink *[]wire.Hash256) {
+	visited := make(map[wire.Hash256]bool)
+	descendants := mp.collectDescendantsLocked(txHash, visited)
+	remove := func(h wire.Hash256) {
+		if _, ok := mp.pool[h]; !ok {
+			return
+		}
+		mp.removeSingleTxLocked(h, MempoolRemovalReasonReplaced)
+		if sink != nil {
+			*sink = append(*sink, h)
+		}
+	}
+	for i := len(descendants) - 1; i >= 0; i-- {
+		remove(descendants[i])
+	}
+	remove(txHash)
 }
 
 // removeSingleTxLocked removes a single transaction without touching descendants.
@@ -4145,28 +4180,16 @@ func (mp *Mempool) acceptSingleTxPackage(tx *wire.MsgTx, result *PackageResult) 
 		return result, nil
 	}
 
-	// FIX-73 (W120 BUG-9): capture REPLACED evictions during AddTransaction
-	// so they surface in submitpackage / sendrawtransaction responses as
-	// `replaced-transactions`. Wallet front-ends key off this list to mark
-	// their own pending txs as replaced rather than abandoned.
-	//
-	// We chain the existing OnTxEvicted subscriber (FIX-47 fee-estimator
-	// path) by wrapping it for the duration of this call. The wrapper is
-	// reverted before return so external subscribers continue to receive
-	// callbacks unchanged afterwards.
-	prevCb := mp.OnTxEvicted
-	mp.OnTxEvicted = func(h wire.Hash256, reason MemPoolRemovalReason) {
-		if reason == MempoolRemovalReasonReplaced {
-			result.ReplacedTxs = append(result.ReplacedTxs, h)
-		}
-		if prevCb != nil {
-			prevCb(h, reason)
-		}
-	}
-	defer func() { mp.OnTxEvicted = prevCb }()
-
-	// Try to add the transaction
-	if err := mp.AddTransaction(tx); err != nil {
+	// FIX-73 (W120 BUG-9): REPLACED evictions surface in submitpackage /
+	// sendrawtransaction responses as `replaced-transactions`; wallet
+	// front-ends key off this list to mark their own pending txs as replaced
+	// rather than abandoned. They are collected per call through
+	// acceptOpts.replaced (Core Workspace::m_replaced_transactions). The
+	// shared OnTxEvicted subscriber is left alone: swapping it here without
+	// mu let overlapping calls (two peers' pkgtxns, or a peer and
+	// submitpackage) restore out of order and leave a finished call's
+	// wrapper installed for good.
+	if err := mp.addTransactionOpts(tx, "", acceptOpts{replaced: &result.ReplacedTxs}); err != nil {
 		txResult.Error = err
 		result.PackageError = err
 		result.PackageMsg = PackageMsgTxFailed
@@ -4203,21 +4226,10 @@ func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResul
 	mp.mu.Lock()
 	defer mp.mu.Unlock()
 
-	// FIX-73 (W120 BUG-9): same pattern as acceptSingleTxPackage —
-	// intercept REPLACED evictions so they show up in
-	// result.ReplacedTxs / SubmitPackageResult.ReplacedTransactions.
-	// The wrapper is reverted on return so unrelated callbacks (fee
-	// estimator, future wallet, ZMQ) keep firing afterwards.
-	prevCb := mp.OnTxEvicted
-	mp.OnTxEvicted = func(h wire.Hash256, reason MemPoolRemovalReason) {
-		if reason == MempoolRemovalReasonReplaced {
-			result.ReplacedTxs = append(result.ReplacedTxs, h)
-		}
-		if prevCb != nil {
-			prevCb(h, reason)
-		}
-	}
-	defer func() { mp.OnTxEvicted = prevCb }()
+	// FIX-73 (W120 BUG-9): REPLACED evictions are collected per call into
+	// result.ReplacedTxs (SubmitPackageResult.ReplacedTransactions) through
+	// acceptOpts.replaced and acceptSubpackageLocked, as in
+	// acceptSingleTxPackage; the shared OnTxEvicted subscriber is not touched.
 
 	var deferred []*wire.MsgTx
 	var quitErr error
@@ -4239,7 +4251,7 @@ func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResul
 		}
 
 		var out acceptOut
-		err := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, out: &out})
+		err := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, out: &out, replaced: &result.ReplacedTxs})
 		if err == nil {
 			txResult.setAccepted(out.fee, out.adjVSize, out.fee, out.adjVSize, []wire.Hash256{wtxid})
 			continue
@@ -4267,7 +4279,7 @@ func (mp *Mempool) acceptMultiTxPackage(txns []*wire.MsgTx, result *PackageResul
 		tx := deferred[0]
 		txResult := result.TxResults[tx.WTxHash()]
 		var out acceptOut
-		if aerr := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, out: &out}); aerr != nil {
+		if aerr := mp.acceptLocked(tx, "", acceptOpts{inPackage: true, out: &out, replaced: &result.ReplacedTxs}); aerr != nil {
 			txResult.Error = mp.packageTxErrorLocked(tx, aerr)
 			err = fmt.Errorf("transaction %s failed: %w", tx.TxHash(), aerr)
 		} else {
@@ -4391,7 +4403,7 @@ func (mp *Mempool) acceptSubpackageLocked(sub []*wire.MsgTx, result *PackageResu
 	// that leaves the conflicts gone and the package out.
 	mp.pkgView = nil
 	for conflict := range conflicts {
-		mp.removeWithDescendantsLocked(conflict, MempoolRemovalReasonReplaced)
+		mp.removeReplacedLocked(conflict, &result.ReplacedTxs)
 	}
 	for i, tx := range sub {
 		txid := tx.TxHash()

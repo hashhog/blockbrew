@@ -2565,6 +2565,15 @@ func (sm *SyncManager) HandleNotFound(peer *Peer, msg *MsgNotFound) {
 		if !ok {
 			continue
 		}
+		// Only the peer we asked can cancel the request. Core's NOTFOUND
+		// handler calls RemoveBlockRequest(hash, pfrom.GetId()), which
+		// removes the request only if it was made to the sender. Without
+		// this check any peer could send notfound for blocks in flight to
+		// other peers and cancel them over and over, stalling IBD and tip
+		// sync.
+		if req.Peer != peer {
+			continue
+		}
 
 		// Record peer as unable to serve this block.  Log only on first
 		// notice per (peer, block) pair — repeat notfounds from the same
@@ -2632,21 +2641,28 @@ func buildCmpctBlockReply(block *wire.MsgBlock, depth int32) *MsgCmpctBlock {
 // net_processing.cpp ProcessMessage("getblocktxn"): unknown/unstored block ->
 // ignore; deeper than MAX_BLOCKTXN_DEPTH below the tip -> the full block
 // instead; any index out of range -> misbehaving.
+//
+// The depth check comes before any disk read, and a deeper request is not
+// served here: it is queued as a MSG_WITNESS_BLOCK getdata item (Core pushes
+// it onto Peer::m_getdata_requests), so it is read and sent by the getdata
+// path, which pauses while the peer's send queue is backed up (H2). Reading
+// it here and calling SendMessage directly let a peer that never reads make
+// us read one block per getblocktxn and drop it on the full queue.
 func (sm *SyncManager) HandleGetBlockTxn(p *Peer, msg *MsgGetBlockTxn) {
 	depth, ok := sm.blockDepth(msg.BlockHash)
 	if !ok || sm.chainDB == nil {
 		log.Printf("[compact] getblocktxn from %s for unknown block %s, ignoring", p.Address(), msg.BlockHash)
 		return
 	}
+	if depth > MaxBlocktxnDepth {
+		log.Printf("[compact] getblocktxn from %s for block %s is %d deep (limit %d), queueing full block",
+			p.Address(), msg.BlockHash, depth, MaxBlocktxnDepth)
+		sm.HandleGetData(p, &MsgGetData{InvList: []*InvVect{{Type: InvTypeWitnessBlock, Hash: msg.BlockHash}}})
+		return
+	}
 	block, err := sm.chainDB.GetBlock(msg.BlockHash)
 	if err != nil {
 		log.Printf("[compact] getblocktxn from %s: block %s not available: %v", p.Address(), msg.BlockHash, err)
-		return
-	}
-	if depth > MaxBlocktxnDepth {
-		log.Printf("[compact] getblocktxn from %s for block %s is %d deep (limit %d), sending full block",
-			p.Address(), msg.BlockHash, depth, MaxBlocktxnDepth)
-		p.SendMessage(&MsgBlock{Block: block})
 		return
 	}
 	reply, err := buildBlockTxnReply(block, msg)
@@ -2775,8 +2791,14 @@ func (sm *SyncManager) drainGetData(peer *Peer) {
 
 // getDataSendPaused reports whether the peer's send queue is too full to
 // serve more getdata replies (Core CNode::fPauseSend).
+//
+// Core sets fPauseSend on BYTES: nSendSize above -maxsendbuffer (net.cpp).
+// A message count alone let a peer that stopped reading pin
+// getDataPauseDepth full blocks (25 x up to 4 MB) in our send queue, so the
+// byte budget is checked as well; the count stays so served blocks never
+// fill the slots pings and headers need.
 func (p *Peer) getDataSendPaused() bool {
-	return len(p.sendQueue) >= getDataPauseDepth
+	return len(p.sendQueue) >= getDataPauseDepth || p.sendBytes.Load() > MaxSendBuffer
 }
 
 // popGetData removes and returns the head of the peer's getdata queue when
