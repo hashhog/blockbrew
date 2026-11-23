@@ -15,7 +15,9 @@ package p2p
 // newly accepted tx), against a real mempool.
 
 import (
+	"reflect"
 	"testing"
+	"unsafe"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
@@ -130,6 +132,24 @@ func (h *pkgHarness) request(w []wire.Hash256) bool {
 	return r.RequestPkgTxns(w)
 }
 
+// arm marks wtxids as an outstanding getpkgtxns without going through
+// RequestPkgTxns, which refuses to send on a link failing conditions 1-3.
+// That lets each receive-side condition be the only reason a pkgtxns is
+// dropped. Reflection keeps this file compiling on a tree without the field
+// (arm then reports false).
+func (h *pkgHarness) arm(w []wire.Hash256) bool {
+	f := reflect.ValueOf(h.peer).Elem().FieldByName("pkgTxnsRequested")
+	if !f.IsValid() {
+		return false
+	}
+	set := map[wire.Hash256]struct{}{}
+	for _, x := range w {
+		set[x] = struct{}{}
+	}
+	reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.ValueOf(set))
+	return true
+}
+
 func (h *pkgHarness) push() {
 	h.peer.handleMessage(&MsgPkgTxns{Txs: h.pkg})
 }
@@ -167,12 +187,17 @@ func TestUnsolicitedPkgTxnsIgnored(t *testing.T) {
 	h.assertIgnored(t)
 }
 
-// Each condition on its own is enough to drop the message.
+// Each condition on its own is enough to drop the message. In the first
+// three subtests the request is armed directly, so the condition under test
+// is the only one that fails.
 func TestPkgTxnsGateEachCondition(t *testing.T) {
-	t.Run("flag off, negotiated, unsolicited", func(t *testing.T) {
+	t.Run("flag off, negotiated, request outstanding", func(t *testing.T) {
 		h := newPkgHarness(PeerConfig{}, true)
 		if h.request(h.wtxids()) {
 			t.Error("RequestPkgTxns sent with -packagerelay off")
+		}
+		if !h.arm(h.wtxids()) {
+			t.Fatal("cannot arm an outstanding getpkgtxns")
 		}
 		h.push()
 		h.assertIgnored(t)
@@ -182,6 +207,9 @@ func TestPkgTxnsGateEachCondition(t *testing.T) {
 		if h.request(h.wtxids()) {
 			t.Error("RequestPkgTxns sent to a peer without sendpackages")
 		}
+		if !h.arm(h.wtxids()) {
+			t.Fatal("cannot arm an outstanding getpkgtxns")
+		}
 		h.push()
 		h.assertIgnored(t)
 	})
@@ -190,12 +218,23 @@ func TestPkgTxnsGateEachCondition(t *testing.T) {
 		if h.request(h.wtxids()) {
 			t.Error("RequestPkgTxns sent on a block-relay-only link")
 		}
+		if !h.arm(h.wtxids()) {
+			t.Fatal("cannot arm an outstanding getpkgtxns")
+		}
 		h.push()
 		h.assertIgnored(t)
 	})
 	t.Run("flag on, negotiated, no getpkgtxns outstanding", func(t *testing.T) {
 		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
 		h.push()
+		h.assertIgnored(t)
+	})
+	t.Run("flag on, negotiated, requested, empty reply", func(t *testing.T) {
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
+		if !h.request(h.wtxids()) {
+			t.Fatal("RequestPkgTxns refused on a qualifying link")
+		}
+		h.peer.handleMessage(&MsgPkgTxns{})
 		h.assertIgnored(t)
 	})
 	t.Run("flag on, negotiated, reply carries a tx we did not ask for", func(t *testing.T) {

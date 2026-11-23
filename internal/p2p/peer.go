@@ -1068,6 +1068,8 @@ func (p *Peer) acceptPkgTxns(m *MsgPkgTxns) bool {
 		reason = "block-relay-only peer"
 	case len(p.pkgTxnsRequested) == 0:
 		reason = "no outstanding getpkgtxns"
+	case len(m.Txs) == 0:
+		reason = "empty pkgtxns"
 	}
 	if reason == "" {
 		for _, tx := range m.Txs {
@@ -1087,7 +1089,9 @@ func (p *Peer) acceptPkgTxns(m *MsgPkgTxns) bool {
 
 // RequestPkgTxns sends a BIP-331 getpkgtxns for wtxids and records them as
 // outstanding, so the peer's pkgtxns reply passes acceptPkgTxns. It returns
-// false without sending when the link does not qualify for package relay.
+// false without sending when the link does not qualify for package relay,
+// and false with the request disarmed when the send is dropped. A new
+// request replaces any outstanding one (one getpkgtxns in flight per peer).
 func (p *Peer) RequestPkgTxns(wtxids []wire.Hash256) bool {
 	if len(wtxids) == 0 || len(wtxids) > MaxGetPkgTxnsCount {
 		return false
@@ -1102,7 +1106,12 @@ func (p *Peer) RequestPkgTxns(wtxids []wire.Hash256) bool {
 		p.pkgTxnsRequested[w] = struct{}{}
 	}
 	p.mu.Unlock()
-	p.SendMessage(&MsgGetPkgTxns{WTxIDs: wtxids})
+	if !p.SendMessage(&MsgGetPkgTxns{WTxIDs: wtxids}) {
+		p.mu.Lock()
+		p.pkgTxnsRequested = nil
+		p.mu.Unlock()
+		return false
+	}
 	return true
 }
 
