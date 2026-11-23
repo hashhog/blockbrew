@@ -37,6 +37,15 @@ const (
 	SendQueueSize    = 50
 )
 
+// DefaultMaxSendBuffer is Core's -maxsendbuffer default in bytes
+// (DEFAULT_MAXSENDBUFFER = 1000, times 1000; net.h, init.cpp).
+const DefaultMaxSendBuffer = 1 * 1000 * 1000
+
+// MaxSendBuffer is the per-peer send budget in bytes. Serving getdata replies
+// pauses while the bytes queued for a peer plus the message being written to
+// it exceed it (Core CNode::fPauseSend, net.cpp). Set once at startup.
+var MaxSendBuffer int64 = DefaultMaxSendBuffer
+
 // BIP133 feefilter constants.
 const (
 	// FeeFilterBroadcastInterval is the average interval between feefilter broadcasts.
@@ -197,6 +206,9 @@ type Peer struct {
 	verAckRecvd       bool
 	peerVersion       *MsgVersion    // Received version message
 	sendQueue         chan Message   // Outbound message queue
+	sendSizeMu        sync.Mutex     // serializes enqueues so sendSizes matches sendQueue order
+	sendSizes         []int64        // wire size of each queued message, in sendQueue order
+	sendBytes         atomic.Int64   // bytes queued plus the message being written (Core nSendSize)
 	getDataMu         sync.Mutex     // guards getDataQueue, getDataDraining
 	getDataQueue      []*InvVect     // getdata items not yet served (Core Peer::m_getdata_requests)
 	getDataDraining   bool           // a drain goroutine owns the rest of getDataQueue
@@ -784,11 +796,16 @@ func (p *Peer) writeHandler() {
 	for {
 		select {
 		case msg := <-p.sendQueue:
+			// The message stays counted in sendBytes while it is being
+			// written: a peer that stops reading holds it in flight.
+			size := p.popSendSize()
+
 			// Set write deadline via the transport so v2's wrapping
 			// conn (if any) gets the deadline too.
 			p.transport.SetWriteDeadline(time.Now().Add(30 * time.Second))
 
 			err := p.transport.WriteMessage(msg)
+			p.sendBytes.Add(-size)
 			if err != nil {
 				p.noteIOError("write "+msg.Command(), err)
 				return
@@ -1637,28 +1654,96 @@ func (p *Peer) SendMessage(msg Message) bool {
 		return false
 	default:
 	}
-	select {
-	case p.sendQueue <- msg:
+	if p.tryEnqueue(msg, messageWireSize(msg)) {
 		return true
+	}
+	select {
 	case <-p.quit:
 		return false
 	default:
-		log.Printf("p2p: send queue FULL for %s — dropping %s", p.Address(), msg.Command())
-		return false
 	}
+	log.Printf("p2p: send queue FULL for %s — dropping %s", p.Address(), msg.Command())
+	return false
 }
 
 // SendMessageWait queues a message and waits briefly for it to be sent.
 // Returns error if the queue is full.
 func (p *Peer) SendMessageWait(msg Message) error {
+	size := messageWireSize(msg)
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for {
+		if p.tryEnqueue(msg, size) {
+			return nil
+		}
+		if !time.Now().Before(deadline) {
+			return ErrSendQueueFull
+		}
+		select {
+		case <-p.quit:
+			return ErrPeerDisconnected
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// tryEnqueue puts msg on the send queue without blocking and counts its size
+// in sendBytes (Core CConnman::PushMessage adds to nSendSize). The channel
+// send and the sendSizes append happen under one lock, so sendSizes stays in
+// the channel's order and writeHandler, which takes the same lock after its
+// receive, always finds the size of the message it received.
+func (p *Peer) tryEnqueue(msg Message, size int64) bool {
+	p.sendSizeMu.Lock()
+	defer p.sendSizeMu.Unlock()
 	select {
 	case p.sendQueue <- msg:
-		return nil
-	case <-p.quit:
-		return ErrPeerDisconnected
-	case <-time.After(100 * time.Millisecond):
-		return ErrSendQueueFull
+		p.sendSizes = append(p.sendSizes, size)
+		p.sendBytes.Add(size)
+		return true
+	default:
+		return false
 	}
+}
+
+// popSendSize returns the size recorded for the message just received from
+// sendQueue. The caller subtracts it from sendBytes once the message is
+// written. Messages put on the channel directly (tests) have no entry and
+// count as 0.
+func (p *Peer) popSendSize() int64 {
+	p.sendSizeMu.Lock()
+	defer p.sendSizeMu.Unlock()
+	if len(p.sendSizes) == 0 {
+		return 0
+	}
+	size := p.sendSizes[0]
+	p.sendSizes = p.sendSizes[1:]
+	if len(p.sendSizes) == 0 {
+		p.sendSizes = nil
+	}
+	return size
+}
+
+// SendBufferBytes returns the bytes queued for the peer plus the message
+// being written to it (Core CNode nSendSize).
+func (p *Peer) SendBufferBytes() int64 {
+	return p.sendBytes.Load()
+}
+
+// byteCounter is an io.Writer that only counts.
+type byteCounter int64
+
+func (c *byteCounter) Write(b []byte) (int, error) {
+	*c += byteCounter(len(b))
+	return len(b), nil
+}
+
+// messageWireSize returns the v1 wire size of msg: the 24-byte header plus
+// the serialized payload.
+func messageWireSize(msg Message) int64 {
+	var c byteCounter
+	if err := msg.Serialize(&c); err != nil {
+		return MessageHeaderSize
+	}
+	return MessageHeaderSize + int64(c)
 }
 
 // Address returns the peer's remote address.

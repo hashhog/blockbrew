@@ -2610,8 +2610,14 @@ func (sm *SyncManager) drainGetData(peer *Peer) {
 
 // getDataSendPaused reports whether the peer's send queue is too full to
 // serve more getdata replies (Core CNode::fPauseSend).
+//
+// Core sets fPauseSend on BYTES: nSendSize above -maxsendbuffer (net.cpp).
+// A message count alone let a peer that stopped reading pin
+// getDataPauseDepth full blocks (25 x up to 4 MB) in our send queue, so the
+// byte budget is checked as well; the count stays so served blocks never
+// fill the slots pings and headers need.
 func (p *Peer) getDataSendPaused() bool {
-	return len(p.sendQueue) >= getDataPauseDepth
+	return len(p.sendQueue) >= getDataPauseDepth || p.sendBytes.Load() > MaxSendBuffer
 }
 
 // popGetData removes and returns the head of the peer's getdata queue when
