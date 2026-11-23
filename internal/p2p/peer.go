@@ -231,13 +231,19 @@ type Peer struct {
 	wantsAddrv2          bool // Peer supports BIP155 ADDRv2 messages
 
 	// BIP331 package relay: bitfield received in sendpackages.
-	// 0 means peer did not advertise. Bit 0 = ancestor packages.
+	// 0 means peer did not advertise. Bit 0 (PackageRelayVersionAncestor)
+	// is the one version this node implements: getpkgtxns / pkgtxns.
 	packageVersions uint64
 
-	// BIP331: wtxids we asked this peer for in a getpkgtxns that has not
-	// been answered yet. A pkgtxns is processed only if every tx in it is
-	// one of these (see acceptPkgTxns); the set is cleared by the reply.
-	pkgTxnsRequested map[wire.Hash256]struct{}
+	// BIP331: true once our own sendpackages to this peer was queued.
+	// Package relay is negotiated only if both sides announced it.
+	sentSendPackages bool
+
+	// BIP331: the wtxids of our outstanding getpkgtxns to this peer, in
+	// request order. A pkgtxns is processed only if it carries exactly
+	// these transactions in this order (see acceptPkgTxns); any pkgtxns
+	// disarms the request, because a getpkgtxns gets one reply.
+	pkgTxnsRequested []wire.Hash256
 
 	// BIP152 compact block state
 	compactBlockState *CompactBlockState
@@ -1042,77 +1048,97 @@ func (p *Peer) handleMessage(msg Message) {
 	}
 }
 
-// acceptPkgTxns reports whether a received pkgtxns may be handed to the
-// mempool. BIP-331 lets a node send pkgtxns only in reply to our getpkgtxns,
-// and only on a link where both sides negotiated sendpackages; Core v31 has
-// no pkgtxns at all, and its ProcessMessage drops tx messages from
-// block-relay-only peers (m_tx_relay == nullptr). So we require all of:
+// pkgRelayRefusalLocked returns why this link does not qualify for BIP-331
+// package relay, or "" if it does. Caller holds p.mu. BIP-331 requires:
 //   - package relay enabled locally (-packagerelay; default off);
-//   - the peer announced sendpackages with a version we also announce
-//     (ancestor packages; BIP-331 negotiates the intersection);
-//   - the link relays transactions (not block-relay-only);
-//   - every tx answers a wtxid from our outstanding getpkgtxns to this peer.
+//   - we sent sendpackages (only done when the common version is at least
+//     WTxidRelayVersion, in handleVersion) and the peer announced a version
+//     we also announce (bit 0; BIP-331 negotiates the intersection);
+//   - wtxidrelay from both sides (BIP-339; we send it in the same branch
+//     as sendpackages, so sentSendPackages covers our side);
+//   - the link relays transactions: not block-relay-only on our side, and
+//     fRelay true in the peer's version message (Core's ProcessMessage
+//     also drops tx messages when m_tx_relay == nullptr).
+func (p *Peer) pkgRelayRefusalLocked() string {
+	switch {
+	case !p.config.EnablePackageRelay:
+		return "package relay disabled"
+	case !p.sentSendPackages:
+		return "we did not send sendpackages"
+	case p.packageVersions&PackageRelayVersionAncestor == 0:
+		return "peer did not negotiate sendpackages"
+	case !p.wtxidRelaySupported:
+		return "peer did not send wtxidrelay"
+	case p.config.DisableRelayTx:
+		return "block-relay-only peer"
+	case p.peerVersion == nil || !p.peerVersion.Relay:
+		return "peer set fRelay=false"
+	}
+	return ""
+}
+
+// acceptPkgTxns reports whether a received pkgtxns may be handed to the
+// mempool. BIP-331 lets a node send pkgtxns only in reply to our
+// getpkgtxns, on a link where package relay was negotiated
+// (pkgRelayRefusalLocked), and the reply must carry all the requested
+// transactions in request order. Core v31 has no pkgtxns at all.
 //
-// Anything else is ignored, like Core ignores an unknown message. A
-// matching reply consumes the whole outstanding request: BIP-331 answers a
-// getpkgtxns with one pkgtxns, and wtxids it left out are not re-armed.
+// Any pkgtxns disarms the outstanding request, whether or not it is
+// accepted: BIP-331 answers a getpkgtxns with one pkgtxns (or notfound), so
+// a wrong or partial reply cannot be followed by a second try, and a replay
+// of an accepted reply is ignored.
 func (p *Peer) acceptPkgTxns(m *MsgPkgTxns) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	reason := ""
-	switch {
-	case !p.config.EnablePackageRelay:
-		reason = "package relay disabled"
-	case p.packageVersions&PackageRelayVersionAncestor == 0:
-		reason = "peer did not negotiate sendpackages"
-	case p.config.DisableRelayTx:
-		reason = "block-relay-only peer"
-	case len(p.pkgTxnsRequested) == 0:
-		reason = "no outstanding getpkgtxns"
-	case len(m.Txs) == 0:
-		reason = "empty pkgtxns"
-	}
+	req := p.pkgTxnsRequested
+	p.pkgTxnsRequested = nil
+	reason := p.pkgRelayRefusalLocked()
 	if reason == "" {
-		for _, tx := range m.Txs {
-			if _, ok := p.pkgTxnsRequested[tx.WTxHash()]; !ok {
-				reason = "tx not requested in getpkgtxns"
-				break
+		switch {
+		case len(req) == 0:
+			reason = "no outstanding getpkgtxns"
+		case len(m.Txs) != len(req):
+			reason = "reply does not carry exactly the requested txs"
+		default:
+			for i, tx := range m.Txs {
+				if tx.WTxHash() != req[i] {
+					reason = "reply does not carry exactly the requested txs in order"
+					break
+				}
 			}
 		}
 	}
 	if reason != "" {
-		log.Printf("peer %s: ignoring unsolicited pkgtxns (%d txs): %s", p.addr, len(m.Txs), reason)
+		log.Printf("peer %s: ignoring pkgtxns (%d txs): %s", p.addr, len(m.Txs), reason)
 		return false
 	}
-	p.pkgTxnsRequested = nil
 	return true
 }
 
 // RequestPkgTxns sends a BIP-331 getpkgtxns for wtxids and records them as
 // outstanding, so the peer's pkgtxns reply passes acceptPkgTxns. It returns
-// false without sending when the link does not qualify for package relay,
-// and false with the request disarmed when the send is dropped. A new
-// request replaces any outstanding one (one getpkgtxns in flight per peer).
+// false without sending when the link does not qualify for package relay.
+// The request is armed only after the send was queued, and the check, the
+// send and the arming happen under p.mu, so a pkgtxns read meanwhile (which
+// takes p.mu in acceptPkgTxns) cannot see a request that was never sent.
+// If the send is dropped, nothing changes: an earlier outstanding request,
+// whose getpkgtxns did go out, stays armed. A sent request replaces any
+// outstanding one (one getpkgtxns in flight per peer).
 func (p *Peer) RequestPkgTxns(wtxids []wire.Hash256) bool {
 	if len(wtxids) == 0 || len(wtxids) > MaxGetPkgTxnsCount {
 		return false
 	}
 	p.mu.Lock()
-	if !p.config.EnablePackageRelay || p.packageVersions&PackageRelayVersionAncestor == 0 || p.config.DisableRelayTx {
-		p.mu.Unlock()
+	defer p.mu.Unlock()
+	if p.pkgRelayRefusalLocked() != "" {
 		return false
 	}
-	p.pkgTxnsRequested = make(map[wire.Hash256]struct{}, len(wtxids))
-	for _, w := range wtxids {
-		p.pkgTxnsRequested[w] = struct{}{}
-	}
-	p.mu.Unlock()
-	if !p.SendMessage(&MsgGetPkgTxns{WTxIDs: wtxids}) {
-		p.mu.Lock()
-		p.pkgTxnsRequested = nil
-		p.mu.Unlock()
+	req := append([]wire.Hash256(nil), wtxids...)
+	// SendMessage never blocks and does not take p.mu.
+	if !p.SendMessage(&MsgGetPkgTxns{WTxIDs: req}) {
 		return false
 	}
+	p.pkgTxnsRequested = req
 	return true
 }
 
@@ -1174,14 +1200,18 @@ func (p *Peer) handleVersion(msg *MsgVersion) {
 		p.SendMessage(&MsgWTxidRelay{})
 		// BIP155: Signal ADDRv2 support
 		p.SendMessage(&MsgSendAddrv2{})
-		// BIP-331: advertise ancestor-package support so peers may push
-		// "pkgtxns" / request "getpkgtxns" against us. Bit 0 = ancestor.
+		// BIP-331: advertise package relay (bit 0, getpkgtxns / pkgtxns) so
+		// peers may request "getpkgtxns" against us and answer ours.
 		// Default OFF — Bitcoin Core v31.99 has no package-relay wire protocol,
 		// so a default node must not emit sendpackages (honest-wire parity).
 		// Opt in via -packagerelay / BLOCKBREW_PACKAGE_RELAY=1. The receive
 		// side stays enabled unconditionally.
 		if p.config.EnablePackageRelay {
-			p.SendMessage(&MsgSendPackages{Versions: PackageRelayVersionAncestor})
+			if p.SendMessage(&MsgSendPackages{Versions: PackageRelayVersionAncestor}) {
+				p.mu.Lock()
+				p.sentSendPackages = true
+				p.mu.Unlock()
+			}
 		}
 	}
 
@@ -2021,7 +2051,7 @@ func (p *Peer) SupportsErlay() bool {
 
 // PackageVersions returns the bitfield of BIP-331 package-relay versions the
 // peer announced via "sendpackages". 0 means the peer did not advertise
-// package-relay support. Bit 0 = ancestor packages.
+// package-relay support. Bit 0 = getpkgtxns / pkgtxns.
 func (p *Peer) PackageVersions() uint64 {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
