@@ -198,3 +198,39 @@ func TestHeavierForkThroughPresyncIsStored(t *testing.T) {
 		t.Fatal("an honest heavier fork got its peer punished")
 	}
 }
+
+// The gate lets any peer start a low-work PRESYNC at tip. That pipeline owns
+// only its own peer's header requests: the periodic getheaders must still go
+// to every other peer, or one peer feeding a low-work chain would stop the
+// node learning new blocks from the rest.
+func TestLowWorkPresyncDoesNotSilenceOtherPeers(t *testing.T) {
+	sm, idx, other := antiDoSFixture(t, MaxHeadersPerRequest+300)
+	sm.HandleHeaders(other, &MsgHeaders{Headers: forkFromGenesis(idx, MaxHeadersPerRequest)})
+	sm.mu.Lock()
+	syncPeer := sm.syncPeer
+	_, presync := sm.peerHeadersSync[other.Address()]
+	sm.mu.Unlock()
+	if !presync {
+		t.Fatal("fixture: no PRESYNC started")
+	}
+	countGetHeaders := func(p *Peer) int {
+		n := 0
+		for len(p.sendQueue) > 0 {
+			if _, ok := (<-p.sendQueue).(*MsgGetHeaders); ok {
+				n++
+			}
+		}
+		return n
+	}
+	countGetHeaders(other)
+	countGetHeaders(syncPeer)
+
+	sm.sendPeriodicGetHeaders()
+
+	if n := countGetHeaders(syncPeer); n != 1 {
+		t.Fatalf("periodic getheaders to a peer with no pipeline: got %d, want 1", n)
+	}
+	if n := countGetHeaders(other); n != 0 {
+		t.Fatalf("periodic getheaders to the peer in PRESYNC: got %d, want 0 (its pipeline owns its requests)", n)
+	}
+}

@@ -1175,6 +1175,29 @@ func (sm *SyncManager) needsHeadersSync() bool {
 	return tip.TotalWork.Cmp(minWork) < 0
 }
 
+// pipelineOwnsHeadersLocked reports whether a tip-rooted getheaders to p must
+// be held back because a PRESYNC/REDOWNLOAD pipeline owns that peer's header
+// requests (its reply would re-enter the live HeadersSyncState out of order).
+// During initial header sync any pipeline holds every request back: only the
+// sync peer runs one, and other peers' replies are dropped anyway. At tip the
+// anti-DoS gate can start a pipeline for any peer, so only that peer's
+// requests are held; one peer's low-work PRESYNC must not silence header
+// requests to the rest. p == nil asks about requests to every peer.
+// Caller must hold sm.mu (read or write).
+func (sm *SyncManager) pipelineOwnsHeadersLocked(p *Peer) bool {
+	if len(sm.peerHeadersSync) == 0 {
+		return false
+	}
+	if !sm.headersSynced {
+		return true
+	}
+	if p == nil {
+		return false
+	}
+	_, ok := sm.peerHeadersSync[p.Address()]
+	return ok
+}
+
 // computeMinimumRequiredWork returns the minimum chain work threshold that a
 // peer's chain must meet.  This is the greater of the chain tip's work and
 // nMinimumChainWork, matching Bitcoin Core net_processing.cpp:2643.
@@ -1742,7 +1765,7 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 				// addPipelineHeaders fix the redownload index now climbs in order, so
 				// this orphan should no longer fire mid-pipeline; this is the general
 				// class guard.)
-				if len(sm.peerHeadersSync) > 0 {
+				if sm.pipelineOwnsHeadersLocked(peer) {
 					return
 				}
 				log.Printf("sync: orphan header from %s, re-requesting headers", addr)
@@ -2314,14 +2337,27 @@ func (sm *SyncManager) NotifyTxReceived(txid, wtxid wire.Hash256) {
 func (sm *SyncManager) sendPeriodicGetHeaders() {
 	sm.mu.RLock()
 	pm := sm.peerMgr
-	// Do NOT broadcast a tip-rooted getheaders while a headerssync pipeline is
-	// active for any peer — the reply would re-enter that peer's live
+	// Do NOT send a tip-rooted getheaders to a peer whose headerssync pipeline
+	// is active (during initial sync: while any pipeline is active) — the
+	// reply would re-enter that peer's live
 	// HeadersSyncState out of order (false "non-continuous" abort). The pipeline
 	// owns header requests via NextLocator. Core's periodic header fetch in
 	// SendMessages is likewise gated off while presync is active.
-	if len(sm.peerHeadersSync) > 0 {
+	if sm.pipelineOwnsHeadersLocked(nil) {
 		sm.mu.RUnlock()
 		return
+	}
+	// At tip, skip only the peers whose own pipeline owns their requests.
+	var owned map[*Peer]bool
+	if pm != nil {
+		for _, p := range pm.ConnectedPeers() {
+			if sm.pipelineOwnsHeadersLocked(p) {
+				if owned == nil {
+					owned = make(map[*Peer]bool)
+				}
+				owned[p] = true
+			}
+		}
 	}
 	// Build the locator once from the best header tip so we ask for everything
 	// above our highest known header (not just above the connected chain tip).
@@ -2339,7 +2375,7 @@ func (sm *SyncManager) sendPeriodicGetHeaders() {
 		// Fall back to the chain-tip single-hash locator if the header index
 		// has no usable tip yet.
 		peers := pm.ConnectedPeers()
-		if len(peers) > 0 {
+		if len(peers) > 0 && !owned[peers[0]] {
 			sm.sendGetHeadersTo(peers[0])
 		}
 		return
@@ -2350,7 +2386,7 @@ func (sm *SyncManager) sendPeriodicGetHeaders() {
 		return
 	}
 	for _, peer := range peers {
-		if !peer.IsConnected() {
+		if !peer.IsConnected() || owned[peer] {
 			continue
 		}
 		sm.sendGetHeaders(peer, locator)
@@ -2406,7 +2442,7 @@ func (sm *SyncManager) checkStaleTip() {
 	// legitimate presync next-batch requests flow through HeadersSyncState via
 	// NextLocator in HandleHeaders. Skip while any pipeline is active.
 	sm.mu.RLock()
-	presyncActive := len(sm.peerHeadersSync) > 0
+	presyncActive := sm.pipelineOwnsHeadersLocked(nil)
 	sm.mu.RUnlock()
 	if presyncActive {
 		return
@@ -2468,9 +2504,14 @@ func (sm *SyncManager) checkStaleTip() {
 		}
 
 		// Request headers from the best peer
-		log.Printf("sync: requesting headers from best peer %s (height %d)",
-			bestPeer.Address(), bestHeight)
-		sm.sendGetHeadersTo(bestPeer)
+		sm.mu.RLock()
+		owned := sm.pipelineOwnsHeadersLocked(bestPeer)
+		sm.mu.RUnlock()
+		if !owned {
+			log.Printf("sync: requesting headers from best peer %s (height %d)",
+				bestPeer.Address(), bestHeight)
+			sm.sendGetHeadersTo(bestPeer)
+		}
 	} else {
 		// No peer ahead of us — send getheaders to random peer to discover
 		sm.sendPeriodicGetHeaders()
