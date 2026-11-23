@@ -1048,7 +1048,8 @@ func (p *Peer) handleMessage(msg Message) {
 // no pkgtxns at all, and its ProcessMessage drops tx messages from
 // block-relay-only peers (m_tx_relay == nullptr). So we require all of:
 //   - package relay enabled locally (-packagerelay; default off);
-//   - the peer announced sendpackages;
+//   - the peer announced sendpackages with a version we also announce
+//     (ancestor packages; BIP-331 negotiates the intersection);
 //   - the link relays transactions (not block-relay-only);
 //   - every tx answers a wtxid from our outstanding getpkgtxns to this peer.
 //
@@ -1062,7 +1063,7 @@ func (p *Peer) acceptPkgTxns(m *MsgPkgTxns) bool {
 	switch {
 	case !p.config.EnablePackageRelay:
 		reason = "package relay disabled"
-	case p.packageVersions == 0:
+	case p.packageVersions&PackageRelayVersionAncestor == 0:
 		reason = "peer did not negotiate sendpackages"
 	case p.config.DisableRelayTx:
 		reason = "block-relay-only peer"
@@ -1097,7 +1098,7 @@ func (p *Peer) RequestPkgTxns(wtxids []wire.Hash256) bool {
 		return false
 	}
 	p.mu.Lock()
-	if !p.config.EnablePackageRelay || p.packageVersions == 0 || p.config.DisableRelayTx {
+	if !p.config.EnablePackageRelay || p.packageVersions&PackageRelayVersionAncestor == 0 || p.config.DisableRelayTx {
 		p.mu.Unlock()
 		return false
 	}

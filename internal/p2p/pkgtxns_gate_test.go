@@ -213,6 +213,18 @@ func TestPkgTxnsGateEachCondition(t *testing.T) {
 		h.push()
 		h.assertIgnored(t)
 	})
+	t.Run("flag on, peer announced only a version we do not support", func(t *testing.T) {
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, false)
+		h.peer.packageVersions = PackageRelayVersionAncestor << 1
+		if h.request(h.wtxids()) {
+			t.Error("RequestPkgTxns sent to a peer sharing no package-relay version")
+		}
+		if !h.arm(h.wtxids()) {
+			t.Fatal("cannot arm an outstanding getpkgtxns")
+		}
+		h.push()
+		h.assertIgnored(t)
+	})
 	t.Run("flag on, negotiated, block-relay-only", func(t *testing.T) {
 		h := newPkgHarness(PeerConfig{EnablePackageRelay: true, DisableRelayTx: true}, true)
 		if h.request(h.wtxids()) {
