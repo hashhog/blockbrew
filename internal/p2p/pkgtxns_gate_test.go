@@ -106,10 +106,22 @@ func newPkgHarness(cfg PeerConfig, negotiated bool) *pkgHarness {
 		peerVersion:   &MsgVersion{ProtocolVersion: 70016, Relay: true},
 		config:        cfg,
 	}
+	h.peer.wtxidRelaySupported = true
+	h.setFlag("sentSendPackages", cfg.EnablePackageRelay)
 	if negotiated {
 		h.peer.packageVersions = PackageRelayVersionAncestor
 	}
 	return h
+}
+
+// setFlag sets a bool field of the peer by name through reflection, so this
+// file still compiles on a tree without the field (it is then a no-op).
+func (h *pkgHarness) setFlag(name string, v bool) {
+	f := reflect.ValueOf(h.peer).Elem().FieldByName(name)
+	if !f.IsValid() || f.Kind() != reflect.Bool {
+		return
+	}
+	reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().SetBool(v)
 }
 
 func (h *pkgHarness) wtxids() []wire.Hash256 {
@@ -142,12 +154,24 @@ func (h *pkgHarness) arm(w []wire.Hash256) bool {
 	if !f.IsValid() {
 		return false
 	}
-	set := map[wire.Hash256]struct{}{}
-	for _, x := range w {
-		set[x] = struct{}{}
+	dst := reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem()
+	switch f.Kind() {
+	case reflect.Slice: // ordered request (current layout)
+		dst.Set(reflect.ValueOf(append([]wire.Hash256(nil), w...)))
+	case reflect.Map: // earlier layout: a set of wtxids
+		set := map[wire.Hash256]struct{}{}
+		for _, x := range w {
+			set[x] = struct{}{}
+		}
+		dst.Set(reflect.ValueOf(set))
+	default:
+		return false
 	}
-	reflect.NewAt(f.Type(), unsafe.Pointer(f.UnsafeAddr())).Elem().Set(reflect.ValueOf(set))
 	return true
+}
+
+func (h *pkgHarness) pushTxs(txs ...*wire.MsgTx) {
+	h.peer.handleMessage(&MsgPkgTxns{Txs: txs})
 }
 
 func (h *pkgHarness) push() {
@@ -236,6 +260,42 @@ func TestPkgTxnsGateEachCondition(t *testing.T) {
 		h.push()
 		h.assertIgnored(t)
 	})
+	t.Run("flag on, negotiated, we never sent sendpackages", func(t *testing.T) {
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
+		h.setFlag("sentSendPackages", false)
+		if h.request(h.wtxids()) {
+			t.Error("RequestPkgTxns sent although we never announced sendpackages")
+		}
+		if !h.arm(h.wtxids()) {
+			t.Fatal("cannot arm an outstanding getpkgtxns")
+		}
+		h.push()
+		h.assertIgnored(t)
+	})
+	t.Run("flag on, negotiated, peer did not send wtxidrelay", func(t *testing.T) {
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
+		h.peer.wtxidRelaySupported = false
+		if h.request(h.wtxids()) {
+			t.Error("RequestPkgTxns sent to a peer without wtxidrelay")
+		}
+		if !h.arm(h.wtxids()) {
+			t.Fatal("cannot arm an outstanding getpkgtxns")
+		}
+		h.push()
+		h.assertIgnored(t)
+	})
+	t.Run("flag on, negotiated, peer set fRelay=false", func(t *testing.T) {
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
+		h.peer.peerVersion.Relay = false
+		if h.request(h.wtxids()) {
+			t.Error("RequestPkgTxns sent to a peer with fRelay=false")
+		}
+		if !h.arm(h.wtxids()) {
+			t.Fatal("cannot arm an outstanding getpkgtxns")
+		}
+		h.push()
+		h.assertIgnored(t)
+	})
 	t.Run("flag on, negotiated, no getpkgtxns outstanding", func(t *testing.T) {
 		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
 		h.push()
@@ -269,8 +329,8 @@ func TestSolicitedPkgTxnsAccepted(t *testing.T) {
 	select {
 	case m := <-h.peer.sendQueue:
 		g, ok := m.(*MsgGetPkgTxns)
-		if !ok || len(g.WTxIDs) != 2 {
-			t.Fatalf("RequestPkgTxns queued %#v, want getpkgtxns with 2 wtxids", m)
+		if !ok || len(g.WTxIDs) != 2 || g.WTxIDs[0] != h.pkg[0].WTxHash() || g.WTxIDs[1] != h.pkg[1].WTxHash() {
+			t.Fatalf("RequestPkgTxns queued %#v, want getpkgtxns for parent, child", m)
 		}
 	default:
 		t.Fatal("RequestPkgTxns queued nothing")
@@ -285,5 +345,108 @@ func TestSolicitedPkgTxnsAccepted(t *testing.T) {
 	h.push()
 	if h.listened != 1 {
 		t.Errorf("OnPkgTxns ran %d times, want 1 (a replay must not reuse the consumed request)", h.listened)
+	}
+}
+
+// BIP-331: a pkgtxns answers a getpkgtxns with all the requested
+// transactions, in request order. A partial or reordered reply is not that
+// reply, and since a getpkgtxns gets one reply, any rejected pkgtxns
+// disarms the request: the peer cannot deliver the same wtxids later.
+func TestPkgTxnsReplyMustMatchRequest(t *testing.T) {
+	newReq := func(t *testing.T) *pkgHarness {
+		t.Helper()
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
+		if !h.request(h.wtxids()) {
+			t.Fatal("RequestPkgTxns refused on a qualifying link")
+		}
+		return h
+	}
+	t.Run("subset reply", func(t *testing.T) {
+		h := newReq(t)
+		h.pushTxs(h.pkg[0]) // parent only; it is valid alone
+		h.assertIgnored(t)
+	})
+	t.Run("reordered reply", func(t *testing.T) {
+		h := newReq(t)
+		h.pushTxs(h.pkg[1], h.pkg[0])
+		h.assertIgnored(t)
+	})
+	t.Run("empty reply disarms the request", func(t *testing.T) {
+		h := newReq(t)
+		h.pushTxs()
+		h.push() // the correct reply, too late
+		h.assertIgnored(t)
+	})
+	t.Run("reply with an extra tx disarms the request", func(t *testing.T) {
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
+		if !h.request(h.wtxids()[:1]) {
+			t.Fatal("RequestPkgTxns refused on a qualifying link")
+		}
+		h.push()            // parent + unrequested child
+		h.pushTxs(h.pkg[0]) // the correct reply, too late
+		h.assertIgnored(t)
+	})
+	t.Run("subset reply disarms the request", func(t *testing.T) {
+		h := newReq(t)
+		h.pushTxs(h.pkg[0])
+		h.push()
+		h.assertIgnored(t)
+	})
+}
+
+// RequestPkgTxns arms the request only once getpkgtxns was queued. A
+// dropped send must leave no request behind, and must not wipe an earlier
+// request whose getpkgtxns did go out.
+func TestRequestPkgTxnsDroppedSend(t *testing.T) {
+	t.Run("dropped send arms nothing", func(t *testing.T) {
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
+		close(h.peer.quit) // SendMessage now reports a drop
+		if h.request(h.wtxids()) {
+			t.Fatal("RequestPkgTxns reported success for a dropped send")
+		}
+		h.push()
+		h.assertIgnored(t)
+	})
+	t.Run("dropped send keeps the earlier request", func(t *testing.T) {
+		h := newPkgHarness(PeerConfig{EnablePackageRelay: true}, true)
+		if !h.request(h.wtxids()) {
+			t.Fatal("RequestPkgTxns refused on a qualifying link")
+		}
+		for len(h.peer.sendQueue) < cap(h.peer.sendQueue) {
+			h.peer.sendQueue <- &MsgVerAck{}
+		}
+		if h.request(h.wtxids()[:1]) {
+			t.Fatal("RequestPkgTxns reported success with a full send queue")
+		}
+		h.push() // answers the first request, which was sent
+		if n := h.mp.Count(); n != 2 {
+			t.Errorf("reply to the sent request admitted %d txs, want 2 (a dropped send wiped it)", n)
+		}
+	})
+}
+
+// Package relay needs our own sendpackages too. handleVersion sends it only
+// when the common version reaches WTxidRelayVersion, so a peer at 70015 that
+// still announces sendpackages has not negotiated package relay with us.
+// These drive the real handshake path instead of setting the flag directly.
+func TestRequestPkgTxnsNeedsOurSendPackages(t *testing.T) {
+	try := func(peerProto int32) bool {
+		p := newHandshakePeerForGate(true)
+		p.handleVersion(&MsgVersion{ProtocolVersion: peerProto, Relay: true, Nonce: 0xdeadbeef})
+		for len(p.sendQueue) > 0 {
+			<-p.sendQueue
+		}
+		p.packageVersions = PackageRelayVersionAncestor
+		p.wtxidRelaySupported = true
+		r, ok := any(p).(interface {
+			RequestPkgTxns([]wire.Hash256) bool
+		})
+		return ok && r.RequestPkgTxns([]wire.Hash256{{0x01}})
+	}
+	if !try(70016) {
+		t.Error("RequestPkgTxns refused after we sent sendpackages in the handshake")
+	}
+	if try(70015) {
+		t.Error("RequestPkgTxns sent although we never sent sendpackages (common version 70015)")
 	}
 }
