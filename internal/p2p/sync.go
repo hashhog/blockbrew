@@ -2476,21 +2476,28 @@ func buildCmpctBlockReply(block *wire.MsgBlock, depth int32) *MsgCmpctBlock {
 // net_processing.cpp ProcessMessage("getblocktxn"): unknown/unstored block ->
 // ignore; deeper than MAX_BLOCKTXN_DEPTH below the tip -> the full block
 // instead; any index out of range -> misbehaving.
+//
+// The depth check comes before any disk read, and a deeper request is not
+// served here: it is queued as a MSG_WITNESS_BLOCK getdata item (Core pushes
+// it onto Peer::m_getdata_requests), so it is read and sent by the getdata
+// path, which pauses while the peer's send queue is backed up (H2). Reading
+// it here and calling SendMessage directly let a peer that never reads make
+// us read one block per getblocktxn and drop it on the full queue.
 func (sm *SyncManager) HandleGetBlockTxn(p *Peer, msg *MsgGetBlockTxn) {
 	depth, ok := sm.blockDepth(msg.BlockHash)
 	if !ok || sm.chainDB == nil {
 		log.Printf("[compact] getblocktxn from %s for unknown block %s, ignoring", p.Address(), msg.BlockHash)
 		return
 	}
+	if depth > MaxBlocktxnDepth {
+		log.Printf("[compact] getblocktxn from %s for block %s is %d deep (limit %d), queueing full block",
+			p.Address(), msg.BlockHash, depth, MaxBlocktxnDepth)
+		sm.HandleGetData(p, &MsgGetData{InvList: []*InvVect{{Type: InvTypeWitnessBlock, Hash: msg.BlockHash}}})
+		return
+	}
 	block, err := sm.chainDB.GetBlock(msg.BlockHash)
 	if err != nil {
 		log.Printf("[compact] getblocktxn from %s: block %s not available: %v", p.Address(), msg.BlockHash, err)
-		return
-	}
-	if depth > MaxBlocktxnDepth {
-		log.Printf("[compact] getblocktxn from %s for block %s is %d deep (limit %d), sending full block",
-			p.Address(), msg.BlockHash, depth, MaxBlocktxnDepth)
-		p.SendMessage(&MsgBlock{Block: block})
 		return
 	}
 	reply, err := buildBlockTxnReply(block, msg)
