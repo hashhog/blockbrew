@@ -61,12 +61,14 @@ func simpleTestTx(n uint32) *wire.MsgTx {
 	}
 }
 
-// drainSent non-blockingly collects all messages currently queued on the peer.
+// drainSent non-blockingly collects all messages currently queued on the peer,
+// releasing their bytes from the send budget as writeHandler would.
 func drainSent(peer *Peer) []Message {
 	var out []Message
 	for {
 		select {
 		case msg := <-peer.sendQueue:
+			peer.sendBytes.Add(-peer.popSendSize())
 			out = append(out, msg)
 		default:
 			return out
