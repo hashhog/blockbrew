@@ -16,6 +16,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/hashhog/blockbrew/internal/wire"
 )
 
 // DefaultConnectTimeout is how long an outbound TCP dial may take before it is
@@ -73,9 +75,9 @@ type PeerConfig struct {
 	// EnablePackageRelay gates the BIP-331 "sendpackages" handshake message.
 	// Default OFF: Bitcoin Core v31.99 has no package-relay wire protocol and a
 	// default node never emits sendpackages. The RECEIVE side (handling a
-	// peer's sendpackages / answering getpkgtxns) stays enabled regardless;
-	// only our SEND of sendpackages is gated. Opt in via -packagerelay /
-	// BLOCKBREW_PACKAGE_RELAY=1.
+	// peer's sendpackages / answering getpkgtxns) stays enabled regardless.
+	// Processing a received pkgtxns also requires this flag (acceptPkgTxns).
+	// Opt in via -packagerelay / BLOCKBREW_PACKAGE_RELAY=1.
 	EnablePackageRelay bool
 	// LocalAddrFunc, when set, supplies our own address for the VERSION
 	// addr_from field (ok=false keeps the 0.0.0.0:0 placeholder).
@@ -231,6 +233,11 @@ type Peer struct {
 	// BIP331 package relay: bitfield received in sendpackages.
 	// 0 means peer did not advertise. Bit 0 = ancestor packages.
 	packageVersions uint64
+
+	// BIP331: wtxids we asked this peer for in a getpkgtxns that has not
+	// been answered yet. A pkgtxns is processed only if every tx in it is
+	// one of these (see acceptPkgTxns); the set is cleared by the reply.
+	pkgTxnsRequested map[wire.Hash256]struct{}
 
 	// BIP152 compact block state
 	compactBlockState *CompactBlockState
@@ -1026,10 +1033,77 @@ func (p *Peer) handleMessage(msg Message) {
 			p.config.Listeners.OnGetPkgTxns(p, m)
 		}
 	case *MsgPkgTxns:
+		if !p.acceptPkgTxns(m) {
+			return
+		}
 		if p.config.Listeners != nil && p.config.Listeners.OnPkgTxns != nil {
 			p.config.Listeners.OnPkgTxns(p, m)
 		}
 	}
+}
+
+// acceptPkgTxns reports whether a received pkgtxns may be handed to the
+// mempool. BIP-331 lets a node send pkgtxns only in reply to our getpkgtxns,
+// and only on a link where both sides negotiated sendpackages; Core v31 has
+// no pkgtxns at all, and its ProcessMessage drops tx messages from
+// block-relay-only peers (m_tx_relay == nullptr). So we require all of:
+//   - package relay enabled locally (-packagerelay; default off);
+//   - the peer announced sendpackages;
+//   - the link relays transactions (not block-relay-only);
+//   - every tx answers a wtxid from our outstanding getpkgtxns to this peer.
+//
+// Anything else is ignored, like Core ignores an unknown message. A
+// matching reply consumes the whole outstanding request: BIP-331 answers a
+// getpkgtxns with one pkgtxns, and wtxids it left out are not re-armed.
+func (p *Peer) acceptPkgTxns(m *MsgPkgTxns) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	reason := ""
+	switch {
+	case !p.config.EnablePackageRelay:
+		reason = "package relay disabled"
+	case p.packageVersions == 0:
+		reason = "peer did not negotiate sendpackages"
+	case p.config.DisableRelayTx:
+		reason = "block-relay-only peer"
+	case len(p.pkgTxnsRequested) == 0:
+		reason = "no outstanding getpkgtxns"
+	}
+	if reason == "" {
+		for _, tx := range m.Txs {
+			if _, ok := p.pkgTxnsRequested[tx.WTxHash()]; !ok {
+				reason = "tx not requested in getpkgtxns"
+				break
+			}
+		}
+	}
+	if reason != "" {
+		log.Printf("peer %s: ignoring unsolicited pkgtxns (%d txs): %s", p.addr, len(m.Txs), reason)
+		return false
+	}
+	p.pkgTxnsRequested = nil
+	return true
+}
+
+// RequestPkgTxns sends a BIP-331 getpkgtxns for wtxids and records them as
+// outstanding, so the peer's pkgtxns reply passes acceptPkgTxns. It returns
+// false without sending when the link does not qualify for package relay.
+func (p *Peer) RequestPkgTxns(wtxids []wire.Hash256) bool {
+	if len(wtxids) == 0 || len(wtxids) > MaxGetPkgTxnsCount {
+		return false
+	}
+	p.mu.Lock()
+	if !p.config.EnablePackageRelay || p.packageVersions == 0 || p.config.DisableRelayTx {
+		p.mu.Unlock()
+		return false
+	}
+	p.pkgTxnsRequested = make(map[wire.Hash256]struct{}, len(wtxids))
+	for _, w := range wtxids {
+		p.pkgTxnsRequested[w] = struct{}{}
+	}
+	p.mu.Unlock()
+	p.SendMessage(&MsgGetPkgTxns{WTxIDs: wtxids})
+	return true
 }
 
 // handleVersion processes a received version message.
