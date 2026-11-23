@@ -234,3 +234,98 @@ func TestLowWorkPresyncDoesNotSilenceOtherPeers(t *testing.T) {
 		t.Fatalf("periodic getheaders to the peer in PRESYNC: got %d, want 0 (its pipeline owns its requests)", n)
 	}
 }
+
+// Initial header sync, before a sync peer is chosen (Warden, blockbrew#78):
+// peer.Start runs the read loop before OnPeerConnected calls
+// startHeaderSync, so a headers message can arrive while headersSynced is
+// false and syncPeer is nil. A full low-work message from such a peer must
+// not install a PRESYNC that then makes startHeaderSync return early: the
+// node would never pick a sync peer nor send getheaders to the peers that
+// can serve the real chain. During initial sync only the sync peer runs a
+// pipeline, so the gate ignores the message (stores nothing) and sync still
+// starts with the peer that is ahead.
+func TestLowWorkPresyncBeforeSyncPeerDoesNotBlockInitialSync(t *testing.T) {
+	params := *consensus.RegtestParams()
+	// Above the work of one full message from genesis (2001 blocks).
+	params.MinimumChainWork = new(big.Int).Mul(big.NewInt(3*MaxHeadersPerRequest), consensus.CalcWork(0x207fffff))
+	idx := consensus.NewHeaderIndex(&params)
+	g := idx.Genesis()
+
+	pm := &PeerManager{}
+	feeder := createMockPeer("feeder.example:8333", 0)
+	server := createMockPeer("server.example:8333", 900000)
+	pm.InsertConnectedPeer(feeder)
+	pm.InsertConnectedPeer(server)
+
+	sm := NewSyncManager(SyncManagerConfig{
+		ChainParams:  &params,
+		HeaderIndex:  idx,
+		PeerManager:  pm,
+		ChainManager: &mockChainConnector{tipHash: g.Hash, tipHeight: 0},
+	})
+	sm.mu.Lock()
+	sm.headersSynced = false
+	sm.syncPeer = nil
+	sm.mu.Unlock()
+
+	before := idx.NodeCount()
+	sm.HandleHeaders(feeder, &MsgHeaders{Headers: forkFromGenesis(idx, MaxHeadersPerRequest)})
+	if got := idx.NodeCount(); got != before {
+		t.Fatalf("low-work headers stored during initial sync: index %d -> %d", before, got)
+	}
+	if feeder.ShouldBan() {
+		t.Fatal("valid-PoW low-work headers are not a misbehaviour")
+	}
+
+	countGetHeaders := func(p *Peer) int {
+		n := 0
+		for len(p.sendQueue) > 0 {
+			if _, ok := (<-p.sendQueue).(*MsgGetHeaders); ok {
+				n++
+			}
+		}
+		return n
+	}
+	countGetHeaders(feeder)
+
+	sm.startHeaderSync()
+
+	sm.mu.Lock()
+	sp := sm.syncPeer
+	_, feederPipeline := sm.peerHeadersSync[feeder.Address()]
+	sm.mu.Unlock()
+	if sp != server {
+		t.Fatalf("initial header sync did not pick the peer that is ahead (syncPeer=%v): "+
+			"a low-work PRESYNC from a non-sync peer blocked startHeaderSync", sp)
+	}
+	if n := countGetHeaders(server); n != 1 {
+		t.Fatalf("getheaders sent to the peer serving the real chain: got %d, want 1", n)
+	}
+	if feederPipeline {
+		t.Fatal("a non-sync peer holds a PRESYNC pipeline during initial header sync")
+	}
+}
+
+// Control for the initial-sync guard above: the sync peer itself is still
+// gated during initial sync. A full low-work message from it starts its
+// PRESYNC and stores nothing, as before.
+func TestLowWorkHeadersFromSyncPeerDuringInitialSyncStartPresync(t *testing.T) {
+	sm, idx, _ := antiDoSFixture(t, MaxHeadersPerRequest+300)
+	sm.mu.Lock()
+	sm.headersSynced = false
+	sp := sm.syncPeer
+	sm.mu.Unlock()
+	before := idx.NodeCount()
+
+	sm.HandleHeaders(sp, &MsgHeaders{Headers: forkFromGenesis(idx, MaxHeadersPerRequest)})
+
+	if got := idx.NodeCount(); got != before {
+		t.Fatalf("header index grew from %d to %d: PRESYNC must not store headers", before, got)
+	}
+	sm.mu.Lock()
+	_, ok := sm.peerHeadersSync[sp.Address()]
+	sm.mu.Unlock()
+	if !ok {
+		t.Fatal("no PRESYNC started for the sync peer's full low-work message during initial sync")
+	}
+}

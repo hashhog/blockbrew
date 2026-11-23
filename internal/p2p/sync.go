@@ -1179,7 +1179,8 @@ func (sm *SyncManager) needsHeadersSync() bool {
 // be held back because a PRESYNC/REDOWNLOAD pipeline owns that peer's header
 // requests (its reply would re-enter the live HeadersSyncState out of order).
 // During initial header sync any pipeline holds every request back: only the
-// sync peer runs one, and other peers' replies are dropped anyway. At tip the
+// sync peer runs one (tryLowWorkHeadersSyncLocked refuses any other peer, even
+// before a sync peer is chosen), and other peers' replies are dropped anyway. At tip the
 // anti-DoS gate can start a pipeline for any peer, so only that peer's
 // requests are held; one peer's low-work PRESYNC must not silence header
 // requests to the rest. p == nil asks about requests to every peer.
@@ -1488,6 +1489,19 @@ func (sm *SyncManager) tryLowWorkHeadersSyncLocked(peer *Peer, headers []wire.Bl
 		// chain is not worth syncing. Not a misbehaviour.
 		log.Printf("sync: ignoring low-work chain (height=%d) from %s",
 			chainStart.Height+int32(len(headers)), peer.Address())
+		return true
+	}
+	if !sm.headersSynced && peer != sm.syncPeer {
+		// Initial header sync is single-peer: only the sync peer may own a
+		// pipeline. A PRESYNC for any other peer — including one whose
+		// message arrives before a sync peer is chosen (the read loop starts
+		// before OnPeerConnected runs startHeaderSync) — would make
+		// startHeaderSync return early and pipelineOwnsHeadersLocked hold
+		// back every getheaders, stalling IBD for as long as that peer stays
+		// connected. Ignore the message (nothing is stored); the chain is
+		// fetched from the sync peer.
+		log.Printf("sync: ignoring low-work headers from non-sync peer %s during initial sync",
+			peer.Address())
 		return true
 	}
 	addr := peer.Address()
