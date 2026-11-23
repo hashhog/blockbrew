@@ -386,6 +386,30 @@ func (t *V2Transport) readGarbageAndTerminator(terminator []byte) error {
 	}
 }
 
+// maxReserveAhead bounds how far ahead of the bytes actually received a
+// packet buffer may be grown (Core net.cpp MAX_RESERVE_AHEAD).
+const maxReserveAhead = 256 * 1024
+
+// readFullIncremental reads exactly n bytes from r, growing the buffer by at
+// most maxReserveAhead beyond what has been received, so a peer that claims a
+// large length and then stalls costs us no more than it has sent plus 256 KiB.
+func readFullIncremental(r io.Reader, n int) ([]byte, error) {
+	buf := make([]byte, 0, min(n, maxReserveAhead))
+	for len(buf) < n {
+		if len(buf) == cap(buf) {
+			grown := make([]byte, len(buf), min(n, len(buf)+maxReserveAhead))
+			copy(grown, buf)
+			buf = grown
+		}
+		m, err := io.ReadFull(r, buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+m]
+		if err != nil {
+			return nil, err
+		}
+	}
+	return buf, nil
+}
+
 // readVersionPacket reads and decrypts the version packet.
 func (t *V2Transport) readVersionPacket() error {
 	// Read encrypted length (3 bytes)
@@ -399,10 +423,19 @@ func (t *V2Transport) readVersionPacket() error {
 		return fmt.Errorf("decrypt length: %w", err)
 	}
 
-	// Read encrypted payload (length + 1 header + 16 tag)
+	// Same cap as the APP state (ReadMessage). Core rejects an over-size
+	// length in VERSION and APP alike (net.cpp ProcessReceivedPacketBytes,
+	// MAX_CONTENTS_LEN); without it any inbound peer could make us reserve
+	// the full 24-bit length (16 MiB) before the handshake completes.
+	if length > MaxPayloadSize {
+		return ErrPayloadTooLarge
+	}
+
+	// Read encrypted payload (length + 1 header + 16 tag), growing the
+	// buffer only as bytes arrive.
 	payloadLen := int(length) + HeaderLen + crypto.Expansion
-	encPayload := make([]byte, payloadLen)
-	if _, err := io.ReadFull(t.conn, encPayload); err != nil {
+	encPayload, err := readFullIncremental(t.conn, payloadLen)
+	if err != nil {
 		return fmt.Errorf("read payload: %w", err)
 	}
 
