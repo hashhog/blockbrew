@@ -2400,6 +2400,15 @@ func (sm *SyncManager) HandleNotFound(peer *Peer, msg *MsgNotFound) {
 		if !ok {
 			continue
 		}
+		// Only the peer we asked can cancel the request. Core's NOTFOUND
+		// handler calls RemoveBlockRequest(hash, pfrom.GetId()), which
+		// removes the request only if it was made to the sender. Without
+		// this check any peer could send notfound for blocks in flight to
+		// other peers and cancel them over and over, stalling IBD and tip
+		// sync.
+		if req.Peer != peer {
+			continue
+		}
 
 		// Record peer as unable to serve this block.  Log only on first
 		// notice per (peer, block) pair — repeat notfounds from the same
