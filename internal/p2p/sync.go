@@ -1175,6 +1175,30 @@ func (sm *SyncManager) needsHeadersSync() bool {
 	return tip.TotalWork.Cmp(minWork) < 0
 }
 
+// pipelineOwnsHeadersLocked reports whether a tip-rooted getheaders to p must
+// be held back because a PRESYNC/REDOWNLOAD pipeline owns that peer's header
+// requests (its reply would re-enter the live HeadersSyncState out of order).
+// During initial header sync any pipeline holds every request back: only the
+// sync peer runs one (tryLowWorkHeadersSyncLocked refuses any other peer, even
+// before a sync peer is chosen), and other peers' replies are dropped anyway. At tip the
+// anti-DoS gate can start a pipeline for any peer, so only that peer's
+// requests are held; one peer's low-work PRESYNC must not silence header
+// requests to the rest. p == nil asks about requests to every peer.
+// Caller must hold sm.mu (read or write).
+func (sm *SyncManager) pipelineOwnsHeadersLocked(p *Peer) bool {
+	if len(sm.peerHeadersSync) == 0 {
+		return false
+	}
+	if !sm.headersSynced {
+		return true
+	}
+	if p == nil {
+		return false
+	}
+	_, ok := sm.peerHeadersSync[p.Address()]
+	return ok
+}
+
 // computeMinimumRequiredWork returns the minimum chain work threshold that a
 // peer's chain must meet.  This is the greater of the chain tip's work and
 // nMinimumChainWork, matching Bitcoin Core net_processing.cpp:2643.
@@ -1280,76 +1304,213 @@ func (sm *SyncManager) HandleHeaders(peer *Peer, msg *MsgHeaders) {
 	// -----------------------------------------------------------------------
 	// PRESYNC / REDOWNLOAD pipeline (Core headerssync.cpp)
 	// -----------------------------------------------------------------------
-	// If a HeadersSyncState exists for this peer, route the batch through it.
-	// The pipeline returns either:
-	//   - Success=false → disconnect/penalise the peer, abandon sync.
-	//   - Success=true + RequestMore=true → send a follow-up GETHEADERS.
-	//   - POWValidatedHeaders non-empty → promote these to the normal path.
-	// Once the state transitions to FINAL (i.e. success=true, request_more=false)
-	// we delete it and fall through to the normal completion logic.
+	// If a HeadersSyncState exists for this peer, route the batch through it
+	// (see processHeadersSyncLocked).
 	if hss, ok := sm.peerHeadersSync[addr]; ok {
-		fullMsg := len(msg.Headers) == MaxHeadersPerRequest
-		result := hss.ProcessNextHeaders(msg.Headers, fullMsg)
-
-		if !result.Success {
-			// Peer violated the protocol — penalise and restart.
-			log.Printf("headerssync: pipeline failure with peer=%s, disconnecting", addr)
-			delete(sm.peerHeadersSync, addr)
-			peer.Misbehaving(ScoreHeadersDontConnect, "headerssync pipeline failure")
-			// ASYNC: peer goroutine + sm.mu held. See Peer.Disconnect.
-			peer.DisconnectAsync()
-			sm.syncPeer = nil
-			go sm.startHeaderSync()
-			return
-		}
-
-		if result.RequestMore {
-			// Still in PRESYNC or REDOWNLOAD — ask for the next batch. This is
-			// the ONLY getheaders allowed to this peer while the pipeline is
-			// active (Core MaybeSendGetHeaders inside the headerssync path).
-			locator := hss.NextLocator(func(height int32) wire.Hash256 {
-				n := sm.headerIndex.BestTip().GetAncestor(height)
-				if n == nil {
-					return wire.Hash256{}
-				}
-				return n.Hash
-			})
-			if len(locator) == 0 {
-				locator = sm.headerIndex.BestTip().BuildLocator()
-			}
-			sm.sendGetHeaders(peer, locator)
-
-			// Core parity (net_processing.cpp:2751 `headers.swap(result.
-			// pow_validated_headers)`): during REDOWNLOAD the state machine drains
-			// its validated-lookahead buffer on EVERY batch, not just the final
-			// one. Promote those to the header index now (index-only — the pipeline
-			// still owns the next getheaders via NextLocator above). The previous
-			// early return DROPPED result.POWValidatedHeaders, so the index stayed
-			// stuck at genesis through the entire redownload; only the final batch
-			// tried to promote, its parent (height base-of-buffer) was never added
-			// → ErrOrphanHeader → a spurious tip-rooted re-sync that wedged the IBD
-			// at h102000. See _ibd-from-genesis-campaign finding #1.
-			if len(result.POWValidatedHeaders) > 0 {
-				sm.addPipelineHeaders(peer, result.POWValidatedHeaders)
-			}
-			return
-		}
-
-		// Pipeline complete (FINAL): promote the PoW-validated headers.
-		delete(sm.peerHeadersSync, addr)
-		if len(result.POWValidatedHeaders) > 0 {
-			sm.addValidatedHeaders(peer, result.POWValidatedHeaders)
-		}
-		// After a successful PRESYNC/REDOWNLOAD cycle the pipeline produced
-		// all confirmed headers; continue to the regular completion path below.
-		// If addValidatedHeaders already triggered sync completion, the guard
-		// at the bottom will be a no-op.
+		sm.processHeadersSyncLocked(peer, hss, msg.Headers)
 		return
 	}
+
+	// Anti-DoS work gate (Core ProcessHeadersMessage → TryLowWorkHeadersSync).
+	// Checked on EVERY headers message, from every peer: a chain whose claimed
+	// work is below GetAntiDoSWorkThreshold() is never stored. A full message
+	// starts a bounded PRESYNC/REDOWNLOAD for this peer; a shorter one is
+	// ignored. Before this gate a HeadersSyncState existed only for the sync
+	// peer and only while our tip was below MinimumChainWork, so low-work fork
+	// headers from any other peer went straight into the index (AddHeader with
+	// minPowChecked=true), were persisted, and were reloaded on every boot.
+	if sm.tryLowWorkHeadersSyncLocked(peer, msg.Headers) {
+		return
+	}
+
 	// -----------------------------------------------------------------------
-	// Normal path (chain already above nMinimumChainWork)
+	// Normal path (chain meets the anti-DoS work threshold)
 	// -----------------------------------------------------------------------
 	sm.addValidatedHeaders(peer, msg.Headers)
+}
+
+// processHeadersSyncLocked routes a headers batch through the peer's
+// PRESYNC/REDOWNLOAD pipeline (Core headerssync.cpp, via
+// IsContinuationOfLowWorkHeadersSync). The pipeline returns either:
+//   - Success=false → disconnect/penalise the peer, abandon sync.
+//   - Success=true + RequestMore=true → send a follow-up GETHEADERS.
+//   - POWValidatedHeaders non-empty → promote these to the normal path.
+//
+// Once the state transitions to FINAL (i.e. success=true, request_more=false)
+// we delete it and promote the validated headers. Caller must hold sm.mu.
+func (sm *SyncManager) processHeadersSyncLocked(peer *Peer, hss *HeadersSyncState, headers []wire.BlockHeader) {
+	addr := peer.Address()
+	fullMsg := len(headers) == MaxHeadersPerRequest
+	result := hss.ProcessNextHeaders(headers, fullMsg)
+
+	if !result.Success {
+		// Peer violated the protocol — penalise and restart.
+		log.Printf("headerssync: pipeline failure with peer=%s, disconnecting", addr)
+		delete(sm.peerHeadersSync, addr)
+		peer.Misbehaving(ScoreHeadersDontConnect, "headerssync pipeline failure")
+		// ASYNC: peer goroutine + sm.mu held. See Peer.Disconnect.
+		peer.DisconnectAsync()
+		// A low-work PRESYNC can now run for a peer that is not the sync
+		// peer (the anti-DoS gate); only losing the sync peer restarts sync.
+		if sm.syncPeer == nil || sm.syncPeer == peer {
+			sm.syncPeer = nil
+			go sm.startHeaderSync()
+		}
+		return
+	}
+
+	if result.RequestMore {
+		// Still in PRESYNC or REDOWNLOAD — ask for the next batch. This is
+		// the ONLY getheaders allowed to this peer while the pipeline is
+		// active (Core MaybeSendGetHeaders inside the headerssync path).
+		locator := hss.NextLocator(func(height int32) wire.Hash256 {
+			n := sm.headerIndex.BestTip().GetAncestor(height)
+			if n == nil {
+				return wire.Hash256{}
+			}
+			return n.Hash
+		})
+		if len(locator) == 0 {
+			locator = sm.headerIndex.BestTip().BuildLocator()
+		}
+		sm.sendGetHeaders(peer, locator)
+
+		// Core parity (net_processing.cpp:2751 `headers.swap(result.
+		// pow_validated_headers)`): during REDOWNLOAD the state machine drains
+		// its validated-lookahead buffer on EVERY batch, not just the final
+		// one. Promote those to the header index now (index-only — the pipeline
+		// still owns the next getheaders via NextLocator above). The previous
+		// early return DROPPED result.POWValidatedHeaders, so the index stayed
+		// stuck at genesis through the entire redownload; only the final batch
+		// tried to promote, its parent (height base-of-buffer) was never added
+		// → ErrOrphanHeader → a spurious tip-rooted re-sync that wedged the IBD
+		// at h102000. See _ibd-from-genesis-campaign finding #1.
+		if len(result.POWValidatedHeaders) > 0 {
+			sm.addPipelineHeaders(peer, result.POWValidatedHeaders)
+		}
+		return
+	}
+
+	// Pipeline complete (FINAL): promote the PoW-validated headers.
+	// If addValidatedHeaders triggers sync completion, later calls are no-ops.
+	delete(sm.peerHeadersSync, addr)
+	if len(result.POWValidatedHeaders) > 0 {
+		sm.addValidatedHeaders(peer, result.POWValidatedHeaders)
+	}
+}
+
+// activeTipNodeLocked returns the header-index node of the chain manager's
+// active tip (Core ActiveChain().Tip()), or nil when there is no chain
+// manager or its tip is not indexed. Caller must hold sm.mu.
+func (sm *SyncManager) activeTipNodeLocked() *consensus.BlockNode {
+	if sm.chainMgr == nil || sm.headerIndex == nil {
+		return nil
+	}
+	hash, _ := sm.chainMgr.BestBlock()
+	return sm.headerIndex.GetNode(hash)
+}
+
+// antiDoSWorkThresholdLocked is Core's GetAntiDoSWorkThreshold
+// (net_processing.cpp): the active tip's chain work minus 144 blocks of the
+// tip's own proof (so forks from near the tip are still accepted), floored
+// at zero, and never below MinimumChainWork. Caller must hold sm.mu.
+func (sm *SyncManager) antiDoSWorkThresholdLocked() *big.Int {
+	threshold := new(big.Int)
+	if tip := sm.activeTipNodeLocked(); tip != nil && tip.TotalWork != nil {
+		buffer := new(big.Int).Mul(big.NewInt(144), consensus.CalcWork(tip.Header.Bits))
+		if buffer.Cmp(tip.TotalWork) > 0 {
+			buffer.Set(tip.TotalWork)
+		}
+		threshold.Sub(tip.TotalWork, buffer)
+	}
+	if mw := sm.chainParams.MinimumChainWork; mw != nil && mw.Cmp(threshold) > 0 {
+		threshold.Set(mw)
+	}
+	return threshold
+}
+
+// tryLowWorkHeadersSyncLocked is Core's anti-DoS step of ProcessHeadersMessage
+// plus TryLowWorkHeadersSync. It reports true when the message was consumed
+// here (low-work: PRESYNC started, or ignored, or bad PoW punished) and must
+// not reach the header index. It reports false — leaving the message to the
+// normal path — for an empty message, one that does not connect to the index
+// (the unconnecting-headers path handles it), one whose last header is
+// already an ancestor of the best header or the active tip, one from a noban
+// peer, and one whose chain meets the threshold. Caller must hold sm.mu.
+func (sm *SyncManager) tryLowWorkHeadersSyncLocked(peer *Peer, headers []wire.BlockHeader) bool {
+	if len(headers) == 0 || sm.headerIndex == nil || sm.chainParams == nil {
+		return false
+	}
+	chainStart := sm.headerIndex.GetNode(headers[0].PrevBlock)
+	if chainStart == nil || chainStart.TotalWork == nil {
+		return false
+	}
+	// Already have these headers on the best-header chain or the active
+	// chain: skip the anti-DoS checks, as Core does.
+	if last := sm.headerIndex.GetNode(headers[len(headers)-1].BlockHash()); last != nil {
+		if best := sm.headerIndex.BestTip(); best != nil && best.GetAncestor(last.Height) == last {
+			return false
+		}
+		if tip := sm.activeTipNodeLocked(); tip != nil && tip.GetAncestor(last.Height) == last {
+			return false
+		}
+	}
+	// Core: a NoBan peer bypasses the anti-DoS logic.
+	if peer.IsNoBan() {
+		return false
+	}
+
+	threshold := sm.antiDoSWorkThresholdLocked()
+	total := new(big.Int).Set(chainStart.TotalWork)
+	for i := range headers {
+		total.Add(total, consensus.CalcWork(headers[i].Bits))
+	}
+	if total.Cmp(threshold) >= 0 {
+		return false
+	}
+
+	// Core runs CheckHeadersPoW on every message before the anti-DoS step;
+	// the normal path checks PoW inside AddHeader, but nothing here reaches
+	// AddHeader, so check it explicitly.
+	if err := checkHeadersPoW(headers, sm.chainParams.PowLimit); err != nil {
+		log.Printf("sync: bad low-work headers from %s: %v", peer.Address(), err)
+		peer.Misbehaving(ScoreInvalidBlock, fmt.Sprintf("invalid header: %v", err))
+		// ASYNC: peer goroutine + sm.mu held. See Peer.Disconnect.
+		peer.DisconnectAsync()
+		if sm.syncPeer == peer {
+			sm.syncPeer = nil
+			go sm.startHeaderSync()
+		}
+		return true
+	}
+
+	if len(headers) != MaxHeadersPerRequest {
+		// Not full: the peer has nothing after these, so its too-little-work
+		// chain is not worth syncing. Not a misbehaviour.
+		log.Printf("sync: ignoring low-work chain (height=%d) from %s",
+			chainStart.Height+int32(len(headers)), peer.Address())
+		return true
+	}
+	if !sm.headersSynced && peer != sm.syncPeer {
+		// Initial header sync is single-peer: only the sync peer may own a
+		// pipeline. A PRESYNC for any other peer — including one whose
+		// message arrives before a sync peer is chosen (the read loop starts
+		// before OnPeerConnected runs startHeaderSync) — would make
+		// startHeaderSync return early and pipelineOwnsHeadersLocked hold
+		// back every getheaders, stalling IBD for as long as that peer stays
+		// connected. Ignore the message (nothing is stored); the chain is
+		// fetched from the sync peer.
+		log.Printf("sync: ignoring low-work headers from non-sync peer %s during initial sync",
+			peer.Address())
+		return true
+	}
+	addr := peer.Address()
+	hss := NewHeadersSyncState(addr, sm.chainParams, chainStart, threshold)
+	sm.peerHeadersSync[addr] = hss
+	log.Printf("sync: starting PRESYNC pipeline with %s (low-work chain from height %d)",
+		addr, chainStart.Height)
+	sm.processHeadersSyncLocked(peer, hss, headers)
+	return true
 }
 
 // backfillRetryInterval bounds how long an unanswered backfill getheaders is
@@ -1618,7 +1779,7 @@ func (sm *SyncManager) addValidatedHeaders(peer *Peer, headers []wire.BlockHeade
 				// addPipelineHeaders fix the redownload index now climbs in order, so
 				// this orphan should no longer fire mid-pipeline; this is the general
 				// class guard.)
-				if len(sm.peerHeadersSync) > 0 {
+				if sm.pipelineOwnsHeadersLocked(peer) {
 					return
 				}
 				log.Printf("sync: orphan header from %s, re-requesting headers", addr)
@@ -2190,14 +2351,27 @@ func (sm *SyncManager) NotifyTxReceived(txid, wtxid wire.Hash256) {
 func (sm *SyncManager) sendPeriodicGetHeaders() {
 	sm.mu.RLock()
 	pm := sm.peerMgr
-	// Do NOT broadcast a tip-rooted getheaders while a headerssync pipeline is
-	// active for any peer — the reply would re-enter that peer's live
+	// Do NOT send a tip-rooted getheaders to a peer whose headerssync pipeline
+	// is active (during initial sync: while any pipeline is active) — the
+	// reply would re-enter that peer's live
 	// HeadersSyncState out of order (false "non-continuous" abort). The pipeline
 	// owns header requests via NextLocator. Core's periodic header fetch in
 	// SendMessages is likewise gated off while presync is active.
-	if len(sm.peerHeadersSync) > 0 {
+	if sm.pipelineOwnsHeadersLocked(nil) {
 		sm.mu.RUnlock()
 		return
+	}
+	// At tip, skip only the peers whose own pipeline owns their requests.
+	var owned map[*Peer]bool
+	if pm != nil {
+		for _, p := range pm.ConnectedPeers() {
+			if sm.pipelineOwnsHeadersLocked(p) {
+				if owned == nil {
+					owned = make(map[*Peer]bool)
+				}
+				owned[p] = true
+			}
+		}
 	}
 	// Build the locator once from the best header tip so we ask for everything
 	// above our highest known header (not just above the connected chain tip).
@@ -2215,7 +2389,7 @@ func (sm *SyncManager) sendPeriodicGetHeaders() {
 		// Fall back to the chain-tip single-hash locator if the header index
 		// has no usable tip yet.
 		peers := pm.ConnectedPeers()
-		if len(peers) > 0 {
+		if len(peers) > 0 && !owned[peers[0]] {
 			sm.sendGetHeadersTo(peers[0])
 		}
 		return
@@ -2226,7 +2400,7 @@ func (sm *SyncManager) sendPeriodicGetHeaders() {
 		return
 	}
 	for _, peer := range peers {
-		if !peer.IsConnected() {
+		if !peer.IsConnected() || owned[peer] {
 			continue
 		}
 		sm.sendGetHeaders(peer, locator)
@@ -2282,7 +2456,7 @@ func (sm *SyncManager) checkStaleTip() {
 	// legitimate presync next-batch requests flow through HeadersSyncState via
 	// NextLocator in HandleHeaders. Skip while any pipeline is active.
 	sm.mu.RLock()
-	presyncActive := len(sm.peerHeadersSync) > 0
+	presyncActive := sm.pipelineOwnsHeadersLocked(nil)
 	sm.mu.RUnlock()
 	if presyncActive {
 		return
@@ -2344,9 +2518,14 @@ func (sm *SyncManager) checkStaleTip() {
 		}
 
 		// Request headers from the best peer
-		log.Printf("sync: requesting headers from best peer %s (height %d)",
-			bestPeer.Address(), bestHeight)
-		sm.sendGetHeadersTo(bestPeer)
+		sm.mu.RLock()
+		owned := sm.pipelineOwnsHeadersLocked(bestPeer)
+		sm.mu.RUnlock()
+		if !owned {
+			log.Printf("sync: requesting headers from best peer %s (height %d)",
+				bestPeer.Address(), bestHeight)
+			sm.sendGetHeadersTo(bestPeer)
+		}
 	} else {
 		// No peer ahead of us — send getheaders to random peer to discover
 		sm.sendPeriodicGetHeaders()
