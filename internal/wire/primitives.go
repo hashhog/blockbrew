@@ -273,7 +273,48 @@ func ReadVarBytes(r io.Reader, maxSize uint64) ([]byte, error) {
 	if length == 0 {
 		return nil, nil
 	}
-	return ReadBytes(r, int(length))
+	return readBytesGrowing(r, int(length))
+}
+
+// varBytesChunk is the first allocation readBytesGrowing makes for a
+// peer-declared byte vector. Scripts and almost every witness item fit in
+// it, so they still decode with one exact-size allocation.
+const varBytesChunk = 64 << 10
+
+// readBytesGrowing reads exactly n bytes, but sizes each allocation at no
+// more than twice the bytes the reader has actually delivered (and at most
+// varBytesChunk before the first byte arrives), so total allocation stays
+// proportional to the input rather than to the declared length. A length prefix is untrusted: ReadBytes'
+// make([]byte, n) let a 5-byte input declaring MaxCompactSize allocate
+// 32 MiB before failing on EOF. Core bounds the allocation by the stream the
+// same way, growing vectors in MAX_VECTOR_ALLOCATE batches (serialize.h).
+func readBytesGrowing(r io.Reader, n int) ([]byte, error) {
+	if n <= varBytesChunk {
+		return ReadBytes(r, n)
+	}
+	buf := make([]byte, varBytesChunk)
+	off := 0
+	for {
+		if _, err := io.ReadFull(r, buf[off:]); err != nil {
+			// A single ReadFull of the whole body reports a body cut off
+			// after some data as ErrUnexpectedEOF; keep that.
+			if off > 0 && err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return nil, err
+		}
+		off = len(buf)
+		if off == n {
+			return buf, nil
+		}
+		next := 2 * off
+		if next > n {
+			next = n
+		}
+		grown := make([]byte, next)
+		copy(grown, buf)
+		buf = grown
+	}
 }
 
 // ReadVarString reads a string with a CompactSize length prefix.
