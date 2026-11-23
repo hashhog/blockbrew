@@ -107,7 +107,10 @@ func newPkgHarness(cfg PeerConfig, negotiated bool) *pkgHarness {
 		config:        cfg,
 	}
 	h.peer.wtxidRelaySupported = true
-	h.setFlag("sentSendPackages", cfg.EnablePackageRelay)
+	// White-box: our side of the handshake is marked done even with the
+	// flag off, so "flag off" is the only failing condition in that subtest.
+	// TestRequestPkgTxnsNeedsOurSendPackages covers the real handshake path.
+	h.setFlag("sentSendPackages", true)
 	if negotiated {
 		h.peer.packageVersions = PackageRelayVersionAncestor
 	}
