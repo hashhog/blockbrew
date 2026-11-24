@@ -1649,14 +1649,17 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	subsidy := CalcBlockSubsidyForInterval(node.Height, cm.params.SubsidyHalvingInterval)
 
 	// Track total fees and undo data.
-	// Skip undo data generation during assume-valid IBD for performance.
+	//
+	// Undo is built and written for EVERY connected block, as Core does
+	// (ConnectBlock fills blockundo unconditionally and WriteBlockUndo runs
+	// for every block past genesis, validation.cpp). Assume-valid skips
+	// script checks only. It used to skip undo too (during IBD below the
+	// assume-valid block), which left those blocks impossible to disconnect:
+	// invalidateblock, a reorg below the old tip, or the boot consistency
+	// probe's peel all hit "failed to read undo data".
 	var totalFees int64
-	generateUndo := !skipScripts || !cm.isIBD
-	var blockUndo *storage.BlockUndo
-	if generateUndo {
-		blockUndo = &storage.BlockUndo{
-			TxUndos: make([]storage.TxUndo, 0, len(block.Transactions)-1),
-		}
+	blockUndo := &storage.BlockUndo{
+		TxUndos: make([]storage.TxUndo, 0, len(block.Transactions)-1),
 	}
 
 	// Genesis block special case: the genesis coinbase is unspendable.
@@ -2023,13 +2026,9 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			spentInputs = append(spentInputs, in.PreviousOutPoint)
 		}
 
-		// Persist undo data to disk only when needed (not during assume-valid IBD)
-		if generateUndo {
-			txUndo := storage.TxUndo{
-				SpentCoins: spentCoins,
-			}
-			blockUndo.TxUndos = append(blockUndo.TxUndos, txUndo)
-		}
+		blockUndo.TxUndos = append(blockUndo.TxUndos, storage.TxUndo{
+			SpentCoins: spentCoins,
+		})
 
 		// Update UTXO view: spend inputs and add outputs.
 		// CVE-2012-2459 / dup-txid fix: after spending inputs, evict them from
@@ -2191,9 +2190,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				rollbackUTXOs()
 				return SystemFault("stage block body on reorg batch", fmt.Errorf("%w: %v", ErrChainstateWrite, err))
 			}
-			if generateUndo {
-				cm.chainDB.WriteBlockUndoBatch(cm.reorgBatch, hash, blockUndo)
-			}
+			cm.chainDB.WriteBlockUndoBatch(cm.reorgBatch, hash, blockUndo)
 			cm.chainDB.SetBlockHeightBatch(cm.reorgBatch, node.Height, hash)
 			cm.chainDB.SetChainStateBatch(cm.reorgBatch, &storage.ChainState{
 				BestHash:   hash,
@@ -2206,9 +2203,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// keeps the reorg path symmetric with the regular path.
 			cm.headerIndex.noteBlockReceived(node)
 			node.Status |= StatusDataStored
-			if generateUndo {
-				node.Status |= StatusHaveUndo
-			}
+			node.Status |= StatusHaveUndo
 		} else {
 			writeChainState := !isIBDAfter || shouldFlush
 
@@ -2232,9 +2227,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 				}
 
 				// Undo data keyed by block hash (not height, since heights can change during reorgs)
-				if generateUndo {
-					cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
-				}
+				cm.chainDB.WriteBlockUndoBatch(batch, hash, blockUndo)
 
 				// Height -> hash mapping
 				cm.chainDB.SetBlockHeightBatch(batch, node.Height, hash)
@@ -2293,9 +2286,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 			// ReceivedBlockTransactions + blockstorage.cpp:1029 ordering.
 			cm.headerIndex.noteBlockReceived(node)
 			node.Status |= StatusDataStored
-			if generateUndo {
-				node.Status |= StatusHaveUndo
-			}
+			node.Status |= StatusHaveUndo
 
 			if shouldFlush {
 				log.Printf("chainmgr: UTXO flush at height %d (atomic)", node.Height)
@@ -2308,9 +2299,7 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 		// Preserve that behavior so the test paths don't regress.
 		cm.headerIndex.noteBlockReceived(node)
 		node.Status |= StatusDataStored
-		if generateUndo {
-			node.Status |= StatusHaveUndo
-		}
+		node.Status |= StatusHaveUndo
 	}
 
 	// The block is durable (or staged into the reorg union batch): publish it.

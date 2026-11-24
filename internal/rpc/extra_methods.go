@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"math/big"
 	"os"
 	"strings"
@@ -424,33 +425,127 @@ func (s *Server) handleImportMempool(params json.RawMessage) (interface{}, *RPCE
 }
 
 // handlePruneBlockchain implements Core's pruneblockchain RPC
-// (rpc/blockchain.cpp:908-963). The R5 height-type-error probe is
-// params=["zz"] → RPC_TYPE_ERROR (-3) from UniValue::getInt<int>.
+// (rpc/blockchain.cpp:908-963): delete block files and the blocks' undo up
+// to a height or a block time, and return the height of the last block pruned (-1 when
+// nothing is pruned).
+//
+// Errors, in Core's order:
+//   - height not a number -> RPC_TYPE_ERROR (-3); RPCHelpMan type-checks the
+//     argument before the handler runs (R5 probe params=["zz"]).
+//   - not in prune mode -> RPC_MISC_ERROR (-1) "Cannot prune blocks because
+//     node is not in prune mode."
+//   - height not an int (fraction, out of range) -> getInt<int>'s error.
+//   - height < 0 -> RPC_INVALID_PARAMETER (-8) "Negative block height."
+//   - height > 1e9 is a block time: the first active-chain block whose
+//     running max time is >= height - TIMESTAMP_WINDOW (2 h), Core
+//     CChain::FindEarliestAtLeast; none -> -8 "Could not find block with at
+//     least the specified timestamp."
+//   - chain below PruneAfterHeight -> -1 "Blockchain is too short for pruning."
+//   - height > tip -> -8 "Blockchain is shorter than the attempted prune height."
+//   - height > tip - 288 is clamped to tip - 288 (MIN_BLOCKS_TO_KEEP).
 func (s *Server) handlePruneBlockchain(params json.RawMessage) (interface{}, *RPCError) {
 	var args []interface{}
 	if err := json.Unmarshal(params, &args); err != nil || len(args) < 1 {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid parameters"}
 	}
-	if args[0] == nil {
+	if _, isNum := args[0].(float64); !isNum {
 		return nil, &RPCError{
 			Code:    RPCErrTypeError,
-			Message: "JSON value of type null is not of expected type number",
+			Message: "JSON value of type " + jsonTypeName(args[0]) + " is not of expected type number",
 		}
+	}
+	if s.pruner == nil || !s.pruner.IsEnabled() {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Cannot prune blocks because node is not in prune mode."}
 	}
 	height, rpcErr := parseRPCInt32(args[0])
 	if rpcErr != nil {
 		return nil, rpcErr
 	}
-	if s.pruner == nil || !s.pruner.IsEnabled() {
-		return nil, &RPCError{Code: RPCErrMisc, Message: "Cannot prune blocks because node is not in prune mode."}
-	}
 	if height < 0 {
 		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Negative block height."}
 	}
-	// Height-targeted manual prune (PruneBlockFilesManual) is not wired
-	// yet; report the current prune floor rather than deleting. Archive
-	// nodes never reach here.
-	return int64(s.pruner.PruneHeight()), nil
+	var tip *consensus.BlockNode
+	if s.chainMgr != nil {
+		tip = s.chainMgr.BestBlockNode()
+	}
+	if tip == nil {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Blockchain is too short for pruning."}
+	}
+
+	// A value above a billion is too high for a height and too low for a
+	// block time (Sep 2001): treat it as a time, with Core's 2 h buffer for
+	// blocks with old timestamps.
+	if height > 1000000000 {
+		h, ok := findEarliestAtLeast(tip, int64(height)-timestampWindow)
+		if !ok {
+			return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Could not find block with at least the specified timestamp."}
+		}
+		height = h
+	}
+
+	chainHeight := tip.Height
+	pruneAfter := int32(0)
+	if s.chainParams != nil {
+		pruneAfter = s.chainParams.PruneAfterHeight
+	}
+	if chainHeight < pruneAfter {
+		return nil, &RPCError{Code: RPCErrMisc, Message: "Blockchain is too short for pruning."}
+	} else if height > chainHeight {
+		return nil, &RPCError{Code: RPCErrInvalidParameter, Message: "Blockchain is shorter than the attempted prune height."}
+	} else if height > chainHeight-storage.MinBlocksToKeep {
+		// Core logs "Attempt to prune blocks close to the tip. Retaining the
+		// minimum number of blocks." and goes on.
+		height = chainHeight - storage.MinBlocksToKeep
+	}
+
+	// Core's PruneBlockFilesManual only logs a failed flush and still
+	// answers with the prune height, so a failure here is logged too.
+	if _, err := s.pruner.PruneManual(height, chainHeight); err != nil {
+		log.Printf("pruneblockchain: manual prune to height %d failed: %v", height, err)
+	}
+	return s.lastPrunedHeight(tip), nil
+}
+
+// timestampWindow is Core's TIMESTAMP_WINDOW (chain.h, = MAX_FUTURE_BLOCK_TIME).
+const timestampWindow = 2 * 60 * 60
+
+// findEarliestAtLeast is Core's CChain::FindEarliestAtLeast(nTime, 0): the
+// lowest active-chain height whose block or an ancestor has a timestamp >=
+// t (Core compares nTimeMax, the running maximum).
+func findEarliestAtLeast(tip *consensus.BlockNode, t int64) (int32, bool) {
+	var maxTime int64
+	for h := int32(0); h <= tip.Height; h++ {
+		n := tip.GetAncestor(h)
+		if n == nil {
+			return 0, false
+		}
+		if ts := int64(n.Header.Timestamp); ts > maxTime {
+			maxTime = ts
+		}
+		if maxTime >= t {
+			return h, true
+		}
+	}
+	return 0, false
+}
+
+// lastPrunedHeight is Core's GetPruneHeight(...).value_or(-1)
+// (rpc/blockchain.cpp): the height of the last block without data below the
+// contiguous run that ends at the tip, the tip's own height if its body is
+// gone, and -1 if every block from height 1 up has its body (genesis does
+// not count).
+func (s *Server) lastPrunedHeight(tip *consensus.BlockNode) int64 {
+	if s.chainDB == nil || tip.Height <= 0 {
+		return -1
+	}
+	if !s.chainDB.HasBlockBody(tip.Hash) {
+		return int64(tip.Height)
+	}
+	floor, hole := s.chainDB.BodyFloor(tip.Height, s.hashAtHeight)
+	if !hole {
+		return -1
+	}
+	return int64(floor) - 1
 }
 
 // ============================================================================
