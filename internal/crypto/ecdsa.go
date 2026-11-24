@@ -199,9 +199,19 @@ func parseDERInt(sig []byte, pos int) (val []byte, newPos int, ok bool) {
 	lenByte := sig[pos]
 	pos++
 	if lenByte&0x80 != 0 {
-		// Long form
+		// Long form. Core ecdsa_signature_parse_der_lax (pubkey.cpp) skips
+		// leading zero length bytes first and only then requires fewer than
+		// 4 significant ones, so e.g. 0x85 00 00 00 00 20 is a valid length
+		// of 32 (accepted in pre-BIP66 blocks).
 		nLenBytes := int(lenByte & 0x7f)
-		if nLenBytes > 4 || pos+nLenBytes > len(sig) {
+		if pos+nLenBytes > len(sig) {
+			return nil, pos, false
+		}
+		for nLenBytes > 0 && sig[pos] == 0x00 {
+			pos++
+			nLenBytes--
+		}
+		if nLenBytes >= 4 {
 			return nil, pos, false
 		}
 		for i := 0; i < nLenBytes; i++ {
