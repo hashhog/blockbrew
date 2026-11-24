@@ -30,7 +30,7 @@ func createMockPeer(addr string, startHeight int32) *Peer {
 // createTestBlockHeader creates a test block header with valid PoW for regtest.
 func createTestBlockHeader(prevHash wire.Hash256, timestamp uint32, baseNonce uint32) wire.BlockHeader {
 	header := wire.BlockHeader{
-		Version:    1,
+		Version:    4, // BIP34/66/65 are active from height 1 on regtest
 		PrevBlock:  prevHash,
 		MerkleRoot: wire.Hash256{},
 		Timestamp:  timestamp,

@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
@@ -96,7 +97,7 @@ func (s *Server) handleSubmitHeader(params json.RawMessage) (result interface{},
 	// Core: chainman.ProcessNewBlockHeaders({{h}}, min_pow_checked=true, state).
 	// blockbrew's equivalent is HeaderIndex.AddHeader, which performs the same
 	// CheckProofOfWork + ContextualCheckBlockHeader (bad-diffbits / time-too-old /
-	// timewarp / time-too-new) + checkpoint gates and inserts the validated
+	// timewarp / time-too-new / bad-version) + checkpoint gates and inserts the validated
 	// header into the index.
 	//
 	// minPowChecked=true: Core's submitheader passes min_pow_checked=true to
@@ -114,7 +115,12 @@ func (s *Server) handleSubmitHeader(params json.RawMessage) (result interface{},
 			return nil, nil
 		}
 		// All other failures are validation failures -> RPC_VERIFY_ERROR (-25)
-		// with the Core reject reason string.
+		// with the Core reject reason string. Core's bad-version reason embeds
+		// the header's nVersion, strprintf("bad-version(0x%08x)", nVersion)
+		// (validation.cpp:4116), so it is formatted here, not mapped.
+		if errors.Is(err, consensus.ErrBlockVersionTooLow) {
+			return nil, &RPCError{Code: RPCErrVerify, Message: fmt.Sprintf("bad-version(0x%08x)", uint32(header.Version))}
+		}
 		return nil, &RPCError{Code: RPCErrVerify, Message: headerRejectReason(err)}
 	}
 

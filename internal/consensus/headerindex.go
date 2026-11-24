@@ -499,22 +499,23 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader, minPowChecked bool) (
 	}
 
 	// Header-contextual gates (difficulty / time-too-old / BIP-94 timewarp /
-	// time-too-new), in Bitcoin Core's ContextualCheckBlockHeader order. The
-	// production path injects the LIVE values it has always used — the parent's
-	// median-time-past and the wall clock (headerNowUnix) — and DISABLES the
-	// header-level version gate (checkVersion=false) so block-version
-	// enforcement stays exactly where blockbrew has always enforced it, in
-	// CheckBlockContext at block-connect time. Behavior here is byte-identical
-	// to the inlined checks this replaces; ContextualCheckBlockHeader is the
-	// single source of truth the header differential drives with injected
-	// MTP / current-time / expected-bits.
+	// time-too-new / bad-version), in Bitcoin Core's ContextualCheckBlockHeader
+	// order, with the parent's median-time-past and the wall clock
+	// (headerNowUnix). The BIP34/66/65 version gate runs here too
+	// (checkVersion=true): Core's AcceptBlockHeader refuses a header with an
+	// outdated nVersion before indexing it (validation.cpp:4112-4118), so a
+	// P2P headers message, submitheader or submitblock carrying one must leave
+	// nothing in the index. It used to be deferred to CheckBlockContext at
+	// connect time, which let such a header be indexed and become the best
+	// header. The gate is height-gated like Core's DeploymentActiveAfter, so
+	// historical v1/v2/v3 headers below the activation heights still pass.
 	parentMTP, err := parent.GetMedianTimePastChecked()
 	if err != nil {
 		return nil, err
 	}
 	if err := idx.ContextualCheckBlockHeader(
 		header, parent, height,
-		parentMTP, headerNowUnix(), nil, false,
+		parentMTP, headerNowUnix(), nil, true,
 	); err != nil {
 		return nil, err
 	}
@@ -610,11 +611,10 @@ func (idx *HeaderIndex) AddHeader(header wire.BlockHeader, minPowChecked bool) (
 //     the full 2016-block retarget context is not the gate under
 //     test. Production always passes nil (real recompute).
 //   - checkVersion — when true, also enforce the BIP34/66/65 mandatory-version
-//     gate (validation.cpp:4112, "bad-version"). Production passes
-//     FALSE so block-version enforcement stays in CheckBlockContext
-//     exactly where blockbrew has always applied it (default-
-//     preserving); the differential passes TRUE for full Core-parity
-//     header validation.
+//     gate (validation.cpp:4112, "bad-version"). The production
+//     header paths (AddHeader, checkLinkedHeaderLocked) and the
+//     differential pass TRUE; CheckBlockContext re-applies the same
+//     gate at block-connect time.
 //
 // PoW (the high-hash gate, validation.cpp CheckBlockHeader/CheckProofOfWork) is
 // NOT done here — AddHeader runs it before calling this, and the differential
@@ -667,8 +667,7 @@ func (idx *HeaderIndex) ContextualCheckBlockHeader(
 		return ErrTimestampTooFarFuture
 	}
 
-	// (5) bad-version (validation.cpp:4112) — only when requested (see doc). The
-	// production header path leaves this to CheckBlockContext at block-connect.
+	// (5) bad-version (validation.cpp:4112) — only when requested (see doc).
 	if checkVersion {
 		if err := CheckBlockHeaderVersion(header.Version, height, idx.params); err != nil {
 			return err
@@ -1553,7 +1552,7 @@ func (idx *HeaderIndex) checkLinkedHeaderLocked(hdr wire.BlockHeader, parent *Bl
 	if err != nil {
 		return err
 	}
-	if err := idx.ContextualCheckBlockHeader(hdr, parent, height, mtp, headerNowUnix(), nil, false); err != nil {
+	if err := idx.ContextualCheckBlockHeader(hdr, parent, height, mtp, headerNowUnix(), nil, true); err != nil {
 		return err
 	}
 	if err := VerifyCheckpoint(idx.checkpointData, height, hdr.BlockHash()); err != nil {

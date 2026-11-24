@@ -51,7 +51,7 @@ func makeW30NonCoinbaseTx(nonce byte) *wire.MsgTx {
 // Regtest difficulty (0x207fffff) is trivially satisfied by almost any hash.
 func findW30Header(prevHash wire.Hash256, merkleRoot wire.Hash256, parentTimestamp uint32) wire.BlockHeader {
 	h := wire.BlockHeader{
-		Version:    1,
+		Version:    4,
 		PrevBlock:  prevHash,
 		MerkleRoot: merkleRoot,
 		Timestamp:  parentTimestamp + 600,
