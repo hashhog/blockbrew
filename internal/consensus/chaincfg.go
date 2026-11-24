@@ -30,6 +30,7 @@ type ChainParams struct {
 	TargetSpacing          int64    // In seconds
 	DifficultyAdjInterval  int64
 	SubsidyHalvingInterval int32
+	PruneAfterHeight       int32 // Core nPruneAfterHeight: pruneblockchain needs the chain at least this tall
 	BIP34Height            int32
 	// BIP34Hash is the hash of the block at BIP34Height. Used by the BIP-30
 	// short-circuit: once BIP34 is active and the block at BIP34Height on the
@@ -192,6 +193,7 @@ func MainnetParams() *ChainParams {
 		TargetSpacing:          TargetSpacing,
 		DifficultyAdjInterval:  DifficultyAdjustmentInterval,
 		SubsidyHalvingInterval: SubsidyHalvingInterval,
+		PruneAfterHeight:       100000,
 		BIP34Height: 227931,
 		// BIP34Hash: hash of mainnet block 227,931 — the block whose coinbase
 		// first included the block height, confirming BIP34 activation.
@@ -296,6 +298,7 @@ func TestnetParams() *ChainParams {
 		TargetSpacing:          TargetSpacing,
 		DifficultyAdjInterval:  DifficultyAdjustmentInterval,
 		SubsidyHalvingInterval: SubsidyHalvingInterval,
+		PruneAfterHeight:       1000,
 		BIP34Height: 21111,
 		// BIP34Hash: hash of testnet3 block 21,111.
 		// Bitcoin Core kernel/chainparams.cpp:213
@@ -392,6 +395,7 @@ func RegtestParams() *ChainParams {
 		CSVHeight:              0,
 		SegwitHeight:           0,
 		TaprootHeight:          0,
+		PruneAfterHeight:       1000,
 		Bech32HRP:              "bcrt",
 		PubKeyHashAddrID:       0x6f,
 		ScriptHashAddrID:       0xc4,
@@ -448,6 +452,7 @@ func SignetParams() *ChainParams {
 		TargetSpacing:          TargetSpacing,
 		DifficultyAdjInterval:  DifficultyAdjustmentInterval,
 		SubsidyHalvingInterval: SubsidyHalvingInterval,
+		PruneAfterHeight:       1000,
 		BIP34Height:            1,
 		BIP65Height:            1,
 		BIP66Height:            1,
@@ -517,6 +522,7 @@ func Testnet4Params() *ChainParams {
 		TargetSpacing:          TargetSpacing,
 		DifficultyAdjInterval:  DifficultyAdjustmentInterval,
 		SubsidyHalvingInterval: SubsidyHalvingInterval,
+		PruneAfterHeight:       1000,
 		BIP34Height:            1,  // All BIPs active from genesis
 		BIP65Height:            1,
 		BIP66Height:            1,

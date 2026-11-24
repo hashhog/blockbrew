@@ -233,6 +233,16 @@ func NewBlockStore(dataDir string, magic uint32, db DB) (*BlockStore, error) {
 	return bs, nil
 }
 
+// SetMaxFileSize caps each blk*.dat file at n bytes, so a short chain spans
+// several files. For tests only, the analogue of Core's -fastprune (64 KiB
+// block files); a node always runs at MaxBlockFileSize. Call before the
+// first write.
+func (bs *BlockStore) SetMaxFileSize(n uint32) {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	bs.maxFileSize = n
+}
+
 // blockFilename returns the filename for a block file.
 func (bs *BlockStore) blockFilename(fileNum int32) string {
 	return filepath.Join(bs.dataDir, fmt.Sprintf("%s%05d.dat", BlockFilePrefix, fileNum))

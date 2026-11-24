@@ -318,36 +318,9 @@ func (p *Pruner) MaybePrune(tipHeight int32) (PruneStats, error) {
 			continue
 		}
 
-		bytesFreed := uint64(fi.Size) + uint64(fi.UndoSize)
-
-		// Drop per-block position index entries for the blocks that lived
-		// in this file. Walk heights HeightFirst..HeightLast inclusive;
-		// look up the canonical hash via chainDB.GetBlockHashByHeight and
-		// delete the block-pos and undo-pos rows. Best-effort: missing
-		// height rows (reorged sidechains, etc.) are skipped silently.
-		for h := int32(fi.HeightFirst); h <= int32(fi.HeightLast); h++ {
-			hash, err := p.chainDB.GetBlockHashByHeight(h)
-			if err != nil {
-				continue
-			}
-			_ = p.bs.DeleteBlockIndex(hash)
-			_ = p.bs.DeleteUndoIndex(hash)
-		}
-
-		// Reset metadata in-memory and persist.
-		if err := p.bs.PruneOneBlockFile(fileNum); err != nil {
-			return stats, fmt.Errorf("flatfile: PruneOneBlockFile(%d): %w", fileNum, err)
-		}
-
-		// Unlink the on-disk files.
-		freed, err := p.bs.UnlinkPrunedFile(fileNum)
+		bytesFreed, err := p.pruneFile(fileNum, fi)
 		if err != nil {
-			return stats, fmt.Errorf("flatfile: UnlinkPrunedFile(%d): %w", fileNum, err)
-		}
-		// Use the larger of (metadata size, fs size) — fs size accounts for
-		// the preallocated tail that the metadata Size doesn't track.
-		if freed > bytesFreed {
-			bytesFreed = freed
+			return stats, err
 		}
 
 		if currentUsage > bytesFreed {
@@ -377,6 +350,105 @@ func (p *Pruner) MaybePrune(tipHeight int32) (PruneStats, error) {
 			newPruneHeight,
 		)
 	}
+	stats.PruneHeight = newPruneHeight
+	return stats, nil
+}
+
+// pruneFile drops one blk/rev pair: the per-block position index rows of
+// the blocks it held, its BlockFileInfo, and the two files on disk. Returns
+// the bytes freed. The caller holds p.mu and has already decided the file
+// is eligible (not the active file, nothing above the safe height).
+func (p *Pruner) pruneFile(fileNum int32, fi BlockFileInfo) (uint64, error) {
+	bytesFreed := uint64(fi.Size) + uint64(fi.UndoSize)
+
+	// Drop per-block position index entries for the blocks that lived
+	// in this file. Walk heights HeightFirst..HeightLast inclusive;
+	// look up the canonical hash via chainDB.GetBlockHashByHeight and
+	// delete the block-pos and undo-pos rows. Best-effort: missing
+	// height rows (reorged sidechains, etc.) are skipped silently.
+	for h := int32(fi.HeightFirst); h <= int32(fi.HeightLast); h++ {
+		hash, err := p.chainDB.GetBlockHashByHeight(h)
+		if err != nil {
+			continue
+		}
+		_ = p.bs.DeleteBlockIndex(hash)
+		_ = p.bs.DeleteUndoIndex(hash)
+	}
+
+	// Reset metadata in-memory and persist.
+	if err := p.bs.PruneOneBlockFile(fileNum); err != nil {
+		return 0, fmt.Errorf("flatfile: PruneOneBlockFile(%d): %w", fileNum, err)
+	}
+
+	// Unlink the on-disk files.
+	freed, err := p.bs.UnlinkPrunedFile(fileNum)
+	if err != nil {
+		return 0, fmt.Errorf("flatfile: UnlinkPrunedFile(%d): %w", fileNum, err)
+	}
+	// Use the larger of (metadata size, fs size) — fs size accounts for
+	// the preallocated tail that the metadata Size doesn't track.
+	if freed > bytesFreed {
+		bytesFreed = freed
+	}
+	return bytesFreed, nil
+}
+
+// PruneManual deletes every block file whose blocks all lie at or below
+// min(pruneHeight, tipHeight - MinBlocksToKeep): the pruneblockchain RPC.
+// Mirrors Core's BlockManager::FindFilesToPruneManual (node/blockstorage.cpp)
+// with Chainstate::GetPruneRange (validation.cpp): a file is pruned when it
+// is non-empty and its highest block is <= the last prunable height; usage
+// and the -prune target play no part, so it works in manual (-prune=1) and
+// automatic mode alike. pruneHeight <= 0 prunes nothing (Core calls it only
+// for nManualPruneHeight > 0). The file being written is never pruned.
+//
+// tipHeight - MinBlocksToKeep is applied here as well as by the RPC caller,
+// so no caller can reach the 288-block window Core always keeps.
+func (p *Pruner) PruneManual(pruneHeight, tipHeight int32) (PruneStats, error) {
+	var stats PruneStats
+	if !p.IsEnabled() || p.chainDB == nil {
+		return stats, nil
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	stats.LastSafeHeight = lastSafeHeight(tipHeight)
+	lastCanPrune := pruneHeight
+	if lastCanPrune > stats.LastSafeHeight {
+		lastCanPrune = stats.LastSafeHeight
+	}
+	newPruneHeight := p.pruneHeight.Load()
+	if pruneHeight <= 0 || tipHeight <= 0 || lastCanPrune <= 0 {
+		stats.PruneHeight = newPruneHeight
+		stats.CurrentUsage = p.bs.CalculateCurrentUsage()
+		return stats, nil
+	}
+
+	files := p.bs.FileInfoSnapshot()
+	currentFile := p.bs.CurrentFile()
+	for fileNum := int32(0); fileNum < int32(len(files)); fileNum++ {
+		fi := files[fileNum]
+		if fi.Size == 0 || fileNum == currentFile || int32(fi.HeightLast) > lastCanPrune {
+			continue
+		}
+		bytesFreed, err := p.pruneFile(fileNum, fi)
+		if err != nil {
+			return stats, err
+		}
+		stats.FilesPruned++
+		stats.BytesPruned += bytesFreed
+		if int32(fi.HeightLast)+1 > newPruneHeight {
+			newPruneHeight = int32(fi.HeightLast) + 1
+		}
+	}
+
+	stats.CurrentUsage = p.bs.CalculateCurrentUsage()
+	if stats.FilesPruned > 0 {
+		p.havePruned.Store(true)
+		p.pruneHeight.Store(newPruneHeight)
+	}
+	log.Printf("prune (manual): prune_height=%d removed %d blk/rev pairs (%d MiB freed)",
+		lastCanPrune, stats.FilesPruned, stats.BytesPruned>>20)
 	stats.PruneHeight = newPruneHeight
 	return stats, nil
 }
