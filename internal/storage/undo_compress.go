@@ -332,7 +332,15 @@ func deserializeBlockUndoCompressed(r *bytes.Reader) (*BlockUndo, error) {
 			if err != nil {
 				return nil, err
 			}
-			if scriptLen > 10000 {
+			// scriptLen counts the compressed form: a 1-byte type tag, then
+			// the body. A script that matches no template is stored verbatim
+			// behind the tag, so a spendable script of exactly
+			// MAX_SCRIPT_SIZE bytes is maxScriptSize+1 bytes here. Bound the
+			// raw script, as Core's ScriptCompression::Unser does
+			// (compressor.h: nSize - nSpecialScripts > MAX_SCRIPT_SIZE). A
+			// longer script is unspendable, so no block can spend it and no
+			// undo record can hold it: such a record is corrupt.
+			if scriptLen > 1+maxScriptSize {
 				return nil, errors.New("undo: compressed script length too large")
 			}
 			compressed := make([]byte, scriptLen)

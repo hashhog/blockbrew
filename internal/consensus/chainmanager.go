@@ -2437,6 +2437,16 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 // storage and best-chain selection are decoupled.
 var ErrSideBranchAccepted = fmt.Errorf("block accepted as side-branch")
 
+// ErrDisconnectFailed marks a reorg that could not disconnect a block of the
+// active chain (its body or undo record could not be read or applied). It is a
+// failure of this node, never a verdict on the block being activated: Core's
+// ActivateBestChainStep fails on DisconnectTip before the new block is checked
+// (validation.cpp), so submitblock's state catcher never fires and the answer
+// is "inconclusive" (rpc/mining.cpp). It must not reach the reject-token
+// mapping, which reads error text and turned the undo decoder's "script"
+// message into "block-script-verify-flag-failed".
+var ErrDisconnectFailed = errors.New("failed to disconnect block")
+
 // ProcessSubmittedBlock handles an externally-submitted block (RPC submitblock
 // path). Unlike ConnectBlock which only extends the active tip, this method
 // also accepts side-branch blocks (parent in header index but not on active
@@ -3582,7 +3592,7 @@ func (cm *ChainManager) reorgToLocked(newTip *BlockNode) error {
 		var disconnected *wire.MsgBlock
 		if err := cm.disconnectBlock(node.Hash, &disconnected); err != nil {
 			rollbackToOriginalTip()
-			return fmt.Errorf("disconnect block %s failed: %w", node.Hash.String()[:16], err)
+			return fmt.Errorf("%w %s: %w", ErrDisconnectFailed, node.Hash.String()[:16], err)
 		}
 		if disconnected != nil {
 			disconnectedOK = append(disconnectedOK, heightBlock{disconnected, node.Height})
@@ -3753,7 +3763,7 @@ func (cm *ChainManager) reorgInMemoryFallback(
 ) error {
 	for _, node := range disconnectNodes {
 		if err := cm.DisconnectBlock(node.Hash); err != nil {
-			return fmt.Errorf("disconnect block %s failed: %w", node.Hash.String()[:16], err)
+			return fmt.Errorf("%w %s: %w", ErrDisconnectFailed, node.Hash.String()[:16], err)
 		}
 	}
 	for _, node := range connectNodes {
