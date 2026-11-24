@@ -97,6 +97,16 @@ var regtestPowLimit = func() *big.Int {
 	return limit
 }()
 
+// signetPowLimit is the highest proof of work value for the default signet:
+// 00000377ae000000000000000000000000000000000000000000000000000000
+// (Core SigNetParams consensus.powLimit, kernel/chainparams.cpp; compact
+// 0x1e0377ae, the signet genesis nBits). It is 1024x easier than mainnet's.
+var signetPowLimit = func() *big.Int {
+	limit := new(big.Int)
+	limit.SetString("00000377ae000000000000000000000000000000000000000000000000000000", 16)
+	return limit
+}()
+
 // mainnetParams holds the chain parameters for mainnet.
 var mainnetParams *ChainParams
 
@@ -447,7 +457,7 @@ func SignetParams() *ChainParams {
 		GenesisBlock:           genesisBlock,
 		GenesisHash:            genesisHash,
 		PowLimitBits:           0x1e0377ae,
-		PowLimit:               mainnetPowLimit, // Same as mainnet
+		PowLimit:               signetPowLimit,
 		TargetTimespan:         TargetTimespan,
 		TargetSpacing:          TargetSpacing,
 		DifficultyAdjInterval:  DifficultyAdjustmentInterval,
