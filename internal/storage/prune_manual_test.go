@@ -216,3 +216,140 @@ func TestAutoPruneDeletesUndoRecords(t *testing.T) {
 		assertUndoKept(t, cdb, h, hash, bs.HasBlock(hash))
 	}
 }
+
+// replacedHeightStore builds the shape Warden reproduced on #82: blocks at
+// heights 0..20 in 1 KiB files, then a replacement block for one height of
+// an early file written later (a reorg or re-download), so it lands in a
+// later file whose height range (HeightFirst..HeightLast) overlaps the early
+// file's, then heights 21..30 so that later file is finished, not active.
+// The height map names the replacement. Returns the height replaced, the
+// stale and replacement hashes, and every hash written with its file.
+func replacedHeightStore(t *testing.T) (bs *BlockStore, cdb *ChainDB, dir string,
+	h int32, stale, repl wire.Hash256, fileOfHash map[wire.Hash256]int32) {
+	t.Helper()
+	dir = t.TempDir()
+	db := NewMemDB()
+	t.Cleanup(func() { db.Close() })
+	var err error
+	bs, err = NewBlockStore(dir, testMagic, db)
+	if err != nil {
+		t.Fatalf("NewBlockStore: %v", err)
+	}
+	t.Cleanup(func() { bs.Close() })
+	bs.mu.Lock()
+	bs.maxFileSize = 1024
+	bs.mu.Unlock()
+	cdb = NewChainDB(db)
+	cdb.SetBlockStore(bs)
+	payload := bytes.Repeat([]byte{0xCD}, 200)
+	fileOfHash = map[wire.Hash256]int32{}
+	write := func(height int32, salt byte) wire.Hash256 {
+		hash := wire.DoubleHashB([]byte{byte(height), byte(height >> 8), salt})
+		pos, err := bs.WriteAndIndexBlock(hash, payload, uint32(height), uint64(height))
+		if err != nil {
+			t.Fatalf("WriteAndIndexBlock(%d): %v", height, err)
+		}
+		if err := cdb.SetBlockHeight(height, hash); err != nil {
+			t.Fatalf("SetBlockHeight(%d): %v", height, err)
+		}
+		if err := cdb.WriteBlockUndo(hash, &BlockUndo{}); err != nil {
+			t.Fatalf("WriteBlockUndo(%d): %v", height, err)
+		}
+		fileOfHash[hash] = pos.FileNum
+		return hash
+	}
+	for height := int32(0); height <= 20; height++ {
+		write(height, 0xA5)
+	}
+	// Replace the top height of file 1, so file 1's HeightLast is exactly
+	// the height whose canonical block now lives elsewhere.
+	h = int32(bs.GetFileInfo(1).HeightLast)
+	stale, _ = cdb.GetBlockHashByHeight(h)
+	repl = write(h, 0x5A)
+	for height := int32(21); height <= 30; height++ {
+		write(height, 0xA5)
+	}
+	if fileOfHash[stale] != 1 || fileOfHash[repl] <= 1 || fileOfHash[repl] == bs.CurrentFile() {
+		t.Fatalf("precondition: stale in file %d, replacement in file %d, current %d",
+			fileOfHash[stale], fileOfHash[repl], bs.CurrentFile())
+	}
+	if fi := bs.GetFileInfo(fileOfHash[repl]); int32(fi.HeightFirst) > h || int32(fi.HeightLast) <= h {
+		t.Fatalf("precondition: replacement file heights %d..%d do not straddle %d",
+			fi.HeightFirst, fi.HeightLast, h)
+	}
+	return bs, cdb, dir, h, stale, repl, fileOfHash
+}
+
+// assertPrunedByFile checks, for every block written, that its position
+// index and undo record are present exactly when its own file was kept, and
+// that the replacement in particular kept both.
+func assertPrunedByFile(t *testing.T, bs *BlockStore, cdb *ChainDB, dir string,
+	h int32, stale, repl wire.Hash256, fileOfHash map[wire.Hash256]int32) {
+	t.Helper()
+	if _, err := os.Stat(filepath.Join(dir, fmtBlockFile(1))); !os.IsNotExist(err) {
+		t.Fatalf("file 1 (HeightLast %d) still on disk: %v", h, err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, fmtBlockFile(fileOfHash[repl]))); err != nil {
+		t.Fatalf("replacement's file %d was removed: %v", fileOfHash[repl], err)
+	}
+	if !bs.HasBlock(repl) {
+		t.Errorf("height %d: the active block's position index (file %d, kept) was deleted", h, fileOfHash[repl])
+	}
+	if _, err := cdb.ReadBlockUndo(repl); err != nil {
+		t.Errorf("height %d: the active block's undo record (file %d, kept) was deleted: %v", h, fileOfHash[repl], err)
+	}
+	if bs.HasBlock(stale) {
+		t.Errorf("height %d: the stale block's position index still points into pruned file 1", h)
+	}
+	if _, err := cdb.ReadBlockUndo(stale); err == nil {
+		t.Errorf("height %d: the stale block in pruned file 1 kept its undo record", h)
+	}
+	for hash, f := range fileOfHash {
+		_, statErr := os.Stat(filepath.Join(dir, fmtBlockFile(f)))
+		kept := statErr == nil
+		if bs.HasBlock(hash) != kept {
+			t.Errorf("block %x in file %d (on disk=%v): position index present=%v", hash[:4], f, kept, !kept)
+		}
+		_, undoErr := cdb.ReadBlockUndo(hash)
+		if (undoErr == nil) != kept {
+			t.Errorf("block %x in file %d (on disk=%v): undo present=%v", hash[:4], f, kept, undoErr == nil)
+		}
+	}
+}
+
+// TestPruneManualSelectsBlocksByFileNotHeight: pruning file 1 removes the
+// blocks stored in file 1, not the blocks the height map names for file 1's
+// height range. The active block at file 1's HeightLast lives in a later,
+// kept file; it must keep its position index and undo (DisconnectBlock of it
+// needs both), and the stale block that was in file 1 is the one removed.
+// The 288-block window does not cover this: the replaced height is at or
+// below tip - 288.
+func TestPruneManualSelectsBlocksByFileNotHeight(t *testing.T) {
+	bs, cdb, dir, h, stale, repl, fileOfHash := replacedHeightStore(t)
+	p := NewPruner(PruneConfig{Manual: true}, bs, cdb)
+	stats, err := manualPrune(t, p, h, h+MinBlocksToKeep)
+	if err != nil {
+		t.Fatalf("PruneManual: %v", err)
+	}
+	if stats.FilesPruned == 0 {
+		t.Fatal("precondition: nothing pruned")
+	}
+	assertPrunedByFile(t, bs, cdb, dir, h, stale, repl, fileOfHash)
+}
+
+// TestAutoPruneSelectsBlocksByFileNotHeight: the automatic pass shares the
+// per-file cleanup and must select by file too.
+func TestAutoPruneSelectsBlocksByFileNotHeight(t *testing.T) {
+	bs, cdb, dir, h, stale, repl, fileOfHash := replacedHeightStore(t)
+	p := NewPruner(PruneConfig{TargetBytes: 1}, bs, cdb)
+	// Tip so that file 1 is prunable but the replacement's file is not.
+	tip := h + MinBlocksToKeep
+	stats, err := p.MaybePrune(tip)
+	if err != nil {
+		t.Fatalf("MaybePrune: %v", err)
+	}
+	if stats.FilesPruned == 0 {
+		t.Fatal("precondition: nothing pruned")
+	}
+	assertPrunedByFile(t, bs, cdb, dir, h, stale, repl, fileOfHash)
+}
