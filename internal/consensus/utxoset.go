@@ -1923,7 +1923,14 @@ func DeserializeUTXOEntry(data []byte) (*UTXOEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	if scriptLen > 10000 {
+	// scriptLen counts the compressed form: a 1-byte type tag, then the body.
+	// CompressScript stores a non-template script verbatim behind the tag, so
+	// a spendable script of exactly MAX_SCRIPT_SIZE bytes is MaxScriptSize+1
+	// bytes here. Bound the raw script, as Core's ScriptCompression::Unser
+	// does (compressor.h: nSize - nSpecialScripts > MAX_SCRIPT_SIZE). A longer
+	// script is unspendable (IsUnspendable) and never enters the set, so such
+	// a record is corrupt.
+	if scriptLen > 1+MaxScriptSize {
 		return nil, errors.New("script too large")
 	}
 	compressedScript := make([]byte, scriptLen)

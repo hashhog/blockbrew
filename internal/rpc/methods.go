@@ -2258,6 +2258,14 @@ func bip22ResultString(err error) string {
 		return "" // caller should return null (success)
 	}
 	switch {
+	// A reorg that could not disconnect a block of the active chain is a
+	// local failure, not a verdict on the submitted block. Core's
+	// ActivateBestChainStep fails on DisconnectTip before the block is ever
+	// checked, so submitblock's state catcher never fires: "inconclusive"
+	// (rpc/mining.cpp submitblock). Checked first: the wrapped cause is a
+	// storage error whose text must never reach the catch-all below.
+	case errors.Is(err, consensus.ErrDisconnectFailed):
+		return "inconclusive"
 	// Core AcceptBlockHeader: BLOCK_CACHED_INVALID for a block (or a child of
 	// a block) already marked failed; BLOCK_INVALID_PREV for a header whose
 	// parent is failed (audit 2026-10-07 BB-3).
