@@ -2470,6 +2470,38 @@ func bip22ResultStringForBlock(block *wire.MsgBlock, err error) string {
 	return bip22ResultString(err)
 }
 
+// checkSideBranchContext runs Core's ContextualCheckBlock for a block that
+// submitblock is about to store on a side branch (AcceptBlock,
+// validation.cpp:4350-4357), against the block's own parent: its height, the
+// parent header and the parent's median-time-past (BIP113 cutoff). verdict is
+// a consensus rejection; on one that is not a mutation, the block is marked
+// failed as Core's InvalidBlockFound does, so a resubmit answers
+// "duplicate-invalid". A bad-version verdict is not marked: Core refuses that
+// header before indexing it at all. fault means the parent's MTP window is
+// not available, which is no verdict on the block.
+func (s *Server) checkSideBranchContext(block *wire.MsgBlock, node *consensus.BlockNode) (verdict, fault error) {
+	if node == nil || node.Parent == nil {
+		return nil, nil
+	}
+	mtp, err := node.Parent.GetMedianTimePastChecked()
+	if err != nil {
+		return nil, err
+	}
+	prev := node.Parent.Header
+	verdict = consensus.CheckBlockContext(block, &prev, node.Height, s.chainParams, uint32(mtp))
+	if verdict == nil {
+		return nil, nil
+	}
+	if s.chainMgr != nil && !consensus.IsBlockMutationErr(verdict) &&
+		!errors.Is(verdict, consensus.ErrBlockVersionTooLow) {
+		_ = s.chainWrite(func() error {
+			s.chainMgr.MarkBlockFailed(node.Hash)
+			return nil
+		})
+	}
+	return verdict, nil
+}
+
 func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, rpcErr *RPCError) {
 	// Recover from any panic during block deserialization or processing to
 	// prevent a malformed submitblock from crashing the node (DoS vector).
@@ -2722,57 +2754,25 @@ func (s *Server) handleSubmitBlock(params json.RawMessage) (result interface{}, 
 	// the side-branch-stored arm needs the body durable for a future reorg
 	// dispatch when a sibling extends this branch past tip work.
 	if !isActiveTip && s.chainDB != nil {
-		// Context-free witness-commitment gate on the side-branch store path.
-		// CheckBlockSanity (above) covers PoW/merkle/weight/legacy-sigops but
-		// NOT the segwit witness commitment — Core keeps that in
-		// CheckWitnessMalleation, which its ProcessNewBlock->CheckBlock
-		// (IsBlockMutated) runs on EVERY submitblock before storage, including
-		// a non-tip-extending sibling. Without this the side-branch is stored
-		// with a corrupted witness commitment (bad-witness-merkle-match) that
-		// Core rejects outright. The active-tip arm already validates it via
-		// ProcessSubmittedBlock->ConnectBlock->CheckBlockContext, so this only
-		// closes the store-and-return-inconclusive gap.
-		// See CORE-PARITY-AUDIT/submitblock-path-differential-2026-07-11.md.
-		if hdrNode != nil && hdrNode.Height >= s.chainParams.SegwitHeight {
-			if werr := consensus.CheckWitnessCommitment(block); werr != nil {
-				return bip22ResultString(werr), nil
-			}
-		}
-
-		// bad-version gate on the side-branch store path.
+		// Block-contextual gates on the side-branch store path.
 		//
-		// Core runs the block-version rules inside ContextualCheckBlockHeader
-		// (validation.cpp:4112-4118) for EVERY header, so a v3 block past the
-		// BIP65/CLTV height is rejected before it can be stored at all.
-		// blockbrew instead enforces version in CheckBlockContext at
-		// block-connect time, and AddHeader deliberately passes
-		// checkVersion=false (headerindex.go:430-432). That is fine for a block
-		// that will be connected — but a side-branch block is stored and
-		// answered "inconclusive" WITHOUT ever connecting, so the gate never
-		// runs and blockbrew keeps a block Core rejects outright.
-		//
-		// Found by the full corpus sweep, 2026-08-02: entry
-		// submitblock-sidebranch/bad-version-v3, Core
-		// reject:bad-version(0x00000003) vs blockbrew "inconclusive"
-		// (receipts/corpus-sweep-2026-08-02.md). ouroboros had the same class
-		// of gap on its own side-branch path.
-		//
-		// Only the store path is changed; the active-tip arm still reaches
-		// CheckBlockContext as before, and the P2P header path is untouched.
-		// The reason string is built here rather than routed through
-		// bip22ResultString because Core embeds the offending version inline —
-		// strprintf("bad-version(0x%08x)", block.nVersion) at
-		// validation.cpp:4116 — so it cannot be a fixed token. Routing it
-		// through the mapper would reject correctly but report the generic
-		// "rejected", turning a fixed consensus split into a pointless
-		// error-code divergence.
-		if hdrNode != nil {
-			if verr := consensus.CheckBlockHeaderVersion(
-				block.Header.Version, hdrNode.Height, s.chainParams,
-			); verr != nil {
-				return fmt.Sprintf("bad-version(0x%08x)",
-					uint32(block.Header.Version)), nil
-			}
+		// Core's AcceptBlock runs CheckBlock + ContextualCheckBlock
+		// (validation.cpp:4350-4357) on EVERY block it is about to write,
+		// including a lower- or equal-work side branch it will not connect:
+		// finality (bad-txns-nonfinal), BIP34 (bad-cb-height), the witness
+		// commitment / unexpected-witness, and the witness-inclusive weight
+		// (bad-blk-weight). This arm used to run only the witness commitment
+		// and the BIP34/66/65 header version (corpus sweep 2026-08-02,
+		// submitblock-sidebranch/bad-version-v3), so any other contextual
+		// failure was stored and answered "inconclusive". CheckBlockContext is
+		// the same function ConnectBlock runs on the active-tip arm, given the
+		// side block's own parent, height and parent MTP; it covers both
+		// earlier gates, and bip22ResultStringForBlock keeps the
+		// bad-version(0x%08x) form.
+		if verdict, fault := s.checkSideBranchContext(block, hdrNode); fault != nil {
+			return nil, &RPCError{Code: RPCErrVerify, Message: fault.Error()}
+		} else if verdict != nil {
+			return bip22ResultStringForBlock(block, verdict), nil
 		}
 		if err := s.chainDB.StoreBlock(hash, block); err != nil {
 			return nil, &RPCError{Code: RPCErrInternal, Message: fmt.Sprintf("Failed to store block: %v", err)}
@@ -2936,6 +2936,14 @@ func (s *Server) handleSubmitBlockBatch(params json.RawMessage) (result interfac
 		}
 
 		if !isActiveTipBatch && s.chainDB != nil {
+			// Same AcceptBlock-time contextual gate as handleSubmitBlock.
+			if verdict, fault := s.checkSideBranchContext(block, s.headerIndex.GetNode(hash)); fault != nil {
+				results[i] = fmt.Sprintf("block context check failed: %v", fault)
+				continue
+			} else if verdict != nil {
+				results[i] = fmt.Sprintf("block context check failed: %v", verdict)
+				continue
+			}
 			if err := s.chainDB.StoreBlock(hash, block); err != nil {
 				results[i] = fmt.Sprintf("failed to store block: %v", err)
 				continue
