@@ -354,18 +354,26 @@ func (p *Pruner) MaybePrune(tipHeight int32) (PruneStats, error) {
 	return stats, nil
 }
 
-// pruneFile drops one blk/rev pair: the per-block position index rows of
-// the blocks it held, its BlockFileInfo, and the two files on disk. Returns
-// the bytes freed. The caller holds p.mu and has already decided the file
-// is eligible (not the active file, nothing above the safe height).
+// pruneFile drops one blk/rev pair: the per-block position index rows and
+// undo records of the blocks it held, its BlockFileInfo, and the two files
+// on disk. Returns the bytes freed. The caller holds p.mu and has already
+// decided the file is eligible (not the active file, nothing above the safe
+// height).
 func (p *Pruner) pruneFile(fileNum int32, fi BlockFileInfo) (uint64, error) {
 	bytesFreed := uint64(fi.Size) + uint64(fi.UndoSize)
 
-	// Drop per-block position index entries for the blocks that lived
-	// in this file. Walk heights HeightFirst..HeightLast inclusive;
-	// look up the canonical hash via chainDB.GetBlockHashByHeight and
-	// delete the block-pos and undo-pos rows. Best-effort: missing
+	// Drop per-block entries for the blocks that lived in this file. Walk
+	// heights HeightFirst..HeightLast inclusive; look up the canonical hash
+	// via chainDB.GetBlockHashByHeight and delete the block-pos and
+	// undo-pos rows and the block's undo record. Best-effort: missing
 	// height rows (reorged sidechains, etc.) are skipped silently.
+	//
+	// The undo record lives in Pebble (ChainDB.WriteBlockUndoBatch), not in
+	// rev*.dat, so unlinking the files does not free it. Core's undo is in
+	// the rev file and goes with the block file; without this the undo of
+	// every block (written since undo stopped being skipped under
+	// assume-valid) would outlive pruning and the -prune target would not
+	// bound disk use.
 	for h := int32(fi.HeightFirst); h <= int32(fi.HeightLast); h++ {
 		hash, err := p.chainDB.GetBlockHashByHeight(h)
 		if err != nil {
@@ -373,6 +381,7 @@ func (p *Pruner) pruneFile(fileNum int32, fi BlockFileInfo) (uint64, error) {
 		}
 		_ = p.bs.DeleteBlockIndex(hash)
 		_ = p.bs.DeleteUndoIndex(hash)
+		_ = p.chainDB.DeleteBlockUndo(hash)
 	}
 
 	// Reset metadata in-memory and persist.

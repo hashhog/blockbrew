@@ -425,8 +425,8 @@ func (s *Server) handleImportMempool(params json.RawMessage) (interface{}, *RPCE
 }
 
 // handlePruneBlockchain implements Core's pruneblockchain RPC
-// (rpc/blockchain.cpp:908-963): delete block and undo files up to a height or
-// a block time, and return the height of the last block pruned (-1 when
+// (rpc/blockchain.cpp:908-963): delete block files and the blocks' undo up
+// to a height or a block time, and return the height of the last block pruned (-1 when
 // nothing is pruned).
 //
 // Errors, in Core's order:

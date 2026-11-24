@@ -242,6 +242,13 @@ func TestPruneBlockchainPrunesToHeight(t *testing.T) {
 		if int64(h) > want && !has {
 			t.Fatalf("block %d is above the pruned height %d but its body is gone", h, want)
 		}
+		_, undoErr := r.cdb.ReadBlockUndo(r.hashAt(t, h))
+		if int64(h) <= want && undoErr == nil {
+			t.Fatalf("block %d was pruned but its undo record is still on disk", h)
+		}
+		if int64(h) > want && undoErr != nil {
+			t.Fatalf("block %d is above the pruned height %d but its undo is gone: %v", h, want, undoErr)
+		}
 	}
 	// getblockchaininfo agrees: pruneheight is the first unpruned block.
 	info := testRPCRequest(t, r.server.handleRPC, "getblockchaininfo", []interface{}{}, "", "")

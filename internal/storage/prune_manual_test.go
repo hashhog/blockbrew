@@ -52,6 +52,9 @@ func manualPruneStore(t *testing.T, first, last int) (*BlockStore, *ChainDB, str
 		if err := cdb.SetBlockHeight(int32(h), hash); err != nil {
 			t.Fatalf("SetBlockHeight(%d): %v", h, err)
 		}
+		if err := cdb.WriteBlockUndo(hash, &BlockUndo{}); err != nil {
+			t.Fatalf("WriteBlockUndo(%d): %v", h, err)
+		}
 	}
 	if bs.MaxBlockfileNum() < 4 {
 		t.Fatalf("precondition: want >= 4 block files, got %d", bs.MaxBlockfileNum())
@@ -113,10 +116,12 @@ func TestPruneManualPrunesFilesAtOrBelowHeight(t *testing.T) {
 	for h := int32(0); h <= 40; h++ {
 		hash, _ := cdb.GetBlockHashByHeight(h)
 		fi := before[fileOf[h]]
-		if want := fi.HeightLast > pruneTo || fileOf[h] == bs.CurrentFile(); bs.HasBlock(hash) != want {
+		want := fi.HeightLast > pruneTo || fileOf[h] == bs.CurrentFile()
+		if bs.HasBlock(hash) != want {
 			t.Errorf("height %d (file %d, heights %d..%d): block index present=%v, want %v",
 				h, fileOf[h], fi.HeightFirst, fi.HeightLast, !want, want)
 		}
+		assertUndoKept(t, cdb, h, hash, want)
 	}
 	if !p.HavePruned() || p.PruneHeight() == 0 {
 		t.Errorf("after a manual prune: HavePruned=%v PruneHeight=%d", p.HavePruned(), p.PruneHeight())
@@ -167,5 +172,47 @@ func TestPruneManualZeroHeightIsNoOp(t *testing.T) {
 	}
 	if p.HavePruned() || off.HavePruned() {
 		t.Error("HavePruned=true after a no-op")
+	}
+}
+
+// assertUndoKept checks the block's undo record is on disk exactly when its
+// block file was kept. Core keeps undo in the rev file, which is deleted
+// with the block file; blockbrew keeps it in Pebble, so pruning must delete
+// it there.
+func assertUndoKept(t *testing.T, cdb *ChainDB, h int32, hash wire.Hash256, kept bool) {
+	t.Helper()
+	_, err := cdb.ReadBlockUndo(hash)
+	if kept && err != nil {
+		t.Errorf("height %d: block file kept but its undo record is gone: %v", h, err)
+	}
+	if !kept && err == nil {
+		t.Errorf("height %d: block file pruned but its undo record is still on disk", h)
+	}
+}
+
+// TestAutoPruneDeletesUndoRecords: the automatic pass frees the undo of the
+// blocks in the files it prunes, as Core's rev files go with blk files.
+func TestAutoPruneDeletesUndoRecords(t *testing.T) {
+	bs, cdb, _ := manualPruneStore(t, 0, 40)
+	fileOf := map[int32]int32{}
+	for h := int32(0); h <= 40; h++ {
+		hash, _ := cdb.GetBlockHashByHeight(h)
+		pos, err := bs.GetBlockPos(hash)
+		if err != nil {
+			t.Fatalf("GetBlockPos(%d): %v", h, err)
+		}
+		fileOf[h] = pos.FileNum
+	}
+	p := NewPruner(PruneConfig{TargetBytes: 1}, bs, cdb)
+	stats, err := p.MaybePrune(1000)
+	if err != nil {
+		t.Fatalf("MaybePrune: %v", err)
+	}
+	if stats.FilesPruned == 0 {
+		t.Fatal("precondition: the automatic pass pruned nothing")
+	}
+	for h := int32(0); h <= 40; h++ {
+		hash, _ := cdb.GetBlockHashByHeight(h)
+		assertUndoKept(t, cdb, h, hash, bs.HasBlock(hash))
 	}
 }
