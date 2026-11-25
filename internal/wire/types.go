@@ -19,7 +19,25 @@ const (
 	MaxTxInputs = 100_000
 
 	// MaxTxOutputs is the maximum number of outputs in a single transaction.
-	MaxTxOutputs = 100_000
+	//
+	// This is a DoS bound only and must never be tighter than consensus.
+	// Bitcoin Core has no output-count cap at deserialization (only
+	// MAX_SIZE = 0x02000000 on the CompactSize); the real limit is the
+	// stripped-size rule (CheckTransaction "bad-txns-oversize" and CheckBlock
+	// "bad-blk-length": stripped size <= 1,000,000 bytes). A minimal output
+	// is 9 bytes (8-byte value + 1-byte empty scriptPubKey length), so a
+	// consensus-valid transaction can carry about 111,100 outputs; the former
+	// cap of 100,000 made blockbrew reject valid blocks at the wire layer.
+	// MaxBlockSerializedSize / 9 = 444,444 is the most outputs any message
+	// we deserialize (block or tx, <= 4,000,000 bytes) could physically
+	// carry, so it rejects nothing that can be valid while still refusing a
+	// peer-declared count of millions up front. Slices are sized with
+	// preallocCap, so a large declared count does not preallocate.
+	MaxTxOutputs = MaxBlockSerializedSize / minTxOutSize
+
+	// minTxOutSize is the smallest serialized TxOut: 8-byte value plus a
+	// 1-byte CompactSize for an empty scriptPubKey.
+	minTxOutSize = 9
 
 	// MaxWitnessItems is the maximum number of witness items per input.
 	//
