@@ -4894,7 +4894,7 @@ func (sm *SyncManager) connectPendingBlocks(pending map[int32]*blockWithRequest)
 				releaseGate := sm.chainWriterGate()
 				defer releaseGate()
 				if sm.chainMgr.IsIBD() && !sm.isForkOffActiveTip(bwr.req.Hash) {
-					connectErr = sm.chainMgr.ConnectBlock(bwr.block)
+					connectErr = sm.connectSanityCheckedBlock(bwr.block)
 				} else {
 					connectErr = sm.chainMgr.ProcessSubmittedBlock(bwr.block)
 					if errors.Is(connectErr, consensus.ErrSideBranchAccepted) {
@@ -5371,6 +5371,25 @@ func (bwr *blockWithRequest) deliverer() *Peer {
 		return bwr.req.Peer
 	}
 	return nil
+}
+
+// sanityCheckedConnector is implemented by *consensus.ChainManager. Optional
+// on ChainConnector so test doubles need not implement it.
+type sanityCheckedConnector interface {
+	ConnectBlockSanityChecked(block *wire.MsgBlock) error
+}
+
+// connectSanityCheckedBlock connects a block from the connect loop. Every
+// body reaching it was run through consensus.CheckBlockSanity by
+// validationWorker (bwr.block, the same object, is what req.pipelineBlock
+// holds once the request is Validated), so the chain manager may skip the
+// repeated sanity pass during IBD. Connectors without the method get plain
+// ConnectBlock.
+func (sm *SyncManager) connectSanityCheckedBlock(block *wire.MsgBlock) error {
+	if c, ok := sm.chainMgr.(sanityCheckedConnector); ok {
+		return c.ConnectBlockSanityChecked(block)
+	}
+	return sm.chainMgr.ConnectBlock(block)
 }
 
 // blockFailureMarker is implemented by *consensus.ChainManager. Optional on

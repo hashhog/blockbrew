@@ -1489,7 +1489,29 @@ type durableUTXOView interface {
 	StageFlush(batch storage.Batch) (*StagedFlush, error)
 }
 
+// ConnectBlock validates block and connects it to the active tip. It always
+// runs the context-free CheckBlockSanity first, in or out of IBD, as Bitcoin
+// Core's ConnectBlock always runs CheckBlock (validation.cpp:2320). Every
+// caller that has not itself just run CheckBlockSanity on this same block
+// object — import-blocks, ReorgTo replay, boot recovery replay, the miner,
+// submitblock — must use this entry point.
 func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
+	return cm.connectBlock(block, false)
+}
+
+// ConnectBlockSanityChecked is ConnectBlock for a caller that has JUST run
+// CheckBlockSanity (same params, PoW checked) on this same *wire.MsgBlock and
+// rejected it on failure: the P2P sync connect loop, whose validationWorker
+// does exactly that before handing the block on. While in IBD it skips the
+// repeated sanity pass, so IBD does not pay for it twice; outside IBD it runs
+// it anyway, as ConnectBlock does. This mirrors Core's CBlock::fChecked,
+// which caches CheckBlock only on the same in-memory object. Do not call it
+// with a block read back from disk or received from anywhere else.
+func (cm *ChainManager) ConnectBlockSanityChecked(block *wire.MsgBlock) error {
+	return cm.connectBlock(block, true)
+}
+
+func (cm *ChainManager) connectBlock(block *wire.MsgBlock, sanityChecked bool) error {
 	if !cm.beginMutation() {
 		return mutationRefused()
 	}
@@ -1606,8 +1628,13 @@ func (cm *ChainManager) ConnectBlock(block *wire.MsgBlock) error {
 	// 2-week equivalent-time burial. See shouldSkipScripts for details.
 	skipScripts := cm.shouldSkipScripts(node)
 
-	// Full block validation (skip sanity during IBD -- already done by validationWorker)
-	if !cm.isIBD {
+	// Context-free block validation (Core CheckBlock). Skipped only for the
+	// P2P sync connect loop during IBD, whose validationWorker has just run
+	// it on this same object (ConnectBlockSanityChecked). It used to be
+	// skipped on cm.isIBD alone, which also let import-blocks, ReorgTo replay
+	// and boot recovery replay connect blocks with a wrong merkle root, a
+	// second coinbase or excessive coinbase sigops while in IBD.
+	if !(sanityChecked && cm.isIBD) {
 		err := CheckBlockSanity(block, cm.params.PowLimit)
 		if err != nil {
 			return blockVerdict(hash, fmt.Errorf("block sanity check failed: %w", err))
