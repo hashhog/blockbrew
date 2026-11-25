@@ -679,16 +679,16 @@ func (e *Engine) opCheckSig(script []byte) error {
 			scriptCode := e.currentScript[e.lastCodeSepIdx:]
 			sighash, err = CalcWitnessSignatureHash(scriptCode, hashType, e.tx, e.txIdx, e.amount)
 		}
-		if err != nil {
-			e.stack.PushBool(false)
-			return nil
+		// A key that does not parse (e.g. a 0x02-prefixed x off the curve,
+		// which passes the STRICTENC shape check) is a FAILED check, not an
+		// early exit: Core's CheckECDSASignature returns false for
+		// !pubkey.IsValid() and EvalChecksigPreTapscript then applies
+		// NULLFAIL to the non-empty signature (interpreter.cpp:338-340).
+		if err == nil {
+			if pubKey, pkErr := crypto.PublicKeyFromBytes(pubKeyBytes); pkErr == nil {
+				valid = crypto.VerifyECDSALax(pubKey, sighash, sig)
+			}
 		}
-		pubKey, err := crypto.PublicKeyFromBytes(pubKeyBytes)
-		if err != nil {
-			e.stack.PushBool(false)
-			return nil
-		}
-		valid = crypto.VerifyECDSALax(pubKey, sighash, sig)
 
 		// NULLFAIL: non-empty signature that fails verification must cause error
 		if !valid && len(sigBytes) > 0 && (e.flags&ScriptVerifyNullFail != 0) {
@@ -1261,6 +1261,37 @@ func IsValidDERSignatureEncoding(sig []byte) bool {
 	return true
 }
 
+// stripLeadingZeros drops leading 0x00 bytes from a big-endian integer.
+func stripLeadingZeros(b []byte) []byte {
+	for len(b) > 0 && b[0] == 0x00 {
+		b = b[1:]
+	}
+	return b
+}
+
+// lessThanCurveOrder reports whether the big-endian value b (no leading
+// zeros) is below the secp256k1 group order N.
+func lessThanCurveOrder(b []byte) bool {
+	n := [32]byte{
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE,
+		0xBA, 0xAE, 0xDC, 0xE6, 0xAF, 0x48, 0xA0, 0x3B,
+		0xBF, 0xD2, 0x5E, 0x8C, 0xD0, 0x36, 0x41, 0x41,
+	}
+	if len(b) < 32 {
+		return true
+	}
+	if len(b) > 32 {
+		return false
+	}
+	for i := 0; i < 32; i++ {
+		if b[i] != n[i] {
+			return b[i] < n[i]
+		}
+	}
+	return false
+}
+
 // IsLowSSignature checks that the S value in a DER-encoded signature is in the
 // lower half of the curve order (BIP62 rule 5). The signature must already be
 // valid DER encoding. The signature includes the sighash type byte.
@@ -1284,11 +1315,20 @@ func IsLowSSignature(sig []byte) bool {
 		0xDF, 0xE9, 0x2F, 0x46, 0x68, 0x1B, 0x20, 0xA0,
 	}
 
+	// Core CPubKey::CheckLowS parses with ecdsa_signature_parse_der_lax,
+	// which replaces the whole signature by (0, 0) when R or S does not fit
+	// in 32 bytes or is >= the curve order; secp256k1_ecdsa_signature_normalize
+	// then reports "not high", so such a signature PASSES LOW_S (and simply
+	// fails verification later).
+	rBytes := stripLeadingZeros(sig[4 : 4+lenR])
+	sBytes = stripLeadingZeros(sBytes)
+	if !lessThanCurveOrder(rBytes) || !lessThanCurveOrder(sBytes) {
+		return true
+	}
+	lenS = len(sBytes)
+
 	// Pad S to 32 bytes for comparison
 	var sPadded [32]byte
-	if lenS > 32 {
-		return false
-	}
 	copy(sPadded[32-lenS:], sBytes)
 
 	// Compare: S must be <= halfOrder
