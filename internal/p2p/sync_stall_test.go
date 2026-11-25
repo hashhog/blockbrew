@@ -659,7 +659,7 @@ func nearMaxWeightBlock(t *testing.T, prev wire.Hash256, timestamp uint32) *wire
 	}
 	hashes := []wire.Hash256{coinbase.TxHash(), padding.TxHash()}
 	block.Header = wire.BlockHeader{
-		Version:    1,
+		Version:    4,
 		PrevBlock:  prev,
 		MerkleRoot: consensus.CalcMerkleRoot(hashes),
 		Timestamp:  timestamp,
@@ -1118,7 +1118,7 @@ func largeSerializedNearMaxBlock(t *testing.T, prev wire.Hash256, timestamp uint
 	copy(commitOut.PkScript[6:], commit[:])
 	hashes := []wire.Hash256{coinbase.TxHash(), padding.TxHash()}
 	block.Header = wire.BlockHeader{
-		Version:    1,
+		Version:    4,
 		PrevBlock:  prev,
 		MerkleRoot: consensus.CalcMerkleRoot(hashes),
 		Timestamp:  timestamp,

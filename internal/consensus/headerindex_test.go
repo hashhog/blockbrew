@@ -11,7 +11,7 @@ import (
 // Uses brute force to find a valid nonce (regtest is very easy).
 func createTestHeader(prevHash wire.Hash256, timestamp uint32, baseNonce uint32) wire.BlockHeader {
 	header := wire.BlockHeader{
-		Version:    1,
+		Version:    4, // BIP34/66/65 are active from height 1 on regtest
 		PrevBlock:  prevHash,
 		MerkleRoot: wire.Hash256{},
 		Timestamp:  timestamp,
