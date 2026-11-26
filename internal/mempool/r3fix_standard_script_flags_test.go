@@ -10,9 +10,11 @@
 // tapscript pubkey types, non-minimal pushes / IF arguments, unclean P2SH
 // stacks and OP_CODESEPARATOR in legacy scripts.
 //
-// Every reject case below is consensus-valid (the block flags accept it); a
-// positive control of the same shape is accepted, so the reject is the policy
-// flag and not some other gate.
+// Every policy-flag reject case below is consensus-valid (the block flags
+// accept it); a positive control of the same shape is accepted, so the reject
+// is the policy flag and not some other gate. The truncated-push pre-scan
+// cases (TestR3Fix_TapscriptPrescanTruncatedPush) are invalid at block flags
+// by design; only their reported error moves.
 package mempool
 
 import (
