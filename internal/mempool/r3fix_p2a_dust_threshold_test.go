@@ -139,3 +139,42 @@ func TestR3Fix_P2AValuesAroundThreshold(t *testing.T) {
 		}
 	}
 }
+
+// TestR3Fix_P2AZeroSatAnchorInZeroFeeParentStillCPFPs is the control for the
+// direction that must keep working: a 0-fee parent carrying a 0-sat anchor
+// (now dust) plus a child that spends the anchor and pays for both. Core
+// admits it: IsStandardTx allows one dust output (MAX_DUST_OUTPUTS_PER_TX),
+// PreCheckEphemeralTx passes because the parent's fee is 0, and
+// CheckEphemeralSpends passes because the child spends the dust
+// (policy/ephemeral_policy.cpp). Making P2A dust below 240 sat must not
+// break ephemeral anchors.
+func TestR3Fix_P2AZeroSatAnchorInZeroFeeParentStillCPFPs(t *testing.T) {
+	mp, op := spendableMempool(0xa2, cpfpFunding)
+	parent := spendableTx(op, cpfpFunding, 1) // pays 0 fee
+	parent.TxOut = append(parent.TxOut, &wire.TxOut{Value: 0, PkScript: r3p2aScript})
+	if !mp.isDust(parent.TxOut[1]) {
+		t.Fatal("fixture: the 0-sat anchor must be dust, as in Core")
+	}
+	child := spendableTx(wire.OutPoint{Hash: parent.TxHash(), Index: 0}, cpfpFunding-20_000, 1)
+	child.TxIn = append(child.TxIn, &wire.TxIn{
+		PreviousOutPoint: wire.OutPoint{Hash: parent.TxHash(), Index: 1}, // the anchor: empty scriptSig and witness
+		Sequence:         0xffffffff,
+	})
+	res, err := mp.AcceptPackage([]*wire.MsgTx{parent, child})
+	if err != nil {
+		t.Fatalf("ephemeral-anchor CPFP package refused (Core accepts it): %v", err)
+	}
+	for _, tx := range []*wire.MsgTx{parent, child} {
+		if r := res.TxResults[tx.WTxHash()]; r == nil || !r.Accepted || !mp.HasTransaction(tx.TxHash()) {
+			t.Fatalf("package member %s not accepted: %+v", tx.TxHash(), r)
+		}
+	}
+
+	// Negative control: the same parent paying a fee is refused for its dust.
+	mp2, op2 := spendableMempool(0xa3, cpfpFunding)
+	feeParent := spendableTx(op2, cpfpFunding-1_000, 1)
+	feeParent.TxOut = append(feeParent.TxOut, &wire.TxOut{Value: 0, PkScript: r3p2aScript})
+	if err := mp2.AddTransaction(feeParent); !errors.Is(err, ErrEphemeralDustNonZeroFee) {
+		t.Fatalf("fee-paying parent with a 0-sat anchor: got %v, want Core's dust/0-fee refusal", err)
+	}
+}
