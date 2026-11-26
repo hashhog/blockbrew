@@ -11,7 +11,6 @@ import (
 	"github.com/hashhog/blockbrew/internal/address"
 	"github.com/hashhog/blockbrew/internal/consensus"
 	"github.com/hashhog/blockbrew/internal/mempool"
-	"github.com/hashhog/blockbrew/internal/script"
 	"github.com/hashhog/blockbrew/internal/wallet"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -1187,8 +1186,9 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		}
 
 		// --- Input-dependent gates (need the prevout view). Order mirrors the
-		// real accept path: per-tx sigops cost, then input-standardness sigops,
-		// then coinbase maturity (mempool.go PreChecks 5d gates 1-3, then step 6). ---
+		// real accept path: per-tx sigops cost (mempool.go PreChecks 5d gate 1),
+		// then coinbase maturity and in-belowout (step 6), then input
+		// standardness (step 6b, ValidateInputsStandardness). ---
 
 		// Per-tx BIP141 sigops cost (MAX_STANDARD_TX_SIGOPS_COST = 16000). Reuses
 		// the exact helper the real path calls so P2SH redeem-script + witness
@@ -1197,42 +1197,6 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if consensus.GetTransactionSigOpCost(tx, prevoutView, s.mempool.ConsensusScriptFlags()) > consensus.MaxStandardTxSigOpsCost {
 			result.Allowed = false
 			result.RejectReason = "bad-txns-too-many-sigops"
-			results = append(results, result)
-			continue
-		}
-
-		// Input standardness — P2SH per-input redeemScript sigops (MAX_P2SH_SIGOPS
-		// = 15) and total non-witness (legacy) sigops (BIP54 MAX_TX_LEGACY_SIGOPS
-		// = 2500). Both surface as bad-txns-nonstandard-inputs in Core. Mirrors
-		// mempool.go PreChecks 5d gates 2 & 3 (ValidateInputsStandardness). The
-		// pre-fix dry-run validated no input standardness.
-		nonstdReason := ""
-		for _, txIn := range tx.TxIn {
-			utxo := prevoutView.GetUTXO(txIn.PreviousOutPoint)
-			if utxo == nil || !script.IsP2SH(utxo.PkScript) {
-				continue
-			}
-			if consensus.CountScriptSigOps(txIn.SignatureScript) > consensus.MaxP2SHSigOpsPerInput {
-				nonstdReason = "bad-txns-nonstandard-inputs"
-				break
-			}
-		}
-		if nonstdReason == "" {
-			var legacySigops int
-			for _, txIn := range tx.TxIn {
-				legacySigops += consensus.CountSigOpsAccurate(txIn.SignatureScript)
-				if utxo := prevoutView.GetUTXO(txIn.PreviousOutPoint); utxo != nil {
-					legacySigops += consensus.CountScriptPubKeySigOps(utxo.PkScript, txIn.SignatureScript)
-				}
-				if legacySigops > consensus.MaxTxLegacySigOps {
-					nonstdReason = "bad-txns-nonstandard-inputs"
-					break
-				}
-			}
-		}
-		if nonstdReason != "" {
-			result.Allowed = false
-			result.RejectReason = nonstdReason
 			results = append(results, result)
 			continue
 		}
@@ -1280,6 +1244,27 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		if fee < 0 {
 			result.Allowed = false
 			result.RejectReason = "bad-txns-in-belowout"
+			results = append(results, result)
+			continue
+		}
+
+		// ValidateInputsStandardness (Core policy.cpp, validation.cpp:903): the
+		// same helper the real accept path runs. BIP54 legacy sigops, then
+		// Solver on each prevout (NONSTANDARD / WITNESS_UNKNOWN refused) and,
+		// for P2SH, the scriptSig evaluated with no flags (must succeed, leave a
+		// non-empty stack, and a redeemScript of <= 15 sigops). Core runs it
+		// after CheckTxInputs (premature spend, in-belowout) and before the
+		// min-relay-fee check, so it sits here. Core reject token:
+		// bad-txns-nonstandard-inputs.
+		if err := mempool.ValidateInputsStandardness(tx, prevoutView.GetUTXO); err != nil {
+			result.Allowed = false
+			var rej *mempool.RBFRejectError
+			if errors.As(err, &rej) {
+				result.RejectReason = rej.Reason
+				result.RejectDetails = rej.Error()
+			} else {
+				result.RejectReason = "bad-txns-nonstandard-inputs"
+			}
 			results = append(results, result)
 			continue
 		}
