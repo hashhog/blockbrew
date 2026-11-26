@@ -1277,21 +1277,25 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 		}
 	}
 
-	// 6b. ValidateInputsStandardness (Core policy.cpp, validation.cpp:903):
-	// BIP54 legacy sigops, then Solver on each prevout (NONSTANDARD and
-	// WITNESS_UNKNOWN refused) and, for P2SH, the scriptSig evaluated with no
-	// flags (must succeed and leave a redeemScript of <= 15 sigops). Core runs
-	// it after the missing-inputs check and CheckTxInputs, so a tx with a
-	// missing input or outputs above its inputs is left to those checks.
-	if len(missingInputs) == 0 {
-		var outSum int64
-		for _, out := range tx.TxOut {
-			outSum += out.Value
-		}
-		if totalInputValue >= outSum {
-			if err := ValidateInputsStandardness(tx, mp.lookupOutputLocked); err != nil {
-				return err
-			}
+	// 6b. ValidateInputsStandardness (Core policy.cpp AreInputsStandard,
+	// validation.cpp:903): BIP54 legacy sigops, then Solver on each prevout
+	// (NONSTANDARD and WITNESS_UNKNOWN refused) and, for P2SH, the scriptSig
+	// evaluated with no flags (must succeed and leave a redeemScript of <= 15
+	// sigops).
+	//
+	// Core reaches it only after every check it runs earlier has passed. This
+	// path runs some of those later than Core does, so a tx that would fail
+	// one of them is left to that check (which then answers as before):
+	//   - a missing input (TX_MISSING_INPUTS, validation.cpp:857-879);
+	//   - more than one dust output (IsStandardTx "dust", policy.cpp, the
+	//     first thing PreChecks runs; judged here at step 9);
+	//   - BIP68 sequence locks (non-BIP68-final, validation.cpp:894; judged
+	//     here at step 10b);
+	//   - outputs above inputs (CheckTxInputs bad-txns-in-belowout,
+	//     validation.cpp:899; judged here at step 7).
+	if len(missingInputs) == 0 && mp.inputsStandardnessReachedLocked(tx, totalInputValue) {
+		if err := ValidateInputsStandardness(tx, mp.lookupOutputLocked); err != nil {
+			return err
 		}
 	}
 
@@ -1838,6 +1842,26 @@ func (mp *Mempool) checkStandardnessLocked(tx *wire.MsgTx) error {
 	}
 
 	return nil
+}
+
+// inputsStandardnessReachedLocked reports whether Core's PreChecks would get
+// as far as AreInputsStandard for tx (all inputs present), given the checks
+// Core runs before it that this accept path only runs later: IsStandardTx's
+// dust count (more than MAX_DUST_OUTPUTS_PER_TX = 1 dust output is "dust"),
+// BIP68 sequence locks, and CheckTxInputs' outputs <= inputs.
+func (mp *Mempool) inputsStandardnessReachedLocked(tx *wire.MsgTx, totalInputValue int64) bool {
+	var outSum int64
+	dust := 0
+	for _, out := range tx.TxOut {
+		outSum += out.Value
+		if mp.isDust(out) {
+			dust++
+		}
+	}
+	if dust > 1 || outSum > totalInputValue {
+		return false
+	}
+	return mp.checkSequenceLocksLocked(tx) == nil
 }
 
 // isStandardOutputScript returns true if pkScript is a known-standard output

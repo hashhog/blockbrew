@@ -81,6 +81,27 @@ func TestR3fixAreInputsStandardSolverTestMempoolAcceptP2WPKHControl(t *testing.T
 	}
 }
 
+// TestR3fixAreInputsStandardSolverTestMempoolAcceptInBelowoutFirst: Core runs
+// CheckTxInputs (bad-txns-in-belowout, validation.cpp:899) before
+// AreInputsStandard (:903), so the R106 tx paying out more than its bare OP_1
+// coin holds is in-belowout, not bad-txns-nonstandard-inputs.
+func TestR3fixAreInputsStandardSolverTestMempoolAcceptInBelowoutFirst(t *testing.T) {
+	raw, _ := hex.DecodeString(r3fixAISMinimisedHex)
+	tx := &wire.MsgTx{}
+	if err := tx.Deserialize(bytes.NewReader(raw)); err != nil {
+		t.Fatalf("deserialize: %v", err)
+	}
+	view := consensus.NewInMemoryUTXOView()
+	view.AddUTXO(tx.TxIn[0].PreviousOutPoint, &consensus.UTXOEntry{Amount: 50_000, PkScript: []byte{0x51}, Height: 10})
+	cfg := mempool.DefaultConfig()
+	cfg.ChainState = &tmaFakeChainState{height: 200, mtp: 1_600_000_000}
+	srv := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0"}, WithMempool(mempool.New(cfg, view)))
+	r := runTMA(t, srv, r3fixAISMinimisedHex)
+	if r.Allowed || r.RejectReason != "bad-txns-in-belowout" {
+		t.Fatalf("allowed=%v reject-reason=%q, want allowed=false bad-txns-in-belowout", r.Allowed, r.RejectReason)
+	}
+}
+
 // p2shOpTrueTestScript is P2SH(OP_TRUE), a coin fixtures can spend without a
 // signature that Core's ValidateInputsStandardness still accepts (Solver
 // SCRIPTHASH). Fixtures used to fund from a bare OP_1 output, which Core

@@ -193,9 +193,11 @@ func TestR3fixAreInputsStandardSolverAdmits(t *testing.T) {
 	}
 }
 
-// TestR3fixAreInputsStandardSolverOrder: Core runs ValidateInputsStandardness
-// after the missing-inputs check and CheckTxInputs (validation.cpp:857-903),
-// so a tx that also fails one of those gets that earlier reason.
+// TestR3fixAreInputsStandardSolverOrder: Core runs AreInputsStandard only
+// after IsStandardTx (dust), the missing-inputs check, BIP68 sequence locks
+// and CheckTxInputs (validation.cpp:815-903), so a tx that also fails one of
+// those gets that earlier reason. All but the last subtest pass on master too;
+// they guard against putting the new check ahead of those.
 func TestR3fixAreInputsStandardSolverOrder(t *testing.T) {
 	t.Run("outputs-above-inputs-is-in-belowout", func(t *testing.T) {
 		utxos := newTestUTXOSet()
@@ -223,6 +225,40 @@ func TestR3fixAreInputsStandardSolverOrder(t *testing.T) {
 		err := mp.AddTransaction(tx)
 		if !errors.Is(err, ErrMissingInputs) {
 			t.Fatalf("AddTransaction = %v, want ErrMissingInputs (Core TX_MISSING_INPUTS comes first)", err)
+		}
+	})
+	// Core runs CheckSequenceLocksAtTip (validation.cpp:894) before
+	// AreInputsStandard: a BIP68-non-final spend of a bare OP_1 coin is
+	// non-BIP68-final, not bad-txns-nonstandard-inputs.
+	t.Run("bip68-non-final-is-non-bip68-final", func(t *testing.T) {
+		utxos := newTestUTXOSet()
+		op := wire.OutPoint{Hash: wire.Hash256{0xa2, 6}, Index: 0}
+		utxos.AddUTXO(op, &consensus.UTXOEntry{Amount: 1_000_000, PkScript: []byte{0x51}, Height: 100})
+		cs := &fakeChainState{tipHeight: 100, tipMTP: 1_700_000_000}
+		mp := mempoolWithChainState(utxos, cs)
+		mp.SetChainHeight(cs.tipHeight)
+		tx := buildMinimalSpendTx(op, nil, p2wpkhOutput(6))
+		tx.Version = 2
+		tx.TxIn[0].Sequence = 10 // height lock of 10 blocks, coin is 1 deep
+		tx.TxOut[0].Value = 990_000
+		err := mp.AddTransaction(tx)
+		if !errors.Is(err, ErrSequenceLockNotMet) {
+			t.Fatalf("AddTransaction = %v, want ErrSequenceLockNotMet (Core non-BIP68-final comes first)", err)
+		}
+	})
+	// Core's IsStandardTx refuses more than one dust output ("dust") before
+	// it looks at any input.
+	t.Run("two-dust-outputs-is-dust", func(t *testing.T) {
+		utxos := newTestUTXOSet()
+		op := wire.OutPoint{Hash: wire.Hash256{0xa2, 7}, Index: 0}
+		utxos.AddUTXO(op, &consensus.UTXOEntry{Amount: 1_000_000, PkScript: []byte{0x51}, Height: 1})
+		mp := newTestMempool(utxos)
+		tx := buildMinimalSpendTx(op, nil, p2wpkhOutput(7))
+		tx.TxOut[0].Value = 1
+		tx.TxOut = append(tx.TxOut, &wire.TxOut{Value: 1, PkScript: p2wpkhOutput(8)})
+		err := mp.AddTransaction(tx)
+		if !errors.Is(err, ErrDustOutput) {
+			t.Fatalf("AddTransaction = %v, want ErrDustOutput (Core IsStandardTx dust comes first)", err)
 		}
 	})
 	t.Run("second-input-nonstandard-names-input-1", func(t *testing.T) {
