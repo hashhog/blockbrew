@@ -63,10 +63,25 @@ func CheckWitnessStandard(tx *wire.MsgTx, view consensus.UTXOView) error {
 	return isWitnessStandard(tx, view.GetUTXO)
 }
 
+// TestSiblingEviction is TestReplacement with sibling added to tx's direct
+// conflicts. Core's single-transaction accept (test_accept included) runs
+// with m_allow_sibling_eviction (validation.cpp:498): when SingleTRUCChecks
+// offers a sibling for eviction, the sibling becomes a conflict and
+// ReplacementChecks decides (validation.cpp:962-975) instead of
+// "TRUC-violation". Same return contract as TestReplacement, with conflicts
+// always true.
+func (mp *Mempool) TestSiblingEviction(tx *wire.MsgTx, sibling wire.Hash256) (conflicts bool, err error) {
+	mp.mu.RLock()
+	defer mp.mu.RUnlock()
+	return mp.testReplacementLocked(tx, &sibling)
+}
+
 // CheckSingleTRUC is Core's SingleTRUCChecks (policy/truc_policy.cpp:171,
 // validation.cpp:960) against the current mempool, with the mempool
 // transactions tx conflicts with as the direct conflicts: acceptLocked's
-// TRUC gate. A non-nil error means Core's "TRUC-violation".
+// TRUC gate. A non-nil error means Core's "TRUC-violation", except a
+// sibling-eviction hint (IsTRUCSiblingEviction), which a single-transaction
+// test accept turns into a replacement check (TestSiblingEviction).
 func (mp *Mempool) CheckSingleTRUC(tx *wire.MsgTx) error {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()

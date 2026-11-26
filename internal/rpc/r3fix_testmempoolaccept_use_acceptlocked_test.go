@@ -341,3 +341,53 @@ func TestR3Fix_TMA_TRUC(t *testing.T) {
 		r3tmaWantAllowed(t, r)
 	})
 }
+
+// G8, sibling eviction: Core's single-transaction test accept allows TRUC
+// sibling eviction (validation.cpp:498 m_allow_sibling_eviction=true). A v3
+// child of a v3 parent that already has one child is not "TRUC-violation":
+// the existing child joins the conflicts and ReplacementChecks decides
+// (validation.cpp:962-975), naming the sibling in its reason.
+func TestR3Fix_TMA_TRUCSiblingEviction(t *testing.T) {
+	ws := []byte{0x51}
+	setup := func(t *testing.T) (*Server, *wire.MsgTx) {
+		t.Helper()
+		op := wire.OutPoint{Hash: wire.Hash256{0x85, 0x01}, Index: 0}
+		view := consensus.NewInMemoryUTXOView()
+		view.AddUTXO(op, &consensus.UTXOEntry{Amount: 100_000, PkScript: r3tmaP2WSH(ws), Height: 10})
+		cfg := mempool.DefaultConfig()
+		cfg.ChainParams = consensus.RegtestParams()
+		cfg.ChainState = &tmaFakeChainState{height: 200, mtp: 1_600_000_000}
+		mp := mempool.New(cfg, view)
+		parent := &wire.MsgTx{Version: 3, TxIn: []*wire.TxIn{{PreviousOutPoint: op, Witness: [][]byte{ws}, Sequence: 0xffffffff}},
+			TxOut: []*wire.TxOut{{Value: 45_000, PkScript: r3tmaP2WSH(ws)}, {Value: 45_000, PkScript: r3tmaP2WSH(ws)}}}
+		if err := mp.AddTransaction(parent); err != nil {
+			t.Fatalf("setup: add v3 parent: %v", err)
+		}
+		sibling := &wire.MsgTx{Version: 3, TxIn: []*wire.TxIn{{PreviousOutPoint: wire.OutPoint{Hash: parent.TxHash(), Index: 0}, Witness: [][]byte{ws}, Sequence: 0xffffffff}},
+			TxOut: []*wire.TxOut{{Value: 44_000, PkScript: tmaP2WPKHScript(0x90)}}} // fee 1,000
+		if err := mp.AddTransaction(sibling); err != nil {
+			t.Fatalf("setup: add v3 sibling: %v", err)
+		}
+		return NewServer(RPCConfig{ListenAddr: "127.0.0.1:0"}, WithMempool(mp)), parent
+	}
+	child := func(parent *wire.MsgTx, value int64) *wire.MsgTx {
+		return &wire.MsgTx{Version: 3, TxIn: []*wire.TxIn{{PreviousOutPoint: wire.OutPoint{Hash: parent.TxHash(), Index: 1}, Witness: [][]byte{ws}, Sequence: 0xffffffff}},
+			TxOut: []*wire.TxOut{{Value: value, PkScript: tmaP2WPKHScript(0x91)}}}
+	}
+
+	// Fee 5,000 pays for evicting the 1,000-fee sibling: Core allows it.
+	t.Run("sibling_replaced_allowed", func(t *testing.T) {
+		srv, parent := setup(t)
+		r3tmaWantAllowed(t, runTMA(t, srv, txToHex(t, child(parent, 40_000))))
+	})
+
+	// Fee 500 does not pay for evicting the sibling.
+	t.Run("sibling_not_paid_for", func(t *testing.T) {
+		srv, parent := setup(t)
+		r := runTMA(t, srv, txToHex(t, child(parent, 44_500)))
+		r3tmaWantReject(t, r, "insufficient fee (including sibling eviction)")
+		if !strings.HasPrefix(r.RejectDetails, "insufficient fee (including sibling eviction), ") {
+			t.Fatalf("reject-details = %q, want Core's \"insufficient fee (including sibling eviction), <reason>\"", r.RejectDetails)
+		}
+	})
+}

@@ -3646,8 +3646,17 @@ func formatMoney(sats int64) string {
 func (mp *Mempool) TestReplacement(tx *wire.MsgTx) (conflicts bool, err error) {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
+	return mp.testReplacementLocked(tx, nil)
+}
 
+// testReplacementLocked is TestReplacement's body. extra, when non-nil, is
+// one more mempool transaction to treat as a direct conflict (a TRUC sibling
+// offered for eviction). Must be called with mu held.
+func (mp *Mempool) testReplacementLocked(tx *wire.MsgTx, extra *wire.Hash256) (conflicts bool, err error) {
 	var conflictingTxs map[wire.Hash256]bool
+	if extra != nil {
+		conflictingTxs = map[wire.Hash256]bool{*extra: true}
+	}
 	var totalInputValue int64
 	var missingInputs int
 

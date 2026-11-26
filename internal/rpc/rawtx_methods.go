@@ -1333,13 +1333,21 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 
 		// SingleTRUCChecks (Core validation.cpp:960, TX_MEMPOOL_POLICY
 		// "TRUC-violation"): after CheckFeeRate, before ReplacementChecks.
-		// Same check acceptLocked runs.
+		// Same check acceptLocked runs. A sibling-eviction hint is not a
+		// refusal here: Core's single test accept allows sibling eviction
+		// (validation.cpp:498, :962-975), so the sibling joins the conflicts
+		// and the replacement gate below decides.
+		var trucSibling *wire.Hash256
 		if err := s.mempool.CheckSingleTRUC(tx); err != nil {
-			result.Allowed = false
-			result.RejectReason = "TRUC-violation"
-			result.RejectDetails = "TRUC-violation, " + err.Error()
-			results = append(results, result)
-			continue
+			if sib, ok := mempool.IsTRUCSiblingEviction(err); ok {
+				trucSibling = &sib
+			} else {
+				result.Allowed = false
+				result.RejectReason = "TRUC-violation"
+				result.RejectDetails = "TRUC-violation, " + err.Error()
+				results = append(results, result)
+				continue
+			}
 		}
 
 		// BIP-125 / full-RBF replacement gate (mempool conflict handling).
@@ -1358,12 +1366,30 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 		// branch: it reuses the identical checkRBFLocked gate without mutating
 		// the mempool. We map its Core-shaped error sentinels onto the same
 		// reject-reason CATEGORY tokens Core emits.
-		if conflicts, rbfErr := s.mempool.TestReplacement(tx); conflicts && rbfErr != nil {
+		//
+		// With a TRUC sibling offered for eviction the sibling is one more
+		// conflict, and Core names it in two reasons: "too many potential
+		// replacements (including sibling eviction)" and "insufficient fee
+		// (including sibling eviction)" (validation.cpp ReplacementChecks).
+		var conflicts bool
+		var rbfErr error
+		if trucSibling != nil {
+			conflicts, rbfErr = s.mempool.TestSiblingEviction(tx, *trucSibling)
+		} else {
+			conflicts, rbfErr = s.mempool.TestReplacement(tx)
+		}
+		if conflicts && rbfErr != nil {
 			result.Allowed = false
 			result.RejectReason = classifyRBFReject(rbfErr)
+			if trucSibling != nil && (result.RejectReason == "insufficient fee" || result.RejectReason == "too many potential replacements") {
+				result.RejectReason += " (including sibling eviction)"
+			}
 			var rej *mempool.RBFRejectError
 			if errors.As(rbfErr, &rej) {
-				result.RejectDetails = rej.Error()
+				result.RejectDetails = result.RejectReason
+				if rej.Detail != "" {
+					result.RejectDetails += ", " + rej.Detail
+				}
 			} else if errors.Is(rbfErr, mempool.ErrClusterTooLarge) {
 				// Core: state.Invalid(TX_MEMPOOL_POLICY, "too-large-cluster", ""),
 				// so ToString() is the bare reason.
