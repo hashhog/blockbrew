@@ -235,6 +235,25 @@ func (e *Engine) Execute() error {
 		}
 		serializedScript, _ := savedStack.Pop()
 
+		// Core VerifyScript (interpreter.cpp:2065-2075) evaluates the
+		// redeemScript and requires a true top element BEFORE it looks for a
+		// P2SH-wrapped witness program. A witness redeemScript is
+		// `OP_n <program>`, so this leaves the program on top: an all-zero
+		// (or negative-zero) program makes the spend EVAL_FALSE even though
+		// the program itself would be anyone-can-spend (v1+) or unsatisfiable.
+		e.stack = savedStack
+		e.opCount = 0
+		if err := e.executeScript(serializedScript); err != nil {
+			return err
+		}
+		if e.stack.IsEmpty() {
+			return ErrScriptFailed
+		}
+		result, _ := e.stack.Pop()
+		if !CastToBool(result) {
+			return ErrScriptFailed
+		}
+
 		// Check if it's a P2SH-wrapped witness program
 		witnessVersion, witnessProgram := ExtractWitnessProgram(serializedScript)
 
@@ -248,8 +267,15 @@ func (e *Engine) Execute() error {
 			if !bytes.Equal(scriptSig, canonicalPushScript(serializedScript)) {
 				return ErrWitnessMalleatedP2SH
 			}
-			// Fix #7: P2SH-wrapped witness v1+ is not executed (BIP341).
+			// Fix #7: P2SH-wrapped witness v1+ is not executed (BIP341):
+			// Core VerifyWitnessProgram(is_p2sh=true) reaches neither the
+			// taproot nor the P2A arm, so it lands in the upgradable branch
+			// (interpreter.cpp:1992-1996) — discouraged under
+			// DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, otherwise success.
 			if witnessVersion >= 1 {
+				if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
+					return ErrWitnessProgram
+				}
 				return nil
 			}
 			if err := e.executeWitnessProgram(witnessVersion, witnessProgram, txIn.Witness); err != nil {
@@ -264,22 +290,6 @@ func (e *Engine) Execute() error {
 			// size()==0. Reset the main stack to empty so the CLEANSTACK check
 			// below passes for the genuinely-not-clean witness-execution stack.
 			e.stack = NewStack()
-		} else {
-			// Regular P2SH
-			e.stack = savedStack
-			e.opCount = 0
-			if err := e.executeScript(serializedScript); err != nil {
-				return err
-			}
-
-			// Check result
-			if e.stack.IsEmpty() {
-				return ErrScriptFailed
-			}
-			result, _ := e.stack.Pop()
-			if !CastToBool(result) {
-				return ErrScriptFailed
-			}
 		}
 	}
 
