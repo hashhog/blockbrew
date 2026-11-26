@@ -128,6 +128,7 @@ type Engine struct {
 	sigopBudget int           // Tapscript signature validation weight budget
 	opSuccess   bool          // True if an OP_SUCCESSx short-circuit fired in the most recent tapscript executeScript()
 	annexHash   *[32]byte     // SHA256 of the length-prefixed annex (nil = no annex), committed to by tapscript CHECKSIG(ADD) sighash
+	tapLeafHash *[32]byte     // TapLeaf(0xc0, leaf script), computed once per script-path spend (Core execdata.m_tapleaf_hash); nil outside a tapscript spend
 
 	// For legacy sighash: track the script and the byte offset after last OP_CODESEPARATOR
 	currentScript    []byte // The script currently being executed
@@ -573,6 +574,7 @@ func (e *Engine) executeTaprootKeyPath(pubKey []byte, sig []byte, annex []byte) 
 // executeTaprootScriptPath executes a taproot script path spend.
 func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, annex []byte) error {
 	e.sigVersion = SigVersionTapscript
+	e.tapLeafHash = nil
 
 	// Compute the annex commitment ONCE for the whole spend, mirroring the key
 	// path (executeTaprootKeyPath) and Core, which computes execdata (including
@@ -615,6 +617,13 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	// the already-masked `leafVersion` here so the call is byte-identical
 	// regardless of TapLeaf's internal masking (see sighash.go).
 	leafHash := TapLeaf(leafVersion, script)
+	// Keep it for every tapscript CHECKSIG/CHECKSIGVERIFY/CHECKSIGADD of this
+	// spend, as Core keeps execdata.m_tapleaf_hash (interpreter.cpp:1973,
+	// :1977) and SignatureHashSchnorr writes it in (:1561-1562). Re-hashing
+	// the whole leaf per signature check made the cost ~S^2/50 in the leaf
+	// size. Execution below is reached only when leafVersion == 0xc0, so
+	// this is the same value the opcodes computed with TapLeaf(0xc0, script).
+	e.tapLeafHash = &leafHash
 
 	// Compute merkle root by walking the path with lex-ordered sibling hashing.
 	k := leafHash

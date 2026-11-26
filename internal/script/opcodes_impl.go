@@ -756,12 +756,10 @@ func (e *Engine) opCheckSig(script []byte) error {
 			return ErrTapscriptInvalidSigSize
 		}
 
-		// Get tapscript-specific sighash.  TapLeaf is invoked with the
-		// post-mask leaf-version constant (Core only enters this path when
-		// the leaf-version equals TaprootLeafTapscript=0xC0).
-		leafHash := TapLeaf(TaprootLeafTapscript, script)
+		// Get tapscript-specific sighash with the leaf hash computed once
+		// for this spend (Core execdata.m_tapleaf_hash).
 		opts := &TaprootSigHashOptions{
-			TapLeafHash: &leafHash,
+			TapLeafHash: e.tapscriptLeafHash(script),
 			KeyVersion:  0,
 			CodeSepPos:  e.codesepPos,
 			AnnexHash:   e.annexHash,
@@ -1048,10 +1046,9 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 		return ErrTapscriptInvalidSigSize
 	}
 
-	// Compute sighash with tapscript leaf hash.
-	leafHash := TapLeaf(TaprootLeafTapscript, script)
+	// Compute sighash with the tapscript leaf hash computed once per spend.
 	opts := &TaprootSigHashOptions{
-		TapLeafHash: &leafHash,
+		TapLeafHash: e.tapscriptLeafHash(script),
 		KeyVersion:  0,
 		CodeSepPos:  e.codesepPos,
 		AnnexHash:   e.annexHash,
@@ -1067,6 +1064,20 @@ func (e *Engine) opCheckSigAdd(script []byte) error {
 	}
 	// In tapscript, non-empty signature that fails verification is a HARD error
 	return ErrTaprootSigVerify
+}
+
+// tapscriptLeafHash returns the BIP341 tapleaf hash the tapscript
+// signature hash commits to. executeTaprootScriptPath computes it once per
+// spend and stores it on the Engine, as Core stores execdata.m_tapleaf_hash.
+// The fallback covers an Engine driven into SigVersionTapscript without a
+// script-path spend (unit tests set sigVersion directly); it hashes the
+// whole script with leaf version 0xc0, as every caller did before.
+func (e *Engine) tapscriptLeafHash(script []byte) *[32]byte {
+	if e.tapLeafHash != nil {
+		return e.tapLeafHash
+	}
+	h := TapLeaf(TaprootLeafTapscript, script)
+	return &h
 }
 
 // Locktime operations
