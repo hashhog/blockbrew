@@ -1405,8 +1405,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 		}
 		if fee == 0 {
 			// Ephemeral anchor / 0-fee CPFP carrier: dust is permitted.
-			// Continue scanning — other outputs may still need checking
-			// (e.g. AnchorDust cap on P2A handled inside isDust).
+			// Continue scanning — other outputs may still need checking.
 			continue
 		}
 		// Non-zero-fee tx with dust output. Wrap both sentinels so
@@ -1725,26 +1724,21 @@ func (v *mempoolUTXOView) GetUTXO(outpoint wire.OutPoint) *consensus.UTXOEntry {
 	return v.mp.lookupOutputLocked(outpoint)
 }
 
-// AnchorDust is the maximum value allowed for P2A outputs (in satoshis).
-// P2A outputs are exempt from the normal dust threshold but capped at this value.
-const AnchorDust int64 = 240
-
 // isDust checks if an output is dust (uneconomical to spend).
 // Mirrors Bitcoin Core's GetDustThreshold / IsDust (policy/policy.cpp):
 // provably unspendable outputs (OP_RETURN / empty) have a dust threshold of 0
 // and are therefore never dust — they carry no future spending cost.
+//
+// There is no pay-to-anchor (P2A) special case: Core's GetDustThreshold treats
+// P2A (OP_1 <0x4e73>) like any witness program, so its threshold is
+// (13 + 67) * 3 = 240 sat at the default dust relay fee. A 0-sat ephemeral
+// anchor IS dust and is admitted only by the 0-fee rule in the callers
+// (PreCheckEphemeralTx, policy/ephemeral_policy.cpp:27).
 func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 	// Provably unspendable outputs (OP_RETURN or empty) are never dust.
 	// Core's GetDustThreshold returns 0 for IsUnspendable(), so IsDust is false.
 	if consensus.IsUnspendable(txOut.PkScript) {
 		return false
-	}
-
-	// P2A (Pay-to-Anchor) outputs are exempt from normal dust rules.
-	// They are meant for fee bumping via CPFP and can have value 0.
-	// However, for standardness we cap them at AnchorDust satoshis.
-	if consensus.IsPayToAnchor(txOut.PkScript) {
-		return txOut.Value > AnchorDust // P2A is only standard if value <= AnchorDust
 	}
 
 	// Dust is defined as an output whose value is below the cost of spending

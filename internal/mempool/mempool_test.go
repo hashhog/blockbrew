@@ -1657,8 +1657,11 @@ func TestIncrementalRelayFeeConfig(t *testing.T) {
 }
 
 func TestP2AStandardDust(t *testing.T) {
-	// Test P2A (Pay-to-Anchor) dust exemption
-	// P2A outputs are exempt from normal dust rules but capped at AnchorDust (240 satoshis)
+	// P2A (Pay-to-Anchor) dust: Core has no P2A carve-out. GetDustThreshold
+	// (policy/policy.cpp:26-63) treats P2A as a witness program, so the
+	// threshold is (13 + 67) * 3 = 240 sat: < 240 is dust, >= 240 is not.
+	// A 0-sat ephemeral anchor is dust and is only admitted by the 0-fee rule
+	// (policy/ephemeral_policy.cpp:27), not by IsDust.
 
 	utxoSet := newTestUTXOSet()
 	mp := New(Config{
@@ -1678,13 +1681,23 @@ func TestP2AStandardDust(t *testing.T) {
 		Height:   1,
 	})
 
-	t.Run("P2A output with value 0 passes dust check", func(t *testing.T) {
+	t.Run("P2A output with value 0 is dust", func(t *testing.T) {
 		txOut := &wire.TxOut{
 			Value:    0,
 			PkScript: p2aScript,
 		}
-		if mp.isDust(txOut) {
-			t.Error("P2A output with value 0 should NOT be dust")
+		if !mp.isDust(txOut) {
+			t.Error("P2A output with value 0 should be dust (Core IsDust: 0 < 240)")
+		}
+	})
+
+	t.Run("P2A output with value 239 is dust", func(t *testing.T) {
+		txOut := &wire.TxOut{
+			Value:    239,
+			PkScript: p2aScript,
+		}
+		if !mp.isDust(txOut) {
+			t.Error("P2A output with value 239 should be dust (Core IsDust: 239 < 240)")
 		}
 	})
 
@@ -1694,17 +1707,17 @@ func TestP2AStandardDust(t *testing.T) {
 			PkScript: p2aScript,
 		}
 		if mp.isDust(txOut) {
-			t.Error("P2A output with value 240 (AnchorDust) should NOT be dust")
+			t.Error("P2A output with value 240 (the witness dust threshold) should NOT be dust")
 		}
 	})
 
-	t.Run("P2A output with value 241 fails dust check", func(t *testing.T) {
+	t.Run("P2A output with value 241 passes dust check", func(t *testing.T) {
 		txOut := &wire.TxOut{
 			Value:    241,
 			PkScript: p2aScript,
 		}
-		if !mp.isDust(txOut) {
-			t.Error("P2A output with value > AnchorDust should be dust (non-standard)")
+		if mp.isDust(txOut) {
+			t.Error("P2A output with value 241 should NOT be dust (Core: >= 240 is not dust)")
 		}
 	})
 
