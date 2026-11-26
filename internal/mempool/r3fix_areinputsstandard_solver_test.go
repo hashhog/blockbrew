@@ -285,8 +285,12 @@ func TestR3fixAreInputsStandardSolverOrder(t *testing.T) {
 		mp.mu.Lock()
 		err := mp.acceptLocked(tx, "", acceptOpts{reorg: true})
 		mp.mu.Unlock()
-		if err == nil {
-			t.Fatalf("0-fee tx with two dust outputs and a 16-sigop P2SH input admitted; Core refuses it (dust)")
+		// Core's answer is "dust". This path has no MAX_DUST_OUTPUTS_PER_TX
+		// check (a separate gap), so the refusal here is the P2SH sigop limit
+		// (bad-txns-nonstandard-inputs, the same nonstandard class), as on
+		// master. What this pins is that the tx is not admitted.
+		if !errors.Is(err, ErrP2SHSigOpsTooMany) {
+			t.Fatalf("acceptLocked(reorg) = %v; want it refused by the P2SH sigop limit (Core: dust)", err)
 		}
 	})
 	t.Run("second-input-nonstandard-names-input-1", func(t *testing.T) {

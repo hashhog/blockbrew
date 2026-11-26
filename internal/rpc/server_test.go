@@ -1130,7 +1130,7 @@ func TestGetRawTransactionFromMempool(t *testing.T) {
 	// Provide a UTXO set with a P2SH(OP_TRUE) coin and enough value for fees.
 	utxoView := consensus.NewInMemoryUTXOView()
 	utxoView.AddUTXO(tx.TxIn[0].PreviousOutPoint, &consensus.UTXOEntry{
-		Amount:   1_100_000,    // fee = 1_100_000 - 0 = 1_100_000 sat
+		Amount:   1_100_000,              // fee = 1_100_000 - 0 = 1_100_000 sat
 		PkScript: p2shOpTrueTestScript(), // P2SH(OP_TRUE): standard, needs no signature
 		Height:   1,
 	})
