@@ -161,24 +161,22 @@ func (e *Engine) opTuck() error {
 	}
 	// OP_TUCK: Copy top and insert it before the second-to-top item
 	// [x1, x2] -> [x2, x1, x2] where x2 is top
-	top, _ := e.stack.Peek()
-	items := e.stack.Items()
-	n := len(items)
-
-	// Create new slice with space for one more item
-	newItems := make([][]byte, n+1)
-
-	// Copy everything except the last two items
-	copy(newItems, items[:n-2])
-
-	// Insert: copy of top, then second-to-top, then top
+	//
+	// Core (interpreter.cpp OP_TUCK): `valtype vch = stacktop(-1);
+	// stack.insert(stack.end()-2, vch);` copies only the top element and
+	// moves the rest. Do the same: one copy of the top, then shift the two
+	// top slice headers up by one in the existing slice. Deep-copying the
+	// whole stack here made one OP_TUCK cost O(total stack bytes), which a
+	// tapscript leaf (no 201-opcode limit) could repeat ~190,000 times.
+	top := e.stack.items[len(e.stack.items)-1]
 	cp := make([]byte, len(top))
 	copy(cp, top)
-	newItems[n-2] = cp           // copy of top goes before second-to-top
-	newItems[n-1] = items[n-2]   // second-to-top item
-	newItems[n] = items[n-1]     // top stays on top
-
-	e.stack.SetItems(newItems)
+	items := append(e.stack.items, nil)
+	n := len(items)
+	items[n-1] = items[n-2] // top stays on top
+	items[n-2] = items[n-3] // second-to-top moves up one
+	items[n-3] = cp         // copy of top goes before second-to-top
+	e.stack.items = items
 	return nil
 }
 
