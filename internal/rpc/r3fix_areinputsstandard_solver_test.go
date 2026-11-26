@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/mempool"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
@@ -75,3 +76,16 @@ func TestR3fixAreInputsStandardSolverTestMempoolAcceptP2WPKHControl(t *testing.T
 		t.Fatalf("allowed=true with an empty witness on a P2WPKH spend; the script check must refuse it")
 	}
 }
+
+// p2shOpTrueTestScript is P2SH(OP_TRUE), a coin fixtures can spend without a
+// signature that Core's ValidateInputsStandardness still accepts (Solver
+// SCRIPTHASH). Fixtures used to fund from a bare OP_1 output, which Core
+// refuses as a nonstandard input.
+func p2shOpTrueTestScript() []byte {
+	h := crypto.Hash160([]byte{0x51})
+	return append(append([]byte{0xa9, 0x14}, h[:]...), 0x87)
+}
+
+// p2shOpTrueTestScriptSig spends p2shOpTrueTestScript: it pushes the
+// redeemScript OP_TRUE.
+var p2shOpTrueTestScriptSig = []byte{0x01, 0x51}

@@ -33,10 +33,10 @@ func totalFeeServer(t *testing.T, fees []int64) *Server {
 		var fund wire.Hash256
 		fund[0] = 0x7f
 		op := wire.OutPoint{Hash: fund, Index: uint32(i)} // distinct coin per tx
-		view[op] = &consensus.UTXOEntry{Amount: 1_000_000, PkScript: []byte{0x51}, Height: 1}
+		view[op] = &consensus.UTXOEntry{Amount: 1_000_000, PkScript: p2shOpTrueTestScript(), Height: 1}
 
 		tx := &wire.MsgTx{Version: 2}
-		tx.TxIn = []*wire.TxIn{{PreviousOutPoint: op, Sequence: 0xffffffff}}
+		tx.TxIn = []*wire.TxIn{{PreviousOutPoint: op, SignatureScript: p2shOpTrueTestScriptSig, Sequence: 0xffffffff}}
 		tx.TxOut = []*wire.TxOut{{Value: 1_000_000 - fee, PkScript: []byte{0x00, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}}}
 		var buf bytes.Buffer
 		if err := tx.Serialize(&buf); err != nil {
