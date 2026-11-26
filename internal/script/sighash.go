@@ -554,11 +554,13 @@ func FindAndDelete(script []byte, sig []byte) []byte {
 // are tested.  A byte sequence that happens to equal the push-encoded sig
 // but starts INSIDE a push payload is not deleted.  The pre-fix raw
 // bytes.Index scan did not respect opcode boundaries.
+//
+// An EMPTY signature is not a no-op: Core's `CScript() << vchSig` encodes an
+// empty vector as the single byte 0x00 (OP_0), so FindAndDelete removes every
+// opcode-aligned OP_0 (CHECKMULTISIG runs it for every signature, empty ones
+// included — interpreter.cpp:1142-1149). The length-prefix encoding below
+// yields exactly {0x00} for len(sig) == 0.
 func FindAndDeleteCount(script []byte, sig []byte) ([]byte, int) {
-	if len(sig) == 0 {
-		return script, 0
-	}
-
 	// Build the push encoding of the signature (matches Core's CScript << vchSig).
 	var pushSig []byte
 	if len(sig) < OP_PUSHDATA1 {
