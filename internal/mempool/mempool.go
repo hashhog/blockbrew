@@ -1284,11 +1284,11 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	// sigops).
 	//
 	// Core reaches it only after every check it runs earlier has passed. This
-	// path runs some of those later than Core does, so a tx that would fail
-	// one of them is left to that check (which then answers as before):
+	// path runs some of those later than Core does, so a tx that one of them
+	// is certain to refuse is left to that check (which answers as before):
 	//   - a missing input (TX_MISSING_INPUTS, validation.cpp:857-879);
-	//   - more than one dust output (IsStandardTx "dust", policy.cpp, the
-	//     first thing PreChecks runs; judged here at step 9);
+	//   - more than one dust output with a non-zero fee (IsStandardTx "dust",
+	//     policy.cpp, the first thing PreChecks runs; refused here at step 9);
 	//   - BIP68 sequence locks (non-BIP68-final, validation.cpp:894; judged
 	//     here at step 10b);
 	//   - outputs above inputs (CheckTxInputs bad-txns-in-belowout,
@@ -1844,11 +1844,14 @@ func (mp *Mempool) checkStandardnessLocked(tx *wire.MsgTx) error {
 	return nil
 }
 
-// inputsStandardnessReachedLocked reports whether Core's PreChecks would get
-// as far as AreInputsStandard for tx (all inputs present), given the checks
-// Core runs before it that this accept path only runs later: IsStandardTx's
-// dust count (more than MAX_DUST_OUTPUTS_PER_TX = 1 dust output is "dust"),
-// BIP68 sequence locks, and CheckTxInputs' outputs <= inputs.
+// inputsStandardnessReachedLocked reports whether step 6b should run
+// ValidateInputsStandardness for tx (all inputs present). It returns false
+// only when a check Core runs before AreInputsStandard, and that this accept
+// path runs later, is certain to refuse tx there: CheckTxInputs' outputs <=
+// inputs (step 7), IsStandardTx's dust count (more than
+// MAX_DUST_OUTPUTS_PER_TX = 1 dust output; step 9, which refuses dust only
+// when the fee is non-zero), and BIP68 sequence locks (step 10b). In every
+// other case the check runs here, so nothing it refused is admitted.
 func (mp *Mempool) inputsStandardnessReachedLocked(tx *wire.MsgTx, totalInputValue int64) bool {
 	var outSum int64
 	dust := 0
@@ -1858,7 +1861,15 @@ func (mp *Mempool) inputsStandardnessReachedLocked(tx *wire.MsgTx, totalInputVal
 			dust++
 		}
 	}
-	if dust > 1 || outSum > totalInputValue {
+	if outSum > totalInputValue {
+		return false // step 7 refuses it (ErrNegativeFee)
+	}
+	// Core refuses more than one dust output as "dust" before anything else.
+	// Step 9 refuses every dust output of a tx with a non-zero fee, so such a
+	// tx is left to it. A 0-fee tx is NOT: step 9 lets its dust through (this
+	// path does not enforce MAX_DUST_OUTPUTS_PER_TX), so skipping here would
+	// admit what Core and the old sigop gates refuse. It is judged here.
+	if dust > 1 && outSum < totalInputValue {
 		return false
 	}
 	return mp.checkSequenceLocksLocked(tx) == nil

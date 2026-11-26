@@ -26,6 +26,7 @@ import (
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -196,8 +197,10 @@ func TestR3fixAreInputsStandardSolverAdmits(t *testing.T) {
 // TestR3fixAreInputsStandardSolverOrder: Core runs AreInputsStandard only
 // after IsStandardTx (dust), the missing-inputs check, BIP68 sequence locks
 // and CheckTxInputs (validation.cpp:815-903), so a tx that also fails one of
-// those gets that earlier reason. All but the last subtest pass on master too;
-// they guard against putting the new check ahead of those.
+// those gets that earlier reason. Every subtest except
+// second-input-nonstandard-names-input-1 passes on master too; they guard
+// against putting the new check ahead of those checks, or skipping it where
+// no later check refuses.
 func TestR3fixAreInputsStandardSolverOrder(t *testing.T) {
 	t.Run("outputs-above-inputs-is-in-belowout", func(t *testing.T) {
 		utxos := newTestUTXOSet()
@@ -259,6 +262,31 @@ func TestR3fixAreInputsStandardSolverOrder(t *testing.T) {
 		err := mp.AddTransaction(tx)
 		if !errors.Is(err, ErrDustOutput) {
 			t.Fatalf("AddTransaction = %v, want ErrDustOutput (Core IsStandardTx dust comes first)", err)
+		}
+	})
+	// The same with a 0 fee. This path lets the dust of a 0-fee tx through
+	// (it has no MAX_DUST_OUTPUTS_PER_TX check), so the input check must still
+	// run: Core refuses the tx (dust) and so did master (its P2SH sigop gate,
+	// the redeemScript has 16 accurate sigops). Reorg re-admission runs with
+	// no fee floor, so nothing else refuses it.
+	t.Run("two-dust-outputs-zero-fee-still-refused", func(t *testing.T) {
+		redeem := []byte{0x00, 0x63} // OP_0 OP_IF
+		redeem = append(redeem, aisRepeat(0xac, 16)...)
+		redeem = append(redeem, 0x68, 0x51) // OP_ENDIF OP_1
+		h := crypto.Hash160(redeem)
+		spk := aisCat([]byte{0xa9, 0x14}, h[:], []byte{0x87})
+		utxos := newTestUTXOSet()
+		op := wire.OutPoint{Hash: wire.Hash256{0xa2, 8}, Index: 0}
+		utxos.AddUTXO(op, &consensus.UTXOEntry{Amount: 2, PkScript: spk, Height: 1})
+		mp := newTestMempool(utxos)
+		tx := buildMinimalSpendTx(op, aisPush(redeem), p2wpkhOutput(9))
+		tx.TxOut[0].Value = 1
+		tx.TxOut = append(tx.TxOut, &wire.TxOut{Value: 1, PkScript: p2wpkhOutput(10)})
+		mp.mu.Lock()
+		err := mp.acceptLocked(tx, "", acceptOpts{reorg: true})
+		mp.mu.Unlock()
+		if err == nil {
+			t.Fatalf("0-fee tx with two dust outputs and a 16-sigop P2SH input admitted; Core refuses it (dust)")
 		}
 	})
 	t.Run("second-input-nonstandard-names-input-1", func(t *testing.T) {
