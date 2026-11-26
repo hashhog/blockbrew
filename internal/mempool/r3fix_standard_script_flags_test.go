@@ -234,7 +234,14 @@ func TestR3Fix_LegacyAndWitnessV0PolicyFlags(t *testing.T) {
 		{"CONST_SCRIPTCODE_P2SH_codesep", r3fixP2SH(redeemCodesep), []byte{0x02, 0xab, 0x51}, nil, script.ErrCodeOpCodeSeparator, true},
 		{"control_P2WSH_minimal_if", r3fixP2WSH(ifScript), nil, [][]byte{{0x01}, ifScript}, 0, false},
 		{"MINIMALIF_P2WSH_if_arg_02", r3fixP2WSH(ifScript), nil, [][]byte{{0x02}, ifScript}, script.ErrCodeMinimalIf, true},
-		{"DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM_v2", v2, nil, nil, script.ErrCodeDiscourageUpgradableWitnessProgram, true},
+		// P2SH-wrapped witness v2, empty witness. Core reaches the flag here:
+		// the prevout is SCRIPTHASH (standard), IsWitnessStandard skips a null
+		// witness, and VerifyWitnessProgram(is_p2sh) lands in the upgradable
+		// branch. (A NATIVE v2 prevout is refused earlier by Core's
+		// ValidateInputsStandardness as WITNESS_UNKNOWN, so it is checked at the
+		// engine only, in TestR3Fix_DiscourageWitnessProgramEngineSites.)
+		{"DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM_p2sh_v2", r3fixP2SH(v2), append([]byte{byte(len(v2))}, v2...), nil,
+			script.ErrCodeDiscourageUpgradableWitnessProgram, true},
 	}
 	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -361,6 +368,39 @@ func TestR3Fix_TapscriptPrescanTruncatedPush(t *testing.T) {
 			var se *script.Error
 			if !errors.As(err, &se) || se.Code != c.want {
 				t.Fatalf("got %v, want Core's %s (code %d)", err, script.CoreErrorString(c.want), c.want)
+			}
+		})
+	}
+}
+
+// TestR3Fix_DiscourageWitnessProgramEngineSites: the native upgradable
+// witness-program sites return Core's DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM
+// (interpreter.cpp VerifyWitnessProgram upgradable branch) at the mempool's
+// standard flags, and succeed at block flags. Engine-level only: Core's
+// mempool refuses a native WITNESS_UNKNOWN prevout as non-standard before
+// any script check, so the mempool verdict is not asserted here.
+func TestR3Fix_DiscourageWitnessProgramEngineSites(t *testing.T) {
+	mp := newTestMempool(newTestUTXOSet())
+	mp.SetChainHeight(200)
+	for _, c := range []struct {
+		name string
+		pk   []byte
+	}{
+		{"native_v2_32byte", append([]byte{0x52, 0x20}, bytes.Repeat([]byte{0x07}, 32)...)},
+		{"native_v1_20byte", append([]byte{0x51, 0x14}, bytes.Repeat([]byte{0x07}, 20)...)},
+		{"native_v16_2byte", []byte{0x60, 0x02, 0x01, 0x02}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			tx := r3fixSpend(r3fixOutPoint(0xc0), nil, nil)
+			prev := []*wire.TxOut{{Value: r3fixPrevAmount, PkScript: c.pk}}
+			err := script.VerifyScript(nil, c.pk, tx, 0, mp.getStandardScriptFlags(), r3fixPrevAmount, prev)
+			var se *script.Error
+			if !errors.As(err, &se) || se.Code != script.ErrCodeDiscourageUpgradableWitnessProgram {
+				t.Fatalf("standard flags: got %v, want Core's %s", err,
+					script.CoreErrorString(script.ErrCodeDiscourageUpgradableWitnessProgram))
+			}
+			if err := script.VerifyScript(nil, c.pk, tx, 0, mp.getConsensusScriptFlags(), r3fixPrevAmount, prev); err != nil {
+				t.Fatalf("block flags: got %v, want valid (upgradable witness program)", err)
 			}
 		})
 	}
