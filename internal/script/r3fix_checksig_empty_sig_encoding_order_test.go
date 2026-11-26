@@ -164,11 +164,14 @@ func TestR3FixChecksigFindAndDeleteBeforeEncodingChecks(t *testing.T) {
 	r3csWant(t, "bad-DER sig in scriptCode at CONST_SCRIPTCODE", r3csRunBare(r3csPush(bad), spk2, cs), ErrCodeSigFindAndDelete)
 	r3csWant(t, "bad-DER sig in scriptCode without CONST_SCRIPTCODE", r3csRunBare(r3csPush(bad), spk2, r3csPolicyFlags), ErrCodeSigDER)
 
-	// Well-formed sig in the scriptCode with an empty key: SIG_FINDANDDELETE
-	// before PUBKEYTYPE.
+	// Well-formed sig in the scriptCode with a hybrid (0x06/0x07) key:
+	// SIG_FINDANDDELETE before PUBKEYTYPE.
 	sig := r3csWellFormedSig(t)
-	spk3 := append(append(r3csPush(sig), OP_DROP, OP_0), OP_CHECKSIG, OP_NOT)
-	r3csWant(t, "sig in scriptCode + empty key at CONST_SCRIPTCODE", r3csRunBare(r3csPush(sig), spk3, cs), ErrCodeSigFindAndDelete)
+	unc := r3csKey().PubKey().SerializeUncompressed()
+	hybrid := append([]byte{0x06 | (unc[64] & 1)}, unc[1:]...)
+	spk3 := append(append(append(r3csPush(sig), OP_DROP), r3csPush(hybrid)...), OP_CHECKSIG, OP_NOT)
+	r3csWant(t, "sig in scriptCode + hybrid key at CONST_SCRIPTCODE", r3csRunBare(r3csPush(sig), spk3, cs), ErrCodeSigFindAndDelete)
+	r3csWant(t, "sig in scriptCode + hybrid key without CONST_SCRIPTCODE", r3csRunBare(r3csPush(sig), spk3, r3csPolicyFlags), ErrCodePubKeyType)
 
 	// Witness v0 has no FindAndDelete: the same OP_0-bearing script gives
 	// PUBKEYTYPE, not SIG_FINDANDDELETE.
