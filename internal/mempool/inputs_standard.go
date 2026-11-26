@@ -16,16 +16,20 @@ import (
 // or leaves an empty stack.
 var ErrNonStandardInputs = errors.New("bad-txns-nonstandard-inputs")
 
-// nonStandardInputs builds Core's TX_INPUTS_NOT_STANDARD state: reason
-// "bad-txns-nonstandard-inputs" and Core's debug string as the detail.
+// nonStandardInputs builds Core v31.1's TX_INPUTS_NOT_STANDARD state
+// (validation.cpp:903-904): reason "bad-txns-nonstandard-inputs" and no debug
+// string, because v31.1's AreInputsStandard returns a bare bool. Its
+// Error() is therefore exactly the reason, as Core's state.ToString() is.
+// Which check fired is kept in the wrapped cause (errors.Is / Unwrap), in
+// the wording later Core versions put in the debug string, for logs.
 func nonStandardInputs(cause error, detail string) error {
-	return &RBFRejectError{Reason: "bad-txns-nonstandard-inputs", Detail: detail, Err: cause}
+	return &RBFRejectError{Reason: "bad-txns-nonstandard-inputs", Err: fmt.Errorf("%w (%s)", cause, detail)}
 }
 
-// ValidateInputsStandardness is Bitcoin Core's ValidateInputsStandardness
-// (policy/policy.cpp, called from MemPoolAccept::PreChecks at
-// validation.cpp:903 after CheckTxInputs and before IsWitnessStandard),
-// in Core's order:
+// ValidateInputsStandardness is Bitcoin Core v31.1's AreInputsStandard
+// (policy/policy.cpp:213-249, called from MemPoolAccept::PreChecks at
+// validation.cpp:903 after CheckTxInputs and before IsWitnessStandard;
+// later Core renamed it ValidateInputsStandardness), in Core's order:
 //
 //  1. CheckSigopsBIP54: non-witness sigops over all inputs > 2500.
 //  2. For each input, Solver on the prevout scriptPubKey:
@@ -36,7 +40,8 @@ func nonStandardInputs(cause error, detail string) error {
 //     missing", and a redeemScript (top of stack) with more than 15
 //     accurate sigops "p2sh redeemscript sigops exceed limit".
 //
-// Every failure is reason "bad-txns-nonstandard-inputs". lookup returns the
+// Every failure is reason "bad-txns-nonstandard-inputs" (the quoted texts are
+// only in the wrapped cause, see nonStandardInputs). lookup returns the
 // coin an input spends; Core only gets here with every coin present, so
 // callers run this after the missing-inputs check. A nil coin is skipped.
 func ValidateInputsStandardness(tx *wire.MsgTx, lookup func(wire.OutPoint) *consensus.UTXOEntry) error {

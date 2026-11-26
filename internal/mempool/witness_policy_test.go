@@ -160,8 +160,8 @@ func TestWitnessStandard_Gate1_P2AEmptyWitness(t *testing.T) {
 // with an empty scriptSig (empty stack → cannot extract redeemScript) is
 // rejected. Core runs ValidateInputsStandardness (validation.cpp:903) before
 // IsWitnessStandard (validation.cpp:907), and the former already refuses an
-// empty P2SH scriptSig with bad-txns-nonstandard-inputs "input 0 P2SH
-// redeemscript missing" (policy.cpp), so that is Core's answer, not
+// empty P2SH scriptSig (empty stack, policy.cpp AreInputsStandard) with
+// bad-txns-nonstandard-inputs, so that is Core's answer, not
 // IsWitnessStandard's bad-witness-nonstandard.
 func TestWitnessStandard_Gate2_P2SHEmptyScriptSig(t *testing.T) {
 	mp, op := makeWitnessTestMempool(0x03, p2shScript(), 500_000)
@@ -170,8 +170,8 @@ func TestWitnessStandard_Gate2_P2SHEmptyScriptSig(t *testing.T) {
 
 	err := mp.AddTransaction(tx)
 	var rej *RBFRejectError
-	if !errors.As(err, &rej) || rej.Error() != "bad-txns-nonstandard-inputs, input 0 P2SH redeemscript missing" {
-		t.Errorf("Gate 2: P2SH empty scriptSig: want Core's bad-txns-nonstandard-inputs, input 0 P2SH redeemscript missing, got %v", err)
+	if !errors.As(err, &rej) || rej.Error() != "bad-txns-nonstandard-inputs" {
+		t.Errorf("Gate 2: P2SH empty scriptSig: want Core's bad-txns-nonstandard-inputs, got %v", err)
 	}
 }
 

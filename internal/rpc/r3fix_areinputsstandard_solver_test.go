@@ -56,7 +56,11 @@ func TestR3fixAreInputsStandardSolverTestMempoolAcceptBareOP1(t *testing.T) {
 	if r.RejectReason != "bad-txns-nonstandard-inputs" {
 		t.Fatalf("reject-reason = %q, want %q", r.RejectReason, "bad-txns-nonstandard-inputs")
 	}
-	if want := "bad-txns-nonstandard-inputs, input 0 script unknown"; r.RejectDetails != want {
+	// Core v31.1 reject-details = state.ToString(); AreInputsStandard adds no
+	// debug string, so it is the bare reason (the cached Core stream for seed
+	// 739943 has reject-details "bad-txns-nonstandard-inputs" on all 561
+	// such cases).
+	if want := "bad-txns-nonstandard-inputs"; r.RejectDetails != want {
 		t.Errorf("reject-details = %q, want %q", r.RejectDetails, want)
 	}
 }

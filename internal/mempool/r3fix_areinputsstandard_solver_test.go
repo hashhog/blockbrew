@@ -8,7 +8,9 @@ package mempool
 // limits, so it admitted (and relayed) spends of e.g. a bare OP_1 output.
 //
 // Every expected value below is what Core v31.1 does for that prevout /
-// scriptSig. The tests use only APIs that exist on master, so they compile
+// scriptSig: the state is exactly "bad-txns-nonstandard-inputs" (v31.1's
+// AreInputsStandard carries no debug string); the wrapped cause names the
+// check, in the wording later Core versions use. The tests use only APIs that exist on master, so they compile
 // there and fail by name on the assertion.
 //
 // newTestMempool does run the input scripts, so on master most refusal cases
@@ -70,18 +72,24 @@ func aisSpend(t *testing.T, seed byte, prevScript, scriptSig []byte) error {
 	return mp.AddTransaction(tx)
 }
 
-// aisNonStandardInputs reports whether err is Core's
-// "bad-txns-nonstandard-inputs" state, and returns its rendered string.
-func aisNonStandardInputs(err error) (string, bool) {
+// aisNonStandardInputs reports whether err is Core v31.1's
+// "bad-txns-nonstandard-inputs" state, and returns its rendered string
+// (Core's state.ToString()) and the wrapped cause's text, which names the
+// check that fired.
+func aisNonStandardInputs(err error) (string, string, bool) {
 	var rej *RBFRejectError
 	if errors.As(err, &rej) && rej.Reason == "bad-txns-nonstandard-inputs" {
-		return rej.Error(), true
+		cause := ""
+		if rej.Err != nil {
+			cause = rej.Err.Error()
+		}
+		return rej.Error(), cause, true
 	}
-	return "", false
+	return "", "", false
 }
 
 // TestR3fixAreInputsStandardSolverRefuses: prevouts and P2SH scriptSigs Core
-// refuses with bad-txns-nonstandard-inputs, with Core's debug string.
+// refuses with bad-txns-nonstandard-inputs; the cause names which check fired.
 func TestR3fixAreInputsStandardSolverRefuses(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -121,13 +129,17 @@ func TestR3fixAreInputsStandardSolverRefuses(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := aisSpend(t, byte(i+1), tc.prevScript, tc.scriptSig)
-			got, ok := aisNonStandardInputs(err)
+			got, cause, ok := aisNonStandardInputs(err)
 			if !ok {
 				t.Fatalf("AddTransaction = %v, want Core's bad-txns-nonstandard-inputs", err)
 			}
-			want := "bad-txns-nonstandard-inputs, " + tc.wantDetail
-			if got != want {
-				t.Errorf("reject = %q, want %q", got, want)
+			// Core v31.1: state "bad-txns-nonstandard-inputs", no debug string.
+			if got != "bad-txns-nonstandard-inputs" {
+				t.Errorf("reject = %q, want %q", got, "bad-txns-nonstandard-inputs")
+			}
+			// The check that fired (later Core's debug wording).
+			if !strings.Contains(cause, "("+tc.wantDetail+")") {
+				t.Errorf("cause = %q, want it to name %q", cause, tc.wantDetail)
 			}
 		})
 	}
@@ -171,8 +183,8 @@ func TestR3fixAreInputsStandardSolverAdmits(t *testing.T) {
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := aisSpend(t, byte(0x80+i), tc.prevScript, tc.scriptSig)
-			if got, ok := aisNonStandardInputs(err); ok {
-				t.Fatalf("AddTransaction refused as %q; Core's ValidateInputsStandardness passes this input", got)
+			if got, cause, ok := aisNonStandardInputs(err); ok {
+				t.Fatalf("AddTransaction refused as %q (%s); Core's AreInputsStandard passes this input", got, cause)
 			}
 			if err != nil && strings.Contains(err.Error(), "nonstandard-inputs") {
 				t.Fatalf("AddTransaction = %v; Core passes this input", err)
@@ -223,9 +235,9 @@ func TestR3fixAreInputsStandardSolverOrder(t *testing.T) {
 		tx := buildMinimalSpendTx(op0, nil, p2wpkhOutput(3))
 		tx.TxIn = append(tx.TxIn, &wire.TxIn{PreviousOutPoint: op1, Sequence: 0xffffffff})
 		tx.TxOut[0].Value = 1_990_000
-		got, ok := aisNonStandardInputs(mp.AddTransaction(tx))
-		if !ok || got != "bad-txns-nonstandard-inputs, input 1 script unknown" {
-			t.Fatalf("reject = %q (nonstandard=%v), want %q", got, ok, "bad-txns-nonstandard-inputs, input 1 script unknown")
+		got, cause, ok := aisNonStandardInputs(mp.AddTransaction(tx))
+		if !ok || got != "bad-txns-nonstandard-inputs" || !strings.Contains(cause, "(input 1 script unknown)") {
+			t.Fatalf("reject = %q cause %q (nonstandard=%v), want bad-txns-nonstandard-inputs naming input 1 script unknown", got, cause, ok)
 		}
 	})
 }
