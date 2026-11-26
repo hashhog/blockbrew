@@ -119,7 +119,7 @@ type Engine struct {
 	flags       ScriptFlags
 	stack       *Stack
 	altStack    *Stack
-	condStack   []bool        // For nested IF/ELSE/ENDIF
+	condStack   conditionStack // For nested IF/ELSE/ENDIF (O(1), like Core's ConditionStack)
 	amount      int64         // Value of the output being spent (for segwit sighash)
 	prevOuts    []*wire.TxOut // Previous outputs (for taproot sighash)
 	sigVersion  SigVersion
@@ -146,7 +146,6 @@ func NewEngine(scriptPubKey []byte, tx *wire.MsgTx, txIdx int, flags ScriptFlags
 		flags:          flags,
 		stack:          NewStack(),
 		altStack:       NewStack(),
-		condStack:      make([]bool, 0),
 		amount:         amount,
 		prevOuts:       prevOuts,
 		sigVersion:     SigVersionBase,
@@ -209,7 +208,7 @@ func (e *Engine) Execute() error {
 	e.altStack = NewStack()
 
 	// Reset condition stack between scriptSig and scriptPubKey
-	e.condStack = e.condStack[:0]
+	e.condStack.reset()
 
 	// Execute scriptPubKey
 	e.sigVersion = SigVersionBase
@@ -1074,7 +1073,7 @@ func (e *Engine) executeScript(script []byte) error {
 					cond = !cond
 				}
 			}
-			e.condStack = append(e.condStack, executing && cond)
+			e.condStack.push(executing && cond)
 			opcodePos++
 			// Stack size check after control flow opcode
 			if e.stack.Size()+e.altStack.Size() > MaxStackSize {
@@ -1083,13 +1082,12 @@ func (e *Engine) executeScript(script []byte) error {
 			continue
 
 		case OP_ELSE:
-			if len(e.condStack) == 0 {
+			if e.condStack.empty() {
 				return ErrUnbalancedConditional
 			}
-			// Flip the current condition, but only if parent branch is executing
-			if len(e.condStack) == 1 || e.condStack[len(e.condStack)-2] {
-				e.condStack[len(e.condStack)-1] = !e.condStack[len(e.condStack)-1]
-			}
+			// Flip the current condition. Only observable when no false
+			// entry sits below the top (the parent branch is executing).
+			e.condStack.toggleTop()
 			opcodePos++
 			// Stack size check after control flow opcode
 			if e.stack.Size()+e.altStack.Size() > MaxStackSize {
@@ -1098,10 +1096,10 @@ func (e *Engine) executeScript(script []byte) error {
 			continue
 
 		case OP_ENDIF:
-			if len(e.condStack) == 0 {
+			if e.condStack.empty() {
 				return ErrUnbalancedConditional
 			}
-			e.condStack = e.condStack[:len(e.condStack)-1]
+			e.condStack.pop()
 			opcodePos++
 			// Stack size check after control flow opcode
 			if e.stack.Size()+e.altStack.Size() > MaxStackSize {
@@ -1129,21 +1127,18 @@ func (e *Engine) executeScript(script []byte) error {
 	}
 
 	// Check for unbalanced conditionals
-	if len(e.condStack) != 0 {
+	if !e.condStack.empty() {
 		return ErrUnbalancedConditional
 	}
 
 	return nil
 }
 
-// isExecuting returns true if we're in an executing branch.
+// isExecuting returns true if we're in an executing branch. O(1): it is
+// called before every opcode, and tapscript bounds neither the opcode count
+// nor the IF nesting depth.
 func (e *Engine) isExecuting() bool {
-	for _, cond := range e.condStack {
-		if !cond {
-			return false
-		}
-	}
-	return true
+	return e.condStack.allTrue()
 }
 
 // executeOpcode executes a single opcode.

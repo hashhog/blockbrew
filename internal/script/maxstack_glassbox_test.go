@@ -13,7 +13,6 @@ func newBareEngine() *Engine {
 	return &Engine{
 		stack:      NewStack(),
 		altStack:   NewStack(),
-		condStack:  make([]bool, 0),
 		sigVersion: SigVersionBase,
 	}
 }
