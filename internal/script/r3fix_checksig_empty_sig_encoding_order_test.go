@@ -155,6 +155,7 @@ func TestR3FixChecksigFindAndDeleteBeforeEncodingChecks(t *testing.T) {
 	// SIG_FINDANDDELETE (not PUBKEYTYPE, not success).
 	spk := []byte{OP_0, OP_0, OP_CHECKSIG, OP_DROP, OP_1}
 	r3csWant(t, "0 0 CHECKSIG at CONST_SCRIPTCODE", r3csRunBare(nil, spk, cs), ErrCodeSigFindAndDelete)
+	r3csWantOK(t, "0 0 CHECKSIG at block flags", r3csRunBare(nil, spk, r3csBlockFlags))
 
 	// Non-DER sig that appears in the scriptCode: SIG_FINDANDDELETE before
 	// SIG_DER.
@@ -163,6 +164,9 @@ func TestR3FixChecksigFindAndDeleteBeforeEncodingChecks(t *testing.T) {
 	spk2 := append(append(append(r3csPush(bad), OP_DROP), r3csPush(pk)...), OP_CHECKSIG, OP_NOT)
 	r3csWant(t, "bad-DER sig in scriptCode at CONST_SCRIPTCODE", r3csRunBare(r3csPush(bad), spk2, cs), ErrCodeSigFindAndDelete)
 	r3csWant(t, "bad-DER sig in scriptCode without CONST_SCRIPTCODE", r3csRunBare(r3csPush(bad), spk2, r3csPolicyFlags), ErrCodeSigDER)
+	// Block flags: FindAndDelete now runs first but raises nothing without
+	// CONST_SCRIPTCODE, so DERSIG still rejects exactly as before.
+	r3csWant(t, "bad-DER sig in scriptCode at block flags", r3csRunBare(r3csPush(bad), spk2, r3csBlockFlags), ErrCodeSigDER)
 
 	// Well-formed sig in the scriptCode with a hybrid (0x06/0x07) key:
 	// SIG_FINDANDDELETE before PUBKEYTYPE.
@@ -172,11 +176,13 @@ func TestR3FixChecksigFindAndDeleteBeforeEncodingChecks(t *testing.T) {
 	spk3 := append(append(append(r3csPush(sig), OP_DROP), r3csPush(hybrid)...), OP_CHECKSIG, OP_NOT)
 	r3csWant(t, "sig in scriptCode + hybrid key at CONST_SCRIPTCODE", r3csRunBare(r3csPush(sig), spk3, cs), ErrCodeSigFindAndDelete)
 	r3csWant(t, "sig in scriptCode + hybrid key without CONST_SCRIPTCODE", r3csRunBare(r3csPush(sig), spk3, r3csPolicyFlags), ErrCodePubKeyType)
+	r3csWantOK(t, "sig in scriptCode + hybrid key at block flags", r3csRunBare(r3csPush(sig), spk3, r3csBlockFlags))
 
 	// Witness v0 has no FindAndDelete: the same OP_0-bearing script gives
 	// PUBKEYTYPE, not SIG_FINDANDDELETE.
 	ws := []byte{OP_0, OP_0, OP_CHECKSIG, OP_DROP, OP_1}
 	r3csWant(t, "P2WSH 0 0 CHECKSIG at CONST_SCRIPTCODE", r3csRunP2WSH(nil, ws, cs), ErrCodePubKeyType)
+	r3csWantOK(t, "P2WSH 0 0 CHECKSIG at block flags", r3csRunP2WSH(nil, ws, r3csBlockFlags))
 }
 
 // Controls: an empty sig with a valid compressed key is just a failed check
