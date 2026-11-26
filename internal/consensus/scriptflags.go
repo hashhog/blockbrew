@@ -94,10 +94,29 @@ func GetBlockScriptFlags(height int32, params *ChainParams, blockHash wire.Hash2
 	return flags
 }
 
+// standardNotMandatoryScriptFlags are the standard-only flags of Bitcoin Core's
+// STANDARD_SCRIPT_VERIFY_FLAGS (policy/policy.h:118-131) other than STRICTENC,
+// NULLFAIL and WITNESS_PUBKEYTYPE, which GetStandardScriptFlags adds below.
+// Core applies the whole constant in PolicyScriptChecks with no height gate,
+// so these are not height-gated either. Without them the mempool admitted and
+// relayed OP_SUCCESSx and unknown-leaf-version spends, upgradable NOPs,
+// unknown tapscript pubkey types, high-S signatures, non-minimal pushes and IF
+// arguments, unclean legacy stacks and OP_CODESEPARATOR in legacy scripts.
+const standardNotMandatoryScriptFlags = script.ScriptVerifyMinimalData |
+	script.ScriptVerifyDiscourageUpgradableNops |
+	script.ScriptVerifyCleanStack |
+	script.ScriptVerifyMinimalIf |
+	script.ScriptVerifyLowS |
+	script.ScriptVerifyDiscourageUpgradableWitnessProgram |
+	script.ScriptVerifyConstScriptCode |
+	script.ScriptVerifyDiscourageUpgradableTaprootVersion |
+	script.ScriptVerifyDiscourageOpSuccess |
+	script.ScriptVerifyDiscourageUpgradablePubKeyType
+
 // GetStandardScriptFlags returns mempool/relay script verification flags for a
 // given height.  This composes the consensus flags from GetBlockScriptFlags and
 // adds the policy-only STANDARD_SCRIPT_VERIFY_FLAGS additions that Bitcoin Core
-// uses in mempool acceptance (policy/policy.h:119-132).
+// uses in mempool acceptance (policy/policy.h:118-131).
 //
 // Do NOT use this for block validation — use GetBlockScriptFlags instead.
 func GetStandardScriptFlags(height int32, params *ChainParams, blockHash wire.Hash256) script.ScriptFlags {
@@ -111,6 +130,7 @@ func GetStandardScriptFlags(height int32, params *ChainParams, blockHash wire.Ha
 		flags |= script.ScriptVerifyNullFail
 		flags |= script.ScriptVerifyWitnessPubKeyType
 	}
+	flags |= standardNotMandatoryScriptFlags
 
 	return flags
 }

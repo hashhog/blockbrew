@@ -38,6 +38,9 @@ var (
 	ErrTaprootSigVerify         = newError(ErrCodeSchnorrSig, "taproot signature verification failed")
 	ErrDiscourageUpgradableTaprootVersion = newError(ErrCodeDiscourageUpgradableTaprootVersion, "upgradable taproot leaf version (discouraged)")
 	ErrDiscourageUpgradablePubKeyType     = newError(ErrCodeDiscourageUpgradablePubKeyType, "upgradable tapscript pubkey type (discouraged)")
+	// Core SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM (interpreter.cpp
+	// VerifyWitnessProgram upgradable branch).
+	ErrDiscourageUpgradableWitnessProgram = newError(ErrCodeDiscourageUpgradableWitnessProgram, "upgradable witness program (discouraged)")
 	ErrTapscriptEmptyPubKey               = newError(ErrCodeTapscriptEmptyPubKey, "tapscript: empty pubkey not allowed")
 	ErrTapscriptInvalidSigSize            = newError(ErrCodeSchnorrSigSize, "tapscript: invalid schnorr signature size")
 	ErrTapscriptValidationWeight          = newError(ErrCodeTapscriptValidationWeight, "tapscript validation weight budget exceeded")
@@ -274,7 +277,7 @@ func (e *Engine) Execute() error {
 			// DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, otherwise success.
 			if witnessVersion >= 1 {
 				if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
-					return ErrWitnessProgram
+					return ErrDiscourageUpgradableWitnessProgram
 				}
 				return nil
 			}
@@ -363,7 +366,7 @@ func (e *Engine) executeWitnessProgram(version int, program []byte, witness [][]
 		// Non-32-byte v1 program (and not P2A): future anyone-can-spend, but
 		// discourage if the policy flag is set.
 		if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
-			return ErrWitnessProgram
+			return ErrDiscourageUpgradableWitnessProgram
 		}
 		return nil
 	default:
@@ -372,7 +375,7 @@ func (e *Engine) executeWitnessProgram(version int, program []byte, witness [][]
 			return ErrWitnessProgram
 		}
 		if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
-			return ErrWitnessProgram
+			return ErrDiscourageUpgradableWitnessProgram
 		}
 		return nil
 	}
