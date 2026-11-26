@@ -306,3 +306,62 @@ func r3fixFlipS(t *testing.T, der []byte) []byte {
 	body := append(append([]byte{0x02, byte(len(r))}, r...), append([]byte{0x02, byte(len(hs))}, hs...)...)
 	return append([]byte{0x30, byte(len(body))}, body...)
 }
+
+// TestR3Fix_TapscriptPrescanTruncatedPush: Core's tapscript pre-scan
+// (interpreter.cpp ExecuteWitnessScript :1838-1851) fails with BAD_OPCODE on a
+// push whose length bytes or data run past the end of the script, before
+// anything executes. blockbrew's pre-scan stopped silently, so the first
+// failing opcode BEFORE the truncated push was reported. With the standard
+// flags now complete, that let MINIMALDATA / DISCOURAGE_UPGRADABLE_PUBKEYTYPE /
+// non-minimal scriptnum fire where Core says BAD_OPCODE (night-1 seed 739943
+// replay: cases that matched Core on master and mismatched with the flags
+// alone). Every reject case is invalid at block flags too, so only the reason
+// moves; the OP_SUCCESS-first control must stay valid at block flags.
+func TestR3Fix_TapscriptPrescanTruncatedPush(t *testing.T) {
+	ik := r3fixInternalKey()
+	mp := newTestMempool(newTestUTXOSet())
+	mp.SetChainHeight(200)
+	std, cns := mp.getStandardScriptFlags(), mp.getConsensusScriptFlags()
+	cases := []struct {
+		name  string
+		leaf  []byte
+		flags script.ScriptFlags
+		want  script.ErrorCode // 0 = valid
+	}{
+		// 0 OP_2 CHECKSIG <PUSHDATA2 len 0x214e, 1 data byte>: 1-byte pubkey.
+		{"pubkeytype_before_truncated_pushdata2", []byte{0x00, 0x52, 0xac, 0x4d, 0x4e, 0x21, 0x21},
+			cns | script.ScriptVerifyDiscourageUpgradablePubKeyType, script.ErrCodeBadOpcode},
+		// PUSHDATA4 of 2 bytes (non-minimal) then a truncated PUSHDATA2.
+		{"minimaldata_before_truncated_pushdata2", []byte{0x4e, 0x02, 0x00, 0x00, 0x00, 0x01, 0x01, 0x4d, 0x4e, 0x21, 0x21},
+			cns | script.ScriptVerifyMinimalData, script.ErrCodeBadOpcode},
+		// OP_3 <0x00> SUB <push 38, 0 bytes>: non-minimal scriptnum first.
+		{"scriptnum_before_truncated_direct_push", []byte{0x53, 0x01, 0x00, 0x94, 0x26},
+			cns | script.ScriptVerifyMinimalData, script.ErrCodeBadOpcode},
+		// Triage G12 minimised case: CHECKMULTISIG <push 31, 0 bytes>, block flags.
+		{"checkmultisig_before_truncated_push_block_flags", []byte{0xae, 0x1f}, cns, script.ErrCodeBadOpcode},
+		{"checkmultisig_before_truncated_push_std_flags", []byte{0xae, 0x1f}, std, script.ErrCodeBadOpcode},
+		// Missing PUSHDATA1 length byte.
+		{"missing_pushdata1_length", []byte{0x51, 0x4c}, cns, script.ErrCodeBadOpcode},
+		// Controls: an OP_SUCCESS before the truncation wins, as in Core.
+		{"control_opsuccess_first_block_flags_valid", []byte{0x50, 0x4d, 0x4e}, cns, 0},
+		{"control_opsuccess_first_std_flags_discouraged", []byte{0x50, 0x4d, 0x4e}, std, script.ErrCodeDiscourageOpSuccess},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pk, control := r3fixP2TRForLeaf(t, ik, 0xc0, c.leaf)
+			tx := r3fixSpend(r3fixOutPoint(byte(0x90+i)), nil, [][]byte{c.leaf, control})
+			prev := []*wire.TxOut{{Value: r3fixPrevAmount, PkScript: pk}}
+			err := script.VerifyScript(nil, pk, tx, 0, c.flags, r3fixPrevAmount, prev)
+			if c.want == 0 {
+				if err != nil {
+					t.Fatalf("got %v, want valid", err)
+				}
+				return
+			}
+			var se *script.Error
+			if !errors.As(err, &se) || se.Code != c.want {
+				t.Fatalf("got %v, want Core's %s (code %d)", err, script.CoreErrorString(c.want), c.want)
+			}
+		})
+	}
+}
