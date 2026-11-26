@@ -1074,6 +1074,21 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			continue
 		}
 
+		// IsStandardTx's scriptSig loop (Core policy/policy.cpp:117-133): runs
+		// after the weight gate and before the output loop, as in Core. Same
+		// check acceptLocked runs (checkStandardnessLocked).
+		if err := mempool.CheckScriptSigStandard(tx); err != nil {
+			result.Allowed = false
+			if errors.Is(err, mempool.ErrScriptSigTooLarge) {
+				result.RejectReason = "scriptsig-size"
+			} else {
+				result.RejectReason = "scriptsig-not-pushonly"
+			}
+			result.RejectDetails = result.RejectReason
+			results = append(results, result)
+			continue
+		}
+
 		// Output / tx standardness runs BEFORE input existence, matching Core.
 		//
 		// Bitcoin Core runs the FULL IsStandardTx (output-script standardness,
@@ -1186,6 +1201,17 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			continue
 		}
 
+		// BIP68 sequence locks against the next block (Core
+		// CheckSequenceLocksAtTip, validation.cpp:894-895): once every input is
+		// found and before CheckTxInputs. Same check acceptLocked runs.
+		if err := s.mempool.CheckSequenceLocks(tx); err != nil {
+			result.Allowed = false
+			result.RejectReason = "non-BIP68-final"
+			result.RejectDetails = "non-BIP68-final"
+			results = append(results, result)
+			continue
+		}
+
 		// --- Input-dependent gates (need the prevout view). Order mirrors the
 		// real accept path: per-tx sigops cost, then input-standardness sigops,
 		// then coinbase maturity (mempool.go PreChecks 5d gates 1-3, then step 6). ---
@@ -1284,12 +1310,34 @@ func (s *Server) handleTestMempoolAccept(params json.RawMessage) (interface{}, *
 			continue
 		}
 
+		// IsWitnessStandard (Core validation.cpp:908-909): after CheckTxInputs
+		// and AreInputsStandard, before the fee rate. Same check acceptLocked
+		// runs, over this dry run's prevout view.
+		if err := mempool.CheckWitnessStandard(tx, prevoutView); err != nil {
+			result.Allowed = false
+			result.RejectReason = "bad-witness-nonstandard"
+			result.RejectDetails = "bad-witness-nonstandard"
+			results = append(results, result)
+			continue
+		}
+
 		// Check fee rate against minimum
 		feeRate := float64(fee) / float64(vsize) * 1000 // sat/kvB
 		minFeeRate := s.mempool.GetMinFeeRate()
 		if int64(feeRate) < minFeeRate {
 			result.Allowed = false
 			result.RejectReason = "min-fee-not-met"
+			results = append(results, result)
+			continue
+		}
+
+		// SingleTRUCChecks (Core validation.cpp:960, TX_MEMPOOL_POLICY
+		// "TRUC-violation"): after CheckFeeRate, before ReplacementChecks.
+		// Same check acceptLocked runs.
+		if err := s.mempool.CheckSingleTRUC(tx); err != nil {
+			result.Allowed = false
+			result.RejectReason = "TRUC-violation"
+			result.RejectDetails = "TRUC-violation, " + err.Error()
 			results = append(results, result)
 			continue
 		}

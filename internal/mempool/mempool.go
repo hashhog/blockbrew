@@ -1838,14 +1838,8 @@ func (mp *Mempool) checkStandardnessLocked(tx *wire.MsgTx) error {
 
 	// Per-input scriptSig policy (Core IsStandardTx input loop,
 	// policy/policy.cpp:117-135): scriptSig size cap + push-only.
-	for i, in := range tx.TxIn {
-		if len(in.SignatureScript) > MaxStandardScriptSigSize {
-			return fmt.Errorf("%w: input %d scriptSig %d bytes > %d",
-				ErrScriptSigTooLarge, i, len(in.SignatureScript), MaxStandardScriptSigSize)
-		}
-		if len(in.SignatureScript) > 0 && !script.IsPushOnly(in.SignatureScript) {
-			return fmt.Errorf("%w: input %d", ErrScriptSigNotPushOnly, i)
-		}
+	if err := checkScriptSigStandard(tx); err != nil {
+		return err
 	}
 
 	// Output script standardness + cumulative OP_RETURN datacarrier budget

@@ -53,16 +53,31 @@ func tmaP2WPKHScript(seed byte) []byte {
 	return s
 }
 
-// checksigScriptSig returns a scriptSig consisting of n OP_CHECKSIG bytes. Used
-// to drive the sigop-counting gates (this is not a valid signature script, but
-// the dry-run does not verify scripts — it counts sigops, exactly as the real
-// accept path's GetTransactionSigOpCost / BIP54 legacy-sigop gate do).
-func checksigScriptSig(n int) []byte {
+// checksigScript returns a script of n OP_CHECKSIG bytes. Used as a prevout
+// scriptPubKey to drive the BIP54 legacy-sigop gate, which counts prevout
+// scriptPubKey sigops. It is not used as a scriptSig: a scriptSig that is not
+// push-only (or is over 1,650 bytes) is refused by IsStandardTx before any
+// sigop is counted (Core policy/policy.cpp:117-133).
+func checksigScript(n int) []byte {
 	s := make([]byte, n)
 	for i := range s {
 		s[i] = 0xac // OP_CHECKSIG
 	}
 	return s
+}
+
+// bareMultisig1of3 is a standard bare 1-of-3 CHECKMULTISIG scriptPubKey. Its
+// legacy (inaccurate) sigop count is 20 (MAX_PUBKEYS_PER_MULTISIG), and an
+// output's scriptPubKey counts toward the per-tx sigop cost.
+func bareMultisig1of3(seed byte) []byte {
+	s := []byte{0x51} // OP_1
+	for k := 0; k < 3; k++ {
+		s = append(s, 0x21, 0x02)
+		for i := 0; i < 32; i++ {
+			s = append(s, seed+byte(k*32+i))
+		}
+	}
+	return append(s, 0x53, 0xae) // OP_3 OP_CHECKMULTISIG
 }
 
 func txToHex(t *testing.T, tx *wire.MsgTx) string {
@@ -157,23 +172,25 @@ func TestTestMempoolAccept_FalseAcceptClasses(t *testing.T) {
 			name:       "too-many-sigops",
 			wantReason: "bad-txns-too-many-sigops",
 			build: func(t *testing.T) (string, *mempool.Mempool) {
-				// scriptSig of 4100 OP_CHECKSIG -> legacy sigops 4100, scaled x4 =
-				// 16400 > MAX_STANDARD_TX_SIGOPS_COST (16000). Per-tx sigops gate
-				// fires before the input-standardness gate.
+				// 201 bare 1-of-3 multisig outputs -> legacy sigops 201*20 =
+				// 4020, scaled x4 = 16080 > MAX_STANDARD_TX_SIGOPS_COST (16000).
+				// The scriptSig is empty (push-only), so IsStandardTx passes and
+				// the sigop cost is what refuses it, as in Core.
 				prevOut := wire.OutPoint{Hash: wire.Hash256{0x03}, Index: 0}
 				tx := &wire.MsgTx{
 					Version: 2,
 					TxIn: []*wire.TxIn{{
 						PreviousOutPoint: prevOut,
-						SignatureScript:  checksigScriptSig(4100),
 						Sequence:         0xFFFFFFFF,
 					}},
-					TxOut:    []*wire.TxOut{{Value: 50_000, PkScript: tmaP2WPKHScript(0x30)}},
 					LockTime: 0,
+				}
+				for i := 0; i < 201; i++ {
+					tx.TxOut = append(tx.TxOut, &wire.TxOut{Value: 1_000, PkScript: bareMultisig1of3(byte(i))})
 				}
 				view := consensus.NewInMemoryUTXOView()
 				view.AddUTXO(prevOut, &consensus.UTXOEntry{
-					Amount:   100_000,
+					Amount:   1_000_000,
 					PkScript: tmaP2WPKHScript(0x31), // non-P2SH prevout
 					Height:   10,
 				})
@@ -187,16 +204,18 @@ func TestTestMempoolAccept_FalseAcceptClasses(t *testing.T) {
 			name:       "nonstandard-inputs-legacy-sigops",
 			wantReason: "bad-txns-nonstandard-inputs",
 			build: func(t *testing.T) (string, *mempool.Mempool) {
-				// scriptSig of 3000 OP_CHECKSIG -> accurate legacy sigops 3000 >
-				// MAX_TX_LEGACY_SIGOPS (2500) => bad-txns-nonstandard-inputs, while
-				// the per-tx cost 3000x4 = 12000 <= 16000 stays under the
-				// too-many-sigops gate (so this class is reached, not shadowed).
+				// The prevout scriptPubKey is 3000 OP_CHECKSIG -> legacy input
+				// sigops 3000 > MAX_TX_LEGACY_SIGOPS (2500) =>
+				// bad-txns-nonstandard-inputs. Prevout scriptPubKeys do not count
+				// toward the per-tx sigop cost, so the too-many-sigops gate stays
+				// silent (this class is reached, not shadowed). Core refuses such
+				// a prevout with the same reason (AreInputsStandard). The
+				// scriptSig is empty (push-only), so IsStandardTx passes.
 				prevOut := wire.OutPoint{Hash: wire.Hash256{0x04}, Index: 0}
 				tx := &wire.MsgTx{
 					Version: 2,
 					TxIn: []*wire.TxIn{{
 						PreviousOutPoint: prevOut,
-						SignatureScript:  checksigScriptSig(3000),
 						Sequence:         0xFFFFFFFF,
 					}},
 					TxOut:    []*wire.TxOut{{Value: 50_000, PkScript: tmaP2WPKHScript(0x40)}},
@@ -205,7 +224,7 @@ func TestTestMempoolAccept_FalseAcceptClasses(t *testing.T) {
 				view := consensus.NewInMemoryUTXOView()
 				view.AddUTXO(prevOut, &consensus.UTXOEntry{
 					Amount:   100_000,
-					PkScript: tmaP2WPKHScript(0x41),
+					PkScript: checksigScript(3000),
 					Height:   10,
 				})
 				cfg := mempool.DefaultConfig()
