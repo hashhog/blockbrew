@@ -2078,6 +2078,7 @@ func (pm *PeerManager) connectOutbound(ka *KnownAddress, connType ConnType, rele
 
 	// Request addresses from full-relay peers only (not block-relay-only)
 	if connType == ConnFullRelay {
+		peer.MarkGetAddrSent()
 		peer.SendMessage(&MsgGetAddr{})
 	}
 
@@ -2557,6 +2558,7 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 	// Wrap OnAddr to add addresses to our book
 	originalOnAddr := listeners.OnAddr
 	listeners.OnAddr = func(p *Peer, msg *MsgAddr) {
+		received := len(msg.AddrList)
 		// Cap at MaxAddresses to prevent flooding
 		addrs := msg.AddrList
 		if len(addrs) > MaxAddresses {
@@ -2576,8 +2578,18 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 		}
 		pm.addrBook.AddAddresses(addrs, source)
 
-		// Relay to up to 2 random peers (not back to source)
-		pm.relayAddrToRandomPeers(p, msg)
+		// Relay only what the bucket admitted, and only for gossip-sized
+		// messages that are not an answer to our getaddr (Core ProcessAddrs).
+		// The source now knows every admitted address (AddAddressKnown).
+		if p != nil {
+			for i := range addrs {
+				p.addAddrKnown(addrKnownKeyV1(&addrs[i]))
+			}
+			if received <= addrRelayMaxEntries && !p.GetAddrSent() {
+				pm.relayAddrToRandomPeers(p, &MsgAddr{AddrList: addrs})
+			}
+			p.noteAddrMessageDone(received)
+		}
 
 		// Call original handler if set
 		if originalOnAddr != nil {
@@ -2588,6 +2600,7 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 	// Wrap OnAddrv2 to add BIP155 addresses to our book
 	originalOnAddrv2 := listeners.OnAddrv2
 	listeners.OnAddrv2 = func(p *Peer, msg *MsgAddrv2) {
+		received := len(msg.AddrList)
 		// Cap at MaxAddresses to prevent flooding
 		addrs := msg.AddrList
 		if len(addrs) > MaxAddresses {
@@ -2607,8 +2620,16 @@ func (pm *PeerManager) wrapListeners() *PeerListeners {
 		}
 		pm.addrBook.AddAddressesV2(addrs, source)
 
-		// Relay addrv2 to up to 2 random peers (not back to source)
-		pm.relayAddrv2ToRandomPeers(p, msg)
+		// Same admission rules as the addr handler above.
+		if p != nil {
+			for i := range addrs {
+				p.addAddrKnown(addrKnownKeyV2(&addrs[i]))
+			}
+			if received <= addrRelayMaxEntries && !p.GetAddrSent() {
+				pm.relayAddrv2ToRandomPeers(p, &MsgAddrv2{AddrList: addrs})
+			}
+			p.noteAddrMessageDone(received)
+		}
 
 		// Call original handler if set
 		if originalOnAddrv2 != nil {
@@ -2634,75 +2655,101 @@ func extractIP(addr string) string {
 	return host
 }
 
-// relayAddrToRandomPeers relays an addr message to up to 2 random connected
-// peers, excluding the source peer. This implements Bitcoin Core's RelayAddress
-// (net_processing.cpp:5688): only relay when the incoming message has at most 10
-// addresses, matching Core's unsolicited-addr relay gate.
+// relayAddrToRandomPeers relays the entries of an addr message to up to 2
+// random connected peers, excluding the source. The caller passes only the
+// entries the source's token bucket admitted. Following Core's ProcessAddrs
+// and RelayAddress (net_processing.cpp:5685-5688, :2277-2323):
+//   - nothing is relayed from a message of more than 10 entries;
+//   - an entry is relayed only if its timestamp is within the last 10
+//     minutes and the address is routable;
+//   - a destination is never sent an address it already knows (its
+//     addr-known set, Core m_addr_known), and learns each address it is sent;
+//     if SendMessage drops the message, those addresses are forgotten again.
 func (pm *PeerManager) relayAddrToRandomPeers(source *Peer, msg *MsgAddr) {
-	// Core net_processing.cpp:5688 gates relay on vAddr.size() <= 10.
-	// Messages with more entries are responses to GETADDR and should not
-	// be forwarded — only spontaneous announcements (<=10) get relayed.
-	if len(msg.AddrList) > 10 {
+	if len(msg.AddrList) > addrRelayMaxEntries {
 		return
 	}
-
-	pm.mu.RLock()
-	var candidates []*Peer
-	for _, pi := range pm.peers {
-		if pi.peer != nil && pi.peer != source && pi.peer.WantsTxRelay() {
-			candidates = append(candidates, pi.peer)
+	now := time.Now()
+	var relay []NetAddress
+	for _, a := range msg.AddrList {
+		if addrRelayFresh(a.Timestamp, now) && isRoutableIP(a.IP) {
+			relay = append(relay, a)
 		}
 	}
-	pm.mu.RUnlock()
-
-	if len(candidates) == 0 {
+	if len(relay) == 0 {
 		return
 	}
-	rand.Shuffle(len(candidates), func(i, j int) {
-		candidates[i], candidates[j] = candidates[j], candidates[i]
-	})
-	n := 2
-	if len(candidates) < n {
-		n = len(candidates)
-	}
-	for _, p := range candidates[:n] {
-		p.SendMessage(msg)
+	for _, p := range pm.addrRelayTargets(source, false) {
+		var out []NetAddress
+		var keys []uint64
+		for i := range relay {
+			if k := addrKnownKeyV1(&relay[i]); p.addAddrKnownIfNew(k) {
+				out = append(out, relay[i])
+				keys = append(keys, k)
+			}
+		}
+		if len(out) > 0 && !p.SendMessage(&MsgAddr{AddrList: out}) {
+			p.forgetAddrKnown(keys)
+		}
 	}
 }
 
-// relayAddrv2ToRandomPeers relays an addrv2 message to up to 2 random connected
-// peers that support addrv2, excluding the source peer. Applies the same
-// Core net_processing.cpp:5688 size<=10 gate as relayAddrToRandomPeers since
-// Core uses a single ProcessAddrs handler for both ADDR and ADDRV2.
+// relayAddrv2ToRandomPeers is the addrv2 counterpart of
+// relayAddrToRandomPeers, relaying to peers that support addrv2. Core uses
+// one ProcessAddrs path for ADDR and ADDRV2, so the same rules apply.
 func (pm *PeerManager) relayAddrv2ToRandomPeers(source *Peer, msg *MsgAddrv2) {
-	// Core net_processing.cpp:4022 uses one handler for ADDR and ADDRV2;
-	// the vAddr.size() <= 10 relay gate (line 5688) applies to both.
-	if len(msg.AddrList) > 10 {
+	if len(msg.AddrList) > addrRelayMaxEntries {
 		return
 	}
+	now := time.Now()
+	var relay []NetAddressV2
+	for i := range msg.AddrList {
+		a := &msg.AddrList[i]
+		if addrRelayFresh(a.Time, now) && addrV2Routable(a) {
+			relay = append(relay, *a)
+		}
+	}
+	if len(relay) == 0 {
+		return
+	}
+	for _, p := range pm.addrRelayTargets(source, true) {
+		var out []NetAddressV2
+		var keys []uint64
+		for i := range relay {
+			if k := addrKnownKeyV2(&relay[i]); p.addAddrKnownIfNew(k) {
+				out = append(out, relay[i])
+				keys = append(keys, k)
+			}
+		}
+		if len(out) > 0 && !p.SendMessage(&MsgAddrv2{AddrList: out}) {
+			p.forgetAddrKnown(keys)
+		}
+	}
+}
 
+// addrRelayTargets picks up to 2 random relay-eligible peers other than
+// source; with needAddrv2 only peers that negotiated addrv2.
+func (pm *PeerManager) addrRelayTargets(source *Peer, needAddrv2 bool) []*Peer {
 	pm.mu.RLock()
 	var candidates []*Peer
 	for _, pi := range pm.peers {
-		if pi.peer != nil && pi.peer != source && pi.peer.WantsTxRelay() && pi.peer.WantsAddrv2() {
-			candidates = append(candidates, pi.peer)
+		if pi.peer == nil || pi.peer == source || !pi.peer.WantsTxRelay() {
+			continue
 		}
+		if needAddrv2 && !pi.peer.WantsAddrv2() {
+			continue
+		}
+		candidates = append(candidates, pi.peer)
 	}
 	pm.mu.RUnlock()
 
-	if len(candidates) == 0 {
-		return
-	}
 	rand.Shuffle(len(candidates), func(i, j int) {
 		candidates[i], candidates[j] = candidates[j], candidates[i]
 	})
-	n := 2
-	if len(candidates) < n {
-		n = len(candidates)
+	if len(candidates) > 2 {
+		candidates = candidates[:2]
 	}
-	for _, p := range candidates[:n] {
-		p.SendMessage(msg)
-	}
+	return candidates
 }
 
 // banListFile returns the path to the ban list file.
