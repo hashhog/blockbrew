@@ -117,7 +117,7 @@ var p2shOpTrueTestScriptSig = []byte{0x01, 0x51}
 
 // TestR3fixAreInputsStandardSolverTestMempoolAcceptBeforeWitnessStandard pins
 // the order of the two gates the dry run now shares with acceptLocked: Core
-// runs ValidateInputsStandardness (validation.cpp:896) before
+// runs ValidateInputsStandardness (validation.cpp:897) before
 // IsWitnessStandard (:904). A P2SH coin spent with an empty scriptSig and a
 // witness fails both: AreInputsStandard ("P2SH redeemscript missing") and
 // IsWitnessStandard (P2SH scriptSig that leaves no redeemScript). Core
