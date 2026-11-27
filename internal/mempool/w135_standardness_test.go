@@ -512,25 +512,25 @@ func TestW135_G23_BUG7_NoMaxDustOutputsPerTxConstant(t *testing.T) {
 }
 
 // G24 / BUG-5: P2A NOT subject to a special AnchorDust cap.
-// Core: P2A is just a 4-byte scriptPubKey; GetDustThreshold computes the
-// segwit dust threshold for it like any other segwit output (~231 sat at
-// default dust_relay_fee=3000).
+// Core: P2A is just a 4-byte witness-program scriptPubKey; GetDustThreshold
+// (policy.cpp:26-63) computes the segwit dust threshold for it like any other
+// witness output: (13 + 67) * 3 = 240 sat at default dust_relay_fee=3000.
 //
-// blockbrew: hard-coded value > 240 as dust for P2A.
-//
-// SKIP — bug present.
+// FIXED (r3fix-blockbrew-p2a-dust-threshold): the AnchorDust "dust iff > 240"
+// carve-out is deleted; P2A takes the generic DustThreshold path. The two
+// bidirectional examples this test used to log are now asserted.
 func TestW135_G24_BUG5_AnchorDustInvention(t *testing.T) {
-	if AnchorDust != 240 {
-		t.Errorf("AnchorDust = %d, want 240 (blockbrew invention; should be deleted)",
-			AnchorDust)
+	mp := newTestMempool(newTestUTXOSet())
+	p2a := []byte{0x51, 0x02, 0x4e, 0x73}
+	if got := DustThreshold(&wire.TxOut{PkScript: p2a}, consensus.DustRelayFeeRate); got != 240 {
+		t.Errorf("DustThreshold(P2A) = %d, want 240 (Core GetDustThreshold witness branch)", got)
 	}
-	t.Logf("BUG-5: AnchorDust=240 cap on P2A is a blockbrew invention not present in Core. " +
-		"Core treats P2A like any segwit output for dust math (~231 sat threshold at " +
-		"default dust_relay_fee=3000). Bidirectional divergence: " +
-		"P2A value 200 sat (Core: REJECT dust, blockbrew: ACCEPT ≤ 240); " +
-		"P2A value 250 sat (Core: ACCEPT, blockbrew: REJECT > 240).")
-	t.Skip("BUG-5 (HIGH): AnchorDust=240 cap is a blockbrew invention. " +
-		"audit/w135_standardness_rules.md BUG-5.")
+	if !mp.isDust(&wire.TxOut{Value: 200, PkScript: p2a}) {
+		t.Error("P2A 200 sat: not dust; Core IsDust says dust (200 < 240)")
+	}
+	if mp.isDust(&wire.TxOut{Value: 250, PkScript: p2a}) {
+		t.Error("P2A 250 sat: dust; Core IsDust says not dust (250 >= 240)")
+	}
 }
 
 // ─── G25-G28: IsWitnessStandard ─────────────────────────────────────────────
