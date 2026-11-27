@@ -114,3 +114,28 @@ func p2shOpTrueTestScript() []byte {
 // p2shOpTrueTestScriptSig spends p2shOpTrueTestScript: it pushes the
 // redeemScript OP_TRUE.
 var p2shOpTrueTestScriptSig = []byte{0x01, 0x51}
+
+// TestR3fixAreInputsStandardSolverTestMempoolAcceptBeforeWitnessStandard pins
+// the order of the two gates the dry run now shares with acceptLocked: Core
+// runs ValidateInputsStandardness (validation.cpp:896) before
+// IsWitnessStandard (:904). A P2SH coin spent with an empty scriptSig and a
+// witness fails both: AreInputsStandard ("P2SH redeemscript missing") and
+// IsWitnessStandard (P2SH scriptSig that leaves no redeemScript). Core
+// answers bad-txns-nonstandard-inputs, the first of the two.
+func TestR3fixAreInputsStandardSolverTestMempoolAcceptBeforeWitnessStandard(t *testing.T) {
+	raw, _ := hex.DecodeString(r3fixAISMinimisedHex)
+	tx := &wire.MsgTx{}
+	if err := tx.Deserialize(bytes.NewReader(raw)); err != nil {
+		t.Fatalf("deserialize: %v", err)
+	}
+	tx.TxIn[0].Witness = [][]byte{{0x01}}
+	view := consensus.NewInMemoryUTXOView()
+	view.AddUTXO(tx.TxIn[0].PreviousOutPoint, &consensus.UTXOEntry{Amount: 100_000, PkScript: p2shOpTrueTestScript(), Height: 10})
+	cfg := mempool.DefaultConfig()
+	cfg.ChainState = &tmaFakeChainState{height: 200, mtp: 1_600_000_000}
+	srv := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0"}, WithMempool(mempool.New(cfg, view)))
+	r := runTMA(t, srv, txToHex(t, tx))
+	if r.Allowed || r.RejectReason != "bad-txns-nonstandard-inputs" {
+		t.Fatalf("allowed=%v reject-reason=%q, want allowed=false bad-txns-nonstandard-inputs (AreInputsStandard runs before IsWitnessStandard)", r.Allowed, r.RejectReason)
+	}
+}
