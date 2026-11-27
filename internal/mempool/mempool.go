@@ -1503,8 +1503,9 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	// 10. Validate scripts — two-pass STANDARD vs CONSENSUS split (W96).
 	//
 	// PolicyScriptChecks runs with STANDARD_SCRIPT_VERIFY_FLAGS (which is a
-	// strict superset of consensus block flags: adds NULLFAIL, STRICTENC,
-	// WITNESS_PUBKEYTYPE). A failure here means the tx is non-standard.
+	// strict superset of consensus block flags: adds Core's 13 standard-only
+	// flags, see consensus.GetStandardScriptFlags). A failure here means the
+	// tx is non-standard.
 	// Core: validation.cpp:1135-1156, mapped to TX_NOT_STANDARD.
 	//
 	// ConsensusScriptChecks then re-runs CheckInputScripts with the current
@@ -2044,8 +2045,9 @@ func isUnknownWitnessProgram(pkScript []byte) bool {
 }
 
 // getStandardScriptFlags returns script validation flags for mempool validation.
-// Uses GetStandardScriptFlags which adds policy-only flags (NULLFAIL,
-// WITNESS_PUBKEYTYPE, STRICTENC) on top of the consensus flags.
+// Uses GetStandardScriptFlags which adds Core's standard-only flags
+// (STANDARD_SCRIPT_VERIFY_FLAGS minus the mandatory ones) on top of the
+// consensus flags.
 func (mp *Mempool) getStandardScriptFlags() script.ScriptFlags {
 	// Mempool uses current chain tip flags — no exception hash needed
 	// (exceptions are only for historical blocks during IBD).
