@@ -1193,57 +1193,10 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	// `vsize` above — see MaxClusterSizeWeight.
 	clusterAdjWeight := consensus.GetSigOpsAdjustedWeight(weight, txSigOpsCost, consensus.DefaultBytesPerSigOp)
 
-	// Gate 2 — per-P2SH-input redeemScript sigop limit (MAX_P2SH_SIGOPS=15).
-	// For every input spending a P2SH output the redeemScript (last push in
-	// scriptSig) must have ≤ 15 sigops (accurate counting). This prevents
-	// relay of txns with pathological P2SH redeemScripts.
-	// Core: policy.cpp:254-258, ValidateInputsStandardness.
-	{
-		mempoolView := &mempoolUTXOView{mp: mp}
-		for i, in := range tx.TxIn {
-			utxo := mempoolView.GetUTXO(in.PreviousOutPoint)
-			if utxo == nil {
-				continue
-			}
-			if !script.IsP2SH(utxo.PkScript) {
-				continue
-			}
-			// Count sigops in the redeemScript extracted from scriptSig.
-			sigops := consensus.CountScriptSigOps(in.SignatureScript)
-			if sigops > consensus.MaxP2SHSigOpsPerInput {
-				return fmt.Errorf("%w: input %d has %d sigops > %d",
-					ErrP2SHSigOpsTooMany, i, sigops, consensus.MaxP2SHSigOpsPerInput)
-			}
-		}
-	}
-
-	// Gate 3 — total non-witness (legacy) sigops across all inputs (BIP54,
-	// MAX_TX_LEGACY_SIGOPS=2500). Counts: scriptSig sigops (accurate) +
-	// prevout scriptPubKey sigops (P2SH-accurate). Witness sigops excluded.
-	// Core: policy.cpp:170-193 (CheckSigopsBIP54), called from
-	// ValidateInputsStandardness at policy.cpp:221.
-	{
-		mempoolView := &mempoolUTXOView{mp: mp}
-		var legacySigops int
-		overLimit := false
-		for _, in := range tx.TxIn {
-			// scriptSig sigops (accurate).
-			legacySigops += consensus.CountSigOpsAccurate(in.SignatureScript)
-			// prevout scriptPubKey sigops (P2SH-accurate).
-			utxo := mempoolView.GetUTXO(in.PreviousOutPoint)
-			if utxo != nil {
-				legacySigops += consensus.CountScriptPubKeySigOps(utxo.PkScript, in.SignatureScript)
-			}
-			if legacySigops > consensus.MaxTxLegacySigOps {
-				overLimit = true
-				break
-			}
-		}
-		if overLimit {
-			return fmt.Errorf("%w: %d > %d",
-				ErrTxLegacySigOpsTooMany, legacySigops, consensus.MaxTxLegacySigOps)
-		}
-	}
+	// Gates 2 and 3 (P2SH redeemScript sigops, BIP54 legacy sigops) are part
+	// of ValidateInputsStandardness, which runs after the input loop below:
+	// Core runs it only once every coin is present and CheckTxInputs passed
+	// (validation.cpp:903).
 
 	// 6. Check for double spends (with RBF support) and gather input values
 	var totalInputValue int64
@@ -1321,6 +1274,28 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 				return fmt.Errorf("bad-txns-inputvalues-outofrange: accumulated %d",
 					totalInputValue)
 			}
+		}
+	}
+
+	// 6b. ValidateInputsStandardness (Core policy.cpp AreInputsStandard,
+	// validation.cpp:903): BIP54 legacy sigops, then Solver on each prevout
+	// (NONSTANDARD and WITNESS_UNKNOWN refused) and, for P2SH, the scriptSig
+	// evaluated with no flags (must succeed and leave a redeemScript of <= 15
+	// sigops).
+	//
+	// Core reaches it only after every check it runs earlier has passed. This
+	// path runs some of those later than Core does, so a tx that one of them
+	// is certain to refuse is left to that check (which answers as before):
+	//   - a missing input (TX_MISSING_INPUTS, validation.cpp:857-879);
+	//   - more than one dust output with a non-zero fee (IsStandardTx "dust",
+	//     policy.cpp, the first thing PreChecks runs; refused here at step 9);
+	//   - BIP68 sequence locks (non-BIP68-final, validation.cpp:894; judged
+	//     here at step 10b);
+	//   - outputs above inputs (CheckTxInputs bad-txns-in-belowout,
+	//     validation.cpp:899; judged here at step 7).
+	if len(missingInputs) == 0 && mp.inputsStandardnessReachedLocked(tx, totalInputValue) {
+		if err := ValidateInputsStandardness(tx, mp.lookupOutputLocked); err != nil {
+			return err
 		}
 	}
 
@@ -1856,6 +1831,37 @@ func (mp *Mempool) checkStandardnessLocked(tx *wire.MsgTx) error {
 	}
 
 	return nil
+}
+
+// inputsStandardnessReachedLocked reports whether step 6b should run
+// ValidateInputsStandardness for tx (all inputs present). It returns false
+// only when a check Core runs before AreInputsStandard, and that this accept
+// path runs later, is certain to refuse tx there: CheckTxInputs' outputs <=
+// inputs (step 7), IsStandardTx's dust count (more than
+// MAX_DUST_OUTPUTS_PER_TX = 1 dust output; step 9, which refuses dust only
+// when the fee is non-zero), and BIP68 sequence locks (step 10b). In every
+// other case the check runs here, so nothing it refused is admitted.
+func (mp *Mempool) inputsStandardnessReachedLocked(tx *wire.MsgTx, totalInputValue int64) bool {
+	var outSum int64
+	dust := 0
+	for _, out := range tx.TxOut {
+		outSum += out.Value
+		if mp.isDust(out) {
+			dust++
+		}
+	}
+	if outSum > totalInputValue {
+		return false // step 7 refuses it (ErrNegativeFee)
+	}
+	// Core refuses more than one dust output as "dust" before anything else.
+	// Step 9 refuses every dust output of a tx with a non-zero fee, so such a
+	// tx is left to it. A 0-fee tx is NOT: step 9 lets its dust through (this
+	// path does not enforce MAX_DUST_OUTPUTS_PER_TX), so skipping here would
+	// admit what Core and the old sigop gates refuse. It is judged here.
+	if dust > 1 && outSum < totalInputValue {
+		return false
+	}
+	return mp.checkSequenceLocksLocked(tx) == nil
 }
 
 // isStandardOutputScript returns true if pkScript is a known-standard output

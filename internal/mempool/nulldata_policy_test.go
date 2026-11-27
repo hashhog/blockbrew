@@ -23,6 +23,7 @@ import (
 	"testing"
 
 	"github.com/hashhog/blockbrew/internal/consensus"
+	"github.com/hashhog/blockbrew/internal/crypto"
 	"github.com/hashhog/blockbrew/internal/wire"
 )
 
@@ -248,10 +249,11 @@ func buildTxWithOpReturnOut(fundingOut wire.OutPoint, pkScript []byte) *wire.Msg
 		Version:  2,
 		LockTime: 0,
 	}
-	// Spending input — dummy scriptSig, no RBF signal.
+	// Spending input — scriptSig pushes the OP_TRUE redeemScript of the
+	// P2SH(OP_TRUE) funding coin (newTestMempoolNoScript); no RBF signal.
 	tx.TxIn = []*wire.TxIn{{
 		PreviousOutPoint: fundingOut,
-		SignatureScript:  make([]byte, 107),
+		SignatureScript:  []byte{0x01, 0x51},
 		Sequence:         0xffffffff,
 	}}
 	// OP_RETURN output (value must be 0; anything else is also fine per policy).
@@ -264,9 +266,9 @@ func buildTxWithOpReturnOut(fundingOut wire.OutPoint, pkScript []byte) *wire.Msg
 
 // newTestMempoolNoScript creates a test mempool with no ChainState (skips
 // IsFinalTx / BIP-68 checks) and a MinRelayFeeRate that we can control.
-// Script validation will fail unless the UTXO PkScript is empty (which the
-// engine short-circuits).  We wire up real UTXOs with empty PkScript so that
-// script validation passes without needing real signatures.
+// The funding coin is P2SH(OP_TRUE): a standard input type (Core's
+// ValidateInputsStandardness refuses a NONSTANDARD prevout such as an empty
+// scriptPubKey) whose spend needs no signature.
 func newTestMempoolNoScript() (*Mempool, wire.OutPoint) {
 	utxoSet := newTestUTXOSet()
 
@@ -275,10 +277,9 @@ func newTestMempoolNoScript() (*Mempool, wire.OutPoint) {
 	fundingHash[1] = 0x0d
 
 	outpoint := wire.OutPoint{Hash: fundingHash, Index: 0}
-	// Use an empty PkScript so script engine immediately succeeds (no ops).
 	entry := &consensus.UTXOEntry{
 		Amount:     1_000_000, // 0.01 BTC — plenty for any fee
-		PkScript:   []byte{},  // empty = immediately valid
+		PkScript:   p2shOpTrueScript(),
 		Height:     1,
 		IsCoinbase: false,
 	}
@@ -337,4 +338,10 @@ func TestAcceptToMemoryPool_WellFormedOpReturn(t *testing.T) {
 			t.Errorf("well-formed nulldata vout with value=0 incorrectly rejected as dust: %v", err)
 		}
 	}
+}
+
+// p2shOpTrueScript is P2SH(OP_TRUE): OP_HASH160 <hash160(0x51)> OP_EQUAL.
+func p2shOpTrueScript() []byte {
+	h := crypto.Hash160([]byte{0x51})
+	return append(append([]byte{0xa9, 0x14}, h[:]...), 0x87)
 }

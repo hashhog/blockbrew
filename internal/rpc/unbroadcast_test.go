@@ -37,7 +37,7 @@ func TestUnbroadcast_SendRawTransactionMarksUnbroadcast(t *testing.T) {
 	var fund wire.Hash256
 	fund[0], fund[1] = 0xf0, 0x0d
 	op := wire.OutPoint{Hash: fund, Index: 0}
-	view := unbroadcastUTXOView{op: {Amount: 1_000_000, PkScript: []byte{0x51}, Height: 1}}
+	view := unbroadcastUTXOView{op: {Amount: 1_000_000, PkScript: p2shOpTrueTestScript(), Height: 1}}
 	mp := mempool.New(mempool.Config{
 		MaxSize:         10_000_000,
 		MinRelayFeeRate: 1000,
@@ -48,7 +48,7 @@ func TestUnbroadcast_SendRawTransactionMarksUnbroadcast(t *testing.T) {
 	server := NewServer(RPCConfig{ListenAddr: "127.0.0.1:0"}, WithMempool(mp))
 
 	tx := &wire.MsgTx{Version: 2}
-	tx.TxIn = []*wire.TxIn{{PreviousOutPoint: op, Sequence: 0xffffffff}}
+	tx.TxIn = []*wire.TxIn{{PreviousOutPoint: op, SignatureScript: p2shOpTrueTestScriptSig, Sequence: 0xffffffff}}
 	tx.TxOut = []*wire.TxOut{{Value: 990_000, PkScript: []byte{0x00, 0x14, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20}}}
 	var buf bytes.Buffer
 	if err := tx.Serialize(&buf); err != nil {

@@ -391,7 +391,7 @@ func TestRESTTx(t *testing.T) {
 		Version: 2,
 		TxIn: []*wire.TxIn{{
 			PreviousOutPoint: wire.OutPoint{Hash: wire.Hash256{0x01, 0x02, 0x03}, Index: 0},
-			SignatureScript:  []byte{},
+			SignatureScript:  p2shOpTrueTestScriptSig,
 			Sequence:         0xFFFFFFFF,
 		}},
 		TxOut: []*wire.TxOut{{
@@ -403,11 +403,11 @@ func TestRESTTx(t *testing.T) {
 
 	txid := tx.TxHash()
 
-	// Provide a UTXO set with OP_1 (anyone-can-spend) and enough value for fees.
+	// Provide a UTXO set with a P2SH(OP_TRUE) coin and enough value for fees.
 	utxoView := consensus.NewInMemoryUTXOView()
 	utxoView.AddUTXO(tx.TxIn[0].PreviousOutPoint, &consensus.UTXOEntry{
 		Amount:   1_100_000,      // total input; fee = 1_100_000 - 0 = 1_100_000 sat
-		PkScript: []byte{0x51},  // OP_1 (anyone-can-spend)
+		PkScript: p2shOpTrueTestScript(), // P2SH(OP_TRUE): standard, needs no signature
 		Height:   1,
 	})
 	mp := mempool.New(mempool.DefaultConfig(), utxoView)
