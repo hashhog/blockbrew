@@ -1187,11 +1187,9 @@ func (s *Server) handleWalletProcessPSBTWithWallet(params json.RawMessage, walle
 		return nil, rpcErr
 	}
 
-	// Delegate to the existing implementation but use the resolved wallet
-	// This requires temporarily setting s.wallet (hacky but maintains compatibility)
-	oldWallet := s.wallet
-	s.wallet = w
-	defer func() { s.wallet = oldWallet }()
-
-	return s.handleWalletProcessPSBT(params)
+	// Hand the resolved wallet down, like Core's walletprocesspsbt passes the
+	// CWallet from GetWalletForJSONRPCRequest to FillPSBT. Swapping the shared
+	// s.wallet field here instead let overlapping /wallet/A and /wallet/B
+	// calls sign with each other's keys.
+	return s.handleWalletProcessPSBT(w, params)
 }
