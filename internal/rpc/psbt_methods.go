@@ -257,9 +257,12 @@ func (s *Server) handleConvertToPSBT(params json.RawMessage) (interface{}, *RPCE
 	return encoded, nil
 }
 
-// handleWalletProcessPSBT signs a PSBT using the wallet.
-func (s *Server) handleWalletProcessPSBT(params json.RawMessage) (interface{}, *RPCError) {
-	if s.wallet == nil {
+// handleWalletProcessPSBT fills and signs a PSBT with w, the wallet the
+// caller resolved for this request. The wallet is per-request state and is
+// passed in, never read from the Server (Core: GetWalletForJSONRPCRequest,
+// wallet/rpc/util.cpp).
+func (s *Server) handleWalletProcessPSBT(w *wallet.Wallet, params json.RawMessage) (interface{}, *RPCError) {
+	if w == nil {
 		return nil, &RPCError{Code: RPCErrWalletNotFound, Message: "Wallet not loaded"}
 	}
 
@@ -307,7 +310,7 @@ func (s *Server) handleWalletProcessPSBT(params json.RawMessage) (interface{}, *
 	// the PSBT creator did not attach UTXO data. createpsbt is a pure
 	// constructor and leaves inputs empty; without this fill, SignPSBT
 	// returns "PSBT input missing UTXO information".
-	if s.wallet != nil && psbt.UnsignedTx != nil {
+	if psbt.UnsignedTx != nil {
 		for i, in := range psbt.UnsignedTx.TxIn {
 			if i >= len(psbt.Inputs) {
 				break
@@ -315,7 +318,7 @@ func (s *Server) handleWalletProcessPSBT(params json.RawMessage) (interface{}, *
 			if psbt.Inputs[i].WitnessUTXO != nil || psbt.Inputs[i].NonWitnessUTXO != nil {
 				continue
 			}
-			if u := s.wallet.GetUTXO(in.PreviousOutPoint); u != nil {
+			if u := w.GetUTXO(in.PreviousOutPoint); u != nil {
 				psbt.Inputs[i].WitnessUTXO = &wire.TxOut{Value: u.Amount, PkScript: u.PkScript}
 			}
 		}
@@ -323,7 +326,7 @@ func (s *Server) handleWalletProcessPSBT(params json.RawMessage) (interface{}, *
 
 	// Sign if requested
 	if sign {
-		signer := wallet.NewWalletPSBTSigner(s.wallet)
+		signer := wallet.NewWalletPSBTSigner(w)
 		if err := wallet.SignPSBT(psbt, signer); err != nil {
 			return nil, &RPCError{Code: RPCErrWalletError, Message: fmt.Sprintf("Failed to sign PSBT: %v", err)}
 		}
