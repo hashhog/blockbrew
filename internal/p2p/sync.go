@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"math/big"
 	"math/rand/v2"
 	"runtime"
@@ -2902,6 +2903,15 @@ func (sm *SyncManager) serveGetDataBlock(peer *Peer, inv *InvVect) bool {
 			return false
 		}
 	}
+	// Core ProcessGetBlockData: an unknown block, or one BlockRequestAllowed
+	// refuses (off the active chain and not a recent fully-validated stale
+	// block), is ignored -- no block and no notfound. Checked before the disk
+	// read, so a refused request costs no read.
+	if !sm.blockRequestAllowed(inv.Hash) {
+		log.Printf("sync: ignoring getdata from %s for block %x that is not on the active chain or a recent valid stale block",
+			peer.Address(), inv.Hash[:4])
+		return true
+	}
 	block, err := sm.chainDB.GetBlock(inv.Hash)
 	if err != nil {
 		// On any read error in prune mode, send a notfound so the
@@ -2932,6 +2942,86 @@ func (sm *SyncManager) serveGetDataBlock(peer *Peer, inv *InvVect) bool {
 	// MSG_CMPCT_BLOCK beyond the depth limit gets the witness block.
 	peer.SendMessage(&MsgBlock{Block: block, NoWitness: inv.Type == InvTypeBlock})
 	return true
+}
+
+// staleRelayAgeLimit is Core's STALE_RELAY_AGE_LIMIT (net_processing.cpp):
+// a block off the active chain is served only if it is less than this far
+// (in seconds, by header time and by proof-equivalent time) behind the best
+// header.
+const staleRelayAgeLimit = 30 * 24 * 60 * 60
+
+// blockRequestAllowed reports whether a block may be served to a peer that
+// asks for it by hash: Core's PeerManagerImpl::BlockRequestAllowed. Blocks on
+// the active chain are always allowed. Any other block must have passed full
+// validation (BLOCK_VALID_SCRIPTS: StatusFullyValid and not marked failed) and
+// be within staleRelayAgeLimit of the best header, so a side-branch block that
+// was never validated, a failed block, or an old stale block is not handed
+// out (it would relay invalid data and lets a peer fingerprint which forks we
+// have seen).
+//
+// A block missing from the header index is refused, as Core's
+// LookupBlockIndex miss returns before serving. Without a header index or a
+// chain manager there is no chain to check against (unit-test SyncManagers
+// built only to exercise queueing), and the check is skipped.
+func (sm *SyncManager) blockRequestAllowed(hash wire.Hash256) bool {
+	if sm.headerIndex == nil || sm.chainMgr == nil {
+		return true
+	}
+	return blockRequestAllowed(sm.headerIndex.GetNode(hash), sm.chainMgr.BestBlockNode(),
+		sm.headerIndex.BestTip(), sm.chainParams)
+}
+
+// blockRequestAllowed is the check itself, on the requested node, the active
+// tip and the best header.
+func blockRequestAllowed(node, activeTip, bestHeader *consensus.BlockNode, params *consensus.ChainParams) bool {
+	if node == nil {
+		return false
+	}
+	// m_chainman.ActiveChain().Contains(&block_index)
+	if activeTip != nil {
+		if anc := activeTip.GetAncestor(node.Height); anc != nil && anc.Hash == node.Hash {
+			return true
+		}
+	}
+	// block_index.IsValid(BLOCK_VALID_SCRIPTS): IsValid is false for a block
+	// marked failed, whatever its other flags say.
+	if node.Status&consensus.StatusFullyValid == 0 || node.Status.IsInvalid() {
+		return false
+	}
+	if bestHeader == nil || params == nil {
+		return false
+	}
+	if int64(bestHeader.Header.Timestamp)-int64(node.Header.Timestamp) >= staleRelayAgeLimit {
+		return false
+	}
+	return blockProofEquivalentTime(bestHeader, node, bestHeader, params.TargetSpacing) < staleRelayAgeLimit
+}
+
+// blockProofEquivalentTime is Core's GetBlockProofEquivalentTime (chain.cpp):
+// the signed work difference to - from, expressed in seconds of block
+// production at tip's difficulty, saturating at +/- math.MaxInt64.
+func blockProofEquivalentTime(to, from, tip *consensus.BlockNode, targetSpacing int64) int64 {
+	if to.TotalWork == nil || from.TotalWork == nil {
+		return math.MaxInt64
+	}
+	r := new(big.Int)
+	sign := int64(1)
+	if to.TotalWork.Cmp(from.TotalWork) > 0 {
+		r.Sub(to.TotalWork, from.TotalWork)
+	} else {
+		r.Sub(from.TotalWork, to.TotalWork)
+		sign = -1
+	}
+	proof := consensus.CalcWork(tip.Header.Bits)
+	if proof.Sign() <= 0 {
+		return math.MaxInt64
+	}
+	r.Mul(r, big.NewInt(targetSpacing))
+	r.Div(r, proof)
+	if r.BitLen() > 63 {
+		return sign * math.MaxInt64
+	}
+	return sign * r.Int64()
 }
 
 // serveGetDataTx answers one tx item from the mempool. It returns false when
