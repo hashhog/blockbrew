@@ -53,6 +53,12 @@
 //        A receiver that grew the tx but didn't add fee would drop the
 //        feerate below sender's minimum; rejected.
 //
+// G10, G13 and G14 compare scripts and the total fee only. The per-output
+// value rules of BIP-78's sender checklist are enforced separately by
+// payjoinAntisnoopOutputValues: no output except the payment output (when
+// substitution is allowed) may lose value, the fee output only by up to
+// maxadditionalfeecontribution and only to fee.
+//
 // On any G10-G15 failure, the sender invokes G22 fallback: discards the
 // proposal entirely and returns the Original PSBT (caller's broadcast path
 // is unchanged). The caller can then sendrawtransaction the extracted
@@ -70,6 +76,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -358,6 +365,130 @@ func payjoinAntisnoopMaxFeeContribution(original, proposal *PSBT, maxAddFee int6
 	delta := propFee - origFee
 	if delta > maxAddFee {
 		return fmt.Errorf("G13: proposal fee delta %d sats exceeds maxadditionalfeecontribution %d sats", delta, maxAddFee)
+	}
+	return nil
+}
+
+// payjoinFindPaymentOutput returns the index of the Original's payment
+// output: the one output whose pkScript the sender wallet does not own.
+// Returns -1 when that is not exactly one output (a self-payment, or an
+// Original with several third-party outputs); the caller then treats every
+// output, the payment output included, as one that must not lose value.
+func payjoinFindPaymentOutput(original *PSBT, isOwnScriptFn func([]byte) bool) int {
+	if original == nil || original.UnsignedTx == nil || isOwnScriptFn == nil {
+		return -1
+	}
+	idx := -1
+	for i, out := range original.UnsignedTx.TxOut {
+		if isOwnScriptFn(out.PkScript) {
+			continue
+		}
+		if idx >= 0 {
+			return -1
+		}
+		idx = i
+	}
+	return idx
+}
+
+// payjoinAntisnoopOutputValues enforces BIP-78 §"Sender's payjoin proposal
+// checklist" per output. G10/G14 compare pkScripts only and G13 bounds the
+// total fee delta only, so without this check a receiver could move value
+// out of the sender's change into its own output at an unchanged fee.
+//
+// For every output of the Original:
+//   - the payment output (paymentIdx), when output substitution is allowed,
+//     is not checked: the receiver may change its script and value;
+//   - the fee output (opts.AdditionalFeeOutputIndex) may lose at most
+//     maxadditionalfeecontribution, and what it loses (the "actual
+//     contribution") may not exceed the proposal's fee increase, so it
+//     pays fee and not the receiver;
+//   - every other output must appear with the same pkScript and a value
+//     that did not decrease.
+//
+// With no fee output designated, nothing may be taken from any output.
+// paymentIdx == -1 means the payment output is unknown; every output is
+// then protected.
+//
+// Proposal outputs are matched to Original outputs by pkScript (the
+// receiver may reorder them, and may add outputs of its own). When several
+// protected outputs share a pkScript, each must be matched to a distinct
+// proposal output with that pkScript; pairing the outputs' minimum values
+// and the proposal values each sorted in descending order finds such a
+// matching whenever one exists.
+func payjoinAntisnoopOutputValues(original, proposal *PSBT, opts PayjoinSendOptions, paymentIdx int) error {
+	if original == nil || original.UnsignedTx == nil || proposal == nil || proposal.UnsignedTx == nil {
+		return fmt.Errorf("output-values: missing unsigned tx")
+	}
+	origOuts := original.UnsignedTx.TxOut
+	feeIdx := opts.AdditionalFeeOutputIndex
+	if feeIdx >= len(origOuts) {
+		return fmt.Errorf("output-values: additionalfeeoutputindex %d out of range (%d outputs)", feeIdx, len(origOuts))
+	}
+	maxContribution := int64(0)
+	if feeIdx >= 0 && opts.MaxAdditionalFeeContribution > 0 {
+		maxContribution = opts.MaxAdditionalFeeContribution
+	}
+
+	type slot struct {
+		origIdx  int
+		minValue int64
+	}
+	slotsByScript := make(map[string][]slot)
+	for i, out := range origOuts {
+		if i != feeIdx && i == paymentIdx && !opts.DisableOutputSubstitution {
+			continue // BIP-78: payment output with substitution allowed — no check
+		}
+		minValue := out.Value
+		if i == feeIdx {
+			minValue -= maxContribution
+		}
+		k := string(out.PkScript)
+		slotsByScript[k] = append(slotsByScript[k], slot{origIdx: i, minValue: minValue})
+	}
+	propByScript := make(map[string][]int64)
+	for _, out := range proposal.UnsignedTx.TxOut {
+		k := string(out.PkScript)
+		if _, wanted := slotsByScript[k]; wanted {
+			propByScript[k] = append(propByScript[k], out.Value)
+		}
+	}
+
+	contribution := int64(0)
+	for k, slots := range slotsByScript {
+		props := propByScript[k]
+		if len(props) < len(slots) {
+			return fmt.Errorf("output-values: original output %d (pkScript=%x) is missing from the proposal", slots[len(props)].origIdx, []byte(k))
+		}
+		sort.SliceStable(slots, func(a, b int) bool { return slots[a].minValue > slots[b].minValue })
+		sort.Slice(props, func(a, b int) bool { return props[a] > props[b] })
+		for j, s := range slots {
+			got := props[j]
+			orig := origOuts[s.origIdx].Value
+			if got < s.minValue {
+				if s.origIdx == feeIdx {
+					return fmt.Errorf("output-values: fee output %d lost %d sats, more than maxadditionalfeecontribution %d", s.origIdx, orig-got, maxContribution)
+				}
+				return fmt.Errorf("output-values: original output %d value decreased from %d to %d sats", s.origIdx, orig, got)
+			}
+			if s.origIdx == feeIdx && got < orig {
+				contribution = orig - got
+			}
+		}
+	}
+
+	if contribution > 0 {
+		origFee, err := payjoinPSBTFee(original)
+		if err != nil {
+			return fmt.Errorf("output-values: cannot compute original fee: %w", err)
+		}
+		propFee, err := payjoinPSBTFee(proposal)
+		if err != nil {
+			return fmt.Errorf("output-values: cannot compute proposal fee: %w", err)
+		}
+		if contribution > propFee-origFee {
+			return fmt.Errorf("output-values: fee output contribution %d sats exceeds the fee increase %d sats (the difference went to another output)", contribution, propFee-origFee)
+		}
 	}
 	return nil
 }
@@ -655,6 +786,10 @@ func (w *Wallet) SendPayjoinRequest(original *PSBT, opts PayjoinSendOptions) (*P
 		return payjoinFallback(origBase64, resp.StatusCode, err.Error()), nil
 	}
 	if err := payjoinAntisnoopMaxFeeContribution(original, proposal, maxFee); err != nil {
+		return payjoinFallback(origBase64, resp.StatusCode, err.Error()), nil
+	}
+	paymentIdx := payjoinFindPaymentOutput(original, w.IsOwnScript)
+	if err := payjoinAntisnoopOutputValues(original, proposal, opts, paymentIdx); err != nil {
 		return payjoinFallback(origBase64, resp.StatusCode, err.Error()), nil
 	}
 	if opts.DisableOutputSubstitution {
