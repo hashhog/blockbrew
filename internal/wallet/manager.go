@@ -3,6 +3,7 @@ package wallet
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -197,37 +198,47 @@ func (m *Manager) UnloadWallet(name string, loadOnStartup *bool) error {
 
 // CreateWallet creates a new wallet.
 func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, error) {
+	w, _, err := m.CreateWalletWithMnemonic(name, opts)
+	return w, err
+}
+
+// CreateWalletWithMnemonic creates a new wallet and also returns the BIP-39
+// mnemonic it generated ("" when the caller supplied one to restore from, or
+// for a blank / watch-only wallet). The words are handed back here because a
+// wallet created with a passphrase is already locked when this returns, so
+// Mnemonic() refuses them until walletpassphrase.
+func (m *Manager) CreateWalletWithMnemonic(name string, opts CreateWalletOpts) (*Wallet, string, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Validate name
 	if name == "" {
-		return nil, ErrInvalidWalletName
+		return nil, "", ErrInvalidWalletName
 	}
 	if !isValidWalletName(name) {
-		return nil, ErrInvalidWalletName
+		return nil, "", ErrInvalidWalletName
 	}
 
 	// Check if already loaded
 	if _, exists := m.wallets[name]; exists {
-		return nil, ErrWalletAlreadyLoaded
+		return nil, "", ErrWalletAlreadyLoaded
 	}
 
 	// Check limit
 	if len(m.wallets) >= MaxLoadedWallets {
-		return nil, ErrTooManyWallets
+		return nil, "", ErrTooManyWallets
 	}
 
 	walletPath := m.walletDir(name)
 
 	// Check if wallet already exists on disk
 	if _, err := os.Stat(filepath.Join(walletPath, "wallet.dat")); err == nil {
-		return nil, ErrWalletAlreadyExists
+		return nil, "", ErrWalletAlreadyExists
 	}
 
 	// Create wallet directory
 	if err := os.MkdirAll(walletPath, 0700); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	// Create wallet
@@ -250,6 +261,7 @@ func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, err
 	w.disablePrivateKeys = opts.DisablePrivateKeys
 
 	// Initialize with keys unless blank wallet requested
+	generated := ""
 	if !opts.Blank && !opts.DisablePrivateKeys {
 		// Either RESTORE from a caller-supplied BIP-39 mnemonic (deterministic
 		// seed-only recovery — same words always re-derive byte-identical keys
@@ -262,8 +274,9 @@ func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, err
 			var err error
 			mnemonic, err = GenerateMnemonic()
 			if err != nil {
-				return nil, err
+				return nil, "", err
 			}
+			generated = mnemonic
 		}
 		// W161 BUG-16 fix: pass the BIP-39 seed passphrase (NOT the wallet-
 		// file passphrase) through to PBKDF2. opts.SeedPassphrase=="" matches
@@ -272,13 +285,25 @@ func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, err
 		// §"From mnemonic to seed", giving Trezor/Ledger-style "25th word"
 		// support. NFKD-normalisation is applied inside MnemonicToSeed.
 		if err := w.CreateFromMnemonic(mnemonic, opts.SeedPassphrase); err != nil {
-			return nil, err
+			return nil, "", err
+		}
+
+		// A passphrase encrypts the wallet, as Core's CWallet::Create does
+		// (wallet/wallet.cpp:432-454: EncryptWallet, Unlock to set up the
+		// keys, Lock). The keys already exist here, so EncryptWallet, which
+		// seals the master key under the passphrase, makes it the envelope
+		// password and locks, reaches the same end state. It runs before the
+		// first Save, so no plaintext seed is ever written for this wallet.
+		if opts.Passphrase != "" {
+			if err := w.EncryptWallet(opts.Passphrase); err != nil {
+				return nil, "", fmt.Errorf("failed to encrypt the new wallet: %w", err)
+			}
 		}
 	}
 
 	// Save to disk (under the wallet's envelope password).
 	if err := w.Save(); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	m.wallets[name] = w
@@ -292,7 +317,7 @@ func (m *Manager) CreateWallet(name string, opts CreateWalletOpts) (*Wallet, err
 		m.updateAutoLoad(name, *opts.LoadOnStartup)
 	}
 
-	return w, nil
+	return w, generated, nil
 }
 
 // GetWallet returns a loaded wallet by name.

@@ -53,14 +53,15 @@ func TestRelayAddrSizeGate(t *testing.T) {
 	makeAddrs := func(n int) []NetAddress {
 		addrs := make([]NetAddress, n)
 		for i := range addrs {
-			addrs[i] = NetAddress{IP: net.ParseIP("203.0.113.1"), Port: uint16(8333 + i)}
+			// Fresh and routable, so only the size gate can stop the relay.
+			addrs[i] = NetAddress{Timestamp: uint32(time.Now().Unix()), IP: net.ParseIP("5.6.7.8"), Port: uint16(8333 + i)}
 		}
 		return addrs
 	}
 	makeAddrsV2 := func(n int) []NetAddressV2 {
 		addrs := make([]NetAddressV2, n)
 		for i := range addrs {
-			addrs[i] = NetAddressV2{NetworkID: NetIPv4, Addr: []byte{203, 0, 113, byte(i)}, Port: 8333}
+			addrs[i] = NetAddressV2{Time: uint32(time.Now().Unix()), NetworkID: NetIPv4, Addr: []byte{5, 6, 8, byte(i)}, Port: 8333}
 		}
 		return addrs
 	}

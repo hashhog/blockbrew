@@ -38,6 +38,9 @@ var (
 	ErrTaprootSigVerify         = newError(ErrCodeSchnorrSig, "taproot signature verification failed")
 	ErrDiscourageUpgradableTaprootVersion = newError(ErrCodeDiscourageUpgradableTaprootVersion, "upgradable taproot leaf version (discouraged)")
 	ErrDiscourageUpgradablePubKeyType     = newError(ErrCodeDiscourageUpgradablePubKeyType, "upgradable tapscript pubkey type (discouraged)")
+	// Core SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM (interpreter.cpp
+	// VerifyWitnessProgram upgradable branch).
+	ErrDiscourageUpgradableWitnessProgram = newError(ErrCodeDiscourageUpgradableWitnessProgram, "upgradable witness program (discouraged)")
 	ErrTapscriptEmptyPubKey               = newError(ErrCodeTapscriptEmptyPubKey, "tapscript: empty pubkey not allowed")
 	ErrTapscriptInvalidSigSize            = newError(ErrCodeSchnorrSigSize, "tapscript: invalid schnorr signature size")
 	ErrTapscriptValidationWeight          = newError(ErrCodeTapscriptValidationWeight, "tapscript validation weight budget exceeded")
@@ -274,7 +277,7 @@ func (e *Engine) Execute() error {
 			// DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM, otherwise success.
 			if witnessVersion >= 1 {
 				if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
-					return ErrWitnessProgram
+					return ErrDiscourageUpgradableWitnessProgram
 				}
 				return nil
 			}
@@ -363,7 +366,7 @@ func (e *Engine) executeWitnessProgram(version int, program []byte, witness [][]
 		// Non-32-byte v1 program (and not P2A): future anyone-can-spend, but
 		// discourage if the policy flag is set.
 		if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
-			return ErrWitnessProgram
+			return ErrDiscourageUpgradableWitnessProgram
 		}
 		return nil
 	default:
@@ -372,7 +375,7 @@ func (e *Engine) executeWitnessProgram(version int, program []byte, witness [][]
 			return ErrWitnessProgram
 		}
 		if e.flags&ScriptVerifyDiscourageUpgradableWitnessProgram != 0 {
-			return ErrWitnessProgram
+			return ErrDiscourageUpgradableWitnessProgram
 		}
 		return nil
 	}
@@ -660,7 +663,15 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 	// stack element size limits".  A bare OP_SUCCESSx leaf with an oversized or
 	// over-count witness stack MUST be accepted (or policy-rejected with
 	// DISCOURAGE_OP_SUCCESS), never consensus-rejected for stack limits.
+	// A push whose length bytes or data run past the end of the script is
+	// Core's GetOp failure (script.cpp GetScriptOp), which this pre-scan turns
+	// into SCRIPT_ERR_BAD_OPCODE before anything executes (interpreter.cpp
+	// :1841-1844). It used to stop scanning silently, so an earlier opcode's
+	// error was reported instead of BAD_OPCODE. The verdict is the same either
+	// way (a truncated push is always the last thing in the script); only the
+	// reason differs.
 	{
+		errTruncated := newError(ErrCodeBadOpcode, "tapscript push runs past the end of the script")
 		scanPC := 0
 		for scanPC < len(script) {
 			op := script[scanPC]
@@ -669,18 +680,18 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 				scanPC += int(op)
 			} else if op == OP_PUSHDATA1 {
 				if scanPC >= len(script) {
-					break
+					return errTruncated
 				}
 				scanPC += 1 + int(script[scanPC])
 			} else if op == OP_PUSHDATA2 {
 				if scanPC+2 > len(script) {
-					break
+					return errTruncated
 				}
 				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8
 				scanPC += 2 + dataLen
 			} else if op == OP_PUSHDATA4 {
 				if scanPC+4 > len(script) {
-					break
+					return errTruncated
 				}
 				dataLen := int(script[scanPC]) | int(script[scanPC+1])<<8 | int(script[scanPC+2])<<16 | int(script[scanPC+3])<<24
 				scanPC += 4 + dataLen
@@ -689,6 +700,9 @@ func (e *Engine) executeTaprootScriptPath(outputKey []byte, witness [][]byte, an
 					return ErrDiscourageOpSuccess
 				}
 				return nil
+			}
+			if scanPC > len(script) {
+				return errTruncated
 			}
 		}
 	}

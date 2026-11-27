@@ -88,6 +88,10 @@ func (s *Server) handleSendToAddress(params json.RawMessage) (interface{}, *RPCE
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing address and/or amount"}
 	}
 
+	if rpcErr := ensureWalletUnlocked(s.wallet); rpcErr != nil {
+		return nil, rpcErr
+	}
+
 	addr, ok := args[0].(string)
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
@@ -263,6 +267,27 @@ func (s *Server) handleWalletLock() (interface{}, *RPCError) {
 	return nil, nil
 }
 
+// ensureWalletUnlocked is Core's EnsureWalletIsUnlocked (wallet/rpc/util.cpp):
+// -13 while an encrypted wallet is locked. CWallet::IsLocked is false for an
+// unencrypted wallet, so only encrypted wallets are refused here.
+func ensureWalletUnlocked(w *wallet.Wallet) *RPCError {
+	if w.IsEncrypted() && w.IsLocked() {
+		return &RPCError{Code: RPCErrWalletUnlockNeeded, Message: "Error: Please enter the wallet passphrase with walletpassphrase first."}
+	}
+	return nil
+}
+
+// walletUnlockedUntil is getwalletinfo's unlocked_until: present only for an
+// encrypted wallet (Core: `if (pwallet->HasEncryptionKeys())`), 0 while it is
+// locked, else the relock time walletpassphrase set.
+func walletUnlockedUntil(w *wallet.Wallet) *int64 {
+	if !w.IsEncrypted() {
+		return nil
+	}
+	until := w.UnlockedUntil()
+	return &until
+}
+
 // mapEncryptionError converts wallet-package errors into the canonical
 // JSON-RPC error codes from bitcoin-core/src/rpc/protocol.h.
 func mapEncryptionError(err error) *RPCError {
@@ -402,6 +427,7 @@ func (s *Server) handleGetWalletInfo() (interface{}, *RPCError) {
 		KeypoolSize:        20,
 		PayTxFee:           0,
 		Locked:             s.wallet.IsLocked(),
+		UnlockedUntil:      walletUnlockedUntil(s.wallet),
 	}, nil
 }
 

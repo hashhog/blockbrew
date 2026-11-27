@@ -1380,8 +1380,7 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 		}
 		if fee == 0 {
 			// Ephemeral anchor / 0-fee CPFP carrier: dust is permitted.
-			// Continue scanning — other outputs may still need checking
-			// (e.g. AnchorDust cap on P2A handled inside isDust).
+			// Continue scanning — other outputs may still need checking.
 			continue
 		}
 		// Non-zero-fee tx with dust output. Wrap both sentinels so
@@ -1478,8 +1477,9 @@ func (mp *Mempool) acceptLocked(tx *wire.MsgTx, fromPeer string, opts acceptOpts
 	// 10. Validate scripts — two-pass STANDARD vs CONSENSUS split (W96).
 	//
 	// PolicyScriptChecks runs with STANDARD_SCRIPT_VERIFY_FLAGS (which is a
-	// strict superset of consensus block flags: adds NULLFAIL, STRICTENC,
-	// WITNESS_PUBKEYTYPE). A failure here means the tx is non-standard.
+	// strict superset of consensus block flags: adds Core's 13 standard-only
+	// flags, see consensus.GetStandardScriptFlags). A failure here means the
+	// tx is non-standard.
 	// Core: validation.cpp:1135-1156, mapped to TX_NOT_STANDARD.
 	//
 	// ConsensusScriptChecks then re-runs CheckInputScripts with the current
@@ -1700,26 +1700,21 @@ func (v *mempoolUTXOView) GetUTXO(outpoint wire.OutPoint) *consensus.UTXOEntry {
 	return v.mp.lookupOutputLocked(outpoint)
 }
 
-// AnchorDust is the maximum value allowed for P2A outputs (in satoshis).
-// P2A outputs are exempt from the normal dust threshold but capped at this value.
-const AnchorDust int64 = 240
-
 // isDust checks if an output is dust (uneconomical to spend).
 // Mirrors Bitcoin Core's GetDustThreshold / IsDust (policy/policy.cpp):
 // provably unspendable outputs (OP_RETURN / empty) have a dust threshold of 0
 // and are therefore never dust — they carry no future spending cost.
+//
+// There is no pay-to-anchor (P2A) special case: Core's GetDustThreshold treats
+// P2A (OP_1 <0x4e73>) like any witness program, so its threshold is
+// (13 + 67) * 3 = 240 sat at the default dust relay fee. A 0-sat ephemeral
+// anchor IS dust and is admitted only by the 0-fee rule in the callers
+// (PreCheckEphemeralTx, policy/ephemeral_policy.cpp:27).
 func (mp *Mempool) isDust(txOut *wire.TxOut) bool {
 	// Provably unspendable outputs (OP_RETURN or empty) are never dust.
 	// Core's GetDustThreshold returns 0 for IsUnspendable(), so IsDust is false.
 	if consensus.IsUnspendable(txOut.PkScript) {
 		return false
-	}
-
-	// P2A (Pay-to-Anchor) outputs are exempt from normal dust rules.
-	// They are meant for fee bumping via CPFP and can have value 0.
-	// However, for standardness we cap them at AnchorDust satoshis.
-	if consensus.IsPayToAnchor(txOut.PkScript) {
-		return txOut.Value > AnchorDust // P2A is only standard if value <= AnchorDust
 	}
 
 	// Dust is defined as an output whose value is below the cost of spending
@@ -1813,14 +1808,8 @@ func (mp *Mempool) checkStandardnessLocked(tx *wire.MsgTx) error {
 
 	// Per-input scriptSig policy (Core IsStandardTx input loop,
 	// policy/policy.cpp:117-135): scriptSig size cap + push-only.
-	for i, in := range tx.TxIn {
-		if len(in.SignatureScript) > MaxStandardScriptSigSize {
-			return fmt.Errorf("%w: input %d scriptSig %d bytes > %d",
-				ErrScriptSigTooLarge, i, len(in.SignatureScript), MaxStandardScriptSigSize)
-		}
-		if len(in.SignatureScript) > 0 && !script.IsPushOnly(in.SignatureScript) {
-			return fmt.Errorf("%w: input %d", ErrScriptSigNotPushOnly, i)
-		}
+	if err := checkScriptSigStandard(tx); err != nil {
+		return err
 	}
 
 	// Output script standardness + cumulative OP_RETURN datacarrier budget
@@ -2050,8 +2039,9 @@ func isUnknownWitnessProgram(pkScript []byte) bool {
 }
 
 // getStandardScriptFlags returns script validation flags for mempool validation.
-// Uses GetStandardScriptFlags which adds policy-only flags (NULLFAIL,
-// WITNESS_PUBKEYTYPE, STRICTENC) on top of the consensus flags.
+// Uses GetStandardScriptFlags which adds Core's standard-only flags
+// (STANDARD_SCRIPT_VERIFY_FLAGS minus the mandatory ones) on top of the
+// consensus flags.
 func (mp *Mempool) getStandardScriptFlags() script.ScriptFlags {
 	// Mempool uses current chain tip flags — no exception hash needed
 	// (exceptions are only for historical blocks during IBD).
@@ -3658,8 +3648,17 @@ func formatMoney(sats int64) string {
 func (mp *Mempool) TestReplacement(tx *wire.MsgTx) (conflicts bool, err error) {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
+	return mp.testReplacementLocked(tx, nil)
+}
 
+// testReplacementLocked is TestReplacement's body. extra, when non-nil, is
+// one more mempool transaction to treat as a direct conflict (a TRUC sibling
+// offered for eviction). Must be called with mu held.
+func (mp *Mempool) testReplacementLocked(tx *wire.MsgTx, extra *wire.Hash256) (conflicts bool, err error) {
 	var conflictingTxs map[wire.Hash256]bool
+	if extra != nil {
+		conflictingTxs = map[wire.Hash256]bool{*extra: true}
+	}
 	var totalInputValue int64
 	var missingInputs int
 

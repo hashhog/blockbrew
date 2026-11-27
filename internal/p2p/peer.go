@@ -309,6 +309,12 @@ type Peer struct {
 	// nextLocalAddrSend is when our own address is next announced to this
 	// peer (Core Peer::m_next_local_addr_send); zero = never sent yet.
 	nextLocalAddrSend time.Time
+	// getaddrSent is Core Peer::m_getaddr_sent: we sent this peer a getaddr
+	// and have not yet seen an addr message of fewer than 1000 entries.
+	getaddrSent bool
+	// addrKnown is Core Peer::m_addr_known: addresses this peer already has,
+	// so relay never sends them to it again (see addr_relay.go).
+	addrKnown addrKnownSet
 
 	// Per-peer header/block sync heights surfaced by getpeerinfo.
 	// Core: CNodeState.pindexBestKnownBlock / pindexLastCommonBlock

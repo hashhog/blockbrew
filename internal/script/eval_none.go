@@ -18,10 +18,12 @@ import "github.com/hashhog/blockbrew/internal/wire"
 // BaseSignatureChecker, whose signature checks always fail, where this checks
 // signatures against tx. The two can differ only for a scriptSig with a
 // signature opcode, i.e. one that is not push-only. Core never gets here with
-// one: IsStandardTx refuses it first (scriptsig-not-pushonly). The real
-// accept path enforces that rule before this runs; the testmempoolaccept
-// dry-run does not yet, but there Core's answer for such a tx is the
-// scriptsig-not-pushonly refusal anyway, never this function's result.
+// one: IsStandardTx refuses it first (scriptsig-not-pushonly). Both paths
+// that call ValidateInputsStandardness, and so this, enforce that rule
+// first: the real accept path, and the testmempoolaccept dry run, which
+// refuses a non-push-only scriptSig as scriptsig-not-pushonly before it
+// looks up any input. A scriptSig that reaches here is push-only, so the
+// signature checker is never consulted.
 func EvalScriptNone(scriptBytes []byte, tx *wire.MsgTx, txIdx int) ([][]byte, error) {
 	e, err := NewEngine(nil, tx, txIdx, ScriptVerifyNone, 0, nil)
 	if err != nil {
