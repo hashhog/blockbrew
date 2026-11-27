@@ -113,7 +113,7 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 		}
 	}
 
-	w, err := s.walletMgr.CreateWallet(name, opts)
+	w, generatedMnemonic, err := s.walletMgr.CreateWalletWithMnemonic(name, opts)
 	if err != nil {
 		// Core CreateWallet maps FAILED_ALREADY_EXISTS through FAILED_VERIFY
 		// onto RPC_WALLET_ERROR (-4), not RPC_WALLET_ALREADY_LOADED (-35).
@@ -139,10 +139,12 @@ func (s *Server) handleCreateWallet(params json.RawMessage) (interface{}, *RPCEr
 	// convention); strict-parity callers can ignore the field and use the
 	// unlock-gated getmnemonic RPC instead. Deliberately NOT returned on the
 	// restore path (the caller already holds the words).
+	// The words come from the create call, not w.Mnemonic(): a wallet
+	// created with a passphrase is already encrypted and locked here.
 	mnemonicOut := ""
 	if opts.Mnemonic == "" && !opts.Blank && !opts.DisablePrivateKeys {
-		if m, mErr := w.Mnemonic(); mErr == nil {
-			mnemonicOut = m
+		if generatedMnemonic != "" {
+			mnemonicOut = generatedMnemonic
 			warnings = append(warnings, "Write down the mnemonic now: anyone with these words can spend the wallet's funds, and without them the funds cannot be recovered if the wallet file is lost. The phrase is stored in the wallet file and can be re-exported with getmnemonic while the wallet is unlocked.")
 		}
 	}
@@ -599,6 +601,12 @@ func (s *Server) handleSendToAddressWithWallet(params json.RawMessage, walletNam
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Missing address and/or amount"}
 	}
 
+	// Core sendtoaddress calls EnsureWalletIsUnlocked before it parses the
+	// outputs (wallet/rpc/spend.cpp).
+	if rpcErr := ensureWalletUnlocked(w); rpcErr != nil {
+		return nil, rpcErr
+	}
+
 	addr, ok := args[0].(string)
 	if !ok {
 		return nil, &RPCError{Code: RPCErrInvalidParams, Message: "Invalid address"}
@@ -1012,7 +1020,8 @@ func (s *Server) handleGetWalletInfoWithWallet(walletName string) (interface{}, 
 			Hash:   tipHash.String(),
 			Height: tipHeight,
 		},
-		Locked: w.IsLocked(),
+		Locked:        w.IsLocked(),
+		UnlockedUntil: walletUnlockedUntil(w),
 	}, nil
 }
 

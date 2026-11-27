@@ -126,6 +126,10 @@ type Wallet struct {
 	encrypted       bool
 	encryptedMaster []byte      // salt||nonce||ciphertext (output of encryptMasterKey)
 	relockTimer     *time.Timer // auto-relock for walletpassphrase timeout
+	// relockTime is Core's nRelockTime: the unix time walletpassphrase set
+	// for the auto-relock, 0 while locked. getwalletinfo reports it as
+	// unlocked_until for encrypted wallets.
+	relockTime int64
 
 	// payjoinSessions tracks PayJoin offers per BIP-78 §"Receiver's
 	// per-session state" — TTL on offered proposals (G18), in-flight
@@ -3303,6 +3307,7 @@ func (w *Wallet) Lock() {
 // lockLocked locks the wallet; caller must hold w.mu (write lock).
 func (w *Wallet) lockLocked() {
 	w.locked = true
+	w.relockTime = 0
 	if w.relockTimer != nil {
 		w.relockTimer.Stop()
 		w.relockTimer = nil
@@ -3357,6 +3362,18 @@ func (w *Wallet) IsLocked() bool {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 	return w.locked
+}
+
+// UnlockedUntil returns the unix time at which walletpassphrase's unlock
+// expires, or 0 while the wallet is locked. Mirrors CWallet::nRelockTime,
+// which getwalletinfo reports as unlocked_until for encrypted wallets.
+func (w *Wallet) UnlockedUntil() int64 {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.locked {
+		return 0
+	}
+	return w.relockTime
 }
 
 // IsEncrypted returns whether the wallet has had EncryptWallet applied.
@@ -3481,6 +3498,8 @@ func (w *Wallet) UnlockWithPassphrase(passphrase string, timeout int64) error {
 		IsPrivate: true,
 	}
 	w.locked = false
+	// Core walletpassphrase: nRelockTime = GetTime() + nSleepTime.
+	w.relockTime = time.Now().Unix() + timeout
 
 	// Schedule auto-relock. A new call cancels any prior timer.
 	if w.relockTimer != nil {
