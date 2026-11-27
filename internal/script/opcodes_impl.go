@@ -611,36 +611,54 @@ func (e *Engine) opCheckSig(script []byte) error {
 
 	switch e.sigVersion {
 	case SigVersionBase, SigVersionWitnessV0:
-		// Empty signature is always false (but not an error) for legacy/segwit
-		if len(sigBytes) == 0 {
-			e.stack.PushBool(false)
-			return nil
-		}
+		// Core EvalChecksigPreTapscript (interpreter.cpp:321-345) fixes the
+		// order: FindAndDelete (BASE only, CONST_SCRIPTCODE), then
+		// CheckSignatureEncoding, then CheckPubKeyEncoding, then verify, then
+		// NULLFAIL. An empty signature is NOT an early exit: it still runs
+		// FindAndDelete (`CScript() << {}` is OP_0) and the pubkey encoding
+		// checks, and only then fails verification (CheckECDSASignature
+		// returns false for an empty sig). blockbrew used to push false at
+		// once on an empty sig, so `0 0 CHECKSIG` passed STRICTENC.
+		scriptCode := e.currentScript[e.lastCodeSepIdx:]
 
-		// DER signature encoding check (BIP66)
-		if (e.flags&ScriptVerifyDERSig != 0) || (e.flags&ScriptVerifyLowS != 0) || (e.flags&ScriptVerifyStrictEncoding != 0) {
-			if !IsValidDERSignatureEncoding(sigBytes) {
-				return ErrSigDER
+		// Drop the signature in pre-segwit scripts but not segwit scripts.
+		if e.sigVersion == SigVersionBase {
+			var found int
+			scriptCode, found = FindAndDeleteCount(scriptCode, sigBytes)
+			if found > 0 && (e.flags&ScriptVerifyConstScriptCode != 0) {
+				return ErrSigFindAndDelete
 			}
 		}
 
-		// Low-S check (BIP62 rule 5)
-		if e.flags&ScriptVerifyLowS != 0 {
-			if !IsLowSSignature(sigBytes) {
-				return ErrSigHighS
+		// CheckSignatureEncoding: an empty signature is allowed (compact
+		// invalid signature), so these checks apply to non-empty ones only.
+		if len(sigBytes) > 0 {
+			// DER signature encoding check (BIP66)
+			if (e.flags&ScriptVerifyDERSig != 0) || (e.flags&ScriptVerifyLowS != 0) || (e.flags&ScriptVerifyStrictEncoding != 0) {
+				if !IsValidDERSignatureEncoding(sigBytes) {
+					return ErrSigDER
+				}
+			}
+
+			// Low-S check (BIP62 rule 5)
+			if e.flags&ScriptVerifyLowS != 0 {
+				if !IsLowSSignature(sigBytes) {
+					return ErrSigHighS
+				}
+			}
+
+			// STRICTENC: check hashtype is defined
+			if e.flags&ScriptVerifyStrictEncoding != 0 {
+				if !IsDefinedHashtype(sigBytes) {
+					return ErrSigHashType
+				}
 			}
 		}
 
-		// STRICTENC: check hashtype is defined
+		// CheckPubKeyEncoding (interpreter.cpp:218-227), run whatever the
+		// signature: STRICTENC rejects anything that is not a compressed or
+		// uncompressed key, the empty key included.
 		if e.flags&ScriptVerifyStrictEncoding != 0 {
-			if !IsDefinedHashtype(sigBytes) {
-				return ErrSigHashType
-			}
-		}
-
-		// STRICTENC: check pubkey is compressed or uncompressed (reject hybrid)
-		// Only check non-empty pubkeys; empty pubkeys just fail verification.
-		if e.flags&ScriptVerifyStrictEncoding != 0 && len(pubKeyBytes) > 0 {
 			if !IsCompressedOrUncompressedPubKey(pubKeyBytes) {
 				return ErrPubKeyType
 			}
@@ -653,28 +671,23 @@ func (e *Engine) opCheckSig(script []byte) error {
 			}
 		}
 
+		// Core's CheckECDSASignature returns false for an empty signature;
+		// NULLFAIL only applies to a non-empty one.
+		if len(sigBytes) == 0 {
+			e.stack.PushBool(false)
+			return nil
+		}
+
 		// Extract sighash type (last byte of signature)
 		hashType := SigHashType(sigBytes[len(sigBytes)-1])
 		sig := sigBytes[:len(sigBytes)-1]
 
 		if e.sigVersion == SigVersionBase {
-			// For legacy, get scriptCode from after last OP_CODESEPARATOR
-			scriptCode := e.currentScript[e.lastCodeSepIdx:]
-			// Apply FindAndDelete to remove the push-encoded signature from scriptCode.
-			// CONST_SCRIPTCODE (BIP-342): if the signature was actually found and
-			// deleted, the script is non-constant — reject it. Mirrors Core
-			// EvalChecksigPreTapscript interpreter.cpp:330-332.
-			var found int
-			scriptCode, found = FindAndDeleteCount(scriptCode, sigBytes)
-			if found > 0 && (e.flags&ScriptVerifyConstScriptCode != 0) {
-				return ErrSigFindAndDelete
-			}
 			sighash, err = CalcSignatureHash(scriptCode, hashType, e.tx, e.txIdx)
 		} else {
 			// For witness v0, use BIP143 sighash.
 			// BIP143 scriptCode: use the witness script from after the last
 			// OP_CODESEPARATOR (no FindAndDelete in witness v0).
-			scriptCode := e.currentScript[e.lastCodeSepIdx:]
 			sighash, err = CalcWitnessSignatureHash(scriptCode, hashType, e.tx, e.txIdx, e.amount)
 		}
 		// A key that does not parse (e.g. a 0x02-prefixed x off the curve,
@@ -689,7 +702,7 @@ func (e *Engine) opCheckSig(script []byte) error {
 		}
 
 		// NULLFAIL: non-empty signature that fails verification must cause error
-		if !valid && len(sigBytes) > 0 && (e.flags&ScriptVerifyNullFail != 0) {
+		if !valid && (e.flags&ScriptVerifyNullFail != 0) {
 			return ErrNullFail
 		}
 
