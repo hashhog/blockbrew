@@ -1839,14 +1839,8 @@ func (mp *Mempool) checkStandardnessLocked(tx *wire.MsgTx) error {
 
 	// Per-input scriptSig policy (Core IsStandardTx input loop,
 	// policy/policy.cpp:117-135): scriptSig size cap + push-only.
-	for i, in := range tx.TxIn {
-		if len(in.SignatureScript) > MaxStandardScriptSigSize {
-			return fmt.Errorf("%w: input %d scriptSig %d bytes > %d",
-				ErrScriptSigTooLarge, i, len(in.SignatureScript), MaxStandardScriptSigSize)
-		}
-		if len(in.SignatureScript) > 0 && !script.IsPushOnly(in.SignatureScript) {
-			return fmt.Errorf("%w: input %d", ErrScriptSigNotPushOnly, i)
-		}
+	if err := checkScriptSigStandard(tx); err != nil {
+		return err
 	}
 
 	// Output script standardness + cumulative OP_RETURN datacarrier budget
@@ -3654,8 +3648,17 @@ func formatMoney(sats int64) string {
 func (mp *Mempool) TestReplacement(tx *wire.MsgTx) (conflicts bool, err error) {
 	mp.mu.RLock()
 	defer mp.mu.RUnlock()
+	return mp.testReplacementLocked(tx, nil)
+}
 
+// testReplacementLocked is TestReplacement's body. extra, when non-nil, is
+// one more mempool transaction to treat as a direct conflict (a TRUC sibling
+// offered for eviction). Must be called with mu held.
+func (mp *Mempool) testReplacementLocked(tx *wire.MsgTx, extra *wire.Hash256) (conflicts bool, err error) {
 	var conflictingTxs map[wire.Hash256]bool
+	if extra != nil {
+		conflictingTxs = map[wire.Hash256]bool{*extra: true}
+	}
 	var totalInputValue int64
 	var missingInputs int
 
